@@ -113,6 +113,7 @@ struct ReposInner {
     worktrees_root: PathBuf,
     runner: std::sync::Arc<dyn ProcessRunner>,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    mutation_locks: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     http: reqwest::Client,
     github_avatars: std::sync::Mutex<HashMap<String, String>>,
     github_avatar_pages: std::sync::Mutex<HashSet<String>>,
@@ -178,6 +179,7 @@ impl Repos {
                 worktrees_root,
                 runner,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
+                mutation_locks: std::sync::Mutex::new(HashMap::new()),
                 http: reqwest::Client::builder()
                     .timeout(GITHUB_AVATAR_TIMEOUT)
                     .user_agent("Comet-Git-History")
@@ -229,14 +231,61 @@ impl Repos {
 
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
+        self.git_with(args, cwd, &[]).await
+    }
+
+    async fn git_with(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+    ) -> Result<String, EngineError> {
+        self.git_vec(
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+            cwd,
+            env,
+        )
+        .await
+    }
+
+    async fn git_vec(
+        &self,
+        args: Vec<String>,
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+    ) -> Result<String, EngineError> {
+        let stdout = self.git_output(args, cwd, env).await?;
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    }
+
+    async fn git_raw(&self, args: &[&str], cwd: Option<&Path>) -> Result<Vec<u8>, EngineError> {
+        self.git_output(
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+            cwd,
+            &[],
+        )
+        .await
+    }
+
+    async fn git_output(
+        &self,
+        args: Vec<String>,
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+    ) -> Result<Vec<u8>, EngineError> {
+        let first = args
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .cloned()
+            .unwrap_or_else(|| "?".into());
         let output = self
             .inner
             .runner
             .run(ProcessRequest {
                 program: "git".into(),
-                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                args,
                 cwd: cwd.map(Path::to_path_buf),
-                env: Vec::new(),
+                env: env.to_vec(),
                 timeout: LONG_GIT_TIMEOUT,
                 output_limit: GIT_OUTPUT_LIMIT,
                 kill_on_drop: false,
@@ -246,8 +295,7 @@ impl Repos {
                 EngineError::Other(match error {
                     ProcessRunError::Spawn(kind) => format!("git spawn failed: {kind}"),
                     ProcessRunError::Timeout => format!(
-                        "git {} timed out after {}s",
-                        args.first().unwrap_or(&"?"),
+                        "git {first} timed out after {}s",
                         LONG_GIT_TIMEOUT.as_secs()
                     ),
                     ProcessRunError::Io => "git io failed".to_string(),
@@ -257,7 +305,7 @@ impl Repos {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
             return Err(EngineError::Other(if message.is_empty() {
-                format!("git {} failed", args.first().unwrap_or(&"?"))
+                format!("git {first} failed")
             } else {
                 format!("git: {message}")
             }));
@@ -266,12 +314,26 @@ impl Repos {
         // a short branch list or a half-read porcelain stanza. Say so instead.
         if output.stdout_truncated {
             return Err(EngineError::Other(format!(
-                "git {} output exceeded {} bytes",
-                args.first().unwrap_or(&"?"),
-                GIT_OUTPUT_LIMIT
+                "git {first} output exceeded {GIT_OUTPUT_LIMIT} bytes"
             )));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(output.stdout)
+    }
+
+    fn mutation_lock(&self, repo_path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let key = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+        let mut locks = self
+            .inner
+            .mutation_locks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            lock
+        } else {
+            let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(key, std::sync::Arc::downgrade(&lock));
+            lock
+        }
     }
 
     /// Async existence probe with a timeout: a wedged network mount just reads
@@ -322,6 +384,246 @@ impl Repos {
         self.git(&["fetch", "--all", "--quiet"], Some(repo_path))
             .await
             .map(drop)
+    }
+
+    fn no_prompt() -> Vec<(String, String)> {
+        vec![("GIT_TERMINAL_PROMPT".into(), "0".into())]
+    }
+
+    fn validate_repo_paths(paths: &[String]) -> Result<Vec<String>, EngineError> {
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let relative = crate::workspace_files::WorkspaceRelativePath::file(path)
+                .map_err(|error| EngineError::Other(format!("invalid path: {error}")))?;
+            out.push(relative.wire_path());
+        }
+        Ok(out)
+    }
+
+    fn literal_pathspecs(paths: Vec<String>) -> Vec<String> {
+        paths
+            .into_iter()
+            .map(|path| format!(":(literal){path}"))
+            .collect()
+    }
+
+    pub(crate) async fn stage_files(
+        &self,
+        repo_path: &Path,
+        paths: &[String],
+    ) -> Result<(), EngineError> {
+        let paths = Self::validate_repo_paths(paths)?;
+        let lock = self.mutation_lock(repo_path);
+        let _guard = lock.lock().await;
+        let mut args = vec!["add".to_string(), "--".into()];
+        args.extend(Self::literal_pathspecs(paths));
+        self.git_vec(args, Some(repo_path), &[]).await.map(drop)
+    }
+
+    pub(crate) async fn unstage_files(
+        &self,
+        repo_path: &Path,
+        paths: &[String],
+    ) -> Result<(), EngineError> {
+        let paths = Self::validate_repo_paths(paths)?;
+        let lock = self.mutation_lock(repo_path);
+        let _guard = lock.lock().await;
+        let mut args = vec!["restore".into(), "--staged".into(), "--".into()];
+        args.extend(Self::literal_pathspecs(paths));
+        self.git_vec(args, Some(repo_path), &[]).await.map(drop)
+    }
+
+    pub(crate) async fn discard_files(
+        &self,
+        repo_path: &Path,
+        paths: &[String],
+    ) -> Result<(), EngineError> {
+        let paths = Self::validate_repo_paths(paths)?;
+        let lock = self.mutation_lock(repo_path);
+        let _guard = lock.lock().await;
+        let files = self.status_files(repo_path).await?;
+        let mut restore = Vec::new();
+        let mut untracked = Vec::new();
+        for path in &paths {
+            let is_untracked = files.iter().any(|file| {
+                let reported = file.path.trim_end_matches('/');
+                (reported == path.as_str() || file.path == *path)
+                    && (file.index == zeron_proto::GitFileStatus::Untracked
+                        || file.worktree == zeron_proto::GitFileStatus::Untracked)
+            });
+            if is_untracked {
+                untracked.push(path.clone());
+            } else {
+                restore.push(path.clone());
+            }
+        }
+        if !restore.is_empty() {
+            let mut args = vec!["restore".into(), "--worktree".into(), "--".into()];
+            args.extend(Self::literal_pathspecs(restore));
+            self.git_vec(args, Some(repo_path), &[]).await?;
+        }
+        for path in &untracked {
+            let full = repo_path.join(path);
+            if full.is_dir() {
+                std::fs::remove_dir_all(&full)?;
+            } else if full.exists() {
+                std::fs::remove_file(&full)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn status_files(
+        &self,
+        repo_path: &Path,
+    ) -> Result<Vec<zeron_proto::CheckoutStatusFile>, EngineError> {
+        let raw = self
+            .git_raw(
+                &["--no-optional-locks", "status", "--porcelain=v1", "-z"],
+                Some(repo_path),
+            )
+            .await?;
+        Ok(crate::diff_sync::parse_porcelain_v1_z(&raw))
+    }
+
+    pub(crate) async fn commit(&self, repo_path: &Path, message: &str) -> Result<(), EngineError> {
+        if message.trim().is_empty() {
+            return Err(EngineError::Other(
+                "commit message must not be empty".into(),
+            ));
+        }
+        let lock = self.mutation_lock(repo_path);
+        let _guard = lock.lock().await;
+        if self
+            .git(&["diff", "--cached", "--quiet"], Some(repo_path))
+            .await
+            .is_ok()
+        {
+            return Err(EngineError::Other("nothing staged to commit".into()));
+        }
+        self.git(&["commit", "-m", message], Some(repo_path))
+            .await
+            .map(drop)
+    }
+    async fn default_remote(&self, repo_path: &Path) -> Result<String, EngineError> {
+        let remotes = self.git(&["remote"], Some(repo_path)).await?;
+        let names: Vec<&str> = remotes
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        if names.iter().any(|name| *name == "origin") {
+            return Ok("origin".into());
+        }
+        names
+            .first()
+            .map(|name| (*name).to_string())
+            .ok_or_else(|| EngineError::Other("git: no remote configured".into()))
+    }
+
+    pub(crate) async fn push_checkout(&self, repo_path: &Path) -> Result<(), EngineError> {
+        let lock = self.mutation_lock(repo_path);
+        let _guard = lock.lock().await;
+        let env = Self::no_prompt();
+        let upstream = self
+            .git(
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+                Some(repo_path),
+            )
+            .await
+            .ok()
+            .filter(|value| !value.is_empty());
+        if upstream.is_some() {
+            return self
+                .git_with(&["push"], Some(repo_path), &env)
+                .await
+                .map(drop);
+        }
+        let branch = self.current_branch(repo_path).await?;
+        if branch == "HEAD" {
+            return Err(EngineError::Other(
+                "git: cannot publish a detached HEAD".into(),
+            ));
+        }
+        let remote = self.default_remote(repo_path).await?;
+        self.git_vec(
+            vec!["push".into(), "--set-upstream".into(), remote, branch],
+            Some(repo_path),
+            &env,
+        )
+        .await
+        .map(drop)
+    }
+
+    pub(crate) async fn pull_checkout(&self, repo_path: &Path) -> Result<(), EngineError> {
+        let lock = self.mutation_lock(repo_path);
+        let _guard = lock.lock().await;
+        self.git_with(&["pull", "--ff-only"], Some(repo_path), &Self::no_prompt())
+            .await
+            .map(drop)
+    }
+
+    pub(crate) async fn sync_checkout(&self, repo_path: &Path) -> Result<(), EngineError> {
+        let upstream = self
+            .git(
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+                Some(repo_path),
+            )
+            .await
+            .ok()
+            .filter(|value| !value.is_empty());
+        if upstream.is_some() {
+            self.pull_checkout(repo_path).await?;
+        }
+        self.push_checkout(repo_path).await
+    }
+
+    pub(crate) async fn upstream_divergence(
+        &self,
+        repo_path: &Path,
+    ) -> Result<(Option<String>, usize, usize), EngineError> {
+        let upstream = self
+            .git(
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+                Some(repo_path),
+            )
+            .await
+            .ok()
+            .filter(|value| !value.is_empty());
+        let Some(upstream) = upstream else {
+            return Ok((None, 0, 0));
+        };
+        let counts = self
+            .git(
+                &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+                Some(repo_path),
+            )
+            .await?;
+        let mut parts = counts.split_whitespace();
+        let ahead = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let behind = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        Ok((Some(upstream), ahead, behind))
     }
 
     /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
@@ -2620,6 +2922,7 @@ prunable gitdir file points to non-existent location
         porcelain: String,
         refuse: &'static [&'static str],
         calls: std::sync::Mutex<Vec<Vec<String>>>,
+        envs: std::sync::Mutex<Vec<Vec<(String, String)>>>,
     }
 
     impl FakeGit {
@@ -2628,6 +2931,7 @@ prunable gitdir file points to non-existent location
                 porcelain,
                 refuse,
                 calls: std::sync::Mutex::new(Vec::new()),
+                envs: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -2640,6 +2944,7 @@ prunable gitdir file points to non-existent location
     impl ProcessRunner for FakeGit {
         async fn run(&self, r: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
             self.calls.lock().unwrap().push(r.args.clone());
+            self.envs.lock().unwrap().push(r.env.clone());
             let refused = !self.refuse.is_empty()
                 && r.args.len() >= self.refuse.len()
                 && (self.refuse.iter())
@@ -3186,5 +3491,157 @@ tmpfs /run tmpfs rw 0 0
 
         assert_eq!(alpha.unwrap()[0].path, "alpha.rs");
         assert_eq!(beta.unwrap()[0].path, "beta.rs");
+    }
+
+    #[tokio::test]
+    async fn source_control_argv_uses_literal_pathspecs() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file with space.txt"), "x").unwrap();
+        std::fs::write(root.join("scratch.txt"), "y").unwrap();
+        let git = FakeGit::new("?? scratch.txt\0".into(), &[]);
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+
+        repos
+            .stage_files(&root, &["file with space.txt".into()])
+            .await
+            .unwrap();
+        repos.unstage_files(&root, &["a.txt".into()]).await.unwrap();
+        repos
+            .discard_files(&root, &["tracked.txt".into()])
+            .await
+            .unwrap();
+        repos
+            .discard_files(&root, &["scratch.txt".into()])
+            .await
+            .unwrap();
+        repos.commit(&root, "msg").await.unwrap_err();
+        let _ = repos.push_checkout(&root).await;
+        let _ = repos.pull_checkout(&root).await;
+
+        let calls = git.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|args| { args.as_slice() == ["add", "--", ":(literal)file with space.txt"] }),
+            "stage argv: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|args| {
+                args.as_slice() == ["restore", "--staged", "--", ":(literal)a.txt"]
+            }),
+            "unstage argv: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|args| args
+                .windows(2)
+                .any(|w| w == ["restore".to_string(), "--worktree".into()])),
+            "tracked discard restore: {calls:?}"
+        );
+        let restore_scratch = calls.iter().any(|args| {
+            args.iter().any(|a| a == "restore") && args.iter().any(|a| a.contains("scratch.txt"))
+        });
+        assert!(
+            !restore_scratch,
+            "untracked discard must not restore: {calls:?}"
+        );
+        let envs = git.envs.lock().unwrap().clone();
+        let push_or_pull = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, args)| args.iter().any(|arg| arg == "push" || arg == "pull"));
+        for (i, _) in push_or_pull {
+            assert!(
+                envs[i]
+                    .iter()
+                    .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v == "0"),
+                "network git must set GIT_TERMINAL_PROMPT=0: {:?}",
+                envs[i]
+            );
+        }
+    }
+
+    struct RecordingGit {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for RecordingGit {
+        async fn run(&self, r: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+            self.calls.lock().unwrap().push(r.args.clone());
+            SystemProcessRunner.run(r).await
+        }
+    }
+
+    fn git_cmd(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_divergence_reads_local_ahead_and_behind_without_fetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("origin.git");
+        let repo = temp.path().join("repo");
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        git_cmd(&repo, &["init", "-b", "main"]);
+        git_cmd(&repo, &["config", "user.email", "test@test"]);
+        git_cmd(&repo, &["config", "user.name", "test"]);
+        git_cmd(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        git_cmd(&repo, &["add", "tracked.txt"]);
+        git_cmd(&repo, &["commit", "-m", "initial"]);
+        git_cmd(&origin, &["init", "--bare", "-b", "main"]);
+        git_cmd(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_cmd(&repo, &["push", "-u", "origin", "main"]);
+        git_cmd(
+            temp.path(),
+            &["clone", origin.to_str().unwrap(), other.to_str().unwrap()],
+        );
+        git_cmd(&other, &["config", "user.email", "test@test"]);
+        git_cmd(&other, &["config", "user.name", "test"]);
+        git_cmd(&other, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(other.join("behind.txt"), "from-other\n").unwrap();
+        git_cmd(&other, &["add", "behind.txt"]);
+        git_cmd(&other, &["commit", "-m", "other"]);
+        git_cmd(&other, &["push"]);
+        std::fs::write(repo.join("ahead.txt"), "from-repo\n").unwrap();
+        git_cmd(&repo, &["add", "ahead.txt"]);
+        git_cmd(&repo, &["commit", "-m", "local"]);
+        git_cmd(&repo, &["fetch"]);
+
+        let recorder = std::sync::Arc::new(RecordingGit {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let repos = Repos::with_runner(&temp.path().join("data"), "dev", recorder.clone());
+        let (upstream, ahead, behind) = repos.upstream_divergence(&repo).await.unwrap();
+        assert_eq!(ahead, 1, "ahead");
+        assert_eq!(behind, 1, "behind");
+        assert_eq!(upstream.as_deref(), Some("origin/main"));
+        let calls = recorder.calls.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|args| args
+                .iter()
+                .any(|arg| { matches!(arg.as_str(), "fetch" | "ls-remote" | "pull" | "push") })),
+            "ahead/behind must not talk to the network: {calls:?}"
+        );
     }
 }

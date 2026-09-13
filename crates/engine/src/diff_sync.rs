@@ -167,6 +167,7 @@ struct DiffSyncInner {
     /// How long an entry may sit chat-less before reconcile removes it.
     orphan_grace: Duration,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
+    status_tx: watch::Sender<Vec<zeron_proto::CheckoutStatus>>,
     /// chat_id → turn-start tree (see [`TurnSnapshot`]).
     turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
     /// The tasks hold `Weak` refs, but an in-flight iteration holds an
@@ -228,6 +229,7 @@ impl CheckoutDiffSync {
         orphan_grace: Duration,
     ) -> Self {
         let (diffs_tx, _) = watch::channel(Vec::new());
+        let (status_tx, _) = watch::channel(Vec::new());
         let sync = Self {
             inner: Arc::new(DiffSyncInner {
                 repos,
@@ -240,6 +242,7 @@ impl CheckoutDiffSync {
                 identities: Mutex::new(HashMap::new()),
                 orphan_grace,
                 diffs_tx,
+                status_tx,
                 turn_trees: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
                 supervisor: Mutex::new(None),
@@ -269,6 +272,10 @@ impl CheckoutDiffSync {
     /// `WatchCheckoutDiffs` source: every tracked checkout's latest diff.
     pub fn watch_diffs(&self) -> watch::Receiver<Vec<CheckoutDiff>> {
         self.inner.diffs_tx.subscribe()
+    }
+
+    pub fn watch_status(&self) -> watch::Receiver<Vec<zeron_proto::CheckoutStatus>> {
+        self.inner.status_tx.subscribe()
     }
 
     /// Track `cwd`'s checkout for as long as the returned guard lives, whether
@@ -667,6 +674,12 @@ async fn entry_task(
 // ---------------------------------------------------------------------------
 
 async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
+    if let Ok(status) =
+        capture_checkout_status(&inner.repos, &entry.identity.root, &entry.identity.id).await
+    {
+        publish_status_with(inner, Some(status));
+    }
+
     let snapshot = match capture_diff(&inner.repos, &entry.identity.root).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -766,6 +779,24 @@ fn publish_watch_with(inner: &Arc<DiffSyncInner>, updated: Option<CheckoutDiff>)
 
 fn publish_watch(inner: &Arc<DiffSyncInner>) {
     publish_watch_with(inner, None);
+    publish_status_with(inner, None);
+}
+
+fn publish_status_with(inner: &Arc<DiffSyncInner>, updated: Option<zeron_proto::CheckoutStatus>) {
+    let live: HashSet<String> = lock(&inner.entries).keys().cloned().collect();
+    inner.status_tx.send_modify(|statuses| {
+        statuses.retain(|status| live.contains(&status.checkout_id));
+        if let Some(updated) = updated {
+            match statuses
+                .iter_mut()
+                .find(|status| status.checkout_id == updated.checkout_id)
+            {
+                Some(slot) => *slot = updated,
+                None => statuses.push(updated),
+            }
+        }
+        statuses.sort_by(|a, b| a.checkout_id.cmp(&b.checkout_id));
+    });
 }
 
 /// Chat-watch follower + repair tick. Holds only weak handles so dropping the
@@ -831,10 +862,15 @@ async fn capture_git(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Capture, EngineError> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    if args.first() != Some(&"--no-optional-locks") {
+        argv.push("--no-optional-locks".to_string());
+    }
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
     let output = runner
         .run(ProcessRequest {
             program: "git".into(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            args: argv,
             cwd: Some(cwd.to_path_buf()),
             env: Vec::new(),
             timeout: LONG_GIT_TIMEOUT,
@@ -873,6 +909,84 @@ fn split_z(value: &[u8]) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).to_string())
         .collect()
+}
+
+fn git_xy(code: char) -> zeron_proto::GitFileStatus {
+    match code {
+        ' ' => zeron_proto::GitFileStatus::Unmodified,
+        'M' | 'T' => zeron_proto::GitFileStatus::Modified,
+        'A' => zeron_proto::GitFileStatus::Added,
+        'D' => zeron_proto::GitFileStatus::Deleted,
+        'R' => zeron_proto::GitFileStatus::Renamed,
+        'C' => zeron_proto::GitFileStatus::Copied,
+        'U' => zeron_proto::GitFileStatus::Unmerged,
+        '?' => zeron_proto::GitFileStatus::Untracked,
+        _ => zeron_proto::GitFileStatus::Modified,
+    }
+}
+
+pub(crate) fn parse_porcelain_v1_z(value: &[u8]) -> Vec<zeron_proto::CheckoutStatusFile> {
+    let fields = split_z(value);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < fields.len() {
+        let record = &fields[i];
+        i += 1;
+        let mut chars = record.chars();
+        let Some(x) = chars.next() else { continue };
+        let Some(y) = chars.next() else { continue };
+        let Some(' ') = chars.next() else { continue };
+        let rest = chars.as_str().to_string();
+        let renamed = matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C');
+        let (path, old_path) = if renamed {
+            let Some(old_path) = fields.get(i).cloned() else {
+                break;
+            };
+            i += 1;
+            (rest, Some(old_path))
+        } else {
+            (rest, None)
+        };
+        out.push(zeron_proto::CheckoutStatusFile {
+            path,
+            old_path,
+            index: git_xy(x),
+            worktree: git_xy(y),
+        });
+    }
+    out
+}
+
+pub async fn capture_checkout_status(
+    repos: &Repos,
+    root: &Path,
+    checkout_id: &str,
+) -> Result<zeron_proto::CheckoutStatus, EngineError> {
+    let porcelain = capture_git(
+        repos.runner(),
+        root,
+        &["--no-optional-locks", "status", "--porcelain=v1", "-z"],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let files = parse_porcelain_v1_z(&porcelain.stdout);
+    let branch = repos
+        .current_branch(root)
+        .await
+        .unwrap_or_else(|_| "HEAD".into());
+    let (upstream, ahead, behind) = repos
+        .upstream_divergence(root)
+        .await
+        .unwrap_or((None, 0, 0));
+    Ok(zeron_proto::CheckoutStatus {
+        checkout_id: checkout_id.to_string(),
+        cwd: root.to_string_lossy().to_string(),
+        branch,
+        upstream,
+        ahead,
+        behind,
+        files,
+    })
 }
 
 fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
@@ -1225,7 +1339,7 @@ pub async fn capture_diff_against(
     let status = capture_git(
         repos.runner(),
         root,
-        &["--no-optional-locks", "status", "--porcelain", "-z"],
+        &["--no-optional-locks", "status", "--porcelain=v1", "-z"],
         2 * 1024 * 1024,
     )
     .await?;
@@ -1241,24 +1355,14 @@ pub async fn capture_diff_against(
         patch.push_str("\n# Zeron diff truncated\n");
     }
 
-    // `?? path` records; rename records (`R  new\0old`) consume their extra field.
-    let mut untracked: Vec<String> = Vec::new();
-    let records = split_z(&status.stdout);
-    let mut i = 0usize;
-    while i < records.len() {
-        let record = &records[i];
-        i += 1;
-        if record.len() < 3 {
-            continue;
-        }
-        let (code, path) = record.split_at(2);
-        if code.starts_with('R') || code.starts_with('C') {
-            i += 1; // skip the origin-path field
-        }
-        if code == "??" {
-            untracked.push(path.trim_start().to_string());
-        }
-    }
+    let mut untracked: Vec<String> = parse_porcelain_v1_z(&status.stdout)
+        .into_iter()
+        .filter(|file| {
+            file.index == zeron_proto::GitFileStatus::Untracked
+                || file.worktree == zeron_proto::GitFileStatus::Untracked
+        })
+        .map(|file| file.path)
+        .collect();
     untracked.sort();
 
     for path in untracked {
@@ -1937,6 +2041,86 @@ mod future_size_tests {
             assert!(
                 size <= BUDGET,
                 "{name} future is {size} bytes, over the {BUDGET}-byte budget"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod parse_porcelain_v1_z_tests {
+    use super::parse_porcelain_v1_z;
+    use zeron_proto::GitFileStatus;
+
+    #[test]
+    fn splits_staged_unstaged_untracked_and_rename() {
+        let buf = b"MM both.txt\0A  added.txt\0?? untracked.txt\0R  new name.txt\0old name.txt\0 M path with space.txt\0??  nota.txt\0";
+        let files = parse_porcelain_v1_z(buf);
+        assert_eq!(files[0].path, "both.txt");
+        assert_eq!(files[0].index, GitFileStatus::Modified);
+        assert_eq!(files[0].worktree, GitFileStatus::Modified);
+        assert_eq!(files[1].path, "added.txt");
+        assert_eq!(files[1].index, GitFileStatus::Added);
+        assert_eq!(files[1].worktree, GitFileStatus::Unmodified);
+        assert_eq!(files[2].path, "untracked.txt");
+        assert_eq!(files[2].index, GitFileStatus::Untracked);
+        assert_eq!(files[2].worktree, GitFileStatus::Untracked);
+        assert_eq!(files[3].path, "new name.txt");
+        assert_eq!(files[3].old_path.as_deref(), Some("old name.txt"));
+        assert_eq!(files[3].index, GitFileStatus::Renamed);
+        assert_eq!(files[4].path, "path with space.txt");
+        assert_eq!(files[4].index, GitFileStatus::Unmodified);
+        assert_eq!(files[4].worktree, GitFileStatus::Modified);
+        assert_eq!(files[5].path, " nota.txt");
+        assert_eq!(files[5].index, GitFileStatus::Untracked);
+    }
+}
+
+#[cfg(test)]
+mod no_optional_locks_tests {
+    use super::*;
+    use crate::process::{ProcessOutput, ProcessRequest, ProcessRunError, ProcessRunner};
+    use crate::repos::Repos;
+
+    struct RecordingGit(std::sync::Mutex<Vec<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for RecordingGit {
+        async fn run(&self, r: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+            self.calls().push(r.args.clone());
+            Ok(ProcessOutput {
+                success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+            })
+        }
+    }
+
+    impl RecordingGit {
+        fn calls(&self) -> std::sync::MutexGuard<'_, Vec<Vec<String>>> {
+            self.0.lock().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_captures_prefix_no_optional_locks() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = std::sync::Arc::new(RecordingGit(std::sync::Mutex::new(Vec::new())));
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+        let _ = capture_diff(&repos, &root).await;
+        let calls = git.calls().clone();
+        let diffs = calls
+            .iter()
+            .filter(|args| args.iter().any(|arg| arg == "diff"))
+            .collect::<Vec<_>>();
+        assert!(!diffs.is_empty(), "expected diff argv, got {calls:?}");
+        for args in diffs {
+            assert_eq!(
+                args.first().map(String::as_str),
+                Some("--no-optional-locks"),
+                "diff argv: {args:?}"
             );
         }
     }

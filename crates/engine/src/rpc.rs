@@ -663,6 +663,19 @@ impl EngineRpc {
         ))
     }
 
+    /// Source Control RPCs are relay-forwardable, so the cwd is resolved against
+    /// this device's chats/spaces before any git identity or mutation.
+    async fn authorized_checkout(
+        &self,
+        cwd: &str,
+    ) -> Result<crate::repos::CheckoutIdentity, RpcError> {
+        let root = self.change_request_root(cwd).await?;
+        self.repos
+            .checkout_identity(&root)
+            .await
+            .map_err(git_rpc_error)
+    }
+
     /// Most-recent-first paths the current chat actually touched, followed by
     /// files still changed in its checkout. The search worker validates and
     /// normalizes them against the resolved root before using them as ranking
@@ -932,6 +945,15 @@ impl EngineRpc {
 /// transport means the shared device link itself cannot carry other calls.
 fn should_invalidate_link(error: &RpcError) -> bool {
     matches!(error, RpcError::Closed | RpcError::Transport(_))
+}
+
+fn git_rpc_error(error: crate::EngineError) -> RpcError {
+    let message = error.to_string();
+    if message.starts_with("invalid path") {
+        RpcError::BadParams(message)
+    } else {
+        RpcError::Failed(message)
+    }
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1901,6 +1923,113 @@ impl RpcService for EngineRpc {
                     checksum: snapshot.checksum,
                     updated_at: chrono::Utc::now(),
                 })
+            }
+            methods::GET_CHECKOUT_STATUS => {
+                let request: zeron_proto::GetCheckoutStatusRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                let status = crate::diff_sync::capture_checkout_status(
+                    &self.repos,
+                    &identity.root,
+                    &identity.id,
+                )
+                .await
+                .map_err(git_rpc_error)?;
+                RpcReply::value(&status)
+            }
+            methods::WATCH_CHECKOUT_STATUS => {
+                let request: zeron_proto::WatchCheckoutStatusRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                let pin = self.diff_sync.pin_checkout(&identity.root).await.ok();
+                let checkout_id = identity.id.clone();
+                let stream = watch_stream(self.diff_sync.watch_status()).filter_map(move |value| {
+                    let checkout_id = checkout_id.clone();
+                    async move {
+                        let statuses: Vec<zeron_proto::CheckoutStatus> =
+                            serde_json::from_value(value).ok()?;
+                        statuses
+                            .into_iter()
+                            .find(|status| status.checkout_id == checkout_id)
+                            .and_then(|status| serde_json::to_value(status).ok())
+                    }
+                });
+                Ok(RpcReply::Stream(
+                    stream
+                        .map(move |value| {
+                            let _pin = &pin;
+                            value
+                        })
+                        .boxed(),
+                ))
+            }
+            methods::STAGE_FILES => {
+                let request: zeron_proto::CheckoutFilesRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                self.repos
+                    .stage_files(&identity.root, &request.paths)
+                    .await
+                    .map_err(git_rpc_error)?;
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::UNSTAGE_FILES => {
+                let request: zeron_proto::CheckoutFilesRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                self.repos
+                    .unstage_files(&identity.root, &request.paths)
+                    .await
+                    .map_err(git_rpc_error)?;
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::DISCARD_FILES => {
+                let request: zeron_proto::CheckoutFilesRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                self.repos
+                    .discard_files(&identity.root, &request.paths)
+                    .await
+                    .map_err(git_rpc_error)?;
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::COMMIT_CHECKOUT => {
+                let request: zeron_proto::CommitCheckoutRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                self.repos
+                    .commit(&identity.root, &request.message)
+                    .await
+                    .map_err(git_rpc_error)?;
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::PUSH_CHECKOUT => {
+                let request: zeron_proto::CheckoutOpRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                self.repos
+                    .push_checkout(&identity.root)
+                    .await
+                    .map_err(git_rpc_error)?;
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::PULL_CHECKOUT => {
+                let request: zeron_proto::CheckoutOpRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                self.repos
+                    .pull_checkout(&identity.root)
+                    .await
+                    .map_err(git_rpc_error)?;
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SYNC_CHECKOUT => {
+                let request: zeron_proto::CheckoutOpRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                self.repos
+                    .sync_checkout(&identity.root)
+                    .await
+                    .map_err(git_rpc_error)?;
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::GET_CHECKOUT_FILE_DIFF_TEXT => {
                 // This branch contains several large nested async futures. Keep it

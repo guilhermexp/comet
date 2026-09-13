@@ -283,9 +283,12 @@ use gpui::{
     SharedString, Subscription, Task, div, img, prelude::*, px,
 };
 use zeron_proto::{
-    AgentAccountsSnapshot,
+    AgentAccountsSnapshot, CheckoutFilesRequest, CheckoutOpRequest, CheckoutStatus,
+    CheckoutStatusFile, CommitCheckoutRequest, GetCheckoutStatusRequest,
+    WatchCheckoutStatusRequest,
     agent::{WorkflowProgressNode, WorkflowTaskStatus},
 };
+use zeron_rpc::methods;
 
 use crate::{
     composer::{Composer, ComposerInput, ComposerInputEvent},
@@ -311,6 +314,7 @@ use crate::{
         },
         files_view::{file_glyph, material_icon_path},
         recency::{FileRecency, RECENCY_TICK, RecencyLevel},
+        source_control,
         subagent_avatars::blobatar_subagent_avatar_path,
         todos::{latest_todos, todo_status_layout, todo_viewport_height_px},
         usage::{
@@ -411,6 +415,15 @@ pub enum DetailsSidebarEvent {
         session_id: String,
         title: String,
     },
+    OpenWorkingTreeDiff {
+        path: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum SourceControlSection {
+    Staged,
+    Changes,
 }
 
 fn open_subagent_event(chat_id: &str, row: &ChatActivityRow) -> DetailsSidebarEvent {
@@ -522,6 +535,18 @@ pub struct DetailsSidebar {
     _pickers_observe: Subscription,
     _composer_observe: Subscription,
     _search_events: Subscription,
+    checkout_status: Option<CheckoutStatus>,
+    checkout_not_git: bool,
+    checkout_status_error: Option<SharedString>,
+    source_control_watch: Option<Task<()>>,
+    source_control_watch_key: Option<String>,
+    source_control_fetch: Option<Task<()>>,
+    source_control_op: Option<Task<()>>,
+    source_control_busy: bool,
+    source_control_op_error: Option<SharedString>,
+    commit_input: Entity<ComposerInput>,
+    _commit_events: Subscription,
+    discard_prompt: Option<source_control::DiscardPrompt>,
 }
 
 impl DetailsSidebar {
@@ -537,6 +562,15 @@ impl DetailsSidebar {
         let search_events = cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 this.reload_files(cx);
+            }
+        });
+        let commit_input = cx.new(|cx| ComposerInput::new("Commit message", cx).with_single_line());
+        let commit_events = cx.subscribe(&commit_input, |this, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                cx.notify();
+            }
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.commit_checkout(cx);
             }
         });
         let state_observe = cx.observe(&app_state, |this, state, cx| {
@@ -556,6 +590,7 @@ impl DetailsSidebar {
                 this.reload_files(cx);
             }
             this.sync_idle_recap(cx);
+            this.ensure_source_control_watch(cx);
             cx.notify();
         });
         let workers_observe = cx.observe(&workers_model, |_, _, cx| cx.notify());
@@ -607,6 +642,18 @@ impl DetailsSidebar {
             material_icons: std::collections::HashMap::new(),
             resolved_branch: None,
             has_git_dir: None,
+            checkout_status: None,
+            checkout_not_git: false,
+            checkout_status_error: None,
+            source_control_watch: None,
+            source_control_watch_key: None,
+            source_control_fetch: None,
+            source_control_op: None,
+            source_control_busy: false,
+            source_control_op_error: None,
+            commit_input,
+            _commit_events: commit_events,
+            discard_prompt: None,
             file_task: None,
             branch_task: None,
             usage_task: None,
@@ -656,12 +703,25 @@ impl DetailsSidebar {
             self.inline_edit = None;
             self.inline_input = None;
             self.file_mutation_error = None;
+            self.source_control_watch = None;
+            self.source_control_watch_key = None;
+            self.source_control_fetch = None;
+            self.source_control_op = None;
+            self.checkout_status = None;
+            self.checkout_not_git = false;
+            self.checkout_status_error = None;
+            self.source_control_op_error = None;
+            self.source_control_busy = false;
+            self.discard_prompt = None;
+            self.commit_input
+                .update(cx, |input, cx| input.set_text("", cx));
             self.resolved_branch = self
                 .sidebar
                 .context()
                 .and_then(|value| value.branch.clone());
             self.reload_files(cx);
             self.load_branch(cx);
+            self.ensure_source_control_watch(cx);
             cx.notify();
             self.sync_idle_recap(cx);
         }
@@ -775,7 +835,682 @@ impl DetailsSidebar {
         }
         self.sidebar.set_tab(tab);
         self.emit_preferences(cx);
+        self.ensure_source_control_watch(cx);
         cx.notify();
+    }
+
+    fn source_control_cwd(&self) -> Option<(String, Option<String>)> {
+        let context = self.sidebar.context()?;
+        Some((
+            context.cwd.to_string_lossy().into_owned(),
+            context.target_device_id.clone(),
+        ))
+    }
+
+    fn source_control_params(
+        &self,
+        request: impl serde::Serialize,
+    ) -> Option<(String, Option<String>, serde_json::Value)> {
+        let (cwd, device) = self.source_control_cwd()?;
+        let mut params = serde_json::to_value(request).ok()?;
+        if let Some(device) = &device {
+            params["targetDeviceId"] = device.clone().into();
+        }
+        Some((cwd, device, params))
+    }
+
+    fn is_not_git_error(error: &zeron_rpc::RpcError) -> bool {
+        error.to_string().to_lowercase().contains("not a git")
+    }
+
+    fn ensure_source_control_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.sidebar.context().cloned() else {
+            self.source_control_watch = None;
+            self.source_control_watch_key = None;
+            self.checkout_status = None;
+            return;
+        };
+        let key = context.key.clone();
+        if self.source_control_watch_key.as_ref() == Some(&key) {
+            return;
+        }
+        let local_device = self.app_state.read(cx).local_device_id.clone();
+        if context_file_access(&context, local_device.as_deref()) == ContextFileAccess::Local
+            && !self.git_dir_exists(&context.cwd)
+        {
+            self.source_control_watch_key = Some(key);
+            self.source_control_watch = None;
+            self.checkout_status = None;
+            self.checkout_not_git = true;
+            self.checkout_status_error = None;
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.app_state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.source_control_watch_key = Some(key.clone());
+        self.checkout_not_git = false;
+        self.refresh_checkout_status(cx);
+        let cwd = context.cwd.to_string_lossy().into_owned();
+        let device = context.target_device_id.clone();
+        self.source_control_watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let request = WatchCheckoutStatusRequest { cwd: cwd.clone() };
+                let mut params = serde_json::to_value(&request).unwrap_or(serde_json::json!({}));
+                if let Some(device) = &device {
+                    params["targetDeviceId"] = device.clone().into();
+                }
+                match engine
+                    .client()
+                    .subscribe(methods::WATCH_CHECKOUT_STATUS, params)
+                    .await
+                {
+                    Err(zeron_rpc::RpcError::UnknownMethod(_)) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.checkout_status_error =
+                                Some("Update the project device to enable Source Control.".into());
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        let not_git = Self::is_not_git_error(&error);
+                        let message = format!("{error}");
+                        let stop = this
+                            .update(cx, |this, cx| {
+                                if this.sidebar.context().map(|c| c.key.as_str())
+                                    != Some(key.as_str())
+                                {
+                                    return true;
+                                }
+                                if not_git {
+                                    this.checkout_not_git = true;
+                                    this.checkout_status = None;
+                                    this.checkout_status_error = None;
+                                } else {
+                                    this.checkout_status_error = Some(message.into());
+                                }
+                                cx.notify();
+                                not_git
+                            })
+                            .unwrap_or(true);
+                        if stop {
+                            return;
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(2))
+                            .await;
+                    }
+                    Ok(mut stream) => {
+                        while let Some(value) = stream.recv().await {
+                            let Ok(status) = serde_json::from_value::<CheckoutStatus>(value) else {
+                                continue;
+                            };
+                            let _ = this.update(cx, |this, cx| {
+                                if this.sidebar.context().map(|c| c.key.as_str())
+                                    != Some(key.as_str())
+                                {
+                                    return;
+                                }
+                                this.checkout_not_git = false;
+                                this.checkout_status = Some(status);
+                                this.checkout_status_error = None;
+                                cx.notify();
+                            });
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    fn refresh_checkout_status(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.sidebar.context().cloned() else {
+            return;
+        };
+        let Some(engine) = self.app_state.read(cx).engine().cloned() else {
+            return;
+        };
+        let key = context.key.clone();
+        let request = GetCheckoutStatusRequest {
+            cwd: context.cwd.to_string_lossy().into_owned(),
+        };
+        let mut params = serde_json::to_value(&request).unwrap_or(serde_json::json!({}));
+        if let Some(device) = &context.target_device_id {
+            params["targetDeviceId"] = device.clone().into();
+        }
+        self.source_control_fetch = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call_as::<CheckoutStatus>(methods::GET_CHECKOUT_STATUS, params)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar.context().map(|c| c.key.as_str()) != Some(key.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(status) => {
+                        this.checkout_not_git = false;
+                        this.checkout_status = Some(status);
+                        this.checkout_status_error = None;
+                    }
+                    Err(zeron_rpc::RpcError::UnknownMethod(_)) => {
+                        this.checkout_status_error =
+                            Some("Update the project device to enable Source Control.".into());
+                    }
+                    Err(error) if Self::is_not_git_error(&error) => {
+                        this.checkout_not_git = true;
+                        this.checkout_status = None;
+                        this.checkout_status_error = None;
+                    }
+                    Err(error) => {
+                        this.checkout_status_error = Some(format!("{error}").into());
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn execute_source_control(
+        &mut self,
+        method: &'static str,
+        params: serde_json::Value,
+        clear_commit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.source_control_busy {
+            return;
+        }
+        let Some(engine) = self.app_state.read(cx).engine().cloned() else {
+            return;
+        };
+        let key = self.sidebar.context().map(|context| context.key.clone());
+        self.source_control_busy = true;
+        self.source_control_op_error = None;
+        cx.notify();
+        self.source_control_op = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(method, params).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar.context().map(|context| context.key.clone()) != key {
+                    return;
+                }
+                this.source_control_busy = false;
+                match result {
+                    Ok(_) => {
+                        this.source_control_op_error = None;
+                        if clear_commit {
+                            this.commit_input
+                                .update(cx, |input, cx| input.set_text("", cx));
+                        }
+                    }
+                    Err(error) => {
+                        this.source_control_op_error = Some(format!("{error}").into());
+                    }
+                }
+                this.refresh_checkout_status(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn stage_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        let Some((cwd, _)) = self.source_control_cwd() else {
+            return;
+        };
+        let Some((_, _, params)) = self.source_control_params(CheckoutFilesRequest { cwd, paths })
+        else {
+            return;
+        };
+        self.execute_source_control(methods::STAGE_FILES, params, false, cx);
+    }
+
+    fn unstage_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        let Some((cwd, _)) = self.source_control_cwd() else {
+            return;
+        };
+        let Some((_, _, params)) = self.source_control_params(CheckoutFilesRequest { cwd, paths })
+        else {
+            return;
+        };
+        self.execute_source_control(methods::UNSTAGE_FILES, params, false, cx);
+    }
+
+    fn discard_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        let Some((cwd, _)) = self.source_control_cwd() else {
+            return;
+        };
+        let request = CheckoutFilesRequest { cwd, paths };
+        let Some((_, _, params)) = self.source_control_params(request) else {
+            return;
+        };
+        self.execute_source_control(methods::DISCARD_FILES, params, false, cx);
+    }
+
+    fn commit_checkout(&mut self, cx: &mut Context<Self>) {
+        let Some((cwd, _)) = self.source_control_cwd() else {
+            return;
+        };
+        let message = self.commit_input.read(cx).text().to_string();
+        let request = CommitCheckoutRequest { cwd, message };
+        let Some((_, _, params)) = self.source_control_params(request) else {
+            return;
+        };
+        self.execute_source_control(methods::COMMIT_CHECKOUT, params, true, cx);
+    }
+
+    fn sync_or_publish_checkout(&mut self, cx: &mut Context<Self>) {
+        let Some((cwd, _)) = self.source_control_cwd() else {
+            return;
+        };
+        let publish = self
+            .checkout_status
+            .as_ref()
+            .and_then(|status| status.upstream.as_ref())
+            .is_none();
+        let request = CheckoutOpRequest { cwd };
+        let Some((_, _, params)) = self.source_control_params(request) else {
+            return;
+        };
+        let method = if publish {
+            methods::PUSH_CHECKOUT
+        } else {
+            methods::SYNC_CHECKOUT
+        };
+        self.execute_source_control(method, params, false, cx);
+    }
+
+    fn request_discard(&mut self, files: Vec<CheckoutStatusFile>, cx: &mut Context<Self>) {
+        if files.is_empty() {
+            return;
+        }
+        self.discard_prompt = Some(source_control::discard_prompt(&files));
+        cx.notify();
+    }
+
+    fn confirm_discard_prompt(&mut self, accepted: bool, cx: &mut Context<Self>) {
+        let Some(prompt) = self.discard_prompt.take() else {
+            return;
+        };
+        if accepted {
+            self.discard_paths(prompt.paths, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_source_control(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        self.ensure_source_control_watch(cx);
+        let mut content = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .p(px(12.0))
+            .gap(px(12.0));
+        if self.sidebar.context().is_none() {
+            return content.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("No workspace selected."),
+            );
+        }
+        if self.checkout_not_git {
+            return content.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("This folder is not a git repository."),
+            );
+        }
+        if let Some(error) = &self.checkout_status_error {
+            content = content.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.danger)
+                    .child(error.clone()),
+            );
+        }
+        let Some(status) = self.checkout_status.clone() else {
+            return content.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("Loading source control…"),
+            );
+        };
+        if let Some(error) = &self.source_control_op_error {
+            content = content.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.danger)
+                    .child(error.clone()),
+            );
+        }
+        let message = self.commit_input.read(cx).text().to_string();
+        let can_commit =
+            source_control::can_commit(&message, &status.files) && !self.source_control_busy;
+        let sync_label = source_control::sync_button_label(status.upstream.as_deref());
+        let busy = self.source_control_busy;
+        let branch = if status.branch.is_empty() {
+            "Detached".to_string()
+        } else {
+            status.branch.clone()
+        };
+        let mut header = div().flex().items_center().gap(px(8.0)).child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_size(px(13.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(branch),
+        );
+        if status.ahead > 0 {
+            header = header.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(format!("↑{}", status.ahead)),
+            );
+        }
+        if status.behind > 0 {
+            header = header.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(format!("↓{}", status.behind)),
+            );
+        }
+        content = content.child(header);
+        content = content.child(
+            div()
+                .h(px(36.0))
+                .flex_none()
+                .px(px(8.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(theme.border)
+                .flex()
+                .items_center()
+                .child(self.commit_input.clone()),
+        );
+        let mut commit_btn = popover::btn_primary(theme, "Commit")
+            .id("details-source-control-commit")
+            .opacity(if can_commit { 1.0 } else { 0.4 });
+        if can_commit {
+            commit_btn =
+                commit_btn.on_click(cx.listener(|this, _, _, cx| this.commit_checkout(cx)));
+        }
+        let mut sync_btn = popover::btn_ghost(theme, sync_label, "details-source-control-sync")
+            .id("details-source-control-sync")
+            .opacity(if busy { 0.4 } else { 1.0 });
+        if !busy {
+            sync_btn =
+                sync_btn.on_click(cx.listener(|this, _, _, cx| this.sync_or_publish_checkout(cx)));
+        }
+        content = content.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(8.0))
+                .child(sync_btn)
+                .child(commit_btn),
+        );
+        let staged = source_control::staged_rows(&status.files);
+        let changes = source_control::changes_rows(&status.files);
+        let staged_files: Vec<CheckoutStatusFile> = status
+            .files
+            .iter()
+            .filter(|file| source_control::is_staged(file))
+            .cloned()
+            .collect();
+        let change_files: Vec<CheckoutStatusFile> = status
+            .files
+            .iter()
+            .filter(|file| source_control::is_unstaged(file))
+            .cloned()
+            .collect();
+        content = content.child(self.render_source_control_section(
+            theme,
+            "Staged Changes",
+            &staged,
+            &staged_files,
+            SourceControlSection::Staged,
+            cx,
+        ));
+        content = content.child(self.render_source_control_section(
+            theme,
+            "Changes",
+            &changes,
+            &change_files,
+            SourceControlSection::Changes,
+            cx,
+        ));
+        content
+    }
+
+    fn render_source_control_section(
+        &mut self,
+        theme: &Theme,
+        title: &'static str,
+        rows: &[source_control::SourceControlRow],
+        files: &[CheckoutStatusFile],
+        section: SourceControlSection,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let bulk_paths: Vec<String> = rows.iter().map(|row| row.path.clone()).collect();
+        let bulk_files = files.to_vec();
+        let mut header = div().flex().items_center().justify_between().child(
+            div()
+                .text_size(px(11.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child(format!("{title} ({})", rows.len())),
+        );
+        if !rows.is_empty() && !self.source_control_busy {
+            let mut actions = div().flex().items_center().gap(px(8.0));
+            match section {
+                SourceControlSection::Staged => {
+                    let paths = bulk_paths.clone();
+                    actions = actions.child(
+                        div()
+                            .id("details-source-control-unstage-all")
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.unstage_paths(paths.clone(), cx)
+                            }))
+                            .child("Unstage All"),
+                    );
+                }
+                SourceControlSection::Changes => {
+                    let paths = bulk_paths.clone();
+                    actions = actions.child(
+                        div()
+                            .id("details-source-control-stage-all")
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.stage_paths(paths.clone(), cx)
+                            }))
+                            .child("Stage All"),
+                    );
+                }
+            }
+            let discard_id = if matches!(section, SourceControlSection::Staged) {
+                "details-source-control-discard-all-staged"
+            } else {
+                "details-source-control-discard-all-changes"
+            };
+            actions = actions.child(
+                div()
+                    .id(discard_id)
+                    .text_size(px(11.0))
+                    .text_color(theme.danger)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request_discard(bulk_files.clone(), cx)
+                    }))
+                    .child("Discard All"),
+            );
+            header = header.child(actions);
+        }
+        let mut list = div().flex().flex_col().gap(px(2.0)).child(header);
+        if rows.is_empty() {
+            return list.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("No files"),
+            );
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let path = row.path.clone();
+            let open_path = row.path.clone();
+            let letter = row.letter.to_string();
+            let label = match &row.old_path {
+                Some(old) => format!("{old} → {}", row.path),
+                None => row.path.clone(),
+            };
+            let file = files.iter().find(|file| file.path == row.path).cloned();
+            let section_tag = match section {
+                SourceControlSection::Staged => "staged",
+                SourceControlSection::Changes => "changes",
+            };
+            let mut row_el = div()
+                .id((
+                    SharedString::from(format!("details-source-control-row-{section_tag}")),
+                    index,
+                ))
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .w(px(12.0))
+                        .flex_none()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child(letter),
+                )
+                .child(
+                    div()
+                        .id(("details-source-control-file", index))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(DetailsSidebarEvent::OpenWorkingTreeDiff {
+                                path: open_path.clone(),
+                            });
+                        }))
+                        .child(label),
+                );
+            if !self.source_control_busy {
+                match section {
+                    SourceControlSection::Staged => {
+                        let unstage_path = path.clone();
+                        row_el = row_el.child(
+                            div()
+                                .id(("details-source-control-unstage", index))
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.unstage_paths(vec![unstage_path.clone()], cx)
+                                }))
+                                .child("Unstage"),
+                        );
+                    }
+                    SourceControlSection::Changes => {
+                        let stage_path = path.clone();
+                        row_el = row_el.child(
+                            div()
+                                .id(("details-source-control-stage", index))
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.stage_paths(vec![stage_path.clone()], cx)
+                                }))
+                                .child("Stage"),
+                        );
+                    }
+                }
+                if let Some(file) = file {
+                    row_el = row_el.child(
+                        div()
+                            .id(("details-source-control-discard", index))
+                            .text_size(px(11.0))
+                            .text_color(theme.danger)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.request_discard(vec![file.clone()], cx)
+                            }))
+                            .child("Discard"),
+                    );
+                }
+            }
+            list = list.child(row_el);
+        }
+        list
+    }
+
+    fn render_discard_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let prompt = self.discard_prompt.as_ref()?;
+        let message = prompt.message.clone();
+        let card = popover::dialog_card(theme)
+            .child(popover::dialog_title(theme, "Discard changes"))
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .child(popover::dialog_body(theme, message)),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(
+                            theme,
+                            "Cancel",
+                            "details-source-control-discard-cancel",
+                        )
+                        .id("details-source-control-discard-cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_discard_prompt(false, cx);
+                        })),
+                    )
+                    .child(
+                        popover::btn_danger(theme, "Discard")
+                            .id("details-source-control-discard-confirm")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_discard_prompt(true, cx);
+                            })),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal(
+            "details-source-control-discard-dialog",
+            viewport,
+            card,
+        ))
     }
 
     fn reload_files(&mut self, cx: &mut Context<Self>) {
@@ -1670,7 +2405,33 @@ impl DetailsSidebar {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_tab(DetailsTab::Files, cx)
                                     })),
-                            ),
+                            )
+                            .child({
+                                let badge = self
+                                    .checkout_status
+                                    .as_ref()
+                                    .map(|status| source_control::change_badge(&status.files))
+                                    .unwrap_or(0);
+                                let mut tab_pill =
+                                    pill("Source Control", tab == DetailsTab::SourceControl)
+                                        .id("source-control-tab")
+                                        .gap(px(6.0))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_tab(DetailsTab::SourceControl, cx)
+                                        }));
+                                if badge > 0 {
+                                    tab_pill = tab_pill.child(
+                                        div()
+                                            .px(px(6.0))
+                                            .rounded(px(8.0))
+                                            .bg(crate::theme::ink(0.08))
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_muted)
+                                            .child(format!("{badge}")),
+                                    );
+                                }
+                                tab_pill
+                            }),
                     ),
             )
             .when(tab == DetailsTab::Files, |header| {
@@ -4286,9 +5047,11 @@ impl Render for DetailsSidebar {
         let body: AnyElement = match self.sidebar.tab() {
             DetailsTab::Details => self.render_details(&theme, cx).into_any_element(),
             DetailsTab::Files => self.render_files(&theme, cx).into_any_element(),
+            DetailsTab::SourceControl => self.render_source_control(&theme, cx).into_any_element(),
         };
         let file_menu = self.render_file_context_menu(&theme, cx);
         let delete_dialog = self.render_delete_dialog(viewport, &theme, cx);
+        let discard_dialog = self.render_discard_dialog(viewport, &theme, cx);
         div()
             .size_full()
             .flex()
@@ -4307,6 +5070,7 @@ impl Render for DetailsSidebar {
             )
             .children(file_menu)
             .children(delete_dialog)
+            .children(discard_dialog)
     }
 }
 
@@ -4489,6 +5253,13 @@ mod tests {
 
         assert_eq!(avatar, "icons/subagents/blobatar/23.svg");
         assert_ne!(avatar, crate::icons::BOT);
+    }
+
+    #[test]
+    fn source_control_tab_persists_like_files() {
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        state.set_tab(DetailsTab::SourceControl);
+        assert_eq!(state.preferences().active_tab, DetailsTab::SourceControl);
     }
 
     #[test]

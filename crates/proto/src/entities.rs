@@ -804,6 +804,77 @@ pub struct CheckoutDiff {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One character of a porcelain XY pair. Index is X, worktree is Y.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitFileStatus {
+    Unmodified,
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    Unmerged,
+}
+
+/// One path from `git status --porcelain=v1`, with index and worktree split.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutStatusFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub index: GitFileStatus,
+    pub worktree: GitFileStatus,
+}
+
+/// Lightweight git status for a checkout — not a diff, not `CheckoutDiff`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutStatus {
+    pub checkout_id: String,
+    pub cwd: String,
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub files: Vec<CheckoutStatusFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetCheckoutStatusRequest {
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchCheckoutStatusRequest {
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutFilesRequest {
+    pub cwd: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitCheckoutRequest {
+    pub cwd: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutOpRequest {
+    pub cwd: String,
+}
+
 /// Provider-neutral lifecycle state for a code change request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1346,6 +1417,33 @@ mod tests {
         .unwrap();
         assert_eq!(mutation["path"], "src/notes.md");
         assert_eq!(mutation["isDirectory"], false);
+    }
+
+    #[test]
+    fn checkout_status_round_trips_xy_enums_and_old_path() {
+        let status = CheckoutStatus {
+            checkout_id: "c1".into(),
+            cwd: "/repo".into(),
+            branch: "main".into(),
+            upstream: Some("origin/main".into()),
+            ahead: 1,
+            behind: 2,
+            files: vec![CheckoutStatusFile {
+                path: "new.txt".into(),
+                old_path: Some("old.txt".into()),
+                index: GitFileStatus::Renamed,
+                worktree: GitFileStatus::Modified,
+            }],
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["checkoutId"], "c1");
+        assert_eq!(value["files"][0]["oldPath"], "old.txt");
+        assert_eq!(value["files"][0]["index"], "renamed");
+        assert_eq!(value["files"][0]["worktree"], "modified");
+        assert_eq!(
+            serde_json::from_value::<CheckoutStatus>(value).unwrap(),
+            status
+        );
     }
 
     #[test]

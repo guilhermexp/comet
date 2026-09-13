@@ -14,6 +14,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - SearchGitHistory e ResolveGitAvatars são unary tipados e relay-forwardable no registry. Não recriar listas de forwardable/deadlines no handler.
 
+- `GetCheckoutStatus`, `WatchCheckoutStatus` (stream), `StageFiles`, `UnstageFiles`, `DiscardFiles`, `CommitCheckout`, `PushCheckout`, `PullCheckout` e `SyncCheckout` são tipados e relay-forwardable. `forwardable` aqui só autoriza o relay ao device dono do checkout — não autoriza cwd arbitrário. A engine de destino recusa path que não é Chat/Space local (`change_request_root`) antes de qualquer git. Push/pull/sync usam deadline de 900s. Status é o stream leve; mutações são unary. Não recriar listas de forwardable/deadlines no handler.
+
 - `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
 
 - `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `RenameWorkspaceEntry`, `DeleteWorkspaceEntry`, `MoveWorkspaceEntry` e `CopyWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Copy/move usam deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash).

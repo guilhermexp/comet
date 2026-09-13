@@ -16,6 +16,7 @@ pub enum DetailsTab {
     #[default]
     Details,
     Files,
+    SourceControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
