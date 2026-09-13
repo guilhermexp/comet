@@ -2,6 +2,8 @@
 **/*.rs.bk
 # Local-only scratch space — holds signing/notary credentials, never commit.
 /ignore/
+# Evidência de verificação local (runs isolados, logs, sandbox) — nunca commitada.
+/.tmp/
 *.pdb
 .DS_Store
 .env

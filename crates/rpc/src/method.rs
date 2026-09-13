@@ -237,6 +237,11 @@ rpc_methods! {
     SEARCH_WORKSPACE_FILES / SearchWorkspaceFiles = "SearchWorkspaceFiles" { params: zeron_proto::SearchWorkspaceFilesRequest, reply: Vec<zeron_proto::WorkspaceFileSearchMatch>, forwardable: true },
     READ_WORKSPACE_FILE / ReadWorkspaceFile = "ReadWorkspaceFile" { params: zeron_proto::ReadWorkspaceFileRequest, reply: zeron_proto::WorkspaceFileText, forwardable: true },
     WATCH_WORKSPACE_FILES / WatchWorkspaceFiles = "WatchWorkspaceFiles" { params: zeron_proto::WatchWorkspaceFilesRequest, reply: zeron_proto::WorkspaceFileChanges, forwardable: true, stream: true },
+    CREATE_WORKSPACE_ENTRY / CreateWorkspaceEntry = "CreateWorkspaceEntry" { params: zeron_proto::CreateWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true },
+    RENAME_WORKSPACE_ENTRY / RenameWorkspaceEntry = "RenameWorkspaceEntry" { params: zeron_proto::RenameWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true },
+    DELETE_WORKSPACE_ENTRY / DeleteWorkspaceEntry = "DeleteWorkspaceEntry" { params: zeron_proto::DeleteWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true },
+    MOVE_WORKSPACE_ENTRY / MoveWorkspaceEntry = "MoveWorkspaceEntry" { params: zeron_proto::MoveWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true, deadline_secs: 60 },
+    COPY_WORKSPACE_ENTRY / CopyWorkspaceEntry = "CopyWorkspaceEntry" { params: zeron_proto::CopyWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true, deadline_secs: 60 },
     CREATE_WORKTREE / CreateWorktree = "CreateWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 120 },
     DELETE_WORKTREE / DeleteWorktree = "DeleteWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     // Terminals (ControlRpc, relay-forwardable — a terminal lives on the chat's

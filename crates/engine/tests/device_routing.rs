@@ -942,6 +942,39 @@ async fn workspace_file_surface_proxies_over_the_relay() {
     }
     drop(stream);
 
+    let created = client
+        .call(
+            methods::CREATE_WORKSPACE_ENTRY,
+            serde_json::json!({
+                "chatId": "chat-files",
+                "parentPath": "src",
+                "name": "relayed.rs",
+                "kind": "file",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("remote create");
+    assert_eq!(created["path"], "src/relayed.rs");
+    assert!(repo_b.join("src/relayed.rs").is_file());
+    let listing = client
+        .call(
+            methods::LIST_WORKSPACE_DIRECTORY,
+            serde_json::json!({
+                "chatId": "chat-files",
+                "directory": "src",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("list after remote create");
+    assert!(
+        listing["entries"].as_array().is_some_and(|entries| entries
+            .iter()
+            .any(|entry| entry["path"] == "src/relayed.rs")),
+        "{listing}"
+    );
+
     core_a.shutdown().await;
     core_b.shutdown().await;
 }

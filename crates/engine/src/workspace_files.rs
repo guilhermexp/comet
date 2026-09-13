@@ -14,11 +14,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeron_proto::{
-    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
-    WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
+    CopyWorkspaceEntryRequest, CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest,
+    ListWorkspaceDirectoryRequest, MoveWorkspaceEntryRequest, ReadWorkspaceFileRequest,
+    RenameWorkspaceEntryRequest, SearchWorkspaceFilesRequest, WatchWorkspaceFilesRequest,
+    WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind, WorkspaceEntryMutation,
     WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges, WorkspaceFileSearchMatch,
     WorkspaceFileText, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
-    WorkspaceTextEncoding,
+    WorkspaceTextEncoding, join_workspace_relative, unique_copy_name, validate_workspace_component,
+    validate_workspace_create_name,
 };
 use zeron_rpc::RpcError;
 
@@ -31,6 +34,8 @@ pub const MAX_DIRECTORY_ENTRIES: usize = 50_000;
 pub const MAX_SEARCH_QUERY_CHARS: usize = 256;
 pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const WORKSPACE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(6);
+pub const WORKSPACE_FILE_MUTATION_TIMEOUT: Duration = Duration::from_secs(6);
+pub const WORKSPACE_FILE_COPY_MOVE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_EDITABLE_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_PREVIEW_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const WATCH_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -112,6 +117,8 @@ impl WorkspaceRelativePath {
         Self::parse(path, true)
     }
 
+    /// A path that may or may not exist yet; component rules are identical
+    /// either way, so creation validates with the same parser as reading.
     pub fn file(path: &str) -> Result<Self, WorkspaceFilesError> {
         Self::parse(path, false)
     }
@@ -442,6 +449,56 @@ impl WorkspaceFiles {
         for task in tasks {
             let _ = task.await;
         }
+    }
+
+    pub async fn create_entry(
+        &self,
+        request: CreateWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        tokio::task::spawn_blocking(move || create_entry_blocking(&workspace.root, request))
+            .await
+            .map_err(|error| WorkspaceFilesError::Io(format!("create worker failed: {error}")))?
+    }
+
+    pub async fn rename_entry(
+        &self,
+        request: RenameWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        tokio::task::spawn_blocking(move || rename_entry_blocking(&workspace.root, request))
+            .await
+            .map_err(|error| WorkspaceFilesError::Io(format!("rename worker failed: {error}")))?
+    }
+
+    pub async fn delete_entry(
+        &self,
+        request: DeleteWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        tokio::task::spawn_blocking(move || delete_entry_blocking(&workspace.root, request))
+            .await
+            .map_err(|error| WorkspaceFilesError::Io(format!("delete worker failed: {error}")))?
+    }
+
+    pub async fn move_entry(
+        &self,
+        request: MoveWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        tokio::task::spawn_blocking(move || move_entry_blocking(&workspace.root, request))
+            .await
+            .map_err(|error| WorkspaceFilesError::Io(format!("move worker failed: {error}")))?
+    }
+
+    pub async fn copy_entry(
+        &self,
+        request: CopyWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        tokio::task::spawn_blocking(move || copy_entry_blocking(&workspace.root, request))
+            .await
+            .map_err(|error| WorkspaceFilesError::Io(format!("copy worker failed: {error}")))?
     }
 }
 
@@ -1620,6 +1677,390 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn name_error(error: zeron_proto::WorkspaceNameError) -> WorkspaceFilesError {
+    WorkspaceFilesError::BadParams(error.as_str().into())
+}
+
+fn collision_error() -> WorkspaceFilesError {
+    WorkspaceFilesError::BadParams("an entry with that name already exists".into())
+}
+
+fn descendant_error() -> WorkspaceFilesError {
+    WorkspaceFilesError::BadParams("cannot paste a folder into itself".into())
+}
+
+fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceFilesError> {
+    let canonical = std::fs::canonicalize(root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WorkspaceFilesError::NotFound("workspace folder not found".into())
+        } else {
+            WorkspaceFilesError::Io(error.to_string())
+        }
+    })?;
+    if !canonical.is_absolute() {
+        return Err(bad_path("workspace root is not absolute"));
+    }
+    Ok(canonical)
+}
+
+fn resolve_existing(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+) -> Result<(PathBuf, PathBuf, std::fs::Metadata), WorkspaceFilesError> {
+    let root = canonical_root(root)?;
+    if relative.as_path().as_os_str().is_empty() {
+        return Err(bad_path("path must not be empty"));
+    }
+    let mut current = root.clone();
+    let components: Vec<_> = relative.as_path().components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(bad_path("invalid file component"));
+        };
+        current.push(name);
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceFilesError::NotFound("entry not found".into())
+            } else {
+                WorkspaceFilesError::Io(error.to_string())
+            }
+        })?;
+        if metadata.file_type().is_symlink() {
+            let message = if index + 1 == components.len() {
+                "path is a symlink"
+            } else {
+                "path traverses a symlink"
+            };
+            return Err(WorkspaceFilesError::Unsupported(message.into()));
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(WorkspaceFilesError::Unsupported(
+                "file parent is not a directory".into(),
+            ));
+        }
+    }
+    if current == root || !current.starts_with(&root) {
+        return Err(WorkspaceFilesError::Authorization(
+            "file escaped workspace".into(),
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&current)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    Ok((root, current, metadata))
+}
+
+fn resolve_directory(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+) -> Result<(PathBuf, PathBuf), WorkspaceFilesError> {
+    let root = canonical_root(root)?;
+    if relative.as_path().as_os_str().is_empty() {
+        return Ok((root.clone(), root));
+    }
+    let (root, path, metadata) = resolve_existing(&root, relative)?;
+    if !metadata.is_dir() {
+        return Err(WorkspaceFilesError::Unsupported(
+            "destination is not a directory".into(),
+        ));
+    }
+    Ok((root, path))
+}
+
+fn resolve_planned(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+) -> Result<(PathBuf, PathBuf), WorkspaceFilesError> {
+    let root = canonical_root(root)?;
+    if relative.as_path().as_os_str().is_empty() {
+        return Err(bad_path("path must not be empty"));
+    }
+    let mut current = root.clone();
+    let components: Vec<_> = relative.as_path().components().collect();
+    let mut missing = false;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(bad_path("invalid file component"));
+        };
+        current.push(name);
+        if missing {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(WorkspaceFilesError::Unsupported(
+                        if index + 1 == components.len() {
+                            "path is a symlink"
+                        } else {
+                            "path traverses a symlink"
+                        }
+                        .into(),
+                    ));
+                }
+                if index + 1 < components.len() && !metadata.is_dir() {
+                    return Err(WorkspaceFilesError::Unsupported(
+                        "file parent is not a directory".into(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing = true;
+            }
+            Err(error) => return Err(WorkspaceFilesError::Io(error.to_string())),
+        }
+    }
+    if current == root || !current.starts_with(&root) {
+        return Err(WorkspaceFilesError::Authorization(
+            "file escaped workspace".into(),
+        ));
+    }
+    Ok((root, current))
+}
+
+fn directory_names(path: &Path) -> Result<Vec<String>, WorkspaceFilesError> {
+    let mut names = Vec::new();
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(names),
+        Err(error) => return Err(WorkspaceFilesError::Io(error.to_string())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+fn sibling_collision(
+    dir: &Path,
+    name: &str,
+    except: Option<&Path>,
+) -> Result<bool, WorkspaceFilesError> {
+    for entry in directory_names(dir)? {
+        if !entry.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let candidate = dir.join(&entry);
+        if except.is_some_and(|path| path == candidate) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn mutation_result(
+    root: &Path,
+    path: &Path,
+    is_directory: bool,
+) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| WorkspaceFilesError::Authorization("file escaped workspace".into()))?;
+    let wire = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(WorkspaceEntryMutation {
+        path: wire,
+        is_directory,
+    })
+}
+
+fn create_entry_blocking(
+    root: &Path,
+    request: CreateWorkspaceEntryRequest,
+) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+    match request.kind {
+        WorkspaceEntryKind::File | WorkspaceEntryKind::Directory => {}
+        WorkspaceEntryKind::Symlink => {
+            return Err(WorkspaceFilesError::BadParams(
+                "kind must be file or directory".into(),
+            ));
+        }
+    }
+    validate_workspace_create_name(&request.name).map_err(name_error)?;
+    let relative = join_workspace_relative(&request.parent_path, &request.name);
+    let planned = WorkspaceRelativePath::file(&relative)?;
+    let (root, dest) = resolve_planned(root, &planned)?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| bad_path("path must be UTF-8"))?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| WorkspaceFilesError::Authorization("file escaped workspace".into()))?;
+    if sibling_collision(parent, name, None)? {
+        return Err(collision_error());
+    }
+    if dest.exists() {
+        return Err(collision_error());
+    }
+    if request.kind == WorkspaceEntryKind::Directory {
+        std::fs::create_dir_all(&dest)
+            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        return mutation_result(&root, &dest, true);
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                collision_error()
+            } else {
+                WorkspaceFilesError::Io(error.to_string())
+            }
+        })?;
+    mutation_result(&root, &dest, false)
+}
+
+fn rename_entry_blocking(
+    root: &Path,
+    request: RenameWorkspaceEntryRequest,
+) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+    validate_workspace_component(&request.new_name).map_err(name_error)?;
+    let source = WorkspaceRelativePath::file(&request.path)?;
+    let (root, source_path, metadata) = resolve_existing(root, &source)?;
+    let current_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| bad_path("path must be UTF-8"))?;
+    if current_name == request.new_name {
+        return mutation_result(&root, &source_path, metadata.is_dir());
+    }
+    let parent = source_path
+        .parent()
+        .ok_or_else(|| WorkspaceFilesError::Authorization("file escaped workspace".into()))?;
+    if sibling_collision(parent, &request.new_name, Some(&source_path))? {
+        return Err(collision_error());
+    }
+    let dest = parent.join(&request.new_name);
+    std::fs::rename(&source_path, &dest)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    mutation_result(&root, &dest, metadata.is_dir())
+}
+
+fn delete_entry_blocking(
+    root: &Path,
+    request: DeleteWorkspaceEntryRequest,
+) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+    let source = WorkspaceRelativePath::file(&request.path)?;
+    let (root, path, metadata) = resolve_existing(root, &source)?;
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(&path)
+            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    } else {
+        std::fs::remove_file(&path).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    }
+    mutation_result(&root, &path, metadata.is_dir())
+}
+
+fn move_entry_blocking(
+    root: &Path,
+    request: MoveWorkspaceEntryRequest,
+) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+    let source = WorkspaceRelativePath::file(&request.source_path)?;
+    let destination = WorkspaceRelativePath::directory(&request.destination_directory)?;
+    let (root, source_path, metadata) = resolve_existing(root, &source)?;
+    let (_, dest_dir) = resolve_directory(&root, &destination)?;
+    if metadata.is_dir() && dest_dir.starts_with(&source_path) {
+        return Err(descendant_error());
+    }
+    let file_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| bad_path("path must be UTF-8"))?;
+    if sibling_collision(&dest_dir, file_name, None)? {
+        return Err(collision_error());
+    }
+    let dest = dest_dir.join(file_name);
+    std::fs::rename(&source_path, &dest)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    mutation_result(&root, &dest, metadata.is_dir())
+}
+
+fn copy_entry_blocking(
+    root: &Path,
+    request: CopyWorkspaceEntryRequest,
+) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
+    let source = WorkspaceRelativePath::file(&request.source_path)?;
+    let destination = WorkspaceRelativePath::directory(&request.destination_directory)?;
+    let (root, source_path, metadata) = resolve_existing(root, &source)?;
+    let (_, dest_dir) = resolve_directory(&root, &destination)?;
+    if metadata.is_dir() && dest_dir.starts_with(&source_path) {
+        return Err(descendant_error());
+    }
+    let original = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| bad_path("path must be UTF-8"))?;
+    let names = directory_names(&dest_dir)?;
+    let unique = unique_copy_name(
+        original,
+        metadata.is_dir(),
+        names.iter().map(String::as_str),
+    );
+    let dest = dest_dir.join(&unique);
+    match copy_tree(&source_path, &dest) {
+        Ok(()) => mutation_result(&root, &dest, metadata.is_dir()),
+        Err(error) => {
+            if dest.is_dir() {
+                let _ = std::fs::remove_dir_all(&dest);
+            } else {
+                let _ = std::fs::remove_file(&dest);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn copy_tree(source: &Path, dest: &Path) -> Result<(), WorkspaceFilesError> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            let target = std::fs::read_link(source)
+                .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+            std::os::unix::fs::symlink(&target, dest)
+                .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(WorkspaceFilesError::Unsupported(
+                "symlink copy is unavailable on this platform".into(),
+            ));
+        }
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir(dest).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        for entry in
+            std::fs::read_dir(source).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?
+        {
+            let entry = entry.map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        std::fs::copy(source, dest).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        return Ok(());
+    }
+    Err(WorkspaceFilesError::Unsupported(
+        "path is not a regular file or directory".into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1746,7 +2187,123 @@ mod tests {
                 WorkspaceRelativePath::file(path).is_err(),
                 "unsafe path accepted: {path:?}"
             );
+            assert!(
+                WorkspaceRelativePath::file(path).is_err(),
+                "unsafe planned path accepted: {path:?}"
+            );
         }
+        assert!(WorkspaceRelativePath::file("docs/adr/0001.md").is_ok());
+        assert!(WorkspaceRelativePath::file("src/.git/config").is_err());
+        assert!(WorkspaceRelativePath::file("a/../b").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planned_path_refuses_symlink_components_on_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("linked")).unwrap();
+        let planned = WorkspaceRelativePath::file("linked/new.txt").unwrap();
+        let error = resolve_planned(&root, &planned).unwrap_err();
+        assert!(
+            matches!(error, WorkspaceFilesError::Unsupported(ref message) if message.contains("symlink")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn create_rename_delete_move_and_copy_change_the_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let target = WorkspaceTarget {
+            chat_id: None,
+            space_id: Some("unused".into()),
+            checkout_path: None,
+        };
+        let created = create_entry_blocking(
+            &root,
+            CreateWorkspaceEntryRequest {
+                target: target.clone(),
+                parent_path: String::new(),
+                name: "docs/adr/0001.md".into(),
+                kind: WorkspaceEntryKind::File,
+            },
+        )
+        .unwrap();
+        assert_eq!(created.path, "docs/adr/0001.md");
+        assert_eq!(std::fs::read(root.join("docs/adr/0001.md")).unwrap(), b"");
+
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        let renamed = rename_entry_blocking(
+            &root,
+            RenameWorkspaceEntryRequest {
+                target: target.clone(),
+                path: "a.txt".into(),
+                new_name: "b.txt".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(renamed.path, "b.txt");
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"hello");
+
+        std::fs::write(root.join("c.txt"), b"keep").unwrap();
+        let collision = rename_entry_blocking(
+            &root,
+            RenameWorkspaceEntryRequest {
+                target: target.clone(),
+                path: "b.txt".into(),
+                new_name: "c.txt".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(collision.to_string().contains("exist"), "{collision}");
+
+        std::fs::create_dir(root.join("util")).unwrap();
+        let moved = move_entry_blocking(
+            &root,
+            MoveWorkspaceEntryRequest {
+                target: target.clone(),
+                source_path: "b.txt".into(),
+                destination_directory: "util".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(moved.path, "util/b.txt");
+
+        let copied = copy_entry_blocking(
+            &root,
+            CopyWorkspaceEntryRequest {
+                target: target.clone(),
+                source_path: "c.txt".into(),
+                destination_directory: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(copied.path, "c copy.txt");
+
+        std::fs::create_dir_all(root.join("folder/child")).unwrap();
+        std::fs::write(root.join("folder/child/x.txt"), b"x").unwrap();
+        delete_entry_blocking(
+            &root,
+            DeleteWorkspaceEntryRequest {
+                target: target.clone(),
+                path: "folder".into(),
+            },
+        )
+        .unwrap();
+        assert!(!root.join("folder").exists());
+
+        let nested = move_entry_blocking(
+            &root,
+            MoveWorkspaceEntryRequest {
+                target,
+                source_path: "docs".into(),
+                destination_directory: "docs/adr".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(nested.to_string().contains("itself"), "{nested}");
     }
 
     #[test]

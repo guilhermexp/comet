@@ -2000,6 +2000,10 @@ impl Shell {
                         cx,
                     );
                 }
+                DetailsSidebarEvent::CloseFile {
+                    context_key,
+                    relative_path,
+                } => this.close_preview_surface(context_key, relative_path, cx),
                 DetailsSidebarEvent::OpenSubagent {
                     chat_id,
                     doc_id,

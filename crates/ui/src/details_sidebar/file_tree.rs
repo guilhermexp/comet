@@ -271,6 +271,58 @@ pub fn flatten_visible_rows(nodes: &[FileNode], expanded: &HashSet<String>) -> V
     rows
 }
 
+pub fn inline_create_insert_index(rows: &[VisibleFileRow], parent: &str, is_dir: bool) -> usize {
+    let sibling_depth = if parent.is_empty() {
+        0
+    } else {
+        rows.iter()
+            .find(|row| row.node.relative_path == parent)
+            .map(|row| row.depth + 1)
+            .unwrap_or(0)
+    };
+    let mut first_sibling = None;
+    let mut after_directories = None;
+    let mut last_sibling = None;
+    for (index, row) in rows.iter().enumerate() {
+        let is_child = if parent.is_empty() {
+            row.depth == 0
+        } else {
+            row.depth == sibling_depth && row.node.relative_path.starts_with(&format!("{parent}/"))
+        };
+        if !is_child {
+            if first_sibling.is_some() {
+                break;
+            }
+            continue;
+        }
+        if first_sibling.is_none() {
+            first_sibling = Some(index);
+        }
+        last_sibling = Some(index);
+        if row.node.is_dir {
+            after_directories = Some(index + 1);
+        } else if after_directories.is_none() {
+            after_directories = Some(index);
+        }
+    }
+    if is_dir {
+        return first_sibling.unwrap_or_else(|| {
+            rows.iter()
+                .position(|row| row.node.relative_path == parent)
+                .map(|index| index + 1)
+                .unwrap_or(0)
+        });
+    }
+    after_directories
+        .or(last_sibling.map(|index| index + 1))
+        .or_else(|| {
+            rows.iter()
+                .position(|row| row.node.relative_path == parent)
+                .map(|index| index + 1)
+        })
+        .unwrap_or(rows.len())
+}
+
 fn checked_relative(relative: &str) -> Result<PathBuf, FileActionError> {
     let path = Path::new(relative);
     if path.as_os_str().is_empty() || path.is_absolute() {
@@ -350,10 +402,7 @@ pub fn move_entry(
     destination_dir_relative: &str,
 ) -> Result<String, FileActionError> {
     let (root, source) = checked_existing(root, source_relative)?;
-    let (_, destination_dir) = checked_existing(&root, destination_dir_relative)?;
-    if !destination_dir.is_dir() {
-        return Err(FileActionError::MissingEntry);
-    }
+    let (_, destination_dir) = checked_directory(&root, destination_dir_relative)?;
     if source.is_dir() && destination_dir.starts_with(&source) {
         return Err(FileActionError::MoveIntoDescendant);
     }
@@ -366,6 +415,133 @@ pub fn move_entry(
     relative_string(&root, &target)
 }
 
+pub fn create_entry(
+    root: &Path,
+    parent_relative: &str,
+    name: &str,
+    is_dir: bool,
+) -> Result<String, FileActionError> {
+    zeron_proto::validate_workspace_create_name(name).map_err(|_| FileActionError::InvalidName)?;
+    let (root, parent) = checked_directory(root, parent_relative)?;
+    let relative = zeron_proto::join_workspace_relative(parent_relative, name);
+    let dest = parent.join(name);
+    if !dest.starts_with(&root) || dest == root {
+        return Err(FileActionError::OutsideCheckout);
+    }
+    let leaf = dest
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(FileActionError::InvalidName)?;
+    if sibling_taken(dest.parent().unwrap_or(&parent), leaf, None)? {
+        return Err(FileActionError::TargetExists);
+    }
+    if is_dir {
+        fs::create_dir_all(&dest)?;
+    } else {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)?;
+    }
+    let _ = relative;
+    relative_string(&root, &dest)
+}
+
+pub fn copy_entry(
+    root: &Path,
+    source_relative: &str,
+    destination_dir_relative: &str,
+) -> Result<String, FileActionError> {
+    let (root, source) = checked_existing(root, source_relative)?;
+    let (_, destination_dir) = checked_directory(&root, destination_dir_relative)?;
+    if source.is_dir() && destination_dir.starts_with(&source) {
+        return Err(FileActionError::MoveIntoDescendant);
+    }
+    let original = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(FileActionError::OutsideCheckout)?;
+    let existing = directory_names(&destination_dir)?;
+    let unique = zeron_proto::unique_copy_name(
+        original,
+        source.is_dir(),
+        existing.iter().map(String::as_str),
+    );
+    let dest = destination_dir.join(&unique);
+    copy_tree(&source, &dest)?;
+    relative_string(&root, &dest)
+}
+
+fn checked_directory(root: &Path, relative: &str) -> Result<(PathBuf, PathBuf), FileActionError> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| FileActionError::MissingEntry)?;
+    if relative.is_empty() {
+        return Ok((root.clone(), root));
+    }
+    let (root, path) = checked_existing(&root, relative)?;
+    if !path.is_dir() {
+        return Err(FileActionError::MissingEntry);
+    }
+    Ok((root, path))
+}
+
+fn directory_names(path: &Path) -> Result<Vec<String>, FileActionError> {
+    let mut names = Vec::new();
+    if !path.exists() {
+        return Ok(names);
+    }
+    for entry in fs::read_dir(path)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+fn sibling_taken(dir: &Path, name: &str, except: Option<&Path>) -> Result<bool, FileActionError> {
+    for entry in directory_names(dir)? {
+        if !entry.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let candidate = dir.join(&entry);
+        if except.is_some_and(|path| path == candidate) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn copy_tree(source: &Path, dest: &Path) -> Result<(), FileActionError> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(source)?;
+            std::os::unix::fs::symlink(target, dest)?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(FileActionError::Io(
+                "symlink copy is unavailable on this platform".into(),
+            ));
+        }
+    }
+    if metadata.is_dir() {
+        fs::create_dir(dest)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    fs::copy(source, dest)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, fs};
@@ -373,7 +549,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        FileActionError, delete_entry, flatten_visible_rows, is_denied_relative, move_entry,
+        DirectoryCache, FileActionError, FileNode, copy_entry, create_entry, delete_entry,
+        flatten_visible_rows, inline_create_insert_index, is_denied_relative, move_entry,
         rename_entry, scan_checkout,
     };
 
@@ -522,6 +699,29 @@ mod tests {
     }
 
     #[test]
+    fn inline_create_row_lands_before_folders_or_after_files() {
+        let rows = flatten_visible_rows(
+            &[
+                FileNode {
+                    name: "src".into(),
+                    relative_path: "src".into(),
+                    is_dir: true,
+                    children: Vec::new(),
+                },
+                FileNode {
+                    name: "a.rs".into(),
+                    relative_path: "a.rs".into(),
+                    is_dir: false,
+                    children: Vec::new(),
+                },
+            ],
+            &HashSet::new(),
+        );
+        assert_eq!(inline_create_insert_index(&rows, "", true), 0);
+        assert_eq!(inline_create_insert_index(&rows, "", false), 1);
+    }
+
+    #[test]
     fn mutations_are_jailed_and_reject_descendant_moves() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join("folder/child")).unwrap();
@@ -543,6 +743,55 @@ mod tests {
         assert_eq!(moved, "target/renamed.txt");
         delete_entry(root.path(), "target/renamed.txt").unwrap();
         assert!(!root.path().join("target/renamed.txt").exists());
+
+        let created = create_entry(root.path(), "", "docs/adr/0001.md", false).unwrap();
+        assert_eq!(created, "docs/adr/0001.md");
+        assert_eq!(
+            std::fs::read(root.path().join("docs/adr/0001.md")).unwrap(),
+            b""
+        );
+        std::fs::write(root.path().join("notes.txt"), "keep").unwrap();
+        let copied = copy_entry(root.path(), "notes.txt", "").unwrap();
+        assert_eq!(copied, "notes copy.txt");
+        assert_eq!(
+            copy_entry(root.path(), "folder", "folder/child").unwrap_err(),
+            FileActionError::MoveIntoDescendant,
+        );
+    }
+
+    #[test]
+    fn directory_cache_keeps_untouched_folders_after_one_page_refresh() {
+        let page = |directory: &str, names: &[&str]| zeron_proto::WorkspaceDirectoryPage {
+            directory: directory.into(),
+            entries: names
+                .iter()
+                .map(|name| zeron_proto::WorkspaceEntry {
+                    path: if directory.is_empty() {
+                        (*name).to_string()
+                    } else {
+                        format!("{directory}/{name}")
+                    },
+                    name: (*name).to_string(),
+                    kind: zeron_proto::WorkspaceEntryKind::Directory,
+                    size: None,
+                    modified_at: None,
+                    ignored: false,
+                    read_only: false,
+                })
+                .collect(),
+            next_cursor: None,
+            truncated: false,
+        };
+        let mut cache = DirectoryCache::default();
+        cache.apply(page("", &["src", "docs"]), false);
+        cache.apply(page("src", &["util"]), false);
+        cache.apply(page("docs", &["adr"]), false);
+        assert!(cache.contains("src"));
+        assert!(cache.contains("docs"));
+        cache.apply(page("src", &["util", "bin"]), false);
+        assert!(cache.contains("docs"), "unrelated expansion must survive");
+        assert!(cache.contains("src"));
+        assert_eq!(cache.loaded_count("src"), 2);
     }
 }
 

@@ -584,6 +584,160 @@ pub enum WorkspaceFileChangeKind {
     Renamed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWorkspaceEntryRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    #[serde(default)]
+    pub parent_path: String,
+    #[serde(default)]
+    pub name: String,
+    pub kind: WorkspaceEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameWorkspaceEntryRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub path: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteWorkspaceEntryRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveWorkspaceEntryRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub source_path: String,
+    #[serde(default)]
+    pub destination_directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyWorkspaceEntryRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub source_path: String,
+    #[serde(default)]
+    pub destination_directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceEntryMutation {
+    pub path: String,
+    pub is_directory: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceNameError {
+    Empty,
+    InvalidComponent,
+}
+
+impl WorkspaceNameError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "name must not be empty",
+            Self::InvalidComponent => "name contains an invalid component",
+        }
+    }
+}
+
+pub fn validate_workspace_component(name: &str) -> Result<(), WorkspaceNameError> {
+    if name.is_empty() {
+        return Err(WorkspaceNameError::Empty);
+    }
+    if name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':', '\0'])
+        || name.eq_ignore_ascii_case(".git")
+    {
+        return Err(WorkspaceNameError::InvalidComponent);
+    }
+    Ok(())
+}
+
+pub fn validate_workspace_create_name(name: &str) -> Result<(), WorkspaceNameError> {
+    if name.is_empty() {
+        return Err(WorkspaceNameError::Empty);
+    }
+    if name.starts_with('/') {
+        return Err(WorkspaceNameError::InvalidComponent);
+    }
+    for component in name.split('/') {
+        validate_workspace_component(component)?;
+    }
+    Ok(())
+}
+
+pub fn join_workspace_relative(parent: &str, name: &str) -> String {
+    match (parent.is_empty(), name.is_empty()) {
+        (true, _) => name.to_string(),
+        (_, true) => parent.to_string(),
+        _ => format!("{parent}/{name}"),
+    }
+}
+
+pub fn sibling_name_taken<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+    existing
+        .into_iter()
+        .any(|entry| entry.eq_ignore_ascii_case(name))
+}
+
+pub fn unique_copy_name<'a>(
+    original: &str,
+    is_directory: bool,
+    existing: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let taken: Vec<String> = existing
+        .into_iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let is_taken = |candidate: &str| {
+        taken
+            .iter()
+            .any(|name| name == &candidate.to_ascii_lowercase())
+    };
+    if !is_taken(original) {
+        return original.to_string();
+    }
+    let (stem, ext) = copy_stem_and_ext(original, is_directory);
+    let first = format!("{stem} copy{ext}");
+    if !is_taken(&first) {
+        return first;
+    }
+    let mut index = 2u32;
+    loop {
+        let candidate = format!("{stem} copy {index}{ext}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn copy_stem_and_ext(name: &str, is_directory: bool) -> (String, String) {
+    if is_directory {
+        return (name.to_string(), String::new());
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.to_string(), String::new()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffFileSummary {
@@ -1100,5 +1254,86 @@ mod tests {
             serde_json::from_value::<WorkspaceFileChanges>(value).unwrap(),
             changes
         );
+    }
+
+    #[test]
+    fn workspace_entry_mutation_contract_is_camel_case() {
+        let target = WorkspaceTarget {
+            chat_id: Some("chat-1".into()),
+            space_id: None,
+            checkout_path: None,
+        };
+        let create = serde_json::to_value(CreateWorkspaceEntryRequest {
+            target: target.clone(),
+            parent_path: "src".into(),
+            name: "notes.md".into(),
+            kind: WorkspaceEntryKind::File,
+        })
+        .unwrap();
+        assert_eq!(create["chatId"], "chat-1");
+        assert_eq!(create["parentPath"], "src");
+        assert_eq!(create["name"], "notes.md");
+        assert_eq!(create["kind"], "file");
+        let rename = serde_json::to_value(RenameWorkspaceEntryRequest {
+            target: target.clone(),
+            path: "src/a.txt".into(),
+            new_name: "b.txt".into(),
+        })
+        .unwrap();
+        assert_eq!(rename["path"], "src/a.txt");
+        assert_eq!(rename["newName"], "b.txt");
+        let delete = serde_json::to_value(DeleteWorkspaceEntryRequest {
+            target: target.clone(),
+            path: "src/a.txt".into(),
+        })
+        .unwrap();
+        assert_eq!(delete["path"], "src/a.txt");
+        let move_req = serde_json::to_value(MoveWorkspaceEntryRequest {
+            target: target.clone(),
+            source_path: "src/a.rs".into(),
+            destination_directory: "src/util".into(),
+        })
+        .unwrap();
+        assert_eq!(move_req["sourcePath"], "src/a.rs");
+        assert_eq!(move_req["destinationDirectory"], "src/util");
+        let copy = serde_json::to_value(CopyWorkspaceEntryRequest {
+            target,
+            source_path: "a.txt".into(),
+            destination_directory: String::new(),
+        })
+        .unwrap();
+        assert_eq!(copy["sourcePath"], "a.txt");
+        assert_eq!(copy["destinationDirectory"], "");
+        let mutation = serde_json::to_value(WorkspaceEntryMutation {
+            path: "src/notes.md".into(),
+            is_directory: false,
+        })
+        .unwrap();
+        assert_eq!(mutation["path"], "src/notes.md");
+        assert_eq!(mutation["isDirectory"], false);
+    }
+
+    #[test]
+    fn unique_copy_name_derives_case_insensitive_collisions() {
+        assert_eq!(
+            unique_copy_name("a.txt", false, ["b.txt"].into_iter()),
+            "a.txt"
+        );
+        assert_eq!(
+            unique_copy_name("a.txt", false, ["a.txt"].into_iter()),
+            "a copy.txt"
+        );
+        assert_eq!(
+            unique_copy_name("a.txt", false, ["a.txt", "A copy.txt"].into_iter()),
+            "a copy 2.txt"
+        );
+        assert_eq!(
+            unique_copy_name("docs", true, ["docs"].into_iter()),
+            "docs copy"
+        );
+        assert!(validate_workspace_create_name("docs/adr/0001.md").is_ok());
+        assert!(validate_workspace_component("..").is_err());
+        assert!(validate_workspace_create_name("").is_err());
+        assert!(sibling_name_taken(["Readme.md"].into_iter(), "readme.md"));
     }
 }

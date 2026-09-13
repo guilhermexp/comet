@@ -16,7 +16,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
 
-- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile` e `WatchWorkspaceFiles` são tipados e relay-forwardable; só o último é stream. Ownership e limites de filesystem são validados pela engine de destino.
+- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `RenameWorkspaceEntry`, `DeleteWorkspaceEntry`, `MoveWorkspaceEntry` e `CopyWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Copy/move usam deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash).
 
 - **Um protocolo só** para in-process, daemon local e device remoto. Atalho que só existe no modo in-process quebra headless silenciosamente.
 - **`src/method.rs` é a lista única de métodos**: nome de fio, `params`, `reply`, `forwardable`, `stream` e `deadline` de um método moram todos numa linha do macro `rpc_methods!`. Adicionar RPC = uma linha no macro + o handler na engine. Nome e valor de cada const de `methods::` são fio — nunca renomear. A engine lê esses atributos por `zeron_rpc::info(method)`; não existe segunda lista para estender.

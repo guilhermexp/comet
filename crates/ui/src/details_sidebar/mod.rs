@@ -1,5 +1,7 @@
 pub mod chat_workers;
 pub mod context;
+pub mod file_actions;
+pub mod file_menu;
 pub mod file_tree;
 pub(crate) mod files_view;
 pub mod idle_recap;

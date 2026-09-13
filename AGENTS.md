@@ -42,6 +42,8 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 
 ## Gotchas duráveis
 
+- **Worktrees de verificação usam `target` próprio.** Não compartilhar `CARGO_TARGET_DIR` entre checkouts com fontes diferentes: o Cargo pode reutilizar artefatos locais stale e acusar tipos ausentes que já existem no fonte. Se ocorrer, limpar somente a crate afetada (`cargo clean -p <crate>`) e reconstruir no checkout de execução.
+
 - **`cargo run` usa o checkout atual do Comet e o OMP instalado.** Não impor OMP de fonte em `.cargo/config.toml`: desenvolvimento com o checkout irmão é opt-in via `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` (contrato em `scripts/AGENTS.md`). Outro worktree tem código e binário próprios; executar ali não inclui mudanças locais deste checkout.
 
 - **Sync com o upstream é frequente** (várias versões por semana). A receita que faz o merge passar é `cargo fmt --all` do nosso lado **antes** do merge. Conflitos se resolvem a favor do fork, e o motivo de cada um vai no corpo do commit de merge.

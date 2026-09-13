@@ -23,7 +23,8 @@
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
-//!   reads and a checkout-scoped filesystem change stream.
+//!   reads, checkout-scoped filesystem change stream, and jailed create/rename/
+//!   delete/move/copy mutations executed on the owning device.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -2221,6 +2222,61 @@ impl RpcService for EngineRpc {
                     Some((value, subscription))
                 });
                 Ok(RpcReply::Stream(stream.boxed()))
+            }
+            methods::CREATE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::CreateWorkspaceEntryRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_MUTATION_TIMEOUT,
+                    self.workspace_files.create_entry(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace create timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
+            }
+            methods::RENAME_WORKSPACE_ENTRY => {
+                let request: zeron_proto::RenameWorkspaceEntryRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_MUTATION_TIMEOUT,
+                    self.workspace_files.rename_entry(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace rename timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
+            }
+            methods::DELETE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::DeleteWorkspaceEntryRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_MUTATION_TIMEOUT,
+                    self.workspace_files.delete_entry(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace delete timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
+            }
+            methods::MOVE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::MoveWorkspaceEntryRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_COPY_MOVE_TIMEOUT,
+                    self.workspace_files.move_entry(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace move timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
+            }
+            methods::COPY_WORKSPACE_ENTRY => {
+                let request: zeron_proto::CopyWorkspaceEntryRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_COPY_MOVE_TIMEOUT,
+                    self.workspace_files.copy_entry(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace copy timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
             }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
