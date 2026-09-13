@@ -3207,18 +3207,6 @@ fn migrate_comet_workers_presets() -> Result<Value, WorkersError> {
         return Ok(raw);
     }
 
-    let has_presets = raw
-        .get("presets")
-        .and_then(Value::as_array)
-        .is_some_and(|presets| !presets.is_empty());
-    let native_presets_were_seeded = raw
-        .get("native_preset_overlay_migrated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !has_presets && !native_presets_were_seeded {
-        return Ok(raw);
-    }
-
     unpeel_core::app_state::edit(|state| {
         let current_version = state
             .get(COMET_WORKERS_PRESET_CATALOG_VERSION_KEY)
@@ -3236,6 +3224,17 @@ fn migrate_comet_workers_presets() -> Result<Value, WorkersError> {
             .map_err(|error| error.to_string())?
             .unwrap_or_default();
         let builtin_presets = unpeel_core::state::builtin_global_presets();
+        // The original native frontend seeded fresh profiles. Comet must do
+        // that here too, under the state lock; an initialized empty list is
+        // a user deletion, not an invitation to restore the defaults.
+        let native_presets_were_seeded = state
+            .get("native_preset_overlay_migrated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if current_version == 0 && presets.is_empty() && !native_presets_were_seeded {
+            presets = builtin_presets.clone();
+            state.insert("native_preset_overlay_migrated".into(), Value::Bool(true));
+        }
         if current_version < 1 {
             for builtin in builtin_presets
                 .iter()
