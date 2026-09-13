@@ -655,6 +655,9 @@ impl WorkspaceNameError {
     }
 }
 
+/// Shared depth/component budget for jailed workspace paths and copy/delete walks.
+pub const MAX_WORKSPACE_PATH_COMPONENTS: usize = 256;
+
 pub fn validate_workspace_component(name: &str) -> Result<(), WorkspaceNameError> {
     if name.is_empty() {
         return Err(WorkspaceNameError::Empty);
@@ -663,10 +666,45 @@ pub fn validate_workspace_component(name: &str) -> Result<(), WorkspaceNameError
         || name == ".."
         || name.contains(['/', '\\', ':', '\0'])
         || name.eq_ignore_ascii_case(".git")
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || is_windows_device_name(name)
     {
         return Err(WorkspaceNameError::InvalidComponent);
     }
     Ok(())
+}
+
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    if stem.is_empty() {
+        return false;
+    }
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 pub fn validate_workspace_create_name(name: &str) -> Result<(), WorkspaceNameError> {
@@ -691,9 +729,10 @@ pub fn join_workspace_relative(parent: &str, name: &str) -> String {
 }
 
 pub fn sibling_name_taken<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+    let folded = name.to_lowercase();
     existing
         .into_iter()
-        .any(|entry| entry.eq_ignore_ascii_case(name))
+        .any(|entry| entry.to_lowercase() == folded)
 }
 
 pub fn unique_copy_name<'a>(
@@ -703,13 +742,9 @@ pub fn unique_copy_name<'a>(
 ) -> String {
     let taken: Vec<String> = existing
         .into_iter()
-        .map(|name| name.to_ascii_lowercase())
+        .map(|name| name.to_lowercase())
         .collect();
-    let is_taken = |candidate: &str| {
-        taken
-            .iter()
-            .any(|name| name == &candidate.to_ascii_lowercase())
-    };
+    let is_taken = |candidate: &str| taken.iter().any(|name| name == &candidate.to_lowercase());
     if !is_taken(original) {
         return original.to_string();
     }
@@ -1331,9 +1366,32 @@ mod tests {
             unique_copy_name("docs", true, ["docs"].into_iter()),
             "docs copy"
         );
-        assert!(validate_workspace_create_name("docs/adr/0001.md").is_ok());
-        assert!(validate_workspace_component("..").is_err());
-        assert!(validate_workspace_create_name("").is_err());
+        assert_eq!(
+            unique_copy_name("ä.txt", false, ["Ä.txt"].into_iter()),
+            "ä copy.txt"
+        );
+        assert_eq!(validate_workspace_create_name("docs/adr/0001.md"), Ok(()));
+        assert_eq!(
+            validate_workspace_component(".."),
+            Err(WorkspaceNameError::InvalidComponent)
+        );
+        assert_eq!(
+            validate_workspace_create_name(""),
+            Err(WorkspaceNameError::Empty)
+        );
+        assert_eq!(
+            validate_workspace_component("foo."),
+            Err(WorkspaceNameError::InvalidComponent)
+        );
+        assert_eq!(
+            validate_workspace_component("foo "),
+            Err(WorkspaceNameError::InvalidComponent)
+        );
+        assert_eq!(
+            validate_workspace_component("CON"),
+            Err(WorkspaceNameError::InvalidComponent)
+        );
         assert!(sibling_name_taken(["Readme.md"].into_iter(), "readme.md"));
+        assert!(sibling_name_taken(["Ä.txt"].into_iter(), "ä.txt"));
     }
 }

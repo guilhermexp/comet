@@ -5,8 +5,7 @@ use crate::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileMenuKind {
     Root,
-    Directory,
-    File,
+    Entry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +183,7 @@ mod tests {
     #[test]
     fn remote_checkout_omits_finder_and_terminal() {
         let items = file_menu_items(
-            FileMenuKind::File,
+            FileMenuKind::Entry,
             FileCheckoutAccess::Remote,
             FileClipboardPresence::Occupied,
         );

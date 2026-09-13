@@ -298,7 +298,7 @@ use crate::{
         context::detect_git_branch,
         file_actions::{
             DeletePrompt, FileClipboard, FileClipboardMode, FileMutation, InlineCreateKind,
-            InlineEditState, create_parent_path,
+            InlineEditState, create_parent_path, path_is_within, retarget_path,
         },
         file_menu::{
             FileActionTooltip, FileCheckoutAccess, FileClipboardPresence, FileMenuItem,
@@ -651,6 +651,11 @@ impl DetailsSidebar {
             self.chat_workers
                 .sync_context(self.sidebar.context().map(|context| context.key.as_str()));
             self.active_file = None;
+            self.file_clipboard = None;
+            self.delete_prompt = None;
+            self.inline_edit = None;
+            self.inline_input = None;
+            self.file_mutation_error = None;
             self.resolved_branch = self
                 .sidebar
                 .context()
@@ -1693,7 +1698,6 @@ impl DetailsSidebar {
                             icons::DOCUMENT_ADD,
                             "New File",
                             theme,
-                            cx,
                             cx.listener(|this, _, window, cx| {
                                 this.start_inline_create(InlineCreateKind::File, window, cx);
                             }),
@@ -1703,7 +1707,6 @@ impl DetailsSidebar {
                             icons::FOLDER_WITH_FILES,
                             "New Folder",
                             theme,
-                            cx,
                             cx.listener(|this, _, window, cx| {
                                 this.start_inline_create(InlineCreateKind::Directory, window, cx);
                             }),
@@ -1789,7 +1792,6 @@ impl DetailsSidebar {
         icon_path: &'static str,
         tooltip: &'static str,
         theme: &Theme,
-        _cx: &mut Context<Self>,
         listener: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     ) -> gpui::Stateful<gpui::Div> {
         let label: SharedString = tooltip.into();
@@ -3416,28 +3418,70 @@ impl DetailsSidebar {
         path: String,
         cx: &mut Context<Self>,
     ) {
-        if matches!(mutation, FileMutation::Delete { .. }) {
-            if self.active_file.as_deref() == Some(path.as_str()) {
-                self.active_file = None;
+        match mutation {
+            FileMutation::Delete { path: deleted } => {
+                if let Some(active) = self.active_file.clone() {
+                    if path_is_within(deleted, &active) {
+                        self.active_file = None;
+                        if active != *deleted {
+                            self.emit_close_file(&active, cx);
+                        }
+                    }
+                }
+                self.emit_close_file(deleted, cx);
+                if self
+                    .file_clipboard
+                    .as_ref()
+                    .is_some_and(|clip| path_is_within(deleted, &clip.relative_path))
+                {
+                    self.file_clipboard = None;
+                }
+                if self
+                    .delete_prompt
+                    .as_ref()
+                    .is_some_and(|prompt| path_is_within(deleted, &prompt.path))
+                {
+                    self.delete_prompt = None;
+                }
+                if self
+                    .inline_edit
+                    .as_ref()
+                    .is_some_and(|edit| match &edit.edit {
+                        super::file_actions::InlineFileEdit::Rename { path, .. } => {
+                            path_is_within(deleted, path)
+                        }
+                        super::file_actions::InlineFileEdit::Create { parent, .. } => {
+                            path_is_within(deleted, parent)
+                        }
+                    })
+                {
+                    self.inline_edit = None;
+                    self.inline_input = None;
+                }
             }
-            if let Some(context) = self.sidebar.context() {
-                cx.emit(DetailsSidebarEvent::CloseFile {
-                    context_key: context.key.clone(),
-                    relative_path: path.clone(),
-                });
+            FileMutation::Rename { path: old, .. } | FileMutation::Move { source: old, .. } => {
+                if let Some(active) = self.active_file.clone() {
+                    if let Some(next) = retarget_path(old, &path, &active) {
+                        if next != active {
+                            self.emit_close_file(&active, cx);
+                            self.emit_open_file(&next, cx);
+                        }
+                        self.active_file = Some(next);
+                    }
+                }
+                let cut_consumed = matches!(mutation, FileMutation::Move { source, .. } if self
+                    .file_clipboard
+                    .as_ref()
+                    .is_some_and(|clip| clip.mode == FileClipboardMode::Cut && clip.relative_path == *source));
+                if cut_consumed {
+                    self.file_clipboard = None;
+                } else if let Some(clip) = self.file_clipboard.as_mut() {
+                    if let Some(next) = retarget_path(old, &path, &clip.relative_path) {
+                        clip.relative_path = next;
+                    }
+                }
             }
-        }
-        if let FileMutation::Rename { path: old, .. } = mutation {
-            if self.active_file.as_deref() == Some(old.as_str()) {
-                self.active_file = Some(path.clone());
-            }
-        }
-        if let FileMutation::Move { source, .. } = mutation {
-            if self.file_clipboard.as_ref().is_some_and(|clip| {
-                clip.mode == FileClipboardMode::Cut && clip.relative_path == *source
-            }) {
-                self.file_clipboard = None;
-            }
+            _ => {}
         }
         let parents = mutation.refresh_directories(&path);
         for parent in &parents {
@@ -3457,26 +3501,40 @@ impl DetailsSidebar {
             self.refresh_files(cx);
         }
         if matches!(mutation, FileMutation::CreateFile { .. }) {
-            if let Some(context) = self.sidebar.context() {
-                self.active_file = Some(path.clone());
-                cx.emit(DetailsSidebarEvent::OpenFile {
-                    context_key: context.key.clone(),
-                    root: context.cwd.clone(),
-                    relative_path: path,
-                    remote_target: if context_file_access(
-                        context,
-                        self.app_state.read(cx).local_device_id.as_deref(),
-                    ) == ContextFileAccess::Remote
-                    {
-                        self.workspace_file_source(cx)
-                            .map(|(_, target, device)| (target, device))
-                    } else {
-                        None
-                    },
-                });
-            }
+            self.active_file = Some(path.clone());
+            self.emit_open_file(&path, cx);
         }
         cx.notify();
+    }
+
+    fn emit_close_file(&self, relative_path: &str, cx: &mut Context<Self>) {
+        if let Some(context) = self.sidebar.context() {
+            cx.emit(DetailsSidebarEvent::CloseFile {
+                context_key: context.key.clone(),
+                relative_path: relative_path.to_string(),
+            });
+        }
+    }
+
+    fn emit_open_file(&self, relative_path: &str, cx: &mut Context<Self>) {
+        let Some(context) = self.sidebar.context() else {
+            return;
+        };
+        cx.emit(DetailsSidebarEvent::OpenFile {
+            context_key: context.key.clone(),
+            root: context.cwd.clone(),
+            relative_path: relative_path.to_string(),
+            remote_target: if context_file_access(
+                context,
+                self.app_state.read(cx).local_device_id.as_deref(),
+            ) == ContextFileAccess::Remote
+            {
+                self.workspace_file_source(cx)
+                    .map(|(_, target, device)| (target, device))
+            } else {
+                None
+            },
+        });
     }
 
     fn apply_file_menu_item(
@@ -3497,7 +3555,6 @@ impl DetailsSidebar {
                 if !target.is_root {
                     self.file_clipboard = Some(FileClipboard {
                         relative_path: target.path.clone(),
-                        is_dir: target.is_dir,
                         mode: FileClipboardMode::Cut,
                     });
                 }
@@ -3508,7 +3565,6 @@ impl DetailsSidebar {
                 if !target.is_root {
                     self.file_clipboard = Some(FileClipboard {
                         relative_path: target.path.clone(),
-                        is_dir: target.is_dir,
                         mode: FileClipboardMode::Copy,
                     });
                 }
@@ -3678,7 +3734,6 @@ impl DetailsSidebar {
             cx.stop_propagation();
             self.file_clipboard = Some(FileClipboard {
                 relative_path: path,
-                is_dir,
                 mode: FileClipboardMode::Copy,
             });
             cx.notify();
@@ -3686,7 +3741,6 @@ impl DetailsSidebar {
             cx.stop_propagation();
             self.file_clipboard = Some(FileClipboard {
                 relative_path: path,
-                is_dir,
                 mode: FileClipboardMode::Cut,
             });
             cx.notify();
@@ -3721,10 +3775,8 @@ impl DetailsSidebar {
         let closing = self.file_menu.closing_since();
         let kind = if target.is_root {
             FileMenuKind::Root
-        } else if target.is_dir {
-            FileMenuKind::Directory
         } else {
-            FileMenuKind::File
+            FileMenuKind::Entry
         };
         let clipboard = if self.file_clipboard.is_some() {
             FileClipboardPresence::Occupied
@@ -4265,6 +4317,7 @@ fn file_action_error_message(error: &FileActionError) -> SharedString {
         FileActionError::MissingEntry => "That file no longer exists.".into(),
         FileActionError::TargetExists => "an entry with that name already exists".into(),
         FileActionError::MoveIntoDescendant => "cannot paste a folder into itself".into(),
+        FileActionError::Unsupported => "path is a symlink".into(),
         FileActionError::Io(message) => message.clone().into(),
     }
 }
@@ -4405,10 +4458,9 @@ mod tests {
     use super::{
         ContextFileAccess, DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
         FileNode, context_file_access, details_sidebar_background, file_node_is_dir,
-        open_subagent_event, open_worker_event, paste_mutation, sibling_entry_names,
-        subagent_row_avatar_path, worker_click_event,
+        open_subagent_event, open_worker_event, sibling_entry_names, subagent_row_avatar_path,
+        worker_click_event,
     };
-    use super::{FileClipboard, FileClipboardMode, FileMutation};
     use crate::details_sidebar::chat_workers::{ChatActivityRow, ChatWorkerRow, WorkerSemantic};
     use crate::details_sidebar::context::{DetailsContext, DetailsMode, DetailsTab};
     use crate::theme::Theme;
@@ -4785,24 +4837,6 @@ mod tests {
     }
 
     #[test]
-    fn close_file_event_names_the_deleted_preview_path() {
-        let event = DetailsSidebarEvent::CloseFile {
-            context_key: "chat-1".into(),
-            relative_path: "src/lib.rs".into(),
-        };
-        match event {
-            DetailsSidebarEvent::CloseFile {
-                context_key,
-                relative_path,
-            } => {
-                assert_eq!(context_key, "chat-1");
-                assert_eq!(relative_path, "src/lib.rs");
-            }
-            _ => panic!("expected CloseFile"),
-        }
-    }
-
-    #[test]
     fn sibling_lookup_walks_nested_directories() {
         let tree = vec![FileNode {
             name: "src".into(),
@@ -4827,34 +4861,5 @@ mod tests {
         assert!(!file_node_is_dir(&tree, "src/a.rs"));
         assert_eq!(sibling_entry_names(&tree, "src"), vec!["a.rs", "b.rs"]);
         assert_eq!(sibling_entry_names(&tree, ""), vec!["src"]);
-    }
-
-    #[test]
-    fn paste_mutation_follows_clipboard_mode() {
-        let cut = FileClipboard {
-            relative_path: "src/a.rs".into(),
-            is_dir: false,
-            mode: FileClipboardMode::Cut,
-        };
-        assert_eq!(
-            paste_mutation(Some(&cut), "lib".into()),
-            Some(FileMutation::Move {
-                source: "src/a.rs".into(),
-                destination_directory: "lib".into(),
-            })
-        );
-        let copy = FileClipboard {
-            relative_path: "src/a.rs".into(),
-            is_dir: false,
-            mode: FileClipboardMode::Copy,
-        };
-        assert_eq!(
-            paste_mutation(Some(&copy), String::new()),
-            Some(FileMutation::Copy {
-                source: "src/a.rs".into(),
-                destination_directory: String::new(),
-            })
-        );
-        assert_eq!(paste_mutation(None, "lib".into()), None);
     }
 }

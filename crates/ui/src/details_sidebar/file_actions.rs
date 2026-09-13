@@ -65,7 +65,6 @@ pub enum FileClipboardMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileClipboard {
     pub relative_path: String,
-    pub is_dir: bool,
     pub mode: FileClipboardMode,
 }
 
@@ -199,6 +198,22 @@ pub fn validate_rename_name(
     Ok(())
 }
 
+pub fn path_is_within(prefix: &str, path: &str) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+pub fn retarget_path(old: &str, new: &str, path: &str) -> Option<String> {
+    if path == old {
+        Some(new.to_string())
+    } else {
+        path.strip_prefix(&format!("{old}/"))
+            .map(|rest| format!("{new}/{rest}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,12 +226,46 @@ mod tests {
 
     #[test]
     fn inline_validation_rejects_empty_dot_and_collision() {
-        assert!(validate_create_name("", &[]).is_err());
-        assert!(validate_create_name("..", &[]).is_err());
-        assert!(validate_create_name("a.txt", &["A.TXT"]).is_err());
-        assert!(validate_create_name("docs/adr/0001.md", &[]).is_ok());
-        assert!(validate_rename_name("b.txt", &["b.txt"], "a.txt").is_err());
-        assert!(validate_rename_name("a.txt", &["a.txt"], "a.txt").is_ok());
+        assert_eq!(
+            validate_create_name("", &[]).unwrap_err(),
+            "name must not be empty"
+        );
+        assert_eq!(
+            validate_create_name("..", &[]).unwrap_err(),
+            "name contains an invalid component"
+        );
+        assert_eq!(
+            validate_create_name("a.txt", &["A.TXT"]).unwrap_err(),
+            "an entry with that name already exists"
+        );
+        assert_eq!(
+            validate_create_name("CON", &[]).unwrap_err(),
+            "name contains an invalid component"
+        );
+        assert_eq!(validate_create_name("docs/adr/0001.md", &[]), Ok(()));
+        assert_eq!(
+            validate_rename_name("b.txt", &["b.txt"], "a.txt").unwrap_err(),
+            "an entry with that name already exists"
+        );
+        assert_eq!(validate_rename_name("a.txt", &["a.txt"], "a.txt"), Ok(()));
+        assert_eq!(
+            validate_rename_name(".git", &[], "folder").unwrap_err(),
+            "name contains an invalid component"
+        );
+    }
+
+    #[test]
+    fn path_retarget_covers_descendants_and_rewrites_prefixes() {
+        assert!(path_is_within("src", "src"));
+        assert!(path_is_within("src", "src/a.rs"));
+        assert!(!path_is_within("src", "src2/a.rs"));
+        assert!(!path_is_within("", "src/a.rs"));
+        assert_eq!(retarget_path("src", "lib", "src").as_deref(), Some("lib"));
+        assert_eq!(
+            retarget_path("src", "lib", "src/a.rs").as_deref(),
+            Some("lib/a.rs")
+        );
+        assert_eq!(retarget_path("src", "lib", "docs/a.rs"), None);
     }
 
     #[test]

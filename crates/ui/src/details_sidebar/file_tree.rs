@@ -95,6 +95,7 @@ pub enum FileActionError {
     MissingEntry,
     TargetExists,
     MoveIntoDescendant,
+    Unsupported,
     Io(String),
 }
 
@@ -342,14 +343,25 @@ fn checked_existing(root: &Path, relative: &str) -> Result<(PathBuf, PathBuf), F
         .canonicalize()
         .map_err(|_| FileActionError::MissingEntry)?;
     let relative = checked_relative(relative)?;
-    let path = root
-        .join(relative)
-        .canonicalize()
-        .map_err(|_| FileActionError::MissingEntry)?;
-    if path == root || !path.starts_with(&root) {
+    let mut current = root.clone();
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(FileActionError::OutsideCheckout);
+        };
+        current.push(name);
+        let metadata = fs::symlink_metadata(&current).map_err(|_| FileActionError::MissingEntry)?;
+        if metadata.file_type().is_symlink() {
+            return Err(FileActionError::Unsupported);
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(FileActionError::Unsupported);
+        }
+    }
+    if current == root || !current.starts_with(&root) {
         return Err(FileActionError::OutsideCheckout);
     }
-    Ok((root, path))
+    Ok((root, current))
 }
 
 fn relative_string(root: &Path, path: &Path) -> Result<String, FileActionError> {
@@ -360,26 +372,72 @@ fn relative_string(root: &Path, path: &Path) -> Result<String, FileActionError> 
         .ok_or_else(|| FileActionError::Io("path is not valid UTF-8".into()))
 }
 
+fn same_file_entry(left: &Path, right: &Path) -> bool {
+    let Ok(left_meta) = fs::symlink_metadata(left) else {
+        return false;
+    };
+    let Ok(right_meta) = fs::symlink_metadata(right) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        left == right
+    }
+}
+
+fn dest_is_taken(dest: &Path, source: Option<&Path>) -> bool {
+    fs::symlink_metadata(dest).is_ok() && source.is_none_or(|path| !same_file_entry(path, dest))
+}
+
+fn ensure_tree_within_depth(path: &Path) -> Result<(), FileActionError> {
+    let mut stack = vec![(path.to_path_buf(), 1usize)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > zeron_proto::MAX_WORKSPACE_PATH_COMPONENTS {
+            return Err(FileActionError::Io("path is too deep".into()));
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&current)? {
+                stack.push((entry?.path(), depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn rename_entry(
     root: &Path,
     relative: &str,
     new_name: &str,
 ) -> Result<String, FileActionError> {
-    if new_name.is_empty()
-        || Path::new(new_name).components().count() != 1
-        || !matches!(
-            Path::new(new_name).components().next(),
-            Some(Component::Normal(_))
-        )
-    {
-        return Err(FileActionError::InvalidName);
-    }
+    zeron_proto::validate_workspace_component(new_name)
+        .map_err(|_| FileActionError::InvalidName)?;
     let (root, source) = checked_existing(root, relative)?;
-    let target = source
-        .parent()
-        .ok_or(FileActionError::OutsideCheckout)?
-        .join(new_name);
-    if target.exists() {
+    let current_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(FileActionError::InvalidName)?;
+    if current_name == new_name {
+        return relative_string(&root, &source);
+    }
+    let parent = source.parent().ok_or(FileActionError::OutsideCheckout)?;
+    let names = directory_names(parent)?;
+    if zeron_proto::sibling_name_taken(
+        names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| *name != current_name),
+        new_name,
+    ) {
+        return Err(FileActionError::TargetExists);
+    }
+    let target = parent.join(new_name);
+    if dest_is_taken(&target, Some(&source)) {
         return Err(FileActionError::TargetExists);
     }
     fs::rename(&source, &target)?;
@@ -388,7 +446,9 @@ pub fn rename_entry(
 
 pub fn delete_entry(root: &Path, relative: &str) -> Result<(), FileActionError> {
     let (_, path) = checked_existing(root, relative)?;
-    if path.is_dir() {
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.is_dir() {
+        ensure_tree_within_depth(&path)?;
         fs::remove_dir_all(path)?;
     } else {
         fs::remove_file(path)?;
@@ -403,12 +463,20 @@ pub fn move_entry(
 ) -> Result<String, FileActionError> {
     let (root, source) = checked_existing(root, source_relative)?;
     let (_, destination_dir) = checked_directory(&root, destination_dir_relative)?;
-    if source.is_dir() && destination_dir.starts_with(&source) {
+    let source_meta = fs::symlink_metadata(&source)?;
+    if source_meta.is_dir() && destination_dir.starts_with(&source) {
         return Err(FileActionError::MoveIntoDescendant);
     }
-    let file_name = source.file_name().ok_or(FileActionError::OutsideCheckout)?;
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(FileActionError::OutsideCheckout)?;
+    let names = directory_names(&destination_dir)?;
+    if zeron_proto::sibling_name_taken(names.iter().map(String::as_str), file_name) {
+        return Err(FileActionError::TargetExists);
+    }
     let target = destination_dir.join(file_name);
-    if target.exists() {
+    if dest_is_taken(&target, Some(&source)) {
         return Err(FileActionError::TargetExists);
     }
     fs::rename(&source, &target)?;
@@ -424,7 +492,7 @@ pub fn create_entry(
     zeron_proto::validate_workspace_create_name(name).map_err(|_| FileActionError::InvalidName)?;
     let (root, parent) = checked_directory(root, parent_relative)?;
     let relative = zeron_proto::join_workspace_relative(parent_relative, name);
-    let dest = parent.join(name);
+    let dest = root.join(Path::new(&relative));
     if !dest.starts_with(&root) || dest == root {
         return Err(FileActionError::OutsideCheckout);
     }
@@ -432,7 +500,11 @@ pub fn create_entry(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(FileActionError::InvalidName)?;
-    if sibling_taken(dest.parent().unwrap_or(&parent), leaf, None)? {
+    let names = directory_names(dest.parent().unwrap_or(&parent))?;
+    if zeron_proto::sibling_name_taken(names.iter().map(String::as_str), leaf) {
+        return Err(FileActionError::TargetExists);
+    }
+    if dest_is_taken(&dest, None) {
         return Err(FileActionError::TargetExists);
     }
     if is_dir {
@@ -444,9 +516,15 @@ pub fn create_entry(
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&dest)?;
+            .open(&dest)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    FileActionError::TargetExists
+                } else {
+                    FileActionError::Io(error.to_string())
+                }
+            })?;
     }
-    let _ = relative;
     relative_string(&root, &dest)
 }
 
@@ -457,7 +535,8 @@ pub fn copy_entry(
 ) -> Result<String, FileActionError> {
     let (root, source) = checked_existing(root, source_relative)?;
     let (_, destination_dir) = checked_directory(&root, destination_dir_relative)?;
-    if source.is_dir() && destination_dir.starts_with(&source) {
+    let source_meta = fs::symlink_metadata(&source)?;
+    if source_meta.is_dir() && destination_dir.starts_with(&source) {
         return Err(FileActionError::MoveIntoDescendant);
     }
     let original = source
@@ -467,11 +546,11 @@ pub fn copy_entry(
     let existing = directory_names(&destination_dir)?;
     let unique = zeron_proto::unique_copy_name(
         original,
-        source.is_dir(),
+        source_meta.is_dir(),
         existing.iter().map(String::as_str),
     );
     let dest = destination_dir.join(&unique);
-    copy_tree(&source, &dest)?;
+    copy_tree(&source, &dest, 1)?;
     relative_string(&root, &dest)
 }
 
@@ -483,7 +562,8 @@ fn checked_directory(root: &Path, relative: &str) -> Result<(PathBuf, PathBuf), 
         return Ok((root.clone(), root));
     }
     let (root, path) = checked_existing(&root, relative)?;
-    if !path.is_dir() {
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_dir() {
         return Err(FileActionError::MissingEntry);
     }
     Ok((root, path))
@@ -491,7 +571,7 @@ fn checked_directory(root: &Path, relative: &str) -> Result<(PathBuf, PathBuf), 
 
 fn directory_names(path: &Path) -> Result<Vec<String>, FileActionError> {
     let mut names = Vec::new();
-    if !path.exists() {
+    if fs::symlink_metadata(path).is_err() {
         return Ok(names);
     }
     for entry in fs::read_dir(path)? {
@@ -500,27 +580,22 @@ fn directory_names(path: &Path) -> Result<Vec<String>, FileActionError> {
     Ok(names)
 }
 
-fn sibling_taken(dir: &Path, name: &str, except: Option<&Path>) -> Result<bool, FileActionError> {
-    for entry in directory_names(dir)? {
-        if !entry.eq_ignore_ascii_case(name) {
-            continue;
-        }
-        let candidate = dir.join(&entry);
-        if except.is_some_and(|path| path == candidate) {
-            continue;
-        }
-        return Ok(true);
+fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), FileActionError> {
+    if depth > zeron_proto::MAX_WORKSPACE_PATH_COMPONENTS {
+        return Err(FileActionError::Io("path is too deep".into()));
     }
-    Ok(false)
-}
-
-fn copy_tree(source: &Path, dest: &Path) -> Result<(), FileActionError> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
         #[cfg(unix)]
         {
             let target = fs::read_link(source)?;
-            std::os::unix::fs::symlink(target, dest)?;
+            std::os::unix::fs::symlink(target, dest).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    FileActionError::TargetExists
+                } else {
+                    FileActionError::Io(error.to_string())
+                }
+            })?;
             return Ok(());
         }
         #[cfg(not(unix))]
@@ -531,15 +606,40 @@ fn copy_tree(source: &Path, dest: &Path) -> Result<(), FileActionError> {
         }
     }
     if metadata.is_dir() {
-        fs::create_dir(dest)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        match fs::create_dir(dest) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(FileActionError::TargetExists);
+            }
+            Err(error) => return Err(error.into()),
         }
-        return Ok(());
+        let result = (|| {
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                copy_tree(&entry.path(), &dest.join(entry.file_name()), depth + 1)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(dest);
+        }
+        return result;
     }
-    fs::copy(source, dest)?;
-    Ok(())
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(FileActionError::TargetExists);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    fs::copy(source, dest).map(|_| ()).map_err(|error| {
+        let _ = fs::remove_file(dest);
+        FileActionError::Io(error.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -757,6 +857,46 @@ mod tests {
             copy_entry(root.path(), "folder", "folder/child").unwrap_err(),
             FileActionError::MoveIntoDescendant,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_backend_refuses_symlink_without_mutating_the_target() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("real")).unwrap();
+        fs::write(root.path().join("real/inside.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(root.path().join("real"), root.path().join("linked")).unwrap();
+
+        assert!(delete_entry(root.path(), "linked").is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("real/inside.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(
+            root.path()
+                .join("linked")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink row must remain a symlink"
+        );
+        assert_eq!(
+            rename_entry(root.path(), "linked", "renamed").unwrap_err(),
+            FileActionError::Unsupported,
+        );
+    }
+
+    #[test]
+    fn local_backend_refuses_dot_git_as_a_new_name() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("folder")).unwrap();
+        assert_eq!(
+            rename_entry(root.path(), "folder", ".git").unwrap_err(),
+            FileActionError::InvalidName,
+        );
+        assert!(root.path().join("folder").is_dir());
+        assert!(!root.path().join(".git").exists());
     }
 
     #[test]
