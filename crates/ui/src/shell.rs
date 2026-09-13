@@ -2037,6 +2037,9 @@ impl Shell {
                         cx,
                     );
                 }
+                DetailsSidebarEvent::OpenWorkingTreeDiff { path } => {
+                    this.focus_working_tree_diff(path.clone(), cx);
+                }
                 DetailsSidebarEvent::OpenWorkerSession {
                     chat_id,
                     session_id,
@@ -2797,6 +2800,30 @@ impl Shell {
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// Source Control file click: open the existing Changes pane and focus
+    /// `path` in working-tree scope. Does not create a second diff viewer.
+    fn focus_working_tree_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        let from = self.eval_tween(self.right_tween, self.right_target(cx));
+        let key = self.panel_key(cx);
+        self.panels.show(&key);
+        match self
+            .right_surface_rows(cx)
+            .into_iter()
+            .find(|(surface, _)| matches!(surface, RightSurface::Diff(_)))
+        {
+            Some((surface, _)) => self.set_right_active(surface, cx),
+            None => self.add_diff_surface(cx),
+        }
+        if let RightSurface::Diff(id) = self.resolved_right_active(cx)
+            && let Some(changes) = self.diffs.get(&id).cloned()
+        {
+            changes.update(cx, |changes, cx| {
+                changes.focus_working_tree_path(&path, cx);
+            });
+        }
+        self.finish_right_transition(from, cx);
     }
 
     /// `cmd-b` / the Changes entry: select this chat's diff tab, opening one

@@ -1926,6 +1926,28 @@ impl Changes {
         cx.notify();
     }
 
+    /// Source Control row click: switch this existing pane to the working
+    /// tree, expand the named file, and scroll it into view. Does not parse
+    /// a second diff — the watch already owns the working-tree patch.
+    pub fn focus_working_tree_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.set_scope(DiffScope::WorkingTree, cx);
+        self.ensure_watch(cx);
+        let fold = self.folds.entry(path.to_string()).or_default();
+        fold.collapsed = false;
+        fold.toggled_at = None;
+        self.reflatten(cx);
+        if let Some(ix) = self
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.files.iter().position(|file| file.path == path))
+        {
+            if let Some(start) = self.row_ranges.get(ix).map(|range| range.start) {
+                self.list.scroll_to_reveal_item(start);
+            }
+        }
+        cx.notify();
+    }
+
     fn history_pane(&mut self, cx: &mut Context<Self>) -> Entity<GitHistory> {
         if let Some(history) = &self.history {
             return history.clone();
