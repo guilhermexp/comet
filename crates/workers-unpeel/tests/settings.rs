@@ -81,6 +81,125 @@ fn settings_use_upstream_defaults_and_catalog() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+fn fresh_settings_seed_persisted_presets_once() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    for existing_skeleton in [false, true] {
+        let home = TempDir::new()?;
+        let _guard = UnpeelHomeGuard::set(home.path());
+        let state_path = home.path().join("app-state.json");
+        if existing_skeleton {
+            fs::write(
+                &state_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "presets": [], "future_owner_key": { "must": "survive" }
+                }))?,
+            )?;
+        }
+        let client = LocalWorkersClient::new();
+        let settings = client.settings()?;
+        let builtins = unpeel_core::state::builtin_global_presets();
+        assert!(!builtins.is_empty());
+        assert_eq!(settings.presets.len(), builtins.len());
+        for (preset, builtin) in settings.presets.iter().zip(&builtins) {
+            assert_eq!(preset.id, builtin.id);
+            assert_eq!(preset.command, builtin.command);
+            if let Some(cli_id) = &preset.cli_id {
+                let runtime = settings
+                    .runtimes
+                    .iter()
+                    .find(|r| &r.cli_id == cli_id)
+                    .unwrap();
+                assert_eq!(preset.installed, runtime.installed);
+            }
+        }
+        for cli_id in ["claude", "codex", "omp", "gemini", "pi"] {
+            assert!(
+                settings
+                    .presets
+                    .iter()
+                    .any(|p| p.cli_id.as_deref() == Some(cli_id))
+            );
+        }
+        let persisted = fs::read(&state_path)?;
+        let raw: serde_json::Value = serde_json::from_slice(&persisted)?;
+        assert_eq!(raw["native_preset_overlay_migrated"], true);
+        assert_eq!(raw["comet_workers_preset_catalog_version"], 2);
+        if existing_skeleton {
+            assert_eq!(raw["future_owner_key"]["must"], "survive");
+        }
+        client.settings()?;
+        assert_eq!(fs::read(&state_path)?, persisted);
+        let bootstrap = client.bootstrap()?;
+        for preset in settings.presets.iter().filter(|p| p.enabled) {
+            assert!(
+                bootstrap
+                    .presets
+                    .iter()
+                    .any(|p| p.id == preset.id && p.command == preset.command)
+            );
+        }
+        for preset in &settings.presets {
+            client.delete_preset(&preset.id)?;
+        }
+        assert!(client.settings()?.presets.is_empty());
+        assert!(client.bootstrap()?.presets.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn initialized_empty_settings_do_not_restore_the_full_catalog()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    for markers in [
+        serde_json::json!({"native_preset_overlay_migrated": true}),
+        serde_json::json!({"comet_workers_preset_catalog_version": 1}),
+        serde_json::json!({"comet_workers_preset_catalog_version": 2}),
+    ] {
+        let home = TempDir::new()?;
+        let _guard = UnpeelHomeGuard::set(home.path());
+        let mut raw = markers;
+        raw["presets"] = serde_json::json!([]);
+        fs::write(
+            home.path().join("app-state.json"),
+            serde_json::to_vec(&raw)?,
+        )?;
+        let settings = LocalWorkersClient::new().settings()?;
+        let expected = match raw["comet_workers_preset_catalog_version"].as_u64() {
+            Some(2) => vec![],
+            Some(1) => vec!["agy"],
+            _ => vec!["omp", "prime-agent", "agy"],
+        };
+        assert_eq!(
+            settings
+                .presets
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_presets_are_not_replaced_with_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let home = TempDir::new()?;
+    let _guard = UnpeelHomeGuard::set(home.path());
+    let state_path = home.path().join("app-state.json");
+    for raw in [
+        br#"{"presets": {"invalid": true}}"#.as_slice(),
+        br#"{"presets": [{"id": "broken"}]}"#.as_slice(),
+    ] {
+        fs::write(&state_path, raw)?;
+        assert!(LocalWorkersClient::new().settings().is_err());
+        assert_eq!(fs::read(&state_path)?, raw);
+    }
+    Ok(())
+}
+
+#[test]
 fn resource_settings_default_to_invisible_monitoring_and_disabled_hibernation() {
     let settings = WorkersResourceSettings::default();
 

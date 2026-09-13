@@ -31,6 +31,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
 
+- **Settings inicializa os presets no primeiro uso.** `migrate_comet_workers_presets` popula `builtin_global_presets()` quando a lista está vazia, a versão é zero e `native_preset_overlay_migrated` está ausente/false. Elegibilidade, presets e markers são lidos/gravados sob o mesmo lock. A lista persistida alimenta o próximo bootstrap; detecção de instalação continua sendo projeção do catálogo de runtimes. Versão positiva ou marker nativo impede restaurar o catálogo completo após exclusões; migrações v1/v2 existentes continuam adicionando só seus IDs. Dados malformados falham sem sobrescrita.
+
 - **Request id é sequência única do processo.** O `REPLAY_CACHE` do host é global e chaveado por `(principal, request_id)`, e todo `LocalWorkersClient` fala pelo mesmo principal (`comet-local`). Um contador por instância fazia cada `new()` recomeçar em 1 — e a UI criava cinco (terminal, model, resource monitor, workspace, settings/projects). Hoje a UI passa por `crate::workers::client::shared()` e tem **uma** instância, mas o contador compartilhado permanece como segunda defesa: qualquer consumidor novo (controller MCP, teste, host) volta a criar clientes próprios. Colidir com payload diferente devolve `409: request id reused with different request`; colidir com payload **igual** é pior, porque o segundo cliente recebe a resposta do primeiro sem erro nenhum. `next_request_id` é `shared_next_request_id()`, no mesmo padrão `OnceLock` dos outros campos compartilhados.
 
 - **`third_party/unpeel` e codigo vendorizado, nao submodulo.** O upstream
@@ -450,7 +452,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
-| `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
+| `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
 
