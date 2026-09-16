@@ -11601,6 +11601,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "zeron-doc",
  "zeron-proto",
  "zeron-workers-unpeel",
 ]

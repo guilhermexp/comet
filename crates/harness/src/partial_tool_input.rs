@@ -1,5 +1,20 @@
 use zeron_proto::ToolCall;
 
+/// Minimum spacing between partial previews — the host's streamed commit
+/// window, IMPORTED and never restated.
+///
+/// It used to be a literal 100ms while the host committed every 120ms. Two
+/// throttles in series whose periods do not divide each other alias: a preview
+/// emitted just after a window closes waits the whole window, two inside one
+/// window collapse to one, and the visible cadence pulses on their LCM (600ms)
+/// instead of holding steady. Tying them together is what removes the beat.
+///
+/// The gate stays — it bounds the EVENT stream, not just the doc. Without it a
+/// megabyte body emits one event per delta, and the linearity suites cap a
+/// streamed megabyte at 70 refreshes.
+const PREVIEW_GATE: std::time::Duration =
+    std::time::Duration::from_millis(zeron_doc::STREAM_COMMIT_MS);
+
 pub(crate) const PARTIAL_PREVIEW_BODY_MAX_BYTES: usize = 8 * 1024;
 pub(crate) const PARTIAL_REFRESH_BYTES: usize = 16 * 1024;
 const PARTIAL_PATH_MAX_BYTES: usize = 4 * 1024;
@@ -164,7 +179,7 @@ impl PartialFileToolInput {
             && !first_semantic_followup
             && self
                 .last_emit_at
-                .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_millis(100))
+                .is_some_and(|at| now.duration_since(at) < PREVIEW_GATE)
         {
             return None;
         }
@@ -502,7 +517,9 @@ mod tests {
         parser.push(r#"{"file_path":"a.rs","content":"first"#);
         parser.push(r#"\nsecond"#); // initial semantic follow-up
         assert!(parser.push(" token").is_none());
-        std::thread::sleep(std::time::Duration::from_millis(110));
+        // Derived from the gate, never a literal: a hardcoded sleep is what
+        // makes this test silently pass-or-fail when the cadence is retuned.
+        std::thread::sleep(PREVIEW_GATE + std::time::Duration::from_millis(10));
         assert!(matches!(parser.push(" third"),
             Some(ToolCall::WriteFile { content: Some(content), .. })
                 if content == "first\nsecond token third"));
@@ -510,6 +527,21 @@ mod tests {
         assert!(matches!(parser.force_preview(),
             Some(ToolCall::WriteFile { content: Some(content), .. })
                 if content.ends_with("third final")));
+    }
+
+    #[test]
+    fn the_preview_gate_is_the_commit_window() {
+        // Two throttles in series whose periods do not divide each other alias:
+        // the visible cadence pulses on their LCM rather than holding steady.
+        // This is the whole point of the constant, so it is pinned here.
+        assert_eq!(
+            PREVIEW_GATE,
+            std::time::Duration::from_millis(zeron_doc::STREAM_COMMIT_MS),
+        );
+        // And the gate must still exist: it bounds the event stream, not just
+        // the doc, and the linearity suites cap a streamed megabyte at 70
+        // refreshes.
+        assert!(!PREVIEW_GATE.is_zero());
     }
 
     #[test]
