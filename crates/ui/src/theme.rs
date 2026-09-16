@@ -1395,15 +1395,6 @@ impl Theme {
             wash_for(self.appearance, 0.05)
         }
     }
-
-    /// Effective sidebar column fill after the extra wash, if any.
-    pub fn sidebar_column_fill(&self) -> Hsla {
-        if self.flat_shell {
-            self.surface
-        } else {
-            flatten(self.sidebar_column_overlay(), self.surface)
-        }
-    }
 }
 
 impl Default for Theme {
@@ -2631,7 +2622,6 @@ mod tests {
         assert_eq!(mono.frost_blur_radius, Some(24.0));
         assert!(mono.flat_shell);
         assert_eq!(mono_theme.frost_blur_or(crate::frost::MENU_BLUR), 24.0);
-        assert_eq!(mono_theme.sidebar_column_fill(), mono_theme.surface);
         assert_eq!(mono_theme.sidebar_column_overlay().a, 0.0);
         if cfg!(target_os = "macos") {
             // Authored coverage is 0.85; the renderer may take one contrast
