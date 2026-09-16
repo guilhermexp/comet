@@ -3592,7 +3592,7 @@ impl Render for ContextUsageTooltip {
         let theme = Theme::of(cx);
         crate::frost::frosted(
             10.0,
-            16.0,
+            theme.frost_blur_or(16.0),
             div()
                 .w(px(220.0))
                 .px(px(14.0))
@@ -7115,7 +7115,8 @@ impl Composer {
         // [`crate::frost::MENU_BLUR`] documents 16 as leaving backdrop detail
         // ghosting through rows. The pill gets away with 16 because it is one
         // line tall.
-        crate::frost::frosted(26.0, crate::frost::MENU_BLUR, panel).into_any_element()
+        crate::frost::frosted(26.0, theme.frost_blur_or(crate::frost::MENU_BLUR), panel)
+            .into_any_element()
     }
 
     fn render_send_button(
@@ -8359,7 +8360,7 @@ impl Render for Composer {
                 .relative()
                 .child(crate::frost::frosted(
                     COMPOSER_CORNER_RADIUS,
-                    16.0,
+                    theme.frost_blur_or(16.0),
                     motion::fade_quick("composer-input", body),
                 ))
                 // Both completion popups span the full pill width above it —

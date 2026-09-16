@@ -290,6 +290,9 @@ fn open_main_window(
             },
             move |window, cx| {
                 appearance::observe_window(window, cx).detach();
+                window.set_background_blur_radius(
+                    theme::Theme::of(cx).window_background_blur_radius(),
+                );
                 cx.new(|cx| shell::Shell::new(shell_state, boot, workers_model, cx))
             },
         )

@@ -16,7 +16,7 @@ use gpui::{
     SharedString, Style, TextRun, Window, fill, font, outline, point, px, relative, size,
 };
 
-use crate::theme::{Appearance, Theme, rgb_to_hsl};
+use crate::theme::{Appearance, Theme, flatten, rgb_to_hsl};
 
 use super::emulator::{CellColor, CellSnapshot, Side};
 use super::panel::TerminalPanel;
@@ -100,7 +100,17 @@ fn extended_indexed_rgb(appearance: Appearance, index: u8) -> (u8, u8, u8) {
 pub fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
     match color {
         CellColor::Foreground => theme.terminal.foreground,
-        CellColor::Background => theme.terminal.background,
+        CellColor::Background => {
+            let background = theme.terminal.background;
+            // Alpha 0 (MonoCode) is a window-canvas hole. Used as a glyph
+            // after SGR 7 it would paint invisible ink; flatten onto the
+            // shell so reverse video stays opaque.
+            if background.a < 1.0 {
+                flatten(background, theme.surface)
+            } else {
+                background
+            }
+        }
         CellColor::Indexed(ix @ 0..=15) => theme.terminal.ansi[ix as usize],
         CellColor::Indexed(ix) => {
             let (r, g, b) = extended_indexed_rgb(theme.appearance, ix);
@@ -714,7 +724,11 @@ fn shape_row(
         }
         let (fg, _) = cell.display_colors();
         let mut color = resolve_color(fg, theme);
-        if cell.dim {
+        if cell.hidden {
+            // Hidden cells swap fg onto bg; flattening Background for inverse
+            // glyphs must not make hidden text reappear.
+            color.a = 0.0;
+        } else if cell.dim {
             color.a *= 0.6;
         }
         let mut cell_font = mono.clone();
@@ -995,6 +1009,37 @@ mod tests {
             (238, 238, 238)
         );
         assert_eq!(extended_indexed_rgb(Appearance::Light, 255), (8, 8, 8));
+    }
+
+    #[test]
+    fn monocode_wash_terminal_inverse_stays_legible() {
+        let variant = zeron_theme::ThemeRegistry::builtin()
+            .variant("monocode-dark")
+            .expect("monocode-dark");
+        let theme = Theme::from_variant(
+            variant,
+            zeron_theme::AccentSelection::ThemeDefault,
+            zeron_theme::SurfacePreference::Frosted,
+        );
+        let mut emulator = crate::terminal::emulator::Emulator::new(16, 2);
+        emulator.feed(b"\x1b[7mI");
+        let cell = emulator.line(0)[0];
+        assert!(cell.inverse);
+        let (fg, bg) = cell.display_colors();
+        assert_eq!(fg, CellColor::Background);
+        assert_eq!(bg, CellColor::Foreground);
+        let glyph = resolve_color(fg, &theme);
+        let cell_bg = resolve_color(bg, &theme);
+        assert!(
+            glyph.a >= 1.0 - f32::EPSILON,
+            "inverse glyph alpha is {}, not full",
+            glyph.a
+        );
+        let contrast = crate::theme::contrast_ratio(glyph, cell_bg);
+        assert!(
+            contrast >= 4.5,
+            "inverse glyph contrast is {contrast:.2}:1 against the cell background"
+        );
     }
 
     #[test]

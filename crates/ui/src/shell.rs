@@ -10246,7 +10246,7 @@ impl Render for Shell {
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(crate::theme::wash(0.05))
+                    .bg(Theme::of(cx).sidebar_column_overlay())
                     .border_r_1()
                     .border_color(border_color);
                 // The content row spans the FULL window height — the titlebar

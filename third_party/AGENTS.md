@@ -10,6 +10,8 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - `cmux/` — checkout local-only do terminal macOS baseado em Ghostty, usado
   apenas como referência de pesquisa.
 - `unpeel-upstream.toml` — proveniência verificável do snapshot vendorizado.
+- `zui/` — snapshot vendorizado do renderer gpui (`zeronsh/zui`), consumido por `path` no `Cargo.toml` raiz.
+- `zui-upstream.toml` — proveniência verificável do snapshot gpui.
 - `rust/` — snapshots licenciados de crates.io com patches mínimos de compatibilidade do toolchain e transporte, documentados em `rust/PATCHES.md` e consumidos por `[patch.crates-io]`.
 
 ## Ownership
@@ -49,8 +51,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   downstream e atualização simultânea de `vendored_tree` na metadata.
 - `cmux/` não é rastreado, está excluído em `.git/info/exclude`, e nenhum build,
   CI ou documento operacional pode depender da sua presença.
-- O renderer gpui (`zeronsh/zui`) continua uma dependência Git do Cargo, não um
-  diretório desta árvore. Crates GPL do Zed permanecem proibidas.
+- O renderer gpui (`zeronsh/zui`) mora em `zui/`. O workspace **exclui** `third_party/zui` porque o snapshot tem workspace próprio; só `gpui` / `gpui_platform` / `gpui_tokio` entram no build do Comet pela dependência path. Não editar o conteúdo do vendor: se o head vendorizado não compilar, reportar — não patchar código de terceiro aqui. Crates GPL do Zed permanecem proibidas.
 - Patches em `rust/` não são atualização de dependência: a versão publicada permanece idêntica e a mudança deve se limitar ao diagnóstico documentado que motivou a vendorização. Nova correção exige proveniência em `rust/PATCHES.md`.
 
 ## Work Guidance
@@ -148,9 +149,11 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 | `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
+| `third_party/zui` | unit no vendor (API de blur da janela) + compile downstream | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --lib window_blur_` · `cargo build -p zeron` |
 
 ## Child DOX Index
 
 | Domínio | Doc | Papel |
 |---|---|---|
 | Unpeel | [`unpeel/AGENTS.md`](unpeel/AGENTS.md) | Contratos upstream e verificação executável de hooks do fork |
+| zui | — | Snapshot vendorizado do gpui; regra local vive neste doc |

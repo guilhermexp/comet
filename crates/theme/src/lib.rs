@@ -75,6 +75,13 @@ pub enum SurfacePreference {
     Opaque,
 }
 
+/// Inclusive frost coverage accepted on a deserialized variant.
+pub const FROST_ALPHA_MIN: f32 = 0.0;
+pub const FROST_ALPHA_MAX: f32 = 1.0;
+/// Inclusive backdrop blur radius, in pixels, accepted on a deserialized variant.
+pub const FROST_BLUR_RADIUS_MIN: f32 = 0.0;
+pub const FROST_BLUR_RADIUS_MAX: f32 = 64.0;
+
 impl SurfacePreference {
     pub const ALL: [Self; 3] = [Self::ThemeDefault, Self::Frosted, Self::Opaque];
 
@@ -490,7 +497,7 @@ pub struct TerminalPalette {
     pub ansi: [Color; 16],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemeVariant {
     pub id: String,
@@ -506,7 +513,18 @@ pub struct ThemeVariant {
     pub syntax: BTreeMap<String, Color>,
     pub terminal: TerminalPalette,
     pub source: ThemeSource,
+    /// Window frost coverage. `None` keeps the renderer's default alpha.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frost_alpha: Option<f32>,
+    /// Backdrop blur radius in pixels. `None` keeps each call site's fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frost_blur_radius: Option<f32>,
+    /// When true the sidebar column is the shell fill with no extra wash.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flat_shell: bool,
 }
+
+impl Eq for ThemeVariant {}
 
 impl ThemeVariant {
     pub fn accent_for(&self, selection: AccentSelection) -> AccentRoles {
@@ -621,14 +639,16 @@ impl ThemeRegistry {
                     variant.accent.strong,
                     4.5,
                 );
+                let terminal_canvas = flattened_terminal_canvas(variant);
                 validate_contrast(
                     &mut issues,
                     variant,
                     "terminal foreground",
                     variant.terminal.foreground,
-                    variant.terminal.background,
+                    terminal_canvas,
                     4.5,
                 );
+                validate_frost_bounds(&mut issues, variant);
                 if variant.source.url.is_empty()
                     || variant.source.revision.is_empty()
                     || variant.source.license.is_empty()
@@ -646,7 +666,7 @@ impl ThemeRegistry {
                     if index % 8 == 0 {
                         continue;
                     }
-                    if color.contrast(variant.terminal.background) < 3.0 {
+                    if color.contrast(terminal_canvas) < 3.0 {
                         issues.push(ValidationIssue::contrast_warning(
                             &variant.id,
                             format!("terminal ANSI slot {index} is below 3:1"),
@@ -656,6 +676,43 @@ impl ThemeRegistry {
             }
         }
         issues
+    }
+}
+
+fn flattened_terminal_canvas(variant: &ThemeVariant) -> Color {
+    variant
+        .terminal
+        .background
+        .blend_over(variant.colors.background)
+}
+
+fn frost_out_of_range(value: f32, min: f32, max: f32) -> bool {
+    match value {
+        v if v.is_finite() && v >= min && v <= max => false,
+        _ => true,
+    }
+}
+
+fn validate_frost_bounds(issues: &mut Vec<ValidationIssue>, variant: &ThemeVariant) {
+    if let Some(alpha) = variant.frost_alpha {
+        if frost_out_of_range(alpha, FROST_ALPHA_MIN, FROST_ALPHA_MAX) {
+            issues.push(ValidationIssue::structural_error(
+                &variant.id,
+                format!(
+                    "frost_alpha {alpha} is outside {FROST_ALPHA_MIN}..={FROST_ALPHA_MAX} or not finite"
+                ),
+            ));
+        }
+    }
+    if let Some(radius) = variant.frost_blur_radius {
+        if frost_out_of_range(radius, FROST_BLUR_RADIUS_MIN, FROST_BLUR_RADIUS_MAX) {
+            issues.push(ValidationIssue::structural_error(
+                &variant.id,
+                format!(
+                    "frost_blur_radius {radius} is outside {FROST_BLUR_RADIUS_MIN}..={FROST_BLUR_RADIUS_MAX} or not finite"
+                ),
+            ));
+        }
     }
 }
 
@@ -899,5 +956,280 @@ mod tests {
             .map(|c| c.to_string())
             .collect();
         assert_eq!(actual_ansi, expected_ansi);
+        assert_eq!(variant.source.revision, "85a5d03");
+        assert_eq!(variant.terminal.background.to_string(), "#17171700");
     }
+
+    #[test]
+    fn monocode_fidelity_state_roles_are_neutral() {
+        let variant = ThemeRegistry::builtin()
+            .variant("monocode-dark")
+            .expect("monocode-dark variant should be resolved");
+        let colors = &variant.colors;
+        assert_eq!(colors.border.to_string(), "#ebebeb12");
+        assert_eq!(colors.border_strong.to_string(), "#ebebeb33");
+        assert_eq!(colors.hover.to_string(), "#ebebeb26");
+        assert_eq!(colors.active.to_string(), "#ebebeb1f");
+        assert_eq!(colors.input.to_string(), "#ebebeb0f");
+        assert_eq!(colors.diff_hunk.to_string(), "#ebebeb0d");
+        assert_eq!(colors.cursor.to_string(), "#459bf7");
+        assert_eq!(variant.terminal.selection.to_string(), "#ffffff2e");
+        assert_eq!(colors.input.a, (0.06_f32 * 255.0).round() as u8);
+        let composer_over_canvas = |pct: f32| {
+            let mix = |ink: u8, canvas: u8| {
+                (ink as f32 * pct + canvas as f32 * (1.0 - pct)).round() as u8
+            };
+            Color::rgb(
+                mix(colors.text.r, colors.background.r),
+                mix(colors.text.g, colors.background.g),
+                mix(colors.text.b, colors.background.b),
+            )
+        };
+        assert_eq!(composer_over_canvas(0.03).to_string(), "#1d1d1d");
+        let accent = variant.accent.primary;
+        for role in [
+            colors.hover,
+            colors.active,
+            colors.border,
+            colors.border_strong,
+            colors.input,
+            colors.diff_hunk,
+        ] {
+            assert_eq!(role.r, role.g, "role {role} is not neutral");
+            assert_eq!(role.g, role.b, "role {role} is not neutral");
+            assert_ne!(
+                (role.r, role.g, role.b),
+                (accent.r, accent.g, accent.b),
+                "role {role} carries the accent hue"
+            );
+        }
+    }
+
+    #[test]
+    fn monocode_fidelity_non_declaring_variants_are_unchanged() {
+        let registry = ThemeRegistry::builtin();
+        for (id, hover, active, border, border_strong, input, cursor, diff_hunk, selection, hash) in
+            NON_DECLARING_VARIANT_FIXTURES
+        {
+            let variant = registry
+                .variant(id)
+                .unwrap_or_else(|| panic!("{id} should be registered"));
+            let encoded = serde_json::to_value(variant).expect("variant serializes");
+            assert!(
+                encoded.get("frostAlpha").is_none()
+                    && encoded.get("frostBlurRadius").is_none()
+                    && encoded.get("flatShell").is_none(),
+                "{id} serialized frost fields, which would move asset_hash"
+            );
+            assert_eq!(variant.colors.hover.to_string(), hover, "{id} hover");
+            assert_eq!(variant.colors.active.to_string(), active, "{id} active");
+            assert_eq!(variant.colors.border.to_string(), border, "{id} border");
+            assert_eq!(
+                variant.colors.border_strong.to_string(),
+                border_strong,
+                "{id} border_strong"
+            );
+            assert_eq!(variant.colors.input.to_string(), input, "{id} input");
+            assert_eq!(variant.colors.cursor.to_string(), cursor, "{id} cursor");
+            assert_eq!(
+                variant.colors.diff_hunk.to_string(),
+                diff_hunk,
+                "{id} diff_hunk"
+            );
+            assert_eq!(
+                variant.terminal.selection.to_string(),
+                selection,
+                "{id} terminal.selection"
+            );
+            assert_eq!(variant.source.asset_hash, hash, "{id} asset_hash");
+        }
+        for variant in registry
+            .families
+            .iter()
+            .flat_map(|family| &family.variants)
+            .filter(|variant| variant.id != "monocode-dark")
+        {
+            let encoded = serde_json::to_value(variant).expect("variant serializes");
+            assert!(
+                encoded.get("frostAlpha").is_none()
+                    && encoded.get("frostBlurRadius").is_none()
+                    && encoded.get("flatShell").is_none(),
+                "{} serialized frost fields, which would move asset_hash",
+                variant.id
+            );
+        }
+    }
+
+    #[test]
+    fn monocode_fidelity_terminal_background_keeps_alpha() {
+        let variant = ThemeRegistry::builtin()
+            .variant("monocode-dark")
+            .expect("monocode-dark variant should be resolved");
+        assert_eq!(variant.terminal.background.to_string(), "#17171700");
+        assert_eq!(variant.terminal.background.a, 0);
+        let flattened = variant
+            .terminal
+            .background
+            .blend_over(variant.colors.background);
+        assert_eq!(flattened.to_string(), "#171717");
+        assert!(
+            variant.terminal.foreground.contrast(flattened) >= 4.5,
+            "terminal foreground contrast is {:.2}:1 against flattened canvas",
+            variant.terminal.foreground.contrast(flattened)
+        );
+    }
+
+    fn registry_with(variant: ThemeVariant) -> ThemeRegistry {
+        ThemeRegistry {
+            families: vec![ThemeFamily {
+                id: variant.family_id.clone(),
+                name: variant.name.clone(),
+                variants: vec![variant],
+            }],
+        }
+    }
+
+    #[test]
+    fn frost_bounds_rejects_out_of_range() {
+        let monocode = ThemeRegistry::builtin()
+            .variant("monocode-dark")
+            .expect("monocode-dark")
+            .clone();
+        assert_eq!(monocode.frost_alpha, Some(0.85));
+        assert_eq!(monocode.frost_blur_radius, Some(24.0));
+        let in_range = registry_with(monocode.clone()).validate();
+        assert!(
+            in_range
+                .iter()
+                .all(|issue| !issue.message.contains("frost")),
+            "monocode-dark frost parameters produced issues: {in_range:#?}"
+        );
+
+        let mut too_large = monocode.clone();
+        too_large.frost_blur_radius = Some(100_000.0);
+        let mut negative = monocode.clone();
+        negative.frost_blur_radius = Some(-1.0);
+        let mut alpha_high = monocode;
+        alpha_high.frost_alpha = Some(2.0);
+
+        for (label, variant) in [
+            ("frostBlurRadius 100000.0", too_large),
+            ("frostBlurRadius -1.0", negative),
+            ("frostAlpha 2.0", alpha_high),
+        ] {
+            let issues: Vec<_> = registry_with(variant)
+                .validate()
+                .into_iter()
+                .filter(|issue| issue.is_blocking())
+                .collect();
+            assert!(
+                issues.iter().any(|issue| {
+                    issue.category == ValidationCategory::Structural
+                        && issue.message.contains("frost")
+                }),
+                "{label} produced no blocking structural frost issue: {issues:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frost_bounds_terminal_contrast_uses_flattened_canvas() {
+        let mut variant = ThemeRegistry::builtin()
+            .variant("zeron-dark")
+            .expect("zeron-dark")
+            .clone();
+        variant.id = "frost-bounds-terminal-canvas".into();
+        // White RGB at alpha 0: contrast() against the seed sees a white plate
+        // the runtime never paints. Flattened over the dark canvas, a near-black
+        // foreground disappears.
+        variant.terminal.background = Color::rgba(255, 255, 255, 0);
+        variant.terminal.foreground = Color::rgb(10, 10, 10);
+        let raw = variant
+            .terminal
+            .foreground
+            .contrast(variant.terminal.background);
+        let flattened = variant
+            .terminal
+            .background
+            .blend_over(variant.colors.background);
+        let against_canvas = variant.terminal.foreground.contrast(flattened);
+        assert!(
+            raw >= 4.5,
+            "fixture must pass against the raw seed ({raw:.2}:1)"
+        );
+        assert!(
+            against_canvas < 4.5,
+            "fixture must fail against the flattened canvas ({against_canvas:.2}:1)"
+        );
+        let issues = registry_with(variant).validate();
+        assert!(
+            issues.iter().any(|issue| {
+                issue.category == ValidationCategory::Contrast
+                    && issue.message.contains("terminal foreground")
+            }),
+            "validation did not reject foreground that only passes against the raw seed: {issues:#?}"
+        );
+    }
+
+    const NON_DECLARING_VARIANT_FIXTURES: [(
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+    ); 4] = [
+        (
+            "dracula",
+            "#ffffff1c",
+            "#bd93f92e",
+            "#ffffff1a",
+            "#ffffff2e",
+            "#44475ab8",
+            "#f8f8f266",
+            "#bd93f914",
+            "#ffffff38",
+            "sha256:0b58791c5d0f6c734f3d8067bb2306714ca4ad0e5486df94fbfb63e210372a21",
+        ),
+        (
+            "nord",
+            "#ffffff1c",
+            "#88c0d02e",
+            "#ffffff1a",
+            "#ffffff2e",
+            "#434c5eb8",
+            "#d8dee966",
+            "#88c0d014",
+            "#ffffff38",
+            "sha256:c755c8df13672b5a2d05ffc953b44465977d13eb868fa01426acdb01375f169e",
+        ),
+        (
+            "andromeda",
+            "#ffffff1c",
+            "#00e8c62e",
+            "#ffffff1a",
+            "#ffffff2e",
+            "#2d313bb8",
+            "#d5ced966",
+            "#00e8c614",
+            "#ffffff38",
+            "sha256:cceb72fb94316b4e15918578c8e4387c2a49ae36c048bc32ea131cbc9617dfe5",
+        ),
+        (
+            "zeron-dark",
+            "#ffffff1c",
+            "#8b7cf62e",
+            "#ffffff1a",
+            "#ffffff2e",
+            "#343438b8",
+            "#e8e8ea66",
+            "#8b7cf614",
+            "#ffffff38",
+            "sha256:f9f884d86a85710dce959329d682cb88cc5f6bf2c05ea4db65c5a935a241988c",
+        ),
+    ];
 }

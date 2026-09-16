@@ -18,6 +18,7 @@ members = [
 ]
 exclude = [
     "third_party/unpeel",
+    "third_party/zui",
     "third_party/rust/block-0.1.6",
     "third_party/rust/proc-macro-error2-2.0.1",
     "third_party/rust/rtc-sctp-0.20.5",
@@ -73,14 +74,17 @@ loro-protocol = "0.3"
 # stopped vending CABackdropLayer for Selection — window blur went dead);
 # b68970e rasterizes BackdropBlur in the wgpu renderer (frosted floats on
 # Linux — the Metal path's snapshot/blur/composite, ported).
-gpui = { git = "https://github.com/zeronsh/zui", rev = "07fd941ad72e7edc812fed317aab66adb69fa8cc" }
-gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "07fd941ad72e7edc812fed317aab66adb69fa8cc", features = [
+# The tree now lives at `third_party/zui` (see `third_party/zui-upstream.toml`);
+# path deps replace the previous git pin so `Window::set_background_blur_radius`
+# is available without pushing to zeronsh/zui.
+gpui = { path = "third_party/zui/crates/gpui" }
+gpui_platform = { path = "third_party/zui/crates/gpui_platform", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "07fd941ad72e7edc812fed317aab66adb69fa8cc" }
+gpui_tokio = { path = "third_party/zui/crates/gpui_tokio" }
 
 # diffs
 similar = "2"

@@ -11,7 +11,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 ## Stack
 
 - **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,preview}` + `apps/zeron` (membro padrão do workspace).
-- **UI = gpui**, pinado num fork do Zed (`zeronsh/zui`, extração Apache-2.0 de `zeronsh/zui`, rev fixado em `Cargo.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
+- **UI = gpui**, snapshot vendorizado de `zeronsh/zui` em `third_party/zui` (Apache-2.0; proveniência em `third_party/zui-upstream.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
 - **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres nem Hono server. Sync não usa WebRTC; previews de servidores usam RTC autenticado por PreviewRoom.
 - **apps/ios** — cliente iOS (projeto Xcode), fora do workspace Cargo.
@@ -50,7 +50,7 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 - `crates/tui` / `apps/tui` foram **deletados** (upstream removeu o viewport ratatui). Isso **não** é o painel de terminal dentro do app — esse vive em `crates/ui/src/terminal/` e está intacto.
 - `dist/` guarda **assets-fonte** de packaging (ícone, `.desktop`, `Info.plist`), consumidos por `scripts/package-*.sh` e pelo workflow de release. Só `edge/dist/` é gerado/ignorado — não apagar a `dist/` da raiz.
 - Build do gpui é caro; `[profile.dev]` já usa `opt-level = 2` pras deps. Primeira build leva minutos.
-- Bump do rev do gpui exige verificar ambas as regras de `comet/line-wrap-closing-punctuation` (`line_wrapper` e `line_layout`); o pin zui 07fd941a já incorpora essas correções.
+- Re-vendorizar `third_party/zui` exige verificar ambas as regras de `comet/line-wrap-closing-punctuation` (`line_wrapper` e `line_layout`); não editar o conteúdo do vendor no lugar.
 - **Live Voice pertence à engine host, não à surface selecionada.** Trocar/limpar o Chat, perder foco ou minimizar não encerra a call. Em `Working`/`AwaitingInput`, start exige que o OMP anuncie contexto operacional silencioso; a engine projeta só status/texto visível/label de tool/espera/erro e coalesce o último snapshot. Delegação vocal confirmada entra como comando durável `Steer`, com fallback único para novo turno se o run assentar; comando durável alheio, End/Escape no Chat ativo, falha de transporte, shutdown ou quit encerram. Run OMP estacionado em `Idle` continua quente e requer só Live básico.
 - Este é um repo de terceiro sob MIT. Preservar licença e atribuição.
 
@@ -95,4 +95,4 @@ A seção **Verification** carrega a **Test Coverage Matrix** local (`camada/pat
 | Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/zeron` (CLI headed/headless) e `apps/ios` |
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |
-| Código externo | [`third_party/AGENTS.md`](third_party/AGENTS.md) | Unpeel vendorizado, patches Rust licenciados, proveniência e referências locais |
+| Código externo | [`third_party/AGENTS.md`](third_party/AGENTS.md) | Unpeel e zui vendorizados, patches Rust licenciados, proveniência e referências locais |

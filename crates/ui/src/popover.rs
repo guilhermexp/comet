@@ -366,7 +366,8 @@ fn exit_progress(since: std::time::Instant) -> f32 {
 /// primitive ignores `element_opacity`, so without this the glass slab would
 /// hold full strength through the fade and pop off at unmount.
 fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
-    let blur = crate::frost::MENU_BLUR * (1.0 - exit.unwrap_or(0.0));
+    let blur =
+        crate::theme::current_frost_blur(crate::frost::MENU_BLUR) * (1.0 - exit.unwrap_or(0.0));
     crate::frost::frosted(CARD_RADIUS, blur, content).into_any_element()
 }
 
@@ -659,8 +660,12 @@ fn modal_with(
     corner_radius: f32,
     scrim: f32,
 ) -> AnyElement {
-    let card =
-        crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR, card).into_any_element();
+    let card = crate::frost::frosted(
+        corner_radius,
+        crate::theme::current_frost_blur(crate::frost::MENU_BLUR),
+        card,
+    )
+    .into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
