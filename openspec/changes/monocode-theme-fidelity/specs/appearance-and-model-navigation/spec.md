@@ -54,6 +54,12 @@ A theme SHALL be able to declare its frost alpha, its backdrop blur radius and w
 - **THEN** the input wash keeps its authored alpha
 - **AND** the composer fill is half of that alpha
 
+#### Scenario: Composer fill keeps plate coverage without an authored wash
+- Test: unit — `zeron-ui` asserts `composer_glass_bg` under forced frost is half of 15/255 on `monocode-dark` and `0.5 × a²` of `input_glass_bg` on `zeron-dark`.
+- **WHEN** frost is forced on `monocode-dark` and `zeron-dark`
+- **THEN** `monocode-dark` composer alpha is half of the seeded wash
+- **AND** `zeron-dark` composer alpha is the historical quadratic coverage of its own input plate
+
 #### Scenario: Reverse video stays opaque on a translucent terminal
 - Test: unit — `zeron-ui` feeds SGR 7 to a `monocode-dark` cell and asserts the glyph colour is fully opaque with readable contrast against the cell background.
 - **WHEN** a terminal cell with default colours is inverted under `monocode-dark`

@@ -32,3 +32,4 @@
 - [x] 5.3 Flatten `CellColor::Background` when it is a glyph colour so SGR 7 stays opaque on a translucent terminal; lock with `monocode_wash_terminal_inverse_stays_legible`.
 - [x] 5.4 Reject out-of-range `frost_alpha` / `frost_blur_radius` as blocking structural issues in `ThemeRegistry::validate`; clamp blur so `frost_blur_or` and `current_frost_blur` agree.
 - [x] 5.5 Measure terminal contrast in `validate` and model-foreground hardening against `terminal.background.blend_over(colors.background)`; lock with `frost_bounds_terminal_contrast_uses_flattened_canvas`.
+- [x] 5.6 Preserve historical plate coverage in `composer_glass_bg` (`fill.opacity(fill.a * 0.5)`) and use the real half only for authored washes (`input_bg.a < 0.20`); lock with `composer_fill_keeps_plate_coverage_and_halves_wash`.

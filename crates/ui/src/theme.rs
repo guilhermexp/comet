@@ -902,9 +902,17 @@ impl Theme {
     /// pinned at the top of its turn.
     pub fn composer_glass_bg(&self) -> Hsla {
         let fill = self.input_glass_bg();
-        // Hsla::opacity multiplies; 0.5 halves coverage instead of
-        // squaring the authored alpha.
-        fill.opacity(0.5)
+        // Two regimes because Hsla::opacity multiplies. The historical
+        // `fill.opacity(fill.a * 0.5)` was quadratic (0.5 · a²) and was
+        // calibrated by eye for plate-type inputs — the product owner asked
+        // to lower coverage. Authored washes (`input_bg.a < 0.20`, same
+        // criterion as `input_glass_bg`) need the real half (0.5 · a);
+        // applying the quadratic to a 6% wash would land at 0.17%, no fill.
+        if self.input_bg.a < 0.20 {
+            fill.opacity(0.5)
+        } else {
+            fill.opacity(fill.a * 0.5)
+        }
     }
 
     /// Section-card fill (settings cards and similar in-panel cards). The
@@ -2672,6 +2680,46 @@ mod tests {
             (composer - SEEDED_ALPHA * 0.5).abs() < ALPHA_TOLERANCE,
             "composer_glass_bg alpha {composer} != half of seeded {}",
             SEEDED_ALPHA * 0.5
+        );
+    }
+
+    #[test]
+    fn composer_fill_keeps_plate_coverage_and_halves_wash() {
+        let registry = ThemeRegistry::builtin();
+        let mono = Theme::from_variant(
+            registry.variant("monocode-dark").expect("monocode-dark"),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Frosted,
+        );
+        let zeron = Theme::from_variant(
+            registry.variant("zeron-dark").expect("zeron-dark"),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Frosted,
+        );
+        assert!(
+            mono.is_frost(),
+            "this regression is the frost path; got opaque compositing"
+        );
+        assert!(
+            zeron.is_frost(),
+            "this regression is the frost path; got opaque compositing"
+        );
+
+        const SEEDED_WASH: f32 = 15.0 / 255.0;
+        const ALPHA_TOLERANCE: f32 = 1.0 / 255.0;
+        let mono_composer = mono.composer_glass_bg().a;
+        let expected_wash_half = SEEDED_WASH * 0.5;
+        assert!(
+            (mono_composer - expected_wash_half).abs() < ALPHA_TOLERANCE,
+            "monocode-dark composer_glass_bg alpha {mono_composer} != half of seeded wash {expected_wash_half}"
+        );
+
+        let plate = zeron.input_glass_bg().a;
+        let expected_plate = 0.5 * plate * plate;
+        let zeron_composer = zeron.composer_glass_bg().a;
+        assert!(
+            (zeron_composer - expected_plate).abs() < ALPHA_TOLERANCE,
+            "zeron-dark composer_glass_bg alpha {zeron_composer} != historical 0.5·a² {expected_plate} (input_glass_bg.a={plate})"
         );
     }
 

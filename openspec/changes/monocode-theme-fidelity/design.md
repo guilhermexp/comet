@@ -26,7 +26,7 @@ The colour parser already accepts `#rrggbbaa` (`crates/theme/src/lib.rs:90-97,21
 
 ### Input at 6% so the composer lands at 3%
 
-`composer_glass_bg()` halves the input alpha (`crates/ui/src/theme.rs:855-857`) and paints the composer pill, the user bubble and toasts. Seeding `input` at ink 6% therefore lands the composer at ink 3% — the reference value — while plain inputs keep ink 6%, matching the reference's search and picker fills. Seeding 3% directly would halve to 1.5% and read as no fill at all.
+`composer_glass_bg()` paints the composer pill, the user bubble and toasts. Authored washes (`input_bg.a < 0.20`) take the real half of that alpha, so seeding `input` at ink 6% lands the composer at ink 3% — the reference value — while plain inputs keep ink 6%, matching the reference's search and picker fills. Seeding 3% directly would halve to 1.5% and read as no fill at all. Plate-type inputs (`a ≥ 0.20`) keep the historical quadratic coverage (`0.5 · a²`) that was calibrated by eye; `Hsla::opacity` multiplies, so a linear `opacity(0.5)` on those plates would densify zeron-dark ~1.92× and light ~3.33×.
 
 ### Frost parameters on `ThemeVariant`, serde-defaulted
 
