@@ -320,16 +320,16 @@ fn sync_ns_appearance(_mode: AppearanceMode) {}
 
 /// Push the theme's window background appearance onto every open window.
 pub fn reapply_window_background(cx: &mut App) {
-    let Some(wanted) = cx
-        .try_global::<Theme>()
-        .map(|theme| theme.window_background_appearance())
-    else {
+    let Some(theme) = cx.try_global::<Theme>() else {
         return;
     };
+    let wanted = theme.window_background_appearance();
+    let blur_radius = theme.window_background_blur_radius();
     for window in cx.windows() {
         window
             .update(cx, |_, window, _| {
                 window.set_background_appearance(wanted);
+                window.set_background_blur_radius(blur_radius);
             })
             .ok();
     }

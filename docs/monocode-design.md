@@ -425,21 +425,20 @@ pub fn is_frost(&self) -> bool {
 Ou seja, em macOS e Linux, o Comet ativa as camadas de desfoque e translucidez do GPUI. No Windows, o compositor GPUI não possui backend para frost e retrocede silenciosamente para renderização opaca através de `glass()` (`crates/ui/src/theme.rs:734-737`), garantindo que não ocorram artefatos gráficos.
 
 ### 10.3 Frost por variante
-`ThemeVariant` declara `frost_alpha = 0.85`, `frost_blur_radius = 24.0` e `flat_shell = true` em `monocode-dark`. O renderer lê esses campos com `GLASS_ALPHA` / `MENU_BLUR` / `wash(0.05)` como fallback para variantes que não declaram. Off-macOS o frost continua opaco, independente do que a variante peça. Usuários que preferirem casca sólida continuam respaldados pela política local `SurfacePreference::Opaque` (`crates/theme/src/lib.rs:71-87`).
+`ThemeVariant` declara `frost_alpha = 0.85`, `frost_blur_radius = 24.0` e `flat_shell = true` em `monocode-dark`. O renderer lê esses campos com `GLASS_ALPHA` / `MENU_BLUR` / `wash(0.05)` como fallback para variantes que não declaram. A janela pede `Window::set_background_blur_radius(Some(px(24.0)))` só quando o variante declara e a plataforma tem frost; sem declaração o gpui permanece no material AppKit. Off-macOS o frost continua opaco, independente do que a variante peça. Usuários que preferirem casca sólida continuam respaldados pela política local `SurfacePreference::Opaque` (`crates/theme/src/lib.rs:71-87`).
 
 ---
 
 ## 11. GAPs
 
-Fechados nesta change: papéis de interação (hover/active/border/input/cursor/diff_hunk/terminal.selection) como overrides com alpha; `terminal_background` translúcido; frost alpha 0.85, blur 24 e shell plano sem o `wash(0.05)` extra da sidebar.
+Fechados nesta change: papéis de interação (hover/active/border/input/cursor/diff_hunk/terminal.selection) como overrides com alpha; `terminal_background` translúcido; frost alpha 0.85, blur 24 e shell plano sem o `wash(0.05)` extra da sidebar; o vidro da **janela** em `monocode-dark`, que deixa de usar o material AppKit `UnderWindowBackground` (downsample do backdrop) e pede raio WindowServer 24. Sobre o mesmo backdrop a média de luminância é praticamente a mesma (92,4 vs 90,4), mas o WindowServer deixa passar **18,1×** mais energia de alta frequência (0,547 vs 0,030). Variante sem raio declarado continua no material — o comportamento dos outros temas não muda.
 
 Ainda abertos:
 
-1. **Vibrancy e Acrylic do Sistema Operacional:** O MonoCode deixa o wallpaper do desktop atravessar a janela (`src/index.css:98-102`). O Comet declara alpha/blur da casca, mas não compõe o wallpaper do usuário.
-2. **Sliders de Matiz e Saturação em Tempo Real:** Os seletores de personalização em `src/lib/appearance.ts:107-153` alteram dinamicamente `--theme-hue` e `--theme-saturation` no elemento raiz. O port para o Comet assume estritamente o ponto de calibração padrão (`240` / `0%`).
-3. **Biblioteca de Ícones Externa:** O MonoCode depende de ícones vetoriais com pesos de traço próprios via `@hugeicons/core-free-icons` (`src/chrome/icons.tsx:29-33`) e do tema de ícones de arquivos `react-material-icon-theme` (`package.json:51`). O Comet possui seu próprio repositório de glifos no GPUI.
-4. **Animações de Transição de Camada:** O MonoCode define curvas Bézier cúbicas customizadas para a abertura de popovers e diálogos (`src/index.css:966-1033`: `popover-open` em 170ms com `cubic-bezier(0.16, 1, 0.3, 1)` e `modal-panel-in` em 200ms). O modelo `zeron-theme` não armazena timings nem interpolações de movimento.
-5. **Tipografia e geometria por tema:** escala 13px/1.6, titlebar 28px, raios 6/8/12px e densidade — apêndice 12. Fora desta change.
+1. **Sliders de Matiz e Saturação em Tempo Real:** Os seletores de personalização em `src/lib/appearance.ts:107-153` alteram dinamicamente `--theme-hue` e `--theme-saturation` no elemento raiz. O port para o Comet assume estritamente o ponto de calibração padrão (`240` / `0%`).
+2. **Biblioteca de Ícones Externa:** O MonoCode depende de ícones vetoriais com pesos de traço próprios via `@hugeicons/core-free-icons` (`src/chrome/icons.tsx:29-33`) e do tema de ícones de arquivos `react-material-icon-theme` (`package.json:51`). O Comet possui seu próprio repositório de glifos no GPUI.
+3. **Animações de Transição de Camada:** O MonoCode define curvas Bézier cúbicas customizadas para a abertura de popovers e diálogos (`src/index.css:966-1033`: `popover-open` em 170ms com `cubic-bezier(0.16, 1, 0.3, 1)` e `modal-panel-in` em 200ms). O modelo `zeron-theme` não armazena timings nem interpolações de movimento.
+4. **Tipografia e geometria por tema:** escala 13px/1.6, titlebar 28px, raios 6/8/12px e densidade — apêndice 12. Fora desta change.
 
 ---
 

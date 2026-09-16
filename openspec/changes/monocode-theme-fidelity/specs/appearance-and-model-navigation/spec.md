@@ -66,6 +66,12 @@ A theme SHALL be able to declare its frost alpha, its backdrop blur radius and w
 - **THEN** the glyph colour is the terminal background flattened over the canvas, at full alpha
 - **AND** its contrast against the effective cell background stays readable
 
+#### Scenario: Window blur follows the declared frost radius
+- Test: unit — `zeron-ui` `window_blur_monocode_dark_requests_declared_radius` and `window_blur_undeclared_variant_requests_none`.
+- **WHEN** `monocode-dark` is active on a platform with frost
+- **THEN** the window asks `Some(px(24.0))`
+- **AND** a variant that declares no frost radius asks `None`, keeping the AppKit material
+
 ### Requirement: Frost parameters are bounded at the registry boundary
 
 A deserialized variant SHALL only install when `frost_alpha` is finite and within 0.0..=1.0 and `frost_blur_radius` is finite and within 0.0..=64.0. Values outside those ranges SHALL produce a blocking structural `ValidationIssue` so `load_editable_family` and `install` refuse the file. After clamping, instance blur (`frost_blur_or`) and context-free blur (`current_frost_blur`) SHALL return the same radius for the same variant.

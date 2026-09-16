@@ -33,3 +33,9 @@
 - [x] 5.4 Reject out-of-range `frost_alpha` / `frost_blur_radius` as blocking structural issues in `ThemeRegistry::validate`; clamp blur so `frost_blur_or` and `current_frost_blur` agree.
 - [x] 5.5 Measure terminal contrast in `validate` and model-foreground hardening against `terminal.background.blend_over(colors.background)`; lock with `frost_bounds_terminal_contrast_uses_flattened_canvas`.
 - [x] 5.6 Preserve historical plate coverage in `composer_glass_bg` (`fill.opacity(fill.a * 0.5)`) and use the real half only for authored washes (`input_bg.a < 0.20`); lock with `composer_fill_keeps_plate_coverage_and_halves_wash`.
+
+## 6. Window background blur radius
+
+- [x] 6.1 Vendor `zeronsh/zui` at `3712355` into `third_party/zui` (no `.git`, no `target/`), register `third_party/zui-upstream.toml`, and point `gpui` / `gpui_platform` / `gpui_tokio` at the path.
+- [x] 6.2 Decide the window radius from the resolved `Theme` (`Some` only when the variant declares frost blur and the platform frosts) and call `set_background_blur_radius` at window open and in `reapply_window_background`.
+- [x] 6.3 Lock with `window_blur_monocode_dark_requests_declared_radius` (`Some(px(24.0))`) and `window_blur_undeclared_variant_requests_none` (`None`).

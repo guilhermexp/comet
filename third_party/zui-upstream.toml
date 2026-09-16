@@ -1,0 +1,23 @@
+repository = "https://github.com/zeronsh/zui"
+base_revision = "c6076032f0566e631d6c2707f89bd0dd87ab55b4"
+vendored_tree = "37123559dda41271fb4984992f79b644b3d681ba"
+vendored_from = "working-tree"
+license = "Apache-2.0"
+
+# Snapshot of the local working tree at `feat/window-blur-radius` head
+# 3712355, without `.git` or `target/`. Upstream `main` at vendoring time
+# is `base_revision` (merge of nested-frosted-blur). Six local commits
+# sit on top of that base:
+
+# 457b8eda4dca592c0cd52d37c334d9ca52fd1f01
+#   Allow consumers to declare the macOS window-background blur radius.
+# e8e415bac880006cc6d61f56fc6339a2d88a51d8
+#   chore: keep verification evidence out of git
+# c9d1677f13be6895dddffb4dbde0efce8af5a983
+#   no-mistakes(review): Raise blur clamp to 128, drop redundant blur code paths
+# 2c65e882c11fe5b71f65575dca47891d61ea9599
+#   no-mistakes(review): Type blur radius as Pixels, restore AppKit rationale
+# ccbb1c54cb8dd2ab5ef9c7ad1b8b042ee45d1d90
+#   no-mistakes(review): Drop unverifiable scale claim, simplify example call
+# 37123559dda41271fb4984992f79b644b3d681ba
+#   no-mistakes(document): document window_blur example in examples README

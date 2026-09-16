@@ -952,6 +952,18 @@ impl Theme {
         }
     }
 
+    /// Radius the window should ask of the compositor.
+    ///
+    /// `Some` only when the variant declared a frost blur and this platform
+    /// actually frosts. `None` keeps gpui on the AppKit material — today's
+    /// behaviour for every theme that does not declare a radius.
+    pub fn window_background_blur_radius(&self) -> Option<gpui::Pixels> {
+        if !self.is_frost() {
+            return None;
+        }
+        clamp_frost_blur_radius(self.frost_blur_radius).map(gpui::px)
+    }
+
     /// Build the dark theme. The surface tones are sampled straight from the
     /// reference screenshots of the original app (docs/reference): main panel
     /// `#060606`, shell/sidebar `#0d0d0d`.
@@ -1782,7 +1794,8 @@ mod tests {
             srgb_u8(oklch_to_srgb(0.704, 0.191, 22.216)),
             [255, 100, 103]
         ); // red-400
-        assert_eq!(srgb_u8(oklch_to_srgb(0.828, 0.189, 84.429)), [255, 185, 0]); // amber-400
+        assert_eq!(srgb_u8(oklch_to_srgb(0.828, 0.189, 84.429)), [255, 185, 0]);
+        // amber-400
     }
 
     #[test]
@@ -2749,5 +2762,33 @@ mod tests {
             );
         }
         DECLARED_FROST_BLUR_HUNDREDTHS.store(previous, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn window_blur_monocode_dark_requests_declared_radius() {
+        let theme = Theme::from_variant(
+            ThemeRegistry::builtin()
+                .variant("monocode-dark")
+                .expect("monocode-dark"),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Frosted,
+        );
+        assert!(
+            theme.is_frost(),
+            "this regression is the frost path; got opaque compositing"
+        );
+        assert_eq!(theme.window_background_blur_radius(), Some(gpui::px(24.0)));
+    }
+
+    #[test]
+    fn window_blur_undeclared_variant_requests_none() {
+        let theme = Theme::from_variant(
+            ThemeRegistry::builtin()
+                .variant("zeron-dark")
+                .expect("zeron-dark"),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Frosted,
+        );
+        assert_eq!(theme.window_background_blur_radius(), None);
     }
 }
