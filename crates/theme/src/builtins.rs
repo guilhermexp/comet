@@ -93,9 +93,32 @@ struct Seeds<'a> {
     ansi: [&'a str; 16],
     syntax: [&'a str; 12],
     source: ThemeSource,
+    overrides: RoleOverrides<'a>,
+    frost: FrostSeeds,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RoleOverrides<'a> {
+    hover: Option<&'a str>,
+    active: Option<&'a str>,
+    border: Option<&'a str>,
+    border_strong: Option<&'a str>,
+    input: Option<&'a str>,
+    cursor: Option<&'a str>,
+    diff_hunk: Option<&'a str>,
+    terminal_selection: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FrostSeeds {
+    alpha: Option<f32>,
+    blur_radius: Option<f32>,
+    flat_shell: bool,
 }
 
 fn variant(seed: Seeds<'_>) -> ThemeVariant {
+    let overrides = seed.overrides;
+    let frost = seed.frost;
     let background = c(seed.background);
     let shell = c(seed.shell);
     let raised = c(seed.raised);
@@ -114,6 +137,7 @@ fn variant(seed: Seeds<'_>) -> ThemeVariant {
     } else {
         Color::rgb(35, 35, 40)
     };
+    let or_color = |value: Option<&str>, derived: Color| value.map(c).unwrap_or(derived);
     let colors = ThemeColors {
         background,
         shell,
@@ -121,10 +145,22 @@ fn variant(seed: Seeds<'_>) -> ThemeVariant {
         card,
         dialog: card.mix(raised, if dark { 0.18 } else { 0.04 }),
         overlay: card.mix(raised, if dark { 0.34 } else { 0.02 }),
-        hover: border_tone.with_alpha(if dark { 0.11 } else { 0.06 }),
-        active: accent.primary.with_alpha(if dark { 0.18 } else { 0.10 }),
-        border: border_tone.with_alpha(if dark { 0.10 } else { 0.12 }),
-        border_strong: border_tone.with_alpha(if dark { 0.18 } else { 0.22 }),
+        hover: or_color(
+            overrides.hover,
+            border_tone.with_alpha(if dark { 0.11 } else { 0.06 }),
+        ),
+        active: or_color(
+            overrides.active,
+            accent.primary.with_alpha(if dark { 0.18 } else { 0.10 }),
+        ),
+        border: or_color(
+            overrides.border,
+            border_tone.with_alpha(if dark { 0.10 } else { 0.12 }),
+        ),
+        border_strong: or_color(
+            overrides.border_strong,
+            border_tone.with_alpha(if dark { 0.18 } else { 0.22 }),
+        ),
         text,
         text_muted: muted,
         text_faint: faint,
@@ -136,13 +172,23 @@ fn variant(seed: Seeds<'_>) -> ThemeVariant {
         warning_muted: warning.mix(text, 0.25),
         success,
         success_muted: success.mix(text, 0.25),
-        input: if dark { raised.with_alpha(0.72) } else { card },
-        cursor: text.with_alpha(if dark { 0.40 } else { 0.55 }),
+        input: or_color(
+            overrides.input,
+            if dark { raised.with_alpha(0.72) } else { card },
+        ),
+        cursor: or_color(
+            overrides.cursor,
+            text.with_alpha(if dark { 0.40 } else { 0.55 }),
+        ),
         diff_add: success,
         diff_delete: danger,
-        diff_hunk: accent.primary.with_alpha(if dark { 0.08 } else { 0.07 }),
+        diff_hunk: or_color(
+            overrides.diff_hunk,
+            accent.primary.with_alpha(if dark { 0.08 } else { 0.07 }),
+        ),
     };
     let terminal_background = c(seed.terminal_background);
+    let terminal_canvas = terminal_background.blend_over(background);
     let mut variant = ThemeVariant {
         id: seed.id.into(),
         family_id: seed.family_id.into(),
@@ -154,11 +200,17 @@ fn variant(seed: Seeds<'_>) -> ThemeVariant {
         syntax: syntax(seed.syntax),
         terminal: TerminalPalette {
             background: terminal_background,
-            foreground: text.ensure_contrast(terminal_background, 4.5),
-            selection: border_tone.with_alpha(if dark { 0.22 } else { 0.16 }),
+            foreground: text.ensure_contrast(terminal_canvas, 4.5),
+            selection: or_color(
+                overrides.terminal_selection,
+                border_tone.with_alpha(if dark { 0.22 } else { 0.16 }),
+            ),
             ansi: seed.ansi.map(c),
         },
         source: seed.source,
+        frost_alpha: frost.alpha,
+        frost_blur_radius: frost.blur_radius,
+        flat_shell: frost.flat_shell,
     };
     // Hash the checked-in resolved definition itself (with the hash field
     // blanked), not merely its source URL. This makes provenance sensitive to
@@ -268,6 +320,8 @@ fn zeron_dark() -> ThemeVariant {
             "d138049",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -302,6 +356,8 @@ fn zeron_light() -> ThemeVariant {
             "d138049",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -339,6 +395,8 @@ fn vscode_dark() -> ThemeVariant {
             "e33d147d4c0fa65ce17cb73ec9d798f064b4bf1f",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -373,6 +431,8 @@ fn vscode_light() -> ThemeVariant {
             "e33d147d4c0fa65ce17cb73ec9d798f064b4bf1f",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -410,6 +470,8 @@ fn catppuccin_mocha() -> ThemeVariant {
             "befc9e6fc41980f4241408f7049755d47c06ff45",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -447,6 +509,8 @@ fn catppuccin_latte() -> ThemeVariant {
             "befc9e6fc41980f4241408f7049755d47c06ff45",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -484,6 +548,8 @@ fn tokyo_dark() -> ThemeVariant {
             "7c0f11eaef322f293621ca7befe462214b7ea468",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -521,6 +587,8 @@ fn tokyo_light() -> ThemeVariant {
             "7c0f11eaef322f293621ca7befe462214b7ea468",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -558,6 +626,8 @@ fn dracula() -> ThemeVariant {
             "1b9ecf4d7e0c8cc2e2e890a7a41ad1db5fff1e6c",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -595,6 +665,8 @@ fn github_light() -> ThemeVariant {
             "cd78e5e4e7bcf132a6f428ae0f32264bb1b729cf",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -632,6 +704,8 @@ fn github_dark() -> ThemeVariant {
             "cd78e5e4e7bcf132a6f428ae0f32264bb1b729cf",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -669,6 +743,8 @@ fn ayu_light() -> ThemeVariant {
             "444ef92911cb75c3933c8003e3a7c79b6b6c914f",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -706,6 +782,8 @@ fn ayu_dark() -> ThemeVariant {
             "444ef92911cb75c3933c8003e3a7c79b6b6c914f",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -743,6 +821,8 @@ fn ayu_mirage() -> ThemeVariant {
             "444ef92911cb75c3933c8003e3a7c79b6b6c914f",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -780,6 +860,8 @@ fn gruvbox_light() -> ThemeVariant {
             "ca3b8ad203e84a884ca33fb84b5795cf43032709",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -817,6 +899,8 @@ fn gruvbox_dark() -> ThemeVariant {
             "ca3b8ad203e84a884ca33fb84b5795cf43032709",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -854,6 +938,8 @@ fn rose_pine_dawn() -> ThemeVariant {
             "d8f5ebe8e096fa833e997c07eb7685ee1677a4ba",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -891,6 +977,8 @@ fn rose_pine_moon() -> ThemeVariant {
             "d8f5ebe8e096fa833e997c07eb7685ee1677a4ba",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -928,6 +1016,8 @@ fn nord() -> ThemeVariant {
             "8ead09822c02d0d49d0f764104505e5a34d3689f",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -965,6 +1055,8 @@ fn one_dark_pro() -> ThemeVariant {
             "e6ccf638d5b69aa38cd1005edb0ee7ba7ef6fedc",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1002,6 +1094,8 @@ fn atom_one_dark() -> ThemeVariant {
             "a8be970644982221f9b61fb1c4b3da74b4beab79",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1039,6 +1133,8 @@ fn night_owl() -> ThemeVariant {
             "cc291eba7976b20d7c66bde6883c27b902196b07",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1076,6 +1172,8 @@ fn night_owl_light() -> ThemeVariant {
             "cc291eba7976b20d7c66bde6883c27b902196b07",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1113,6 +1211,8 @@ fn winter_dark_blue() -> ThemeVariant {
             "260547834cb6ac37dd5b8bb5842cc1c8d3164946",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1150,6 +1250,8 @@ fn winter_light() -> ThemeVariant {
             "260547834cb6ac37dd5b8bb5842cc1c8d3164946",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1187,6 +1289,8 @@ fn palenight() -> ThemeVariant {
             "6291efaace90855abe3d79025327ca41b9a3138c",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1224,6 +1328,8 @@ fn synthwave_84() -> ThemeVariant {
             "ecfa2fe1279f7233663fa3f98a96e6756000567b",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1261,6 +1367,8 @@ fn shades_of_purple() -> ThemeVariant {
             "e8eb49f33e5db05ceba6677367b33ddb27ad821c",
             "MIT with additional upstream condition; see THIRD_PARTY_NOTICES.md",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1298,6 +1406,8 @@ fn cobalt2() -> ThemeVariant {
             "c4e9574372b85afad1682ed0fdd1ac0411c62512",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1335,6 +1445,8 @@ fn andromeda() -> ThemeVariant {
             "d1abb48c69493000aa0133a32d594eb25e523d4f",
             "MIT",
         ),
+        overrides: RoleOverrides::default(),
+        frost: FrostSeeds::default(),
     })
 }
 
@@ -1356,7 +1468,7 @@ fn monocode_dark() -> ThemeVariant {
         danger: "#f87171",
         warning: "#fbbf24",
         success: "#4ade80",
-        terminal_background: "#141b1f",
+        terminal_background: "#17171700",
         ansi: [
             "#1d2428", "#f87171", "#4ade80", "#fbbf24", "#60a5fa", "#c084fc", "#22d3ee", "#e8eef2",
             "#64748b", "#fca5a5", "#86efac", "#fde68a", "#93c5fd", "#d8b4fe", "#67e8f9", "#f8fafc",
@@ -1369,8 +1481,23 @@ fn monocode_dark() -> ThemeVariant {
             "monocode-dark",
             "css",
             "https://github.com/hardbeat920/monocode",
-            "65fbe78",
+            "85a5d03",
             "MIT",
         ),
+        overrides: RoleOverrides {
+            hover: Some("#ebebeb26"),
+            active: Some("#ebebeb1f"),
+            border: Some("#ebebeb12"),
+            border_strong: Some("#ebebeb33"),
+            input: Some("#ebebeb0f"),
+            cursor: Some("#459bf7"),
+            diff_hunk: Some("#ebebeb0d"),
+            terminal_selection: Some("#ffffff2e"),
+        },
+        frost: FrostSeeds {
+            alpha: Some(0.85),
+            blur_radius: Some(24.0),
+            flat_shell: true,
+        },
     })
 }

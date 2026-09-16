@@ -4,13 +4,13 @@
 
 Este documento é a especificação técnica port-ready da linguagem visual do **MonoCode** para o modelo de temas built-in do **Comet** (`zeron-theme`). Ele define a tradução determinística de parâmetros visuais, superfícies, paletas de terminal e realce de sintaxe em sementes de configuração prontas para consumo pela função `variant()` em `crates/theme/src/builtins.rs:97-169`.
 
-Este documento é a especificação; a implementação vive em `crates/theme/src/builtins.rs` (`monocode_dark()` + a família `monocode` no `builtin_registry()`). **Somente a variante escura foi implementada**, por decisão explícita do dono do produto: a família é single-variant, como `dracula` e `nord`. A tabela `Seeds` light da seção 4.2, os slots ANSI light da 5.2 e a coluna "Hex Light" da 6.1 permanecem aqui como referência de port, sem código correspondente — o seletor de tema do Comet é por aparência (`crates/ui/src/settings/appearance.rs:700-760`), então MonoCode aparece apenas na lista Dark.
+Este documento é a especificação; a implementação vive em `crates/theme/src/builtins.rs` (`monocode_dark()` + a família `monocode` no `builtin_registry()`) e nos campos de frost lidos por `crates/ui`. **Somente a variante escura foi implementada**, por decisão explícita do dono do produto: a família é single-variant, como `dracula` e `nord`. A tabela `Seeds` light da seção 4.2, os slots ANSI light da 5.2 e a coluna "Hex Light" da 6.1 permanecem aqui como referência de port, sem código correspondente — o seletor de tema do Comet é por aparência (`crates/ui/src/settings/appearance.rs:700-760`), então MonoCode aparece apenas na lista Dark.
 
-O documento também não altera nada em `crates/ui`. Os aspectos da identidade do MonoCode que dependem de alpha por superfície, raio de blur ou escala tipográfica estão registrados como GAPs na seção 11 e no apêndice da 12, e continuam inexpressáveis pelo modelo de temas.
+Papéis de interação, `terminal_background` com alpha e frost por variante (0.85 / 24 / shell plano) já são expressáveis. Tipografia, geometria e tinting em runtime continuam abertos na seção 11 e no apêndice 12.
 
 ### 1.1 Metadados do Repositório de Origem
 - **Repositório:** `hardbeat920/monocode` (clone local read-only em `/Users/guilhermevarela/Documents/Projetos/SelfHosting/monocode`)
-- **Revisão:** Commit `65fbe78`
+- **Revisão:** Commit `85a5d03`
 - **Versão:** `v0.1.34` (`package.json:4`)
 - **Licença:** MIT Copyright (c) 2026 Nick (`LICENSE:1-3`)
 
@@ -22,7 +22,7 @@ source(
     "monocode-dark",
     "builtin",
     "https://github.com/hardbeat920/monocode",
-    "65fbe78",
+    "85a5d03",
     "MIT",
 )
 ```
@@ -148,7 +148,7 @@ O contrato de semeadura do Comet (`crates/theme/src/builtins.rs:74-95`) requer e
 | `danger` | `#f87171` | `src/surfaces/TerminalView.tsx:45` (`ANSI_DARK.red` / `red-400`) | `#f87171` | Nenhum |
 | `warning` | `#fbbf24` | `src/surfaces/TerminalView.tsx:47` (`ANSI_DARK.yellow` / `amber-400`) | `#fbbf24` | Nenhum |
 | `success` | `#4ade80` | `src/surfaces/TerminalView.tsx:46` (`ANSI_DARK.green` / `green-400`) | `#4ade80` | Nenhum |
-| `terminal_background` | `#141b1f` | `src/surfaces/TerminalView.tsx:104` (`OSC_DARK.bg`) | `#141b1f` | Nenhum |
+| `terminal_background` | `#17171700` | `src/surfaces/TerminalView.tsx:100-102` (`#00000000` no canvas; seed na hue do canvas para flatten honesto) | `#17171700` (alpha 0) | Nenhum — `terminal.foreground` endurece contra o canvas achatado |
 
 *Correção de proveniência do `shell` (medida na tela, macOS):* a regra opaca `color-mix(in srgb, var(--color-background-base) 90%, black)` de `src/index.css:104-106` é **fallback de plataforma sem vidro nativo**. No macOS quem pinta é `html.has-native-glass .sidebar-glass` (`:114-119`), que usa `background` a `var(--sidebar-opacity)` = 85% sobre uma janela cujo fundo foi zerado (`:98-102`) — a sidebar do MonoCode nunca fica **mais escura** que o canvas; medida em `#191919` sobre desktop escuro. Semear `#151515` invertia o sinal. Como alpha por superfície não existe no modelo do Comet, o flatten determinístico e independente do papel de parede é o próprio `background`, `#171717`.
 
@@ -197,7 +197,7 @@ O MonoCode implementa sua emulação de terminal via `@xterm/xterm` no arquivo `
 | 13 | Bright Magenta | `#d8b4fe` | `src/surfaces/TerminalView.tsx:57` |
 | 14 | Bright Cyan | `#67e8f9` | `src/surfaces/TerminalView.tsx:58` |
 | 15 | Bright White | `#f8fafc` | `src/surfaces/TerminalView.tsx:59` |
-| - | `terminal_background` | `#141b1f` | `src/surfaces/TerminalView.tsx:104` (`OSC_DARK.bg`) |
+| - | `terminal_background` | `#17171700` | canvas hue at zero alpha; the OSC `#00000000` flattened onto `#171717` |
 
 ### 5.2 Slots ANSI Light (`ANSI_LIGHT` em `src/surfaces/TerminalView.tsx:63-80`)
 
@@ -424,23 +424,22 @@ pub fn is_frost(&self) -> bool {
 
 Ou seja, em macOS e Linux, o Comet ativa as camadas de desfoque e translucidez do GPUI. No Windows, o compositor GPUI não possui backend para frost e retrocede silenciosamente para renderização opaca através de `glass()` (`crates/ui/src/theme.rs:734-737`), garantindo que não ocorram artefatos gráficos.
 
-### 10.3 O que se Perde na Tradução
-O modelo de temas do Comet (`crates/theme/src/lib.rs:59-65`) é estritamente discreto: o enum `SurfaceTreatment` possui apenas as variantes `Opaque` e `Frosted`. Ele não expressa:
-- Porcentagem contínua de opacidade de casca (como o `--sidebar-opacity: 0.85` de `src/lib/appearance.ts:54`).
-- Raio de desfoque gaussiano em pixels (como o `--sidebar-blur: 24px` de `src/lib/appearance.ts:58`).
-
-Ao marcar `SurfaceTreatment::Frosted`, o tema adota o cálculo fixo de vidro do Comet (`crates/ui/src/theme.rs:734-754`), preservando a atmosfera etérea do MonoCode nos limites técnicos do modelo do Comet. Usuários que preferirem casca sólida continuam respaldados pela política local `SurfacePreference::Opaque` (`crates/theme/src/lib.rs:71-87`).
+### 10.3 Frost por variante
+`ThemeVariant` declara `frost_alpha = 0.85`, `frost_blur_radius = 24.0` e `flat_shell = true` em `monocode-dark`. O renderer lê esses campos com `GLASS_ALPHA` / `MENU_BLUR` / `wash(0.05)` como fallback para variantes que não declaram. Off-macOS o frost continua opaco, independente do que a variante peça. Usuários que preferirem casca sólida continuam respaldados pela política local `SurfacePreference::Opaque` (`crates/theme/src/lib.rs:71-87`).
 
 ---
 
 ## 11. GAPs
 
-Esta seção mapeia os elementos visuais do MonoCode que dependem de variáveis dinâmicas de runtime, composição externa ou extensões que **não resolvem** para valores hexadecimais estáticos:
+Fechados nesta change: papéis de interação (hover/active/border/input/cursor/diff_hunk/terminal.selection) como overrides com alpha; `terminal_background` translúcido; frost alpha 0.85, blur 24 e shell plano sem o `wash(0.05)` extra da sidebar.
 
-1. **Vibrancy e Acrylic do Sistema Operacional:** O MonoCode suporta transparência nativa da janela via Tauri (`src/lib/platform.ts:8-9`: `HAS_NATIVE_GLASS = IS_MAC || IS_WIN`). Quando ativado (`html.has-native-glass`), o fundo do app torna-se transparente (`src/index.css:98-102`), permitindo que as cores do papel de parede do usuário componham a interface. Isso é irreproduzível por um arquivo de tema estático.
+Ainda abertos:
+
+1. **Vibrancy e Acrylic do Sistema Operacional:** O MonoCode deixa o wallpaper do desktop atravessar a janela (`src/index.css:98-102`). O Comet declara alpha/blur da casca, mas não compõe o wallpaper do usuário.
 2. **Sliders de Matiz e Saturação em Tempo Real:** Os seletores de personalização em `src/lib/appearance.ts:107-153` alteram dinamicamente `--theme-hue` e `--theme-saturation` no elemento raiz. O port para o Comet assume estritamente o ponto de calibração padrão (`240` / `0%`).
 3. **Biblioteca de Ícones Externa:** O MonoCode depende de ícones vetoriais com pesos de traço próprios via `@hugeicons/core-free-icons` (`src/chrome/icons.tsx:29-33`) e do tema de ícones de arquivos `react-material-icon-theme` (`package.json:51`). O Comet possui seu próprio repositório de glifos no GPUI.
 4. **Animações de Transição de Camada:** O MonoCode define curvas Bézier cúbicas customizadas para a abertura de popovers e diálogos (`src/index.css:966-1033`: `popover-open` em 170ms com `cubic-bezier(0.16, 1, 0.3, 1)` e `modal-panel-in` em 200ms). O modelo `zeron-theme` não armazena timings nem interpolações de movimento.
+5. **Tipografia e geometria por tema:** escala 13px/1.6, titlebar 28px, raios 6/8/12px e densidade — apêndice 12. Fora desta change.
 
 ---
 
