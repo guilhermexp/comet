@@ -16,12 +16,12 @@ Test: engine unit table for missing, unsafe, unreadable, and malformed credentia
 
 - **WHEN** the managed credential is missing, unsafe, unreadable, or malformed
 - **THEN** the account snapshot contains no Kimi account
-- **AND** the Usage widget omits Kimi rather than showing a not-signed-in placeholder
+- **AND** the Usage widget keeps a Kimi row and shows the not-signed-in placeholder
 - **AND** no secret material appears in warnings or logs
 
 ### Requirement: Render Kimi in the Usage widget
 
-The Usage widget SHALL include a Kimi row only when a Kimi account is present in the snapshot and is not hidden. Among visible accounts, provider order SHALL follow Settings → Accounts (Claude, Codex, Kimi, Antigravity, Cursor). The existing quota, reset, pace, reserve/deficit, and projected-exhaustion presentation SHALL still apply to Kimi windows.
+The Usage widget SHALL render one Kimi row per visible Kimi account, exactly one placeholder row when no Kimi account is present in the snapshot, and no row at all when every Kimi account is hidden. Among visible accounts, provider order SHALL follow Settings → Accounts (Claude, Codex, Kimi, Antigravity, Cursor). The existing quota, reset, pace, reserve/deficit, and projected-exhaustion presentation SHALL still apply to Kimi windows.
 
 #### Scenario: Authenticated subscription has quota data
 Test: UI usage-row unit test plus headed GPUI smoke against the authenticated local subscription.

@@ -898,6 +898,7 @@ impl ProjectsPage {
                 );
                 div()
                     .id(SharedString::from(format!("project-row-{}", row.path)))
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -987,6 +988,7 @@ impl ProjectsPage {
                 div()
                     .id("projects-list-scroll")
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .px(px(8.0))
                     .pt(px(8.0))
@@ -1029,10 +1031,15 @@ impl ProjectsPage {
             .map(|error| SharedString::from(error.to_owned()));
 
         div()
+            .id(SharedString::from(format!(
+                "projects-detail-scroll-{}",
+                row.path
+            )))
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .h_full()
-            .overflow_hidden()
+            .overflow_y_scroll()
             .child(
                 widgets::page_column()
                     .child(widgets::page_header(theme, "General", None))

@@ -6,13 +6,13 @@ Per-account opt-in that makes Settings → Accounts the membership source for th
 
 ### Requirement: Toggle Usage membership from each Accounts row
 
-Settings → Accounts SHALL expose a trailing toggle on every account row, including managed Kimi Code and Antigravity accounts. The toggle SHALL default ON for any account whose id is absent from the persisted hidden set. Turning it OFF SHALL omit that account from the Usage widget and SHALL NOT remove the account, its meters, or its login. Turning it ON SHALL include that account as its own Usage row.
+Settings → Accounts SHALL expose a trailing toggle on every account row, including managed Kimi Code and Antigravity accounts. The toggle SHALL default ON for any account whose id is absent from the persisted hidden set. Turning it OFF SHALL omit that account's own row from the Usage widget and SHALL NOT remove the account, its meters, or its login. Hiding the last visible account of a provider SHALL take that provider out of the widget entirely, with no placeholder row standing in for it. Turning it ON SHALL include that account as its own Usage row.
 
-#### Scenario: Hidden account disappears from Usage and stays on Accounts
-Test: UI unit test in `usage.rs` that a snapshot account whose id is in the hidden set produces no Usage row while `provider_accounts` still returns it.
+#### Scenario: Hidden account loses its own row and stays on Accounts
+Test: UI unit test in `usage.rs` that a snapshot account whose id is in the hidden set produces no Usage row carrying that id while `provider_accounts` still returns it.
 
 - **WHEN** an account is present in the agent-accounts snapshot and its Usage toggle is OFF
-- **THEN** the Usage widget contains no row for that account id
+- **THEN** the Usage widget contains no row carrying that account id
 - **AND** Settings → Accounts still lists the account with its usage meters
 
 #### Scenario: New or unmentioned accounts are visible
@@ -34,12 +34,12 @@ Test: UI unit test in `usage.rs` with a visible Cursor account.
 - **WHEN** a Cursor account is present and visible
 - **THEN** the Usage widget contains a Cursor row
 
-#### Scenario: Empty membership is a valid widget
-Test: UI unit test in `usage.rs` with an empty snapshot or every account hidden.
+#### Scenario: Hiding every account of a provider removes it from the widget
+Test: UI unit test in `usage.rs` with every account of a provider in the hidden set.
 
-- **WHEN** no visible accounts remain
-- **THEN** the Usage widget has zero provider rows
-- **AND** it does not emit placeholder not-signed-in rows for Claude, Codex, Kimi, or Antigravity
+- **WHEN** no visible account remains for a provider that has accounts in the snapshot
+- **THEN** the Usage widget contains no row for that provider
+- **AND** the widget renders its empty-state copy when this leaves it with no rows at all
 
 ### Requirement: Persist visibility as device-local UI settings
 

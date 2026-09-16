@@ -5,7 +5,7 @@
 
 ## 2. Derive Usage rows from visible accounts
 
-- [x] 2.1 Change `provider_usage_rows` to take the hidden set, emit one row per visible account in Accounts provider order, include Cursor, drop not-signed-in placeholders
+- [x] 2.1 Change `provider_usage_rows` to take the hidden set, emit one row per visible account in Accounts provider order, include Cursor, and keep one not-signed-in placeholder per provider with no account in the snapshot
 - [x] 2.2 Key expand/id by account id; attach email/display_name only when multiple visible accounts share a harness
 - [x] 2.3 Update existing usage tests and add hidden/two-Claude/Cursor/empty-membership cases
 

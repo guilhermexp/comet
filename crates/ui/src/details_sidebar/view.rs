@@ -322,7 +322,7 @@ use crate::{
             usage_provider_icon,
         },
         widgets::{
-            CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
+            CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState, TabActivity,
             chat_workers_viewport_height_px, property_row, property_row_custom, widget_card,
             worker_expansion_key, workers_tab_presence,
         },
@@ -543,6 +543,9 @@ pub struct DetailsSidebar {
     source_control_fetch: Option<Task<()>>,
     source_control_op: Option<Task<()>>,
     source_control_busy: bool,
+    commit_generating: bool,
+    commit_revision: u64,
+    source_control_collapsed: [bool; 2],
     source_control_op_error: Option<SharedString>,
     commit_input: Entity<ComposerInput>,
     _commit_events: Subscription,
@@ -564,9 +567,12 @@ impl DetailsSidebar {
                 this.reload_files(cx);
             }
         });
-        let commit_input = cx.new(|cx| ComposerInput::new("Commit message", cx).with_single_line());
+        let commit_input = cx.new(|cx| {
+            ComposerInput::new("Message (Enter to commit)", cx).with_text_metrics(13.0, 20.0)
+        });
         let commit_events = cx.subscribe(&commit_input, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
+                this.commit_revision = this.commit_revision.wrapping_add(1);
                 cx.notify();
             }
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -650,6 +656,9 @@ impl DetailsSidebar {
             source_control_fetch: None,
             source_control_op: None,
             source_control_busy: false,
+            commit_generating: false,
+            commit_revision: 0,
+            source_control_collapsed: [false; 2],
             source_control_op_error: None,
             commit_input,
             _commit_events: commit_events,
@@ -712,6 +721,9 @@ impl DetailsSidebar {
             self.checkout_status_error = None;
             self.source_control_op_error = None;
             self.source_control_busy = false;
+            self.commit_generating = false;
+            self.commit_revision = self.commit_revision.wrapping_add(1);
+            self.source_control_collapsed = [false; 2];
             self.discard_prompt = None;
             self.commit_input
                 .update(cx, |input, cx| input.set_text("", cx));
@@ -1088,7 +1100,71 @@ impl DetailsSidebar {
         self.execute_source_control(methods::DISCARD_FILES, params, false, cx);
     }
 
+    fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
+        if self.source_control_busy
+            || !self
+                .checkout_status
+                .as_ref()
+                .is_some_and(|status| status.files.iter().any(source_control::is_staged))
+        {
+            return;
+        }
+        let Some(engine) = self.app_state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some((cwd, _)) = self.source_control_cwd() else {
+            return;
+        };
+        let Some((_, _, params)) =
+            self.source_control_params(zeron_proto::GenerateCommitMessageRequest { cwd })
+        else {
+            return;
+        };
+        let key = self.sidebar.context().map(|context| context.key.clone());
+        let revision = self.commit_revision;
+        self.source_control_busy = true;
+        self.commit_generating = true;
+        self.source_control_op_error = None;
+        cx.notify();
+        self.source_control_op = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::GENERATE_COMMIT_MESSAGE, params).await
+                .and_then(|value| serde_json::from_value::<zeron_proto::GeneratedCommitMessage>(value)
+                    .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string())));
+            let _ = this.update(cx, |this, cx| {
+                let current_key = this.sidebar.context().map(|context| context.key.clone());
+                if current_key != key { return; }
+                this.source_control_busy = false;
+                this.commit_generating = false;
+                match result {
+                    Ok(result) if source_control::can_apply_generated_message(key.as_deref(), current_key.as_deref(), revision, this.commit_revision) => {
+                        this.commit_input.update(cx, |input, cx| input.set_text(result.message, cx));
+                    }
+                    Ok(_) => {
+                        this.source_control_op_error = Some("Message changed while generating; your edits were kept. Generate again to replace them.".into());
+                    }
+                    Err(zeron_rpc::RpcError::UnknownMethod(_)) => {
+                        this.source_control_op_error = Some("Update the project device to generate commit messages.".into());
+                    }
+                    Err(error) => { this.source_control_op_error = Some(error.to_string().into()); }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn commit_checkout(&mut self, cx: &mut Context<Self>) {
+        if self.source_control_busy {
+            return;
+        }
+        let message = self.commit_input.read(cx).text().to_string();
+        if !self
+            .checkout_status
+            .as_ref()
+            .is_some_and(|status| source_control::can_commit(&message, &status.files))
+        {
+            return;
+        }
+
         let Some((cwd, _)) = self.source_control_cwd() else {
             return;
         };
@@ -1141,12 +1217,7 @@ impl DetailsSidebar {
 
     fn render_source_control(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         self.ensure_source_control_watch(cx);
-        let mut content = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p(px(12.0))
-            .gap(px(12.0));
+        let mut content = div().w_full().min_w_0().flex().flex_col().pb(px(12.0));
         if self.sidebar.context().is_none() {
             return content.child(
                 div()
@@ -1197,66 +1268,173 @@ impl DetailsSidebar {
         } else {
             status.branch.clone()
         };
-        let mut header = div().flex().items_center().gap(px(8.0)).child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .text_size(px(13.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .child(branch),
-        );
-        if status.ahead > 0 {
-            header = header.child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child(format!("↑{}", status.ahead)),
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child(
+                icons::icon(icons::GIT_BRANCH)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(div().min_w_0().truncate().child(branch));
+        let can_generate = !busy && status.files.iter().any(source_control::is_staged);
+        let mut generate_btn = div()
+            .id("details-generate-commit-message")
+            .size(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.0))
+            .bg(theme.text.opacity(0.06))
+            .role(gpui::Role::Button)
+            .aria_label("Generate commit message")
+            .tooltip(|_, cx| {
+                cx.new(|_| FileActionTooltip {
+                    label: "Generate commit message".into(),
+                })
+                .into()
+            })
+            .opacity(if can_generate || self.commit_generating {
+                1.0
+            } else {
+                0.4
+            });
+        if self.commit_generating {
+            generate_btn = generate_btn.child(crate::loaders::mini_mono_spinner(
+                "commit-message-generation",
+                2.0,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            ));
+        } else {
+            generate_btn = generate_btn.child(
+                icons::icon(icons::THOUGHT_SPARKLE)
+                    .size(px(15.0))
+                    .text_color(theme.text_muted),
             );
         }
+        if can_generate {
+            generate_btn = generate_btn
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.text.opacity(0.12)))
+                .on_click(cx.listener(|this, _, _, cx| this.generate_commit_message(cx)));
+        }
+        let mut commit_btn = div()
+            .id("details-source-control-commit")
+            .w_full()
+            .h(px(32.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(8.0))
+            .rounded(px(6.0))
+            .bg(theme.text)
+            .text_color(theme.bg)
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .opacity(if can_commit { 1.0 } else { 0.4 })
+            .role(gpui::Role::Button)
+            .aria_label("Commit staged changes")
+            .child(
+                icons::icon(icons::CHECK)
+                    .size(px(16.0))
+                    .text_color(theme.bg),
+            )
+            .child("Commit");
+        if can_commit {
+            commit_btn = commit_btn
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| this.commit_checkout(cx)));
+        }
+        let mut sync_btn = div()
+            .id("details-source-control-sync")
+            .w_full()
+            .h(px(32.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(8.0))
+            .rounded(px(6.0))
+            .bg(theme.text.opacity(0.08))
+            .text_size(px(13.0))
+            .text_color(theme.text)
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .role(gpui::Role::Button)
+            .aria_label(sync_label)
+            .opacity(if busy { 0.4 } else { 1.0 })
+            .child(
+                icons::icon(if status.upstream.is_some() {
+                    icons::REFRESH
+                } else {
+                    icons::ARROW_UP
+                })
+                .size(px(16.0))
+                .text_color(theme.text),
+            )
+            .child(sync_label);
         if status.behind > 0 {
-            header = header.child(
+            sync_btn = sync_btn.child(
                 div()
-                    .text_size(px(11.0))
                     .text_color(theme.text_muted)
                     .child(format!("↓{}", status.behind)),
             );
         }
-        content = content.child(header);
-        content = content.child(
-            div()
-                .h(px(36.0))
-                .flex_none()
-                .px(px(8.0))
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(theme.border)
-                .flex()
-                .items_center()
-                .child(self.commit_input.clone()),
-        );
-        let mut commit_btn = popover::btn_primary(theme, "Commit")
-            .id("details-source-control-commit")
-            .opacity(if can_commit { 1.0 } else { 0.4 });
-        if can_commit {
-            commit_btn =
-                commit_btn.on_click(cx.listener(|this, _, _, cx| this.commit_checkout(cx)));
+        if status.ahead > 0 {
+            sync_btn = sync_btn.child(
+                div()
+                    .text_color(theme.text_muted)
+                    .child(format!("↑{}", status.ahead)),
+            );
         }
-        let mut sync_btn = popover::btn_ghost(theme, sync_label, "details-source-control-sync")
-            .id("details-source-control-sync")
-            .opacity(if busy { 0.4 } else { 1.0 });
         if !busy {
-            sync_btn =
-                sync_btn.on_click(cx.listener(|this, _, _, cx| this.sync_or_publish_checkout(cx)));
+            sync_btn = sync_btn
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.text.opacity(0.12)))
+                .on_click(cx.listener(|this, _, _, cx| this.sync_or_publish_checkout(cx)));
         }
         content = content.child(
             div()
+                .w_full()
+                .flex_none()
                 .flex()
-                .items_center()
-                .justify_end()
+                .flex_col()
                 .gap(px(8.0))
-                .child(sync_btn)
-                .child(commit_btn),
+                .p(px(10.0))
+                .pb(px(12.0))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(header)
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .h(px((message.lines().count().max(1) as f32 * 20.0 + 14.0)
+                            .clamp(34.0, 134.0)))
+                        .flex_none()
+                        .px(px(9.0))
+                        .rounded(px(6.0))
+                        .bg(theme.text.opacity(0.05))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.commit_input.clone()),
+                        )
+                        .child(generate_btn),
+                )
+                .child(commit_btn)
+                .child(sync_btn),
         );
         let staged = source_control::staged_rows(&status.files);
         let changes = source_control::changes_rows(&status.files);
@@ -1272,14 +1450,16 @@ impl DetailsSidebar {
             .filter(|file| source_control::is_unstaged(file))
             .cloned()
             .collect();
-        content = content.child(self.render_source_control_section(
-            theme,
-            "Staged Changes",
-            &staged,
-            &staged_files,
-            SourceControlSection::Staged,
-            cx,
-        ));
+        if !staged.is_empty() {
+            content = content.child(self.render_source_control_section(
+                theme,
+                "Staged Changes",
+                &staged,
+                &staged_files,
+                SourceControlSection::Staged,
+                cx,
+            ));
+        }
         content = content.child(self.render_source_control_section(
             theme,
             "Changes",
@@ -1300,165 +1480,274 @@ impl DetailsSidebar {
         section: SourceControlSection,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let bulk_paths: Vec<String> = rows.iter().map(|row| row.path.clone()).collect();
+        let slot = match section {
+            SourceControlSection::Staged => 0,
+            SourceControlSection::Changes => 1,
+        };
+        let tag = if slot == 0 { "staged" } else { "changes" };
+        let collapsed = self.source_control_collapsed[slot];
+        let busy = self.source_control_busy;
+        let paths: Vec<String> = rows.iter().map(|row| row.path.clone()).collect();
         let bulk_files = files.to_vec();
-        let mut header = div().flex().items_center().justify_between().child(
-            div()
-                .text_size(px(11.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text_muted)
-                .child(format!("{title} ({})", rows.len())),
-        );
-        if !rows.is_empty() && !self.source_control_busy {
-            let mut actions = div().flex().items_center().gap(px(8.0));
-            match section {
-                SourceControlSection::Staged => {
-                    let paths = bulk_paths.clone();
-                    actions = actions.child(
-                        div()
-                            .id("details-source-control-unstage-all")
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.unstage_paths(paths.clone(), cx)
-                            }))
-                            .child("Unstage All"),
-                    );
-                }
-                SourceControlSection::Changes => {
-                    let paths = bulk_paths.clone();
-                    actions = actions.child(
-                        div()
-                            .id("details-source-control-stage-all")
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.stage_paths(paths.clone(), cx)
-                            }))
-                            .child("Stage All"),
-                    );
-                }
+        let mut actions = div().flex().items_center().flex_none();
+        if !busy {
+            if slot == 1 {
+                actions = actions.child(self.toolbar_button_with_tooltip(
+                    "source-control-refresh",
+                    icons::REFRESH,
+                    "Refresh Changes",
+                    theme,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.refresh_checkout_status(cx);
+                    }),
+                ));
             }
-            let discard_id = if matches!(section, SourceControlSection::Staged) {
-                "details-source-control-discard-all-staged"
-            } else {
-                "details-source-control-discard-all-changes"
-            };
-            actions = actions.child(
-                div()
-                    .id(discard_id)
-                    .text_size(px(11.0))
-                    .text_color(theme.danger)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.request_discard(bulk_files.clone(), cx)
-                    }))
-                    .child("Discard All"),
-            );
-            header = header.child(actions);
+            if !rows.is_empty() {
+                actions = actions.child(self.toolbar_button_with_tooltip(
+                    if slot == 0 {
+                        "source-control-discard-staged"
+                    } else {
+                        "source-control-discard-changes"
+                    },
+                    icons::RESTART,
+                    "Discard Changes…",
+                    theme,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.request_discard(bulk_files.clone(), cx);
+                    }),
+                ));
+                actions = actions.child(self.toolbar_button_with_tooltip(
+                    if slot == 0 {
+                        "source-control-unstage-all"
+                    } else {
+                        "source-control-stage-all"
+                    },
+                    if slot == 0 { icons::MINUS } else { icons::PLUS },
+                    if slot == 0 {
+                        "Unstage All Changes"
+                    } else {
+                        "Stage All Changes"
+                    },
+                    theme,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        match section {
+                            SourceControlSection::Staged => this.unstage_paths(paths.clone(), cx),
+                            SourceControlSection::Changes => this.stage_paths(paths.clone(), cx),
+                        }
+                    }),
+                ));
+            }
         }
-        let mut list = div().flex().flex_col().gap(px(2.0)).child(header);
+        let header = div()
+            .id(("source-control-section", slot))
+            .h(px(34.0))
+            .w_full()
+            .flex_none()
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.source_control_collapsed[slot] = !this.source_control_collapsed[slot];
+                cx.notify();
+            }))
+            .child(
+                icons::icon(if collapsed {
+                    icons::ALT_ARROW_RIGHT
+                } else {
+                    icons::ALT_ARROW_DOWN
+                })
+                .size(px(12.0))
+                .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child(title.to_uppercase()),
+            )
+            .child(
+                div()
+                    .min_w(px(18.0))
+                    .h(px(18.0))
+                    .px(px(5.0))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::rgb(0x387dcc))
+                    .text_size(px(10.0))
+                    .text_color(gpui::rgb(0xffffff))
+                    .child(rows.len().to_string()),
+            )
+            .child(div().flex_1())
+            .child(actions);
+        let mut list = div()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .child(header);
+        if collapsed {
+            return list;
+        }
         if rows.is_empty() {
             return list.child(
                 div()
+                    .px(px(26.0))
+                    .py(px(6.0))
                     .text_size(px(12.0))
                     .text_color(theme.text_muted)
-                    .child("No files"),
+                    .child("No changes"),
             );
         }
         for (index, row) in rows.iter().enumerate() {
             let path = row.path.clone();
-            let open_path = row.path.clone();
-            let letter = row.letter.to_string();
-            let label = match &row.old_path {
-                Some(old) => format!("{old} → {}", row.path),
-                None => row.path.clone(),
+            let (directory, name) = path
+                .trim_end_matches('/')
+                .rsplit_once('/')
+                .unwrap_or(("", path.trim_end_matches('/')));
+            let tooltip: SharedString = match &row.old_path {
+                Some(old) => format!("{old} → {}", row.path).into(),
+                None => row.path.clone().into(),
             };
-            let file = files.iter().find(|file| file.path == row.path).cloned();
-            let section_tag = match section {
-                SourceControlSection::Staged => "staged",
-                SourceControlSection::Changes => "changes",
+            let glyph = self.material_icon(material_icon_path(name, path.ends_with('/'), false));
+            let group: SharedString = format!("source-control-{tag}-{index}").into();
+            let status_color = match row.letter {
+                'M' => theme.warning,
+                'A' => theme.success,
+                'D' | '!' => theme.danger,
+                'U' | 'R' | 'C' => match theme.appearance {
+                    crate::theme::Appearance::Dark => gpui::rgb(0x29c5f6).into(),
+                    crate::theme::Appearance::Light => gpui::rgb(0x007eaa).into(),
+                },
+                _ => theme.text_muted,
             };
-            let mut row_el = div()
-                .id((
-                    SharedString::from(format!("details-source-control-row-{section_tag}")),
-                    index,
-                ))
-                .h(px(24.0))
+            let mut row_actions = div()
+                .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(8.0))
+                .invisible()
+                .group_hover(group.clone(), |s| s.visible());
+            if !busy {
+                if let Some(file) = files.iter().find(|file| file.path == row.path).cloned() {
+                    row_actions = row_actions.child(
+                        self.toolbar_button_with_tooltip(
+                            "source-control-row-discard",
+                            icons::RESTART,
+                            "Discard Changes…",
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.request_discard(vec![file.clone()], cx);
+                            }),
+                        )
+                        .size(px(24.0)),
+                    );
+                }
+                let action_path = path.clone();
+                row_actions = row_actions.child(
+                    self.toolbar_button_with_tooltip(
+                        "source-control-row-stage",
+                        if slot == 0 { icons::MINUS } else { icons::PLUS },
+                        if slot == 0 {
+                            "Unstage Changes"
+                        } else {
+                            "Stage Changes"
+                        },
+                        theme,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            match section {
+                                SourceControlSection::Staged => {
+                                    this.unstage_paths(vec![action_path.clone()], cx)
+                                }
+                                SourceControlSection::Changes => {
+                                    this.stage_paths(vec![action_path.clone()], cx)
+                                }
+                            }
+                        }),
+                    )
+                    .size(px(24.0)),
+                );
+            }
+            let open_path = path.clone();
+            let row_el = div()
+                .id((
+                    SharedString::from(format!("source-control-row-{tag}")),
+                    index,
+                ))
+                .group(group)
+                .h(px(28.0))
+                .flex_none()
+                .w_full()
+                .min_w_0()
+                .pl(px(12.0))
+                .pr(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.element_hover))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| FileActionTooltip {
+                        label: tooltip.clone(),
+                    })
+                    .into()
+                })
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(DetailsSidebarEvent::OpenWorkingTreeDiff {
+                        path: open_path.clone(),
+                    });
+                }))
+                .child(glyph)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_shrink(1.0)
+                                .truncate()
+                                .text_size(px(13.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(name.to_string()),
+                        )
+                        .when(!directory.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted)
+                                    .child(directory.to_string()),
+                            )
+                        }),
+                )
+                .child(row_actions)
                 .child(
                     div()
                         .w(px(12.0))
                         .flex_none()
-                        .font_family(theme.font_mono.clone())
+                        .text_center()
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted)
-                        .child(letter),
-                )
-                .child(
-                    div()
-                        .id(("details-source-control-file", index))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.0))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(DetailsSidebarEvent::OpenWorkingTreeDiff {
-                                path: open_path.clone(),
-                            });
-                        }))
-                        .child(label),
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(status_color)
+                        .child(row.letter.to_string()),
                 );
-            if !self.source_control_busy {
-                match section {
-                    SourceControlSection::Staged => {
-                        let unstage_path = path.clone();
-                        row_el = row_el.child(
-                            div()
-                                .id(("details-source-control-unstage", index))
-                                .text_size(px(11.0))
-                                .text_color(theme.text_muted)
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.unstage_paths(vec![unstage_path.clone()], cx)
-                                }))
-                                .child("Unstage"),
-                        );
-                    }
-                    SourceControlSection::Changes => {
-                        let stage_path = path.clone();
-                        row_el = row_el.child(
-                            div()
-                                .id(("details-source-control-stage", index))
-                                .text_size(px(11.0))
-                                .text_color(theme.text_muted)
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.stage_paths(vec![stage_path.clone()], cx)
-                                }))
-                                .child("Stage"),
-                        );
-                    }
-                }
-                if let Some(file) = file {
-                    row_el = row_el.child(
-                        div()
-                            .id(("details-source-control-discard", index))
-                            .text_size(px(11.0))
-                            .text_color(theme.danger)
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.request_discard(vec![file.clone()], cx)
-                            }))
-                            .child("Discard"),
-                    );
-                }
-            }
             list = list.child(row_el);
         }
         list
@@ -2413,7 +2702,7 @@ impl DetailsSidebar {
                                     .map(|status| source_control::change_badge(&status.files))
                                     .unwrap_or(0);
                                 let mut tab_pill =
-                                    pill("Source Control", tab == DetailsTab::SourceControl)
+                                    pill("Changes", tab == DetailsTab::SourceControl)
                                         .id("source-control-tab")
                                         .gap(px(6.0))
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2434,84 +2723,6 @@ impl DetailsSidebar {
                             }),
                     ),
             )
-            .when(tab == DetailsTab::Files, |header| {
-                header.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(2.0))
-                        .child(self.toolbar_button(
-                            "details-hidden-toggle",
-                            if self.sidebar.show_hidden() {
-                                icons::DETAILS_EYE
-                            } else {
-                                icons::DETAILS_EYE_OFF
-                            },
-                            theme,
-                            cx.listener(|this, _, _, cx| {
-                                this.sidebar.toggle_hidden();
-                                this.emit_preferences(cx);
-                                this.reload_files(cx);
-                            }),
-                        ))
-                        .child(self.toolbar_button_with_tooltip(
-                            "details-new-file",
-                            icons::DOCUMENT_ADD,
-                            "New File",
-                            theme,
-                            cx.listener(|this, _, window, cx| {
-                                this.start_inline_create(InlineCreateKind::File, window, cx);
-                            }),
-                        ))
-                        .child(self.toolbar_button_with_tooltip(
-                            "details-new-folder",
-                            icons::FOLDER_WITH_FILES,
-                            "New Folder",
-                            theme,
-                            cx.listener(|this, _, window, cx| {
-                                this.start_inline_create(InlineCreateKind::Directory, window, cx);
-                            }),
-                        ))
-                        .child(self.toolbar_button(
-                            "details-search-toggle",
-                            icons::MAGNIFER,
-                            theme,
-                            cx.listener(|this, _, window, cx| {
-                                this.search_visible = !this.search_visible;
-                                if this.search_visible {
-                                    window.focus(&this.search.read(cx).focus_handle(cx), cx);
-                                }
-                                cx.notify();
-                            }),
-                        ))
-                        .child(self.toolbar_button(
-                            "details-expand-all",
-                            icons::FOLD_VERTICAL,
-                            theme,
-                            cx.listener(|this, _, _, cx| {
-                                let folders = match &this.files {
-                                    LoadState::Ready(files) => {
-                                        let mut folders = Vec::new();
-                                        Self::all_folder_paths(files, &mut folders);
-                                        folders
-                                    }
-                                    _ => Vec::new(),
-                                };
-                                let all_expanded = folders
-                                    .iter()
-                                    .all(|path| this.sidebar.expanded_paths().contains(path));
-                                for path in folders {
-                                    if this.sidebar.expanded_paths().contains(&path) == all_expanded
-                                    {
-                                        this.sidebar.toggle_expanded(&path);
-                                    }
-                                }
-                                this.emit_preferences(cx);
-                                cx.notify();
-                            }),
-                        )),
-                )
-            })
             .when(tab == DetailsTab::Details, |header| {
                 header.child(
                     div()
@@ -3203,12 +3414,39 @@ impl DetailsSidebar {
             snapshot.latest_started_at(ChatWorkersTab::Subagents),
             snapshot.latest_started_at(ChatWorkersTab::Workers),
         ];
-        self.chat_workers.sync_dispatch_with_recency(
-            Some(workflows),
-            Some(subagents),
-            workers_error.is_none().then_some(workers),
-            latest_started,
-        );
+        // What is running right now, per tab. A worker that goes back to work
+        // shows up only here: its `created_at` is old and `updated_at` moves
+        // with the host heartbeat, so neither can say it is active again.
+        let running = |rows: &[ChatActivityRow]| {
+            rows.iter()
+                .filter(|row| row.status == WorkflowTaskStatus::Running)
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        };
+        self.chat_workers.sync_tab_focus([
+            Some(TabActivity::new(
+                workflows,
+                running(&snapshot.workflows),
+                latest_started[0],
+            )),
+            Some(TabActivity::new(
+                subagents,
+                running(&snapshot.subagents),
+                latest_started[1],
+            )),
+            workers_error.is_none().then(|| {
+                TabActivity::new(
+                    workers,
+                    snapshot
+                        .workers
+                        .iter()
+                        .filter(|worker| worker.semantic.is_active())
+                        .map(|worker| worker.session_id.clone())
+                        .collect(),
+                    latest_started[2],
+                )
+            }),
+        ]);
         let active = self.chat_workers.active_tab_with_recency(
             (workflows, latest_started[0]),
             (subagents, latest_started[1]),
@@ -3628,6 +3866,8 @@ impl DetailsSidebar {
         let usage_body = match (&self.usage, &self.usage_snapshot) {
             (_, Some(snapshot)) => {
                 let rows = provider_usage_rows(snapshot, &hidden, chrono::Utc::now());
+                // Reachable only when every detected provider is toggled off —
+                // an undetected one still contributes its placeholder.
                 if rows.is_empty() {
                     div()
                         .p(px(10.0))
@@ -3678,14 +3918,24 @@ impl DetailsSidebar {
             && (!row.windows.is_empty() || !row.usage_lines.is_empty());
         let expanded = expandable && self.usage_expanded.contains(&key);
         let (icon_path, claude_tint) = usage_provider_icon(row.harness);
+        // A row without quota reports the engine's own reason when there is one:
+        // an expired credential or a rejected payload is not "no usage yet".
         let summary: SharedString = match row.state {
             ProviderUsageState::Ready => row
                 .weekly_summary
                 .clone()
                 .unwrap_or_else(|| "—".into())
                 .into(),
-            ProviderUsageState::NoUsage => "No usage yet".into(),
-            ProviderUsageState::NotSignedIn => "Not signed in".into(),
+            ProviderUsageState::NoUsage => row
+                .warning
+                .clone()
+                .unwrap_or_else(|| "No usage yet".into())
+                .into(),
+            ProviderUsageState::NotSignedIn => row
+                .warning
+                .clone()
+                .unwrap_or_else(|| "Not signed in".into())
+                .into(),
         };
         let reset_badge: Option<SharedString> = row
             .weekly_reset_badge
@@ -3779,7 +4029,8 @@ impl DetailsSidebar {
                             })
                             .child(
                                 div()
-                                    .flex_none()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_size(px(12.0))
                                     .text_color(tone_text)
                                     .child(summary),
@@ -4793,6 +5044,95 @@ impl DetailsSidebar {
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text)
                                         .child("Files"),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(2.0))
+                                        .child(self.toolbar_button(
+                                            "details-hidden-toggle",
+                                            if self.sidebar.show_hidden() {
+                                                icons::DETAILS_EYE
+                                            } else {
+                                                icons::DETAILS_EYE_OFF
+                                            },
+                                            theme,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.sidebar.toggle_hidden();
+                                                this.emit_preferences(cx);
+                                                this.reload_files(cx);
+                                            }),
+                                        ))
+                                        .child(self.toolbar_button_with_tooltip(
+                                            "details-new-file",
+                                            icons::DOCUMENT_ADD,
+                                            "New File",
+                                            theme,
+                                            cx.listener(|this, _, window, cx| {
+                                                this.start_inline_create(
+                                                    InlineCreateKind::File,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ))
+                                        .child(self.toolbar_button_with_tooltip(
+                                            "details-new-folder",
+                                            icons::FOLDER_WITH_FILES,
+                                            "New Folder",
+                                            theme,
+                                            cx.listener(|this, _, window, cx| {
+                                                this.start_inline_create(
+                                                    InlineCreateKind::Directory,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ))
+                                        .child(self.toolbar_button(
+                                            "details-search-toggle",
+                                            icons::MAGNIFER,
+                                            theme,
+                                            cx.listener(|this, _, window, cx| {
+                                                this.search_visible = !this.search_visible;
+                                                if this.search_visible {
+                                                    window.focus(
+                                                        &this.search.read(cx).focus_handle(cx),
+                                                        cx,
+                                                    );
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(self.toolbar_button(
+                                            "details-expand-all",
+                                            icons::FOLD_VERTICAL,
+                                            theme,
+                                            cx.listener(|this, _, _, cx| {
+                                                let folders = match &this.files {
+                                                    LoadState::Ready(files) => {
+                                                        let mut folders = Vec::new();
+                                                        Self::all_folder_paths(files, &mut folders);
+                                                        folders
+                                                    }
+                                                    _ => Vec::new(),
+                                                };
+                                                let all_expanded = folders.iter().all(|path| {
+                                                    this.sidebar.expanded_paths().contains(path)
+                                                });
+                                                for path in folders {
+                                                    if this.sidebar.expanded_paths().contains(&path)
+                                                        == all_expanded
+                                                    {
+                                                        this.sidebar.toggle_expanded(&path);
+                                                    }
+                                                }
+                                                this.emit_preferences(cx);
+                                                cx.notify();
+                                            }),
+                                        )),
                                 ),
                         )
                         .child(

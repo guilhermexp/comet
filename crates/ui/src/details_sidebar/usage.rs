@@ -59,6 +59,10 @@ pub struct ProviderUsageRow {
     /// (`Reset 12h 16m`) or when remaining quota is exhausted (`Reset 5d 0h`).
     pub weekly_reset_badge: Option<String>,
     pub usage_lines: Vec<AgentUsageLine>,
+    /// The engine warning for this harness, carried only by rows that have no
+    /// quota of their own to show — "No usage yet" names the wrong cause when
+    /// the probe failed or the credential expired.
+    pub warning: Option<String>,
 }
 
 /// Provider mark plus whether the Claude brand tint applies. Kimi reuses the
@@ -201,6 +205,16 @@ pub fn derive_usage_pace(
     })
 }
 
+/// One row per visible account. The two ways a provider ends up with none are
+/// NOT the same thing and do not render the same:
+///
+/// - **No account detected.** The credentials behind this widget come from the
+///   device (Keychain, `~/.codex`, `~/.kimi`, `~/.cli-proxy-api`, `~/.cursor`,
+///   `~/.grok`), not from anything Comet did, so a provider silently dropping
+///   off reads as Comet losing it. It stays, as a `NotSignedIn` placeholder.
+/// - **Every account hidden.** That is the user working the Accounts toggle.
+///   An explicit opt-out removes the provider; leaving a placeholder behind
+///   would make the toggle look broken.
 pub fn provider_usage_rows(
     snapshot: &AgentAccountsSnapshot,
     hidden_account_ids: &BTreeSet<String>,
@@ -209,22 +223,49 @@ pub fn provider_usage_rows(
     PROVIDERS
         .into_iter()
         .flat_map(|(harness, _, _)| {
-            let visible: Vec<&AgentAccount> = provider_accounts(snapshot, harness)
+            let warning = snapshot
+                .warnings
+                .iter()
+                .find(|warning| warning.harness == harness)
+                .map(|warning| warning.message.clone());
+            let detected = provider_accounts(snapshot, harness);
+            if detected.is_empty() {
+                return vec![placeholder_usage_row(harness, warning)];
+            }
+            let visible: Vec<&AgentAccount> = detected
                 .into_iter()
                 .filter(|account| !hidden_account_ids.contains(&account.id))
                 .collect();
             let show_account_label = visible.len() > 1;
             visible
                 .into_iter()
-                .map(move |account| account_usage_row(account, show_account_label, now))
+                .map(|account| account_usage_row(account, show_account_label, warning.clone(), now))
                 .collect::<Vec<_>>()
         })
         .collect()
 }
 
+/// A provider with no account detected on this device.
+fn placeholder_usage_row(harness: HarnessId, warning: Option<String>) -> ProviderUsageRow {
+    ProviderUsageRow {
+        harness,
+        label: usage_provider_label(harness),
+        account_id: None,
+        account_label: None,
+        state: ProviderUsageState::NotSignedIn,
+        weekly_summary: None,
+        weekly_tone: UsageTone::Neutral,
+        windows: Vec::new(),
+        weekly_reset_badge: None,
+        usage_lines: Vec::new(),
+        warning,
+    }
+}
+
 fn account_usage_row(
     account: &AgentAccount,
     show_account_label: bool,
+    warning: Option<String>,
     now: DateTime<Utc>,
 ) -> ProviderUsageRow {
     let windows: Vec<_> = account
@@ -303,6 +344,10 @@ fn account_usage_row(
         windows,
         weekly_reset_badge,
         usage_lines: account.usage_lines.clone(),
+        // A provider already showing quota must not double as an error channel.
+        warning: (state != ProviderUsageState::Ready)
+            .then_some(warning)
+            .flatten(),
     }
 }
 
@@ -312,12 +357,13 @@ mod tests {
 
     use chrono::{DateTime, TimeZone, Utc};
     use zeron_proto::{
-        AgentAccount, AgentAccountsSnapshot, AgentUsageLine, AgentUsageWindow, HarnessId,
+        AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentUsageLine, AgentUsageWindow,
+        HarnessId,
     };
 
     use super::{
-        ProviderUsageRow, ProviderUsageState, UsageTone, derive_usage_pace, provider_usage_rows,
-        reset_text, usage_provider_icon,
+        PROVIDERS, ProviderUsageRow, ProviderUsageState, UsageTone, derive_usage_pace,
+        provider_usage_rows, reset_text, usage_provider_icon,
     };
 
     fn usage_rows(snapshot: &AgentAccountsSnapshot, now: DateTime<Utc>) -> Vec<ProviderUsageRow> {
@@ -331,6 +377,16 @@ mod tests {
     ) -> Vec<ProviderUsageRow> {
         let hidden = hidden.iter().map(|id| (*id).to_string()).collect();
         provider_usage_rows(snapshot, &hidden, now)
+    }
+
+    /// Rows that carry a real account, i.e. the list minus the placeholders every
+    /// provider without a visible login contributes.
+    fn account_rows(rows: &[ProviderUsageRow]) -> Vec<&ProviderUsageRow> {
+        rows.iter().filter(|row| row.account_id.is_some()).collect()
+    }
+
+    fn rows_for(rows: &[ProviderUsageRow], harness: HarnessId) -> Vec<&ProviderUsageRow> {
+        rows.iter().filter(|row| row.harness == harness).collect()
     }
 
     #[test]
@@ -485,29 +541,40 @@ mod tests {
         };
         let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
         let rows = usage_rows_hiding(&snapshot, &["claude-old"], now);
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].label, "Claude");
-        assert_eq!(rows[0].account_id.as_deref(), Some("claude-active"));
-        assert_eq!(rows[0].weekly_summary.as_deref(), Some("Weekly 52%"));
-        assert_eq!(rows[1].label, "Codex");
-        assert_eq!(rows[1].weekly_summary.as_deref(), Some("Weekly 54%"));
-        assert_eq!(rows[2].label, "Kimi");
-        assert_eq!(rows[2].weekly_summary.as_deref(), Some("Weekly 60%"));
-        assert!(rows[2].windows[1].pace.is_some());
+        // Every provider is listed; Cursor and Grok have no login here and ride
+        // along as placeholders after the four detected ones.
+        assert_eq!(rows.len(), PROVIDERS.len());
+        let detected = account_rows(&rows);
+        assert_eq!(detected.len(), 4);
+        assert_eq!(detected[0].label, "Claude");
+        assert_eq!(detected[0].account_id.as_deref(), Some("claude-active"));
+        assert_eq!(detected[0].weekly_summary.as_deref(), Some("Weekly 52%"));
+        assert_eq!(detected[1].label, "Codex");
+        assert_eq!(detected[1].weekly_summary.as_deref(), Some("Weekly 54%"));
+        assert_eq!(detected[2].label, "Kimi");
+        assert_eq!(detected[2].weekly_summary.as_deref(), Some("Weekly 60%"));
+        assert!(detected[2].windows[1].pace.is_some());
 
-        assert_eq!(rows[3].label, "Antigravity");
-        assert_eq!(rows[3].account_id.as_deref(), Some("antigravity-managed"));
-        assert_eq!(rows[3].weekly_summary.as_deref(), Some("Weekly 67%"));
-        assert_eq!(rows[3].weekly_tone, UsageTone::Neutral);
-        assert_eq!(rows[3].windows.len(), 4);
-        assert_eq!(rows[3].windows[0].label, "Weekly");
-        assert_eq!(rows[3].windows[1].label, "5h");
-        assert_eq!(rows[3].windows[2].label, "Weekly (Claude/GPT)");
-        assert_eq!(rows[3].windows[3].label, "5h (Claude/GPT)");
-        assert!(rows[3].windows[0].pace.is_some());
-        assert!(rows[3].windows[1].pace.is_some());
-        assert!(rows[3].windows[2].pace.is_some());
-        assert!(rows[3].windows[3].pace.is_some());
+        assert_eq!(detected[3].label, "Antigravity");
+        assert_eq!(
+            detected[3].account_id.as_deref(),
+            Some("antigravity-managed")
+        );
+        assert_eq!(detected[3].weekly_summary.as_deref(), Some("Weekly 67%"));
+        assert_eq!(detected[3].weekly_tone, UsageTone::Neutral);
+        assert_eq!(detected[3].windows.len(), 4);
+        assert_eq!(detected[3].windows[0].label, "Weekly");
+        assert_eq!(detected[3].windows[1].label, "5h");
+        assert_eq!(detected[3].windows[2].label, "Weekly (Claude/GPT)");
+        assert_eq!(detected[3].windows[3].label, "5h (Claude/GPT)");
+        assert!(detected[3].windows[0].pace.is_some());
+        assert!(detected[3].windows[1].pace.is_some());
+        assert!(detected[3].windows[2].pace.is_some());
+        assert!(detected[3].windows[3].pace.is_some());
+        assert_eq!(
+            rows.iter().map(|row| row.label).collect::<Vec<_>>(),
+            ["Claude", "Codex", "Kimi", "Antigravity", "Cursor", "Grok"]
+        );
 
         assert_eq!(
             usage_provider_icon(HarnessId::Antigravity),
@@ -543,9 +610,92 @@ mod tests {
     }
 
     #[test]
-    fn missing_provider_account_yields_no_placeholder_rows() {
+    fn empty_snapshot_still_lists_every_provider() {
         let rows = usage_rows(&AgentAccountsSnapshot::default(), Utc::now());
-        assert!(rows.is_empty());
+        assert_eq!(
+            rows.iter().map(|row| row.label).collect::<Vec<_>>(),
+            ["Claude", "Codex", "Kimi", "Antigravity", "Cursor", "Grok"]
+        );
+        assert!(rows.iter().all(|row| {
+            row.account_id.is_none()
+                && row.state == ProviderUsageState::NotSignedIn
+                && row.weekly_tone == UsageTone::Neutral
+                && row.weekly_summary.is_none()
+        }));
+    }
+
+    #[test]
+    fn detected_providers_sit_beside_not_signed_in_ones() {
+        let now = Utc::now();
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![account(
+                "claude-active",
+                HarnessId::ClaudeCode,
+                true,
+                vec![AgentUsageWindow {
+                    label: "Weekly".into(),
+                    used_fraction: 0.25,
+                    resets_at: None,
+                }],
+            )],
+            warnings: vec![],
+        };
+
+        let rows = usage_rows(&snapshot, now);
+        assert_eq!(rows.len(), PROVIDERS.len());
+        assert_eq!(rows[0].account_id.as_deref(), Some("claude-active"));
+        assert_eq!(rows[0].weekly_summary.as_deref(), Some("Weekly 75%"));
+        assert!(
+            rows[1..]
+                .iter()
+                .all(|row| row.state == ProviderUsageState::NotSignedIn)
+        );
+    }
+
+    #[test]
+    fn warning_replaces_the_generic_summary_only_on_rows_without_quota() {
+        let now = Utc::now();
+        let mut codex = account("codex-active", HarnessId::Codex, true, vec![]);
+        codex.usage_windows = vec![AgentUsageWindow {
+            label: "Weekly".into(),
+            used_fraction: 0.15,
+            resets_at: None,
+        }];
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![
+                account("kimi-managed", HarnessId::Kimi, true, vec![]),
+                codex,
+            ],
+            warnings: vec![
+                AgentAccountWarning {
+                    harness: HarnessId::Kimi,
+                    message: "Kimi Code Usage returned an invalid payload".into(),
+                },
+                AgentAccountWarning {
+                    harness: HarnessId::Codex,
+                    message: "ignored while quota is showing".into(),
+                },
+                AgentAccountWarning {
+                    harness: HarnessId::Grok,
+                    message: "No Grok subscription detected on this device".into(),
+                },
+            ],
+        };
+
+        let rows = usage_rows(&snapshot, now);
+        let kimi = rows_for(&rows, HarnessId::Kimi)[0];
+        assert_eq!(kimi.state, ProviderUsageState::NoUsage);
+        assert_eq!(
+            kimi.warning.as_deref(),
+            Some("Kimi Code Usage returned an invalid payload")
+        );
+        // A provider already showing quota is not an error channel.
+        assert_eq!(rows_for(&rows, HarnessId::Codex)[0].warning, None);
+        // The placeholder carries its harness warning too.
+        assert_eq!(
+            rows_for(&rows, HarnessId::Grok)[0].warning.as_deref(),
+            Some("No Grok subscription detected on this device")
+        );
     }
 
     #[test]
@@ -630,10 +780,6 @@ mod tests {
     #[test]
     fn primary_window_summary_and_tone_stay_paired() {
         let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
-        // Empty snapshot: no placeholder rows.
-        let empty_snapshot = AgentAccountsSnapshot::default();
-        assert!(usage_rows(&empty_snapshot, now).is_empty());
-
         // NoUsage
         let no_usage_snapshot = AgentAccountsSnapshot {
             accounts: vec![account(
@@ -720,7 +866,8 @@ mod tests {
             warnings: vec![],
         };
 
-        let visible = usage_rows(&snapshot, now);
+        let rows = usage_rows(&snapshot, now);
+        let visible = rows_for(&rows, HarnessId::ClaudeCode);
         assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].account_id.as_deref(), Some("claude-alice"));
         assert_eq!(
@@ -730,7 +877,8 @@ mod tests {
         assert_eq!(visible[1].account_id.as_deref(), Some("claude-bob"));
         assert_eq!(visible[1].account_label.as_deref(), Some("bob@example.com"));
 
-        let hidden = usage_rows_hiding(&snapshot, &["claude-bob"], now);
+        let rows = usage_rows_hiding(&snapshot, &["claude-bob"], now);
+        let hidden = rows_for(&rows, HarnessId::ClaudeCode);
         assert_eq!(hidden.len(), 1);
         assert_eq!(hidden[0].account_id.as_deref(), Some("claude-alice"));
         assert_eq!(hidden[0].account_label, None);
@@ -743,9 +891,9 @@ mod tests {
             warnings: vec![],
         };
         let rows = usage_rows(&snapshot, Utc::now());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Cursor");
-        assert_eq!(rows[0].account_id.as_deref(), Some("cursor-1"));
+        let cursor = rows_for(&rows, HarnessId::Cursor);
+        assert_eq!(cursor.len(), 1);
+        assert_eq!(cursor[0].account_id.as_deref(), Some("cursor-1"));
         assert_eq!(
             usage_provider_icon(HarnessId::Cursor),
             (crate::icons::CURSOR_MARK, false)
@@ -759,9 +907,9 @@ mod tests {
             warnings: vec![],
         };
         let rows = usage_rows(&snapshot, Utc::now());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Grok");
-        assert_eq!(rows[0].account_id.as_deref(), Some("grok-1"));
+        let grok = rows_for(&rows, HarnessId::Grok);
+        assert_eq!(grok.len(), 1);
+        assert_eq!(grok[0].account_id.as_deref(), Some("grok-1"));
         assert_eq!(
             usage_provider_icon(HarnessId::Grok),
             (crate::icons::GROK_MARK, false)
@@ -769,11 +917,47 @@ mod tests {
     }
 
     #[test]
-    fn fully_hidden_snapshot_has_no_rows() {
+    fn hiding_every_account_of_a_provider_removes_it_entirely() {
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![account("kimi-managed", HarnessId::Kimi, true, vec![])],
+            warnings: vec![AgentAccountWarning {
+                harness: HarnessId::Kimi,
+                message: "Kimi Code Usage returned an invalid payload".into(),
+            }],
+        };
+
+        // Detected and visible: its own row, no placeholder beside it.
+        let shown = usage_rows(&snapshot, Utc::now());
+        assert_eq!(rows_for(&shown, HarnessId::Kimi).len(), 1);
+        assert_eq!(
+            rows_for(&shown, HarnessId::Kimi)[0].account_id.as_deref(),
+            Some("kimi-managed")
+        );
+
+        // Toggled off: the provider leaves the widget. A placeholder here would
+        // make the Accounts toggle look like it did nothing — and the warning
+        // goes with it, since the user asked not to see this provider.
+        let hidden = usage_rows_hiding(&snapshot, &["kimi-managed"], Utc::now());
+        assert!(rows_for(&hidden, HarnessId::Kimi).is_empty());
+        assert_eq!(hidden.len(), PROVIDERS.len() - 1);
+    }
+
+    #[test]
+    fn hiding_one_of_two_accounts_keeps_the_provider_without_a_placeholder() {
+        let now = Utc::now();
+        let mut alice = account("claude-alice", HarnessId::ClaudeCode, true, vec![]);
+        alice.email = Some("alice@example.com".into());
+        let mut bob = account("claude-bob", HarnessId::ClaudeCode, false, vec![]);
+        bob.email = Some("bob@example.com".into());
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![alice, bob],
             warnings: vec![],
         };
-        assert!(usage_rows_hiding(&snapshot, &["kimi-managed"], Utc::now()).is_empty());
+
+        let rows = usage_rows_hiding(&snapshot, &["claude-bob"], now);
+        let claude = rows_for(&rows, HarnessId::ClaudeCode);
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].account_id.as_deref(), Some("claude-alice"));
+        assert_ne!(claude[0].state, ProviderUsageState::NotSignedIn);
     }
 }

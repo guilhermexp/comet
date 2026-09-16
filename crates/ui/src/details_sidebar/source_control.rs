@@ -21,8 +21,8 @@ pub fn status_letter(status: GitFileStatus) -> char {
         GitFileStatus::Deleted => 'D',
         GitFileStatus::Renamed => 'R',
         GitFileStatus::Copied => 'C',
-        GitFileStatus::Untracked => '?',
-        GitFileStatus::Unmerged => 'U',
+        GitFileStatus::Untracked => 'U',
+        GitFileStatus::Unmerged => '!',
     }
 }
 
@@ -74,9 +74,9 @@ pub fn can_commit(message: &str, files: &[CheckoutStatusFile]) -> bool {
 
 pub fn sync_button_label(upstream: Option<&str>) -> &'static str {
     if upstream.is_some() {
-        "Sync"
+        "Sync Changes"
     } else {
-        "Publish"
+        "Publish Branch"
     }
 }
 
@@ -162,8 +162,8 @@ mod tests {
 
     #[test]
     fn sync_label_is_publish_without_upstream() {
-        assert_eq!(sync_button_label(Some("origin/main")), "Sync");
-        assert_eq!(sync_button_label(None), "Publish");
+        assert_eq!(sync_button_label(Some("origin/main")), "Sync Changes");
+        assert_eq!(sync_button_label(None), "Publish Branch");
     }
 
     #[test]
@@ -185,13 +185,54 @@ mod tests {
     }
 
     #[test]
-    fn untracked_letter_is_question_mark_not_added() {
+    fn untracked_letter_is_distinct_from_added_and_conflict() {
         let files = [file(
             "new.txt",
             GitFileStatus::Untracked,
             GitFileStatus::Untracked,
         )];
-        assert_eq!(changes_rows(&files)[0].letter, '?');
+        assert_eq!(changes_rows(&files)[0].letter, 'U');
+        assert_eq!(status_letter(GitFileStatus::Unmerged), '!');
+        assert_eq!(status_letter(GitFileStatus::Added), 'A');
         assert!(staged_rows(&files).is_empty());
+    }
+}
+
+/// A result belongs only to the unchanged draft that requested it.
+pub fn can_apply_generated_message(
+    request_context: Option<&str>,
+    current_context: Option<&str>,
+    request_revision: u64,
+    current_revision: u64,
+) -> bool {
+    request_context.is_some()
+        && request_context == current_context
+        && request_revision == current_revision
+}
+
+#[cfg(test)]
+mod generated_message_tests {
+    use super::*;
+    #[test]
+    fn switching_context_or_editing_draft_rejects_generated_message() {
+        assert!(can_apply_generated_message(
+            Some("worker:a"),
+            Some("worker:a"),
+            3,
+            3
+        ));
+        assert!(!can_apply_generated_message(
+            Some("worker:a"),
+            Some("worker:b"),
+            3,
+            3
+        ));
+        assert!(!can_apply_generated_message(
+            Some("worker:a"),
+            Some("worker:a"),
+            3,
+            4
+        ));
+        assert!(!can_apply_generated_message(None, None, 3, 3));
     }
 }

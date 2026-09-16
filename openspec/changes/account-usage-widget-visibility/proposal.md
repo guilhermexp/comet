@@ -6,7 +6,7 @@ Settings → Accounts already lists every device-local provider login with its M
 
 - Each Accounts row gets a trailing toggle that opts that login into (default ON) or out of the Usage widget.
 - The Usage widget derives one row per visible account, in Accounts provider order then engine slot order. Multiple logins of the same harness can appear. Cursor is eligible. Hidden accounts stay on the Accounts page with their meters.
-- Missing or hidden accounts produce no placeholder `NotSignedIn` row. An empty widget is valid.
+- Hiding every account of a provider removes it from the widget; an empty widget is valid. A provider with no account in the snapshot at all keeps a `NotSignedIn` placeholder — see `always-show-usage-providers`, which split the two cases after the first shipped behavior (omit both) read as Comet losing providers it had never been told to hide.
 - Visibility is a device-local `UiSettings` set of hidden account ids. No engine, RPC, CRDT, or snapshot field.
 
 ## Capabilities
@@ -17,7 +17,7 @@ Settings → Accounts already lists every device-local provider login with its M
 
 ### Modified Capabilities
 
-- `kimi-managed-usage`: Widget no longer emits a Kimi `NotSignedIn` placeholder when the managed credential is absent or the account is hidden.
+- `kimi-managed-usage`: Kimi membership follows the same per-account toggle; a hidden Kimi account leaves the widget, while an absent credential keeps the placeholder row.
 - `antigravity-managed-usage`: Widget membership follows the same per-account toggle; Antigravity is no longer guaranteed to be the fourth row.
 - `usage-widget-freshness-and-tone`: Row derivation takes the hidden-id set; countdown/tone rules still apply per remaining visible row.
 

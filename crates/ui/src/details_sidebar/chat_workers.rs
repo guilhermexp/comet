@@ -26,7 +26,9 @@ pub enum WorkerSemantic {
 }
 
 impl WorkerSemantic {
-    fn is_active(self) -> bool {
+    /// Running now, as opposed to merely listed. The Workers widget uses this
+    /// both for the activity shimmer and to decide which tab has live work.
+    pub fn is_active(self) -> bool {
         matches!(self, Self::Starting | Self::Working | Self::Blocked)
     }
 }

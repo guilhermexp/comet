@@ -40,7 +40,7 @@ Test: engine unit test covering missing, disabled (`disabled: true`), and malfor
 
 - **WHEN** the credential is missing, disabled, or malformed
 - **THEN** the account snapshot contains no usable Antigravity account
-- **AND** the Usage widget omits Antigravity rather than showing a not-signed-in placeholder
+- **AND** the Usage widget keeps an Antigravity row and shows the not-signed-in placeholder
 - **AND** no secret material appears in warnings or logs
 
 #### Scenario: All credentials expired and cannot be renewed
