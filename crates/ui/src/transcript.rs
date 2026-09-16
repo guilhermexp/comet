@@ -100,6 +100,11 @@ pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 /// the row's padding is the only free space there, so `-COLUMN_GUTTER` is a
 /// full-bleed breakout that can never leave the transcript's own bounds.
 pub const COLUMN_GUTTER: f32 = 16.0;
+/// Widest a table may become. Bounded rather than tied to the pane: on a large
+/// display, letting a two-column table run the full width puts a 1700px table
+/// directly under a 736px paragraph, which reads worse than the scroller it
+/// replaced. Tune here — nothing else encodes this number.
+pub const TABLE_MAX_WIDTH: f32 = 1100.0;
 /// Tool stream row height / gap — analytic, so fold heights need no measurement.
 /// Event headers share a compact 28px slot and one label baseline.
 /// Details expand only on request; no nested cards or connector spines.
@@ -2191,6 +2196,23 @@ fn row_markdown_block(kind: &RowKind) -> Option<&crate::markdown::parser::Block>
         }
         _ => None,
     }
+}
+
+/// The prose column and the per-side table bleed budget for a measured
+/// viewport. Both are needed by `RenderOptions`: widths resolve at layout, so
+/// the bleed cannot read the column it is widening.
+///
+/// A narrow window yields ZERO budget — `column` and `target` collapse to the
+/// same value — so a bleed can never push a table off-screen.
+pub fn column_and_table_bleed(viewport_width: Option<f32>) -> (f32, f32) {
+    let usable = viewport_width
+        .filter(|width| width.is_finite())
+        .map(|width| (width - 2.0 * COLUMN_GUTTER).max(0.0))
+        // No measurement yet: assume the column, which yields no bleed.
+        .unwrap_or(MAX_CONTENT_WIDTH);
+    let column = usable.min(MAX_CONTENT_WIDTH);
+    let target = usable.min(TABLE_MAX_WIDTH).max(column);
+    (column, ((target - column) / 2.0).max(0.0))
 }
 
 /// Vertical gap opening `row` given its predecessor: turn gap at turn starts;
@@ -6489,6 +6511,8 @@ impl Transcript {
                 if should_render_mermaid(&top.block, false) {
                     self.render_mermaid_block(&row.id, tree, *block_ix, window, &theme, cx)
                 } else {
+                    let (md_width, bleed_budget) =
+                        column_and_table_bleed(self.sticky_turn.viewport.map(|(w, _)| w));
                     let opts = RenderOptions {
                         row_key: row.id.clone(),
                         veil: None,
@@ -6497,6 +6521,8 @@ impl Transcript {
                         copy: Some(self.copy_ui_for(&row.id, cx)),
                         open_file: self.open_file_link(cx),
                         selection_group: None,
+                        block_width: md_width,
+                        table_bleed_budget: bleed_budget,
                         file_root: self
                             .state
                             .read(cx)
@@ -6536,6 +6562,8 @@ impl Transcript {
                         })
                         .clone()
                 });
+                let (md_width, bleed_budget) =
+                    column_and_table_bleed(self.sticky_turn.viewport.map(|(w, _)| w));
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
                     veil: veil.clone(),
@@ -6544,6 +6572,8 @@ impl Transcript {
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     open_file: self.open_file_link(cx),
                     selection_group: None,
+                    block_width: md_width,
+                    table_bleed_budget: bleed_budget,
                     file_root: self
                         .state
                         .read(cx)
@@ -7722,6 +7752,8 @@ impl Transcript {
 
         let mut column = div().w_full().flex().flex_col().child(header);
         if open {
+            let (md_width, bleed_budget) =
+                column_and_table_bleed(self.sticky_turn.viewport.map(|(w, _)| w));
             let opts = RenderOptions {
                 row_key: SharedString::from(format!("{row_id}-reasoning")),
                 veil: None,
@@ -7730,6 +7762,8 @@ impl Transcript {
                 copy: None,
                 open_file: self.open_file_link(cx),
                 selection_group: None,
+                block_width: md_width,
+                table_bleed_budget: bleed_budget,
                 file_root: self
                     .state
                     .read(cx)
@@ -7904,6 +7938,8 @@ impl Transcript {
 
         // Fallback on failure: clean syntax-highlighted code block (like Craft)
         if matches!(&state, MermaidSnapshot::Failed) {
+            let (md_width, bleed_budget) =
+                column_and_table_bleed(self.sticky_turn.viewport.map(|(w, _)| w));
             let opts = RenderOptions {
                 row_key: SharedString::from(format!("{row_id}#mermaid-code")),
                 veil: None,
@@ -7913,6 +7949,8 @@ impl Transcript {
                 open_file: None,
                 file_root: None,
                 selection_group: None,
+                block_width: md_width,
+                table_bleed_budget: bleed_budget,
             };
             let highlight = self.code_highlight_for(row_id, tree, Some(block_ix), cx);
             return render::render_block(
@@ -13829,6 +13867,34 @@ mod tests {
             stream_copy(&call, "Called", "js · literal title").1,
             "js · literal title"
         );
+    }
+
+    #[test]
+    fn a_narrow_viewport_never_buys_a_table_any_bleed() {
+        // Wide display: the column stays at its cap and the budget fills the
+        // gap up to TABLE_MAX_WIDTH.
+        let (column, budget) = column_and_table_bleed(Some(3000.0));
+        assert_eq!(column, MAX_CONTENT_WIDTH);
+        assert_eq!(budget, (TABLE_MAX_WIDTH - MAX_CONTENT_WIDTH) / 2.0);
+
+        // Exactly the column plus its gutters: nothing left over.
+        let (column, budget) =
+            column_and_table_bleed(Some(MAX_CONTENT_WIDTH + 2.0 * COLUMN_GUTTER));
+        assert_eq!(column, MAX_CONTENT_WIDTH);
+        assert_eq!(budget, 0.0);
+
+        // Narrower than the column: the column shrinks with the window and the
+        // budget stays zero — a bleed here would push the table off-screen.
+        let (column, budget) = column_and_table_bleed(Some(400.0));
+        assert_eq!(column, 400.0 - 2.0 * COLUMN_GUTTER);
+        assert_eq!(budget, 0.0);
+
+        // Absurdly narrow, and unmeasured: still no bleed, still no negatives.
+        for viewport in [Some(0.0), Some(8.0), None] {
+            let (column, budget) = column_and_table_bleed(viewport);
+            assert!(column >= 0.0, "{viewport:?}");
+            assert_eq!(budget, 0.0, "{viewport:?}");
+        }
     }
 
     #[test]

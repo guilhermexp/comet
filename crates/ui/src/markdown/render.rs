@@ -113,6 +113,27 @@ pub struct RenderOptions {
     pub file_root: Option<String>,
     /// Inline fragments from the same paragraph copy without inserted newlines.
     pub selection_group: Option<String>,
+    /// Width the caller lays this Markdown out at, and how far a TABLE may
+    /// extend past it on each side. Widths resolve at layout, not while
+    /// elements are built, so the bleed cannot read the resolved column — the
+    /// caller supplies both from what it already measured.
+    /// A zero budget keeps tables inside the column, which is what every
+    /// surface other than the transcript wants.
+    pub block_width: f32,
+    pub table_bleed_budget: f32,
+}
+
+/// How far a table extends past the prose column on EACH side: as far as its
+/// natural width needs, never more than the caller's budget, never negative.
+///
+/// `min(needed, budget)` and not `budget`: a table that already fits must not
+/// be stretched, or a two-column table would drift out of alignment with the
+/// paragraph above it for no reason.
+pub fn table_bleed(natural_width: f32, block_width: f32, budget: f32) -> f32 {
+    if !natural_width.is_finite() || !block_width.is_finite() || !budget.is_finite() {
+        return 0.0;
+    }
+    (((natural_width - block_width) / 2.0).max(0.0)).min(budget.max(0.0))
 }
 
 /// Um destino de link que o preview interno sabe abrir: caminho local, sem
@@ -151,6 +172,8 @@ impl RenderOptions {
             open_file: None,
             file_root: None,
             selection_group: None,
+            block_width: 0.0,
+            table_bleed_budget: 0.0,
         }
     }
 }
@@ -606,14 +629,24 @@ fn render_table(
     // The horizontal scroller — when the floors exceed the viewport the inner
     // block keeps `min_table_width` and this viewport scrolls it.
     let scroll_id: SharedString = format!("{}-table{ix}", opts.row_key).into();
-    div()
+    let scroller = div()
         .id(scroll_id)
         .min_w_0()
         .max_w_full()
         .w_full()
         .overflow_x_scroll()
-        .child(inner)
-        .into_any_element()
+        .child(inner);
+
+    let natural_width: f32 = geo.naturals.iter().sum();
+    let bleed = table_bleed(natural_width, opts.block_width, opts.table_bleed_budget);
+    if bleed <= 0.0 {
+        return scroller.into_any_element();
+    }
+    // Width stays AUTO here on purpose: block layout stretches this box to
+    // `column + 2 * bleed`, whereas `w_full` would resolve 100% against the
+    // column and merely shift it sideways. The scroller inside keeps `w_full`,
+    // which now resolves against the widened box.
+    div().mx(px(-bleed)).child(scroller).into_any_element()
 }
 
 /// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges.
@@ -1433,6 +1466,22 @@ pub fn runs_for_syntax_line_with_plain(
 mod tests {
     use super::*;
     use crate::markdown::parser::InlineStyle;
+
+    #[test]
+    fn table_bleed_takes_what_it_needs_and_never_more() {
+        // Needs more than the column: extends by half the shortfall per side.
+        assert_eq!(table_bleed(1000.0, 736.0, 182.0), 132.0);
+        // Needs more than the budget allows: clamped, the scroller keeps the rest.
+        assert_eq!(table_bleed(2000.0, 736.0, 182.0), 182.0);
+        // Already fits: no stretch, so a narrow table stays aligned with prose.
+        assert_eq!(table_bleed(500.0, 736.0, 182.0), 0.0);
+        assert_eq!(table_bleed(736.0, 736.0, 182.0), 0.0);
+        // No budget (narrow window, or any surface that is not the transcript).
+        assert_eq!(table_bleed(2000.0, 736.0, 0.0), 0.0);
+        // Degenerate inputs never produce a negative or NaN margin.
+        assert_eq!(table_bleed(f32::NAN, 736.0, 182.0), 0.0);
+        assert_eq!(table_bleed(1000.0, 736.0, -50.0), 0.0);
+    }
 
     #[test]
     fn block_gap_groups_a_heading_with_what_follows_it() {
