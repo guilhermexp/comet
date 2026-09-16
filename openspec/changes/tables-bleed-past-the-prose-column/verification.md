@@ -22,3 +22,13 @@ what actually keeps a diagram from scrolling is that it is FITTED, and
 `INLINE_MERMAID_SCALE` (1.25) scales the drawing against its own natural size,
 not against the column. A table has no equivalent because its column floors
 cannot shrink. That is why the bleed had to be built rather than copied.
+
+## Tuning pass
+`TABLE_MAX_WIDTH` shipped at 1100 (~1.5x the 736px column) and was reviewed on
+screen: the table broke the left edge of the reading column hard enough to read
+as a separate document. Lowered to 900 (~1.2x, +82px per side). The mechanism
+was correct — measured on the screenshot the table rendered at ~1.4x the prose
+width, which is what 1100 specifies — so only the constant moved.
+
+This is the first part of this change actually seen rendered; the height and
+virtualization behavior on a viewport change still has not been exercised.

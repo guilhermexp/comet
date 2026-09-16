@@ -100,11 +100,18 @@ pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 /// the row's padding is the only free space there, so `-COLUMN_GUTTER` is a
 /// full-bleed breakout that can never leave the transcript's own bounds.
 pub const COLUMN_GUTTER: f32 = 16.0;
-/// Widest a table may become. Bounded rather than tied to the pane: on a large
-/// display, letting a two-column table run the full width puts a 1700px table
-/// directly under a 736px paragraph, which reads worse than the scroller it
-/// replaced. Tune here — nothing else encodes this number.
-pub const TABLE_MAX_WIDTH: f32 = 1100.0;
+/// Widest a table may become — about 1.2x the prose column.
+///
+/// Bounded rather than tied to the pane: on a large display, letting a
+/// two-column table run the full width puts a 1700px table directly under a
+/// 736px paragraph, which reads worse than the scroller it replaced. The first
+/// value tried, 1100 (~1.5x), was already too much on screen: the table broke
+/// the left edge of the reading column hard enough to read as a different
+/// document. This gives a table ~164px more room than the prose without losing
+/// the column as the page's spine.
+///
+/// Tune here — nothing else encodes this number, and the tests derive from it.
+pub const TABLE_MAX_WIDTH: f32 = 900.0;
 /// Tool stream row height / gap — analytic, so fold heights need no measurement.
 /// Event headers share a compact 28px slot and one label baseline.
 /// Details expand only on request; no nested cards or connector spines.
