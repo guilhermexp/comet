@@ -18,7 +18,7 @@ Modelo source-neutral de temas, registro built-in, biblioteca device-local de te
 - Tema inválido ou incompleto falha fechado e não substitui o último registro válido.
 - `AccentPreset` é o único enum de accent do app (a ui o reexporta como `AccentColor`). Os aliases serde `violet`/`indigo`/`red`/`purple` → `Zeron` e `teal` → `Cyan` são compatibilidade de dado em disco: sem eles um `ui-settings.json` antigo falha a leitura na abertura do app. Renomear variante exige alias novo, nunca troca seca.
 - Built-ins curados podem declarar overrides de papel (`hover`, `active`, `border`, `border_strong`, `input`, `cursor`, `diff_hunk`, `terminal.selection`) e parâmetros de frost (`frost_alpha`, `frost_blur_radius`, `flat_shell`) em `ThemeVariant`. Campos novos em `ThemeVariant` levam `#[serde(default, skip_serializing_if = …)]`: `asset_hash` é SHA-256 da variante serializada, e um campo que serializa por default move o hash dos 31 variantes.
-- `terminal_background` pode carregar alpha. O contraste de `terminal.foreground` endurece contra `flatten(terminal_background, background)`, nunca contra o seed translúcido.
+- `terminal_background` pode carregar alpha. O contraste de `terminal.foreground` endurece contra `flatten(terminal_background, background)`, nunca contra o seed translúcido. `ThemeRegistry::validate` mede o mesmo canvas achatado e rejeita `frost_alpha` fora de `0.0..=1.0` e `frost_blur_radius` fora de `0.0..=64.0` (incluindo não-finito) com `ValidationIssue` estrutural, para `load_editable_family` e `install` bloquearem via `is_blocking`.
 
 ## Work Guidance
 
@@ -34,6 +34,8 @@ Modelo source-neutral de temas, registro built-in, biblioteca device-local de te
 | `src/builtins.rs` (`monocode-dark` papéis de interação) | unit | `cargo test -p zeron-theme --lib monocode_fidelity_state_roles_are_neutral` |
 | `src/builtins.rs` (variantes sem override) | unit | `cargo test -p zeron-theme --lib monocode_fidelity_non_declaring_variants_are_unchanged` |
 | `src/builtins.rs` (`terminal_background` com alpha) | unit | `cargo test -p zeron-theme --lib monocode_fidelity_terminal_background_keeps_alpha` |
+| `src/lib.rs` (faixa de frost) | unit | `cargo test -p zeron-theme --lib frost_bounds_rejects_out_of_range` |
+| `src/lib.rs` (contraste do terminal no canvas achatado) | unit | `cargo test -p zeron-theme --lib frost_bounds_terminal_contrast_uses_flattened_canvas` |
 | `src/library.rs` | unit + filesystem temporário | `cargo test -p zeron-theme library` |
 | `src/vscode.rs` | unit | `cargo test -p zeron-theme vscode` |
 

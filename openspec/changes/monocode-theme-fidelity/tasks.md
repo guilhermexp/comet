@@ -24,3 +24,11 @@
 - [ ] 4.2 Launch the app with `monocode-dark` active and confirm the translucent terminal, the neutral selection and the flat sidebar render as specified; capture evidence or report the unverified item.
 - [x] 4.3 Update the owning DOX (`crates/theme/AGENTS.md`, `crates/ui/AGENTS.md`) with the override contract and the frost fields, including the `Test:` matrix rows for the new scenarios.
 - [x] 4.4 Update `docs/monocode-design.md`: mark the gaps this change closes, repin the referenced revision, and leave the typography, geometry and tinting gaps recorded as still open.
+
+## 5. Review-followup: wash, reverse video, frost bounds
+
+- [x] 5.1 Return the authored input wash from `input_glass_bg` under frost (`Hsla::opacity` multiplies) and keep `composer_glass_bg` at half that alpha; lock with `monocode_wash_survives_frost`.
+- [x] 5.2 Restore shell-text contrast coverage for wash inputs (assert against the window composite) so no builtin is skipped; plates keep the flattened-surface assertion.
+- [x] 5.3 Flatten `CellColor::Background` when it is a glyph colour so SGR 7 stays opaque on a translucent terminal; lock with `monocode_wash_terminal_inverse_stays_legible`.
+- [x] 5.4 Reject out-of-range `frost_alpha` / `frost_blur_radius` as blocking structural issues in `ThemeRegistry::validate`; clamp blur so `frost_blur_or` and `current_frost_blur` agree.
+- [x] 5.5 Measure terminal contrast in `validate` and model-foreground hardening against `terminal.background.blend_over(colors.background)`; lock with `frost_bounds_terminal_contrast_uses_flattened_canvas`.

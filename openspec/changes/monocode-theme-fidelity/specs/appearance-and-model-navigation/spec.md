@@ -26,6 +26,12 @@ A theme SHALL be able to declare a terminal background with alpha below full opa
 - **THEN** its terminal background keeps zero alpha over the canvas hue
 - **AND** its terminal foreground still meets the readable contrast ratio measured against the flattened canvas
 
+#### Scenario: Terminal contrast is measured on the flattened canvas
+- Test: unit — `zeron-theme` asserts a translucent `terminal_background` whose foreground would pass against the raw seed is rejected against the canvas flattened over `colors.background`.
+- **WHEN** validation checks terminal foreground contrast
+- **THEN** the background is `terminal.background` blended over the theme canvas
+- **AND** a foreground that only passes against the uncomposited seed fails
+
 ### Requirement: Frost parameters belong to the theme
 
 A theme SHALL be able to declare its frost alpha, its backdrop blur radius and whether its shell is painted flat. The renderer SHALL use the declared values for window frost, floating-card blur and shell tint. A theme that declares none of them SHALL keep the renderer's current alpha, blur radius and shell wash. Platforms without a blur guarantee SHALL keep their existing opaque behaviour regardless of what the theme declares.
@@ -41,3 +47,25 @@ A theme SHALL be able to declare its frost alpha, its backdrop blur radius and w
 - **WHEN** a variant declaring a flat shell paints the sidebar column
 - **THEN** the column fill equals the shell fill with no additional wash
 - **AND** a variant that does not declare it keeps the existing extra wash
+
+#### Scenario: Authored input wash survives frost
+- Test: unit — `zeron-ui` asserts `monocode-dark` `input_glass_bg` alpha equals the seeded 15/255 under forced frost, and `composer_glass_bg` is half of that.
+- **WHEN** `monocode-dark` paints input and composer fills on a frost platform
+- **THEN** the input wash keeps its authored alpha
+- **AND** the composer fill is half of that alpha
+
+#### Scenario: Reverse video stays opaque on a translucent terminal
+- Test: unit — `zeron-ui` feeds SGR 7 to a `monocode-dark` cell and asserts the glyph colour is fully opaque with readable contrast against the cell background.
+- **WHEN** a terminal cell with default colours is inverted under `monocode-dark`
+- **THEN** the glyph colour is the terminal background flattened over the canvas, at full alpha
+- **AND** its contrast against the effective cell background stays readable
+
+### Requirement: Frost parameters are bounded at the registry boundary
+
+A deserialized variant SHALL only install when `frost_alpha` is finite and within 0.0..=1.0 and `frost_blur_radius` is finite and within 0.0..=64.0. Values outside those ranges SHALL produce a blocking structural `ValidationIssue` so `load_editable_family` and `install` refuse the file. After clamping, instance blur (`frost_blur_or`) and context-free blur (`current_frost_blur`) SHALL return the same radius for the same variant.
+
+#### Scenario: Out-of-range frost is rejected
+- Test: unit — `zeron-theme` asserts `frostBlurRadius` 100000.0, `-1.0` and `frostAlpha` 2.0 produce blocking structural issues, and `monocode-dark` at 0.85/24.0 does not.
+- **WHEN** an editable variant declares frost parameters outside the accepted range
+- **THEN** validation emits a blocking structural issue
+- **AND** `monocode-dark` with 0.85 and 24.0 produces none

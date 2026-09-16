@@ -37,8 +37,8 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 use comet_syntax::HighlightKind;
 use gpui::{App, Global, Hsla, SharedString, hsla};
 use zeron_theme::{
-    AccentSelection, Color as ModelColor, SurfacePreference, SurfaceTreatment, ThemeRegistry,
-    ThemeVariant,
+    AccentSelection, Color as ModelColor, FROST_BLUR_RADIUS_MAX, FROST_BLUR_RADIUS_MIN,
+    SurfacePreference, SurfaceTreatment, ThemeRegistry, ThemeVariant,
 };
 
 /// User-selectable accent family and the appearance being painted both live in
@@ -210,8 +210,14 @@ pub fn current_appearance() -> Appearance {
     }
 }
 
+fn clamp_frost_blur_radius(value: Option<f32>) -> Option<f32> {
+    value
+        .filter(|radius| radius.is_finite())
+        .map(|radius| radius.clamp(FROST_BLUR_RADIUS_MIN, FROST_BLUR_RADIUS_MAX))
+}
+
 fn set_declared_frost_blur(value: Option<f32>) {
-    let stored = match value {
+    let stored = match clamp_frost_blur_radius(value) {
         Some(radius) => (radius * 100.0).round() as i32,
         None => -1,
     };
@@ -878,9 +884,11 @@ impl Theme {
         };
         // Authored washes (MonoCode input at 6%) are the fill. Pumping them
         // toward opacity to chase contrast against an unknown desktop would
-        // erase the 3% composer plate the seed is aiming at.
+        // erase the 3% composer plate the seed is aiming at. Hsla::opacity
+        // multiplies alpha, so returning opacity(base) would square 6% to
+        // 0.35%.
         if self.input_bg.a < 0.20 {
-            return self.input_bg.opacity(base);
+            return self.input_bg;
         }
         let window = flatten(self.glass(), self.adverse_backdrop());
         self.input_bg
@@ -894,7 +902,9 @@ impl Theme {
     /// pinned at the top of its turn.
     pub fn composer_glass_bg(&self) -> Hsla {
         let fill = self.input_glass_bg();
-        fill.opacity(fill.a * 0.5)
+        // Hsla::opacity multiplies; 0.5 halves coverage instead of
+        // squaring the authored alpha.
+        fill.opacity(0.5)
     }
 
     /// Section-card fill (settings cards and similar in-panel cards). The
@@ -1234,9 +1244,13 @@ impl Theme {
         theme.frost_blur_radius = variant.frost_blur_radius;
         theme.flat_shell = variant.flat_shell;
         if !is_curated_builtin {
+            let terminal_canvas = variant
+                .terminal
+                .background
+                .blend_over(variant.colors.background);
             theme.terminal.foreground = model_color(harden_model_foreground(
                 variant.terminal.foreground,
-                &[variant.terminal.background],
+                &[terminal_canvas],
                 4.5,
                 Some(safe_text),
             ));
@@ -1349,7 +1363,7 @@ impl Theme {
 
     /// Backdrop blur radius declared by the variant, or `fallback` when none.
     pub fn frost_blur_or(&self, fallback: f32) -> f32 {
-        self.frost_blur_radius.unwrap_or(fallback)
+        clamp_frost_blur_radius(self.frost_blur_radius).unwrap_or(fallback)
     }
 
     /// Extra sidebar-column wash. A flat shell paints nothing here so the
@@ -1895,11 +1909,15 @@ mod tests {
                 ),
                 ("settings card", flatten(theme.card_glass_bg(), composite)),
             ];
-            // A wash at a few percent is not a text plate; labels read the
-            // window behind it. Contrast-checking the wash as if it were
-            // opaque inverts MonoCode's 6% input into a light slab.
+            // A wash at a few percent is not a text plate: labels read the
+            // window composite behind it. A plate (alpha ≥ 0.20) is a text
+            // surface, so contrast is measured against the flattened fill.
+            // Every builtin is asserted; skipping the wash hid the quadratic
+            // alpha bug on monocode-dark.
             if theme.input_bg.a >= 0.20 {
                 surfaces.push(("input", flatten(theme.input_glass_bg(), composite)));
+            } else {
+                surfaces.push(("input wash", composite));
             }
             for (surface_name, surface) in surfaces {
                 assert!(
@@ -2624,5 +2642,64 @@ mod tests {
             assert_eq!(other_theme.glass().a, Theme::GLASS_ALPHA);
             assert_eq!(mono_theme.glass().a, Theme::GLASS_ALPHA);
         }
+    }
+
+    #[test]
+    fn monocode_wash_survives_frost() {
+        let variant = ThemeRegistry::builtin()
+            .variant("monocode-dark")
+            .expect("monocode-dark");
+        let theme = Theme::from_variant(
+            variant,
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Frosted,
+        );
+        assert!(
+            theme.is_frost(),
+            "this regression is the frost path; got opaque compositing"
+        );
+        // Seed `#ebebeb0f`: 15/255. Hsla::opacity multiplies, so pumping the
+        // authored wash through opacity(base) squares it (6% → 0.35%).
+        const SEEDED_ALPHA: f32 = 15.0 / 255.0;
+        const ALPHA_TOLERANCE: f32 = 1.0 / 255.0;
+        let input = theme.input_glass_bg().a;
+        let composer = theme.composer_glass_bg().a;
+        assert!(
+            (input - SEEDED_ALPHA).abs() < ALPHA_TOLERANCE,
+            "input_glass_bg alpha {input} != seeded {SEEDED_ALPHA}"
+        );
+        assert!(
+            (composer - SEEDED_ALPHA * 0.5).abs() < ALPHA_TOLERANCE,
+            "composer_glass_bg alpha {composer} != half of seeded {}",
+            SEEDED_ALPHA * 0.5
+        );
+    }
+
+    #[test]
+    fn frost_blur_or_matches_current_frost_blur_after_clamp() {
+        let _guard = lock_appearance();
+        let previous = DECLARED_FROST_BLUR_HUNDREDTHS.load(Ordering::Relaxed);
+        let mut theme = Theme::from_variant(
+            ThemeRegistry::builtin()
+                .variant("monocode-dark")
+                .expect("monocode-dark"),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Frosted,
+        );
+        for (declared, expected) in [(24.0, 24.0), (-1.0, 0.0), (100_000.0, 64.0)] {
+            theme.frost_blur_radius = Some(declared);
+            set_declared_frost_blur(Some(declared));
+            assert_eq!(
+                theme.frost_blur_or(crate::frost::MENU_BLUR),
+                expected,
+                "frost_blur_or({declared})"
+            );
+            assert_eq!(
+                current_frost_blur(crate::frost::MENU_BLUR),
+                expected,
+                "current_frost_blur({declared})"
+            );
+        }
+        DECLARED_FROST_BLUR_HUNDREDTHS.store(previous, Ordering::Relaxed);
     }
 }

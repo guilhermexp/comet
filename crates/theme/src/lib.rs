@@ -75,6 +75,13 @@ pub enum SurfacePreference {
     Opaque,
 }
 
+/// Inclusive frost coverage accepted on a deserialized variant.
+pub const FROST_ALPHA_MIN: f32 = 0.0;
+pub const FROST_ALPHA_MAX: f32 = 1.0;
+/// Inclusive backdrop blur radius, in pixels, accepted on a deserialized variant.
+pub const FROST_BLUR_RADIUS_MIN: f32 = 0.0;
+pub const FROST_BLUR_RADIUS_MAX: f32 = 64.0;
+
 impl SurfacePreference {
     pub const ALL: [Self; 3] = [Self::ThemeDefault, Self::Frosted, Self::Opaque];
 
@@ -632,14 +639,16 @@ impl ThemeRegistry {
                     variant.accent.strong,
                     4.5,
                 );
+                let terminal_canvas = flattened_terminal_canvas(variant);
                 validate_contrast(
                     &mut issues,
                     variant,
                     "terminal foreground",
                     variant.terminal.foreground,
-                    variant.terminal.background,
+                    terminal_canvas,
                     4.5,
                 );
+                validate_frost_bounds(&mut issues, variant);
                 if variant.source.url.is_empty()
                     || variant.source.revision.is_empty()
                     || variant.source.license.is_empty()
@@ -657,7 +666,7 @@ impl ThemeRegistry {
                     if index % 8 == 0 {
                         continue;
                     }
-                    if color.contrast(variant.terminal.background) < 3.0 {
+                    if color.contrast(terminal_canvas) < 3.0 {
                         issues.push(ValidationIssue::contrast_warning(
                             &variant.id,
                             format!("terminal ANSI slot {index} is below 3:1"),
@@ -667,6 +676,43 @@ impl ThemeRegistry {
             }
         }
         issues
+    }
+}
+
+fn flattened_terminal_canvas(variant: &ThemeVariant) -> Color {
+    variant
+        .terminal
+        .background
+        .blend_over(variant.colors.background)
+}
+
+fn frost_out_of_range(value: f32, min: f32, max: f32) -> bool {
+    match value {
+        v if v.is_finite() && v >= min && v <= max => false,
+        _ => true,
+    }
+}
+
+fn validate_frost_bounds(issues: &mut Vec<ValidationIssue>, variant: &ThemeVariant) {
+    if let Some(alpha) = variant.frost_alpha {
+        if frost_out_of_range(alpha, FROST_ALPHA_MIN, FROST_ALPHA_MAX) {
+            issues.push(ValidationIssue::structural_error(
+                &variant.id,
+                format!(
+                    "frost_alpha {alpha} is outside {FROST_ALPHA_MIN}..={FROST_ALPHA_MAX} or not finite"
+                ),
+            ));
+        }
+    }
+    if let Some(radius) = variant.frost_blur_radius {
+        if frost_out_of_range(radius, FROST_BLUR_RADIUS_MIN, FROST_BLUR_RADIUS_MAX) {
+            issues.push(ValidationIssue::structural_error(
+                &variant.id,
+                format!(
+                    "frost_blur_radius {radius} is outside {FROST_BLUR_RADIUS_MIN}..={FROST_BLUR_RADIUS_MAX} or not finite"
+                ),
+            ));
+        }
     }
 }
 
@@ -1030,6 +1076,98 @@ mod tests {
             variant.terminal.foreground.contrast(flattened) >= 4.5,
             "terminal foreground contrast is {:.2}:1 against flattened canvas",
             variant.terminal.foreground.contrast(flattened)
+        );
+    }
+
+    fn registry_with(variant: ThemeVariant) -> ThemeRegistry {
+        ThemeRegistry {
+            families: vec![ThemeFamily {
+                id: variant.family_id.clone(),
+                name: variant.name.clone(),
+                variants: vec![variant],
+            }],
+        }
+    }
+
+    #[test]
+    fn frost_bounds_rejects_out_of_range() {
+        let monocode = ThemeRegistry::builtin()
+            .variant("monocode-dark")
+            .expect("monocode-dark")
+            .clone();
+        assert_eq!(monocode.frost_alpha, Some(0.85));
+        assert_eq!(monocode.frost_blur_radius, Some(24.0));
+        let in_range = registry_with(monocode.clone()).validate();
+        assert!(
+            in_range
+                .iter()
+                .all(|issue| !issue.message.contains("frost")),
+            "monocode-dark frost parameters produced issues: {in_range:#?}"
+        );
+
+        let mut too_large = monocode.clone();
+        too_large.frost_blur_radius = Some(100_000.0);
+        let mut negative = monocode.clone();
+        negative.frost_blur_radius = Some(-1.0);
+        let mut alpha_high = monocode;
+        alpha_high.frost_alpha = Some(2.0);
+
+        for (label, variant) in [
+            ("frostBlurRadius 100000.0", too_large),
+            ("frostBlurRadius -1.0", negative),
+            ("frostAlpha 2.0", alpha_high),
+        ] {
+            let issues: Vec<_> = registry_with(variant)
+                .validate()
+                .into_iter()
+                .filter(|issue| issue.is_blocking())
+                .collect();
+            assert!(
+                issues.iter().any(|issue| {
+                    issue.category == ValidationCategory::Structural
+                        && issue.message.contains("frost")
+                }),
+                "{label} produced no blocking structural frost issue: {issues:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frost_bounds_terminal_contrast_uses_flattened_canvas() {
+        let mut variant = ThemeRegistry::builtin()
+            .variant("zeron-dark")
+            .expect("zeron-dark")
+            .clone();
+        variant.id = "frost-bounds-terminal-canvas".into();
+        // White RGB at alpha 0: contrast() against the seed sees a white plate
+        // the runtime never paints. Flattened over the dark canvas, a near-black
+        // foreground disappears.
+        variant.terminal.background = Color::rgba(255, 255, 255, 0);
+        variant.terminal.foreground = Color::rgb(10, 10, 10);
+        let raw = variant
+            .terminal
+            .foreground
+            .contrast(variant.terminal.background);
+        let flattened = variant
+            .terminal
+            .background
+            .blend_over(variant.colors.background);
+        let against_canvas = variant.terminal.foreground.contrast(flattened);
+        assert!(
+            raw >= 4.5,
+            "fixture must pass against the raw seed ({raw:.2}:1)"
+        );
+        assert!(
+            against_canvas < 4.5,
+            "fixture must fail against the flattened canvas ({against_canvas:.2}:1)"
+        );
+        let issues = registry_with(variant).validate();
+        assert!(
+            issues.iter().any(|issue| {
+                issue.category == ValidationCategory::Contrast
+                    && issue.message.contains("terminal foreground")
+            }),
+            "validation did not reject foreground that only passes against the raw seed: {issues:#?}"
         );
     }
 
