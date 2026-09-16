@@ -742,11 +742,26 @@ fn normalize_tool(name: &str, input: &Value) -> ToolCall {
             path: string_value(input, "path"),
             content: optional_string(input, "content"),
         },
-        "edit" => ToolCall::EditFile {
-            path: string_value(input, "path"),
-            old_string: optional_string(input, "oldText"),
-            new_string: optional_string(input, "newText"),
-        },
+        "edit" => {
+            let explicit = optional_string(input, "path").filter(|path| !path.trim().is_empty());
+            let patch = input
+                .as_str()
+                .or_else(|| input.get("input").and_then(Value::as_str));
+            let paths = patch
+                .map(zeron_proto::hashline_file_paths)
+                .unwrap_or_default();
+            if explicit.is_none() && paths.len() > 1 {
+                ToolCall::ApplyPatch { path: None }
+            } else {
+                ToolCall::EditFile {
+                    path: explicit
+                        .or_else(|| paths.first().map(|path| (*path).to_owned()))
+                        .unwrap_or_default(),
+                    old_string: optional_string(input, "oldText"),
+                    new_string: optional_string(input, "newText"),
+                }
+            }
+        }
         "grep" => ToolCall::Search {
             pattern: string_value(input, "pattern"),
             path: optional_string(input, "path"),
@@ -1913,6 +1928,27 @@ mod tests {
             ToolCall::Exec {
                 command: "cargo check".into()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod edit_target_tests {
+    use super::*;
+    #[test]
+    fn edit_recognizes_hashline_targets_without_inventing_a_batch_path() {
+        let input = serde_json::json!({"input":"[work_ticket_lib.py#A1B2]\nPUT 390.=390:\n+fixed"});
+        assert!(
+            matches!(normalize_tool("edit", &input), ToolCall::EditFile { path, .. } if path == "work_ticket_lib.py")
+        );
+        let batch = serde_json::json!({"input":"[a.py#A1B2]\n[b.py#1234]"});
+        assert!(matches!(
+            normalize_tool("edit", &batch),
+            ToolCall::ApplyPatch { path: None }
+        ));
+        let explicit = serde_json::json!({"path":"correct.py", "input":"[other.py#1234]"});
+        assert!(
+            matches!(normalize_tool("edit", &explicit), ToolCall::EditFile { path, .. } if path == "correct.py")
         );
     }
 }

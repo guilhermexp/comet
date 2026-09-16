@@ -17,6 +17,9 @@ pub(super) fn script() -> Vec<AgentEvent> {
         .collect::<Vec<_>>()
         .join("\n");
     let calls = vec![
+        (ToolCall::ReadFile { path: ".gitignore".into() }, false, "Read .gitignore"),
+        (ToolCall::ReadFile { path: "knip.json".into() }, false, "Read knip.json"),
+        (ToolCall::ReadFile { path: "crates/ui/src/transcript.rs".into() }, false, "Read transcript.rs"),
         (
             ToolCall::Exec {
                 command: "df -h / /System/Volumes/Data 2>/dev/null; echo '---CAPACITY---'; diskutil info / | grep -Ei 'free|available|container'".into(),
@@ -216,7 +219,16 @@ pub(super) fn script() -> Vec<AgentEvent> {
         events.extend(omp.push(serde_json::from_str(line).expect("OMP edit fixture")));
     }
     events.push(AgentEvent::TextDelta {
-        text: "\n\nReview complete. Expand a row to inspect its recorded payload.\n".into(),
+        text: concat!(
+            "\n\n## File references\n\n",
+            "- `.gitignore` and `knip.json` are file targets.\n",
+            "- `crates/ui/src/transcript.rs` opens the transcript source.\n",
+            "- `src/components/views/cobrancas/reconciliation-table.tsx` exercises a long path.\n",
+            "- `npm run knip` and `useState` stay code.\n",
+            "- [Architecture](ARCHITECTURE.md) is an explicit file link.\n\n",
+            "Review complete. Expand a row to inspect its recorded payload.\n",
+        )
+        .into(),
     });
     events
 }
