@@ -95,11 +95,11 @@ pub const GAP_TURN: f32 = 12.0;
 pub const GAP_BLOCK: f32 = 4.0;
 /// Transcript column max width (zeron 46rem).
 pub const MAX_CONTENT_WIDTH: f32 = 736.0;
-/// Gutter each row keeps outside the column (zeron `px-4 @3xl:px-12`). A block
+/// Gutter matching the composer padding at every viewport width. A block
 /// that is a FIGURE rather than prose may reclaim it with a negative margin —
 /// the row's padding is the only free space there, so `-COLUMN_GUTTER` is a
 /// full-bleed breakout that can never leave the transcript's own bounds.
-pub const COLUMN_GUTTER: f32 = 48.0;
+pub const COLUMN_GUTTER: f32 = 16.0;
 /// Tool stream row height / gap — analytic, so fold heights need no measurement.
 /// Event headers share a compact 28px slot and one label baseline.
 /// Details expand only on request; no nested cards or connector spines.
@@ -779,6 +779,9 @@ pub enum RowKind {
     },
     FileChange {
         tool: ToolItem,
+        /// The owning entry is still streaming, so the card shows its diff at
+        /// the expanded budget without a click (mirrors `detail_auto_open`).
+        auto_open: bool,
     },
     TurnSteps {
         rows: Arc<Vec<Row>>,
@@ -915,7 +918,17 @@ fn file_open_target(
     cwd: &str,
     path: &str,
 ) -> Option<(String, std::path::PathBuf, String)> {
-    let clean_path = crate::file_preview::model::strip_line_col(path);
+    let file_url = if path.starts_with("file://") {
+        url::Url::parse(path)
+            .ok()?
+            .to_file_path()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    let clean_path =
+        crate::file_preview::model::strip_line_col(file_url.as_deref().unwrap_or(path));
     let expanded = crate::file_preview::model::expand_tilde(clean_path);
     let root = std::path::PathBuf::from(cwd);
     let candidate = std::path::Path::new(expanded.as_ref());
@@ -1222,16 +1235,19 @@ fn settle_turn_steps_child(row: &mut Row) {
     if let Some(kind) = replacement {
         row.kind = kind;
     }
-    if let RowKind::ToolGroup {
-        auto_open,
-        detail_auto_open,
-        ..
-    } = &mut row.kind
-    {
+    match &mut row.kind {
         // Opening the turn exposes event summaries. Their details remain
         // independently closed until the user asks for them.
-        *auto_open = false;
-        *detail_auto_open = false;
+        RowKind::ToolGroup {
+            auto_open,
+            detail_auto_open,
+            ..
+        } => {
+            *auto_open = false;
+            *detail_auto_open = false;
+        }
+        RowKind::FileChange { auto_open, .. } => *auto_open = false,
+        _ => {}
     }
 }
 
@@ -1500,8 +1516,13 @@ fn rows_for_entry_with_todo_history(
         }
         let tools = std::mem::take(group);
         let image_paths = tool_image_paths(&tools);
+        // Groups never collapse (`tool_group_collapses`), so the group flag has
+        // no job. The DETAIL flag does: while the turn is live, the command
+        // output the run is producing now must be readable without a click.
+        // Per ENTRY, not per group — the trailing-group clause this replaces
+        // re-hid every command as soon as the next one started.
         let auto_open = false;
-        let detail_auto_open = false;
+        let detail_auto_open = streaming;
         let current_group = *group_ix;
         rows.push(ProjectedRow {
             source_start: first_ix,
@@ -1583,6 +1604,22 @@ fn rows_for_entry_with_todo_history(
                         group_first_part_ix,
                         group_last_part_ix,
                     );
+                }
+                // The linked children already present this delegation. Keep
+                // failed wrappers and calls without a bound child inspectable.
+                if matches!(call, ToolCall::Unknown { name, .. } if name == "task")
+                    && !*is_error
+                    && (streaming || *resolved)
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Tool {
+                            id, call, subagent_ref: Some(_), ..
+                        } if is_agent_call(call)
+                            && id.strip_prefix(tool_id.as_str()).is_some_and(|suffix| {
+                                suffix.starts_with("--") && suffix.len() > 2
+                            }))
+                    })
+                {
+                    continue;
                 }
                 if let Some(linked) = question_inputs.get(&part_ix) {
                     flush_group(
@@ -1729,7 +1766,10 @@ fn rows_for_entry_with_todo_history(
                         group_first_part_ix,
                         group_last_part_ix,
                     );
-                    let version = tool_fingerprint(std::slice::from_ref(&item), false, false);
+                    // Reuses the detail bit: it is the same "auto-opened
+                    // because the turn is live" fact, and the version must
+                    // flip when streaming ends or the card would stay open.
+                    let version = tool_fingerprint(std::slice::from_ref(&item), false, streaming);
                     rows.push(ProjectedRow {
                         source_start: part_ix,
                         source_end: part_ix,
@@ -1737,7 +1777,10 @@ fn rows_for_entry_with_todo_history(
                             id: format!("{}#{}", entry.id, tool_id).into(),
                             version,
                             turn_start: false,
-                            kind: RowKind::FileChange { tool: item },
+                            kind: RowKind::FileChange {
+                                tool: item,
+                                auto_open: streaming,
+                            },
                             entry_id: entry.id.clone().into(),
                             timestamp: None,
                             copy_text: None,
@@ -2139,10 +2182,21 @@ fn part_prefix(id: &str) -> &str {
     id.rsplit_once('.').map(|(p, _)| p).unwrap_or(id)
 }
 
+/// The markdown block a row paints, when it paints one. Lets the row gap ask
+/// the same question `render::block_gap` asks inside an unsplit tree.
+fn row_markdown_block(kind: &RowKind) -> Option<&crate::markdown::parser::Block> {
+    match kind {
+        RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
+            tree.blocks.get(*block_ix).map(|top| &top.block)
+        }
+        _ => None,
+    }
+}
+
 /// Vertical gap opening `row` given its predecessor: turn gap at turn starts;
-/// the markdown block gap between sibling block rows split from the same text
-/// part — matching the live row's internal spacing exactly, so the
-/// live→split handoff cannot shift a pixel; the block gap otherwise.
+/// [`render::block_gap`] between sibling block rows split from the same text
+/// part — the SAME rule the live row applies internally, so the live→split
+/// handoff cannot shift a pixel; the block gap otherwise.
 pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     if matches!(row.kind, RowKind::InlineImages { .. }) {
         return 0.0;
@@ -2155,7 +2209,12 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
         is_md(&p.kind) && is_md(&row.kind) && part_prefix(&p.id) == part_prefix(&row.id)
     });
     if same_part_markdown || prev.is_some_and(|p| is_md(&p.kind) || is_md(&row.kind)) {
-        render::MD_BLOCK_GAP
+        // A non-Markdown neighbour passes `None`: a heading that opens after a
+        // tool group still earns its section gap.
+        render::block_gap(
+            prev.and_then(|p| row_markdown_block(&p.kind)),
+            row_markdown_block(&row.kind),
+        )
     } else {
         GAP_BLOCK
     }
@@ -2200,12 +2259,15 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     summary
 }
 
-fn tool_detail_default_open(
-    call: &ToolCall,
-    resolved: bool,
-    active_group: bool,
-    is_last: bool,
-) -> bool {
+/// Which payloads open on their own, and when. Only calls whose payload IS the
+/// work — a command, a write, an edit, a patch — and only while `active_group`
+/// (the entry is streaming). Reads, searches and MCP calls keep starting
+/// closed: their payload repeats what the header already says.
+///
+/// Deliberately blind to `resolved`: a command that finished three calls ago is
+/// exactly the output the user scrolls back to mid-turn. Settling the entry
+/// clears `active_group` and closes all of them at once.
+fn tool_detail_default_open(call: &ToolCall, active_group: bool) -> bool {
     active_group
         && matches!(
             call,
@@ -2214,7 +2276,6 @@ fn tool_detail_default_open(
                 | ToolCall::EditFile { .. }
                 | ToolCall::ApplyPatch { .. }
         )
-        && (!resolved || is_last)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3528,6 +3589,14 @@ enum MermaidSnapshot {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    OpenResource {
+        context_key: String,
+        root: std::path::PathBuf,
+        uri: String,
+        tool_id: String,
+        text: Option<String>,
+        blob_ref: Option<String>,
+    },
     OpenFile {
         context_key: String,
         root: std::path::PathBuf,
@@ -6209,7 +6278,7 @@ impl Transcript {
             .justify_center()
             .pt(px(top_gap))
             .pb(px(bottom_pad))
-            // Wide gutters (zeron `px-4 @3xl:px-12`) around the 46rem column.
+            // Match the composer: 736px of content with 16px outer gutters.
             .px(px(COLUMN_GUTTER))
             .child(
                 div()
@@ -6427,6 +6496,12 @@ impl Transcript {
                         now: Instant::now(),
                         copy: Some(self.copy_ui_for(&row.id, cx)),
                         open_file: self.open_file_link(cx),
+                        selection_group: None,
+                        file_root: self
+                            .state
+                            .read(cx)
+                            .selected_chat_row()
+                            .and_then(|chat| chat.cwd.clone()),
                     };
                     let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                     render::render_block(
@@ -6468,6 +6543,12 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     open_file: self.open_file_link(cx),
+                    selection_group: None,
+                    file_root: self
+                        .state
+                        .read(cx)
+                        .selected_chat_row()
+                        .and_then(|chat| chat.cwd.clone()),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -6526,7 +6607,9 @@ impl Transcript {
                 auto_open,
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
-            RowKind::FileChange { tool } => self.render_file_change(&row.id, tool, &theme, cx),
+            RowKind::FileChange { tool, auto_open } => {
+                self.render_file_change(&row.id, tool, *auto_open, &theme, cx)
+            }
             RowKind::TurnSteps {
                 rows,
                 summary,
@@ -6542,7 +6625,7 @@ impl Transcript {
                     .folds
                     .get(&row.id)
                     .and_then(|fold| fold.open)
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 let toggle_id = row.id.clone();
                 div()
                     .id(SharedString::from(format!("{}-tasks", row.id)))
@@ -6569,6 +6652,7 @@ impl Transcript {
         &mut self,
         row_id: &SharedString,
         tool: &ToolItem,
+        auto_open: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -6599,11 +6683,43 @@ impl Transcript {
             call_path,
             ready.as_ref().map(|ready| ready.snapshot.as_ref()),
         );
+        let path = if path.trim().is_empty() {
+            match tool.detail.as_deref() {
+                Some(ToolDetail::Diff { file, .. }) => file.path.as_str(),
+                Some(ToolDetail::Stats { stats }) if stats.len() == 1 => stats[0].path.as_str(),
+                _ => path,
+            }
+        } else {
+            path
+        };
+        let recorded_output = match tool.detail.as_deref() {
+            Some(ToolDetail::Output { lines, .. }) if path.trim().is_empty() => lines
+                .iter()
+                .map(|line| line.as_ref())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let recovered = zeron_proto::hashline_file_paths(&recorded_output);
+        let path = if path.trim().is_empty() && recovered.len() == 1 {
+            recovered[0]
+        } else {
+            path
+        };
+
         let can_expand = file_card_can_expand(
             tool.resolved,
             ready.is_some() || tool.file_preview.is_some(),
         );
-        let open = can_expand && self.file_change_open.get(row_id).copied().unwrap_or(false);
+        // While the turn is live the card shows its diff at the expanded
+        // budget; settling returns it to the bounded preview. An explicit
+        // click still wins, in both phases. The auto-open reads only the
+        // doc-resident preview — it never triggers the full-file fetch, which
+        // stays an explicit act.
+        let open = match self.file_change_open.get(row_id).copied() {
+            Some(explicit) => can_expand && explicit,
+            None => auto_open && (ready.is_some() || tool.file_preview.is_some()),
+        };
         let preview = crate::file_change::file_card_preview(
             open,
             tool.file_preview.as_deref(),
@@ -6612,12 +6728,18 @@ impl Transcript {
         let filename = std::path::Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or(path)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(if path.trim().is_empty() {
+                "File path unavailable"
+            } else {
+                path
+            })
             .to_string();
         let open_target = {
             let state = self.state.read(cx);
             state
                 .selected_chat_row()
+                .filter(|_| !path.trim().is_empty())
                 .and_then(|chat| file_open_target(&chat.id, chat.cwd.as_deref()?, path))
         };
 
@@ -6702,16 +6824,17 @@ impl Transcript {
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::NORMAL)
             .text_color(theme.text_faint)
-            .cursor_pointer()
             .when_some(open_target, |label, (context_key, root, relative_path)| {
-                label.on_click(cx.listener(move |_this, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.emit(TranscriptEvent::OpenFile {
-                        context_key: context_key.clone(),
-                        root: root.clone(),
-                        relative_path: relative_path.clone(),
-                    });
-                }))
+                label
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(TranscriptEvent::OpenFile {
+                            context_key: context_key.clone(),
+                            root: root.clone(),
+                            relative_path: relative_path.clone(),
+                        });
+                    }))
             })
             .child(filename_text);
         header = header.child(file_label);
@@ -6766,7 +6889,16 @@ impl Transcript {
                 let viewport = Rc::new(Cell::new(Bounds::<Pixels>::default()));
                 let measure = viewport.clone();
                 let body = div()
-                    .h(px(crate::file_change::FILE_CARD_COLLAPSED_BODY_HEIGHT))
+                    // Fixed, not content-sized: a viewport that grew per
+                    // generated line would reflow the transcript (and the
+                    // sticky turn geometry) on every chunk. Matching the
+                    // resolved budget also keeps the card's height stable
+                    // across the whole live turn instead of jumping twice.
+                    .h(px(if auto_open {
+                        crate::file_change::FILE_CARD_EXPANDED_MAX_HEIGHT
+                    } else {
+                        crate::file_change::FILE_CARD_COLLAPSED_BODY_HEIGHT
+                    }))
                     .w_full()
                     .min_w_0()
                     .relative()
@@ -6838,7 +6970,10 @@ impl Transcript {
                     .map(|number| number.to_string().len() as f32 * 7.0)
             });
             let line_height = 20.0;
-            let marker_height = if !open && preview.truncated_before > 0 {
+            // The notice belongs to the PREVIEW, not to the fold: auto-open
+            // shows a truncated preview whenever the full file was never
+            // fetched, and dropping the marker there would hide the cut.
+            let marker_height = if (!open || ready.is_none()) && preview.truncated_before > 0 {
                 line_height
             } else {
                 0.0
@@ -7023,7 +7158,7 @@ impl Transcript {
                     .when(open, |body| body.overflow_y_scroll())
                     .when(!open, |body| body.overflow_hidden())
                     .track_scroll(&plain_scroll);
-                if !open && preview.truncated_before > 0 {
+                if (!open || ready.is_none()) && preview.truncated_before > 0 {
                     body = body.child(
                         div()
                             .h(px(line_height))
@@ -7220,14 +7355,7 @@ impl Transcript {
                         .child(body)
                 })
                 .collect::<Vec<_>>();
-            disclosure = disclosure.child(
-                div()
-                    .w_full()
-                    .pl(px(STREAM_ICON))
-                    .flex()
-                    .flex_col()
-                    .children(children),
-            );
+            disclosure = disclosure.child(div().w_full().flex().flex_col().children(children));
         }
         // One boundary below the entire activity disclosure, open or closed.
         // The final answer is the next projected row, never a nested child.
@@ -7286,6 +7414,130 @@ impl Transcript {
             })
             .ok();
         }))
+    }
+
+    fn read_file_chip(
+        &self,
+        tool: &ToolItem,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let ToolCall::ReadFile { path } = &tool.call else {
+            return None;
+        };
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone());
+        let expanded = crate::file_preview::model::expand_tilde(path);
+        let display_path = cwd
+            .as_deref()
+            .and_then(|cwd| std::path::Path::new(path).strip_prefix(cwd).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| path.clone());
+        let tooltip_path = match cwd {
+            Some(cwd)
+                if !expanded.contains("://")
+                    && !std::path::Path::new(expanded.as_ref()).is_absolute() =>
+            {
+                std::path::Path::new(&cwd)
+                    .join(expanded.as_ref())
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            _ => expanded.into_owned(),
+        };
+        let open_file = if path.contains("://") && !path.starts_with("file://") {
+            let chat = self.state.read(cx).selected_chat_row()?.clone();
+            let uri = path.clone();
+            let tool_id = tool.id.to_string();
+            let blob_ref = tool.output_ref.as_ref().map(ToString::to_string);
+            let text = match tool.detail.as_deref() {
+                Some(ToolDetail::Output {
+                    lines,
+                    truncated_by,
+                }) => {
+                    let mut text = lines
+                        .iter()
+                        .map(|line| line.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if *truncated_by > 0 {
+                        text.push_str(&format!(
+                            "\n\n[Recorded excerpt: {truncated_by} additional lines omitted]"
+                        ));
+                    }
+                    Some(text)
+                }
+                _ => None,
+            };
+            let weak = cx.weak_entity();
+            Some(Rc::new(
+                move |_path: &str, _window: &mut Window, cx: &mut gpui::App| {
+                    weak.update(cx, |_, cx| {
+                        cx.emit(TranscriptEvent::OpenResource {
+                            context_key: chat.id.clone(),
+                            root: chat.cwd.as_deref().unwrap_or_default().into(),
+                            uri: uri.clone(),
+                            tool_id: tool_id.clone(),
+                            text: text.clone(),
+                            blob_ref: blob_ref.clone(),
+                        })
+                    })
+                    .ok();
+                },
+            )
+                as Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>)
+        } else {
+            self.open_file_link(cx)
+        };
+        let target = path.clone();
+        let theme_text_hover = theme.text.opacity(0.10);
+        let hover_color = crate::markdown::inline_chips::file_hover_color(theme);
+        Some(
+            div()
+                .id(SharedString::from(format!("read-file-{}", tool.id)))
+                .min_w_0()
+                .flex_shrink(1.0)
+                .h(px(24.0))
+                .px(px(4.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(4.0))
+                .bg(chip_fill(theme))
+                .text_size(px(13.0))
+                .font_family(theme.font_mono.clone())
+                .text_color(if tool.is_error {
+                    theme.danger
+                } else {
+                    theme.text.opacity(0.7)
+                })
+                .tooltip(move |_, cx| {
+                    cx.new(|_| {
+                        crate::markdown::inline_chips::FilePathTooltip(tooltip_path.clone().into())
+                    })
+                    .into()
+                })
+                .when_some(open_file, |chip, open_file| {
+                    chip.cursor_pointer()
+                        .hover(move |style| style.text_color(hover_color).bg(theme_text_hover))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            open_file(&target, window, cx);
+                        })
+                })
+                .child(tool_icon(&tool.call, theme))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from(display_path)),
+                )
+                .into_any_element(),
+        )
     }
 
     fn copy_ui_for(&self, row_id: &SharedString, cx: &mut Context<Self>) -> render::CopyUi {
@@ -7477,6 +7729,12 @@ impl Transcript {
                 now: Instant::now(),
                 copy: None,
                 open_file: self.open_file_link(cx),
+                selection_group: None,
+                file_root: self
+                    .state
+                    .read(cx)
+                    .selected_chat_row()
+                    .and_then(|chat| chat.cwd.clone()),
             };
             let highlights = self.code_highlight_for(row_id, tree, None, cx);
             let mut trace_theme = theme.clone();
@@ -7653,6 +7911,8 @@ impl Transcript {
                 now: Instant::now(),
                 copy: Some(self.copy_ui_for(row_id, cx)),
                 open_file: None,
+                file_root: None,
+                selection_group: None,
             };
             let highlight = self.code_highlight_for(row_id, tree, Some(block_ix), cx);
             return render::render_block(
@@ -7907,9 +8167,8 @@ impl Transcript {
             .min_w_0()
             .min_h(px(32.0))
             .flex()
-            .flex_wrap()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(8.0))
             .font_family(theme.font_sans.clone())
             .font_weight(gpui::FontWeight::NORMAL)
             .text_size(px(render::MD_TEXT_SIZE))
@@ -7933,6 +8192,11 @@ impl Transcript {
                     .id(SharedString::from(format!("{row_id}#s{ix}")))
                     .min_w_0()
                     .max_w_full()
+                    .flex_shrink(1.0)
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .bg(theme.composer_glass_bg())
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -7953,7 +8217,7 @@ impl Transcript {
                         .flex_none()
                         .object_fit(ObjectFit::Contain),
                     )
-                    .child(div().min_w_0().child(title.clone()))
+                    .child(div().min_w_0().truncate().child(title.clone()))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(TranscriptEvent::OpenSubagent {
                             chat_id: chat_id.clone(),
@@ -8134,15 +8398,7 @@ impl Transcript {
             .collect();
         let detail_defaults: Vec<bool> = tools
             .iter()
-            .enumerate()
-            .map(|(ix, tool)| {
-                tool_detail_default_open(
-                    &tool.call,
-                    tool.resolved,
-                    detail_auto_open,
-                    ix + 1 == tools.len(),
-                )
-            })
+            .map(|tool| tool_detail_default_open(&tool.call, detail_auto_open))
             .collect();
         let detail_opens: Vec<bool> = details
             .iter()
@@ -8324,7 +8580,14 @@ impl Transcript {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
                 if detail.is_none() && invocation.is_none() {
-                    return tool_chip(tool, worker_chips[ix].as_ref(), theme, cx.entity_id(), cx);
+                    return tool_chip(
+                        tool,
+                        worker_chips[ix].as_ref(),
+                        self.read_file_chip(tool, theme, cx),
+                        theme,
+                        cx.entity_id(),
+                        cx,
+                    );
                 }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
@@ -8390,6 +8653,7 @@ impl Transcript {
                                 tool,
                                 open,
                                 worker_chips[ix].as_ref(),
+                                self.read_file_chip(tool, theme, cx),
                                 theme,
                                 cx.entity_id(),
                                 cx,
@@ -8901,19 +9165,24 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
 
 fn tool_icon(call: &ToolCall, theme: &Theme) -> AnyElement {
     let descriptor = crate::tool_icons::tool_icon_descriptor(call);
+    let size = if matches!(call, ToolCall::ReadFile { .. }) {
+        16.0
+    } else {
+        14.0
+    };
     match &descriptor {
         crate::tool_icons::ToolIconDescriptor::Material(_) => {
             let image = descriptor
                 .material_image()
                 .expect("resolved tool icon is embedded");
             img(image)
-                .size(px(14.0))
+                .size(px(size))
                 .object_fit(ObjectFit::Contain)
                 .flex_none()
                 .into_any_element()
         }
         crate::tool_icons::ToolIconDescriptor::Solar(path) => crate::icons::icon(*path)
-            .size(px(14.0))
+            .size(px(size))
             .text_color(theme.text_muted)
             .into_any_element(),
     }
@@ -9076,6 +9345,7 @@ fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
     worker_chips: Option<&WorkersToolChips>,
+    read_file: Option<AnyElement>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9126,26 +9396,29 @@ fn chip_header_row(
         .as_deref()
         .map(crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path);
     let standalone_name = label.is_empty();
+    let is_read = read_file.is_some();
     stream_event_row(theme)
-        .child(
-            // Fixed icon slot shares the label baseline across event types.
-            div()
-                .w(px(STREAM_ICON))
-                .h_full()
-                .flex_none()
-                .relative()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(match subagent_avatar {
-                    Some(avatar) => img(avatar)
-                        .size(px(18.0))
-                        .object_fit(ObjectFit::Contain)
-                        .flex_none()
-                        .into_any_element(),
-                    None => tool_icon(&tool.call, theme),
-                }),
-        )
+        .when(!is_read, |row| {
+            row.child(
+                // Fixed icon slot shares the label baseline across event types.
+                div()
+                    .w(px(STREAM_ICON))
+                    .h_full()
+                    .flex_none()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(match subagent_avatar {
+                        Some(avatar) => img(avatar)
+                            .size(px(18.0))
+                            .object_fit(ObjectFit::Contain)
+                            .flex_none()
+                            .into_any_element(),
+                        None => tool_icon(&tool.call, theme),
+                    }),
+            )
+        })
         .when(!label.is_empty(), |row| {
             row.child(
                 div()
@@ -9157,7 +9430,7 @@ fn chip_header_row(
                     .child(SharedString::from(label)),
             )
         })
-        .child(
+        .child(read_file.unwrap_or_else(|| {
             div()
                 .flex_shrink(1.0)
                 .min_w_0()
@@ -9172,8 +9445,9 @@ fn chip_header_row(
                 } else {
                     theme.text_faint
                 })
-                .child(SharedString::from(detail)),
-        )
+                .child(SharedString::from(detail))
+                .into_any_element()
+        }))
         .when_some(
             worker_chips.and_then(|chips| chips.project.as_ref()),
             |row, name| {
@@ -9183,7 +9457,7 @@ fn chip_header_row(
                         .flex_shrink(1.0)
                         .px(px(5.0))
                         .rounded(px(5.0))
-                        .bg(theme.code_wash)
+                        .bg(chip_fill(theme))
                         .h(px(render::MD_LINE_HEIGHT - 4.0))
                         .line_height(px(render::MD_LINE_HEIGHT - 4.0))
                         .font_family(theme.font_mono.clone())
@@ -9207,7 +9481,7 @@ fn chip_header_row(
                         .items_center()
                         .gap(px(5.0))
                         .rounded(px(5.0))
-                        .bg(theme.code_wash)
+                        .bg(chip_fill(theme))
                         .text_color(tint)
                         .child(
                             crate::icons::icon(identity.icon)
@@ -9338,11 +9612,22 @@ fn chip_header_row(
         })
 }
 
+/// Fill of a transcript chip — the `Read` path chip and the Workers
+/// `@project` / identity chips. Derived from the TEXT color, never from the
+/// accent: these chips used `code_wash` (`accent.opacity(..)`), so on an orange
+/// accent they painted orange pills right beside the neutral path chip, and a
+/// failed row put danger-red text on an accent fill. Named so a test can pin it
+/// against a drift back to the accent.
+pub(crate) fn chip_fill(theme: &Theme) -> gpui::Hsla {
+    theme.text.opacity(0.06)
+}
+
 /// The header row of an expandable chip card.
 fn chip_header(
     tool: &ToolItem,
     open: bool,
     worker_chips: Option<&WorkersToolChips>,
+    read_file: Option<AnyElement>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9351,6 +9636,7 @@ fn chip_header(
         tool,
         Some(ChipTrail::Chevron { open }),
         worker_chips,
+        read_file,
         theme,
         view,
         cx,
@@ -9700,6 +9986,7 @@ fn file_change_line_row(
 fn tool_chip(
     tool: &ToolItem,
     worker_chips: Option<&WorkersToolChips>,
+    read_file: Option<AnyElement>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9708,7 +9995,15 @@ fn tool_chip(
         .h(px(CHIP_HEIGHT))
         .w_full()
         .flex_none()
-        .child(chip_header_row(tool, None, worker_chips, theme, view, cx))
+        .child(chip_header_row(
+            tool,
+            None,
+            worker_chips,
+            read_file,
+            theme,
+            view,
+            cx,
+        ))
         .into_any_element()
 }
 
@@ -9726,15 +10021,20 @@ fn subagent_chip(
 ) -> AnyElement {
     div()
         .id(id)
-        .h(px(CHIP_HEIGHT))
-        .w_full()
+        .min_h(px(CHIP_HEIGHT))
+        .px(px(8.0))
+        .py(px(4.0))
+        .rounded(px(6.0))
+        .bg(theme.composer_glass_bg())
+        .max_w_full()
+        .self_start()
         .flex_none()
         .cursor_pointer()
-        .hover(|s| s.bg(crate::theme::ink(0.04)))
         .on_click(on_open)
         .child(chip_header_row(
             tool,
             Some(ChipTrail::OpenArrow),
+            None,
             None,
             theme,
             view,
@@ -10222,7 +10522,7 @@ mod tests {
         assert!(reasoning_is_open(Some(true), false));
         let entry = assistant(
             "compact",
-            MessageStatus::Streaming,
+            MessageStatus::Complete,
             vec![tool_part("a", "ls"), tool_part("b", "pwd")],
         );
         let rows = rows_for_entry(&entry, false, &mut parse);
@@ -11342,7 +11642,7 @@ mod tests {
         assert_ne!(first_rows[0].version, second_rows[0].version);
         assert!(matches!(
             &second_rows[0].kind,
-            RowKind::FileChange { tool }
+            RowKind::FileChange { tool, .. }
                 if tool.file_preview.as_ref().is_some_and(|preview| preview.total_lines == 3)
         ));
     }
@@ -11378,6 +11678,40 @@ mod tests {
     }
 
     #[test]
+    fn file_cards_open_while_the_turn_is_live_and_close_on_settle() {
+        let parts = vec![write_file_part(
+            "write-1",
+            true,
+            Some(two_line_write_preview()),
+        )];
+        let live = assistant("file-auto", MessageStatus::Streaming, parts.clone());
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        let RowKind::FileChange { auto_open, .. } = live_rows[0].kind else {
+            panic!("file card expected")
+        };
+        assert!(auto_open, "a live turn shows the diff without a click");
+
+        let mut settled_parts = parts;
+        settled_parts.push(text_part("answer", "Done."));
+        let done = assistant("file-auto", MessageStatus::Complete, settled_parts);
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+        let RowKind::TurnSteps { rows: children, .. } = &done_rows[0].kind else {
+            panic!("settled work folds into turn steps")
+        };
+        let RowKind::FileChange { auto_open, .. } = children[0].kind else {
+            panic!("file card expected")
+        };
+        assert!(
+            !auto_open,
+            "settling returns the card to its bounded preview"
+        );
+        // Same row id across the transition, so only the version can force the
+        // repaint that closes it.
+        assert_eq!(children[0].id, live_rows[0].id);
+        assert_ne!(children[0].version, live_rows[0].version);
+    }
+
+    #[test]
     fn path_only_write_does_not_invent_preview_lines() {
         let entry = assistant(
             "file-change-path-only",
@@ -11387,7 +11721,7 @@ mod tests {
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert!(matches!(
             &rows[0].kind,
-            RowKind::FileChange { tool } if tool.file_preview.is_none()
+            RowKind::FileChange { tool, .. } if tool.file_preview.is_none()
         ));
     }
 
@@ -11401,7 +11735,7 @@ mod tests {
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert!(matches!(
             &rows[0].kind,
-            RowKind::FileChange { tool } if tool.file_preview.is_none()
+            RowKind::FileChange { tool, .. } if tool.file_preview.is_none()
         ));
     }
 
@@ -11539,6 +11873,16 @@ mod tests {
         }
 
         // Indicador de linha e coluna é despojado.
+        for path in [
+            "src/main.rs:42-55",
+            "src/main.rs:raw:1+80",
+            "file:///repo/src/main.rs",
+        ] {
+            assert_eq!(
+                file_open_target("chat", "/repo", path).unwrap().2,
+                "src/main.rs"
+            );
+        }
         let with_line = file_open_target("chat", "/repo", "src/main.rs:42:15").unwrap();
         assert_eq!(with_line.2, "src/main.rs");
     }
@@ -12327,14 +12671,30 @@ mod tests {
             panic!("expected completed prefix disclosure");
         };
         assert_eq!(children.len(), 4);
-        // Sibling markdown blocks from the same part: md block gap.
+        // The fixture is `# Title` / `para one` / a fenced block, so the first
+        // boundary is the heading lead and the second the ordinary gap. Both
+        // are asserted against `block_gap` for the very same blocks: that
+        // equality IS the live→split contract, and a literal on the right
+        // would let the two rules drift apart without a failure.
+        for (prev, next) in [(0, 1), (1, 2)] {
+            let expected = render::block_gap(
+                row_markdown_block(&children[prev].kind),
+                row_markdown_block(&children[next].kind),
+            );
+            assert_eq!(
+                top_gap_for(Some(&children[prev]), &children[next]),
+                expected,
+                "rows {prev}->{next}",
+            );
+        }
         assert_eq!(
             top_gap_for(Some(&children[0]), &children[1]),
-            render::MD_BLOCK_GAP
+            render::MD_HEADING_LEAD,
+            "a heading groups with the paragraph it introduces",
         );
         assert_eq!(
             top_gap_for(Some(&children[1]), &children[2]),
-            render::MD_BLOCK_GAP
+            render::MD_BLOCK_GAP,
         );
         // Markdown → tool group inside the disclosure and disclosure → final
         // answer retain the ordinary block gap.
@@ -12345,6 +12705,33 @@ mod tests {
         assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), render::MD_BLOCK_GAP);
         // Turn starts get the turn gap regardless.
         assert_eq!(top_gap_for(None, &rows[0]), GAP_TURN);
+    }
+
+    #[test]
+    fn a_heading_after_a_tool_group_still_opens_its_section() {
+        // The neighbour is not Markdown, so the rule sees `None` on one side —
+        // it must still recognize the heading and give it the section gap
+        // rather than falling back to the flat block gap.
+        let entry = assistant(
+            "m-heading",
+            MessageStatus::Streaming,
+            vec![tool_part("a", "ls"), text_part("t0", MD)],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let heading = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row_markdown_block(&row.kind),
+                    Some(crate::markdown::parser::Block::Heading { .. })
+                )
+            })
+            .expect("the fixture opens with a heading");
+        assert!(heading > 0, "a tool group precedes it");
+        assert_eq!(
+            top_gap_for(Some(&rows[heading - 1]), &rows[heading]),
+            render::MD_SECTION_GAP,
+        );
     }
 
     #[test]
@@ -12507,6 +12894,43 @@ mod tests {
     }
 
     #[test]
+    fn task_wrapper_is_replaced_only_by_bound_children_and_preserves_failures() {
+        for status in [MessageStatus::Streaming, MessageStatus::Complete] {
+            for (bound, failed, child_id, hidden) in [
+                (true, false, "call--one", true),
+                (false, false, "call--one", false),
+                (true, true, "call--one", false),
+                (true, false, "call-other--one", false),
+            ] {
+                let mut task = tool_part("call", "ignored");
+                if let MessagePart::Tool { call, is_error, .. } = &mut task {
+                    *call = ToolCall::Unknown {
+                        name: "task".into(),
+                        input: None,
+                    };
+                    *is_error = failed;
+                }
+                let mut child = agent_part(child_id, "Scout");
+                if !bound {
+                    if let MessagePart::Tool { subagent_ref, .. } = &mut child {
+                        *subagent_ref = None;
+                    }
+                }
+                let entry = assistant("wrapper", status, vec![task, child]);
+                let rows = rows_for_entry(&entry, false, &mut parse);
+                let contains = |id: &str| {
+                    rows.iter().any(|row| {
+                        matches!(&row.kind, RowKind::ToolGroup { tools, .. }
+                        if tools.iter().any(|tool| tool.id.as_ref() == id))
+                    })
+                };
+                assert_eq!(contains("call"), !hidden);
+                assert!(contains(child_id));
+            }
+        }
+    }
+
+    #[test]
     fn stray_subagent_ref_on_a_run_chip_stays_an_ordinary_tool() {
         // Docs written before the claude-driver fix carry subagent refs on
         // ordinary Run chips (a background shell's task_notification was
@@ -12578,7 +13002,11 @@ mod tests {
                 } = &row.kind
                 {
                     assert!(!tool_group_collapses(tools), "no intermediate count header");
-                    assert!(!detail_auto_open, "individual payloads remain closed");
+                    assert_eq!(
+                        *detail_auto_open,
+                        status == MessageStatus::Streaming,
+                        "command payloads open while live and close on settle"
+                    );
                     for tool in tools.iter() {
                         assert!(tool.invocation.is_some(), "recorded detail survives");
                         calls.push(tool.id.as_ref());
@@ -12662,7 +13090,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tail_and_earlier_groups_keep_details_closed() {
+    fn command_payloads_open_across_a_live_turn_and_close_on_settle() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
@@ -12674,8 +13102,8 @@ mod tests {
         else {
             panic!()
         };
-        assert!(!auto_open, "streaming group starts compact");
-        assert!(!detail_auto_open, "tool details open only on request");
+        assert!(!auto_open, "the group fold itself stays compact");
+        assert!(detail_auto_open, "the live command shows its output");
 
         let complete = assistant("m3", MessageStatus::Complete, parts);
         let rows = rows_for_entry(&complete, false, &mut parse);
@@ -12688,10 +13116,10 @@ mod tests {
             panic!()
         };
         assert!(!auto_open);
-        assert!(!detail_auto_open);
+        assert!(!detail_auto_open, "settling returns to the compact record");
 
-        // Earlier groups in the active streaming turn stay open too — and
-        // top-level, since a live turn folds nothing.
+        // An EARLIER group of the same live turn opens too: the output the
+        // user scrolls back to must not disappear because a later call began.
         let mid = assistant(
             "m4",
             MessageStatus::Streaming,
@@ -12707,10 +13135,7 @@ mod tests {
             panic!("earlier group stays a top-level row while streaming")
         };
         assert!(!auto_open, "earlier groups stay compact");
-        assert!(
-            !detail_auto_open,
-            "only the current group opens its command output"
-        );
+        assert!(detail_auto_open, "earlier command output stays readable");
     }
 
     #[test]
@@ -13179,7 +13604,7 @@ mod tests {
     }
 
     #[test]
-    fn active_command_details_open_only_for_the_live_tail() {
+    fn command_details_open_while_the_turn_is_live() {
         let exec = ToolCall::Exec {
             command: "cargo test".into(),
         };
@@ -13193,12 +13618,15 @@ mod tests {
         };
         let patch = ToolCall::ApplyPatch { path: None };
 
-        assert!(tool_detail_default_open(&exec, false, true, true));
-        assert!(tool_detail_default_open(&exec, true, true, true));
-        assert!(tool_detail_default_open(&edit, false, true, false));
-        assert!(tool_detail_default_open(&patch, false, true, false));
-        assert!(!tool_detail_default_open(&exec, true, false, true));
-        assert!(!tool_detail_default_open(&read, false, true, true));
+        // Live turn: every command payload, no matter where it sits.
+        assert!(tool_detail_default_open(&exec, true));
+        assert!(tool_detail_default_open(&edit, true));
+        assert!(tool_detail_default_open(&patch, true));
+        // A read's payload repeats its header; it stays closed even live.
+        assert!(!tool_detail_default_open(&read, true));
+        // Settled turn: nothing opens on its own.
+        assert!(!tool_detail_default_open(&exec, false));
+        assert!(!tool_detail_default_open(&edit, false));
     }
 
     #[test]
@@ -13401,6 +13829,30 @@ mod tests {
             stream_copy(&call, "Called", "js · literal title").1,
             "js · literal title"
         );
+    }
+
+    #[test]
+    fn transcript_chips_never_follow_the_accent() {
+        use crate::theme::AccentColor;
+        for accent in AccentColor::ALL {
+            for theme in [
+                Theme::dark_with_accent(accent),
+                Theme::light_with_accent(accent),
+            ] {
+                let fill = chip_fill(&theme);
+                // `code_wash` IS `accent.opacity(..)` — it is what these chips
+                // used, and what made them orange pills beside the neutral path
+                // chip. Both comparisons must fail for every preset.
+                assert_ne!(fill, theme.code_wash, "{accent:?}");
+                assert_ne!(fill, theme.accent, "{accent:?}");
+            }
+        }
+        // And the fill does not move when only the accent moves: one tone for
+        // the path chip and the Workers chips alike.
+        let first = chip_fill(&Theme::dark_with_accent(AccentColor::ALL[0]));
+        for accent in AccentColor::ALL {
+            assert_eq!(chip_fill(&Theme::dark_with_accent(accent)), first);
+        }
     }
 
     #[test]

@@ -1,0 +1,2 @@
+## Decisions
+Local preview is read-only and resolves explicit paths, including parent components and symlinks, on the local device. Unknown extensions are inspected as bounded text rather than rejected by filename. Virtual references use the exact recorded result of the clicked tool (full sidecar preferred), never a filesystem lookup. Source identity is scoped by Chat and tool invocation; closing the tab releases its resource. Remote sources do not fall back to local disk.

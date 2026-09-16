@@ -30,10 +30,15 @@ impl PreviewDisplayMode {
 
 pub fn strip_line_col(path: &str) -> &str {
     let trimmed = path.trim();
+    if trimmed.contains("://") {
+        return trimmed;
+    }
     if let Some((base, suffix)) = trimmed.rsplit_once(':') {
-        if suffix.chars().all(|c| c.is_ascii_digit()) {
+        let numeric = |value: &str| !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit());
+        let range = suffix.split_once('-').or_else(|| suffix.split_once('+'));
+        if numeric(suffix) || range.is_some_and(|(a, b)| numeric(a) && numeric(b)) {
             if let Some((inner_base, inner_suffix)) = base.rsplit_once(':') {
-                if inner_suffix.chars().all(|c| c.is_ascii_digit()) {
+                if numeric(inner_suffix) || inner_suffix == "raw" {
                     return inner_base;
                 }
             }

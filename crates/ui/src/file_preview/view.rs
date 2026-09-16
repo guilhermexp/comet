@@ -90,10 +90,19 @@ struct RemoteFileSource {
     device: String,
 }
 
+/// Recorded read result: virtual resources belong to a tool invocation, not disk.
+#[derive(Clone)]
+pub struct ResourcePreviewSource {
+    pub engine: Option<crate::state::EngineHandle>,
+    pub blob_ref: Option<String>,
+    pub text: Option<String>,
+}
+
 pub struct FilePreview {
     tabs: PreviewTabs,
     roots: HashMap<String, PathBuf>,
     remote_sources: HashMap<String, RemoteFileSource>,
+    resource_sources: HashMap<(String, String), ResourcePreviewSource>,
     active_context: Option<String>,
     loaded: PreviewLoadState,
     generation: u64,
@@ -115,6 +124,7 @@ impl FilePreview {
             tabs: PreviewTabs::default(),
             roots: HashMap::new(),
             remote_sources: HashMap::new(),
+            resource_sources: HashMap::new(),
             active_context: None,
             loaded: PreviewLoadState::Idle,
             generation: 0,
@@ -126,6 +136,22 @@ impl FilePreview {
             #[cfg(target_os = "macos")]
             native_document: None,
         }
+    }
+
+    pub fn set_resource_source(
+        &mut self,
+        context: String,
+        path: String,
+        source: ResourcePreviewSource,
+    ) {
+        // A pending read may be clicked again after its result arrives.
+        // Force activate_surface to reload even when the tab is already selected.
+        if self.active_context.as_deref() == Some(context.as_str())
+            && self.tabs.active_path(&context) == Some(path.as_str())
+        {
+            self.active_context = None;
+        }
+        self.resource_sources.insert((context, path), source);
     }
 
     pub fn set_remote_source(
@@ -207,6 +233,8 @@ impl FilePreview {
         let was_active_tab =
             is_active_context && self.tabs.active_path(context_key) == Some(relative_path);
         self.tabs.close(context_key, relative_path);
+        self.resource_sources
+            .remove(&(context_key.to_owned(), relative_path.to_owned()));
         if self.tabs.paths(context_key).is_empty() {
             self.remote_sources.remove(context_key);
         }
@@ -230,6 +258,8 @@ impl FilePreview {
             return;
         };
         self.remote_sources.remove(&context_key);
+        self.resource_sources
+            .retain(|(context, _), _| context != &context_key);
         let paths = self.tabs.paths(&context_key).to_vec();
         for path in paths {
             self.tabs.close(&context_key, &path);
@@ -269,9 +299,58 @@ impl FilePreview {
         let font_size = px(12.5);
         let text_system = cx.text_system().clone();
         let remote = self.remote_sources.get(&context_key).cloned();
+        let resource = self
+            .resource_sources
+            .get(&(context_key.clone(), relative_path.clone()))
+            .cloned();
         let viewport_key = (context_key, relative_path.clone());
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = if let Some(remote) = remote {
+            let result = if let Some(resource) = resource {
+                let source = match (resource.blob_ref, resource.engine) {
+                    (Some(blob_ref), Some(engine)) => crate::attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        zeron_rpc::methods::FETCH_TOOL_BLOB,
+                        serde_json::json!({ "blobRef": blob_ref }),
+                        std::time::Duration::from_secs(20),
+                    )
+                    .await
+                    .map_err(|error| {
+                        PreviewLoadError::Remote(format!("Could not load read result: {error}"))
+                    })
+                    .and_then(|value| {
+                        value
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                PreviewLoadError::Remote("Read result is unavailable.".into())
+                            })
+                    }),
+                    (Some(_), None) => Err(PreviewLoadError::Remote(
+                        "Connect to the engine to load this read result.".into(),
+                    )),
+                    (None, _) => resource.text.ok_or_else(|| {
+                        PreviewLoadError::Remote("This read has no recorded result yet.".into())
+                    }),
+                };
+                match source {
+                    Ok(source) => {
+                        cx.background_executor()
+                            .spawn(async move {
+                                super::loader::load_text_preview(
+                                    Path::new("read-result.txt"),
+                                    source,
+                                    font_mono,
+                                    font_size,
+                                    Some(text_system),
+                                )
+                            })
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else if let Some(remote) = remote {
                 let request = zeron_proto::ReadWorkspaceFileRequest {
                     target: remote.target,
                     path: relative_path.clone(),
@@ -358,14 +437,21 @@ impl FilePreview {
             return gpui::Empty.into_any_element();
         };
         let root = self.roots.get(context_key).cloned().unwrap_or_default();
-        let absolute = root.join(&relative_path);
+        let virtual_resource = self
+            .resource_sources
+            .contains_key(&(context_key.to_owned(), relative_path.clone()));
+        let absolute = if virtual_resource {
+            PathBuf::from(&relative_path)
+        } else {
+            root.join(&relative_path)
+        };
         let name = file_name(&relative_path).to_string();
         let icon_path = material_icon_path(&name, false, false);
         let image = icons::material_file_icon_image(icon_path.as_ref())
             .expect("material file icon is embedded");
         let close_path = relative_path.clone();
         let close_context = context_key.to_string();
-        let remote = self.remote_sources.contains_key(context_key);
+        let remote = virtual_resource || self.remote_sources.contains_key(context_key);
         let reveal = absolute.clone();
         let copy = absolute;
         div()
@@ -510,7 +596,7 @@ impl FilePreview {
             PreviewLoadState::Loading => centered_message("Loading file…", theme),
             PreviewLoadState::Error(message) => centered_message(message, theme),
             PreviewLoadState::Ready(LoadedPreview::Unsupported) => {
-                centered_message("Cannot view this file", theme)
+                centered_message("Binary file — no preview available for this format.", theme)
             }
             PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) => {
                 if tree.is_empty() {
@@ -536,7 +622,12 @@ impl FilePreview {
                         .pt(px(if ix == 0 {
                             24.0
                         } else {
-                            markdown_render::MD_BLOCK_GAP
+                            // Same rule as the transcript: a heading groups
+                            // with the content under it here too.
+                            markdown_render::block_gap(
+                                tree.blocks.get(ix - 1).map(|top| &top.block),
+                                tree.blocks.get(ix).map(|top| &top.block),
+                            )
                         }))
                         .when(ix + 1 == tree.len(), |row| row.pb(px(24.0)))
                         .child(markdown_render::render_block(
@@ -717,7 +808,7 @@ fn load_error_message(error: &PreviewLoadError) -> &str {
         PreviewLoadError::TooLarge => "This file is too large to preview safely.",
         PreviewLoadError::InvalidUtf8 => "This text file is not valid UTF-8.",
         PreviewLoadError::Remote(message) => message,
-        PreviewLoadError::Io(_) => "The file could not be read.",
+        PreviewLoadError::Io(message) => message,
     }
 }
 
@@ -924,6 +1015,41 @@ fn render_image(image: Arc<Image>, _theme: &Theme) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn virtual_read_loads_without_disk_and_releases_on_close(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| crate::theme::Theme::install(crate::theme::Appearance::Dark, cx));
+        let preview = cx.new(|_| super::FilePreview::new());
+        preview.update(cx, |preview, cx| {
+            preview.set_resource_source(
+                "chat:read:1".into(),
+                "agent://Audit?q=.findings[1:]".into(),
+                super::ResourcePreviewSource {
+                    engine: None,
+                    blob_ref: None,
+                    text: Some("{\"finding\": \"read result\"}".into()),
+                },
+            );
+            preview.open(
+                "chat:read:1".into(),
+                "/nonexistent-chat-root".into(),
+                "agent://Audit?q=.findings[1:]".into(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        preview.update(cx, |preview, cx| {
+            let super::PreviewLoadState::Ready(super::LoadedPreview::Code { lines, .. }) =
+                &preview.loaded
+            else {
+                panic!("virtual result should load without consulting disk");
+            };
+            assert!(lines[0].contains("read result"));
+            preview.close_path("chat:read:1", "agent://Audit?q=.findings[1:]", cx);
+            assert!(preview.resource_sources.is_empty());
+        });
+    }
+
     #[test]
     fn code_minimap_is_bounded_for_large_files() {
         assert_eq!(

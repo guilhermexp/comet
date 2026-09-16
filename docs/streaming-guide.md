@@ -106,7 +106,7 @@ Fonte: [`RowKind`](../crates/ui/src/transcript.rs):734, projeção em 1403 e des
 | S06 | `ToolGroup` | Uma ou mais tools comuns, ou sequência de spawns. Uma tool mostra só o header individual; várias comuns ganham resumo. | Grupo e detalhes fechados inicialmente. Spawn vinculado abre doc filho; não abre payload inline. |
 | S07 | `FileChange` | **Write/Edit exclusivamente**: card próprio, filename, estado, stats e preview. Não usa header compacto genérico. | Preview fechado de 72px; aberto até 200px; fetch de input histórico e scroll próprios. Ver F03/F04. |
 | S08 | `TurnSteps` | Resumo do prefixo de atividade de um turno assentado, antes do último Text. Não existe durante streaming. | Fechado inicialmente. Abrir monta as rows filhas com IDs preservados e folds internos independentes. |
-| S09 | `TaskSnapshot` | Todo não vazio: título de criação/conclusão/atualização; detalhes com tarefas alteradas. | Fechado inicialmente; abre itens, sem output de tool. Snapshot idêntico ainda produz header (F06). |
+| S09 | `TaskSnapshot` | Todo não vazio: título de criação/conclusão/atualização; detalhes com tarefas alteradas. | Expandido inicialmente (atualizado em 2026-09-13); clique recolhe/expande itens, sem output de tool. Snapshots bem-sucedidos idênticos são omitidos. |
 | S10 | `Question` / `questions.rs` | `Asking question…`, pergunta + `Waiting for response…`, ou card `Answer/Answers` (header 28px, pergunta destacada, resposta discreta). | Passivo; controles no composer. Respostas persistem por id; sem linha genérica `ask`. |
 | S11 | `ErrorChip` | `Error` + mensagem, tint vermelho; card com altura mínima de 34px, fonte 12px. | Sem detalhe expansível; quebras do erro são normalizadas para uma linha de texto na projeção. |
 | S12 | `Notice` | Entry System: texto entre divisores, p.ex. troca de modelo. | Sem disclosure. Trocas de modelo consecutivas são reduzidas à última na UI. |
@@ -331,3 +331,20 @@ Sticky durante streaming: o scroll usado na projeção é publicado somente apó
 Headers Workers (11/09): alvo efetivo `project_id` de Chat local resolve pelo catálogo local e aparece como ação + chip `@nome`, com a aparência de menção do composer. `session_id`, ID não cadastrado e Chat remoto/sem host conhecido mantêm a apresentação técnica. O JSON expandido conserva os IDs; refresh do catálogo atualiza o nome sem reescrever o transcript.
 
 Presets e Workers nos headers (11/09): `launch_worker` conserva `preset_id` no input sanitizado e adiciona chip com ícone do runtime + nome do preset ao lado de `@projeto`. Chamadas com `session_id` conhecido mostram ícone + título do Worker, sem inferir identidade por nome/comando/projeto. O catálogo é local e acompanha refresh; Chats remotos e IDs ausentes mantêm fallback técnico. Lançamentos antigos sem `preset_id` não recuperam o nome do preset.
+
+ReadFile (13/09): `Transcript::read_file_chip` fornece o alvo visual a `chip_header_row` em rows simples e expansíveis. Segue `ToolCallSummary` do MonoCode: fundo neutro 6%/hover 10%, raio/padding de 4px, ícone Material 16px dentro e caminho relativo mono 13px. Não reserva ícone antes da ação. Clique usa `open_file_link` → `OpenFile` sem acionar disclosure; tooltip mostra path completo. Sem cwd, mantém o chip sem abertura. Rows continuam com 28px.
+
+Markdown (13/09): `markdown/inline_chips.rs` renderiza código inline como caixas nativas, conforme `MarkdownCode` do MonoCode: fundo neutro 8%, padding/raio 6px, mínimo 24px, texto mono 0.8em, ícone 14px e gap 4px. Caminhos em código inline abrem o preview; código comum recebe só fundo. Links comuns continuam links. Fragmentos mantêm ranges do texto original; seleção usa identidade do parágrafo e hit-testing horizontal/vertical para copiar sem separadores adicionais. A referência e atribuição estão em [monocode-file-chip-reference.md](monocode-file-chip-reference.md).
+
+Atualização 2026-09-13: wrappers `task` sem falha são omitidos quando seus filhos registrados já aparecem como subagentes vinculados. Sem vínculo ou com falha, o wrapper permanece. Atualização 2026-09-15: cada subagente recebe seu próprio fundo translúcido usando `theme.composer_glass_bg()`, igual ao input do Chat, raio 6px e padding 8px/4px, limitado ao conteúdo. A linha do grupo não tem fundo e mantém os agentes lado a lado, truncando nomes longos em vez de quebrar a linha.
+
+Atualização 2026-09-13: tabelas Markdown incluem padding/ícones dos chips na medição; pisos de coluna consideram palavras inteiras e caixas inline, com viewport horizontal limitado ao transcript.
+
+Atualização 2026-09-13: normalização OMP deriva o alvo de edição hashline dos headers `[PATH#TAG]`. Cards legados sem path tentam diff/stats de arquivo único ou header no output; sem evidência, exibem `File path unavailable` sem link vazio.
+
+Correção 2026-09-14: fragmentos inline usam IDs independentes por bloco/offset também no RowVeil; rótulos dos chips deixam de reiniciar a transparência uns dos outros durante o streaming.
+
+### Preview de leituras globais (2026-09-14)
+Read com URI virtual abre o resultado da própria chamada no painel, buscando `output_ref` completo quando disponível. Caminhos locais aceitam arquivos externos ao cwd, relativos com `..`, symlinks e texto de extensão desconhecida. Não confundir URI `agent://` com path de filesystem.
+
+Alinhamento (2026-09-14): transcript com gutter de 16px e conteúdo máximo de 736px, igual ao campo de mensagem; filhos de TurnSteps expandido não recebem recuo lateral adicional.

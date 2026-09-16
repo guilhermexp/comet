@@ -26,6 +26,7 @@ pub struct Span {
     /// The element's full flat text (copy source, snapshotted at drag time
     /// so copy still works after the element scrolls out of the registry).
     pub text: String,
+    group: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -67,6 +68,7 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
                 key: (*key).to_string(),
                 range: from..to,
                 text: (*text).to_string(),
+                group: None,
             });
         }
     }
@@ -95,6 +97,7 @@ pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
             key: key.to_string(),
             range,
             text: text.to_string(),
+            group: None,
         }],
     });
 }
@@ -268,13 +271,30 @@ pub fn selected_text() -> Option<String> {
     Some(join_spans(&sel.spans))
 }
 
+/// Keep paragraph identity with the selection snapshot after virtualization.
+pub fn set_copy_group(key: &str, group: Option<&str>) {
+    if let Some(selection) = state().lock().unwrap().as_mut() {
+        for span in &mut selection.spans {
+            if span.key == key {
+                span.group = group.map(str::to_owned);
+            }
+        }
+    }
+}
+
 fn join_spans(spans: &[Span]) -> String {
-    spans
-        .iter()
-        .filter(|s| !s.range.is_empty())
-        .map(|s| &s.text[s.range.clone()])
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    let mut previous: Option<&Span> = None;
+    for span in spans.iter().filter(|span| !span.range.is_empty()) {
+        if let Some(before) = previous
+            && (span.group.is_none() || span.group != before.group)
+        {
+            out.push('\n');
+        }
+        out.push_str(&span.text[span.range.clone()]);
+        previous = Some(span);
+    }
+    out
 }
 
 /// Word range around `ix` for double-click selection: an alphanumeric/`_`
@@ -352,6 +372,36 @@ pub(crate) mod tests {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn inline_fragments_copy_as_one_paragraph_after_virtualization() {
+        let _state = state_lock();
+        let elements = [
+            ("a", "Veja "),
+            ("b", "src/ação.rs"),
+            ("c", " agora."),
+            ("next", "Outro parágrafo"),
+        ];
+        begin("a", 0);
+        update_drag(&elements, (3, elements[3].1.len()));
+        for key in ["a", "b", "c"] {
+            set_copy_group(key, Some("paragraph"));
+        }
+        assert_eq!(
+            selected_text().as_deref(),
+            Some("Veja src/ação.rs agora.\nOutro parágrafo")
+        );
+        update_drag(&elements[1..], (2, elements[3].1.len()));
+        for key in ["b", "c"] {
+            set_copy_group(key, Some("paragraph"));
+        }
+        assert_eq!(
+            selected_text().as_deref(),
+            Some("Veja src/ação.rs agora.\nOutro parágrafo")
+        );
+        end_active_drag();
+        clear_if_owner("a");
     }
 
     #[test]

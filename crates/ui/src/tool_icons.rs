@@ -253,6 +253,41 @@ fn value_string<'a>(input: Option<&'a Value>, keys: &[&str]) -> &'a str {
         .unwrap_or_default()
 }
 
+/// `workers` is ONE tool carrying an `action`, so keying the icon off the tool
+/// name paints every listing, launch, wait and read with the same glyph. The
+/// vocabulary mirrors the orchestrator's own worker loop (`harness/src/omp`)
+/// and the activity buckets in `turn_steps`, so the two cannot drift apart
+/// unnoticed.
+///
+/// Solar, not material: the material set is a FILE-TYPE vocabulary painted as a
+/// colour image, and these are control-plane verbs. Solar renders through
+/// `icons::icon()` tinted with the row's own muted text, like the worktree and
+/// pathless-patch glyphs beside them.
+fn workers_action_icon(action: &str) -> &'static str {
+    use crate::icons;
+    match action {
+        "list_projects" => icons::FOLDER_WITH_FILES,
+        "add_project" => icons::ADD_CIRCLE,
+        "list_presets" => icons::TUNING,
+        "list_workers" => icons::LIST,
+        // The one action that brings a worker into existence keeps the bot.
+        "launch_worker" => icons::BOT,
+        "stop_worker" => icons::STOP,
+        "restart_worker" => icons::RESTART,
+        "archive_worker" => icons::ARCHIVE_MINIMALISTIC,
+        "wait_for_status" => icons::CLOCK_CIRCLE,
+        "send_text" => icons::CHAT_ROUND_LINE,
+        "send_keys" => icons::KEYBOARD,
+        "read_output" => icons::TERMINAL,
+        "read_transcript" => icons::DOCUMENT,
+        "inspect_worker" => icons::DETAILS_EYE,
+        "help" => icons::INFO_CIRCLE,
+        // Neutral, and deliberately NOT the launch glyph: "a worker started"
+        // and "we don't know this action" must not read the same.
+        _ => icons::WIDGET,
+    }
+}
+
 fn semantic_tool_icon(name: &str, input: Option<&Value>) -> ToolIconDescriptor {
     let lower = name.trim_start_matches("tool-").to_ascii_lowercase();
     let language = value_string(input, &["language"]).to_ascii_lowercase();
@@ -304,7 +339,11 @@ fn semantic_tool_icon(name: &str, input: Option<&Value>) -> ToolIconDescriptor {
     if lower.contains("terminal") || lower.contains("shell") {
         return material("console");
     }
-    if lower.contains("agent") || lower == "workers" {
+    if lower == "workers" {
+        let action = value_string(input, &["action"]).to_ascii_lowercase();
+        return ToolIconDescriptor::Solar(workers_action_icon(&action));
+    }
+    if lower.contains("agent") {
         return material("robot");
     }
     material("settings")
@@ -422,6 +461,61 @@ mod tests {
                 "{name}",
             );
         }
+    }
+
+    #[test]
+    fn workers_rows_are_identified_by_their_action() {
+        use crate::icons;
+        let icon_for = |action: Option<&str>| {
+            tool_icon_descriptor(&ToolCall::Unknown {
+                name: "workers".into(),
+                input: action.map(|action| json!({ "action": action })),
+            })
+        };
+        let cases = [
+            ("list_projects", icons::FOLDER_WITH_FILES),
+            ("add_project", icons::ADD_CIRCLE),
+            ("list_presets", icons::TUNING),
+            ("list_workers", icons::LIST),
+            ("launch_worker", icons::BOT),
+            ("stop_worker", icons::STOP),
+            ("restart_worker", icons::RESTART),
+            ("archive_worker", icons::ARCHIVE_MINIMALISTIC),
+            ("wait_for_status", icons::CLOCK_CIRCLE),
+            ("send_text", icons::CHAT_ROUND_LINE),
+            ("send_keys", icons::KEYBOARD),
+            ("read_output", icons::TERMINAL),
+            ("read_transcript", icons::DOCUMENT),
+            ("inspect_worker", icons::DETAILS_EYE),
+            ("help", icons::INFO_CIRCLE),
+        ];
+        for (action, expected) in cases {
+            assert_eq!(
+                icon_for(Some(action)),
+                ToolIconDescriptor::Solar(expected),
+                "{action}",
+            );
+        }
+        // Every mapped action is distinguishable — the whole point of the change.
+        let mut glyphs: Vec<&str> = cases.iter().map(|(_, glyph)| *glyph).collect();
+        glyphs.sort_unstable();
+        let total = glyphs.len();
+        glyphs.dedup();
+        assert_eq!(glyphs.len(), total, "two actions share a glyph");
+
+        // Unknown and absent actions land on the neutral glyph, never on launch.
+        for missing in [icon_for(Some("teleport_worker")), icon_for(None)] {
+            assert_eq!(missing, ToolIconDescriptor::Solar(icons::WIDGET));
+            assert_ne!(missing, ToolIconDescriptor::Solar(icons::BOT));
+        }
+        // A subagent spawn is a different genus and keeps its own icon.
+        assert_eq!(
+            tool_icon_descriptor(&ToolCall::Unknown {
+                name: "spawn_agent".into(),
+                input: None,
+            }),
+            material("robot"),
+        );
     }
 
     #[test]

@@ -1,0 +1,2 @@
+## Decisions
+Measure code at 80% body size plus native box padding and optional icon/gap. Measure prose words with their actual runs. Use a 180px normal column floor, enlarged by bounded unbreakable content up to 320px. Short columns retain natural width. Constrain the horizontal viewport to available width and prevent table rows shrinking vertically. Exceptionally long tokens may wrap within the bounded column.

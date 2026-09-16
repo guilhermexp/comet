@@ -3318,6 +3318,29 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match event {
+            TranscriptEvent::OpenResource {
+                context_key,
+                root,
+                uri,
+                tool_id,
+                text,
+                blob_ref,
+            } => {
+                let resource_context = format!("{context_key}:read:{tool_id}");
+                let engine = self.state.read(cx).engine().cloned();
+                self.file_preview.update(cx, |preview, _| {
+                    preview.set_resource_source(
+                        resource_context.clone(),
+                        uri.clone(),
+                        crate::file_preview::view::ResourcePreviewSource {
+                            engine,
+                            blob_ref: blob_ref.clone(),
+                            text: text.clone(),
+                        },
+                    )
+                });
+                self.open_preview_surface(resource_context, root.clone(), uri.clone(), cx);
+            }
             TranscriptEvent::OpenFile {
                 context_key,
                 root,

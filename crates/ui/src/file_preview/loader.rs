@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Component, Path},
+    path::Path,
     sync::{Arc, LazyLock},
 };
 
@@ -199,38 +199,46 @@ pub fn load_preview_with_typography(
     if relative_path.as_os_str().is_empty() {
         return Err(PreviewLoadError::OutsideCheckout);
     }
-    // Um caminho ABSOLUTO abre de onde estiver: e o arquivo que o agente citou,
-    // e ele escreve fora do checkout o tempo todo (workspace de worker, /tmp).
-    // Relativo continua ancorado na raiz — sem ela nao quer dizer nada, e `..`
-    // ou symlink que escapa dela seguem barrados.
-    let path = if relative_path.is_absolute() {
-        relative_path
-            .canonicalize()
-            .map_err(|_| PreviewLoadError::Missing)?
-    } else {
-        if !relative_path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-        {
-            return Err(PreviewLoadError::OutsideCheckout);
+    // Explicit read-only previews may cross projects, including symlinks.
+    // Files mutation and remote workspace RPC keep their separate boundaries.
+    let path = root
+        .join(relative_path)
+        .canonicalize()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => PreviewLoadError::Missing,
+            _ => PreviewLoadError::Io(error.to_string()),
+        })?;
+    if path.is_dir() {
+        let mut entries = fs::read_dir(&path)
+            .map_err(|error| PreviewLoadError::Io(error.to_string()))?
+            .take(2001)
+            .map(|entry| {
+                entry.map(|entry| {
+                    let suffix = if entry.path().is_dir() { "/" } else { "" };
+                    format!("{}{suffix}", entry.file_name().to_string_lossy())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| PreviewLoadError::Io(error.to_string()))?;
+        entries.sort();
+        if entries.len() > 2000 {
+            entries.truncate(2000);
+            entries.push("[Directory listing limited to 2000 entries]".into());
         }
-        let root = root.canonicalize().map_err(|_| PreviewLoadError::Missing)?;
-        let path = root
-            .join(relative_path)
-            .canonicalize()
-            .map_err(|_| PreviewLoadError::Missing)?;
-        if !path.starts_with(&root) {
-            return Err(PreviewLoadError::OutsideCheckout);
-        }
-        path
-    };
+        return load_text_preview(
+            Path::new("directory.txt"),
+            format!("{}\n\n{}", path.display(), entries.join("\n")),
+            font_family,
+            font_size,
+            text_system,
+        );
+    }
     if !path.is_file() {
-        return Err(PreviewLoadError::OutsideCheckout);
+        return Err(PreviewLoadError::Io(
+            "This path is not a regular file or directory.".into(),
+        ));
     }
     let kind = classify_preview_kind(path.to_string_lossy().as_ref());
-    if kind == PreviewKind::Unsupported {
-        return Ok(LoadedPreview::Unsupported);
-    }
     // A video is never read into memory: WebKit streams it off disk, so the
     // binary byte cap below does not apply. Capping it would reject the
     // ordinary case — a screen recording is routinely hundreds of megabytes.
@@ -277,6 +285,37 @@ pub fn load_preview_with_typography(
         return Ok(LoadedPreview::Image(Arc::new(Image::from_bytes(
             format, bytes,
         ))));
+    }
+    if kind == PreviewKind::Unsupported {
+        if let Some(format) = detect_image_format(&bytes, &path) {
+            return Ok(LoadedPreview::Image(Arc::new(Image::from_bytes(
+                format, bytes,
+            ))));
+        }
+        if bytes.starts_with(b"%PDF-") {
+            return Ok(LoadedPreview::Pdf);
+        }
+        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+            let mut source = format!(
+                "Binary file · {} bytes\nHexadecimal preview (first 64 KiB)\n\n",
+                bytes.len()
+            );
+            for (row, chunk) in bytes[..bytes.len().min(65536)].chunks(16).enumerate() {
+                use std::fmt::Write;
+                let _ = write!(source, "{:08x}  ", row * 16);
+                for byte in chunk {
+                    let _ = write!(source, "{byte:02x} ");
+                }
+                source.push('\n');
+            }
+            return load_text_preview(
+                Path::new("binary.txt"),
+                source,
+                font_family,
+                font_size,
+                text_system,
+            );
+        }
     }
     let source = String::from_utf8(bytes).map_err(|_| PreviewLoadError::InvalidUtf8)?;
     load_text_preview(&path, source, font_family, font_size, text_system)
@@ -395,20 +434,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_parent_traversal_and_external_symlink() {
+    fn loads_unknown_text_through_parent_paths_and_external_symlinks() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            load_preview(temp.path(), Path::new("../secret")),
-            Err(PreviewLoadError::OutsideCheckout)
-        ));
+        let root = temp.path().join("chat");
+        fs::create_dir(&root).unwrap();
+        fs::write(temp.path().join(".openspec-target"), "global").unwrap();
+        for path in [
+            temp.path().join(".openspec-target"),
+            Path::new("../.openspec-target").to_owned(),
+        ] {
+            let LoadedPreview::Code { lines, .. } = load_preview(&root, &path).unwrap() else {
+                panic!("unknown text must render");
+            };
+            assert_eq!(lines[0].as_ref(), "global");
+        }
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("/etc/hosts", temp.path().join("hosts")).unwrap();
+            std::os::unix::fs::symlink(temp.path().join(".openspec-target"), root.join("linked"))
+                .unwrap();
             assert!(matches!(
-                load_preview(temp.path(), Path::new("hosts")),
-                Err(PreviewLoadError::OutsideCheckout)
+                load_preview(&root, Path::new("linked")),
+                Ok(LoadedPreview::Code { .. })
             ));
         }
+    }
+
+    #[test]
+    fn unknown_binary_has_a_hex_preview() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("payload.custom"), [0, 255, 42]).unwrap();
+        let LoadedPreview::Code { lines, .. } =
+            load_preview(root.path(), Path::new("payload.custom")).unwrap()
+        else {
+            panic!("binary preview");
+        };
+        assert!(lines.iter().any(|line| line.contains("00 ff 2a")));
     }
 
     #[test]
@@ -427,10 +487,9 @@ mod tests {
             load_preview(root.path(), &outside.path().join("missing.md")),
             Err(PreviewLoadError::Missing)
         ));
-        // Diretorio nao e' preview.
         assert!(matches!(
             load_preview(root.path(), outside.path()),
-            Err(PreviewLoadError::OutsideCheckout)
+            Ok(LoadedPreview::Code { .. })
         ));
     }
 
@@ -663,7 +722,7 @@ pub(crate) fn load_text_preview(
         PreviewKind::Markdown => Ok(LoadedPreview::Markdown(Arc::new(
             crate::markdown::parse_full(&source),
         ))),
-        PreviewKind::Code => {
+        PreviewKind::Code | PreviewKind::Unsupported => {
             let lines: Arc<[SharedString]> = source
                 .split('\n')
                 .map(SharedString::from)
@@ -698,7 +757,7 @@ pub(crate) fn load_text_preview(
                 parse_delimited_table(&source, separator, 2_000, 100).into(),
             ))
         }
-        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Video | PreviewKind::Unsupported => {
+        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Video => {
             Ok(LoadedPreview::Unsupported)
         }
     }

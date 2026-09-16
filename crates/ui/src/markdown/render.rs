@@ -8,7 +8,7 @@
 //! chunk opacity veil over the text runs (see [`super::veil`]) — opacity only,
 //! zero translate, applied after layout-relevant properties are fixed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -27,6 +27,33 @@ use super::veil::{RowVeil, apply_veil, slice_spans};
 
 /// Gap between markdown blocks inside one message (zeron mdBlockGap).
 pub const MD_BLOCK_GAP: f32 = 12.0;
+/// Space a heading takes ABOVE it, and a thematic break takes on both sides.
+pub const MD_SECTION_GAP: f32 = 20.0;
+/// Space under a heading — deliberately tighter than [`MD_BLOCK_GAP`] so the
+/// heading reads as belonging to what follows it.
+pub const MD_HEADING_LEAD: f32 = 6.0;
+
+/// Vertical space between two adjacent top-level blocks.
+///
+/// A single uniform gap put every heading as far from the paragraph it
+/// introduces as from the one it follows, so sections never grouped and a long
+/// answer read as one undifferentiated stack.
+///
+/// `None` means "the neighbour is not a Markdown block" — the transcript puts
+/// tool rows between message blocks, and a heading after one still deserves its
+/// section gap. Every site that stacks blocks calls THIS: the transcript splits
+/// a settled message into one row per block, and if its row gap and the live
+/// row's internal gap disagreed, a turn would visibly jump when it settles.
+pub fn block_gap(previous: Option<&Block>, next: Option<&Block>) -> f32 {
+    match (previous, next) {
+        // Checked first, so a subhead sits tight under its parent instead of
+        // being pushed away by the before-a-heading rule.
+        (Some(Block::Heading { .. }), _) => MD_HEADING_LEAD,
+        (_, Some(Block::Heading { .. })) => MD_SECTION_GAP,
+        (Some(Block::Rule), _) | (_, Some(Block::Rule)) => MD_SECTION_GAP,
+        _ => MD_BLOCK_GAP,
+    }
+}
 /// Body text size / line height (zeron: 14px / 22px).
 pub const MD_TEXT_SIZE: f32 = 14.0;
 pub const MD_LINE_HEIGHT: f32 = 22.0;
@@ -54,13 +81,14 @@ pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
 /// Minimum rendered column width in px, padding included (zeron
 /// `table.minColumnWidth`). Naturally narrower columns keep their content
 /// width; wider ones wrap down to this floor, then the table scrolls.
-pub const TABLE_MIN_COLUMN_WIDTH: f32 = 96.0;
+pub const TABLE_MIN_COLUMN_WIDTH: f32 = 180.0;
 /// Hairline tone (zeron md theme `table.borderColor`: rgba(255,255,255,0.1)).
 pub fn table_hairline() -> Hsla {
     crate::theme::hairline(0.10)
 }
 
 /// Options for one rendered tree (a transcript row or a whole live message).
+#[derive(Clone)]
 pub struct RenderOptions {
     /// Stable row key — prefixes element ids (scroll state, animations).
     pub row_key: SharedString,
@@ -82,11 +110,14 @@ pub struct RenderOptions {
     /// o app do sistema (`cx.open_url`) — o que o preview interno nao sabe
     /// abrir continua indo por la de qualquer jeito.
     pub open_file: Option<Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>>,
+    pub file_root: Option<String>,
+    /// Inline fragments from the same paragraph copy without inserted newlines.
+    pub selection_group: Option<String>,
 }
 
 /// Um destino de link que o preview interno sabe abrir: caminho local, sem
 /// esquema (`https://`, `mailto:`) e de um tipo que `load_preview` renderiza.
-fn is_previewable_file_link(url: &str) -> bool {
+pub(super) fn is_previewable_file_link(url: &str) -> bool {
     if url.contains("://")
         || url.starts_with('#')
         || url.starts_with("mailto:")
@@ -118,6 +149,8 @@ impl RenderOptions {
             now: Instant::now(),
             copy: None,
             open_file: None,
+            file_root: None,
+            selection_group: None,
         }
     }
 }
@@ -206,10 +239,9 @@ pub fn render_tree(
     div()
         .flex()
         .flex_col()
-        .gap(px(MD_BLOCK_GAP))
         .children(tree.blocks.iter().enumerate().map(|(ix, top)| {
             let document = highlight(ix);
-            render_block(
+            let block = render_block(
                 &top.block,
                 ix,
                 ix,
@@ -219,7 +251,12 @@ pub fn render_tree(
                 document
                     .as_deref()
                     .map(|document| document.lines.as_slice()),
-            )
+            );
+            let gap = match ix.checked_sub(1).and_then(|prev| tree.blocks.get(prev)) {
+                Some(previous) => block_gap(Some(&previous.block), Some(&top.block)),
+                None => 0.0,
+            };
+            div().mt(px(gap)).child(block).into_any_element()
         }))
         .into_any_element()
 }
@@ -373,7 +410,7 @@ fn heading_metrics(level: u8) -> (f32, f32) {
 pub struct TableColumns {
     /// Per-column max-content width, padding included.
     pub naturals: Vec<f32>,
-    /// Per-column minimum width, padding included = `min(natural, minColumnWidth)`.
+    /// Per-column minimum width, padding included = bounded by natural width and readable word/chip width.
     pub minimums: Vec<f32>,
     /// Σ minimums — the width below which the table stops shrinking and scrolls.
     pub min_table_width: f32,
@@ -381,14 +418,19 @@ pub struct TableColumns {
 
 /// Resolve column geometry from measured per-column max-content widths
 /// (content only — padding is added here, as the source adds `2 * cellPadding`).
-pub fn table_columns(content_widths: &[f32]) -> TableColumns {
+pub fn table_columns(content_widths: &[f32], token_widths: &[f32]) -> TableColumns {
     let naturals: Vec<f32> = content_widths
         .iter()
         .map(|w| w.max(TABLE_MIN_COLUMN_CONTENT) + 2.0 * TABLE_CELL_PADDING)
         .collect();
     let minimums: Vec<f32> = naturals
         .iter()
-        .map(|n| n.min(TABLE_MIN_COLUMN_WIDTH))
+        .enumerate()
+        .map(|(c, n)| {
+            n.min(TABLE_MIN_COLUMN_WIDTH.max(
+                token_widths.get(c).copied().unwrap_or(0.0).min(320.0) + 2.0 * TABLE_CELL_PADDING,
+            ))
+        })
         .collect();
     let min_table_width = minimums.iter().sum();
     TableColumns {
@@ -408,7 +450,7 @@ pub fn table_columns(content_widths: &[f32]) -> TableColumns {
 /// `flatten_cached` entry and one selection key, so a long document rendered
 /// another block's text. Mixing (FNV-1a) keeps the id a pure function of the
 /// path with collisions at 2^-64 instead of at ten list items.
-fn nested_ix(parent: usize, slot: usize, child: usize) -> usize {
+pub(super) fn nested_ix(parent: usize, slot: usize, child: usize) -> usize {
     // Each component gets its own round: folding `parent` straight into the
     // offset basis would make (parent 1, slot 0) and (parent 0, slot 1) the
     // same id — the test catches exactly that.
@@ -430,7 +472,7 @@ fn table_cell_ix(ix: usize, r: usize, c: usize) -> usize {
 /// theme (see the `TABLE_*` constants).
 ///
 /// Column widths resolve exactly the way the source's CSS does: each cell is
-/// `flex: <max-content> <max-content> 0; min-width: min(max-content, 96px)`,
+/// content-proportional flex with word/chip-aware minimum widths,
 /// so widths are content-proportional with a readable per-column floor.
 /// Naturals come from shaping each cell's runs unwrapped (gpui's line-layout
 /// cache makes repeat frames cheap); the flex resolution itself is Taffy's —
@@ -464,6 +506,7 @@ fn render_table(
     let text_system = window.text_system();
     let mut flats: Vec<Vec<Option<Rc<FlatText>>>> = Vec::with_capacity(all.len());
     let mut content = vec![0.0f32; cols];
+    let mut tokens = vec![0.0f32; cols];
     for (r, row) in all.iter().enumerate() {
         let weight = if has_header && r == 0 {
             TABLE_HEADER_WEIGHT
@@ -478,27 +521,38 @@ fn render_table(
             };
             let flat = flatten_cached(runs, weight, top_ix, table_cell_ix(ix, r, c), opts, theme);
             if !flat.text.is_empty() {
-                // Cell sources are single-line; guard anyway (same byte count,
-                // so the runs still cover the text exactly).
-                let line: SharedString = if flat.text.contains('\n') {
-                    flat.text.replace('\n', " ").into()
-                } else {
-                    flat.text.clone()
-                };
-                let width = f32::from(
-                    text_system
-                        .shape_line(line, px(MD_TEXT_SIZE), &flat.runs, None)
-                        .width(),
-                );
-                if width > *natural {
-                    *natural = width;
+                let mut cell_width = 0.0f32;
+                for (range, chip) in super::inline_chips::segments(&flat) {
+                    let part = super::inline_chips::fragment(&flat, range);
+                    let line: SharedString = part.text.replace('\n', " ").into();
+                    let scale = if chip { 0.8 } else { 1.0 };
+                    let mut width = f32::from(
+                        text_system
+                            .shape_line(line, px(MD_TEXT_SIZE * scale), &part.runs, None)
+                            .width(),
+                    );
+                    if chip {
+                        width += 12.0; // Native box horizontal padding.
+                        if part
+                            .links
+                            .iter()
+                            .any(|(_, url)| is_previewable_file_link(url))
+                            || (part.links.is_empty()
+                                && super::inline_chips::file_target(&part.text).is_some())
+                        {
+                            width += 18.0; // 14px icon + 4px gap.
+                        }
+                    }
+                    cell_width += width;
+                    tokens[c] = tokens[c].max(width);
                 }
+                *natural = cell_width.max(*natural);
             }
             out.push(Some(flat));
         }
         flats.push(out);
     }
-    let geo = table_columns(&content);
+    let geo = table_columns(&content, &tokens);
 
     // Frameless flat-hairline chrome: 1px rules under the header and between
     // rows are the only paint (`table.gap` = 1, borderColor white@10%); the
@@ -514,7 +568,7 @@ fn render_table(
         if r > 0 {
             inner = inner.child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(hairline));
         }
-        let mut row_el = div().flex().flex_row();
+        let mut row_el = div().flex().flex_row().flex_none();
         for (c, cell_flat) in row.iter().enumerate() {
             let mut cell = div()
                 .flex_grow(geo.naturals[c])
@@ -530,12 +584,19 @@ fn render_table(
                 TableAlign::Right => cell.text_right(),
             };
             if let Some(flat) = cell_flat {
-                cell = cell.child(flat_text_element(
-                    flat,
-                    table_cell_ix(ix, r, c),
-                    opts,
-                    theme,
-                ));
+                let index = table_cell_ix(ix, r, c);
+                cell = cell.child(if flat.chips.is_empty() {
+                    flat_text_element(flat, index, opts, theme)
+                } else {
+                    super::inline_chips::render(
+                        flat,
+                        index,
+                        MD_TEXT_SIZE,
+                        MD_LINE_HEIGHT,
+                        opts,
+                        theme,
+                    )
+                });
             }
             row_el = row_el.child(cell);
         }
@@ -547,6 +608,8 @@ fn render_table(
     let scroll_id: SharedString = format!("{}-table{ix}", opts.row_key).into();
     div()
         .id(scroll_id)
+        .min_w_0()
+        .max_w_full()
         .w_full()
         .overflow_x_scroll()
         .child(inner)
@@ -559,6 +622,8 @@ pub struct FlatText {
     pub text: SharedString,
     pub runs: Vec<TextRun>,
     pub links: Vec<(Range<usize>, String)>,
+    pub(super) chips: Vec<Range<usize>>,
+    pub(super) hovered_chip: Rc<Cell<Option<usize>>>,
 }
 
 /// Inline-code tint follows the selected accent.
@@ -585,12 +650,16 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
     let mut links: Vec<(Range<usize>, String)> = Vec::new();
+    let mut chips = Vec::new();
     for run in runs {
         if run.text.is_empty() {
             continue;
         }
         let start = text.len();
         text.push_str(&run.text);
+        if run.style.code {
+            chips.push(start..text.len());
+        }
         let mut f = if run.style.code {
             font(theme.font_mono.clone())
         } else {
@@ -610,13 +679,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         // theme underlines in the text color; indigo is reserved for primary
         // actions).
         let is_link = run.style.link.is_some();
-        // Inline code follows the accent (see `inline_code_text`); everything else
-        // stays the monochrome foreground.
-        let color = if run.style.code {
-            inline_code_text(theme)
-        } else {
-            theme.text
-        };
+        let color = theme.text;
         if let Some(url) = &run.style.link {
             // A still-streaming link (mend.rs sentinel) keeps link styling —
             // so the URL's completion changes nothing visually — but is not
@@ -635,12 +698,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             len: run.text.len(),
             font: f,
             color,
-            // The neutral preset needs a surface to distinguish code from
-            // prose. Paint its rounded wash below, without affecting shaping.
-            background_color: (run.style.code
-                && theme.accent_selection
-                    == zeron_theme::AccentSelection::Preset(crate::theme::AccentColor::Gray))
-            .then_some(theme.code_wash),
+            background_color: run.style.code.then_some(theme.text.opacity(0.08)),
             underline: is_link.then_some(UnderlineStyle {
                 color: Some(theme.text_muted),
                 thickness: px(1.0),
@@ -656,6 +714,8 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         text: text.into(),
         runs: out,
         links,
+        chips,
+        hovered_chip: Rc::new(Cell::new(None)),
     }
 }
 
@@ -685,7 +745,7 @@ fn flatten_cached(
 }
 
 /// Veiled, clickable text for a flattened block (no sizing wrapper).
-fn flat_text_element(
+pub(super) fn flat_text_element(
     flat: &FlatText,
     ix: usize,
     opts: &RenderOptions,
@@ -789,6 +849,7 @@ fn flat_text_element(
     // that drive text selection (round 18; see markdown/selection.rs).
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
     let flat_text = flat.text.clone();
+    let selection_group = opts.selection_group.clone();
     let sel_wash = selection_wash(theme);
     let underlay = canvas(
         |_, _, _| (),
@@ -825,6 +886,7 @@ fn flat_text_element(
                     key: sel_key.clone(),
                     text: flat_text.clone(),
                     layout: layout.clone(),
+                    group: selection_group.clone(),
                 })
             });
             register_selection_listeners(window, &sel_key, &flat_text, &layout);
@@ -873,6 +935,7 @@ pub(crate) fn paint_text_selection(
             key: key.clone(),
             text: text.clone(),
             layout: layout.clone(),
+            group: None,
         })
     });
     register_selection_listeners(window, key, text, layout);
@@ -885,6 +948,7 @@ struct RegEntry {
     key: std::sync::Arc<str>,
     text: SharedString,
     layout: gpui::TextLayout,
+    group: Option<String>,
 }
 
 thread_local! {
@@ -910,7 +974,7 @@ pub fn selection_frame_reset() -> impl IntoElement {
 fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)> {
     REGISTRY.with(|r| {
         let reg = r.borrow();
-        let mut best: Option<(usize, f32)> = None;
+        let mut best: Option<(usize, f32, f32)> = None;
         for (ei, entry) in reg.iter().enumerate() {
             let b = entry.layout.bounds();
             let dy = if position.y < b.top() {
@@ -920,14 +984,21 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
             } else {
                 0.0
             };
-            if best.is_none_or(|(_, d)| dy < d) {
-                best = Some((ei, dy));
+            let dx = if position.x < b.left() {
+                f32::from(b.left() - position.x)
+            } else if position.x > b.right() {
+                f32::from(position.x - b.right())
+            } else {
+                0.0
+            };
+            if best.is_none_or(|(_, y, x)| (dy, dx) < (y, x)) {
+                best = Some((ei, dy, dx));
             }
-            if dy == 0.0 {
+            if dy == 0.0 && dx == 0.0 {
                 break;
             }
         }
-        let (ei, _) = best?;
+        let (ei, _, _) = best?;
         let ix = match reg[ei].layout.index_for_position(position) {
             Ok(ix) | Err(ix) => ix,
         };
@@ -945,7 +1016,11 @@ fn resolve_drag(head: (usize, usize)) -> bool {
             .iter()
             .map(|e| (e.key.as_ref(), e.text.as_ref()))
             .collect();
-        super::selection::update_drag(&elements, head)
+        let changed = super::selection::update_drag(&elements, head);
+        for entry in reg.iter() {
+            super::selection::set_copy_group(&entry.key, entry.group.as_deref());
+        }
+        changed
     })
 }
 
@@ -989,6 +1064,11 @@ fn register_selection_listeners(
                     }
                     _ => super::selection::begin(&key, ix),
                 }
+                REGISTRY.with(|registry| {
+                    for entry in registry.borrow().iter() {
+                        super::selection::set_copy_group(&entry.key, entry.group.as_deref());
+                    }
+                });
                 window.refresh();
             } else if super::selection::clear_if_owner(&key) {
                 window.refresh();
@@ -1129,7 +1209,11 @@ fn text_element(
         FontWeight::NORMAL
     };
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
-    let inner = flat_text_element(&flat, ix, opts, theme);
+    let inner = if flat.chips.is_empty() {
+        flat_text_element(&flat, ix, opts, theme)
+    } else {
+        super::inline_chips::render(&flat, ix, size, line_height, opts, theme)
+    };
     div()
         .text_size(px(size))
         .line_height(px(line_height))
@@ -1351,6 +1435,47 @@ mod tests {
     use crate::markdown::parser::InlineStyle;
 
     #[test]
+    fn block_gap_groups_a_heading_with_what_follows_it() {
+        let heading = Block::Heading {
+            level: 2,
+            runs: Vec::new(),
+        };
+        let para = Block::Paragraph { runs: Vec::new() };
+        let list = Block::List {
+            ordered_start: None,
+            items: Vec::new(),
+        };
+
+        // The asymmetry is the whole point: a heading is nearer the block it
+        // introduces than the one it follows.
+        let above = block_gap(Some(&para), Some(&heading));
+        let below = block_gap(Some(&heading), Some(&para));
+        assert_eq!(above, MD_SECTION_GAP);
+        assert_eq!(below, MD_HEADING_LEAD);
+        assert!(below < above, "a heading must group downward");
+
+        // A subhead sits tight under its parent instead of being pushed away
+        // by the before-a-heading rule.
+        assert_eq!(block_gap(Some(&heading), Some(&heading)), MD_HEADING_LEAD);
+
+        // Ordinary prose pairs are untouched.
+        assert_eq!(block_gap(Some(&para), Some(&para)), MD_BLOCK_GAP);
+        assert_eq!(block_gap(Some(&para), Some(&list)), MD_BLOCK_GAP);
+        assert_eq!(block_gap(Some(&list), Some(&para)), MD_BLOCK_GAP);
+
+        // A thematic break opens space on both sides.
+        assert_eq!(block_gap(Some(&para), Some(&Block::Rule)), MD_SECTION_GAP);
+        assert_eq!(block_gap(Some(&Block::Rule), Some(&para)), MD_SECTION_GAP);
+
+        // `None` is a non-Markdown neighbour (a transcript tool row): the
+        // heading still opens its section, and prose still gets the plain gap.
+        assert_eq!(block_gap(None, Some(&heading)), MD_SECTION_GAP);
+        assert_eq!(block_gap(Some(&heading), None), MD_HEADING_LEAD);
+        assert_eq!(block_gap(None, Some(&para)), MD_BLOCK_GAP);
+        assert_eq!(block_gap(None, None), MD_BLOCK_GAP);
+    }
+
+    #[test]
     fn viewport_cache_regressions_keep_secondary_trees_and_evict_departed_rows() {
         let mut cache = RenderCache::default();
         let flat = Rc::new(flatten_runs(&[], &Theme::dark(), false));
@@ -1382,6 +1507,74 @@ mod tests {
         cache.invalidate_row("visible");
         assert!(cache.flats.is_empty());
         assert!(cache.code.is_empty());
+    }
+
+    #[gpui::test]
+    fn inline_chip_layout_routes_clicks_and_selects_later_fragments(cx: &mut gpui::TestAppContext) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        struct Fixture(Rc<RefCell<Vec<String>>>);
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let calls = self.0.clone();
+                let mut opts = RenderOptions::settled("chips".into());
+                opts.open_file = Some(Rc::new(move |path, _, _| {
+                    calls.borrow_mut().push(path.into())
+                }));
+                let tree = super::super::parser::parse_full("Veja `knip.json` agora.");
+                div()
+                    .w(px(400.0))
+                    .child(selection_frame_reset())
+                    .child(render_tree(&tree, &opts, Theme::of(cx), window, &|_| None))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view(|_, _| Fixture(calls.clone()));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let (file, last, expected_index) = REGISTRY.with(|registry| {
+                let registry = registry.borrow();
+                let file = registry
+                    .iter()
+                    .find(|entry| entry.text.as_ref() == "knip.json")
+                    .unwrap();
+                let (index, last) = registry
+                    .iter()
+                    .enumerate()
+                    .find(|(_, entry)| entry.text.as_ref() == "agora.")
+                    .unwrap();
+                (
+                    file.layout.bounds().center(),
+                    last.layout.bounds().center(),
+                    index,
+                )
+            });
+            assert_eq!(registry_point(last).unwrap().0, expected_index);
+            for event in [
+                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                    position: file,
+                    button: gpui::MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                    position: file,
+                    button: gpui::MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+            ] {
+                window.dispatch_event(event, cx);
+            }
+        });
+        assert_eq!(&*calls.borrow(), &["knip.json"]);
     }
 
     #[gpui::test]
@@ -1653,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn gray_inline_code_background_follows_accent_in_both_appearances() {
+    fn inline_code_background_is_neutral_in_all_appearances() {
         use crate::theme::{AccentColor, Appearance};
         let runs = [
             InlineRun {
@@ -1681,10 +1874,10 @@ mod tests {
                 assert_eq!(flat.links, [(2..9, "/tmp/SOUL.md".into())]);
                 assert_eq!(flat.runs[0].background_color, None);
                 assert_eq!(flat.runs[2].background_color, None);
-                assert_eq!(flat.runs[1].color, theme.code_text);
+                assert_eq!(flat.runs[1].color, theme.text);
                 assert_eq!(
                     flat.runs[1].background_color,
-                    (accent == AccentColor::Gray).then_some(theme.code_wash),
+                    Some(theme.text.opacity(0.08)),
                     "{appearance:?}/{accent:?}"
                 );
                 let fenced =
@@ -1695,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn flatten_styles_inline_code_as_violet_text_without_background() {
+    fn flatten_styles_inline_code_with_neutral_background() {
         let theme = Theme::dark();
         let code = |text: &str| InlineRun {
             text: text.into(),
@@ -1719,9 +1912,12 @@ mod tests {
             &theme,
             false,
         );
-        // Code text keeps the violet tint without any run background.
-        assert_eq!(flat.runs[1].color, inline_code_text(&theme));
-        assert_eq!(flat.runs[1].background_color, None);
+        // Inline code is a neutral chip, independently of the chosen accent.
+        assert_eq!(flat.runs[1].color, theme.text);
+        assert_eq!(
+            flat.runs[1].background_color,
+            Some(theme.text.opacity(0.08))
+        );
         assert_eq!(flat.runs[0].color, theme.text);
     }
 
@@ -1776,19 +1972,28 @@ mod tests {
     fn table_columns_floor_and_padding() {
         // A short column keeps its content width (floored at MIN_COLUMN_CONTENT
         // + padding); a wide one may wrap but no narrower than minColumnWidth.
-        let geo = table_columns(&[10.0, 200.0]);
+        let geo = table_columns(&[10.0, 200.0], &[10.0, 50.0]);
         assert_eq!(geo.naturals, vec![72.0, 224.0]); // 48+24, 200+24
-        assert_eq!(geo.minimums, vec![72.0, 96.0]);
-        assert_eq!(geo.min_table_width, 168.0);
+        assert_eq!(geo.minimums, vec![72.0, 180.0]);
+        assert_eq!(geo.min_table_width, 252.0);
     }
 
     #[test]
     fn table_columns_are_content_proportional_not_equal() {
-        let geo = table_columns(&[300.0, 60.0, 60.0]);
+        let geo = table_columns(&[300.0, 60.0, 60.0], &[70.0, 60.0, 60.0]);
         // Flex grow factors are the naturals — a prose column gets a larger
         // share than short ones (not equal thirds).
         assert!(geo.naturals[0] > 3.0 * geo.naturals[1] * 0.9);
         assert_eq!(geo.naturals[1], geo.naturals[2]);
+    }
+
+    #[test]
+    fn table_columns_preserve_verdicts_and_bounded_inline_boxes() {
+        // Short verdict column stays whole; the code box needs more than
+        // the prose floor; an exceptionally long path remains bounded.
+        let geo = table_columns(&[300.0, 80.0, 600.0, 1200.0], &[60.0, 80.0, 230.0, 1200.0]);
+        assert_eq!(geo.minimums, vec![180.0, 104.0, 254.0, 344.0]);
+        assert_eq!(geo.min_table_width, 882.0);
     }
 
     #[test]
@@ -1849,6 +2054,8 @@ mod tests {
                 text: "x".into(),
                 runs: Vec::new(),
                 links: Vec::new(),
+                chips: Vec::new(),
+                hovered_chip: Rc::new(Cell::new(None)),
             })
         };
         for key in ["m1#r0", "m1#r0-reasoning", "m1#r0#mermaid-code"] {
