@@ -263,6 +263,7 @@ rpc_methods! {
     STAGE_FILES / StageFiles = "StageFiles" { params: zeron_proto::CheckoutFilesRequest, reply: serde_json::Value, forwardable: true },
     UNSTAGE_FILES / UnstageFiles = "UnstageFiles" { params: zeron_proto::CheckoutFilesRequest, reply: serde_json::Value, forwardable: true },
     DISCARD_FILES / DiscardFiles = "DiscardFiles" { params: zeron_proto::CheckoutFilesRequest, reply: serde_json::Value, forwardable: true },
+    GENERATE_COMMIT_MESSAGE / GenerateCommitMessage = "GenerateCommitMessage" { params: zeron_proto::GenerateCommitMessageRequest, reply: zeron_proto::GeneratedCommitMessage, forwardable: true, deadline_secs: 100 },
     COMMIT_CHECKOUT / CommitCheckout = "CommitCheckout" { params: zeron_proto::CommitCheckoutRequest, reply: serde_json::Value, forwardable: true },
     PUSH_CHECKOUT / PushCheckout = "PushCheckout" { params: zeron_proto::CheckoutOpRequest, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
     PULL_CHECKOUT / PullCheckout = "PullCheckout" { params: zeron_proto::CheckoutOpRequest, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
