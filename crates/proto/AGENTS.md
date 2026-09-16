@@ -12,6 +12,10 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `GenerateCommitMessageRequest { cwd }` e `GeneratedCommitMessage { message }` são tipos aditivos de rascunho; a mensagem preserva título/corpo com quebras de linha, sem mutação Git implícita.
+
+- `hashline_file_paths` extrai paths únicos de headers canônicos `[PATH#TAG]` (quatro hex maiúsculos), compartilhado pela normalização OMP e recuperação visual de histórico; não interpreta conteúdo de linhas de corpo.
+
 - GitHistoryPage inclui branchTips com default vazio e comparison opcional. SearchGitHistoryParams e ResolveGitAvatarsParams definem as novas requests aditivas; versões antigas podem continuar lendo páginas sem esses campos.
 
 - `preview.rs` define catálogo de serviços, porta estável e snapshot do browser. Metadados de descoberta não entram no documento Loro; pertencem ao catálogo de previews do device.

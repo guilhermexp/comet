@@ -867,3 +867,41 @@ mod tests {
         );
     }
 }
+
+/// Recorded hashline section targets, shared by adapter and legacy UI recovery.
+/// Body rows start with `+`, so literal headers inside file content do not match.
+pub fn hashline_file_paths(text: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+            continue;
+        };
+        let Some((path, tag)) = section.rsplit_once('#') else {
+            continue;
+        };
+        if !path.trim().is_empty()
+            && tag.len() == 4
+            && tag
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'A'..=b'F').contains(&c))
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+#[cfg(test)]
+mod hashline_target_tests {
+    #[test]
+    fn tagged_paths_are_unique_and_body_rows_are_ignored() {
+        assert_eq!(
+            super::hashline_file_paths(
+                "*** Begin Patch\n[src/a.py#A1B2]\nPUT 1.=1:\n+[fake.py#1234]\n[src/a.py#A1B2]\n[dir with spaces/b.py#4321]\n*** End Patch"
+            ),
+            vec!["src/a.py", "dir with spaces/b.py"]
+        );
+        assert!(super::hashline_file_paths("[x#oops]\n[#1234]\n[x#123]\n[x#abcd]").is_empty());
+    }
+}
