@@ -1,14 +1,28 @@
 //! Device-local Cursor subscription usage.
 //!
-//! Cursor's subscription quota view lives behind the WorkOS session token
-//! that the Cursor desktop app maintains in its own local storage
-//! (`state.vscdb`, `cursorAuth/accessToken`). The `cursor-agent` SDK key
-//! (`crsr_…`) authenticates only the Cloud Agents API and carries no
-//! subscription quota, so it is deliberately never used here. Comet only
-//! emits normalized account/quota snapshots; the token never crosses this
-//! module's boundary, never enters the session doc, and never syncs. The
-//! desktop store is strictly read-only — Cursor's own app owns the token
-//! lifecycle (refresh/write-back) and Comet re-reads it per probe.
+//! Cursor's subscription quota view lives behind a WorkOS session token, and
+//! this device can hold it in either of two places. Both are tried, desktop
+//! first:
+//!
+//! 1. **Cursor desktop app** — its own local storage (`state.vscdb`,
+//!    `cursorAuth/accessToken`).
+//! 2. **`cursor-agent` CLI** — the macOS Keychain item it writes at
+//!    `cursor-access-token` / account `cursor-user`, with the account's email
+//!    recorded separately in `~/.cursor/cli-config.json` (`authInfo.email`).
+//!
+//! The CLI login used to be off limits here on the grounds that it is a
+//! whole-account session token rather than a scoped key. It is read now
+//! because on a machine with the CLI but no desktop app — a normal setup —
+//! there is no other source, and Comet showed an empty Cursor row next to a
+//! `cursor-agent` that renders the quota fine. The narrower SDK key in
+//! `~/.cursor/sdk/auth.json` (`crsr_…`) is NOT an alternative: it authenticates
+//! only the Cloud Agents API and this endpoint answers it with
+//! `401 ERROR_NOT_LOGGED_IN`.
+//!
+//! Comet only emits normalized account/quota snapshots; the token never
+//! crosses this module's boundary, never enters the session doc, and never
+//! syncs. Both stores are strictly read-only — Cursor's own app and CLI own
+//! the token lifecycle (refresh/write-back) and Comet re-reads per probe.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -100,6 +114,12 @@ pub(crate) struct CursorUsage {
     http: reqwest::Client,
     usage_cache: Mutex<Option<CachedCursorUsage>>,
     usage_ttl: Duration,
+    /// `~/.cursor/cli-config.json` — names the account the Keychain token
+    /// belongs to, so quota attaches to the right Cursor row.
+    cli_config_path: PathBuf,
+    /// Tests drive an explicit store and must never fall through to the real
+    /// `cursor-agent` login.
+    include_cli_keychain: bool,
 }
 
 impl CursorUsage {
@@ -109,6 +129,8 @@ impl CursorUsage {
             format!("{CANONICAL_BACKEND}{USAGE_PATH}"),
             HTTP_TIMEOUT,
             USAGE_TTL,
+            default_cli_config_path(),
+            true,
         )
     }
 
@@ -125,6 +147,8 @@ impl CursorUsage {
             format!("{base}{USAGE_PATH}"),
             timeout,
             usage_ttl,
+            PathBuf::new(),
+            false,
         )
     }
 
@@ -133,6 +157,8 @@ impl CursorUsage {
         usage_url: String,
         timeout: Duration,
         usage_ttl: Duration,
+        cli_config_path: PathBuf,
+        include_cli_keychain: bool,
     ) -> Result<Self, CursorUsageError> {
         if reqwest::Url::parse(&usage_url).is_err() {
             return Err(CursorUsageError::UsageRequest);
@@ -148,17 +174,53 @@ impl CursorUsage {
             http,
             usage_cache: Mutex::new(None),
             usage_ttl,
+            cli_config_path,
+            include_cli_keychain,
         })
     }
 
-    pub(crate) async fn snapshot(&self, force_usage: bool) -> CursorUsageSnapshot {
-        // Blocking SQLite (with a 2s busy timeout) must not run on the async
-        // executor: the caller fans this out through `tokio::join!`.
+    /// Desktop store first, `cursor-agent`'s Keychain login second. The desktop
+    /// token is the one Cursor's own app keeps fresh, so it wins when both
+    /// exist; a store that is absent OR unreadable falls through, since the CLI
+    /// login answers the same question either way.
+    async fn read_any_session(&self) -> Result<Option<CursorSession>, CursorUsageError> {
         let db_path = self.state_db_path.clone();
-        let session = tokio::task::spawn_blocking(move || read_session(&db_path))
+        let desktop = tokio::task::spawn_blocking(move || read_session(&db_path))
             .await
             .unwrap_or(Err(CursorUsageError::StoreIo));
-        let session = match session {
+        if let Ok(Some(session)) = desktop {
+            return Ok(Some(session));
+        }
+        if let Some(session) = self.read_cli_session().await {
+            return Ok(Some(session));
+        }
+        desktop
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn read_cli_session(&self) -> Option<CursorSession> {
+        if !self.include_cli_keychain {
+            return None;
+        }
+        let access_token = cli_keychain::read_access_token().await?;
+        let path = self.cli_config_path.clone();
+        let email = tokio::task::spawn_blocking(move || cli_config_email(&path))
+            .await
+            .ok()
+            .flatten();
+        Some(CursorSession {
+            access_token,
+            email,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn read_cli_session(&self) -> Option<CursorSession> {
+        None
+    }
+
+    pub(crate) async fn snapshot(&self, force_usage: bool) -> CursorUsageSnapshot {
+        let session = match self.read_any_session().await {
             Ok(Some(session)) => session,
             Ok(None) => {
                 self.clear_usage_cache();
@@ -322,6 +384,58 @@ fn read_session(db_path: &std::path::Path) -> Result<Option<CursorSession>, Curs
         access_token,
         email,
     }))
+}
+
+/// `cursor-agent`'s config file, which records the logged-in account.
+pub(crate) fn default_cli_config_path() -> PathBuf {
+    home_dir().join(".cursor").join("cli-config.json")
+}
+
+/// The email `cursor-agent` recorded for its login. Used only to attach the
+/// quota to the matching Cursor account row — a mismatch attaches nothing
+/// rather than misreporting another account's quota.
+fn cli_config_email(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let config: Value = serde_json::from_str(&raw).ok()?;
+    config
+        .get("authInfo")?
+        .get("email")?
+        .as_str()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(str::to_string)
+}
+
+/// `cursor-agent` stores its login in the macOS Keychain, service
+/// `cursor-access-token` under account `cursor-user` (it writes the pair with
+/// `security add-generic-password`, so the value comes back as plain text).
+#[cfg(target_os = "macos")]
+mod cli_keychain {
+    use std::time::Duration;
+
+    const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
+    const KEYCHAIN_SERVICE: &str = "cursor-access-token";
+    const KEYCHAIN_ACCOUNT: &str = "cursor-user";
+
+    pub(super) async fn read_access_token() -> Option<String> {
+        let run = tokio::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                KEYCHAIN_ACCOUNT,
+                "-w",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output();
+        let out = tokio::time::timeout(EXEC_TIMEOUT, run).await.ok()?.ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!token.is_empty()).then_some(token)
+    }
 }
 
 fn parse_epoch_ms(value: Option<&Value>) -> Option<DateTime<Utc>> {
@@ -618,6 +732,45 @@ mod tests {
         assert!(second.warning.is_some());
         server.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cli_config_email_reads_only_a_usable_login() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli-config.json");
+        let write = |body: &str| std::fs::write(&path, body).unwrap();
+
+        write(r#"{"authInfo":{"email":"  user@example.com  ","userId":1}}"#);
+        assert_eq!(cli_config_email(&path).as_deref(), Some("user@example.com"));
+
+        // A login with no email attaches to the active Cursor account instead
+        // of inventing an identity to match on.
+        write(r#"{"authInfo":{"userId":1}}"#);
+        assert_eq!(cli_config_email(&path), None);
+        write(r#"{"authInfo":{"email":"   "}}"#);
+        assert_eq!(cli_config_email(&path), None);
+        write("{}");
+        assert_eq!(cli_config_email(&path), None);
+        write("not json");
+        assert_eq!(cli_config_email(&path), None);
+        assert_eq!(cli_config_email(&dir.path().join("absent.json")), None);
+    }
+
+    #[tokio::test]
+    async fn tests_never_fall_through_to_the_real_cli_login() {
+        // `from_paths` is the test seam: it must not read the developer's own
+        // `cursor-agent` Keychain item when the fixture store is empty.
+        let dir = TempDir::new().unwrap();
+        let usage = CursorUsage::from_paths(
+            dir.path().join("absent.vscdb"),
+            "http://127.0.0.1:1".into(),
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(!usage.include_cli_keychain);
+        assert!(usage.read_cli_session().await.is_none());
+        assert!(!usage.snapshot(true).await.present);
     }
 
     #[test]

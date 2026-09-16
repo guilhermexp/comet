@@ -11579,6 +11579,7 @@ dependencies = [
  "zeron-rpc",
  "zeron-sync",
  "zeron-update",
+ "zeron-workers-unpeel",
 ]
 
 [[package]]

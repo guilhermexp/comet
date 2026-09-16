@@ -409,11 +409,13 @@ impl GrokUsage {
             .json::<Value>()
             .await
             .map_err(|_| GrokUsageError::UsagePayload)?;
-        let windows = parse_usage_payload(&payload);
-        if windows.is_empty() {
-            return Err(GrokUsageError::UsagePayload);
+        // An account with no quota of its own is not a failure: reporting it as
+        // an invalid payload put a redacted error on a perfectly healthy row.
+        match parse_usage_payload(&payload) {
+            GrokQuota::Window(window) => Ok(vec![window]),
+            GrokQuota::NoQuota => Ok(Vec::new()),
+            GrokQuota::Malformed => Err(GrokUsageError::UsagePayload),
         }
-        Ok(windows)
     }
 }
 
@@ -572,34 +574,55 @@ fn sync_directory(path: &Path) {
 /// `config.currentPeriod` + `config.creditUsagePercent` → one window. Periods
 /// that are neither weekly nor monthly carry no reset semantics the widget
 /// understands, so they yield nothing.
-fn parse_usage_payload(payload: &Value) -> Vec<AgentUsageWindow> {
+/// What a 200 from the billing endpoint actually said.
+#[derive(Debug, PartialEq)]
+enum GrokQuota {
+    /// A usable quota window.
+    Window(AgentUsageWindow),
+    /// A well-formed answer that carries no quota for this account — x.ai
+    /// returns this for plans with no cap of their own (unified team billing:
+    /// `monthlyLimit`/`onDemandCap`/`prepaidBalance` all zero and no
+    /// `creditUsagePercent`). Nothing to render, and nothing wrong either.
+    NoQuota,
+    /// Not the shape this endpoint is supposed to return.
+    Malformed,
+}
+
+fn parse_usage_payload(payload: &Value) -> GrokQuota {
     let Some(config) = payload.get("config").and_then(Value::as_object) else {
-        return Vec::new();
+        return GrokQuota::Malformed;
     };
     let Some(period) = config.get("currentPeriod").and_then(Value::as_object) else {
-        return Vec::new();
+        // The non-credits shapes answer with a billing period and counters but
+        // no `currentPeriod` block; that is an account without a credits plan,
+        // not a broken response.
+        return if config.contains_key("billingPeriodStart") {
+            GrokQuota::NoQuota
+        } else {
+            GrokQuota::Malformed
+        };
     };
     let label = match period.get("type").and_then(Value::as_str) {
         Some("USAGE_PERIOD_TYPE_WEEKLY") => "Weekly",
         Some("USAGE_PERIOD_TYPE_MONTHLY") => "Monthly",
-        _ => return Vec::new(),
+        _ => return GrokQuota::Malformed,
     };
     let Some(percent) = config.get("creditUsagePercent").and_then(decimal) else {
-        return Vec::new();
+        return GrokQuota::NoQuota;
     };
     if !percent.is_finite() || percent < 0.0 {
-        return Vec::new();
+        return GrokQuota::Malformed;
     }
     let resets_at = period
         .get("end")
         .and_then(Value::as_str)
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.with_timezone(&Utc));
-    vec![AgentUsageWindow {
+    GrokQuota::Window(AgentUsageWindow {
         label: label.to_string(),
         used_fraction: (percent / 100.0).clamp(0.0, 1.0) as f32,
         resets_at,
-    }]
+    })
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<String> {
@@ -1070,15 +1093,23 @@ mod tests {
         ));
     }
 
+    fn window_label(payload: &Value) -> String {
+        match parse_usage_payload(payload) {
+            GrokQuota::Window(window) => window.label,
+            other => panic!("expected a quota window, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_usage_payload_table() {
-        let weekly = parse_usage_payload(&serde_json::from_str(BILLING_WEEKLY).unwrap());
-        assert_eq!(weekly.len(), 1);
-        assert_eq!(weekly[0].label, "Weekly");
-
-        let monthly = parse_usage_payload(&serde_json::from_str(BILLING_MONTHLY).unwrap());
-        assert_eq!(monthly.len(), 1);
-        assert_eq!(monthly[0].label, "Monthly");
+        assert_eq!(
+            window_label(&serde_json::from_str(BILLING_WEEKLY).unwrap()),
+            "Weekly"
+        );
+        assert_eq!(
+            window_label(&serde_json::from_str(BILLING_MONTHLY).unwrap()),
+            "Monthly"
+        );
 
         let unknown = parse_usage_payload(&json!({
             "config": {
@@ -1086,9 +1117,62 @@ mod tests {
                 "creditUsagePercent": 50
             }
         }));
-        assert!(unknown.is_empty());
+        assert_eq!(unknown, GrokQuota::Malformed);
 
-        let no_period = parse_usage_payload(&json!({ "config": {} }));
-        assert!(no_period.is_empty());
+        assert_eq!(
+            parse_usage_payload(&json!({ "config": {} })),
+            GrokQuota::Malformed
+        );
+        assert_eq!(parse_usage_payload(&json!({})), GrokQuota::Malformed);
+
+        // A negative or non-finite percent is a broken answer, not an absent one.
+        assert_eq!(
+            parse_usage_payload(&json!({
+                "config": {
+                    "currentPeriod": { "type": "USAGE_PERIOD_TYPE_WEEKLY" },
+                    "creditUsagePercent": -1
+                }
+            })),
+            GrokQuota::Malformed
+        );
+    }
+
+    /// Live shape from an account on unified team billing: 200, well-formed, and
+    /// carrying no quota at all. Reporting this as an invalid payload put a
+    /// redacted error warning on a healthy row.
+    #[test]
+    fn an_account_without_a_quota_is_not_a_malformed_payload() {
+        // `?format=credits` for such an account: a period, but no percent.
+        assert_eq!(
+            parse_usage_payload(&json!({
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-09-12T17:17:20.027402+00:00",
+                        "end": "2026-09-19T17:17:20.027402+00:00"
+                    },
+                    "onDemandCap": { "val": 0 },
+                    "onDemandUsed": { "val": 0 },
+                    "isUnifiedBillingUser": true,
+                    "prepaidBalance": { "val": 0 }
+                }
+            })),
+            GrokQuota::NoQuota
+        );
+
+        // The token/default shape: counters and a billing period, no `currentPeriod`.
+        assert_eq!(
+            parse_usage_payload(&json!({
+                "config": {
+                    "monthlyLimit": { "val": 0 },
+                    "used": { "val": 11 },
+                    "onDemandCap": { "val": 0 },
+                    "billingPeriodStart": "2026-09-01T00:00:00+00:00",
+                    "billingPeriodEnd": "2026-10-01T00:00:00+00:00",
+                    "history": []
+                }
+            })),
+            GrokQuota::NoQuota
+        );
     }
 }

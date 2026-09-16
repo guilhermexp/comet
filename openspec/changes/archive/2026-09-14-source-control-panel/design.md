@@ -91,3 +91,17 @@ Nenhuma migração de dado. Peer com engine antigo não conhece os métodos novo
 ## Open Questions
 
 Nenhuma.
+
+### D9 — Apresentação compacta conforme referência do usuário (2026-09-14)
+
+O usuário pediu a composição da segunda captura: mensagem, Commit e Sync Changes
+empilhados ocupando a largura; seções com disclosure e badge; Material Icon Theme,
+basename em destaque, diretório secundário e status colorido na direita. Ações por
+arquivo aparecem como ícones no hover, com tooltip e propagação interrompida;
+seções oferecem refresh e ações em massa por ícone. Staged vazio fica oculto.
+Branch continua em linha discreta; ahead/behind ficam junto de Sync Changes.
+Untracked usa U azul e conflito usa ! vermelho, preservando a distinção.
+Reusar os handlers RPC e confirmação existentes. Sem botões decorativos para
+AI, menus de commit ou árvore: essas capabilities não existem neste painel.
+
+D9 atualizado por pedido explícito: a aba exibe **Changes**, com o badge atual. O identificador persistido `source-control` e `DetailsTab::SourceControl` permanecem para compatibilidade; o viewer de diff existente é uma surface distinta.

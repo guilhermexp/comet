@@ -1,8 +1,9 @@
-## Purpose
+# source-control Specification
 
+## Purpose
 Estado de git de um checkout — status por arquivo separado entre índice e worktree, branch, upstream e divergência — e as operações que o alteram: stage, unstage, discard, commit, push, pull e sync, sempre disparadas por ação explícita do usuário.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Estado de git observável por checkout
 O sistema SHALL expor, para um checkout, o branch corrente, o upstream quando existe, os contadores ahead/behind contra esse upstream, e a lista de arquivos mudados com o par de status índice/worktree (staged e unstaged distintos). Arquivo untracked SHALL aparecer como untracked, não como adicionado no índice. Rename SHALL carregar o path antigo. O estado SHALL ser atualizado quando o checkout muda, sem polling da UI. O cálculo de ahead/behind SHALL usar apenas refs locais — nenhuma operação de rede implícita.
@@ -95,12 +96,12 @@ O sistema SHALL oferecer uma ação de sincronizar que traz os commits do upstre
 - **THEN** o branch é criado no remoto com upstream configurado
 
 ### Requirement: Superfície de Source Control na Details Sidebar
-A Details Sidebar SHALL ter uma aba Source Control ao lado de Details e Files, com badge de quantidade de arquivos mudados, que persiste como aba ativa igual às outras. A aba SHALL mostrar branch e ahead/behind no cabeçalho, a caixa de mensagem, os botões Commit e Sync/Publish, e as seções Staged Changes e Changes com a letra de status por arquivo. Cada arquivo SHALL oferecer stage ou unstage e discard; cada seção SHALL oferecer a ação em massa correspondente. Clicar num arquivo SHALL abrir o diff dele no painel Changes existente, no escopo working tree, sem abrir um segundo visualizador. Checkout sem repositório git SHALL mostrar estado vazio explícito, sem oferecer ação.
+A Details Sidebar SHALL ter uma aba Changes ao lado de Details e Files, com badge de quantidade de arquivos mudados, que persiste como aba ativa igual às outras. A aba SHALL mostrar branch e ahead/behind no cabeçalho, a caixa de mensagem, os botões Commit e Sync/Publish, e as seções Staged Changes e Changes com a letra de status por arquivo. Cada arquivo SHALL oferecer stage ou unstage e discard; cada seção SHALL oferecer a ação em massa correspondente. Clicar num arquivo SHALL abrir o diff dele no painel Changes existente, no escopo working tree, sem abrir um segundo visualizador. Checkout sem repositório git SHALL mostrar estado vazio explícito, sem oferecer ação.
 
 #### Scenario: Badge acompanha a quantidade de mudanças
 - Test: unit — derivação do badge a partir do estado de git.
 - **WHEN** o checkout passa a ter três arquivos mudados
-- **THEN** a aba Source Control mostra três no badge
+- **THEN** a aba Changes mostra três no badge
 
 #### Scenario: Arquivo abre no diff existente
 - Test: unit — evento emitido ao clicar na row.
@@ -111,3 +112,34 @@ A Details Sidebar SHALL ter uma aba Source Control ao lado de Details e Files, c
 - Test: unit — composição da aba para checkout sem repositório.
 - **WHEN** o contexto aponta para um diretório que não é repositório git
 - **THEN** a aba mostra estado vazio e nenhum botão de commit ou sync
+
+### Requirement: Apresentação compacta do painel
+O painel SHALL empilhar mensagem, Commit e Sync Changes/Publish em largura total.
+A seção Staged Changes SHALL ficar oculta quando vazia. As seções SHALL poder ser
+recolhidas e mostrar contagem em badge. Cada arquivo SHALL mostrar ícone de tipo,
+basename destacado, diretório secundário truncável e caminho completo em tooltip,
+com status colorido à direita (U para untracked, ! para conflito). As ações SHALL
+usar ícones com tooltip, revelados no hover da linha, sem abrir o diff ao acioná-los.
+
+#### Scenario: Lista compacta em painel estreito
+- Test: none — render GPUI validado visualmente em janela nativa.
+- **WHEN** o painel mostra caminhos longos e nenhuma mudança staged
+- **THEN** o cabeçalho Staged vazio não ocupa espaço, os botões ocupam a largura e as linhas mantêm ícone, nome e status legíveis com o diretório truncado
+
+#### Scenario: Controles da seção e da linha
+- Test: none — interação nativa com seções, hover e confirmação.
+- **WHEN** o usuário recolhe uma seção ou aciona um ícone de stage/discard
+- **THEN** o disclosure altera a lista e a ação usa o handler existente sem abrir diff, preservando a confirmação de discard
+
+### Requirement: Changes em projetos Workers
+O sistema SHALL aceitar Source Control para a raiz de um projeto Worker registrado no device, mesmo sem Chat ou Space. A autorização SHALL consultar o registro atual, excluir grupos e preservar a recusa de checkout não registrado.
+
+#### Scenario: Worker sem Chat ou Space
+- Test: integration — RPC contra registro e checkout temporários.
+- **WHEN** um projeto Worker registrado tem mudanças e nenhum Chat/Space
+- **THEN** status e stage funcionam no checkout desse projeto
+
+#### Scenario: Remoção revoga autorização
+- Test: integration — releitura do registro entre RPCs.
+- **WHEN** o projeto é removido do registro Workers
+- **THEN** uma nova operação de Source Control é recusada se não houver Chat/Space correspondente

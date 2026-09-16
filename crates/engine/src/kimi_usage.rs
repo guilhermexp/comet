@@ -561,8 +561,19 @@ fn parse_usage_payload(payload: &Value) -> Vec<AgentUsageWindow> {
 
 fn usage_row(value: &Value, label: &str) -> Option<AgentUsageWindow> {
     let row = value.as_object()?;
-    let used = decimal(row.get("used")?)?;
     let limit = decimal(row.get("limit")?)?;
+    // The endpoint reports `remaining` today and reported `used` before; both
+    // shapes parse, so a rollback on their side does not blank the widget.
+    let used = match row.get("used") {
+        Some(used) => decimal(used)?,
+        None => {
+            let remaining = decimal(row.get("remaining")?)?;
+            if !remaining.is_finite() {
+                return None;
+            }
+            (limit - remaining).max(0.0)
+        }
+    };
     if !used.is_finite() || !limit.is_finite() || used < 0.0 || limit <= 0.0 {
         return None;
     }
@@ -1026,6 +1037,43 @@ mod tests {
             windows[1].resets_at,
             Utc.with_ymd_and_hms(2027, 1, 15, 3, 0, 0).single()
         );
+    }
+
+    #[test]
+    fn payload_parser_derives_used_from_remaining() {
+        // Live shape as of 2026-09-15: the endpoint dropped `used` and reports
+        // `remaining` in both the weekly summary and each `limits` detail.
+        let windows = parse_usage_payload(&json!({
+            "usage": {
+                "limit": "100",
+                "remaining": "40",
+                "resetTime": "2026-09-18T17:20:49.159160Z"
+            },
+            "limits": [
+                {
+                    "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" },
+                    "detail": { "limit": 100, "remaining": 100 }
+                },
+                {
+                    // remaining above limit clamps instead of failing the payload
+                    "window": { "duration": 7, "timeUnit": "TIME_UNIT_DAY" },
+                    "detail": { "limit": "100", "remaining": "120" }
+                },
+                {
+                    // neither counter: ignored without discarding the siblings
+                    "window": { "duration": 1, "timeUnit": "TIME_UNIT_HOUR" },
+                    "detail": { "limit": "100" }
+                }
+            ]
+        }));
+
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].label, "Weekly");
+        assert!((windows[0].used_fraction - 0.6).abs() < 1e-6);
+        assert_eq!(windows[1].label, "5h");
+        assert_eq!(windows[1].used_fraction, 0.0);
+        assert_eq!(windows[2].label, "7d");
+        assert_eq!(windows[2].used_fraction, 0.0);
     }
 
     #[tokio::test]

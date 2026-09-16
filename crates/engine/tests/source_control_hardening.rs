@@ -286,3 +286,116 @@ async fn diff_captures_survive_stale_index_lock() {
         .expect("diff capture must not fail on a stale index.lock");
     h.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_source_control_uses_live_registry_without_chat_or_space() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("worker");
+    init_repo(&repo).await;
+    std::fs::write(repo.join("tracked.txt"), "worker change\n").unwrap();
+    let state = temp.path().join("workers.json");
+    let register = |projects: Value| {
+        std::fs::write(&state, json!({"projects": projects}).to_string()).unwrap();
+    };
+    register(json!([]));
+    let core = assemble(&temp.path().join("data"));
+    let service = Arc::try_unwrap(core.rpc_service())
+        .ok()
+        .unwrap()
+        .with_worker_projects(
+            zeron_workers_unpeel::registered_projects::RegisteredProjects::at(state.clone()),
+        );
+    let client = zeron_rpc::memory_client(Arc::new(service));
+    let params = json!({"cwd": repo, "paths": ["tracked.txt"]});
+    assert!(
+        client
+            .call(methods::STAGE_FILES, params.clone())
+            .await
+            .is_err()
+    );
+
+    // A group must not authorize its directory as a Worker checkout.
+    register(json!([{"id":"group", "path":repo, "is_group":true}]));
+    assert!(
+        client
+            .call(methods::STAGE_FILES, params.clone())
+            .await
+            .is_err()
+    );
+    register(json!([{"id":"worker", "path":repo, "is_group":false}]));
+    let status = status_of(&client, &repo).await;
+    assert!(
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "tracked.txt")
+    );
+    client
+        .call(methods::STAGE_FILES, params.clone())
+        .await
+        .unwrap();
+    let status = status_of(&client, &repo).await;
+    assert!(
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "tracked.txt" && file["index"] == "modified")
+    );
+    client
+        .call(methods::UNSTAGE_FILES, params.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        git_stdout(&repo, &["diff", "--cached", "--name-only"]).await,
+        ""
+    );
+
+    let mut stream = client
+        .subscribe(methods::WATCH_CHECKOUT_STATUS, json!({"cwd":repo}))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(stream);
+    register(json!([]));
+    assert!(client.call(methods::STAGE_FILES, params).await.is_err());
+    assert_eq!(
+        git_stdout(&repo, &["diff", "--cached", "--name-only"]).await,
+        ""
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_message_requires_authorized_checkout_and_staged_changes() {
+    let h = Harness::owned().await;
+    let foreign = tempfile::tempdir().unwrap();
+    let error = h
+        .client
+        .call(
+            methods::GENERATE_COMMIT_MESSAGE,
+            json!({"cwd": foreign.path().to_str().unwrap()}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not a known checkout"),
+        "{error}"
+    );
+    let error = h
+        .client
+        .call(
+            methods::GENERATE_COMMIT_MESSAGE,
+            json!({"cwd": h.repo.to_str().unwrap()}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Stage changes"), "{error}");
+    h.shutdown().await;
+}

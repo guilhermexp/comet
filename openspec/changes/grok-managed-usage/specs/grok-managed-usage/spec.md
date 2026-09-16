@@ -47,7 +47,9 @@ Test: refresh error table asserting byte-identical persisted credentials and red
 
 ### Requirement: Fetch managed Grok quota windows
 
-The system SHALL request the canonical `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` origin with bearer authentication and an 8-second timeout, SHALL reject cross-origin redirects, and SHALL normalize `config.currentPeriod` and `config.creditUsagePercent` into a quota window whose label derives from the period type (`Weekly` for `USAGE_PERIOD_TYPE_WEEKLY`, `Monthly` for `USAGE_PERIOD_TYPE_MONTHLY`) and whose reset timestamp is the period end. Tests MAY inject an isolated loopback transport without using production environment overrides or credentials.
+The system SHALL request the canonical `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` origin with bearer authentication and an 8-second timeout, SHALL reject cross-origin redirects, and SHALL normalize `config.currentPeriod` and `config.creditUsagePercent` into a quota window whose label derives from the period type (`Weekly` for `USAGE_PERIOD_TYPE_WEEKLY`, `Monthly` for `USAGE_PERIOD_TYPE_MONTHLY`) and whose reset timestamp is the period end.
+
+A successful response that carries no quota for the account SHALL be reported as no usage, never as an invalid payload: x.ai answers `200` with a well-formed `config` and no `creditUsagePercent` for plans that have no cap of their own — unified team billing, where `monthlyLimit`, `onDemandCap` and `prepaidBalance` are all zero. Only a response that is not the shape this endpoint returns SHALL raise the payload error. Tests MAY inject an isolated loopback transport without using production environment overrides or credentials.
 
 #### Scenario: Weekly period is returned
 
@@ -55,7 +57,21 @@ Test: parser unit test covering weekly/monthly period types, fractional percenta
 
 - **WHEN** the endpoint returns `currentPeriod.type = USAGE_PERIOD_TYPE_WEEKLY` with `creditUsagePercent` and period `end`
 - **THEN** Comet maps it to a `Weekly` window with `used_fraction = creditUsagePercent / 100` and `resets_at = end`
-- **AND** a payload without a usable current period yields no windows
+
+#### Scenario: An account with no quota of its own
+
+Test: parser unit test over both live no-quota shapes — a `currentPeriod` without `creditUsagePercent`, and a `billingPeriodStart`/`used` block without `currentPeriod`.
+
+- **WHEN** the endpoint answers `200` with a well-formed `config` that carries no quota
+- **THEN** Comet reports no usage windows and no warning
+- **AND** the Grok row reads as having no usage, not as a failed probe
+
+#### Scenario: A response that is not this endpoint's shape
+
+Test: parser unit test for a missing `config`, an unknown period type, and a negative percentage.
+
+- **WHEN** the response has no `config`, an unrecognized period type, or a non-finite or negative percentage
+- **THEN** Comet raises the payload error and the row carries its redacted warning
 
 #### Scenario: Managed endpoint is unavailable
 

@@ -419,6 +419,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 - **Branch de contexto/PR**: `WorkersProject::change_request_branch` aceita checkout local e worktree, exclui grupos e prefere `git_branch` do snapshot ao registro de criação. Valores vazios não viram branch. O consumidor limita subscriptions ao working set; não inferir que um checkout comum está na default branch ou não possui PR.
 
+- `registered_projects::RegisteredProjects` lê apenas raízes absolutas do working set persistido, excluindo grupos. Não inicia host, não usa ledger histórico e não grava estado. A engine consulta esse adaptador em `spawn_blocking` para autorizar Changes em Workers sem Chat/Space.
+
 ## Work Guidance
 
 - New Workers capability: extend `LocalWorkersClient` + typed models here, then
@@ -449,6 +451,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
 | `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

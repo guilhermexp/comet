@@ -17,7 +17,7 @@
 
 ## Tests
 
-- [x] 7. `cursor_usage` unit tests: parser table (fractional, string/number ms, missing planUsage), error table (401/403/5xx/invalid JSON), missing/empty token table, cache TTL, last-known-good on transient failure, token-change invalidation.
+- [x] 7. `cursor_usage` unit tests: parser table (fractional, string/number ms, missing planUsage), error table (401/403/5xx/invalid JSON), missing/empty token table, cache TTL, last-known-good on transient failure, token-change invalidation, `cli-config.json` email parsing, and proof that the test constructor never reads the real CLI Keychain login.
 - [ ] 8. `agent_accounts` snapshot test: active Cursor account carries the `Monthly` window and zero token material; mismatched session email attaches nothing.
 - [x] 9. `cargo test -p zeron-engine` and `cargo fmt --all` green.
 

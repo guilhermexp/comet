@@ -469,6 +469,7 @@ enum MutateParams {
 }
 
 pub struct EngineRpc {
+    worker_projects: zeron_workers_unpeel::registered_projects::RegisteredProjects,
     sessions: SessionsEngine,
     doc_host: DocHost,
     workspace: WorkspaceHost,
@@ -512,6 +513,7 @@ impl EngineRpc {
             workspace_scope,
         };
         Self {
+            worker_projects: Default::default(),
             sessions,
             doc_host,
             workspace,
@@ -533,6 +535,15 @@ impl EngineRpc {
             engine_info,
             reveal_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RAW_REVEALS)),
         }
+    }
+
+    /// Use the Worker registry of a specific local profile.
+    pub fn with_worker_projects(
+        mut self,
+        projects: zeron_workers_unpeel::registered_projects::RegisteredProjects,
+    ) -> Self {
+        self.worker_projects = projects;
+        self
     }
 
     /// Attach a specific trajectory store (used in tests or profile setup).
@@ -663,13 +674,29 @@ impl EngineRpc {
         ))
     }
 
-    /// Source Control RPCs are relay-forwardable, so the cwd is resolved against
-    /// this device's chats/spaces before any git identity or mutation.
+    /// Source Control resolves against this device's Chats/Spaces or live
+    /// Worker registry before any git identity or mutation.
     async fn authorized_checkout(
         &self,
         cwd: &str,
     ) -> Result<crate::repos::CheckoutIdentity, RpcError> {
-        let root = self.change_request_root(cwd).await?;
+        let root = match self.change_request_root(cwd).await {
+            Ok(root) => root,
+            Err(error) => {
+                let projects = self.worker_projects.clone();
+                let requested = std::path::PathBuf::from(cwd);
+                let root = tokio::task::spawn_blocking(move || {
+                    let requested = std::fs::canonicalize(requested).ok()?;
+                    projects.roots().ok()?.into_iter().find_map(|root| {
+                        let root = std::fs::canonicalize(root).ok()?;
+                        (root == requested).then_some(root)
+                    })
+                })
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+                root.ok_or(error)?
+            }
+        };
         self.repos
             .checkout_identity(&root)
             .await
@@ -1990,6 +2017,15 @@ impl RpcService for EngineRpc {
                     .map_err(git_rpc_error)?;
                 self.diff_sync.sync_all();
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::GENERATE_COMMIT_MESSAGE => {
+                let request: zeron_proto::GenerateCommitMessageRequest = parse_params(params)?;
+                let identity = self.authorized_checkout(&request.cwd).await?;
+                let message =
+                    crate::commit_message::generate(&self.repos, &identity.root, &self.registry)
+                        .await
+                        .map_err(git_rpc_error)?;
+                RpcReply::value(&zeron_proto::GeneratedCommitMessage { message })
             }
             methods::COMMIT_CHECKOUT => {
                 let request: zeron_proto::CommitCheckoutRequest = parse_params(params)?;

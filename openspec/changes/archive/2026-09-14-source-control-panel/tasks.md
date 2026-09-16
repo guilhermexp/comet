@@ -34,3 +34,9 @@
 - [x] 5.1 Rodar `cargo fmt --all` e `cargo test --workspace` uma única vez, no fim.
 - [x] 5.2 DOX pass: `crates/engine/AGENTS.md` (git deixa de ser só leitura/topologia; matriz de teste), `crates/rpc/AGENTS.md` (métodos novos), `crates/ui/AGENTS.md` (terceira aba; Changes segue sendo só viewer).
 - [x] 5.3 `openspec validate source-control-panel --strict` verde e evidência registrada.
+
+## 6. Correção visual solicitada em 2026-09-14
+
+- [x] 6.1 Empilhar controles e compactar seções/rows em `details_sidebar/view.rs`, reutilizando Material icons, tooltips e handlers existentes.
+- [x] 6.2 Verificar derivações de status/labels e compilar app; atualizar contrato DOX.
+- [x] 6.3 Conferir painel nativo largo/estreito, hover e disclosure; registrar evidência e validar OpenSpec.

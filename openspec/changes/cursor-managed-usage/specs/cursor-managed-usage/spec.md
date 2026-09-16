@@ -2,9 +2,14 @@
 
 ## ADDED Requirements
 
-### Requirement: Read the Cursor desktop session token for Usage
+### Requirement: Read a Cursor session token for Usage from either device-local login
 
-The system SHALL read the Cursor subscription Usage credential from the Cursor desktop app's local storage (`state.vscdb`, keys `cursorAuth/accessToken` and `cursorAuth/cachedEmail`) as device-local account state, and SHALL NOT treat the `cursor-agent` SDK API key (`crsr_…`) as a subscription quota credential. The state database SHALL be opened read-only, never written, vacuumed, or otherwise mutated. Explicit `AgentAccountsConfig` paths SHALL never fall through to the real user home.
+The system SHALL read the Cursor subscription Usage credential from whichever of two device-local logins holds one, trying them in this order:
+
+1. the Cursor desktop app's local storage (`state.vscdb`, keys `cursorAuth/accessToken` and `cursorAuth/cachedEmail`);
+2. the `cursor-agent` CLI login in the macOS Keychain (service `cursor-access-token`, account `cursor-user`), whose account email is read from `~/.cursor/cli-config.json` (`authInfo.email`).
+
+The system SHALL NOT treat the `cursor-agent` SDK API key (`crsr_…`) as a subscription quota credential; the quota endpoint rejects it with `401 ERROR_NOT_LOGGED_IN`. Both stores SHALL be read-only — the state database is never written, vacuumed, or otherwise mutated, and the Keychain item is only read. Explicit `AgentAccountsConfig` paths and the test constructor SHALL never fall through to the real user home or to the real Keychain login.
 
 #### Scenario: Desktop session exists
 
@@ -12,13 +17,22 @@ Test: engine unit test with a temporary SQLite `ItemTable`.
 
 - **WHEN** `state.vscdb` contains a non-empty `cursorAuth/accessToken`
 - **THEN** the Cursor account is eligible for managed Usage probing
+- **AND** the desktop token is preferred over the CLI login, since Cursor's own app keeps it fresh
 - **AND** the access token never appears in snapshots, warnings, logs, Loro, or edge sync
 
-#### Scenario: Desktop session is missing or unreadable
+#### Scenario: Only the CLI is logged in
 
-Test: engine unit table for missing database, missing key, and unreadable database.
+Test: none — reading the real Keychain needs a real `cursor-agent` login; covered by a manual engine probe on a device with the CLI and no desktop app.
 
-- **WHEN** the database or the `cursorAuth/accessToken` row is missing, unreadable, or malformed
+- **WHEN** the desktop store is absent or unreadable and `cursor-agent` holds a Keychain login
+- **THEN** the Cursor account is eligible for managed Usage probing with the CLI token
+- **AND** the quota attaches to the account named by `authInfo.email`, or to the active Cursor account when that file names none
+
+#### Scenario: Neither login is present or readable
+
+Test: engine unit table for missing database, missing key, and unreadable database, with the CLI Keychain source disabled.
+
+- **WHEN** neither store yields a usable token
 - **THEN** the Cursor account degrades to its no-usage or unavailable state
 - **AND** no secret material appears in warnings or logs
 

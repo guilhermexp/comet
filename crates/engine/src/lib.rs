@@ -20,6 +20,7 @@ pub(crate) mod antigravity_usage;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
+mod commit_message;
 pub(crate) mod cursor_usage;
 pub mod diff_sync;
 pub mod doc_host;

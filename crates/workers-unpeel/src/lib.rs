@@ -7,6 +7,7 @@ pub mod maintenance;
 mod parent_notifications;
 pub mod project_git;
 pub mod project_ledger;
+pub mod registered_projects;
 pub mod resources;
 mod session_event_journal;
 pub mod workspace_trust;

@@ -839,9 +839,9 @@ async fn diff_sync_task(
 // Diff capture (exposed for tests)
 // ---------------------------------------------------------------------------
 
-struct Capture {
-    stdout: Vec<u8>,
-    truncated: bool,
+pub(crate) struct Capture {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
 /// Run git capturing stdout under a hard byte ceiling — [`ProcessRunner`]
@@ -856,7 +856,7 @@ struct Capture {
 /// 128KiB of `capture_diff` frame plus hundreds of KiB across the handler and
 /// overflowed the 2MiB tokio worker stack (crash: `tokio-rt-worker has
 /// overflowed its stack`).
-async fn capture_git(
+pub(crate) async fn capture_git(
     runner: &dyn ProcessRunner,
     cwd: &Path,
     args: &[&str],
