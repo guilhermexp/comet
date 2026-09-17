@@ -246,7 +246,7 @@ fn file_attachment_chip(
                         .truncate()
                         .text_size(px(10.5))
                         .line_height(px(14.0))
-                        .text_color(theme.text_muted.opacity(0.72))
+                        .text_color(theme.text_faint)
                         .child(SharedString::from(kind)),
                 ),
         )
@@ -6214,7 +6214,7 @@ impl Transcript {
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(px(12.0))
-                .text_color(theme.text_muted.opacity(0.55))
+                .text_color(theme.text_faint)
                 .child(SharedString::from(format_timestamp(ms, &chrono::Local)));
             let copy = copy_text.map(|text| {
                 let entry_id = copy_entry_id.clone();
@@ -7350,6 +7350,7 @@ impl Transcript {
                     .child(
                         crate::icons::icon(crate::icons::CHECKLIST)
                             .size(px(14.0))
+                            // a11y-ok: checklist pictogram beside the plan title, not a glyph to read
                             .text_color(theme.text_muted.opacity(0.72)),
                     ),
             )
@@ -7366,7 +7367,7 @@ impl Transcript {
                     .flex_none()
                     .font_family(theme.font_mono.clone())
                     .text_size(px(10.0))
-                    .text_color(theme.text_muted.opacity(0.5))
+                    .text_color(theme.text_faint)
                     .child(SharedString::from(duration)),
             );
         }
@@ -9201,7 +9202,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                     div()
                         .min_w_0()
                         .flex_1()
-                        .text_color(theme.text.opacity(0.8))
+                        .text_color(theme.text)
                         .child(message),
                 ),
         )
@@ -9281,7 +9282,7 @@ fn detail_body(
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_color(theme.text.opacity(0.85))
+                            .text_color(theme.text)
                             .child(SharedString::from(stat.path.clone())),
                     )
                     .child(
@@ -9645,12 +9646,14 @@ fn chip_header_row(
                 .flex()
                 .items_center()
                 .justify_center()
+                // a11y-ok: chip trailing chevron/arrow tile, not a readable glyph
                 .text_color(theme.text_muted.opacity(0.7));
             row.child(match trail {
                 ChipTrail::Chevron { open } => stream_disclosure(open, theme),
                 ChipTrail::OpenArrow => tile.child(
                     crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
                         .size(px(11.0))
+                        // a11y-ok: open-arrow SVG on a spawn chip, not a readable glyph
                         .text_color(theme.text_muted.opacity(0.8)),
                 ),
             })

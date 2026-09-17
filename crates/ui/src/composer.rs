@@ -3632,14 +3632,14 @@ impl Render for ContextUsageTooltip {
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .text_color(theme.text_muted.opacity(0.82))
+                        .text_color(theme.text_faint)
                         .child(self.state.detail.clone()),
                 )
                 .when(self.compactable, |el| {
                     el.child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_muted)
                             .child("Click to compact"),
                     )
                 }),
@@ -4912,7 +4912,7 @@ impl Composer {
                                     .truncate()
                                     .text_size(px(10.5))
                                     .line_height(px(14.0))
-                                    .text_color(theme.text_muted.opacity(0.72))
+                                    .text_color(theme.text_faint)
                                     .child(subtitle),
                             ),
                     )
@@ -7001,7 +7001,7 @@ impl Composer {
                                 div()
                                     .text_size(px(10.5))
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .text_color(theme.text_muted)
                                     .child(SharedString::from(crate::popover::tracked_upper(
                                         &question.header,
                                     ))),
@@ -7017,7 +7017,7 @@ impl Composer {
                                         .bg(crate::theme::ink(0.06))
                                         .text_size(px(10.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .text_color(theme.text_faint)
                                         .child(SharedString::from(counter)),
                                 )
                             }),
@@ -7036,7 +7036,7 @@ impl Composer {
                             div()
                                 .mt(px(4.0))
                                 .text_size(px(12.0))
-                                .text_color(theme.text_muted.opacity(0.65))
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from("Select one or more options.")),
                         )
                     })
@@ -8119,7 +8119,7 @@ impl Render for Composer {
                     .px(px(12.0))
                     .text_size(px(11.0))
                     .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.8))
+                    .text_color(theme.text_muted)
                     .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
             )
         });

@@ -275,8 +275,8 @@ mod tests {
 pub fn render(
     history: &QuestionHistory,
     theme: &crate::theme::Theme,
-    view: gpui::EntityId,
-    cx: &mut gpui::App,
+    _view: gpui::EntityId,
+    _cx: &mut gpui::App,
 ) -> gpui::AnyElement {
     use gpui::{div, prelude::*, px};
     let mut body = div()
@@ -288,13 +288,7 @@ pub fn render(
         .line_height(px(22.0))
         .font_weight(gpui::FontWeight::NORMAL);
     if history.loading {
-        let phase = crate::motion::pulse_delta(&crate::motion::ACTIVITY_SHIMMER, view, cx);
-        let opacity = 0.55 + 0.45 * (phase * std::f32::consts::PI).sin();
-        body = body.child(
-            div()
-                .text_color(theme.text_muted.opacity(opacity))
-                .child("Asking question…"),
-        );
+        body = body.child(div().text_color(theme.text_muted).child("Asking question…"));
     }
     if let Some(question) = &history.waiting {
         body = body.child(

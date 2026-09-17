@@ -4,13 +4,15 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-Os scripts que fazem o repo rodar fora do `cargo`: `dev-demo.sh` (demo local offline), `e2e-smoke.sh` (smoke multi-device), `package-linux.sh`/`package-macos.sh` (distribuição) e `omp-dev` (launcher de OMP para desenvolvimento).
+Os scripts que fazem o repo rodar fora do `cargo`: `dev-demo.sh` (demo local offline), `e2e-smoke.sh` (smoke multi-device), `package-linux.sh`/`package-macos.sh` (distribuição), `omp-dev` (launcher de OMP para desenvolvimento) e `lint-text-alpha.sh` (contraste de texto sem alpha empilhado sobre papel do tema).
 
 ## Ownership
 
 Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto — se um script começou a decidir comportamento, o lugar é uma crate.
 
 ## Local Contracts
+
+- `lint-text-alpha.sh` falha se `crates/ui/src/**/*.rs` pinta `text_color` com `theme.text` / `text_muted` / `text_faint` + `.opacity(...)` sem `// a11y-ok: <motivo>` na mesma linha ou na imediatamente acima. Só bash/grep/sed.
 
 - `run-macos-browser-fixture.sh` recebe `target/debug/{browser,preview}-fixture` compilado com `cargo build -p zeron --features browser-fixture --bin <fixture>` e empacota somente a fixture local com o Info.plist real para validar política HTTP no macOS. Não assina nem publica; evidência nativa continua separada de unit tests.
 
@@ -37,6 +39,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 | `dev-demo.sh` | none — ferramenta de dev; validação é usar | `scripts/dev-demo.sh` |
 | `seed-demo-workers.py` | integration — fixture consumido pelo bootstrap real | `cargo test -p zeron-workers-unpeel --test dev_demo_fixture` |
 | `package-*.sh` | none — sem suite; validação é gerar o pacote e abrir | execução manual |
+| `lint-text-alpha.sh` | unit — grep do anti-padrão `text_color`+opacity nos papéis de texto | `bash scripts/lint-text-alpha.sh` |
 | `omp-dev` | none — wrapper de 1 decisão; validação é o handshake | `printf '{"type":"ping","id":"x"}\n' \| scripts/omp-dev --mode rpc-ui --auto-approve --allow-home --cwd "$HOME" \| head -1` (espera `"type":"ready"`) |
 
 ## Child DOX Index

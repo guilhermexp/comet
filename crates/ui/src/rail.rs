@@ -529,7 +529,7 @@ impl Transcript {
                             el.child(
                                 div()
                                     .text_size(px(10.0))
-                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .text_color(theme.text_faint)
                                     .child(SharedString::from(format!("{bucket_len} prompts"))),
                             )
                         });

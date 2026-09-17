@@ -817,6 +817,7 @@ impl DetailsSidebar {
                         icons::icon(icon_path)
                             .size(px(15.0))
                             .flex_none()
+                            // a11y-ok: widget-menu icon beside the readable label, not a glyph to read
                             .text_color(theme.text_muted.opacity(0.8)),
                     )
                     .child(div().flex_1().child(SharedString::from(label)))
@@ -2931,7 +2932,7 @@ impl DetailsSidebar {
                     .ml(px(25.0))
                     .pb(px(4.0))
                     .text_size(px(10.0))
-                    .text_color(theme.text_muted.opacity(0.75))
+                    .text_color(theme.text_faint)
                     .child(usage.clone()),
             );
         }
@@ -3011,7 +3012,7 @@ impl DetailsSidebar {
                                 line.child(
                                     div()
                                         .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.75))
+                                        .text_color(theme.text_faint)
                                         .child(model.trim_start_matches("claude-").to_owned()),
                                 )
                             }),
@@ -3541,7 +3542,7 @@ impl DetailsSidebar {
             .px(px(9.0))
             .py(px(12.0))
             .text_size(px(12.0))
-            .text_color(theme.text_muted.opacity(0.75))
+            .text_color(theme.text_muted)
             .child(format!("No {label} yet."))
     }
 
@@ -3742,14 +3743,14 @@ impl DetailsSidebar {
                             .min_w_0()
                             .text_size(px(12.0))
                             .italic()
-                            .text_color(theme.text_muted.opacity(0.85))
+                            .text_color(theme.text_muted)
                             .child(format!("※ recap: {}", entry.text)),
                     )
                     .child(
                         div()
                             .flex_shrink_0()
                             .text_size(px(10.0))
-                            .text_color(theme.text_muted.opacity(0.50))
+                            .text_color(theme.text_faint)
                             .child(clock_text),
                     );
                 workspace_body = workspace_body.child(recap_row);
@@ -4176,7 +4177,7 @@ impl DetailsSidebar {
                                                     div()
                                                         .mt(px(2.0))
                                                         .text_size(px(11.0))
-                                                        .text_color(theme.text_muted.opacity(0.75))
+                                                        .text_color(theme.text_faint)
                                                         .child(subtitle),
                                                 )
                                             })

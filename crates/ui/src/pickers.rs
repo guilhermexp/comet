@@ -2237,7 +2237,7 @@ impl Pickers {
                                     div()
                                         .flex_none()
                                         .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.45))
+                                        .text_color(theme.text_faint)
                                         .child(SharedString::from("You")),
                                 )
                             })
@@ -2326,6 +2326,7 @@ impl Pickers {
                 crate::icons::icon(crate::icons::PLUS)
                     .size(px(12.0))
                     .flex_none()
+                    // a11y-ok: plus pictogram beside New project, not a glyph to read
                     .text_color(theme.text_muted.opacity(0.7)),
             )
             .child(
@@ -2555,7 +2556,7 @@ impl Pickers {
                 el.child(
                     div()
                         .flex_none()
-                        .text_color(tint.unwrap_or(theme.text_muted.opacity(0.7)))
+                        .text_color(tint.unwrap_or(theme.text_faint))
                         .child(suffix),
                 )
             })
@@ -2608,12 +2609,14 @@ impl Pickers {
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
+                    // a11y-ok: leading pictogram beside the chip label, not a glyph to read
                     .text_color(theme.text_muted.opacity(0.7)),
             )
             .child(div().min_w_0().truncate().child(label))
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
+                    // a11y-ok: disclosure chevron on the footer chip, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.5)),
             )
     }
@@ -2636,10 +2639,11 @@ impl Pickers {
             .px(px(8.0))
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_muted.opacity(0.6))
+            .text_color(theme.text_muted)
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
+                    // a11y-ok: decorative chip SVG beside the device/project label, not a glyph to read
                     .text_color(theme.text_muted.opacity(0.6)),
             )
             .child(div().min_w_0().truncate().child(label))
@@ -3173,7 +3177,7 @@ impl Pickers {
                                         div()
                                             .flex_none()
                                             .text_size(px(10.0))
-                                            .text_color(theme.text_muted.opacity(0.6))
+                                            .text_color(theme.text_muted)
                                             .child(SharedString::from("switching…")),
                                     )
                                 })
@@ -3204,7 +3208,7 @@ impl Pickers {
                                             .py(px(1.0))
                                             .rounded(px(3.0))
                                             .bg(theme.ink(0.08))
-                                            .text_color(theme.text_muted.opacity(0.8))
+                                            .text_color(theme.text_faint)
                                             .child(SharedString::from("default")),
                                     )
                                 })
@@ -3217,7 +3221,7 @@ impl Pickers {
                                             .py(px(1.0))
                                             .rounded(px(3.0))
                                             .bg(theme.ink(0.08))
-                                            .text_color(theme.text_muted.opacity(0.6))
+                                            .text_color(theme.text_faint)
                                             .child(SharedString::from("worktree")),
                                     )
                                 })
@@ -3345,6 +3349,7 @@ impl Pickers {
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(11.0))
+                    // a11y-ok: disclosure chevron on the picker trigger, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.7))
                     .flex_none(),
             );
@@ -3625,6 +3630,7 @@ impl Pickers {
                 crate::icons::icon(crate::icons::MAGNIFER)
                     .size(px(14.0))
                     .flex_none()
+                    // a11y-ok: search magnifier beside the query, not a word
                     .text_color(theme.text_muted.opacity(0.7)),
             )
             .child(
@@ -3857,7 +3863,7 @@ impl Pickers {
                             .min_w_0()
                             .truncate()
                             .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.7))
+                            .text_color(theme.text_faint)
                             .child(attribution),
                     )
                 })
@@ -3890,13 +3896,14 @@ impl Pickers {
                             crate::icons::icon(icon_path)
                                 .size(px(11.0))
                                 .flex_none()
+                                // a11y-ok: harness mark SVG beside the harness name, not a glyph to read
                                 .text_color(tint.unwrap_or(theme.text_muted.opacity(0.7))),
                         )
                         .child(
                             div()
                                 .flex_none()
                                 .text_size(px(11.0))
-                                .text_color(theme.text_muted.opacity(0.7))
+                                .text_color(theme.text_faint)
                                 .child(harness_name),
                         )
                         .when_some(attribution, |el, attribution| {
@@ -3904,6 +3911,7 @@ impl Pickers {
                                 div()
                                     .flex_none()
                                     .text_size(px(11.0))
+                                    // a11y-ok: middle-dot separator between harness name and attribution, not a word
                                     .text_color(theme.text_muted.opacity(0.45))
                                     .child(SharedString::from("·")),
                             )
@@ -3912,7 +3920,7 @@ impl Pickers {
                                     .min_w_0()
                                     .truncate()
                                     .text_size(px(11.0))
-                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .text_color(theme.text_faint)
                                     .child(attribution),
                             )
                         }),
@@ -4084,7 +4092,7 @@ fn default_badge(theme: &Theme) -> gpui::Div {
         .flex_none()
         .text_size(px(10.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme.text_muted.opacity(0.6))
+        .text_color(theme.text_faint)
         .child(SharedString::from("Default"))
 }
 
@@ -4203,7 +4211,7 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
         .px(px(8.0))
         .py(px(24.0))
         .text_size(px(12.0))
-        .text_color(theme.text_muted.opacity(0.6))
+        .text_color(theme.text_muted)
         .text_center()
         .child(SharedString::from(copy.to_string()))
         .into_any_element()

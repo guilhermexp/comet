@@ -29,6 +29,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Smoke e2e | `scripts/e2e-smoke.sh` |
 | Edge | `npm -C edge run dev\|test\|typecheck\|deploy` |
 | Packaging | `scripts/package-linux.sh` · `scripts/package-macos.sh` |
+| Lint de texto sem alpha empilhado | `scripts/lint-text-alpha.sh` |
 
 O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes executáveis da extensão lifecycle pi-family do Unpeel vendorizado.
 

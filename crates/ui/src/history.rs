@@ -1598,6 +1598,7 @@ impl Render for GitHistoryFetchButton {
             } else {
                 crate::icons::icon(crate::icons::CLOUD)
                     .size(px(12.0))
+                    // a11y-ok: cloud pictogram, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.75))
                     .into_any_element()
             })

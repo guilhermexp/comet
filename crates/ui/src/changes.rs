@@ -3105,6 +3105,7 @@ impl Changes {
         let chevron = div().flex_none().size(px(14.0)).child(
             crate::icons::icon(chevron_icon)
                 .size(px(13.0))
+                // a11y-ok: fold chevron, not a readable glyph
                 .text_color(theme.text_muted.opacity(0.7)),
         );
         let chevron: AnyElement = if fold.animating() {
@@ -3438,6 +3439,7 @@ impl Changes {
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
+                    // a11y-ok: disclosure chevron beside the scope title, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.7)),
             );
         let trigger = if scope == DiffScope::History {
@@ -3641,6 +3643,7 @@ impl Changes {
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(11.0))
                     .flex_none()
+                    // a11y-ok: branch-menu chevron beside the ref name, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.7)),
             );
         let trigger = if self.ref_menu.get().is_some() {

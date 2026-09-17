@@ -169,7 +169,7 @@ impl ShortcutsPage {
                     div()
                         .id(("shortcut-reset", ix))
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.7))
+                        .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {

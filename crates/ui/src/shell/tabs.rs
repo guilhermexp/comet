@@ -407,7 +407,7 @@ impl Shell {
                                 div()
                                     .flex_none()
                                     .text_size(px(12.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
+                                    .text_color(theme.text_faint)
                                     .child(target),
                             )
                         }),

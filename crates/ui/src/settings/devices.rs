@@ -387,7 +387,7 @@ impl Render for DevicesPage {
                     .py(px(40.0))
                     .text_center()
                     .text_size(px(14.0))
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_muted)
                     .child(SharedString::from("No devices registered")),
             )
         } else {

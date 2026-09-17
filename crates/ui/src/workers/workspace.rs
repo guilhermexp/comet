@@ -708,7 +708,7 @@ impl WorkersSidebar {
             .px(px(Theme::SPACE_SM))
             .text_size(px(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text.opacity(0.8))
+            .text_color(theme.text)
             .bg(if open {
                 theme.glass_hover()
             } else {
@@ -740,6 +740,7 @@ impl WorkersSidebar {
                 icon(icons::ALT_ARROW_DOWN)
                     .size(px(13.0))
                     .flex_none()
+                    // a11y-ok: disclosure chevron beside the project-filter label, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.6)),
             );
 
@@ -830,6 +831,7 @@ impl WorkersSidebar {
                     icon(leading)
                         .size(px(15.0))
                         .flex_none()
+                        // a11y-ok: leading pictogram beside the menu-row label, not a glyph to read
                         .text_color(theme.text_muted.opacity(0.8)),
                 )
                 .child(div().flex_1().min_w_0().truncate().child(label))
@@ -1683,13 +1685,14 @@ impl WorkersSidebar {
                     .flex()
                     .justify_end()
                     .text_size(px(9.0))
-                    .text_color(theme.text_muted.opacity(0.70))
+                    .text_color(theme.text_faint)
                     .child(age),
             )
             .when(session.pinned, |el| {
                 el.child(
                     icon(icons::WORKER_PIN)
                         .size(px(13.0))
+                        // a11y-ok: pin pictogram, not a readable glyph
                         .text_color(theme.text.opacity(0.88)),
                 )
             })
@@ -2676,7 +2679,7 @@ impl WorkersContent {
                     div()
                         .w(px(330.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text.opacity(0.4))
+                        .text_color(theme.text_faint)
                         .child("Screenshots captured by the agent's browser and computer tools — and images you add — show up here."),
                 )
                 .into_any_element()
@@ -3903,6 +3906,7 @@ impl WorkersContent {
                         .child(
                             icon(icons::BELL)
                                 .size(px(30.0))
+                                // a11y-ok: empty-state bell ornament, not a readable glyph
                                 .text_color(theme.text_muted.opacity(0.7)),
                         )
                         .child(
@@ -4528,7 +4532,7 @@ impl Render for WorkersContent {
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(theme.text.opacity(0.35))
+                                        .text_color(theme.text_faint)
                                         .child(
                                             "Pick a session in the sidebar, or hit + on a project",
                                         ),
@@ -4538,6 +4542,7 @@ impl Render for WorkersContent {
                             div()
                                 .text_size(px(10.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
+                                // a11y-ok: build-version watermark on the empty canvas, not a control or data label
                                 .text_color(theme.text.opacity(0.25))
                                 .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                         ),
