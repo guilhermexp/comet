@@ -1095,7 +1095,7 @@ mod tests {
             .variant("monocode-dark")
             .expect("monocode-dark")
             .clone();
-        assert_eq!(monocode.frost_alpha, Some(0.85));
+        assert_eq!(monocode.frost_alpha, Some(0.91));
         assert_eq!(monocode.frost_blur_radius, Some(24.0));
         let in_range = registry_with(monocode.clone()).validate();
         assert!(

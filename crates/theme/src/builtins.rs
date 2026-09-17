@@ -1495,7 +1495,13 @@ fn monocode_dark() -> ThemeVariant {
             terminal_selection: Some("#ffffff2e"),
         },
         frost: FrostSeeds {
-            alpha: Some(0.85),
+            // MonoCode's rail is 85% (`--sidebar-opacity`), but its *body* —
+            // the surface behind almost all text — composites `.body-glass`
+            // at 85% over a 40% window wrapper (`src/App.tsx:6880`), landing
+            // at 0.91 effective coverage. Seeding the rail number here let
+            // more backdrop through than the reference does, and with the
+            // WindowServer blur preserving structure that read as soft text.
+            alpha: Some(0.91),
             blur_radius: Some(24.0),
             flat_shell: true,
         },

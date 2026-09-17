@@ -6,7 +6,7 @@ Este documento é a especificação técnica port-ready da linguagem visual do *
 
 Este documento é a especificação; a implementação vive em `crates/theme/src/builtins.rs` (`monocode_dark()` + a família `monocode` no `builtin_registry()`) e nos campos de frost lidos por `crates/ui`. **Somente a variante escura foi implementada**, por decisão explícita do dono do produto: a família é single-variant, como `dracula` e `nord`. A tabela `Seeds` light da seção 4.2, os slots ANSI light da 5.2 e a coluna "Hex Light" da 6.1 permanecem aqui como referência de port, sem código correspondente — o seletor de tema do Comet é por aparência (`crates/ui/src/settings/appearance.rs:700-760`), então MonoCode aparece apenas na lista Dark.
 
-Papéis de interação, `terminal_background` com alpha e frost por variante (0.85 / 24 / shell plano) já são expressáveis. Tipografia, geometria e tinting em runtime continuam abertos na seção 11 e no apêndice 12.
+Papéis de interação, `terminal_background` com alpha e frost por variante (0.91 / 24 / shell plano) já são expressáveis. Tipografia, geometria e tinting em runtime continuam abertos na seção 11 e no apêndice 12.
 
 ### 1.1 Metadados do Repositório de Origem
 - **Repositório:** `hardbeat920/monocode` (clone local read-only em `/Users/guilhermevarela/Documents/Projetos/SelfHosting/monocode`)
@@ -425,13 +425,13 @@ pub fn is_frost(&self) -> bool {
 Ou seja, em macOS e Linux, o Comet ativa as camadas de desfoque e translucidez do GPUI. No Windows, o compositor GPUI não possui backend para frost e retrocede silenciosamente para renderização opaca através de `glass()` (`crates/ui/src/theme.rs:734-737`), garantindo que não ocorram artefatos gráficos.
 
 ### 10.3 Frost por variante
-`ThemeVariant` declara `frost_alpha = 0.85`, `frost_blur_radius = 24.0` e `flat_shell = true` em `monocode-dark`. O renderer lê esses campos com `GLASS_ALPHA` / `MENU_BLUR` / `wash(0.05)` como fallback para variantes que não declaram. A janela pede `Window::set_background_blur_radius(Some(px(24.0)))` só quando o variante declara e a plataforma tem frost; sem declaração o gpui permanece no material AppKit. Off-macOS o frost continua opaco, independente do que a variante peça. Usuários que preferirem casca sólida continuam respaldados pela política local `SurfacePreference::Opaque` (`crates/theme/src/lib.rs:71-87`).
+`ThemeVariant` declara `frost_alpha = 0.91`, `frost_blur_radius = 24.0` e `flat_shell = true` em `monocode-dark`. O renderer lê esses campos com `GLASS_ALPHA` / `MENU_BLUR` / `wash(0.05)` como fallback para variantes que não declaram. A janela pede `Window::set_background_blur_radius(Some(px(24.0)))` só quando o variante declara e a plataforma tem frost; sem declaração o gpui permanece no material AppKit. Off-macOS o frost continua opaco, independente do que a variante peça. Usuários que preferirem casca sólida continuam respaldados pela política local `SurfacePreference::Opaque` (`crates/theme/src/lib.rs:71-87`).
 
 ---
 
 ## 11. GAPs
 
-Fechados nesta change: papéis de interação (hover/active/border/input/cursor/diff_hunk/terminal.selection) como overrides com alpha; `terminal_background` translúcido; frost alpha 0.85, blur 24 e shell plano sem o `wash(0.05)` extra da sidebar; o vidro da **janela** em `monocode-dark`, que deixa de usar o material AppKit `UnderWindowBackground` (downsample do backdrop) e pede raio WindowServer 24. Sobre o mesmo backdrop a média de luminância é praticamente a mesma (92,4 vs 90,4), mas o WindowServer deixa passar **18,1×** mais energia de alta frequência (0,547 vs 0,030). Variante sem raio declarado continua no material — o comportamento dos outros temas não muda.
+Fechados nesta change: papéis de interação (hover/active/border/input/cursor/diff_hunk/terminal.selection) como overrides com alpha; `terminal_background` translúcido; frost alpha 0.91 (cobertura efetiva do corpo do MonoCode: `.body-glass` 85% sobre o wrapper 40%), blur 24 e shell plano sem o `wash(0.05)` extra da sidebar; o vidro da **janela** em `monocode-dark`, que deixa de usar o material AppKit `UnderWindowBackground` (downsample do backdrop) e pede raio WindowServer 24. Sobre o mesmo backdrop a média de luminância é praticamente a mesma (92,4 vs 90,4), mas o WindowServer deixa passar **18,1×** mais energia de alta frequência (0,547 vs 0,030). Variante sem raio declarado continua no material — o comportamento dos outros temas não muda.
 
 Ainda abertos:
 

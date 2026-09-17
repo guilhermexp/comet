@@ -2618,21 +2618,23 @@ mod tests {
             SurfacePreference::Frosted,
         );
 
-        assert_eq!(mono.frost_alpha, Some(0.85));
+        assert_eq!(mono.frost_alpha, Some(0.91));
         assert_eq!(mono.frost_blur_radius, Some(24.0));
         assert!(mono.flat_shell);
         assert_eq!(mono_theme.frost_blur_or(crate::frost::MENU_BLUR), 24.0);
         assert_eq!(mono_theme.sidebar_column_overlay().a, 0.0);
         if cfg!(target_os = "macos") {
-            // Authored coverage is 0.85; the renderer may take one contrast
-            // step (0.85 + 0.15/20 = 0.8575) so muted shell text holds 3:1
+            // Authored coverage is 0.91 — MonoCode's body composites
+            // `.body-glass` 85% over a 40% wrapper. The renderer may take
+            // one contrast step (0.91 + 0.09/20 = 0.9145) so muted shell
+            // text holds 3:1
             // over a white desktop.
             assert!(
-                (mono_theme.glass().a - 0.85).abs() < 0.01,
+                (mono_theme.glass().a - 0.91).abs() < 0.01,
                 "monocode frost alpha is {}",
                 mono_theme.glass().a
             );
-            assert!(mono_theme.glass().a >= 0.85);
+            assert!(mono_theme.glass().a >= 0.91);
         }
 
         assert_eq!(other.frost_alpha, None);
