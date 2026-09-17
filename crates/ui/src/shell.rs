@@ -166,6 +166,17 @@ impl SidebarDisclosureMotion {
 /// the shared constructor makes left/right seams mirror each other and avoids
 /// relying on paint order when chrome crosses an animated pane boundary.
 const PANE_RESIZE_HITBOX_HALF_WIDTH: f32 = 6.0;
+
+fn compaction_marker(before: u64, after: Option<u64>) -> String {
+    match after.filter(|_| before > 0) {
+        Some(after) => format!(
+            "Context compacted · {} → {}",
+            crate::composer::compact_token_count(before),
+            crate::composer::compact_token_count(after)
+        ),
+        None => "Context compacted.".to_string(),
+    }
+}
 const PANE_RESIZE_HITBOX_TOP: f32 = Theme::TITLEBAR_HEIGHT;
 
 fn stable_panel_content_width(target: f32, transition: Option<(f32, f32)>) -> f32 {
@@ -4340,27 +4351,16 @@ impl Shell {
             return;
         };
         let chat_id = chat_id.to_string();
-        let state = self.state.clone();
-        cx.spawn(async move |_, cx| {
-            // The post-compaction usage rides the settling turn, a beat behind
-            // the Idle edge — reading it immediately would name the old size.
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(800))
-                .await;
-            let after = state.read_with(cx, |state, _| {
-                state
-                    .session_for(&chat_id)
-                    .and_then(|session| session.context_usage)
-                    .map(|usage| usage.tokens)
-            });
-            let text = match after.filter(|after| before > 0 && *after < before) {
-                Some(after) => format!(
-                    "Context compacted · {} → {}",
-                    crate::composer::compact_token_count(before),
-                    crate::composer::compact_token_count(after)
-                ),
-                None => "Context compacted.".to_string(),
-            };
+        // The harness publishes post-command usage before Done. Capture it
+        // now: a delayed read could instead observe the next turn's context.
+        let after = self
+            .state
+            .read(cx)
+            .session_for(&chat_id)
+            .and_then(|session| session.context_usage)
+            .map(|usage| usage.tokens);
+        let text = compaction_marker(before, after);
+        cx.spawn(async move |_, _| {
             let params = serde_json::json!({
                 "op": "noteMarker",
                 "chatId": chat_id,
@@ -6516,7 +6516,13 @@ impl Shell {
         };
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
-        let subline = theme.text_muted.opacity(0.5);
+        // `text_muted` is already the contrast-hardened role: the engine keeps
+        // it at 4.5:1 against the canvas. Multiplying it by an alpha threw
+        // that guarantee away — measured on a live window the subline glyphs
+        // peaked at luminance 110 over a 49 background (2.03:1), which has no
+        // edge for the eye to resolve and reads as blurred text rather than as
+        // quiet text. Use the role as authored.
+        let subline = theme.text_muted;
         let select_id = id.clone();
         let menu_id = id.clone();
         // Hover fades over transition-colors (zeron session-row.tsx) — both
@@ -6615,7 +6621,7 @@ impl Shell {
                                 icon(path)
                                     .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
                                     .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                                    .text_color(tint.unwrap_or(subline)),
                             )
                         },
                     )
@@ -10363,6 +10369,14 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compaction_marker_preserves_increased_and_unchanged_counts() {
+        assert_eq!(super::compaction_marker(16_000, Some(59_000)), "Context compacted · 16k → 59k");
+        assert_eq!(super::compaction_marker(258_000, Some(63_000)), "Context compacted · 258k → 63k");
+        assert_eq!(super::compaction_marker(16_000, Some(16_000)), "Context compacted · 16k → 16k");
+        assert_eq!(super::compaction_marker(16_000, None), "Context compacted.");
+    }
+
     use super::*;
 
     /// Exporting reads memory ONLY for the row that is actually selected. The
