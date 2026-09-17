@@ -37,6 +37,16 @@ pub const VEIL_MIN_FADE_MS: f32 = 120.0;
 pub const VEIL_MAX_FADE_MS: f32 = 400.0;
 /// Dissolve exponent (mugen: `alpha = (1 - p) ** 1.6`).
 pub const VEIL_CURVE_POW: f32 = 1.6;
+/// Lowest alpha the veil ever paints text at.
+///
+/// The upstream curve starts at 0, so an arriving chunk spends the first third
+/// of its fade below readable contrast — `alpha 0.37` at `p = 0.25` lands text
+/// at 3.1:1 over the shell, and the eye reads that as the text sliding in and
+/// out of focus rather than as a settle. Flooring the ramp keeps the arrival
+/// visible while never painting a glyph the reader cannot resolve: at 0.55 the
+/// worst moment of the fade is 5.06:1 over the glass-lifted shell (luminance
+/// 32.6) and 5.30:1 over the flat canvas.
+pub const VEIL_ALPHA_FLOOR: f32 = 0.55;
 /// Gap clamp feeding the EMA (mugen: `min(gap, 1000)`).
 const VEIL_GAP_CLAMP_MS: f32 = 1000.0;
 
@@ -54,9 +64,11 @@ struct Chunk {
 pub type VeilSpan = (Range<usize>, f32);
 
 /// Text alpha for a fade progress `p` (0..1): the veil dissolves as
-/// `(1 − p)^1.6`, so the text shows through at `1 − veil`. Pure.
+/// `(1 − p)^1.6` across the band from [`VEIL_ALPHA_FLOOR`] to 1, so an
+/// arriving chunk is always legible and still visibly settles. Pure.
 pub fn veil_opacity(p: f32) -> f32 {
-    1.0 - (1.0 - p.clamp(0.0, 1.0)).powf(VEIL_CURVE_POW)
+    let dissolved = 1.0 - (1.0 - p.clamp(0.0, 1.0)).powf(VEIL_CURVE_POW);
+    VEIL_ALPHA_FLOOR + (1.0 - VEIL_ALPHA_FLOOR) * dissolved
 }
 
 /// Chunk fade duration for the current inter-append EMA (mugen:
@@ -296,7 +308,7 @@ mod tests {
         let t0 = Instant::now();
         let mut v = ElemVeil::default();
         let spans = v.advance("hello", t0);
-        assert_eq!(spans, vec![(0..5, 0.0)]);
+        assert_eq!(spans, vec![(0..5, VEIL_ALPHA_FLOOR)]);
         // Mid-fade: opacity strictly between 0 and 1, range unchanged.
         let spans = v.advance("hello", at(t0, 250));
         assert_eq!(spans.len(), 1);
@@ -359,12 +371,12 @@ mod tests {
         assert!(!row.is_fading());
         // Appends AFTER the attach fade normally — only the new suffix.
         let spans = row.advance(0, "already streamed text plus", at(t0, 100));
-        assert_eq!(spans, vec![(21..26, 0.0)]);
+        assert_eq!(spans, vec![(21..26, VEIL_ALPHA_FLOOR)]);
         // The attach pass ends after the first render: elements first seen
         // later are newly streamed content and fade from empty.
         row.finish_seeding();
         let spans = row.advance(2, "new block", at(t0, 200));
-        assert_eq!(spans, vec![(0..9, 0.0)]);
+        assert_eq!(spans, vec![(0..9, VEIL_ALPHA_FLOOR)]);
     }
 
     #[test]
@@ -373,7 +385,7 @@ mod tests {
         let t0 = Instant::now();
         let mut row = RowVeil::default();
         let spans = row.advance(0, "fresh", t0);
-        assert_eq!(spans, vec![(0..5, 0.0)]);
+        assert_eq!(spans, vec![(0..5, VEIL_ALPHA_FLOOR)]);
     }
 
     #[test]
@@ -385,7 +397,7 @@ mod tests {
         assert!(v.advance("stable", at(t0, 600)).is_empty());
         // ...then an append veils ONLY the new suffix.
         let spans = v.advance("stable more", at(t0, 700));
-        assert_eq!(spans, vec![(6..11, 0.0)]);
+        assert_eq!(spans, vec![(6..11, VEIL_ALPHA_FLOOR)]);
     }
 
     #[test]
@@ -411,18 +423,23 @@ mod tests {
     }
 
     #[test]
-    fn veil_opacity_curve_endpoints() {
-        // Text alpha = 1 - (1-p)^1.6: 0 at arrival, 1 when the veil is gone.
-        assert_eq!(veil_opacity(0.0), 0.0);
+    fn veil_opacity_never_paints_text_below_the_floor() {
+        // The ramp runs from VEIL_ALPHA_FLOOR to 1, not from 0: an arriving
+        // chunk is legible on frame one and still settles.
+        assert_eq!(veil_opacity(0.0), VEIL_ALPHA_FLOOR);
         assert_eq!(veil_opacity(1.0), 1.0);
+        // The moment that used to be illegible: a quarter into the fade the
+        // upstream curve sat at 0.369 (3.1:1 over the shell); now it is above
+        // 0.7, which clears 4.5:1 with room to spare.
+        assert!(veil_opacity(0.25) > 0.7, "{}", veil_opacity(0.25));
+        // Band shape is preserved: pow-1.6 ease-out, faster than linear early.
         let mid = veil_opacity(0.5);
-        assert!(mid > 0.0 && mid < 1.0);
-        // The pow-1.6 ease-out reveals faster than linear early on.
-        assert!(mid > 0.5);
-        assert!((mid - (1.0 - 0.5f32.powf(1.6))).abs() < 1e-6);
+        let band = 1.0 - VEIL_ALPHA_FLOOR;
+        assert!((mid - (VEIL_ALPHA_FLOOR + band * (1.0 - 0.5f32.powf(1.6)))).abs() < 1e-6);
+        assert!(mid > VEIL_ALPHA_FLOOR + band * 0.5);
         // Monotonic + clamped.
         assert!(veil_opacity(0.2) <= veil_opacity(0.4));
-        assert_eq!(veil_opacity(-1.0), 0.0);
+        assert_eq!(veil_opacity(-1.0), VEIL_ALPHA_FLOOR);
         assert_eq!(veil_opacity(2.0), 1.0);
     }
 
