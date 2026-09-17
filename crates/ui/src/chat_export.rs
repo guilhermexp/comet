@@ -101,8 +101,18 @@ struct ExportMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum ExportPart {
-    Text { text: String },
-    Tool { tool: ExportTool },
+    Text {
+        text: String,
+    },
+    Image {
+        name: String,
+        path: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Tool {
+        tool: ExportTool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -140,6 +150,18 @@ impl ExportDoc {
                 match part {
                     MessagePart::Text { text, .. } => {
                         parts.push(ExportPart::Text { text: text.clone() });
+                    }
+                    MessagePart::Image {
+                        path,
+                        name,
+                        mime_type,
+                        ..
+                    } => {
+                        parts.push(ExportPart::Image {
+                            name: name.clone(),
+                            path: path.clone(),
+                            mime_type: mime_type.clone(),
+                        });
                     }
                     MessagePart::Tool {
                         call,
@@ -329,6 +351,18 @@ pub(crate) fn render_markdown(doc: &ExportDoc) -> String {
                     rendered.push_str(text);
                     rendered.push('\n');
                 }
+                ExportPart::Image {
+                    name,
+                    path,
+                    mime_type,
+                } => {
+                    rendered.push_str(&format!(
+                        "![{}](<{}>) · {}\n",
+                        markdown_link_label(name),
+                        markdown_link_destination(path),
+                        markdown_inline_code(mime_type),
+                    ));
+                }
                 ExportPart::Tool { tool } => {
                     rendered.push_str(&render_markdown_tool(tool));
                 }
@@ -407,6 +441,20 @@ fn markdown_inline_code(text: &str) -> String {
     }
 }
 
+fn markdown_link_label(text: &str) -> String {
+    single_line(text)
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn markdown_link_destination(text: &str) -> String {
+    single_line(text)
+        .replace('\\', "\\\\")
+        .replace('<', "\\<")
+        .replace('>', "\\>")
+}
+
 fn render_markdown_tool(tool: &ExportTool) -> String {
     match tool {
         ExportTool::Exec { command, .. } => {
@@ -446,6 +494,18 @@ pub(crate) fn render_text(doc: &ExportDoc) -> String {
                 ExportPart::Text { text } => {
                     rendered.push_str(text);
                     rendered.push('\n');
+                }
+                ExportPart::Image {
+                    name,
+                    path,
+                    mime_type,
+                } => {
+                    rendered.push_str(&format!(
+                        "[generated image: {}] {} ({})\n",
+                        single_line(name),
+                        single_line(path),
+                        single_line(mime_type),
+                    ));
                 }
                 ExportPart::Tool { tool } => {
                     rendered.push_str(&format!("[used {} tool]\n", tool.label()));
@@ -662,6 +722,33 @@ mod tests {
         assert_eq!(doc.messages[0].id, "m-user");
         assert_eq!(doc.messages[1].id, "m-assistant");
         assert!(doc.artifacts.is_empty());
+    }
+
+    #[test]
+    fn generated_image_export_keeps_metadata_and_escapes_markdown_link() {
+        let mut entry = message("m-assistant", MessageRole::Assistant, "");
+        entry.parts = vec![MessagePart::Image {
+            id: "image-1".to_owned(),
+            path: "/tmp/generated/<image>.png".to_owned(),
+            name: "screen [1].png".to_owned(),
+            mime_type: "image/png".to_owned(),
+        }];
+
+        let doc = ExportDoc::from_transcript(metadata("Images"), &[entry], &[]);
+        let markdown = render_markdown(&doc);
+        assert!(
+            markdown
+                .contains("![screen \\[1\\].png](</tmp/generated/\\<image\\>.png>) · `image/png`")
+        );
+        let text = render_text(&doc);
+        assert!(
+            text.contains(
+                "[generated image: screen [1].png] /tmp/generated/<image>.png (image/png)"
+            )
+        );
+        let json = render_json(&doc).expect("serialize image metadata");
+        assert!(json.contains("\"kind\": \"image\""));
+        assert!(json.contains("\"mimeType\": \"image/png\""));
     }
 
     #[test]

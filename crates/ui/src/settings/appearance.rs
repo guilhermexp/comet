@@ -40,6 +40,7 @@ pub struct AppearancePage {
     import_dialog: Option<ImportDialog>,
     review_entry: Option<String>,
     library_error: Option<SharedString>,
+    font_menu: Option<(bool, Entity<ComposerInput>, Subscription)>,
 }
 
 impl AppearancePage {
@@ -50,7 +51,192 @@ impl AppearancePage {
             import_dialog: None,
             review_entry: None,
             library_error: None,
+            font_menu: None,
         }
+    }
+
+    fn render_font_row(
+        &mut self,
+        terminal: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::typography;
+        let family = if terminal {
+            typography::terminal_requested(cx)
+        } else {
+            typography::code_requested(cx)
+        };
+        let size = if terminal {
+            typography::terminal_font_size(cx)
+        } else {
+            typography::code_font_size(cx)
+        };
+        let slot = if terminal { "terminal" } else { "code" };
+        let mut picker = div().relative().child(
+            div()
+                .id(SharedString::from(format!("{slot}-font")))
+                .relative()
+                .w(px(190.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border)
+                .text_size(px(12.0))
+                .text_color(theme.text)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this
+                        .font_menu
+                        .as_ref()
+                        .is_some_and(|(kind, _, _)| *kind == terminal)
+                    {
+                        this.font_menu = None;
+                    } else {
+                        let input = cx.new(|cx| {
+                            ComposerInput::with_context("Search fonts", "PaletteSearch", cx)
+                        });
+                        let subscription =
+                            cx.subscribe(&input, |_: &mut Self, _, _: &ComposerInputEvent, cx| {
+                                cx.notify();
+                            });
+                        window.focus(&input.focus_handle(cx), cx);
+                        this.font_menu = Some((terminal, input, subscription));
+                    }
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .truncate()
+                        .child(SharedString::from(family.label().to_owned())),
+                ),
+        );
+        if let Some((kind, input, _)) = &self.font_menu
+            && *kind == terminal
+        {
+            let query = input.read(cx).text().to_lowercase();
+            let availability = typography::availability(cx);
+            let choices = if terminal {
+                availability.fixed_width_choices()
+            } else {
+                availability.choices()
+            };
+            let menu = popover::popover_card(theme)
+                .w(px(260.0))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    match event.keystroke.key.as_str() {
+                        "enter" => {
+                            if let Some((terminal, input, _)) = &this.font_menu {
+                                let query = input.read(cx).text().to_lowercase();
+                                let available = typography::availability(cx);
+                                let choices = if *terminal {
+                                    available.fixed_width_choices()
+                                } else {
+                                    available.choices()
+                                };
+                                if let Some(choice) = choices
+                                    .iter()
+                                    .find(|font| font.label().to_lowercase().contains(&query))
+                                {
+                                    if *terminal {
+                                        typography::set_terminal_family(choice.clone(), cx);
+                                    } else {
+                                        typography::set_code_family(choice.clone(), cx);
+                                    }
+                                }
+                            }
+                            this.font_menu = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                        "escape" => {
+                            this.font_menu = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                        _ => {}
+                    }
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.font_menu = None;
+                    cx.notify();
+                }))
+                .child(input.clone())
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{slot}-font-list")))
+                        .max_h(px(260.0))
+                        .overflow_y_scroll()
+                        .children(
+                            choices
+                                .iter()
+                                .filter(|font| font.label().to_lowercase().contains(&query))
+                                .enumerate()
+                                .map(|(index, font)| {
+                                    let choice = font.clone();
+                                    popover::menu_row(
+                                        theme,
+                                        *font == family,
+                                        SharedString::from(format!("{slot}-font-hover-{index}")),
+                                    )
+                                    .id(SharedString::from(format!("{slot}-font-option-{index}")))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if terminal {
+                                            typography::set_terminal_family(choice.clone(), cx);
+                                        } else {
+                                            typography::set_code_family(choice.clone(), cx);
+                                        }
+                                        this.font_menu = None;
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                                    .child(SharedString::from(font.label().to_owned()))
+                                }),
+                        ),
+                );
+            picker = picker.child(popover::anchored_menu_below(
+                SharedString::from(format!("{slot}-fonts")),
+                menu.into_any_element(),
+                None,
+            ));
+        }
+        widgets::card_row(theme, false)
+            .child(div().flex_1().child(widgets::row_title(
+                theme,
+                if terminal {
+                    "Terminal font"
+                } else {
+                    "Code and diff font"
+                },
+            )))
+            .child(picker)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .ml(px(8.0))
+                    .children([-1.0f32, 1.0].into_iter().map(|delta| {
+                        div()
+                            .id(SharedString::from(format!("{slot}-size-{delta}")))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .cursor_pointer()
+                            .text_color(theme.text)
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if terminal {
+                                    typography::set_terminal_font_size(size + delta, cx);
+                                } else {
+                                    typography::set_code_font_size(size + delta, cx);
+                                }
+                                cx.notify();
+                            }))
+                            .child(if delta < 0.0 { "−" } else { "+" })
+                    }))
+                    .child(SharedString::from(format!("{size} px"))),
+            )
+            .into_any_element()
     }
 
     fn open_import(&mut self, cx: &mut Context<Self>) {
@@ -1773,6 +1959,8 @@ impl Render for AppearancePage {
                 )
                 .into_any_element(),
         );
+        settings_rows.push(self.render_font_row(true, &theme, cx));
+        settings_rows.push(self.render_font_row(false, &theme, cx));
         settings_rows.extend(self.render_theme_library_rows(&theme, cx));
         let library_warning = self
             .library_error

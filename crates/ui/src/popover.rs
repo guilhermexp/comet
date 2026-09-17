@@ -304,24 +304,36 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 /// Corner radius of every floating card. The frost wrapper masks its backdrop
 /// blur to the same value, so the two must agree.
 pub const CARD_RADIUS: f32 = 12.0;
+/// Shared spacing between menu rows and the card edge. Keeping this explicit
+/// lets nested menus and the command palette use the same geometry.
+pub const MENU_GAP: f32 = 2.0;
+pub const CARD_INSET: f32 = 4.0;
+pub const MENU_ITEM_RADIUS: f32 = CARD_RADIUS - CARD_INSET;
+pub const PALETTE_ITEM_RADIUS: f32 = 10.0;
+
+/// Shared fill for floating menus, palettes, and dialogs. Frosted surfaces
+/// use the same thinned tint as the composer so backdrop blur remains visible;
+/// opaque themes use the input glass role as their raised overlay.
+pub fn surface_bg(theme: &Theme) -> gpui::Hsla {
+    if theme.is_frost() {
+        theme.composer_glass_bg()
+    } else {
+        theme.input_glass_bg()
+    }
+}
 
 pub fn popover_card(theme: &Theme) -> gpui::Div {
-    let card = div()
+    div()
         .border_1()
-        .border_color(hairline(0.10))
+        .border_color(theme.border)
         .rounded(px(CARD_RADIUS))
-        .shadow_lg()
-        .p(px(4.0))
+        .when(!theme.is_frost(), |el| el.shadow_lg())
+        .bg(surface_bg(theme))
+        .p(px(CARD_INSET))
+        .gap(px(MENU_GAP))
         .overflow_hidden()
         .text_size(px(13.0))
-        .text_color(theme.text);
-    if theme.is_frost() {
-        // Translucent tint — the backdrop blur beneath it comes from the
-        // [`crate::frost::frosted`] wrapper at the mount helpers below.
-        card.bg(theme.glass_overlay())
-    } else {
-        card.bg(theme.surface_overlay)
-    }
+        .text_color(theme.text)
 }
 
 /// [`popover_card`] without the `p-1` inset — for popovers that manage their
@@ -457,6 +469,36 @@ pub fn anchored_menu_below_end(
             )
             .priority(1)
             .into_any_element(),
+        )
+        .into_any_element()
+}
+
+/// A nested menu beside its trigger. The caller selects the side with room;
+/// the anchored layer remains within the window margin and participates in
+/// the same frost/occlusion lifecycle as ordinary menus.
+pub fn nested_menu(id: impl Into<SharedString>, content: AnyElement, left: bool) -> AnyElement {
+    // The child shares the parent's interaction surface; its trigger and
+    // siblings handle dismissal while the top-level picker owns outside clicks.
+    let content =
+        crate::frost::frosted(CARD_RADIUS, crate::frost::MENU_BLUR, content).into_any_element();
+    div()
+        .absolute()
+        .top_0()
+        .size_0()
+        .when(left, |el| el.left(px(-(CARD_INSET + 6.0))))
+        .when(!left, |el| el.right(px(-(CARD_INSET + 6.0))))
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(if left {
+                        Anchor::TopRight
+                    } else {
+                        Anchor::TopLeft
+                    })
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_motion(id.into(), None, div().occlude().child(content))),
+            )
+            .priority(2),
         )
         .into_any_element()
 }
@@ -699,7 +741,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .gap(px(10.0))
         .px(px(8.0))
         .py(px(6.0))
-        .rounded(px(8.0))
+        .rounded(px(MENU_ITEM_RADIUS))
         .text_size(px(13.0))
         .cursor_pointer();
     if active {
@@ -780,7 +822,11 @@ pub fn tracked_upper(label: &str) -> String {
 pub fn menu_separator() -> gpui::Div {
     // Full-bleed: negative margins cancel the card's p-1 inset so the hairline
     // runs border to border (user request).
-    div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(hairline(0.07))
+    div()
+        .h(px(1.0))
+        .mx(px(-CARD_INSET))
+        .my(px(MENU_GAP))
+        .bg(hairline(0.07))
 }
 
 /// The recessed band tone for a palette/picker header or footer strip — a
@@ -804,16 +850,31 @@ pub fn palette_card(theme: &Theme, width: Pixels, corner_radius: f32) -> gpui::D
         .rounded(px(corner_radius))
         .border_1()
         .border_color(hairline(0.10))
-        .bg(if theme.is_frost() {
-            theme.glass_overlay()
-        } else {
-            theme.surface_overlay
-        })
+        .bg(surface_bg(theme))
         .shadow_lg()
         .overflow_hidden()
         .flex()
         .flex_col()
         .text_color(theme.text)
+}
+
+/// A compact magnifier slot used by command/search palettes. The stable
+/// 20px box keeps the icon optically centered as the header resizes.
+pub fn palette_search_icon(theme: &Theme) -> gpui::Div {
+    div()
+        .size(px(20.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            crate::icons::icon(crate::icons::MAGNIFER)
+                .size(px(16.0))
+                .relative()
+                .left(px(0.5))
+                .top(px(0.5))
+                .text_color(theme.text_muted),
+        )
 }
 
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
@@ -950,6 +1011,131 @@ pub fn menu_section() -> gpui::Div {
         .gap(px(2.0))
 }
 
+/// Render query matches with the same compact rounded wash used by composer
+/// mentions. This is paint-only: the original text and row geometry remain
+/// unchanged while palette results become scannable.
+pub(crate) fn search_highlight(
+    text: SharedString,
+    query: Option<&str>,
+    theme: &Theme,
+) -> AnyElement {
+    let Some(query) = query.filter(|query| !query.trim().is_empty()) else {
+        return text.into_any_element();
+    };
+    let ranges = search_match_ranges(&text, query);
+    if ranges.is_empty() {
+        return text.into_any_element();
+    }
+    let styled = gpui::StyledText::new(text).with_highlights(ranges.iter().cloned().map(|range| {
+        (
+            range,
+            gpui::HighlightStyle {
+                color: Some(theme.code_text),
+                ..Default::default()
+            },
+        )
+    }));
+    let layout = styled.layout().clone();
+    let wash = theme.code_wash;
+    let underlay = gpui::canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            for range in &ranges {
+                for mut bounds in crate::markdown::render::range_rects(&layout, range, 1.0, 1.5) {
+                    bounds.origin.y += px(0.5);
+                    window.paint_quad(gpui::quad(
+                        bounds,
+                        px(3.0),
+                        wash,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        gpui::BorderStyle::default(),
+                    ));
+                }
+            }
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .child(underlay)
+        .child(styled)
+        .into_any_element()
+}
+
+fn search_match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let folded = text.to_lowercase();
+    let mut original = Vec::with_capacity(folded.len());
+    for (start, ch) in text.char_indices() {
+        let range = start..start + ch.len_utf8();
+        for lower in ch.to_lowercase() {
+            original.extend(std::iter::repeat_n(range.clone(), lower.len_utf8()));
+        }
+    }
+    let mut ranges = Vec::new();
+    for word in query.to_lowercase().split_whitespace() {
+        for (start, _) in folded.match_indices(word) {
+            let Some(first) = original.get(start) else {
+                continue;
+            };
+            let Some(last) = original.get(start + word.len().saturating_sub(1)) else {
+                continue;
+            };
+            ranges.push(first.start..last.end);
+        }
+    }
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+#[cfg(test)]
+mod search_highlight_tests {
+    use super::search_match_ranges;
+
+    #[test]
+    fn inline_matches_keep_adjacent_word_boundaries() {
+        let text = "fieldnotes/fix-authentication-redirects";
+        let ranges = search_match_ranges(text, "authentication");
+        assert_eq!(&text[..ranges[0].start], "fieldnotes/fix-");
+        assert_eq!(&text[ranges[0].clone()], "authentication");
+        assert_eq!(&text[ranges[0].end..], "-redirects");
+    }
+
+    #[test]
+    fn highlights_repeated_case_insensitive_and_overlapping_words() {
+        assert_eq!(
+            search_match_ranges("New chat, new project", "NEW"),
+            vec![0..3, 10..13]
+        );
+        assert_eq!(
+            search_match_ranges("authentication", "auth authentication"),
+            vec![0..14]
+        );
+        assert!(search_match_ranges("New chat", "  ").is_empty());
+        assert!(search_match_ranges("New chat", "settings").is_empty());
+    }
+
+    #[test]
+    fn preserves_original_unicode_boundaries_after_lowercase_expansion() {
+        assert_eq!(
+            search_match_ranges("İstanbul café", "i CAFÉ"),
+            vec![0..2, 10..15]
+        );
+        assert_eq!(search_match_ranges("🚀 CAFÉ", "café"), vec![5..10]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dialog primitives (zeron dialog.tsx / sidebar dialogs.tsx)
 // ---------------------------------------------------------------------------
@@ -961,10 +1147,10 @@ pub fn dialog_card(theme: &Theme) -> gpui::Div {
         .w(px(360.0))
         .p(px(20.0))
         .rounded(px(16.0))
-        .bg(theme.surface_dialog)
+        .bg(surface_bg(theme))
         .border_1()
         .border_color(hairline(0.10))
-        .shadow_lg()
+        .when(!theme.is_frost(), |el| el.shadow_lg())
         .flex()
         .flex_col()
         .text_color(theme.text)

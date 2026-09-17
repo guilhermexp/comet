@@ -231,7 +231,25 @@ struct RenderToolCall: Hashable {
     var string: (String) -> String? { { key in self.fields[key] as? String } }
 }
 
+/// Durable metadata for a model-generated raster. The bytes stay on the
+/// message owner's device and are fetched through the attachment relay.
+struct GeneratedImageReference: Hashable {
+    var path: String
+    var name: String
+    var mimeType: String
+
+    static let supportedMimeTypes: Set<String> = [
+        "image/png", "image/jpeg", "image/webp", "image/gif",
+    ]
+
+    var isValid: Bool {
+        path.hasPrefix("/") && !path.contains("\0") && !name.isEmpty
+            && Self.supportedMimeTypes.contains(mimeType)
+    }
+}
+
 enum MessagePart: Hashable, Identifiable {
+    case image(id: String, reference: GeneratedImageReference)
     case text(id: String, text: String)
     case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
@@ -239,7 +257,7 @@ enum MessagePart: Hashable, Identifiable {
 
     var id: String {
         switch self {
-        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
+        case .text(let id, _), .image(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
             return id
         }
     }
@@ -328,7 +346,7 @@ struct RunRequest: Codable {
     /// (UploadChunk/UploadCommit) — or `pending://{uploadId}/{name}` refs on
     /// the queued flow (host ≥ 0.2.12), which the host resolves to absolute
     /// paths once the bytes land. The same refs ride the prompt text as
-    /// `Attached images (local files …)` lines — this field additionally lets
+    /// `Attached files (local files …)` lines — this field additionally lets
     /// a harness inline the bytes as image content blocks.
     var attachments: [String] = []
     /// Worktree for the host to materialize at drain time (PR #159). Omitted

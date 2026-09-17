@@ -247,6 +247,7 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     turn_listener: OnceLock<TurnListener>,
     live_voice: LiveVoiceCoordinator,
     trajectory: Mutex<Option<Arc<TrajectoryStore>>>,
@@ -316,6 +317,7 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
+                generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 live_voice: LiveVoiceCoordinator::new(),
                 trajectory: Mutex::new(None),
@@ -410,6 +412,15 @@ impl SessionsEngine {
     /// already treats a missing doc host as "not wired".
     pub fn clear_doc_host(&self) {
         lock(&self.inner.doc_host).take();
+    }
+
+    /// Bind generated-image intake to the same profile store used by attachment RPCs.
+    pub fn set_generated_images(
+        &self,
+        uploads: crate::uploads::Uploads,
+        allowed_root: std::path::PathBuf,
+    ) {
+        let _ = self.inner.generated_images.set((uploads, allowed_root));
     }
 
     /// Wire the chat auto-titler (called once at engine assembly). After each
@@ -1535,6 +1546,85 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    /// Sanitize before ANY journal/publish path, including nested subagent events.
+    async fn prepare_generated_image(
+        &self,
+        chat_id: &str,
+        event: AgentEvent,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Vec<AgentEvent> {
+        let mut parents = Vec::new();
+        let mut leaf = event;
+        while let AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } = leaf
+        {
+            parents.push(parent_tool_use_id);
+            leaf = *event;
+        }
+        let events = if let AgentEvent::GeneratedImage { id, path, .. } = leaf {
+            let key = generated_image_scope_key(chat_id, &parents, &id);
+            if seen.contains(&key) {
+                return vec![];
+            }
+            let result = if let Some((uploads, allowed_root)) = self.generated_images.get() {
+                let uploads = uploads.clone();
+                let root = allowed_root.clone();
+                let stable_key = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    uploads.import_generated_image(std::path::Path::new(&path), &root, &stable_key)
+                })
+                .await
+                .unwrap_or_else(|err| Err(EngineError::Other(err.to_string())))
+            } else {
+                Err(EngineError::Other(
+                    "Generated image intake is not configured".into(),
+                ))
+            };
+            match result {
+                Ok(image) => {
+                    seen.insert(key);
+                    vec![AgentEvent::GeneratedImage {
+                        id,
+                        path: image.path,
+                        name: image.name,
+                        mime_type: image.mime_type,
+                    }]
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "generated image import failed");
+                    vec![
+                        AgentEvent::ToolResult {
+                            id: id.strip_suffix(":image").unwrap_or(&id).into(),
+                            execution: None,
+                            is_error: true,
+                            output: None,
+                            diff: None,
+                        },
+                        AgentEvent::Error {
+                            message: "Generated image unavailable".into(),
+                        },
+                    ]
+                }
+            }
+        } else {
+            vec![leaf]
+        };
+        events
+            .into_iter()
+            .map(|mut event| {
+                for parent in parents.iter().rev() {
+                    event = AgentEvent::Subagent {
+                        parent_tool_use_id: parent.clone(),
+                        event: Box::new(event),
+                    };
+                }
+                event
+            })
+            .collect()
+    }
+
     /// Persist durable events and broadcast every event. File previews stay
     /// live-only; their later authoritative ToolCall is journaled in full.
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
@@ -2226,6 +2316,7 @@ fn trajectory_event_projects(event: &AgentEvent) -> bool {
         | AgentEvent::UserMessage { .. } => true,
         AgentEvent::Subagent { event, .. } => trajectory_event_projects(event),
         AgentEvent::TextDelta { .. }
+        | AgentEvent::GeneratedImage { .. }
         | AgentEvent::ReasoningDelta { .. }
         | AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::ToolCallPreview { .. } => false,
@@ -2502,6 +2593,127 @@ fn folded_text(parts: &[MessagePart]) -> String {
         .join("\n")
 }
 
+const MAX_PERSISTED_SUBAGENT_DOCS: usize = 256;
+const MAX_PERSISTED_SUBAGENT_DEPTH: usize = 32;
+
+fn generated_image_scope_key(chat_id: &str, parents: &[String], image_id: &str) -> String {
+    std::iter::once(chat_id)
+        .chain(parents.iter().map(String::as_str))
+        .chain(std::iter::once(image_id))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+/// Seed replay deduplication from the durable parent and subagent transcripts.
+///
+/// A generated image in a child doc is already materialized and must remain
+/// valid when the source path has disappeared after a restart. Follow only
+/// engine-generated spawn refs, cap the graph, and use doc ids as cycle guards;
+/// synced arbitrary refs must never become an unbounded doc-open primitive.
+fn seed_persisted_generated_images(
+    chat_id: &str,
+    root_doc: Arc<SessionDoc>,
+    host: Option<&DocHost>,
+    seen_images: &mut HashSet<String>,
+    seen_tools: &mut HashSet<String>,
+) {
+    let mut pending = vec![(
+        chat_id.to_owned(),
+        root_doc,
+        Vec::<String>::new(),
+        0usize,
+        true,
+    )];
+    let mut visited = HashSet::from([chat_id.to_owned()]);
+    let mut visited_docs = 0usize;
+
+    while let Some((doc_id, doc, parents, depth, is_root)) = pending.pop() {
+        if visited_docs >= MAX_PERSISTED_SUBAGENT_DOCS {
+            tracing::warn!(
+                chat = %chat_id,
+                limit = MAX_PERSISTED_SUBAGENT_DOCS,
+                "stopping persisted subagent image replay walk at document limit"
+            );
+            break;
+        }
+        visited_docs += 1;
+        let Ok(entries) = doc.read_entries() else {
+            tracing::warn!(chat = %chat_id, doc = %doc_id, "persisted subagent image seed read failed");
+            continue;
+        };
+        for entry in entries {
+            for part in &entry.parts {
+                match part {
+                    MessagePart::Image { id, .. } => {
+                        seen_images.insert(generated_image_scope_key(chat_id, &parents, id));
+                        if is_root && let Some(tool_id) = id.strip_suffix(":image") {
+                            seen_tools.insert(tool_id.to_owned());
+                        }
+                    }
+                    MessagePart::Tool {
+                        id,
+                        call,
+                        subagent_ref: Some(child_id),
+                        ..
+                    } if call.is_subagent_spawn() => {
+                        let Some(host) = host else { continue };
+                        if depth >= MAX_PERSISTED_SUBAGENT_DEPTH {
+                            tracing::warn!(
+                                chat = %chat_id,
+                                doc = %doc_id,
+                                depth,
+                                "stopping persisted subagent image walk at depth limit"
+                            );
+                            continue;
+                        }
+                        let expected = subagent_doc_id(chat_id, id);
+                        if child_id != &expected {
+                            continue;
+                        }
+                        if visited.len() >= MAX_PERSISTED_SUBAGENT_DOCS {
+                            tracing::warn!(
+                                chat = %chat_id,
+                                limit = MAX_PERSISTED_SUBAGENT_DOCS,
+                                "stopping persisted subagent image walk before opening another doc"
+                            );
+                            continue;
+                        }
+                        if !visited.insert(expected.clone()) {
+                            continue;
+                        }
+                        let child = match host.read_local_doc(&expected) {
+                            Ok(Some(child)) => child,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    chat = %chat_id,
+                                    doc = %doc_id,
+                                    child = %expected,
+                                    "persisted subagent image child doc unavailable"
+                                );
+                                continue;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    chat = %chat_id,
+                                    doc = %doc_id,
+                                    child = %expected,
+                                    error = %err,
+                                    "persisted subagent image child doc read failed"
+                                );
+                                continue;
+                            }
+                        };
+                        let mut child_parents = parents.clone();
+                        child_parents.push(id.clone());
+                        pending.push((expected, child, child_parents, depth + 1, false));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 fn sync_segment<'a>(
     doc: &'a SessionDoc,
     writer: &mut Option<SegmentWriter<'a>>,
@@ -2628,6 +2840,15 @@ async fn drive_run(
     // folding the echo would mint an orphan chip mid-text in the NEXT
     // segment — the mid-word transcript splits.
     let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_images = std::collections::HashSet::new();
+    seed_persisted_generated_images(
+        &chat_id,
+        doc.clone(),
+        inner.doc_host().as_ref(),
+        &mut seen_images,
+        &mut seen_tools,
+    );
+    let mut prepared_events = std::collections::VecDeque::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -2724,160 +2945,171 @@ async fn drive_run(
 
     let mut final_completed_turn = None;
     let (final_status, final_error) = loop {
-        let mut event: AgentEvent = tokio::select! {
-            biased;
-            changed = cancel_rx.changed(), if !interrupted => {
-                let _ = changed;
-                interrupted = true;
-                interrupt_deadline = Some(
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(3),
-                );
-                continue;
-            }
-            _ = tokio::time::sleep_until(
-                interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
-            ), if interrupt_deadline.is_some() => AgentEvent::Done {
-                status: DoneStatus::Interrupted,
-                result: None,
-                error: None,
-                session_id: None,
-            },
-            _ = live_heartbeat.tick() => {
-                inner.touch_session(&chat_id);
-                continue;
-            }
-            // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
-            // nobody returned to in 30 minutes releases its child. The turn
-            // was finalized at Done, so this end is clean — no aborted stamp.
-            _ = tokio::time::sleep_until(
-                idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
-            ), if idle_since.is_some() => {
-                tracing::info!(chat = %chat_id, "reaping idle persistent session");
-                if let Some(token) = lock(&inner.runs)
-                    .get(&chat_id)
-                    .filter(|h| h.run_id == run_id)
-                    .map(|h| h.interrupt_token.clone())
-                {
-                    token.cancel();
+        let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+            event
+        } else {
+            let event: AgentEvent = tokio::select! {
+                biased;
+                changed = cancel_rx.changed(), if !interrupted => {
+                    let _ = changed;
+                    interrupted = true;
+                    interrupt_deadline = Some(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                    );
+                    continue;
                 }
-                break (SessionStatus::Idle, None);
-            }
-            Some(event) = engine_rx.recv() => event,
-            next = stream.next() => match next {
-                Some(Ok(event)) => event,
-                // A stream error while PARKED is a post-turn child death —
-                // the turn was already finalized, so the run ends clean
-                // instead of stamping a completed session Errored.
-                Some(Err(err)) if idle_since.is_some() => {
-                    tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
-                    break (SessionStatus::Idle, None);
-                }
-                Some(Err(err)) => AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(err.to_string()),
-                    session_id: None,
-                },
-                None if interrupted => AgentEvent::Done {
+                _ = tokio::time::sleep_until(
+                    interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if interrupt_deadline.is_some() => AgentEvent::Done {
                     status: DoneStatus::Interrupted,
                     result: None,
                     error: None,
                     session_id: None,
                 },
-                // Stream end while PARKED idle: a per-turn adapter closing
-                // after its final Done — a clean end, not a crash (the turn
-                // was already finalized). Persistent adapters keep the
-                // stream open and never hit this.
-                None if idle_since.is_some() => break (SessionStatus::Idle, None),
-                None => AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some("harness stream ended without Done".into()),
-                    session_id: None,
+                _ = live_heartbeat.tick() => {
+                    inner.touch_session(&chat_id);
+                    continue;
+                }
+                // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
+                // nobody returned to in 30 minutes releases its child. The turn
+                // was finalized at Done, so this end is clean — no aborted stamp.
+                _ = tokio::time::sleep_until(
+                    idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
+                ), if idle_since.is_some() => {
+                    tracing::info!(chat = %chat_id, "reaping idle persistent session");
+                    if let Some(token) = lock(&inner.runs)
+                        .get(&chat_id)
+                        .filter(|h| h.run_id == run_id)
+                        .map(|h| h.interrupt_token.clone())
+                    {
+                        token.cancel();
+                    }
+                    break (SessionStatus::Idle, None);
+                }
+                Some(event) = engine_rx.recv() => event,
+                next = stream.next() => match next {
+                    Some(Ok(event)) => event,
+                    // A stream error while PARKED is a post-turn child death —
+                    // the turn was already finalized, so the run ends clean
+                    // instead of stamping a completed session Errored.
+                    Some(Err(err)) if idle_since.is_some() => {
+                        tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
+                        break (SessionStatus::Idle, None);
+                    }
+                    Some(Err(err)) => AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(err.to_string()),
+                        session_id: None,
+                    },
+                    None if interrupted => AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                    // Stream end while PARKED idle: a per-turn adapter closing
+                    // after its final Done — a clean end, not a crash (the turn
+                    // was already finalized). Persistent adapters keep the
+                    // stream open and never hit this.
+                    None if idle_since.is_some() => break (SessionStatus::Idle, None),
+                    None => AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some("harness stream ended without Done".into()),
+                        session_id: None,
+                    },
                 },
-            },
-            _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
-                // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
-                // (parent + any dirty subagent docs).
-                if dirty {
-                    if let Err(err) = sync_segment(
-                        doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
-                    ) {
-                        tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
+                    // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
+                    // (parent + any dirty subagent docs).
+                    if dirty {
+                        if let Err(err) = sync_segment(
+                            doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                        }
+                        dirty = false;
                     }
+                    for sink in subagents.values_mut() {
+                        sink.flush(&device_id);
+                    }
+                    continue;
+                }
+                // Turn-quiesce watchdog (see the knob above). Armed only when the
+                // fold says nothing is in flight: an unresolved tool part is a
+                // command still running (legitimately silent for minutes — the
+                // rejected stall-timeout case), an unresolved input part is a
+                // question awaiting the user. The live-plan chip is exempt from
+                // the tool check: it is a singleton that never resolves. An EMPTY
+                // fold still arms — a Steered boundary that no output ever
+                // follows is one of the wedge shapes — it just parks without
+                // writing a segment (an empty finalize would leave a stub entry).
+                _ = tokio::time::sleep_until({
+                    let mut window = quiesce_after.unwrap_or_default();
+                    if self_continued_turn && let Some(short) = self_quiesce_after {
+                        window = window.min(short);
+                    }
+                    last_stream_activity + window
+                }), if quiesce_after.is_some()
+                    && (self_continued_turn || !authoritative_prompt_end)
+                    && idle_since.is_none()
+                    && !interrupted
+                    && steerable
+                    && !folded.iter().any(|p| match p {
+                        MessagePart::Tool { id, resolved: false, .. } => {
+                            id != zeron_proto::LIVE_PLAN_TOOL_ID
+                        }
+                        MessagePart::Input { resolved: false, .. } => true,
+                        _ => false,
+                    }) =>
+                {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
+                        "turn quiesced: stream silent after completed output with no \
+                         turn-end; parking (suspected missing harness Done)"
+                    );
+                    // Some adapters close a completed response through this
+                    // engine watchdog instead of a native Done. Preserve that
+                    // completion notice, but never notify for an empty boundary
+                    // or while an accepted steer still awaits delivery.
+                    let completed_turn = ((!folded.is_empty() || writer.is_some())
+                        && !inner.has_pending_steers(&chat_id, &run_id))
+                        .then(|| entry_id.clone());
+                    if !folded.is_empty() || writer.is_some() {
+                        if let Err(err) = finish_segment(
+                            doc_ref,
+                            writer.take(),
+                            &entry_id,
+                            &device_id,
+                            segment_started,
+                            &folded,
+                            MessageStatus::Complete,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
+                        }
+                        inner.note_message(&chat_id, &folded_text(&folded));
+                    }
+                    folded.clear();
                     dirty = false;
+                    entry_id = new_id();
+                    segment_started = now_ms();
+                    idle_since = Some(tokio::time::Instant::now());
+                    self_continued_turn = false;
+                    inner.set_status_with_completion(
+                        &chat_id, SessionStatus::Idle, false, completed_turn,
+                    );
+                    continue;
                 }
-                for sink in subagents.values_mut() {
-                    sink.flush(&device_id);
-                }
-                continue;
-            }
-            // Turn-quiesce watchdog (see the knob above). Armed only when the
-            // fold says nothing is in flight: an unresolved tool part is a
-            // command still running (legitimately silent for minutes — the
-            // rejected stall-timeout case), an unresolved input part is a
-            // question awaiting the user. The live-plan chip is exempt from
-            // the tool check: it is a singleton that never resolves. An EMPTY
-            // fold still arms — a Steered boundary that no output ever
-            // follows is one of the wedge shapes — it just parks without
-            // writing a segment (an empty finalize would leave a stub entry).
-            _ = tokio::time::sleep_until({
-                let mut window = quiesce_after.unwrap_or_default();
-                if self_continued_turn && let Some(short) = self_quiesce_after {
-                    window = window.min(short);
-                }
-                last_stream_activity + window
-            }), if quiesce_after.is_some()
-                && (self_continued_turn || !authoritative_prompt_end)
-                && idle_since.is_none()
-                && !interrupted
-                && steerable
-                && !folded.iter().any(|p| match p {
-                    MessagePart::Tool { id, resolved: false, .. } => {
-                        id != zeron_proto::LIVE_PLAN_TOOL_ID
-                    }
-                    MessagePart::Input { resolved: false, .. } => true,
-                    _ => false,
-                }) =>
-            {
-                tracing::warn!(
-                    chat = %chat_id,
-                    quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
-                    "turn quiesced: stream silent after completed output with no \
-                     turn-end; parking (suspected missing harness Done)"
-                );
-                // Some adapters close a completed response through this
-                // engine watchdog instead of a native Done. Preserve that
-                // completion notice, but never notify for an empty boundary
-                // or while an accepted steer still awaits delivery.
-                let completed_turn = ((!folded.is_empty() || writer.is_some())
-                    && !inner.has_pending_steers(&chat_id, &run_id))
-                    .then(|| entry_id.clone());
-                if !folded.is_empty() || writer.is_some() {
-                    if let Err(err) = finish_segment(
-                        doc_ref,
-                        writer.take(),
-                        &entry_id,
-                        &device_id,
-                        segment_started,
-                        &folded,
-                        MessageStatus::Complete,
-                    ) {
-                        tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
-                    }
-                    inner.note_message(&chat_id, &folded_text(&folded));
-                }
-                folded.clear();
-                dirty = false;
-                entry_id = new_id();
-                segment_started = now_ms();
-                idle_since = Some(tokio::time::Instant::now());
-                self_continued_turn = false;
-                inner.set_status_with_completion(
-                    &chat_id, SessionStatus::Idle, false, completed_turn,
-                );
-                continue;
-            }
+            };
+            let mut events = inner
+                .prepare_generated_image(&chat_id, event, &mut seen_images)
+                .await
+                .into_iter();
+            let Some(event) = events.next() else { continue };
+            prepared_events.extend(events);
+            event
         };
 
         // ── subagent routing ───────────────────────────────────────────
@@ -3531,15 +3763,17 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     use super::{
-        HarnessRegistry, PendingInput, RunJournal, RuntimeConfig, SessionsEngine, SubagentSink,
-        apply_context_usage_to_session, apply_run_error_to_session, finish_segment,
-        resolve_pending_question, segment_duration_ms, should_journal_event, subagent_doc_id,
-        workflow_tasks_from_entries,
+        DocHost, HarnessRegistry, PendingInput, RunJournal, RuntimeConfig, SessionsEngine,
+        SubagentSink, apply_context_usage_to_session, apply_run_error_to_session, finish_segment,
+        resolve_pending_question, seed_persisted_generated_images, segment_duration_ms,
+        should_journal_event, subagent_doc_id, workflow_tasks_from_entries,
     };
+    use crate::doc_host::DocHostConfig;
+    use crate::new_id;
     use crate::trajectory_store::TrajectoryStore;
     use chrono::Utc;
     use tokio::sync::oneshot;
@@ -3549,6 +3783,236 @@ mod tests {
         AgentEvent, ContextUsage, DoneStatus, HarnessId, RunRequest, SandboxLevel, Session,
         SessionStatus, ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate,
     };
+    use zeron_sync::DocsStore;
+    #[tokio::test]
+    async fn generated_image_nested_intake_preserves_parent_scope_and_sanitizes_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("generated");
+        std::fs::create_dir(&source_root).unwrap();
+        let source = source_root.join("raw.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let engine = SessionsEngine::new(
+            "device".into(),
+            Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+        engine.set_generated_images(uploads.clone(), source_root);
+        let event = |parent: &str, path: String| AgentEvent::Subagent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(AgentEvent::GeneratedImage {
+                id: "same:image".into(),
+                path,
+                name: "untrusted".into(),
+                mime_type: "untrusted".into(),
+            }),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let first = engine
+            .inner
+            .prepare_generated_image(
+                "chat",
+                event("one", source.to_string_lossy().into_owned()),
+                &mut seen,
+            )
+            .await;
+        let second = engine
+            .inner
+            .prepare_generated_image(
+                "chat",
+                event("two", source.to_string_lossy().into_owned()),
+                &mut seen,
+            )
+            .await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            first, second,
+            "same image id from different children has separate ownership"
+        );
+        let AgentEvent::Subagent {
+            parent_tool_use_id,
+            event: leaf,
+        } = &first[0]
+        else {
+            panic!("parent lost")
+        };
+        assert_eq!(parent_tool_use_id, "one");
+        let AgentEvent::GeneratedImage {
+            path,
+            name,
+            mime_type,
+            ..
+        } = leaf.as_ref()
+        else {
+            panic!("image lost")
+        };
+        assert!(std::path::Path::new(path).starts_with(uploads.dir().canonicalize().unwrap()));
+        assert_eq!(name, "generated.png");
+        assert_eq!(mime_type, "image/png");
+        std::fs::remove_file(&source).unwrap();
+        assert!(
+            engine
+                .inner
+                .prepare_generated_image(
+                    "chat",
+                    event("one", source.to_string_lossy().into_owned()),
+                    &mut seen
+                )
+                .await
+                .is_empty()
+        );
+        let rejected = engine
+            .inner
+            .prepare_generated_image(
+                "chat",
+                event("three", source.to_string_lossy().into_owned()),
+                &mut seen,
+            )
+            .await;
+        assert_eq!(rejected.len(), 2);
+        assert!(
+            !serde_json::to_string(&rejected)
+                .unwrap()
+                .contains("raw.png")
+        );
+        assert!(
+            matches!(&rejected[0], AgentEvent::Subagent { event, .. } if matches!(event.as_ref(), AgentEvent::ToolResult { is_error: true, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_nested_image_replay_skips_removed_source_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = dir.path().join("docs");
+        let source_root = dir.path().join("generated");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("raw.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+
+        let chat = "chat-replay";
+        let outer = "spawn-outer";
+        let inner = "spawn-inner";
+        let outer_doc = subagent_doc_id(chat, outer);
+        let inner_doc = subagent_doc_id(chat, inner);
+        let image_id = "generated-1:image";
+        let entry = |parts| SessionMessageEntry {
+            id: new_id(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 1,
+            device_id: "device".into(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        };
+        let spawn = |id: &str, child: &str| MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: format!("Agent: {id}"),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: Some(child.into()),
+            subagent_status: None,
+            subagent_tail: None,
+        };
+
+        {
+            let store = Arc::new(DocsStore::open(&docs_root).unwrap());
+            let host = DocHost::new(
+                store,
+                DocHostConfig {
+                    device_id: "device".into(),
+                    default_harness: HarnessId::Mock,
+                    edge: None,
+                },
+            );
+            host.open(chat)
+                .unwrap()
+                .doc()
+                .push_message(&entry(vec![spawn(outer, &outer_doc)]))
+                .unwrap();
+            host.open(&outer_doc)
+                .unwrap()
+                .doc()
+                .push_message(&entry(vec![
+                    spawn(inner, &inner_doc),
+                    spawn(outer, &outer_doc),
+                ]))
+                .unwrap();
+            host.open(&inner_doc)
+                .unwrap()
+                .doc()
+                .push_message(&entry(vec![MessagePart::Image {
+                    id: image_id.into(),
+                    path: source.to_string_lossy().into_owned(),
+                    name: "generated.png".into(),
+                    mime_type: "image/png".into(),
+                }]))
+                .unwrap();
+            host.flush_all();
+            host.shutdown_workers().await;
+        }
+
+        std::fs::remove_file(&source).unwrap();
+
+        let store = Arc::new(DocsStore::open(&docs_root).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let root = host.open(chat).unwrap().doc_arc();
+        let engine = SessionsEngine::new(
+            "device".into(),
+            Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        engine.set_doc_host(host.clone());
+        engine.set_generated_images(
+            crate::uploads::Uploads::from_root(&dir.path().join("uploads")),
+            source_root,
+        );
+        let mut seen_images = HashSet::new();
+        let mut seen_tools = HashSet::new();
+        seed_persisted_generated_images(chat, root, Some(&host), &mut seen_images, &mut seen_tools);
+        assert!(seen_images.contains(&format!("{chat}\0{outer}\0{inner}\0{image_id}")));
+        let replay = AgentEvent::Subagent {
+            parent_tool_use_id: outer.into(),
+            event: Box::new(AgentEvent::Subagent {
+                parent_tool_use_id: inner.into(),
+                event: Box::new(AgentEvent::GeneratedImage {
+                    id: image_id.into(),
+                    path: source.to_string_lossy().into_owned(),
+                    name: "untrusted.png".into(),
+                    mime_type: "application/octet-stream".into(),
+                }),
+            }),
+        };
+        assert!(
+            engine
+                .inner
+                .prepare_generated_image(chat, replay, &mut seen_images)
+                .await
+                .is_empty(),
+            "persisted nested image must not require its deleted source"
+        );
+        host.shutdown_workers().await;
+    }
+
     #[test]
     fn journal_policy_skips_transient_preview_but_keeps_authoritative_file_call() {
         let dir = tempfile::tempdir().unwrap();

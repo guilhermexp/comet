@@ -1138,11 +1138,9 @@ impl TerminalPanel {
             geometry.cols as usize,
             geometry.rows as usize,
         );
-        let steps = self.scroll_gesture.steps(
-            event.delta,
-            event.touch_phase,
-            px(super::view::TERM_LINE_HEIGHT),
-        );
+        let steps = self
+            .scroll_gesture
+            .steps(event.delta, event.touch_phase, px(geometry.line_h));
         if steps == 0 {
             return;
         }

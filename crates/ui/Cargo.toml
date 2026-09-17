@@ -46,6 +46,9 @@ sha2.workspace = true
 ignore.workspace = true
 notify.workspace = true
 calamine = "0.36.1"
+roxmltree.workspace = true
+png.workspace = true
+thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
@@ -59,10 +62,18 @@ objc2-web-kit.workspace = true
 reqwest.workspace = true
 image.workspace = true
 
+core-foundation.workspace = true
+core-graphics.workspace = true
+foreign-types.workspace = true
+block.workspace = true
 dispatch2 = "0.3.1"
 block2 = "0.6.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+atspi.workspace = true
+async-io.workspace = true
+x11rb.workspace = true
 image = { workspace = true, features = ["png"] }
 
 [dev-dependencies]

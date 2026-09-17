@@ -22,7 +22,7 @@ struct ActiveChatRow {
     group: Option<(String, String)>,
 }
 
-fn compare_sidebar_chats(
+pub(super) fn compare_sidebar_chats(
     sort: SidebarSort,
     left: &zeron_proto::Chat,
     right: &zeron_proto::Chat,
@@ -1243,6 +1243,7 @@ impl Shell {
                     is_selected,
                     false,
                     jump_label,
+                    None,
                     theme,
                     cx,
                 );
@@ -1568,6 +1569,7 @@ impl Shell {
     // ---- add-space flow (the ⌘K palette) ----
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
         let target = if self.sidebar_mode == SidebarMode::Workers {
             ProjectPickerTarget::Worker
         } else {

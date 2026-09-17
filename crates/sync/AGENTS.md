@@ -17,6 +17,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 - O semáforo de processo `MAX_CONCURRENT_DIALS` limita handshakes WS e ciclos de fallback HTTPS chat2. No WS, a espera observa shutdown e revalida cancelamento antes de conectar; o permit é liberado ao terminar o handshake, antes de tratar sucesso, erro ou backoff. Socket estabelecido não segura slot. O fallback HTTPS segura o permit durante seu ciclo finito de push/pull. Implementação e regressões: `src/chat_client.rs` e `src/chat_client/tests.rs`.
 - Presença é efêmera por design — substitui escrita de heartbeat a cada 15s. Não persistir presença no doc.
 - Chat row import distingue operações aplicadas de dependências causais pendentes. Row pendente segura o cursor e força checkpoint mesmo com frontier aparentemente contida; HTTP e WebSocket usam a mesma regra. Reparo inclui rows próprias e uma geração impede que catch-up antigo limpe um gap mais novo. `CaughtUp` não é emitido enquanto faltar história causal.
+- Publicação de Chat é um outbox SQLite (`chat_outbox`) com `batch_id` estável: o cliente só envia depois de persistir, só remove após ACK persistido e recarrega pendências ao reabrir. Rejeições permanentes ficam marcadas para um checkpoint posterior; a fila em memória nunca substitui o registro durável.
 
 ## Work Guidance
 
@@ -34,6 +35,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 | `src/**` (backoff, VV, DocsStore) | unit | `cargo test -p zeron-sync --features mock-server --lib` |
 | `tests/registry_client.rs` | integration — cliente contra o DO mock in-process | `cargo test -p zeron-sync --features mock-server --test registry_client` |
 | `tests/registry_edge.rs` | e2e, `--ignored` por padrão; precisa de `wrangler dev` + `AUTH_MODE=dev` | `ZERON_EDGE_WS=ws://127.0.0.1:27640 cargo test -p zeron-sync --test registry_edge -- --ignored` |
+| `store.rs` outbox + `chat_client.rs` replay/ACK | unit | `cargo test -p zeron-sync --features mock-server --lib` |
 
 ## Child DOX Index
 

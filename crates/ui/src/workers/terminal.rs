@@ -17,8 +17,8 @@ use crate::terminal::scroll::{
     TerminalScrollModes, scrollbar_metrics, terminal_scroll_action,
 };
 use crate::terminal::view::{
-    COALESCE_MS, InputCoalescer, SELECTION_DRAG_THRESHOLD, TERM_LINE_HEIGHT, TerminalElement,
-    cell_at, keystroke_bytes, paste_bytes,
+    COALESCE_MS, InputCoalescer, SELECTION_DRAG_THRESHOLD, TerminalElement, cell_at,
+    keystroke_bytes, paste_bytes,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1522,16 +1522,18 @@ impl WorkersTerminal {
     }
 
     fn on_scroll_wheel(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        let line_height = crate::theme::Theme::of(cx).terminal_font_size
+            * super::super::terminal::view::TERM_LINE_HEIGHT
+            / super::super::terminal::view::TERM_FONT_SIZE;
         let Some(hit) = self.cell_hit_at(event.position) else {
             return;
         };
         let Some(state) = self.active_state_mut() else {
             return;
         };
-        let steps =
-            state
-                .scroll_gesture
-                .steps(event.delta, event.touch_phase, px(TERM_LINE_HEIGHT));
+        let steps = state
+            .scroll_gesture
+            .steps(event.delta, event.touch_phase, px(line_height));
         if steps == 0 {
             return;
         }

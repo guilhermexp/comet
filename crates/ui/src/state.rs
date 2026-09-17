@@ -223,6 +223,22 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    #[cfg(test)]
+    pub(crate) fn from_test_client(client: RpcClient) -> Self {
+        Self {
+            inner: Arc::new(RemoteEngine {
+                client: Arc::new(client),
+                url: "memory:test".into(),
+                lifecycle_task: tokio::sync::Mutex::new(None),
+            }),
+            engine_info: EngineInfo {
+                device_id: "test".into(),
+                workspace_scope: WorkspaceScope::Local,
+            },
+            deferred_state: None,
+        }
+    }
+
     /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
@@ -1536,6 +1552,11 @@ impl AppState {
 
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_engine(&mut self, handle: EngineHandle) {
+        self.engine = Some(handle);
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {

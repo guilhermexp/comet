@@ -227,9 +227,12 @@ struct DocHostInner {
     /// runtime replacement, where Edge-capable tasks must stop doing
     /// network work even while something still pins the graph.
     shutdown: CancellationToken,
+    edge_disconnected: AtomicBool,
     /// Tracks every spawned worker so `shutdown_workers` can await them.
     tasks: TaskTracker,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// Serialize cold opens without blocking access to already-live handles.
+    opening: Mutex<()>,
     /// chat2 seeds in flight (one per chat — reopen storms must not race
     /// duplicate rebuild+checkpoint POSTs; benign server-side, wasteful).
     seeding: Mutex<HashSet<String>>,
@@ -412,7 +415,8 @@ pub struct ChatDocHandle {
     /// to a minute; offline, forever): buffered here by the subscription
     /// below and drained into the client on join (review B3 — a user
     /// message typed during the dial must not silently never sync).
-    chat2_pending_local: Mutex<Vec<Vec<u8>>>,
+    chat2_pending_local: Mutex<Vec<(String, Vec<u8>)>>,
+    publication_failed: AtomicBool,
     /// Local-update feed into the chat2 client (drop = unsubscribe).
     chat2_local_sub: Mutex<Option<loro::Subscription>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
@@ -613,8 +617,10 @@ impl DocHost {
                 workspace: OnceLock::new(),
                 repos: OnceLock::new(),
                 shutdown: CancellationToken::new(),
+                edge_disconnected: AtomicBool::new(false),
                 tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
+                opening: Mutex::new(()),
                 seeding: Mutex::new(HashSet::new()),
                 seed_waiting: Mutex::new(HashSet::new()),
                 drain_waiting: Mutex::new(HashSet::new()),
@@ -658,6 +664,39 @@ impl DocHost {
                 .iter()
                 .any(|e| is_abandoned_stream(e, &self.inner.config.device_id))
         })
+    }
+
+    /// Read a cached or persisted doc without creating a handle or joining its
+    /// room. Explicit replay walks use this to inspect cold child transcripts
+    /// without turning historical refs into network opens.
+    pub(crate) fn read_local_doc(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<Arc<SessionDoc>>, EngineError> {
+        let cached = lock(&self.inner.handles).get(chat_id).cloned();
+        if cached
+            .as_ref()
+            .is_some_and(|handle| !handle.retired.load(Ordering::Acquire))
+        {
+            return Ok(cached.map(|handle| handle.doc_arc()));
+        }
+        let Some((bytes, _, epoch)) = self.inner.store.load_snapshot_with_cursor(chat_id)? else {
+            // A retired handle can still be the only local copy during an
+            // interrupted chat2 flip; use it until the thin lineage exists.
+            return Ok(cached.map(|handle| handle.doc_arc()));
+        };
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes)
+            .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
+        let doc = SessionDoc::from_doc(raw);
+        if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
+            for (_, bytes) in self.inner.store.pending_chat_updates(chat_id)? {
+                doc.doc()
+                    .import(&bytes)
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+            }
+        }
+        Ok(Some(Arc::new(doc)))
     }
 
     /// Every background task rides the tracker, raced against the shutdown
@@ -962,6 +1001,7 @@ impl DocHost {
             Some(row) => row.room_gen.unwrap_or(1),
             None => 2,
         };
+        let opening = lock(&self.inner.opening);
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
@@ -1095,6 +1135,15 @@ impl DocHost {
                 None => SessionDoc::init(chat_id)?,
             }
         };
+        // Recover committed outgoing operations even when the snapshot debounce
+        // did not run before a crash. Imported updates do not echo as local writes.
+        if room_gen >= 2 {
+            for (_, bytes) in self.inner.store.pending_chat_updates(chat_id)? {
+                doc.doc()
+                    .import(&bytes)
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+            }
+        }
         let doc = Arc::new(doc);
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
@@ -1119,16 +1168,10 @@ impl DocHost {
             checkpointing: Arc::new(AtomicBool::new(false)),
             chat2: Mutex::new(None),
             chat2_pending_local: Mutex::new(Vec::new()),
+            publication_failed: AtomicBool::new(false),
             chat2_local_sub: Mutex::new(None),
             _sub: sub,
         });
-        {
-            let mut handles = lock(&self.inner.handles);
-            if let Some(existing) = handles.get(chat_id) {
-                return Ok(existing.clone()); // racing open — keep the first
-            }
-            handles.insert(chat_id.to_string(), handle.clone());
-        }
 
         // Edge room join — offline-tolerant AND supervised. `ChatClient` only
         // self-reconnects AFTER a first successful join; a one-shot attempt
@@ -1142,11 +1185,20 @@ impl DocHost {
         // wake redials immediately; eviction/purge ends the loop via `weak`.
         if let Some(edge) = &self.inner.config.edge {
             if room_gen >= 2 {
+                // A one-time full replay heals history stranded by older clients.
+                // Its durable marker is independent of the download cursor.
+                if !self.inner.store.chat_outbox_initialized(chat_id)? {
+                    let updates = crate::chat2_host::publication_updates(doc.doc())
+                        .map_err(EngineError::Other)?;
+                    self.inner.store.initialize_chat_outbox(chat_id, &updates)?;
+                }
                 // Subscription BEFORE the dial (review B3): every local
                 // commit lands in the client when connected, else in the
                 // pending buffer the join drains — nothing composed during
                 // (or before) the dial is lost to the room.
                 let weak_push = Arc::downgrade(&handle);
+                let publication_store = self.inner.store.clone();
+                let publication_chat = chat_id.to_string();
                 let sub = doc
                     .doc()
                     .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
@@ -1156,9 +1208,19 @@ impl DocHost {
                             // check and the push let the join's store+drain
                             // slip between, orphaning the update forever).
                             let client_guard = lock(&handle.chat2);
+                            let batch_id = uuid::Uuid::new_v4().to_string();
+                            if let Err(err) = publication_store.enqueue_chat_update(
+                                &publication_chat,
+                                &batch_id,
+                                bytes,
+                            ) {
+                                handle.publication_failed.store(true, Ordering::Release);
+                                tracing::error!(chat = %publication_chat, %err, "chat2: durable outbox write failed");
+                            }
                             match &*client_guard {
-                                Some(client) => client.enqueue_update(bytes.clone()),
-                                None => lock(&handle.chat2_pending_local).push(bytes.clone()),
+                                Some(client) => client.enqueue_batch(batch_id, bytes.clone()),
+                                None => lock(&handle.chat2_pending_local)
+                                    .push((batch_id, bytes.clone())),
                             }
                         }
                         true
@@ -1174,33 +1236,9 @@ impl DocHost {
                 for command in &requeue_commands {
                     let _ = doc.queue_command(command);
                 }
-                // First contact with the room (cursor 0): everything
-                // committed BEFORE the subscription above — SessionDoc::
-                // init's container/meta ops, an adopt's fresh doc — is
-                // invisible to the push path, yet every later commit
-                // causally DEPENDS on it. Rows built on unpushed deps import
-                // into peers' loro pending-buffers and never materialize:
-                // born-chat2 cross-device runs sat invisible on every other
-                // device (host never saw the command, viewers never saw the
-                // transcript). Push the doc's full update log as the join's
-                // first batch; once acked the cursor moves and this never
-                // re-arms.
-                if chat2_cursor == 0 {
-                    match doc
-                        .doc()
-                        .export(loro::ExportMode::updates(&loro::VersionVector::default()))
-                    {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            lock(&handle.chat2_pending_local).push(bytes);
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::warn!(chat = %chat_id, error = %err,
-                                "chat2 first-contact export failed; peers may stall on missing deps");
-                        }
-                    }
+                if !self.inner.edge_disconnected.load(Ordering::Acquire) {
+                    self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
                 }
-                self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
             } else {
                 // Straggler gen-1 chat (the s2 client is gone — post-cutover,
                 // no device reads or writes an s2 room). The local fat doc
@@ -1217,6 +1255,9 @@ impl DocHost {
                 }
             }
         }
+        // Publish only after the durable subscription and bootstrap are installed.
+        lock(&self.inner.handles).insert(chat_id.to_string(), handle.clone());
+        drop(opening);
         self.spawn_worker(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
         Ok(handle)
@@ -1301,14 +1342,44 @@ impl DocHost {
                             // is either drained here or enqueued directly
                             // after — never dropped between (verify pass).
                             let mut client_slot = lock(&handle.chat2);
-                            let pending: Vec<Vec<u8>> =
+                            if host.inner.edge_disconnected.load(Ordering::Acquire) {
+                                return;
+                            }
+                            let pending: Vec<(String, Vec<u8>)> =
                                 std::mem::take(&mut *lock(&handle.chat2_pending_local));
-                            for update in pending {
-                                client.enqueue_update(update);
+                            for (batch_id, update) in pending {
+                                client.enqueue_batch(batch_id, update);
                             }
                             *client_slot = Some(client);
                         }
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
+                        // A missed event, failed POST or actor restart must not
+                        // forget rejected operations. Any author can checkpoint
+                        // its own durable history, including a non-host desktop.
+                        let checkpoint_host = host.clone();
+                        let checkpoint_weak = weak.clone();
+                        host.spawn_worker(async move {
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                let Some(handle) = checkpoint_weak.upgrade() else { return };
+                                if checkpoint_host.inner.edge_disconnected.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                let known = lock(&handle.chat2)
+                                    .as_ref()
+                                    .is_some_and(|c| c.stats().server_known);
+                                if known
+                                    && checkpoint_host
+                                        .inner
+                                        .store
+                                        .rejected_chat_updates(&handle.chat_id)
+                                        .is_ok_and(|v| !v.is_empty())
+                                {
+                                    checkpoint_host
+                                        .spawn_chat2_checkpoint(&handle, "durable-rejection");
+                                }
+                            }
+                        });
                         // Bootstrap heal: a room with NO checkpoint can't
                         // cover its rows' causal deps for cold readers — a
                         // pre-0.1.34 first contact whose init batch never
@@ -1398,7 +1469,7 @@ impl DocHost {
                                     if edge.bearer().await.is_none() {
                                         if let Some(handle) = weak.upgrade() {
                                             lock(&handle.chat2).take();
-                                            lock(&handle.chat2_local_sub).take();
+                                            // Keep journaling local cleanup after credentials disappear.
                                         }
                                         tracing::info!(chat = %chat,
                                             "chat2 credentials removed; leaving room");
@@ -1792,6 +1863,9 @@ impl DocHost {
     /// fresh reader sees only post-reset rows; `PushRejected` — the rejected
     /// ops reach peers only through a checkpoint).
     fn spawn_chat2_checkpoint(&self, handle: &Arc<ChatDocHandle>, reason: &'static str) {
+        if self.inner.edge_disconnected.load(Ordering::Acquire) {
+            return;
+        }
         use base64::Engine as _;
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
@@ -1809,11 +1883,34 @@ impl DocHost {
             return;
         }
         let in_flight = handle.checkpointing.clone();
+        let rejected = self
+            .inner
+            .store
+            .rejected_chat_updates(&chat_id)
+            .unwrap_or_default();
+        let publication_store = self.inner.store.clone();
         let Ok(snapshot) = handle.doc.export_snapshot() else {
             in_flight.store(false, Ordering::Release);
             return;
         };
-        let frontier = handle.doc.doc().oplog_vv().encode();
+        let frontier = match loro::LoroDoc::decode_import_blob_meta(&snapshot, true) {
+            Ok(meta) => meta.partial_end_vv.encode(),
+            Err(err) => {
+                tracing::error!(%err, "chat2: checkpoint metadata decode failed");
+                in_flight.store(false, Ordering::Release);
+                return;
+            }
+        };
+        let snapshot_vv = loro::VersionVector::decode(&frontier).expect("encoded snapshot vector");
+        let covered_rejections: Vec<String> = rejected
+            .into_iter()
+            .filter_map(|(id, bytes)| {
+                loro::LoroDoc::decode_import_blob_meta(&bytes, true)
+                    .ok()
+                    .filter(|m| snapshot_vv.includes_vv(&m.partial_end_vv))
+                    .map(|_| id)
+            })
+            .collect();
         let seq_covered = stats.cursor;
         let http = self.inner.http.clone();
         let weak_note = Arc::downgrade(handle);
@@ -1842,6 +1939,13 @@ impl DocHost {
             {
                 Ok(res) if res.status().is_success() => {
                     tracing::info!(chat = %chat_id, seq_covered, reason, "chat2 checkpoint posted");
+                    for batch_id in &covered_rejections {
+                        if let Err(err) = publication_store
+                            .acknowledge_chat_update(&chat_id, batch_id)
+                        {
+                            tracing::warn!(%err, "chat2: checkpoint obligation retirement failed; will retry");
+                        }
+                    }
                     if let Some(handle) = weak_note.upgrade()
                         && let Some(client) = &*lock(&handle.chat2)
                     {
@@ -1939,6 +2043,11 @@ impl DocHost {
     }
 
     fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
+        // Durable batches may outlive this handle. Only failed disk writes
+        // require retaining the in-memory copy until persistence recovers.
+        if handle.publication_failed.load(Ordering::Acquire) {
+            return true;
+        }
         if handle.messages_tx.receiver_count() > 0 {
             return true;
         }
@@ -3206,7 +3315,7 @@ impl DocHost {
         };
         for path in request.attachments.iter_mut() {
             if let Some(abs) = uploads.resolve_pending(path) {
-                request.prompt = request.prompt.replace(path.as_str(), &abs);
+                request.prompt = rewrite_attachment_reference(&request.prompt, path, &abs);
                 *path = abs;
             }
         }
@@ -3220,7 +3329,7 @@ impl DocHost {
         let mut out = prompt.to_string();
         for r in crate::uploads::pending_refs_in(prompt) {
             if let Some(abs) = uploads.resolve_pending(&r) {
-                out = out.replace(&r, &abs);
+                out = rewrite_attachment_reference(&out, &r, &abs);
             }
         }
         out
@@ -3632,10 +3741,11 @@ impl DocHost {
     /// Close all account-scoped room memberships before graceful engine
     /// draining. Auth-aware join supervisors will not install a late client.
     pub fn disconnect_edge(&self) {
+        self.inner.edge_disconnected.store(true, Ordering::Release);
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             lock(&handle.chat2).take();
-            lock(&handle.chat2_local_sub).take();
+            // Retain the durable subscription through agent shutdown cleanup.
         }
     }
 }
@@ -3678,6 +3788,55 @@ fn encode_part_segment(part_id: &str) -> String {
         }
     }
     out
+}
+
+/// Appshot image attributes and ordinary attachment trailers name the same
+/// file using different escaping. Replace the attribute first so an absolute
+/// profile path containing XML metacharacters never corrupts the context.
+fn rewrite_attachment_reference(prompt: &str, source: &str, target: &str) -> String {
+    fn attribute(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+            .replace('\n', "&#10;")
+            .replace('\r', "&#13;")
+            .replace('\t', "&#9;")
+    }
+    prompt
+        .replace(
+            &format!("image=\"{}\"", attribute(source)),
+            &format!("image=\"{}\"", attribute(target)),
+        )
+        .replace(source, target)
+}
+
+#[cfg(test)]
+mod attachment_reference_tests {
+    use super::rewrite_attachment_reference;
+
+    #[test]
+    fn appshot_reference_preserves_xml_and_plain_attachment_paths() {
+        let source = "pending://id/A&B\".png";
+        let target = "/profile & data/uploads/A_B_.png";
+        let prompt = format!(
+            "<appshot image=\"pending://id/A&amp;B&quot;.png\">observed</appshot>\n\nAttached files (local files):\n- {source}"
+        );
+        let rewritten = rewrite_attachment_reference(&prompt, source, target);
+        assert!(rewritten.contains("image=\"/profile &amp; data/uploads/A_B_.png\""));
+        assert!(rewritten.ends_with(&format!("- {target}")));
+        assert!(!rewritten.contains("pending://"));
+        // Even a source without escapes must produce an escaped attribute.
+        let rewritten = rewrite_attachment_reference(
+            "image=\"pending://id/a.png\"\n- pending://id/a.png",
+            "pending://id/a.png",
+            target,
+        );
+        assert!(rewritten.contains("image=\"/profile &amp; data/uploads/A_B_.png\""));
+        assert!(rewritten.ends_with(target));
+    }
 }
 
 #[cfg(test)]

@@ -404,6 +404,10 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Desktop-local Appshot capture preference and delivery target.
+    pub appshots_enabled: bool,
+    pub appshot_sound_enabled: bool,
+    pub appshot_destination: crate::appshots::AppshotDestination,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Optional columns shown in every Git History pane.
@@ -419,6 +423,10 @@ pub struct UiSettings {
     /// Base size for interface and conversational prose. Code-related surfaces
     /// retain their fixed metrics.
     pub ui_font_size: crate::typography::UiFontSize,
+    pub terminal_font_family: crate::typography::UiFontFamily,
+    pub terminal_font_size: f32,
+    pub code_font_family: crate::typography::UiFontFamily,
+    pub code_font_size: f32,
     /// Independently selected light and dark theme variants.
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
@@ -463,6 +471,9 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            appshots_enabled: false,
+            appshot_sound_enabled: true,
+            appshot_destination: crate::appshots::AppshotDestination::Automatic,
             appearance: crate::appearance::AppearanceMode::default(),
             git_history_columns: GitHistoryColumns::default(),
             git_history_column_widths: GitHistoryColumnWidths::default(),
@@ -470,6 +481,10 @@ impl Default for UiSettings {
             git_history_author_display: GitHistoryAuthorDisplay::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
             ui_font_size: crate::typography::UiFontSize::default(),
+            terminal_font_family: crate::typography::UiFontFamily::GeistMono,
+            terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
+            code_font_family: crate::typography::UiFontFamily::GeistMono,
+            code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
             accent: zeron_theme::AccentSelection::default(),
@@ -508,11 +523,13 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 /// rather than panicking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
+    CaptureAppshot,
     BrowserReload,
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
     NewSession,
+    NewProject,
     NextSession,
     PrevSession,
     ArchiveSession,
@@ -520,12 +537,14 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 8 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 10 + JUMP_SLOTS] = [
+        ShortcutId::CaptureAppshot,
         ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
         ShortcutId::NewSession,
+        ShortcutId::NewProject,
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
         ShortcutId::ArchiveSession,
@@ -540,14 +559,20 @@ impl ShortcutId {
         ShortcutId::JumpSession(8),
     ];
 
+    pub fn available(self) -> bool {
+        self != Self::CaptureAppshot || crate::appshots::is_desktop()
+    }
+
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::CaptureAppshot => "Capture Appshot",
             ShortcutId::BrowserReload => "Reload browser page",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewSession => "New session",
+            ShortcutId::NewProject => "New project",
             ShortcutId::NextSession => "Next session",
             ShortcutId::PrevSession => "Previous session",
             ShortcutId::ArchiveSession => "Archive session",
@@ -564,11 +589,14 @@ impl ShortcutId {
     /// this guards against only exists off macOS).
     pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
+            ShortcutId::CaptureAppshot if mac => "ctrl-alt-space",
+            ShortcutId::CaptureAppshot => "mod-alt-space",
             ShortcutId::ToggleSidebar => "mod-s",
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::BrowserReload => "mod-shift-r",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
+            ShortcutId::NewProject => "mod-shift-n",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
             // recorder spells ctrl (see `combo_from_keystroke`). Off macOS
             // ctrl IS the primary and stores as "mod"; on macOS it is its own
@@ -605,11 +633,13 @@ impl ShortcutId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
+    pub capture_appshot: String,
     pub browser_reload: String,
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
     pub new_session: String,
+    pub new_project: String,
     pub next_session: String,
     pub prev_session: String,
     pub archive_session: String,
@@ -623,11 +653,13 @@ pub struct KeymapConfig {
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
+            capture_appshot: ShortcutId::CaptureAppshot.default_combo().into(),
             browser_reload: ShortcutId::BrowserReload.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
+            new_project: ShortcutId::NewProject.default_combo().into(),
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
             archive_session: ShortcutId::ArchiveSession.default_combo().into(),
@@ -639,11 +671,13 @@ impl Default for KeymapConfig {
 impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
+            ShortcutId::CaptureAppshot => &self.capture_appshot,
             ShortcutId::BrowserReload => &self.browser_reload,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewSession => &self.new_session,
+            ShortcutId::NewProject => &self.new_project,
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
             ShortcutId::ArchiveSession => &self.archive_session,
@@ -657,11 +691,13 @@ impl KeymapConfig {
 
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
+            ShortcutId::CaptureAppshot => self.capture_appshot = combo,
             ShortcutId::BrowserReload => self.browser_reload = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewSession => self.new_session = combo,
+            ShortcutId::NewProject => self.new_project = combo,
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
             ShortcutId::ArchiveSession => self.archive_session = combo,
@@ -863,6 +899,19 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
 impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
+        self.terminal_font_size = clamp_or(
+            self.terminal_font_size,
+            crate::typography::FONT_SIZE_MIN,
+            crate::typography::FONT_SIZE_MAX,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
+        );
+        self.code_font_size = clamp_or(
+            self.code_font_size,
+            crate::typography::FONT_SIZE_MIN,
+            crate::typography::FONT_SIZE_MAX,
+            crate::typography::CODE_FONT_SIZE_DEFAULT,
+        );
+
         if self.sidebar_organization == SidebarOrganization::ByProject {
             self.sidebar_organization = SidebarOrganization::InOneList;
         }
@@ -964,6 +1013,35 @@ fn min_or(value: f32, min: f32, default: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn independent_code_and_terminal_fonts_round_trip_without_changing_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = UiSettings::default();
+        assert_eq!(
+            settings.code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(
+            settings.terminal_font_size,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT
+        );
+        settings.terminal_font_family = crate::typography::UiFontFamily::Installed("Menlo".into());
+        settings.terminal_font_size = 17.0;
+        settings.code_font_family = crate::typography::UiFontFamily::Geist;
+        settings.code_font_size = 14.5;
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.terminal_font_family, settings.terminal_font_family);
+        assert_eq!(loaded.terminal_font_size, 17.0);
+        assert_eq!(loaded.code_font_family, settings.code_font_family);
+        assert_eq!(loaded.code_font_size, 14.5);
+        assert_eq!(loaded.ui_font_size, settings.ui_font_size);
+    }
+
     use super::*;
 
     #[test]
@@ -1021,6 +1099,10 @@ mod tests {
             git_history_author_display: GitHistoryAuthorDisplay::Name,
             ui_font_family: crate::typography::UiFontFamily::System,
             ui_font_size: crate::typography::UiFontSize::default(),
+            terminal_font_family: crate::typography::UiFontFamily::GeistMono,
+            terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
+            code_font_family: crate::typography::UiFontFamily::GeistMono,
+            code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
             theme_selection: zeron_theme::ThemeSelection {
                 light: "catppuccin-latte".into(),
                 dark: "catppuccin-mocha".into(),
@@ -1030,6 +1112,9 @@ mod tests {
             surface: zeron_theme::SurfacePreference::Frosted,
             legacy_accent_color: None,
             usage_widget_hidden_account_ids: BTreeSet::from(["claude-1".into()]),
+            appshots_enabled: true,
+            appshot_sound_enabled: true,
+            appshot_destination: crate::appshots::AppshotDestination::LastSession,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -1328,6 +1413,7 @@ mod tests {
             format!("{ctrl}-shift-tab")
         );
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
+        assert_eq!(keymap.get(ShortcutId::NewProject), "mod-shift-n");
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
@@ -1486,6 +1572,20 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+    }
+
+    #[test]
+    fn new_project_shortcut_migrates_and_persists() {
+        let mut keymap: KeymapConfig =
+            serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
+        assert_eq!(keymap.get(ShortcutId::NewProject), "mod-shift-n");
+        assert_eq!(keymap.get(ShortcutId::NewSession), "mod-alt-n");
+        keymap.set(ShortcutId::NewProject, "mod-alt-p".into());
+        let mut restored: KeymapConfig =
+            serde_json::from_str(&serde_json::to_string(&keymap).unwrap()).unwrap();
+        assert_eq!(restored.get(ShortcutId::NewProject), "mod-alt-p");
+        restored.reset(ShortcutId::NewProject);
+        assert_eq!(restored.get(ShortcutId::NewProject), "mod-shift-n");
     }
     #[test]
     fn jump_slots_get_set_and_reset() {

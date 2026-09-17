@@ -25,6 +25,7 @@ use crate::workers::terminal::WorkersTerminal;
 /// Terminal font metrics (mono).
 pub const TERM_FONT_SIZE: f32 = 13.0;
 pub const TERM_LINE_HEIGHT: f32 = 18.0;
+const TERM_LINE_HEIGHT_RATIO: f32 = TERM_LINE_HEIGHT / TERM_FONT_SIZE;
 /// Inner padding of the grid area.
 pub const TERM_PADDING: f32 = 12.0;
 
@@ -412,6 +413,9 @@ pub struct TerminalPrepaint {
     lines: Vec<Vec<(usize, ShapedLine)>>,
     /// Grid cell advance, so paint can place segments by column.
     cell_w: Pixels,
+    /// Grid row height, so paint places rows on the same baselines prepaint
+    /// measured the grid with.
+    line_h: Pixels,
     cursor: Option<PaintQuad>,
 }
 
@@ -466,7 +470,7 @@ impl gpui::Element for TerminalElement {
         // to the pty (the command runs), only the painted run lost a cell.
         // The landing page disables the same three features on its ASCII art
         // for the same reason.
-        let mut mono = font(theme.font_mono.clone());
+        let mut mono = font(theme.font_terminal.clone());
         mono.features = gpui::FontFeatures(std::sync::Arc::new(vec![
             ("liga".into(), 0),
             ("calt".into(), 0),
@@ -474,13 +478,13 @@ impl gpui::Element for TerminalElement {
         ]));
         // Font probe: measure the actual advance of the resolved mono font so
         // cols/rows track real glyph metrics, not a guessed aspect ratio.
-        let font_size = px(TERM_FONT_SIZE);
+        let font_size = px(theme.terminal_font_size);
         let font_id = window.text_system().resolve_font(&mono);
         let cell_w = window
             .text_system()
             .em_advance(font_id, font_size)
-            .unwrap_or(px(TERM_FONT_SIZE * 0.6));
-        let line_h = px(TERM_LINE_HEIGHT);
+            .unwrap_or(px(theme.terminal_font_size * 0.6));
+        let line_h = px(theme.terminal_font_size * TERM_LINE_HEIGHT_RATIO);
 
         let inner_w = f32::from(bounds.size.width) - 2.0 * TERM_PADDING;
         let inner_h = f32::from(bounds.size.height) - 2.0 * TERM_PADDING;
@@ -524,6 +528,7 @@ impl gpui::Element for TerminalElement {
                 sel_quads: Vec::new(),
                 lines: Vec::new(),
                 cell_w,
+                line_h,
                 cursor: None,
             };
         };
@@ -605,6 +610,7 @@ impl gpui::Element for TerminalElement {
             sel_quads,
             lines,
             cell_w,
+            line_h,
             cursor,
         }
     }
@@ -619,7 +625,7 @@ impl gpui::Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_h = px(TERM_LINE_HEIGHT);
+        let line_h = prepaint.line_h;
         let origin = point(
             bounds.left() + px(TERM_PADDING),
             bounds.top() + px(TERM_PADDING),

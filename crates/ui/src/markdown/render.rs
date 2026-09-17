@@ -60,6 +60,7 @@ pub const MD_LINE_HEIGHT: f32 = 24.0;
 /// Code block metrics — height is `lines × CODE_LINE_HEIGHT + padding + header`.
 pub const CODE_TEXT_SIZE: f32 = 12.5;
 pub const CODE_LINE_HEIGHT: f32 = 18.0;
+const CODE_LINE_HEIGHT_RATIO: f32 = CODE_LINE_HEIGHT / CODE_TEXT_SIZE;
 pub const CODE_PADDING_X: f32 = 12.0;
 pub const CODE_PADDING_Y: f32 = 10.0;
 
@@ -951,12 +952,22 @@ pub(crate) fn paint_text_selection(
     layout: &gpui::TextLayout,
     theme: &Theme,
 ) {
+    paint_text_selection_with_wash(window, key, text, layout, selection_wash(theme));
+}
+
+fn paint_text_selection_with_wash(
+    window: &mut Window,
+    key: &std::sync::Arc<str>,
+    text: &SharedString,
+    layout: &gpui::TextLayout,
+    wash: Hsla,
+) {
     if let Some(range) = super::selection::wash_range(key) {
         for rect in range_rects(layout, &range, 0.0, 0.0) {
             window.paint_quad(quad(
                 rect,
                 px(0.0),
-                selection_wash(theme),
+                wash,
                 px(0.0),
                 gpui::transparent_black(),
                 BorderStyle::default(),
@@ -972,6 +983,29 @@ pub(crate) fn paint_text_selection(
         })
     });
     register_selection_listeners(window, key, text, layout);
+}
+
+fn selectable_code_line(
+    key: std::sync::Arc<str>,
+    text: SharedString,
+    runs: Vec<TextRun>,
+    wash: Hsla,
+) -> AnyElement {
+    let styled = StyledText::new(text.clone()).with_runs(runs);
+    let layout = styled.layout().clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_text_selection_with_wash(window, &key, &text, &layout, wash);
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .child(underlay)
+        .child(styled)
+        .into_any_element()
 }
 
 /// One painted text element, registered per frame in document order — the
@@ -1311,6 +1345,7 @@ fn render_code_block(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
+    let sel_wash = selection_wash(theme);
     // Copy affordance (round 9; no source counterpart — the original block is
     // header + body only): a small ghost button in the block's top-right,
     // absolutely overlaid so clicking / the "Copied" flash never shifts
@@ -1386,8 +1421,8 @@ fn render_code_block(
                 .px(px(CODE_PADDING_X))
                 .py(px(CODE_PADDING_Y))
                 .font_family(theme.font_mono.clone())
-                .text_size(px(CODE_TEXT_SIZE))
-                .line_height(px(CODE_LINE_HEIGHT))
+                .text_size(px(theme.code_font_size))
+                .line_height(px(theme.code_font_size * CODE_LINE_HEIGHT_RATIO))
                 .whitespace_nowrap()
                 .flex()
                 .flex_col()
@@ -1399,9 +1434,14 @@ fn render_code_block(
                     let runs = apply_veil(runs.clone(), &local);
                     Some(
                         div()
-                            .h(px(CODE_LINE_HEIGHT))
+                            .h(px(theme.code_font_size * CODE_LINE_HEIGHT_RATIO))
                             .flex_none()
-                            .child(StyledText::new(line.clone()).with_runs(runs)),
+                            .child(selectable_code_line(
+                                format!("{}-code{ix}-line{li}", opts.row_key).into(),
+                                line.clone(),
+                                runs,
+                                sel_wash,
+                            )),
                     )
                 })),
         )
@@ -1556,6 +1596,61 @@ mod tests {
         cache.invalidate_row("visible");
         assert!(cache.flats.is_empty());
         assert!(cache.code.is_empty());
+    }
+
+    #[gpui::test]
+    fn code_lines_join_selection_across_blank_lines(cx: &mut gpui::TestAppContext) {
+        let _guard = crate::markdown::selection::tests::state_lock();
+        struct Fixture;
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let tree = super::super::parser::parse_full("```rust\nfirst\n\nlast\n```");
+                let opts = RenderOptions::settled("code-selection".into());
+                div()
+                    .w(px(400.0))
+                    .child(selection_frame_reset())
+                    .child(render_tree(&tree, &opts, Theme::of(cx), window, &|_| None))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Fixture);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let (key, end) = REGISTRY.with(|registry| {
+                let registry = registry.borrow();
+                assert!(registry.iter().any(|entry| entry.text.is_empty()));
+                let first = registry
+                    .iter()
+                    .find(|entry| entry.text.as_ref() == "first")
+                    .unwrap();
+                let last = registry
+                    .iter()
+                    .find(|entry| entry.text.as_ref() == "last")
+                    .unwrap();
+                (
+                    first.key.clone(),
+                    point(
+                        last.layout.bounds().right(),
+                        last.layout.bounds().center().y,
+                    ),
+                )
+            });
+            super::super::selection::begin(&key, 0);
+            assert!(update_drag_at(end));
+            assert_eq!(
+                super::super::selection::selected_text().as_deref(),
+                Some("first\n\nlast")
+            );
+            super::super::selection::end_active_drag();
+            super::super::selection::clear_if_owner(&key);
+        });
     }
 
     #[gpui::test]

@@ -38,6 +38,8 @@ struct FakeOpencode {
     /// (the no-replay bus makes prompting before the subscription a real
     /// event-loss race — observed live on fast-failing turns).
     first_prompt_had_subscriber: Arc<Mutex<Option<bool>>>,
+    /// Leading 500s for the v1 lazy-migration session-create regression.
+    fail_session_creates: Arc<Mutex<u32>>,
 }
 
 impl FakeOpencode {
@@ -52,6 +54,7 @@ impl FakeOpencode {
             posts: Arc::new(Mutex::new(Vec::new())),
             providers: Arc::new(Mutex::new(json!({ "all": [], "default": {} }))),
             first_prompt_had_subscriber: Arc::new(Mutex::new(None)),
+            fail_session_creates: Arc::new(Mutex::new(0)),
         };
         let accept = fake.clone();
         tokio::spawn(async move {
@@ -199,7 +202,24 @@ impl FakeOpencode {
                 "200 OK",
                 json!([{ "name": "init", "description": "Create AGENTS.md" }]),
             ),
-            ("POST", "/session") => ("200 OK", json!({ "id": "ses_test" })),
+            ("POST", "/session") => {
+                let mut fails = self.fail_session_creates.lock().unwrap();
+                if *fails > 0 {
+                    *fails -= 1;
+                    (
+                        "500 Internal Server Error",
+                        json!({
+                            "name": "UnknownError",
+                            "data": {
+                                "message": "Unexpected server error. Check server logs for details.",
+                                "ref": "err_test",
+                            },
+                        }),
+                    )
+                } else {
+                    ("200 OK", json!({ "id": "ses_test" }))
+                }
+            }
             ("GET", "/session/ses_resume") => ("200 OK", json!({ "id": "ses_resume" })),
             ("GET", p) if p.starts_with("/session/") => ("404 Not Found", json!({})),
             ("POST", p) if p.ends_with("/prompt_async") => ("204 No Content", json!({})),
@@ -874,4 +894,73 @@ async fn models_discover_from_the_provider_catalog() {
     // Commands were primed off the same probe.
     let commands = harness.commands().await.expect("commands");
     assert_eq!(commands[0].name, "init");
+}
+
+#[tokio::test]
+async fn session_create_retries_once_through_the_lazy_migration_500() {
+    // OpenCode 1.18 can commit its project row before a directory migration
+    // throws. The identical create then succeeds and must not kill the turn.
+    let fake = FakeOpencode::start().await;
+    *fake.fail_session_creates.lock().unwrap() = 1;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+
+    let started = next_event(&mut stream).await;
+    assert!(matches!(
+        &started,
+        AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_test"
+    ));
+    let commands = next_event(&mut stream).await;
+    assert!(matches!(&commands, AgentEvent::AvailableCommands { .. }));
+    let creates = wait_posts(&fake, "/session", 2).await;
+    assert_eq!(creates.len(), 2);
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn repeated_session_create_failure_stops_after_one_retry() {
+    let fake = FakeOpencode::start().await;
+    *fake.fail_session_creates.lock().unwrap() = 10;
+    let (controls, _, _) = controls();
+    let mut stream = harness(&fake).run(request("hi"), controls).await.unwrap();
+    let events = drain_to_done(&mut stream).await;
+    assert_eq!(
+        fake.posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/session")
+            .count(),
+        2
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SessionStarted { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        })
+    ));
 }

@@ -12,6 +12,8 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 
 ## Local Contracts
 
+- Parts `image` preservam `id/path/name/mimeType` no materializador, em paridade com `zeron-doc`; a engine importa os bytes antes de publicar a referência. Regressão: `src/session-doc/generated-images.test.ts`.
+
 - `PreviewRoom` (`preview1/{org}/{userId}`) isola catálogo/sinalização por identidade autenticada, confirma org e sobrescreve headers internos no ingresso. Não transporta bytes de páginas. WebSockets têm limites de tamanho, taxa e peers e removem catálogo stale. Adicionar binding/migration não autoriza deploy.
 
 - Skill/skill preserva apenas os identificadores `skill`, `path` e `name` no input renderizável, com trim e strings vazias omitidas. Args, prompt e conteúdo continuam fora do transcript; sanitizer permanece idempotente.

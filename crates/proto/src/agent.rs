@@ -463,6 +463,14 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// A generated raster asset. The engine materializes this path before publication.
+    #[serde(rename_all = "camelCase")]
+    GeneratedImage {
+        id: String,
+        path: String,
+        name: String,
+        mime_type: String,
+    },
     ReasoningDelta {
         text: String,
     },
@@ -903,5 +911,24 @@ mod hashline_target_tests {
             vec!["src/a.py", "dir with spaces/b.py"]
         );
         assert!(super::hashline_file_paths("[x#oops]\n[#1234]\n[x#123]\n[x#abcd]").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod generated_image_tests {
+    use super::*;
+
+    #[test]
+    fn generated_image_event_round_trip() {
+        let event = AgentEvent::GeneratedImage {
+            id: "item:image".into(),
+            path: "/uploads/generated.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "generatedImage");
+        assert_eq!(value["mimeType"], "image/png");
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
     }
 }

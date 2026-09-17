@@ -2,6 +2,8 @@
 //! local-only without credentials. `zeron login` and `zeron logout` select the
 //! profile used by the next engine start without mutating a live runtime.
 
+#[cfg(target_os = "linux")]
+mod appshot_cli;
 mod auth_cli;
 mod daemon;
 mod update_cli;
@@ -32,6 +34,9 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
+    #[cfg(target_os = "linux")]
+    /// Trigger an Appshot in the running headed instance.
+    Appshot,
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -185,6 +190,8 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
         }
+        #[cfg(target_os = "linux")]
+        Some(Command::Appshot) => appshot_cli::run(&engine_config_from_env().data_dir),
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))

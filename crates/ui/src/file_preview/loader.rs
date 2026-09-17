@@ -22,6 +22,7 @@ pub enum LoadedPreview {
         lines: Arc<[SharedString]>,
         highlights: Option<Arc<HighlightedDocument>>,
         widest_line_ix: Option<usize>,
+        typography: PreviewTypography,
     },
     Html(Arc<str>),
     Image(Arc<Image>),
@@ -29,6 +30,29 @@ pub enum LoadedPreview {
     Video,
     Table(Arc<[Vec<SharedString>]>),
     Unsupported,
+}
+
+/// Typography used to measure a code preview's cached widest line.
+///
+/// The generation catches a family/size change that happens to be restored to
+/// the same value before the next render; the explicit family and size keep
+/// the cache honest for callers that rebuild a theme without advancing the
+/// process typography state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewTypography {
+    pub generation: u32,
+    pub family: SharedString,
+    pub size: Pixels,
+}
+
+impl PreviewTypography {
+    pub fn new(generation: u32, family: SharedString, size: Pixels) -> Self {
+        Self {
+            generation,
+            family,
+            size,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,8 +442,8 @@ mod tests {
     use gpui::SharedString;
 
     use super::{
-        LoadedPreview, PreviewLoadError, find_widest_line_index, isolated_html_document,
-        load_preview,
+        LoadedPreview, PreviewLoadError, PreviewTypography, find_widest_line_index,
+        isolated_html_document, load_preview,
     };
     use calamine::{Data, Range};
 
@@ -547,6 +571,7 @@ mod tests {
             lines,
             highlights,
             widest_line_ix,
+            typography,
         } = load_preview(temp.path(), Path::new("main.rs")).unwrap()
         else {
             panic!("expected prepared code preview");
@@ -554,6 +579,25 @@ mod tests {
         assert_eq!(lines.as_ref(), ["fn main() {}", ""]);
         assert!(highlights.is_some());
         assert_eq!(widest_line_ix, Some(0));
+        assert_eq!(typography.generation, 0);
+        assert_eq!(typography.family.as_ref(), "Geist Mono");
+        assert_eq!(typography.size, gpui::px(12.5));
+    }
+
+    #[test]
+    fn preview_typography_key_covers_generation_family_and_size() {
+        let family = SharedString::from("Geist Mono");
+        let key = PreviewTypography::new(7, family.clone(), gpui::px(12.5));
+
+        assert_ne!(
+            key,
+            PreviewTypography::new(8, family.clone(), gpui::px(12.5))
+        );
+        assert_ne!(
+            key,
+            PreviewTypography::new(7, SharedString::from("Menlo"), gpui::px(12.5))
+        );
+        assert_ne!(key, PreviewTypography::new(7, family, gpui::px(13.0)));
     }
 
     #[test]
@@ -728,6 +772,7 @@ pub(crate) fn load_text_preview(
                 .map(SharedString::from)
                 .collect::<Vec<_>>()
                 .into();
+            let typography_family = font_family.clone();
             let widest_line_ix = {
                 let ts = text_system.unwrap_or_else(|| PREVIEW_TEXT_SYSTEM.clone());
                 let wts = WindowTextSystem::new(ts);
@@ -744,6 +789,7 @@ pub(crate) fn load_text_preview(
                 .ok()
                 .map(Arc::new),
                 widest_line_ix,
+                typography: PreviewTypography::new(0, typography_family, font_size),
             })
         }
         PreviewKind::Html => Ok(LoadedPreview::Html(isolated_html_document(&source).into())),

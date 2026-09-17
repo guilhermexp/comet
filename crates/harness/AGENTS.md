@@ -16,6 +16,9 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 - Edições hashline do OMP aceitam `input` com headers `[PATH#TAG]` quando `path` falta. Um alvo único vira EditFile; múltiplos viram ApplyPatch sem path único inventado; path explícito prevalece.
 
 - Codex mantém fronteiras de parágrafo por thread e item de reasoning: `summaryPartAdded` e novos itens separam texto com duas quebras, sem duplicar quebras já recebidas nem misturar subagentes.
+- Codex mantém a identidade do subagente pelo primeiro spawn: tráfego do filho que chega antes do item pai fica em buffer limitado a 4 MiB, é drenado quando o owner aparece e nunca substitui o `parent_tool_use_id` por activity ids posteriores. `thread/resume` reconstrói os owners sem reemitir chips; `turn/started` de follow-up reabre o mesmo transcript. Os formatos v1 (`collabAgentToolCall`) e v2 (`subAgentActivity`) passam pela mesma tabela de roteamento, que consome bookkeeping do filho para não encerrar o turno pai.
+- Itens Codex de geração de imagem só publicam o `savedPath` como `GeneratedImage`; resultados inline e prompts não atravessam a harness. O item fecha seu tool lifecycle mesmo quando falha ou não traz arquivo, e completions repetidos de um filho são idempotentes.
+- OpenCode detecta v1/v2 por health, mantém o header de diretório nos dois protocolos, traduz o catálogo/eventos v2 para o shape interno e faz o retry único de criação de sessão v1 necessário para a migração lazy.
 
 - Cancelamentos de perguntas emitem `InputResolved` sem `answers`; a engine é dona das respostas submetidas pela bridge, evitando sobrescrever o histórico com um cancelamento tardio.
 
@@ -64,6 +67,7 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/**` (parse, mailbox, catálogos, composição do system prompt) | unit | `cargo test -p zeron-harness` |
+| `src/codex/{normalize,subagents}.rs` | unit — identidade, buffer, resume, lifecycle e imagem | `cargo test -p zeron-harness --lib codex` |
 | `tests/{claude,codex}.rs` | integration — contra fixtures | `cargo test -p zeron-harness` |
 | `tests/acp_quiet.rs` | integration — subprocesso ACP, silêncio, cancelamento e erro | `cargo test -p zeron-harness --test acp_quiet` |
 | `tests/omp_rpc.rs` | integration — launch, handshake, catálogo, RPC | `cargo test -p zeron-harness` |

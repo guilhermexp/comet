@@ -12,6 +12,12 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
+- Login Codex reutiliza o resolvedor de executável do harness (`CODEX_EXECUTABLE` e PATH) e compõe o PATH do filho com o diretório resolvido; não assume que o daemon herdou o PATH do shell interativo. Cobertura: `tests/codex_login_resolver.rs`.
+
+- Imagens geradas são importadas antes de qualquer journal/broadcast/fold, inclusive eventos de subagente. Intake limita a 24 MiB, identifica raster pelo header, prende a abertura ao diretório permitido do Codex e publica somente o path em uploads do perfil. Replay de imagem já persistida não exige que a fonte ainda exista; erro vira resultado de tool falho e aviso visível. Cobertura: `uploads::generated_image_tests`, `tests/e2e.rs::generated_image_is_materialized_before_publication_and_survives_reopen` e relay em `tests/device_routing.rs::target_device_id_routes_over_the_relay`.
+- Replay de imagens de subagentes semeia somente referências determinísticas persistidas, com proteção contra ciclos e limites de 256 docs e 32 níveis. `DocHost::read_local_doc` lê snapshot/outbox locais sem abrir handles nem entrar em rooms históricas; a admissão respeita o limite antes da leitura.
+- Materialização de anexos resolve a referência `pending://` tanto no trailer comum quanto no atributo XML `image` de Appshots, preservando o escape XML do path de destino. O mesmo contrato vale para Run e Steer.
+
 - `GenerateCommitMessage` autoriza o checkout pelo mesmo gate de Changes, captura só `git diff --cached` via `ProcessRunner` (sem ext-diff/textconv, teto 46.000 bytes com truncagem declarada) e executa geração isolada em diretório temporário, read-only, sem Workers MCP ou resume. Usa o harness de títulos se habilitado/suportado, senão Claude Code/Codex habilitado, com o modelo econômico existente. Budget total de 90s inclui captura/catalog/model; resposta JSON subject/body validada, teto de saída 16 KiB no coletor compartilhado com recap. Não escreve em Git, Chat Transcript ou Run Journal.
 
 - O catálogo `Repos::refs` exclui `HEAD` remoto, preservando branches locais/remotas normais e a marcação da branch padrão pelo destino de `origin/HEAD`.
@@ -27,6 +33,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - **Boot recovery não liga a room de todo Chat journalado.** `sweep_abandoned_streams` lê o snapshot local (`peek_needs_abandoned_recovery`) e só chama `open()` — que faz join WS/HTTP — quando este device deixou uma entry assistant `streaming`. O peek não deve abrir handles nem iniciar rede; regressão em `doc_host::tests::peek_does_not_open_a_handle_and_skips_settled_snapshots`. `recover_stale` continua abrindo só os journals sem `Done`.
 - **`raise_nofile_limit`** sobe o soft `RLIMIT_NOFILE` até o hard max no start do binário, antes do gpui. O teto de dials concorrentes mora em `zeron-sync`.
 - `EngineChatSink` só persiste cursor de row cuja história causal foi aplicada. Import com dependências pendentes pede checkpoint ao cliente; checkpoint incompleto falha sem gravar cursor. Operações estacionadas pelo Loro não entram no snapshot, então cursor contíguo da room sozinho não prova durabilidade.
+- Publicação chat2 tem outbox durável por Chat: o `EngineChatSink` recarrega batches estáveis após eviction/restart, ACK só aposenta o batch depois de apagar o registro SQLite e rejeições permanentes sobrevivem até um checkpoint que cubra sua frontier. A subscription local é instalada antes do join e mantém o journal durante `disconnect_edge`; updates legacy são quebrados em rows limitadas no primeiro bootstrap.
 
 - `respond_input` enfileira `InputResolved` com as respostas antes de liberar o runtime; a resolução órfã grava as mesmas respostas no documento antes de retomar o Chat.
 
@@ -105,6 +112,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/change_requests.rs` (cache, backoff e classificação de provider) | unit | `cargo test -p zeron-engine change_requests` |
 | `src/fd_limit.rs` + peek de recovery em `doc_host` | unit | `cargo test -p zeron-engine --lib fd_limit` · `cargo test -p zeron-engine --lib doc_host::tests` |
 | `src/chat2_host.rs` (dependências causais, snapshot e reinício) | unit — Loro + SQLite reais | `cargo test -p zeron-engine --lib chat2_host` |
+| `src/chat2_host.rs` + `tests/session_publication.rs` (outbox, replay, checkpoint rejection) | unit / integration — SQLite/Loro temporários | `cargo test -p zeron-engine --test session_publication` |
 | `src/workspace_files.rs` + `tests/workspace_files.rs` + `tests/workspace_files_mutations.rs` + `tests/workspace_files_hardening.rs` + Files em `tests/device_routing.rs` | unit / integration — filesystem temporário, memória, mutação RPC, hardening (copy sem apagar dest alheio, rename/move sem overwrite, teto de profundidade, nomes Windows) e relay entre engines | `cargo test -p zeron-engine workspace_files` · `cargo test -p zeron-engine --test workspace_files_mutations` · `cargo test -p zeron-engine --test workspace_files_hardening` · `cargo test -p zeron-engine --test device_routing workspace_file_surface` |
 | `src/commit_message.rs` + `recap::collect_isolated_text` | unit — staged real, isolamento, JSON inválido, limites e ausência de mutação; gate RPC em `tests/source_control_hardening.rs` é integration | `cargo test -p zeron-engine commit_message` · `cargo test -p zeron-engine recap` |
 | `src/process.rs` (teto de saída, kill, spawn) | unit | `cargo test -p zeron-engine process::` |

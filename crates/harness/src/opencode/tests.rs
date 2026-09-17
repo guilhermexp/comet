@@ -109,7 +109,7 @@ fn variants_only_ride_models_that_advertise_them() {
 fn prompt_body_carries_model_variant_and_attachments() {
     let body = prompt_body(
         "hello",
-        &Some(("anthropic".into(), "claude-opus-5".into())),
+        Some(("anthropic", "claude-opus-5")),
         Some("high"),
         &["/tmp/shot.png".to_owned()],
     );
@@ -121,6 +121,149 @@ fn prompt_body_carries_model_variant_and_attachments() {
     assert_eq!(body["parts"][1]["type"], "file");
     assert_eq!(body["parts"][1]["mime"], "image/png");
     assert_eq!(body["parts"][1]["url"], "file:///tmp/shot.png");
+}
+
+#[test]
+fn v2_catalog_and_frames_use_the_v1_event_shape() {
+    let catalog = catalog_from_v2_models(&json!({
+        "data": [{
+            "providerID": "anthropic",
+            "id": "claude-opus-5",
+            "name": "Claude Opus 5",
+            "variants": [{"id": "high"}],
+        }]
+    }));
+    let models = models_from_providers(&catalog);
+    assert_eq!(models[0].id, "anthropic/claude-opus-5");
+    assert_eq!(
+        pick_variant(
+            &catalog,
+            "anthropic",
+            "claude-opus-5",
+            Some(ReasoningLevel::High)
+        ),
+        Some("high".into())
+    );
+
+    let mut tools = HashMap::new();
+    let started = normalize_v2_frame(
+        json!({
+            "type": "session.execution.started",
+            "data": {"sessionID": "ses", "assistantMessageID": "msg"}
+        }),
+        &mut tools,
+    );
+    assert_eq!(started[0]["type"], "session.status");
+    let delta = normalize_v2_frame(
+        json!({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses", "assistantMessageID": "msg", "ordinal": 0,
+                "delta": "hello"
+            }
+        }),
+        &mut tools,
+    );
+    assert_eq!(delta[0]["type"], "message.part.delta");
+    assert_eq!(delta[0]["properties"]["delta"], "hello");
+    let end = normalize_v2_frame(
+        json!({
+            "type": "session.execution.succeeded",
+            "data": {"sessionID": "ses"}
+        }),
+        &mut tools,
+    );
+    assert_eq!(end[0]["type"], "session.idle");
+}
+
+#[test]
+fn v2_tool_call_ids_are_scoped_and_errors_are_visible() {
+    let mut tools = HashMap::new();
+    let input = json!({
+        "type": "session.tool.input.started",
+        "data": {
+            "sessionID": "ses", "assistantMessageID": "msg", "id": "call", "name": "bash"
+        }
+    });
+    let started = normalize_v2_frame(input, &mut tools);
+    assert_eq!(started[0]["properties"]["part"]["tool"], "bash");
+    let called = normalize_v2_frame(
+        json!({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses", "assistantMessageID": "msg", "id": "call",
+                "input": {"command": "echo hi"}
+            }
+        }),
+        &mut tools,
+    );
+    assert_eq!(
+        called[0]["properties"]["part"]["state"]["status"],
+        "running"
+    );
+    let failed = normalize_v2_frame(
+        json!({
+            "type": "session.execution.failed",
+            "data": {
+                "sessionID": "ses", "error": {"type": "provider.auth", "message": ""}
+            }
+        }),
+        &mut tools,
+    );
+    assert_eq!(failed[0]["type"], "session.error");
+    assert_eq!(
+        failed[0]["properties"]["error"]["data"]["message"],
+        "provider.auth"
+    );
+}
+
+#[test]
+fn v2_model_list_folds_enabled_variants_into_the_provider_catalog() {
+    let catalog = catalog_from_v2_models(&json!({
+        "data": [
+            {
+                "providerID": "opencode",
+                "id": "muse-spark",
+                "name": "Muse Spark",
+                "variants": [{"id": "low"}, {"id": "high"}],
+                "enabled": true
+            },
+            {"providerID": "opencode", "id": "plain", "enabled": true},
+            {"providerID": "dead", "id": "off", "enabled": false}
+        ]
+    }));
+    let models = models_from_providers(&catalog);
+    assert_eq!(models.len(), 2);
+    let muse = models
+        .iter()
+        .find(|model| model.id == "opencode/muse-spark")
+        .expect("muse model");
+    assert_eq!(muse.label, "Muse Spark");
+    assert_eq!(
+        muse.reasoning_levels,
+        vec![ReasoningLevel::Low, ReasoningLevel::High]
+    );
+    assert_eq!(
+        pick_variant(
+            &catalog,
+            "opencode",
+            "muse-spark",
+            Some(ReasoningLevel::High)
+        )
+        .as_deref(),
+        Some("high")
+    );
+    assert!(models.iter().all(|model| model.id != "dead/off"));
+}
+
+#[test]
+fn prompt_body_v2_carries_text_and_files_only() {
+    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()]);
+    assert_eq!(body["text"], "hello");
+    assert_eq!(body["files"][0]["uri"], "file:///tmp/shot.png");
+    assert_eq!(body["files"][0]["name"], "shot.png");
+    assert!(body.get("model").is_none());
+    assert!(body.get("parts").is_none());
 }
 
 fn feed_with_assistant(message: &str) -> SessionFeed {

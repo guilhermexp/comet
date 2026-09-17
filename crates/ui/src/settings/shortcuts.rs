@@ -8,6 +8,9 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::appshots::{AppshotCapabilities, AppshotDestination};
+#[path = "appshots.rs"]
+mod appshots_page;
 use crate::settings::{KeymapConfig, ShortcutId, combo_from_keystroke, display_combo};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -37,9 +40,16 @@ pub fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> R
 pub enum ShortcutsEvent {
     /// The keymap changed — persist + re-apply.
     Changed(KeymapConfig),
+    AppshotsChanged {
+        enabled: bool,
+        sound_enabled: bool,
+        destination: AppshotDestination,
+    },
 }
 
 pub struct ShortcutsPage {
+    pub(super) appshots_page: bool,
+    pub(super) appshots_focus_pending: bool,
     /// Working copy (kept in sync with the shell via `Changed` events).
     keymap: KeymapConfig,
     recording: Option<ShortcutId>,
@@ -47,6 +57,12 @@ pub struct ShortcutsPage {
     /// conflicts never persist; they're refused at record time, as in zeron.
     conflict_notice: Option<SharedString>,
     focus: FocusHandle,
+    pub(super) appshots_enabled: bool,
+    pub(super) appshot_sound_enabled: bool,
+    pub(super) appshot_destination: AppshotDestination,
+    pub(super) appshot_capabilities: AppshotCapabilities,
+    pub(super) capture_access_prompted: bool,
+    pub(super) semantic_access_prompted: bool,
     // The page never talks RPC; state is kept for parity with sibling pages
     // (and future per-device keymaps).
     _state: Entity<AppState>,
@@ -55,19 +71,54 @@ pub struct ShortcutsPage {
 impl EventEmitter<ShortcutsEvent> for ShortcutsPage {}
 
 impl ShortcutsPage {
-    pub fn new(state: Entity<AppState>, keymap: KeymapConfig, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        keymap: KeymapConfig,
+        appshots_enabled: bool,
+        appshot_sound_enabled: bool,
+        appshot_destination: AppshotDestination,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.on_release(|_, _| crate::appshots::set_recording(false))
+            .detach();
         Self {
+            appshots_page: false,
+            appshots_focus_pending: false,
             keymap,
             recording: None,
             conflict_notice: None,
             focus: cx.focus_handle(),
+            appshots_enabled,
+            appshot_sound_enabled,
+            appshot_destination,
+            appshot_capabilities: crate::appshots::capabilities(),
+            capture_access_prompted: false,
+            semantic_access_prompted: false,
             _state: state,
+        }
+    }
+
+    pub fn show_appshots(&mut self, appshots: bool) {
+        if self.appshots_page != appshots {
+            self.recording = None;
+            crate::appshots::set_recording(false);
+            self.conflict_notice = None;
+            self.appshots_page = appshots;
+            self.appshots_focus_pending = appshots;
         }
     }
 
     fn commit(&mut self, cx: &mut Context<Self>) {
         cx.emit(ShortcutsEvent::Changed(self.keymap.clone()));
         cx.notify();
+    }
+
+    pub(super) fn commit_appshots(&self, cx: &mut Context<Self>) {
+        cx.emit(ShortcutsEvent::AppshotsChanged {
+            enabled: self.appshots_enabled,
+            sound_enabled: self.appshot_sound_enabled,
+            destination: self.appshot_destination,
+        });
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -84,10 +135,21 @@ impl ShortcutsPage {
         ) {
             RecordOutcome::Cancelled => {
                 self.recording = None;
+                crate::appshots::set_recording(false);
                 cx.notify();
             }
             RecordOutcome::Ignored => {}
             RecordOutcome::Set(combo) => {
+                if recording == ShortcutId::CaptureAppshot
+                    && crate::appshots::validate_shortcut(&combo).is_err()
+                {
+                    self.conflict_notice = Some("Use a modified key combination.".into());
+                    self.recording = None;
+                    crate::appshots::set_recording(false);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 // A combo already bound elsewhere is REFUSED, naming the owner
                 // (zeron settings.shortcuts.tsx: "… is already assigned to …").
                 if let Some(owner) = conflict_owner(&self.keymap, recording, &combo) {
@@ -100,10 +162,12 @@ impl ShortcutsPage {
                         .into(),
                     );
                     self.recording = None;
+                    crate::appshots::set_recording(false);
                     cx.notify();
                 } else {
                     self.keymap.set(recording, combo);
                     self.recording = None;
+                    crate::appshots::set_recording(false);
                     self.conflict_notice = None;
                     self.commit(cx);
                 }
@@ -125,7 +189,7 @@ impl ShortcutsPage {
         recording: Option<ShortcutId>,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> impl IntoElement {
         let combo = self.keymap.get(id).to_string();
         let is_recording = recording == Some(id);
         let non_default = combo != id.default_combo();
@@ -212,12 +276,69 @@ impl ShortcutsPage {
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.recording = Some(id);
+                        if id == ShortcutId::CaptureAppshot {
+                            crate::appshots::set_recording(true);
+                        }
                         this.conflict_notice = None;
                         window.focus(&this.focus, cx);
                         cx.notify();
                     }))
                     .child(chip_text),
             )
+    }
+
+    pub(super) fn render_binding_control(
+        &self,
+        id: ShortcutId,
+        ix: usize,
+        recording: Option<ShortcutId>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let combo = self.keymap.get(id).to_string();
+        let is_recording = recording == Some(id);
+        let chip_text: SharedString = if is_recording {
+            "Press keys…".into()
+        } else {
+            display_combo(&combo).into()
+        };
+        div()
+            .id(("shortcut-combo", ix))
+            .min_w(px(96.0))
+            .px(px(12.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .border_1()
+            .flex()
+            .justify_center()
+            .font_family(theme.font_mono.clone())
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .map(|el| {
+                if is_recording {
+                    el.border_color(theme.text.opacity(0.3))
+                        .bg(theme.text)
+                        .text_color(theme.on_solid)
+                } else {
+                    el.border_color(theme.border)
+                        .bg(theme.bg)
+                        .text_color(theme.text)
+                        .hover(|s| {
+                            s.border_color(theme.text.opacity(0.2))
+                                .bg(crate::theme::ink(0.03))
+                        })
+                }
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.recording = Some(id);
+                if id == ShortcutId::CaptureAppshot {
+                    crate::appshots::set_recording(true);
+                }
+                this.conflict_notice = None;
+                window.focus(&this.focus, cx);
+                cx.notify();
+            }))
+            .child(chip_text)
     }
 }
 
@@ -233,15 +354,24 @@ pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Opt
 /// extends the match and appears on the page by construction
 /// (`every_shortcut_lands_in_a_rendered_group` holds the other half: its group
 /// name must be listed here).
-const GROUP_ORDER: [&str; 4] = ["Browser", "Panels", "Sessions", "Jump to session"];
+const GROUP_ORDER: [&str; 6] = [
+    "Appshots",
+    "Browser",
+    "Panels",
+    "Sessions",
+    "Projects",
+    "Jump to session",
+];
 
 /// The section a shortcut's row renders under.
 fn group(id: ShortcutId) -> &'static str {
     match id {
+        ShortcutId::CaptureAppshot => "Appshots",
         ShortcutId::BrowserReload => "Browser",
         ShortcutId::ToggleSidebar | ShortcutId::ToggleChanges | ShortcutId::ToggleTerminal => {
             "Panels"
         }
+        ShortcutId::NewProject => "Projects",
         ShortcutId::NewSession
         | ShortcutId::NextSession
         | ShortcutId::PrevSession
@@ -254,11 +384,15 @@ fn group(id: ShortcutId) -> &'static str {
 /// `SHORTCUT_DEFINITIONS` descriptions, verbatim).
 fn description(id: ShortcutId) -> &'static str {
     match id {
+        ShortcutId::CaptureAppshot => {
+            "Capture the focused application from anywhere on your desktop."
+        }
         ShortcutId::BrowserReload => "Reload the focused browser tab.",
         ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
         ShortcutId::ToggleChanges => "Show or hide changes for the current session.",
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
         ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
+        ShortcutId::NewProject => "Open the new project dialog.",
         ShortcutId::NextSession => "Select the next session in the sidebar, wrapping at the end.",
         ShortcutId::PrevSession => {
             "Select the previous session in the sidebar, wrapping at the start."
@@ -271,8 +405,15 @@ fn description(id: ShortcutId) -> &'static str {
 }
 
 impl Render for ShortcutsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
+        self.appshot_capabilities = crate::appshots::capabilities();
+        if self.appshots_page {
+            if std::mem::take(&mut self.appshots_focus_pending) {
+                window.focus(&self.focus, cx);
+            }
+            return self.render_appshots(cx);
+        }
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
         let customized = self.keymap != KeymapConfig::default();
@@ -392,6 +533,7 @@ impl Render for ShortcutsPage {
                             .child(helper),
                     ),
             )
+            .into_any_element()
     }
 }
 

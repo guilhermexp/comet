@@ -51,7 +51,7 @@ fn state() -> &'static Mutex<Option<MdSelection>> {
 
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
-/// `(key, text)` pairs). Handles either direction; empty slices are skipped.
+/// `(key, text)` pairs). Handles either direction; empty interior lines retain their newline.
 pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, usize)) -> Vec<Span> {
     let (start, end) = if (a.0, a.1) <= (b.0, b.1) {
         (a, b)
@@ -63,7 +63,7 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
         let from = if ei == start.0 { start.1 } else { 0 };
         let to = if ei == end.0 { end.1 } else { text.len() };
         let (from, to) = (from.min(text.len()), to.min(text.len()));
-        if from < to {
+        if from < to || (ei > start.0 && ei < end.0) {
             spans.push(Span {
                 key: (*key).to_string(),
                 range: from..to,
@@ -285,7 +285,7 @@ pub fn set_copy_group(key: &str, group: Option<&str>) {
 fn join_spans(spans: &[Span]) -> String {
     let mut out = String::new();
     let mut previous: Option<&Span> = None;
-    for span in spans.iter().filter(|span| !span.range.is_empty()) {
+    for span in spans {
         if let Some(before) = previous
             && (span.group.is_none() || span.group != before.group)
         {
@@ -402,6 +402,17 @@ pub(crate) mod tests {
         );
         end_active_drag();
         clear_if_owner("a");
+    }
+
+    #[test]
+    fn selection_preserves_blank_code_lines() {
+        let lines = [("a", "first"), ("b", ""), ("c", "last")];
+        let spans = resolve_spans(&lines, (0, 0), (2, 4));
+        assert_eq!(join_spans(&spans), "first\n\nlast");
+        assert_eq!(
+            join_spans(&resolve_spans(&lines, (2, 4), (0, 0))),
+            "first\n\nlast"
+        );
     }
 
     #[test]

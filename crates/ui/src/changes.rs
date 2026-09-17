@@ -84,6 +84,12 @@ pub const SPLIT_MARKER_WIDTH: f32 = 18.0;
 /// Hairline between the two split columns.
 pub const SPLIT_DIVIDER_WIDTH: f32 = 1.0;
 const DIFF_TEXT_SIZE: f32 = 12.0;
+fn diff_text_size(theme: &Theme) -> f32 {
+    DIFF_TEXT_SIZE * theme.code_font_size / crate::typography::CODE_FONT_SIZE_DEFAULT
+}
+fn diff_line_height(theme: &Theme) -> f32 {
+    DIFF_LINE_HEIGHT * theme.code_font_size / crate::typography::CODE_FONT_SIZE_DEFAULT
+}
 
 /// How the diff is laid out. Persisted in `ui-settings.json` (`diffSplit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1093,11 +1099,15 @@ impl DiffRow {
     /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
     /// height sum.
     fn height(self, comments: &[DiffComment]) -> f32 {
+        self.height_with_line_height(comments, DIFF_LINE_HEIGHT)
+    }
+
+    fn height_with_line_height(self, comments: &[DiffComment], line_height: f32) -> f32 {
         match self {
             DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
             DiffRow::Notice { .. } => NOTICE_HEIGHT,
             DiffRow::HunkHeader { .. } => HUNK_HEADER_HEIGHT,
-            DiffRow::Line { .. } | DiffRow::SplitLine { .. } => DIFF_LINE_HEIGHT,
+            DiffRow::Line { .. } | DiffRow::SplitLine { .. } => line_height,
             DiffRow::CommentCard { card, .. } => comments
                 .get(card as usize)
                 .map(|comment| comments::card_height(&comment.body))
@@ -1404,6 +1414,7 @@ struct CommentDraft {
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
+    typography_generation: u32,
     state: Entity<AppState>,
     /// Workers right-pane context. When present, diff/branch RPCs target this
     /// checkout directly instead of consulting the selected Orchestrator chat.
@@ -1478,6 +1489,7 @@ impl Changes {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
         let mode = DiffMode::from_split(crate::settings::current(cx).diff_split);
         Self {
+            typography_generation: crate::typography::generation(cx),
             state,
             explicit_cwd: None,
             mode,
@@ -2113,7 +2125,7 @@ impl Changes {
                 // render.
                 changes
                     .list
-                    .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+                    .reset_with_uniform_height(rows.len(), px(diff_line_height(Theme::of(cx))));
                 changes.rows = rows;
                 changes.row_ranges = ranges;
                 changes.parsed = Some(ParsedDiff {
@@ -2178,12 +2190,17 @@ impl Changes {
         let Some(file) = parsed.files.get(file_ix) else {
             return;
         };
-        let expanded_height = body_height_with(
+        let comments = self.comments_for(&file.path, cx);
+        let expanded_height: f32 = body_rows(
+            0,
             file,
-            &self.comments_for(&file.path, cx),
+            &comments,
             self.draft_anchor_in(&file.path),
             self.mode,
-        );
+        )
+        .into_iter()
+        .map(|row| row.height_with_line_height(&comments, diff_line_height(Theme::of(cx))))
+        .sum();
         let fold = self.folds.entry(file.path.clone()).or_default();
         let currently_collapsed = fold.collapsed;
         fold.from = if currently_collapsed {
@@ -2388,7 +2405,7 @@ impl Changes {
             |ix| collapsed.get(ix).copied().unwrap_or(false),
         );
         self.list
-            .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+            .reset_with_uniform_height(rows.len(), px(diff_line_height(Theme::of(cx))));
         self.rows = rows;
         self.row_ranges = ranges;
         if let Some(start) = anchor_file
@@ -3003,7 +3020,7 @@ impl Changes {
                     (Some(cell), None) => cell.into_any_element(),
                     (None, _) => split_filler().into_any_element(),
                 };
-                split_row(left, right).into_any_element()
+                split_row(left, right, &theme).into_any_element()
             }
             DiffRow::CommentCard { file, card } => {
                 let Some(file_diff) = files.get(file as usize) else {
@@ -3939,7 +3956,7 @@ fn diff_line_row(
         theme,
     );
     div()
-        .h(px(DIFF_LINE_HEIGHT))
+        .h(px(diff_line_height(theme)))
         .w_full()
         .flex_none()
         .flex()
@@ -3977,7 +3994,7 @@ fn diff_line_row(
                 .flex_none()
                 .flex()
                 .justify_center()
-                .text_size(px(DIFF_TEXT_SIZE))
+                .text_size(px(diff_text_size(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
                 .child(SharedString::from(marker)),
@@ -3989,7 +4006,7 @@ fn diff_line_row(
                 .overflow_hidden()
                 .pl(px(12.0))
                 .font_family(theme.font_mono.clone())
-                .text_size(px(DIFF_TEXT_SIZE))
+                .text_size(px(diff_text_size(theme)))
                 .whitespace_nowrap()
                 .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
         )
@@ -4001,7 +4018,7 @@ fn diff_line_row(
 /// mode it spans both halves.
 fn meta_line_row(text: &str, theme: &Theme, pad_left: f32) -> AnyElement {
     div()
-        .h(px(DIFF_LINE_HEIGHT))
+        .h(px(diff_line_height(theme)))
         .w_full()
         .flex_none()
         .flex()
@@ -4108,7 +4125,7 @@ fn split_line_cell(
                 .flex_none()
                 .flex()
                 .justify_center()
-                .text_size(px(DIFF_TEXT_SIZE))
+                .text_size(px(diff_text_size(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
                 .child(SharedString::from(marker)),
@@ -4120,7 +4137,7 @@ fn split_line_cell(
                 .overflow_hidden()
                 .pl(px(6.0))
                 .font_family(theme.font_mono.clone())
-                .text_size(px(DIFF_TEXT_SIZE))
+                .text_size(px(diff_text_size(theme)))
                 .whitespace_nowrap()
                 .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
         )
@@ -4138,9 +4155,9 @@ fn split_filler() -> gpui::Div {
 }
 
 /// Compose the two halves with the centre hairline.
-fn split_row(left: AnyElement, right: AnyElement) -> gpui::Div {
+fn split_row(left: AnyElement, right: AnyElement, theme: &Theme) -> gpui::Div {
     div()
-        .h(px(DIFF_LINE_HEIGHT))
+        .h(px(diff_line_height(theme)))
         .w_full()
         .flex_none()
         .flex()
@@ -4497,14 +4514,14 @@ fn render_file_body_upto(
                             break 'build;
                         }
                         children.push(diff_line_row(line, spans_for(line), theme, gutter_px));
-                        y += DIFF_LINE_HEIGHT;
+                        y += diff_line_height(theme);
                     }
                 }
                 DiffMode::Split => {
                     // Pair only what the clip can still reveal: the unified
                     // arm breaks out of a lazy walk, so the split arm must not
                     // materialize the whole hunk first.
-                    let budget = ((max_px - y) / DIFF_LINE_HEIGHT).ceil().max(0.0) as usize;
+                    let budget = ((max_px - y) / diff_line_height(theme)).ceil().max(0.0) as usize;
                     for (left, right) in split_pairs_upto(&hunk.lines, budget) {
                         if y >= max_px {
                             break 'build;
@@ -4533,11 +4550,10 @@ fn render_file_body_upto(
                                 theme,
                                 2.0 * (ACCENT_BAR_WIDTH + gutter_px),
                             ),
-                            None => {
-                                split_row(cell(left, true), cell(right, false)).into_any_element()
-                            }
+                            None => split_row(cell(left, true), cell(right, false), theme)
+                                .into_any_element(),
                         });
-                        y += DIFF_LINE_HEIGHT;
+                        y += diff_line_height(theme);
                     }
                 }
             }
@@ -4555,6 +4571,11 @@ fn render_file_body_upto(
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
+        let generation = crate::typography::generation(cx);
+        if self.typography_generation != generation {
+            self.list.remeasure();
+            self.typography_generation = generation;
+        }
         // The pane's own options row, under the shell's surface-tab strip:
         // scope dropdown, base-ref selector, split toggle, fold-all. It sits
         // above every state (History included) — without it a History pane

@@ -45,14 +45,30 @@ pub fn plan_turn_steps(
     if last_text <= last_tool {
         return None;
     }
+    // Generated images are transcript output, not tool activity. Keep an
+    // image outside the folded prefix even when a text part follows it; a
+    // final image must remain visible as the run's output.
+    let split_before_part = parts
+        .iter()
+        .position(|part| matches!(part, MessagePart::Image { .. }))
+        .filter(|image| *image < last_text)
+        .unwrap_or(last_text);
+    // A fold with no children would hide the boundary without summarizing
+    // any activity. This happens when the generated image is the first part;
+    // leave the whole settled turn expanded in that case.
+    if split_before_part == 0 {
+        return None;
+    }
+
     let prefix = &parts[..last_text];
     if prefix.iter().any(is_unsettled_part) {
         return None;
     }
+    let folded_prefix = &parts[..split_before_part];
 
     Some(TurnStepsPlan {
-        split_before_part: last_text,
-        summary: turn_summary(prefix),
+        split_before_part,
+        summary: turn_summary(folded_prefix),
     })
 }
 
@@ -71,7 +87,7 @@ fn is_visible_part(part: &MessagePart) -> bool {
         MessagePart::Text { text, .. }
         | MessagePart::Reasoning { text, .. }
         | MessagePart::Error { message: text, .. } => !text.trim().is_empty(),
-        MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
+        MessagePart::Image { .. } | MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
         MessagePart::WorkflowTask { .. } => false,
     }
 }
@@ -90,6 +106,7 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
         MessagePart::Reasoning { .. }
         | MessagePart::Text { .. }
         | MessagePart::Error { .. }
+        | MessagePart::Image { .. }
         | MessagePart::WorkflowTask { .. } => false,
     }
 }
@@ -399,6 +416,60 @@ mod tests {
 
         let plan = plan_turn_steps(&parts, Some(MessageStatus::Complete)).unwrap();
         assert_eq!(plan.split_before_part, 3);
+    }
+
+    fn image(id: &str) -> MessagePart {
+        MessagePart::Image {
+            id: id.into(),
+            path: "/tmp/generated.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn generated_image_stays_after_the_fold_when_it_precedes_more_activity() {
+        let parts = vec![
+            tool("read", read("src/lib.rs"), true),
+            image("image"),
+            tool("exec", exec("cargo test"), true),
+            text("answer", "The issue is fixed."),
+        ];
+
+        let plan = plan_turn_steps(&parts, Some(MessageStatus::Complete)).unwrap();
+        assert_eq!(plan.split_before_part, 1);
+        assert_eq!(plan.summary, "1 read");
+    }
+
+    #[test]
+    fn generated_image_as_the_first_part_does_not_create_an_empty_fold() {
+        let parts = vec![
+            image("image"),
+            tool("read", read("src/lib.rs"), true),
+            text("answer", "The issue is fixed."),
+        ];
+
+        assert_eq!(plan_turn_steps(&parts, Some(MessageStatus::Complete)), None);
+    }
+
+    #[test]
+    fn generated_image_after_the_answer_stays_outside_the_fold() {
+        let parts = vec![
+            tool("read", read("src/lib.rs"), true),
+            text("answer", "The issue is fixed."),
+            image("image"),
+        ];
+
+        let plan = plan_turn_steps(&parts, Some(MessageStatus::Complete)).unwrap();
+        assert_eq!(plan.split_before_part, 1);
+        assert_eq!(plan.summary, "1 read");
+    }
+
+    #[test]
+    fn generated_image_as_the_final_output_without_text_stays_visible() {
+        let parts = vec![tool("read", read("src/lib.rs"), true), image("image")];
+
+        assert_eq!(plan_turn_steps(&parts, Some(MessageStatus::Complete)), None);
     }
 
     #[test]

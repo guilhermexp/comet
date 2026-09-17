@@ -31,6 +31,32 @@ use zeron_rpc::methods;
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
 
+/// Keep a nested setting open while the pointer crosses the small gap toward
+/// its child card. The corridor widens by eight pixels at each child edge so
+/// diagonal movement does not dismiss the menu halfway through.
+fn submenu_corridor(
+    origin: gpui::Point<gpui::Pixels>,
+    pointer: gpui::Point<gpui::Pixels>,
+    submenu: gpui::Bounds<gpui::Pixels>,
+    on_left: bool,
+) -> bool {
+    let edge = if on_left {
+        submenu.right()
+    } else {
+        submenu.left()
+    };
+    let direction = if on_left { -1.0 } else { 1.0 };
+    let distance = f32::from(edge - origin.x) * direction;
+    let advance = f32::from(pointer.x - origin.x) * direction;
+    if distance <= 0.0 || advance <= 0.0 || advance > distance + 8.0 {
+        return false;
+    }
+    let fraction = (advance / distance).min(1.0);
+    let top = origin.y + (submenu.top() - px(8.0) - origin.y) * fraction;
+    let bottom = origin.y + (submenu.bottom() + px(8.0) - origin.y) * fraction;
+    pointer.y >= top && pointer.y <= bottom
+}
+
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
@@ -520,6 +546,27 @@ pub struct RepoTarget {
 pub(crate) struct ReturnComposerFocus;
 impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelSetting {
+    Reasoning,
+    Option(String),
+}
+
+#[derive(Clone)]
+struct SettingChoice {
+    label: String,
+    reasoning: Option<ReasoningLevel>,
+    value: String,
+    selected: bool,
+    default: bool,
+}
+
+struct SettingGroup {
+    id: ModelSetting,
+    label: String,
+    choices: Vec<SettingChoice>,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -539,6 +586,13 @@ pub struct Pickers {
     /// The harness/model picker's rail selection (favorites vs the effective
     /// harness's list). Re-primed on every open.
     model_rail: ModelRail,
+    /// Nested reasoning/model-option menu currently open from the traits tray.
+    setting_menu: Option<ModelSetting>,
+    setting_active: usize,
+    setting_on_left: bool,
+    setting_intent_origin: Option<gpui::Point<gpui::Pixels>>,
+    setting_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    setting_scroll: gpui::ScrollHandle,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     refs: Loadable<Vec<RepoRef>>,
@@ -589,7 +643,7 @@ pub struct Pickers {
 
 impl Pickers {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| ComposerInput::new("Search…", cx));
+        let search = cx.new(|cx| ComposerInput::with_context("Search…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => {
                 // Typing in a filter resets the highlight to the top of the
@@ -604,6 +658,9 @@ impl Pickers {
                         this.active = 0;
                     }
                     if this.open_kind() == Some(PickerKind::HarnessModel) {
+                        this.setting_menu = None;
+                        this.setting_intent_origin = None;
+                        this.setting_bounds = None;
                         this.active = 0;
                         this.model_scroll_base().set_offset(gpui::Point::default());
                     }
@@ -646,6 +703,9 @@ impl Pickers {
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
                 this.refs_key = None;
+                this.setting_menu = None;
+                this.setting_intent_origin = None;
+                this.setting_bounds = None;
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
@@ -714,6 +774,12 @@ impl Pickers {
             draft_owner,
             open,
             model_rail: ModelRail::default(),
+            setting_menu: None,
+            setting_active: 0,
+            setting_on_left: false,
+            setting_intent_origin: None,
+            setting_bounds: None,
+            setting_scroll: gpui::ScrollHandle::new(),
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             refs: Loadable::Idle,
@@ -932,6 +998,9 @@ impl Pickers {
 
     /// Outside clicks and navigation keep focus at the clicked destination.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.setting_menu = None;
+        self.setting_intent_origin = None;
+        self.setting_bounds = None;
         self.model_bar = popover::MenuScrollbarState::default();
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
@@ -981,6 +1050,11 @@ impl Pickers {
             }
             cx.notify();
             return;
+        }
+        if kind != PickerKind::HarnessModel {
+            self.setting_menu = None;
+            self.setting_intent_origin = None;
+            self.setting_bounds = None;
         }
         self.open.open(kind);
         // Clearing stale text emits Edited AFTER this function returns —
@@ -1657,6 +1731,8 @@ impl Pickers {
     }
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+        self.setting_menu = None;
+        self.setting_intent_origin = None;
         // The card stays open on a pick (user request): model and traits
         // share one popover now, and adjusting the tray right after choosing
         // a model is the expected flow. Esc, click-out, or the chip close it.
@@ -1934,7 +2010,15 @@ impl Pickers {
 
     /// Enter on the harness/model popover: pick the highlighted model.
     fn activate_model_row(&mut self, cx: &mut Context<Self>) {
-        self.activate_model_index(self.active, cx);
+        if self.setting_menu.is_some() {
+            self.activate_setting_choice(cx);
+        } else if let Some(index) = self.active.checked_sub(self.model_rows_len(cx)) {
+            if let Some(group) = self.setting_groups(cx).get(index) {
+                self.open_setting(group.id.clone(), cx);
+            }
+        } else {
+            self.activate_model_index(self.active, cx);
+        }
     }
 
     /// Pick the visible row at `ix` — a foreign-harness row (favorites /
@@ -2348,7 +2432,7 @@ impl Pickers {
                 // stopping short of the edges read as a mistake.
                 div()
                     .my(px(2.0))
-                    .mx(px(-4.0))
+                    .mx(px(-popover::CARD_INSET))
                     .h(px(1.0))
                     .flex_none()
                     .bg(theme.border.opacity(0.6)),
@@ -2380,10 +2464,47 @@ impl Pickers {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &Window, cx: &mut Context<Self>) {
         // The frame stays mounted (and possibly focused) through the exit
         // animation — keys must not drive a dying popover.
         if !self.open.is_open() {
+            return;
+        }
+        if self.setting_menu.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" | "left" => {
+                    self.setting_menu = None;
+                    self.setting_intent_origin = None;
+                    self.setting_bounds = None;
+                }
+                "up" | "down" => {
+                    let count = self
+                        .setting_groups(cx)
+                        .into_iter()
+                        .find(|g| Some(&g.id) == self.setting_menu.as_ref())
+                        .map(|g| g.choices.len())
+                        .unwrap_or(0);
+                    self.setting_active = popover::menu_step(
+                        Some(self.setting_active),
+                        count,
+                        if event.keystroke.key == "up" { -1 } else { 1 },
+                    )
+                    .unwrap_or(0);
+                    self.setting_scroll.scroll_to_item(self.setting_active);
+                }
+                "enter" => self.activate_setting_choice(cx),
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if event.keystroke.key == "right"
+            && self.open_kind() == Some(PickerKind::HarnessModel)
+            && self.active >= self.model_rows_len(cx)
+        {
+            self.activate_model_row(cx);
+            cx.stop_propagation();
             return;
         }
         // ⌘1…⌘9 jump-picks the Nth visible model row (t3 modelPickerKeys;
@@ -2402,7 +2523,6 @@ impl Pickers {
             event.keystroke.modifiers.platform,
             event.keystroke.modifiers.control,
         );
-        let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         match key {
             MenuKey::Escape => {
                 self.animate_close(cx);
@@ -2413,11 +2533,11 @@ impl Pickers {
                 let count = match self.open_kind() {
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
                     Some(PickerKind::Checkout) => 2,
-                    // Keyboard nav walks the MODEL list only; the traits
-                    // chips below (reasoning ladder, model options) are
-                    // mouse-only.
-                    Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
-                    Some(PickerKind::Space) => self.filtered_space_rows(cx).len(),
+                    // Continue from model rows into the pinned settings triggers.
+                    Some(PickerKind::HarnessModel) => {
+                        self.model_rows_len(cx) + self.setting_groups(cx).len()
+                    }
+                    Some(PickerKind::Space) => self.filtered_space_rows(cx).len() + 1,
                     Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
                     None => 0,
                 };
@@ -2434,8 +2554,9 @@ impl Pickers {
                         .scroll_to_item(self.active, gpui::ScrollStrategy::Nearest);
                 }
                 cx.notify();
+                cx.stop_propagation();
             }
-            MenuKey::Enter if !search_focused => {
+            MenuKey::Enter | MenuKey::ModEnter => {
                 if self.open_kind() == Some(PickerKind::HarnessModel) {
                     self.activate_model_row(cx);
                 } else if self.open_kind() == Some(PickerKind::Checkout) {
@@ -2448,6 +2569,7 @@ impl Pickers {
                 } else {
                     self.on_search_submit(cx);
                 }
+                cx.stop_propagation();
             }
             _ => {}
         }
@@ -2898,12 +3020,21 @@ impl Pickers {
                     }
                 }),
             )
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.dismiss(cx);
-                if this.focus.contains_focused(window, cx) {
-                    window.blur();
-                }
-            }))
+            .on_mouse_down_out(
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    if this.setting_menu.is_some()
+                        && this
+                            .setting_bounds
+                            .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
+                    this.dismiss(cx);
+                    if this.focus.contains_focused(window, cx) {
+                        window.blur();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .child(content)
@@ -2936,12 +3067,21 @@ impl Pickers {
                     }
                 }),
             )
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.dismiss(cx);
-                if this.focus.contains_focused(window, cx) {
-                    window.blur();
-                }
-            }))
+            .on_mouse_down_out(
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    if this.setting_menu.is_some()
+                        && this
+                            .setting_bounds
+                            .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
+                    this.dismiss(cx);
+                    if this.focus.contains_focused(window, cx) {
+                        window.blur();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .child(content)
@@ -3960,118 +4100,300 @@ impl Pickers {
         div().pb(px(2.0)).child(el).into_any_element()
     }
 
-    /// The traits dropdown body (t3code TraitsPicker): the reasoning ladder
-    /// plus every advertised model option as headed sections of menu ROWS —
-    /// label, a "Default" badge on the section's default choice, and the
-    /// trailing check on the selected row. Sections split by hairline
-    /// separators. Selecting keeps the menu open for multi-adjust.
+    fn setting_groups(&self, cx: &App) -> Vec<SettingGroup> {
+        let mut groups = Vec::new();
+        let levels = self.trait_ladder(cx);
+        if !levels.is_empty() {
+            let selected = self.effective_reasoning(cx);
+            let default = default_reasoning(&levels);
+            groups.push(SettingGroup {
+                id: ModelSetting::Reasoning,
+                label: "Reasoning".into(),
+                choices: levels
+                    .into_iter()
+                    .map(|level| SettingChoice {
+                        label: reasoning_label(level).into(),
+                        value: String::new(),
+                        reasoning: Some(level),
+                        selected: selected == Some(level),
+                        default: default == Some(level),
+                    })
+                    .collect(),
+            });
+        }
+        if let Some(model) = self.selected_model(cx) {
+            let selections = self.explicit_options(cx);
+            for option in &model.options {
+                if option.choices.is_empty() {
+                    continue;
+                }
+                let selected = selections
+                    .get(&option.id)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&option.default_choice);
+                groups.push(SettingGroup {
+                    id: ModelSetting::Option(option.id.clone()),
+                    label: option.label.clone(),
+                    choices: option
+                        .choices
+                        .iter()
+                        .map(|choice| SettingChoice {
+                            label: choice.label.clone(),
+                            value: choice.id.clone(),
+                            reasoning: None,
+                            selected: selected == choice.id,
+                            default: option.default_choice == choice.id,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        groups
+    }
+
+    fn open_setting(&mut self, id: ModelSetting, cx: &mut Context<Self>) {
+        self.setting_active = self
+            .setting_groups(cx)
+            .iter()
+            .find(|g| g.id == id)
+            .and_then(|g| g.choices.iter().position(|c| c.selected))
+            .unwrap_or(0);
+        self.setting_menu = Some(id);
+        self.setting_intent_origin = None;
+        self.setting_bounds = None;
+        self.setting_scroll = gpui::ScrollHandle::new();
+        self.setting_scroll.scroll_to_item(self.setting_active);
+        cx.notify();
+    }
+
+    fn activate_setting_choice(&mut self, cx: &mut Context<Self>) {
+        let Some(group) = self
+            .setting_groups(cx)
+            .into_iter()
+            .find(|g| Some(&g.id) == self.setting_menu.as_ref())
+        else {
+            return;
+        };
+        let Some(choice) = group.choices.get(self.setting_active) else {
+            return;
+        };
+        match group.id {
+            ModelSetting::Reasoning => {
+                if let Some(level) = choice.reasoning {
+                    self.pick_reasoning(level, cx);
+                }
+            }
+            ModelSetting::Option(id) => {
+                self.pick_option(id, choice.value.clone(), choice.default, cx)
+            }
+        }
+        self.setting_menu = None;
+        self.setting_intent_origin = None;
+        self.setting_bounds = None;
+        cx.notify();
+    }
+
+    /// Each model setting gets a compact trigger and its own nested choices.
+    /// This keeps the traits tray bounded while retaining keyboard navigation.
     fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let Some(model) = self.selected_model(cx).cloned() else {
-            return popover::skeleton_menu_rows("traits-skeleton", &theme, 3, cx.entity_id(), cx);
-        };
-        let levels = self.trait_ladder(cx);
-        // Display the effective level (draft pick or the chat's config), so
-        // the ladder check mirrors the chip summary.
-        let current = self.effective_reasoning(cx);
-
-        let mut sections: Vec<AnyElement> = Vec::new();
-        if !levels.is_empty() {
-            let default_level = default_reasoning(&levels);
-            sections.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    // 2px row gap — the menu-column rhythm everywhere else
-                    // (model list, device switcher); without it adjacent
-                    // hover/selected washes fuse into one blob (user report).
-                    .gap(px(2.0))
-                    .child(popover::menu_heading(&theme, "Reasoning"))
-                    .children(levels.into_iter().enumerate().map(|(ix, level)| {
-                        let is_active = current == Some(level);
-                        let is_default = default_level == Some(level);
-                        let mut row =
-                            popover::menu_row(&theme, is_active, format!("trait-reasoning-{ix}"))
-                                .py(px(5.0))
-                                .rounded(px(6.0))
-                                .text_size(px(12.5))
-                                .id(("reasoning-row", ix))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pick_reasoning(level, cx);
-                                }))
-                                .child(SharedString::from(reasoning_label(level)));
-                        row = row.child(div().flex_1());
-                        if is_default {
-                            row = row.child(default_badge(&theme));
+        let base_index = self.model_rows_len(cx);
+        let mut rows = Vec::new();
+        for (ix, group) in self.setting_groups(cx).into_iter().enumerate() {
+            let open = self.setting_menu.as_ref() == Some(&group.id);
+            let value = group
+                .choices
+                .iter()
+                .find(|c| c.selected)
+                .map(|c| c.label.clone())
+                .unwrap_or_default();
+            let id = group.id.clone();
+            let outside_id = id.clone();
+            let exit_id = id.clone();
+            let exit_entity = cx.entity().downgrade();
+            let entity = cx.entity().downgrade();
+            let mut row = popover::menu_row(
+                &theme,
+                open || self.active == base_index + ix,
+                format!("model-setting-{ix}"),
+            )
+            .id(("model-setting", ix))
+            .relative()
+            .h(px(30.0))
+            .py(px(0.0))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.active = base_index + ix;
+                if this.setting_menu.as_ref() == Some(&id) {
+                    this.setting_menu = None;
+                    this.setting_intent_origin = None;
+                    this.setting_bounds = None;
+                } else {
+                    this.open_setting(id.clone(), cx);
+                }
+                window.focus(&this.focus, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_mouse_down_out(
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if this.setting_menu.as_ref() == Some(&outside_id)
+                        && !this
+                            .setting_bounds
+                            .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        this.setting_menu = None;
+                        this.setting_intent_origin = None;
+                        this.setting_bounds = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let left = bounds.right() + px(244.0) > window.viewport_size().width;
+                        let _ = entity.update(cx, |this, cx| {
+                            if this.setting_on_left != left {
+                                this.setting_on_left = left;
+                                cx.notify();
+                            }
+                        });
+                    },
+                    move |trigger, _, window, _| {
+                        if !open {
+                            return;
                         }
-                        row
-                    }))
-                    .into_any_element(),
-            );
-        }
-
-        let selections = self.explicit_options(cx);
-        for (opt_ix, option) in model.options.iter().enumerate() {
-            if !sections.is_empty() {
-                sections.push(popover::menu_separator().into_any_element());
-            }
-            let selected_choice = selections
-                .get(&option.id)
-                .and_then(|v| v.as_str())
-                .unwrap_or(&option.default_choice)
-                .to_string();
-            let option_id = option.id.clone();
-            let default_choice = option.default_choice.clone();
-            sections.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0)) // same rhythm as the Reasoning section above
-                    .child(popover::menu_heading(&theme, &option.label))
-                    .children(
-                        option
-                            .choices
-                            .iter()
-                            .enumerate()
-                            .map(|(choice_ix, choice)| {
-                                let is_active = selected_choice == choice.id;
-                                let choice_id = choice.id.clone();
-                                let option_id = option_id.clone();
-                                let is_default = choice.id == default_choice;
-                                let mut row = popover::menu_row(
-                                    &theme,
-                                    is_active,
-                                    format!("trait-choice-{opt_ix}-{choice_ix}"),
-                                )
-                                .py(px(5.0))
-                                .rounded(px(6.0))
-                                .text_size(px(12.5))
-                                .id(("trait-choice", opt_ix * 32 + choice_ix))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pick_option(
-                                        option_id.clone(),
-                                        choice_id.clone(),
-                                        is_default,
-                                        cx,
-                                    );
-                                }))
-                                .child(SharedString::from(choice.label.clone()));
-                                row = row.child(div().flex_1());
-                                if is_default {
-                                    row = row.child(default_badge(&theme));
+                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            let _ = exit_entity.update(cx, |this, cx| {
+                                if this.setting_menu.as_ref() != Some(&exit_id) {
+                                    return;
                                 }
-                                row
-                            }),
-                    )
-                    .into_any_element(),
+                                let pointer = event.position;
+                                if trigger.contains(&pointer) {
+                                    this.setting_intent_origin = Some(pointer);
+                                    return;
+                                }
+                                let Some(bounds) = this.setting_bounds else {
+                                    return;
+                                };
+                                if bounds.contains(&pointer)
+                                    || this.setting_intent_origin.is_some_and(|origin| {
+                                        submenu_corridor(
+                                            origin,
+                                            pointer,
+                                            bounds,
+                                            this.setting_on_left,
+                                        )
+                                    })
+                                {
+                                    return;
+                                }
+                                this.setting_menu = None;
+                                this.setting_bounds = None;
+                                this.setting_intent_origin = None;
+                                this.active = 0;
+                                cx.notify();
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(SharedString::from(group.label.clone())),
+            )
+            .child(
+                div()
+                    .max_w(px(100.0))
+                    .truncate()
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(value)),
+            )
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted),
             );
+            if open {
+                let entity = cx.entity().downgrade();
+                let menu = popover::popover_card(&theme)
+                    .w(px(232.0))
+                    .relative()
+                    .child(popover::menu_heading(&theme, &group.label))
+                    .child(
+                        div()
+                            .id("model-setting-choices")
+                            .max_h(px(240.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.setting_scroll)
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(group.choices.into_iter().enumerate().map(
+                                |(choice_ix, choice)| {
+                                    popover::menu_row(
+                                        &theme,
+                                        choice_ix == self.setting_active,
+                                        format!("setting-choice-{ix}-{choice_ix}"),
+                                    )
+                                    .id(("setting-choice", choice_ix))
+                                    .h(px(30.0))
+                                    .py(px(0.0))
+                                    .flex_none()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.setting_active = choice_ix;
+                                        this.activate_setting_choice(cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(SharedString::from(choice.label))
+                                    .child(div().flex_1())
+                                    .when(choice.default, |el| el.child(default_badge(&theme)))
+                                    .when(
+                                        choice.selected,
+                                        |el| {
+                                            el.child(
+                                                crate::icons::icon(crate::icons::CHECK)
+                                                    .size(px(14.0))
+                                                    .text_color(theme.text),
+                                            )
+                                        },
+                                    )
+                                },
+                            )),
+                    )
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, cx| {
+                                let _ =
+                                    entity.update(cx, |this, _| this.setting_bounds = Some(bounds));
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    );
+                row = row.child(popover::nested_menu(
+                    format!("setting-menu-{ix}"),
+                    menu.into_any_element(),
+                    self.setting_on_left,
+                ));
+            }
+            rows.push(row);
         }
-
         div()
             .flex()
             .flex_col()
-            .pb(px(2.0))
-            .children(sections)
+            .gap(px(2.0))
+            .py(px(popover::CARD_INSET))
+            .children(rows)
             .into_any_element()
     }
 }

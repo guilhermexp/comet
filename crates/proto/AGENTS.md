@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `GeneratedImage` transporta referência raster (`id`, `path`, `name`, `mimeType`). Paths emitidos pelo runtime são entrada privada da engine: antes de journal/sync ela importa para uploads do perfil. O evento não carrega bytes/base64.
+
 - `GenerateCommitMessageRequest { cwd }` e `GeneratedCommitMessage { message }` são tipos aditivos de rascunho; a mensagem preserva título/corpo com quebras de linha, sem mutação Git implícita.
 
 - `hashline_file_paths` extrai paths únicos de headers canônicos `[PATH#TAG]` (quatro hex maiúsculos), compartilhado pela normalização OMP e recuperação visual de histórico; não interpreta conteúdo de linhas de corpo.

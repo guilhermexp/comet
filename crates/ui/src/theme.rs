@@ -678,8 +678,11 @@ pub struct Theme {
     /// UI font family (bundling of Geist lands with asset work; until then the
     /// text system falls back to the system sans when the family is missing).
     pub font_sans: SharedString,
-    /// Monospace family for code/terminal.
+    /// Selected code/diff family; terminal uses its independent fixed-width family.
     pub font_mono: SharedString,
+    pub font_terminal: SharedString,
+    pub code_font_size: f32,
+    pub terminal_font_size: f32,
     /// Explicit system fallbacks, for callers that want to skip the lookup.
     pub font_sans_fallback: SharedString,
     pub font_mono_fallback: SharedString,
@@ -1033,6 +1036,9 @@ impl Theme {
             flat_shell: false,
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
+            font_terminal: "Geist Mono".into(),
+            code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
+            terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
         }
@@ -1131,6 +1137,9 @@ impl Theme {
             flat_shell: false,
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
+            font_terminal: "Geist Mono".into(),
+            code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
+            terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
         }
@@ -1278,6 +1287,14 @@ impl Theme {
         theme
     }
 
+    fn with_code_typography(mut self, cx: &App) -> Self {
+        self.font_mono = crate::typography::code_effective_family_name(cx);
+        self.font_terminal = crate::typography::terminal_effective_family_name(cx);
+        self.code_font_size = crate::typography::code_font_size(cx);
+        self.terminal_font_size = crate::typography::terminal_font_size(cx);
+        self
+    }
+
     /// Install the theme for `appearance` as the gpui global and point the
     /// context-free paint helpers at it. The **only** way the appearance should
     /// change — setting the global directly leaves [`current_appearance`] stale.
@@ -1291,7 +1308,7 @@ impl Theme {
             .is_some_and(|theme| theme.accent_color != accent);
         set_current_appearance(appearance);
         set_declared_frost_blur(None);
-        cx.set_global(Self::for_preferences(appearance, accent));
+        cx.set_global(Self::for_preferences(appearance, accent).with_code_typography(cx));
         // An accent-only swap leaves CURRENT_APPEARANCE unchanged, but cached
         // resolved colors still need to be discarded for the next frame.
         if accent_changed {
@@ -1346,7 +1363,8 @@ impl Theme {
         cx: &mut App,
     ) {
         let next =
-            Self::for_selection(appearance, variant_id, accent_selection, surface_preference);
+            Self::for_selection(appearance, variant_id, accent_selection, surface_preference)
+                .with_code_typography(cx);
         let changed = cx.try_global::<Theme>().is_some_and(|theme| {
             theme.variant_id != next.variant_id
                 || theme.accent_selection != next.accent_selection

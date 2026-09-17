@@ -642,6 +642,188 @@ async fn models_returns_curated_catalog() {
 }
 
 #[tokio::test]
+async fn resumed_parent_recovers_v1_and_v2_child_owners_without_replaying_chips() {
+    for mode in ["v1", "v2"] {
+        let mut req = request("scenario:resumed-child");
+        req.resume = Some(format!("resume-with-child-{mode}"));
+        let (controls, _steer, _token) = controls("Yes");
+        let events = run_to_end(&harness(), req, controls).await;
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, AgentEvent::ToolCall { call, .. } if call.is_subagent_spawn())
+            )
+        );
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == "spawn-alpha" && matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "resumed alpha")
+        )), "{mode}: {events:?}");
+    }
+}
+
+#[tokio::test]
+async fn v2_lifecycle_reuses_chips_and_reopens_the_same_child_for_followup() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:v2-lifecycle"), controls).await;
+    let spawns: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCall { id, call } if call.is_subagent_spawn() => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spawns, ["spawn-alpha", "spawn-beta"]);
+    let mut alpha_text = String::new();
+    let mut alpha_users = Vec::new();
+    let mut alpha_done = Vec::new();
+    for e in &events {
+        if let AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } = e
+        {
+            assert!(spawns.contains(&parent_tool_use_id.as_str()));
+            if parent_tool_use_id == "spawn-alpha" {
+                match event.as_ref() {
+                    AgentEvent::TextDelta { text } => alpha_text.push_str(text),
+                    AgentEvent::UserMessage { text } => alpha_users.push(text.as_str()),
+                    AgentEvent::Done { status, error, .. } => {
+                        alpha_done.push((*status, error.as_deref()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(alpha_text, "first alpha\n\nsecond alpha\n\n");
+    assert_eq!(alpha_users, ["First assignment"]);
+    assert_eq!(
+        alpha_done,
+        [
+            (DoneStatus::Completed, None),
+            (DoneStatus::Errored, Some("followup failed"))
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn v1_spawns_bind_children_and_controls_do_not_create_agents() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:v1-subagents"), controls).await;
+    let spawns: std::collections::HashSet<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCall { id, call } if call.is_subagent_spawn() => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        spawns,
+        std::collections::HashSet::from(["spawn-alpha", "spawn-beta"])
+    );
+    for e in &events {
+        if let AgentEvent::Subagent {
+            parent_tool_use_id, ..
+        } = e
+        {
+            assert!(spawns.contains(parent_tool_use_id.as_str()), "{e:?}");
+        }
+    }
+    for (owner, text) in [
+        ("spawn-alpha", "alpha answer"),
+        ("spawn-beta", "beta answer"),
+    ] {
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == owner && matches!(event.as_ref(), AgentEvent::TextDelta { text: t } if t == text)
+        )));
+    }
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Subagent { parent_tool_use_id, event }
+        if parent_tool_use_id == "spawn-beta" && matches!(event.as_ref(), AgentEvent::ToolCall { id, .. } if id == "beta-tool")
+    )));
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Subagent { parent_tool_use_id, event }
+        if parent_tool_use_id == "spawn-beta" && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "Also check gamma")
+    )));
+    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::Subagent { event, .. } if matches!(event.as_ref(), AgentEvent::Done { .. }))).count(), 2);
+    let parent: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parent, "parent answer");
+}
+
+#[tokio::test]
+async fn child_identity_survives_early_output_and_later_activity_ids() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:child-identity"), controls).await;
+    let spawn = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCall { id, .. } if id == "spawn-alpha"))
+        .unwrap();
+    let early = events
+        .iter()
+        .position(|e| matches!(e,
+            AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == "spawn-alpha"
+                && matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "early alpha")
+        ))
+        .unwrap();
+    assert!(
+        spawn < early,
+        "the chip must exist before buffered traffic binds"
+    );
+    let mut alpha = String::new();
+    let mut beta = String::new();
+    for e in &events {
+        if let AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } = e
+        {
+            assert!(matches!(
+                parent_tool_use_id.as_str(),
+                "spawn-alpha" | "spawn-beta"
+            ));
+            if let AgentEvent::TextDelta { text } = event.as_ref() {
+                if parent_tool_use_id == "spawn-alpha" {
+                    alpha.push_str(text);
+                } else {
+                    beta.push_str(text);
+                }
+            }
+        }
+    }
+    assert_eq!(alpha, "early alphalater alpha");
+    assert_eq!(beta, "beta outputbeta continues");
+    let parent: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parent, "parent output");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn child_thread_routing_tags_and_never_settles_parent() {
     let (controls, _steer, _token) = controls("Yes");
     let events = run_to_end(&harness(), request("scenario:subagent"), controls).await;

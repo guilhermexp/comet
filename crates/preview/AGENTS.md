@@ -17,6 +17,7 @@ Catálogo, descoberta de listeners/processos, proxy HTTP/WebSocket, multiplexaç
 - O patch licenciado de `rtc-sctp` mantém SCTP + DTLS + UDP/IPv6 dentro de 1280 bytes para não travar em VPN; ver `third_party/rust/PATCHES.md`.
 - RTC transporta bytes HTTP/HMR; PreviewRoom transporta apenas catálogo e sinalização autenticados. Não há fallback TURN.
 - Descoberta roda fora da thread de UI; start é idempotente, stop cancela o serviço e shutdown aguarda tarefas. Novo runtime usa nova instância.
+- Descoberta mantém verdict de HTTP por `(pid, started_at, address)`: listeners confirmados não recebem novo probe a cada ciclo; listeners não-HTTP usam backoff e uma troca de processo/porta invalida o cache. O proxy valida somente o PID e o horário de início antes de conectar. Pairing é refeito a cada 10s enquanto aguarda e um `connect` com nova sessão substitui o peer zumbi.
 
 ## Work Guidance
 
@@ -29,6 +30,7 @@ Preservar limites de frames, backpressure e teardown de peers. Não colocar cred
 | `src/**` | unit | `cargo test -p zeron-preview --lib` |
 | `tests/**` | integration | `cargo test -p zeron-preview --tests` |
 | browser/pairing real | none — BCU e dois devices; fixtures locais não provam rede publicada | ver change OpenSpec |
+| discovery probe cache + same-process guard + peer re-pair | unit / integration | `cargo test -p zeron-preview --lib` · `cargo test -p zeron-preview --test discovery` |
 
 ## Child DOX Index
 

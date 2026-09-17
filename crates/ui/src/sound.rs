@@ -286,3 +286,15 @@ mod tests {
         }
     }
 }
+
+/// Capture sound follows the same Live Voice and user-disable policy as notifications.
+pub fn play_appshot() {
+    if !should_play(Sound::Done) || std::env::var_os(DISABLE_ENV).is_some() {
+        return;
+    }
+    std::thread::spawn(|| {
+        if let Err(error) = play_bytes(include_bytes!("../assets/sounds/appshot.wav")) {
+            tracing::debug!(%error, "capture sound playback failed");
+        }
+    });
+}

@@ -123,6 +123,16 @@ pub(crate) fn pull_request_badge(
     surface: ChangeRequestBadgeSurface,
     theme: &Theme,
 ) -> AnyElement {
+    pull_request_badge_with_query(id, summary, surface, None, theme)
+}
+
+pub(crate) fn pull_request_badge_with_query(
+    id: SharedString,
+    summary: ChangeRequestSummary,
+    surface: ChangeRequestBadgeSurface,
+    query: Option<&str>,
+    theme: &Theme,
+) -> AnyElement {
     let model = ChangeRequestBadgeModel::from_summary(&summary);
     let color = model.tone.color(theme);
     let url = summary.url.clone();
@@ -168,7 +178,7 @@ pub(crate) fn pull_request_badge(
             element.child(
                 div()
                     .font_family(theme.font_mono.clone())
-                    .child(model.number),
+                    .child(crate::popover::search_highlight(model.number, query, theme)),
             )
         })
         .into_any_element()

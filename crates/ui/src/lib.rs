@@ -14,6 +14,7 @@
 
 pub mod app_menus;
 pub mod appearance;
+pub mod appshots;
 pub mod attachments;
 pub mod badges;
 pub mod browser;
@@ -30,6 +31,7 @@ pub mod file_preview;
 pub mod frost;
 pub mod history;
 pub mod icons;
+pub(crate) mod image_media;
 pub mod inline_media;
 #[cfg(debug_assertions)]
 pub mod inspector;
@@ -64,7 +66,7 @@ pub mod workers;
 
 use std::path::PathBuf;
 
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 pub use state::EngineBootConfig;
@@ -153,10 +155,16 @@ pub fn run_app(config: UiConfig) {
         let data_dir = config.boot().data_dir.clone();
         let ui_settings = settings::UiSettings::load(&data_dir);
         settings::init(ui_settings.clone(), data_dir.clone(), cx);
+        appshots::set_enabled(ui_settings.appshots_enabled);
+        appshots::set_capture_sound_enabled(ui_settings.appshot_sound_enabled);
         let font_availability = typography::register_fonts(cx);
         typography::init(
             ui_settings.ui_font_family.clone(),
             ui_settings.ui_font_size,
+            ui_settings.terminal_font_family.clone(),
+            ui_settings.terminal_font_size,
+            ui_settings.code_font_family.clone(),
+            ui_settings.code_font_size,
             font_availability,
             cx,
         );
@@ -243,6 +251,8 @@ pub fn run_app(config: UiConfig) {
             workers_model: workers_model.clone(),
         });
         open_main_window(state, config.boot(), workers_model, cx);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        start_appshot_service(config.boot().data_dir, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -263,7 +273,7 @@ fn open_main_window(
     boot: EngineBootConfig,
     workers_model: gpui::Entity<workers::model::WorkersModel>,
     cx: &mut App,
-) {
+) -> gpui::WindowHandle<shell::Shell> {
     let window_size = if capture::knob("ZERON_DEMO_NARROW").is_some() {
         size(px(900.), px(600.))
     } else {
@@ -309,6 +319,82 @@ fn open_main_window(
     })
     .detach();
     appearance::reapply_window_background(cx);
+    window
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn start_appshot_service(activation_dir: PathBuf, cx: &mut App) {
+    let mut shortcuts = appshots::start_global_shortcut(activation_dir);
+    cx.spawn(async move |cx| {
+        while shortcuts.next().await.is_some() {
+            if !appshots::capture_allowed() {
+                continue;
+            }
+            let Some((target, capture)) = cx.update(start_appshot_capture) else {
+                continue;
+            };
+            let capture = capture.await;
+            while matches!(shortcuts.next().now_or_never(), Some(Some(()))) {}
+            cx.update(|cx| deliver_appshot(target, capture, cx));
+        }
+    })
+    .detach();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn start_appshot_capture(
+    cx: &mut App,
+) -> Option<(
+    Option<String>,
+    gpui::Task<Result<appshots::CapturedAppshot, appshots::CaptureError>>,
+)> {
+    if cx.active_window().is_some() {
+        return None;
+    }
+    let target = cx
+        .window_stack()
+        .unwrap_or_else(|| cx.windows())
+        .into_iter()
+        .find_map(|handle| {
+            let handle = handle.downcast::<shell::Shell>()?;
+            Some(handle.read(cx).ok()?.appshot_target(cx))
+        })?;
+    Some((
+        target,
+        cx.background_executor()
+            .spawn(async { appshots::capture_active_window().await }),
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn deliver_appshot(
+    target: Option<String>,
+    result: Result<appshots::CapturedAppshot, appshots::CaptureError>,
+    cx: &mut App,
+) {
+    let Some(handle) = cx
+        .window_stack()
+        .unwrap_or_else(|| cx.windows())
+        .into_iter()
+        .find_map(|handle| handle.downcast::<shell::Shell>())
+    else {
+        return;
+    };
+    if matches!(
+        result,
+        Err(appshots::CaptureError::Cancelled | appshots::CaptureError::SelfCapture)
+    ) {
+        return;
+    }
+    cx.activate(true);
+    let _ = handle.update(cx, |shell, window, cx| {
+        window.activate_window();
+        match result {
+            Ok(appshot) => shell.receive_appshot_for(target, appshot, window, cx),
+            Err(error) => shell.show_appshot_error(target, error.to_string(), window, cx),
+        }
+    });
+    appshots::foreground_after_capture();
 }
 
 mod surface_chrome;

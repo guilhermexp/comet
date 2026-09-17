@@ -8,7 +8,7 @@ use std::{
 
 use comet_syntax::HighlightedDocument;
 use gpui::{
-    AnyElement, ClipboardItem, Context, EventEmitter, Image, InteractiveElement, IntoElement,
+    AnyElement, App, ClipboardItem, Context, EventEmitter, Image, InteractiveElement, IntoElement,
     ListHorizontalSizingBehavior, ListState, ObjectFit, Render, SharedString, StyledText, Task,
     UniformListScrollHandle, Window, div, font, img, list, prelude::*, px, uniform_list,
 };
@@ -16,7 +16,10 @@ use gpui::{
 use crate::{
     details_sidebar::files_view::material_icon_path,
     file_preview::{
-        loader::{LoadedPreview, PreviewLoadError, load_preview_with_typography},
+        loader::{
+            LoadedPreview, PreviewLoadError, PreviewTypography, find_widest_line_index_with_system,
+            load_preview_with_typography,
+        },
         model::{PreviewDisplayMode, PreviewTabs},
     },
     icons,
@@ -296,7 +299,8 @@ impl FilePreview {
         };
         self.loaded = PreviewLoadState::Loading;
         let font_mono = Theme::of(cx).font_mono.clone();
-        let font_size = px(12.5);
+        let font_size = px(Theme::of(cx).code_font_size);
+        let typography_generation = crate::typography::generation(cx);
         let text_system = cx.text_system().clone();
         let remote = self.remote_sources.get(&context_key).cloned();
         let resource = self
@@ -407,7 +411,12 @@ impl FilePreview {
                     return;
                 }
                 this.loaded = match result {
-                    Ok(preview) => PreviewLoadState::Ready(preview),
+                    Ok(mut preview) => {
+                        if let LoadedPreview::Code { typography, .. } = &mut preview {
+                            typography.generation = typography_generation;
+                        }
+                        PreviewLoadState::Ready(preview)
+                    }
                     Err(error) => PreviewLoadState::Error(load_error_message(&error).into()),
                 };
                 if let PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) = &this.loaded {
@@ -427,6 +436,44 @@ impl FilePreview {
             });
         }));
         cx.notify();
+    }
+
+    /// Re-measure the widest code line only after code typography changes.
+    ///
+    /// The loader measures once in the background. A preview can outlive a
+    /// settings change, though, so the cached line index carries the
+    /// typography key that produced it. Re-shaping is deliberately limited to
+    /// a changed key rather than repeating the scan during every paint.
+    fn refresh_code_width(&mut self, window: &Window, theme: &Theme, cx: &App) {
+        let key = PreviewTypography::new(
+            crate::typography::generation(cx),
+            theme.font_mono.clone(),
+            px(theme.code_font_size),
+        );
+        let Some(lines) = (match &self.loaded {
+            PreviewLoadState::Ready(LoadedPreview::Code {
+                lines, typography, ..
+            }) if *typography != key => Some(lines.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+
+        let widest_line_ix = find_widest_line_index_with_system(
+            lines.as_ref(),
+            window.text_system().as_ref(),
+            &font(key.family.clone()),
+            key.size,
+        );
+        if let PreviewLoadState::Ready(LoadedPreview::Code {
+            widest_line_ix: cached_widest_line_ix,
+            typography,
+            ..
+        }) = &mut self.loaded
+        {
+            *cached_widest_line_ix = widest_line_ix;
+            *typography = key;
+        }
     }
 
     fn render_header(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -581,7 +628,8 @@ impl FilePreview {
             .into_any_element()
     }
 
-    fn render_content(&mut self, window: &mut Window, theme: &Theme) -> AnyElement {
+    fn render_content(&mut self, window: &mut Window, theme: &Theme, cx: &App) -> AnyElement {
+        self.refresh_code_width(window, theme, cx);
         let Some(context_key) = self.active_context.as_deref() else {
             return gpui::Empty.into_any_element();
         };
@@ -648,6 +696,7 @@ impl FilePreview {
                 lines,
                 highlights,
                 widest_line_ix,
+                ..
             }) => {
                 let scroll_handle = self
                     .scroll_handles
@@ -792,7 +841,7 @@ impl Render for FilePreview {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_content(window, &theme)),
+                    .child(self.render_content(window, &theme, cx)),
             )
     }
 }
@@ -910,12 +959,13 @@ fn render_code(
                             &code_theme,
                         );
                         div()
-                            .h(px(20.0))
+                            .h(px(20.0 * code_theme.code_font_size
+                                / crate::typography::CODE_FONT_SIZE_DEFAULT))
                             .min_w_full()
                             .flex()
                             .items_center()
                             .font_family(code_theme.font_mono.clone())
-                            .text_size(px(12.5))
+                            .text_size(px(code_theme.code_font_size))
                             .child(
                                 div()
                                     .w(px(64.0))

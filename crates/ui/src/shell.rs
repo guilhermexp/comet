@@ -72,6 +72,7 @@ use crate::workers::session_gallery;
 use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
 use crate::workers::workspace::{WorkersContent, WorkersSidebar, WorkersSidebarEvent};
 
+mod command_palette;
 mod spaces;
 mod tabs;
 
@@ -83,6 +84,7 @@ actions!(
         ToggleSidebar,
         ToggleChanges,
         AddSpacePalette,
+        ToggleCommandPalette,
         NewSession,
         NextSession,
         PrevSession,
@@ -314,6 +316,7 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             platform_combo(fallback)
         }
     }
+    crate::appshots::set_shortcut(&keymap.capture_appshot);
     cx.clear_key_bindings();
     crate::composer::init(cx);
     // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
@@ -342,6 +345,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             None,
         ),
         KeyBinding::new(
+            &valid_or_default(&keymap.new_project, ShortcutId::NewProject.default_combo()),
+            AddSpacePalette,
+            None,
+        ),
+        KeyBinding::new(
             &valid_or_default(
                 &keymap.next_session,
                 crate::settings::ShortcutId::NextSession.default_combo(),
@@ -362,9 +370,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             ArchiveSession,
             None,
         ),
-        // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
-        // bar); pressing it again dismisses.
-        KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
+        // Fixed: ⌘K summons the global command palette; New project remains
+        // available as an action inside it and through its own shortcut.
+        KeyBinding::new(&platform_combo("mod-k"), ToggleCommandPalette, None),
         // Closing a Worker session rides ⌘W, whose action (`CloseWindow`) is
         // owned by AppKit's Window ▸ Close key equivalent — see the handler in
         // `Shell::render`. Nothing to bind here.
@@ -403,19 +411,21 @@ pub enum SettingsSection {
     Appearance,
     Notifications,
     Shortcuts,
+    Appshots,
     /// O registro durável de projetos — o ledger, não o working set da sidebar.
     Projects,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
+        SettingsSection::Appshots,
         SettingsSection::Projects,
         SettingsSection::Archived,
     ];
@@ -430,6 +440,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::Appshots => "Appshots",
             SettingsSection::Projects => "Projects",
             SettingsSection::Archived => "Archived sessions",
         }
@@ -443,6 +454,7 @@ impl SettingsSection {
             "settings/appearance" => Some(Self::Appearance),
             "settings/notifications" => Some(Self::Notifications),
             "settings/shortcuts" => Some(Self::Shortcuts),
+            "settings/appshots" => Some(Self::Appshots),
             "settings/projects" => Some(Self::Projects),
             "settings/archived" => Some(Self::Archived),
             _ => None,
@@ -1673,6 +1685,8 @@ pub struct Shell {
     /// The add-space palette (⌘K-style; device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
+    /// Global action and Chat history search palette, `Some` while open.
+    command_palette: Option<command_palette::CommandPalette>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
     /// Persisted organization/sort/metadata controls beside the project filter.
@@ -1716,6 +1730,8 @@ pub struct Shell {
     panels: SessionPanels,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
+    /// Last Chat that received an Appshot, used by the Last Chat target.
+    last_appshot_chat: Option<String>,
     /// Last rendered sidebar order (key + estimated height) — the FLIP baseline
     /// for the §1.6 resort glide.
     sidebar_prev_order: Vec<(String, f32)>,
@@ -1909,11 +1925,15 @@ impl Shell {
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
+                    has_appshots,
                 } => {
+                    if *has_appshots {
+                        this.last_appshot_chat = Some(chat_id.clone());
+                    }
                     transcript.update(cx, |t, cx| {
                         t.on_own_send(chat_id.clone(), message_id.clone(), cx)
                     });
@@ -2221,6 +2241,7 @@ impl Shell {
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
+            command_palette: None,
             spaces_menu: popover::Popup::default(),
             sidebar_view_menu: popover::Popup::default(),
             sidebar_view_trigger_focus: cx.focus_handle().tab_stop(true),
@@ -2245,6 +2266,7 @@ impl Shell {
             settings,
             panels: SessionPanels::default(),
             active_chat: String::new(),
+            last_appshot_chat: None,
             sidebar_prev_order: Vec::new(),
             sidebar_resort: std::collections::HashMap::new(),
             sidebar_new_keys: std::collections::HashSet::new(),
@@ -3809,6 +3831,7 @@ impl Shell {
     }
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        self.command_palette = None;
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
         if section == SettingsSection::Harnesses {
@@ -3818,6 +3841,105 @@ impl Shell {
         self.nav.push(NavEntry::Settings(section));
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    /// Resolve the destination at shortcut time. The caller must retain this
+    /// value while native capture awaits; reading selection at delivery time
+    /// would send a slow capture into whichever chat the user opened meanwhile.
+    fn resolve_appshot_target(
+        destination: crate::appshots::AppshotDestination,
+        selected: Option<&str>,
+        last_appshot: Option<&str>,
+    ) -> Option<String> {
+        match destination {
+            crate::appshots::AppshotDestination::Automatic => selected.map(str::to_owned),
+            crate::appshots::AppshotDestination::LastSession => {
+                selected.or(last_appshot).map(str::to_owned)
+            }
+            crate::appshots::AppshotDestination::NewSession => None,
+        }
+    }
+
+    pub(crate) fn appshot_target(&self, cx: &App) -> Option<String> {
+        let selected = self.state.read(cx).selected_chat.clone();
+        Self::resolve_appshot_target(
+            self.settings.appshot_destination,
+            selected.as_deref(),
+            self.last_appshot_chat.as_deref(),
+        )
+    }
+
+    /// Test/UI wrapper for a capture that already has its destination. The
+    /// desktop service calls [`Self::receive_appshot_for`] with the target it
+    /// captured before awaiting native APIs.
+    pub fn receive_appshot(
+        &mut self,
+        appshot: crate::appshots::CapturedAppshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.appshot_target(cx);
+        self.receive_appshot_for(target, appshot, window, cx);
+    }
+
+    pub(crate) fn receive_appshot_for(
+        &mut self,
+        target: Option<String>,
+        appshot: crate::appshots::CapturedAppshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Workers owns a separate surface with no Chat composer. A global
+        // capture remains a Chat action even when the shortcut was pressed
+        // while that surface was visible.
+        self.sidebar_mode = SidebarMode::Orchestrator;
+        let key = if let Some(chat_id) = target {
+            self.route = Route::Chat;
+            if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+                self.state
+                    .update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
+            }
+            chat_id
+        } else {
+            self.open_new_session(cx);
+            String::new()
+        };
+        let accepted = self.composer.update(cx, |composer, cx| {
+            composer.stage_appshot_for(key.clone(), appshot, cx)
+        });
+        if accepted && !key.is_empty() {
+            self.last_appshot_chat = Some(key);
+        }
+        let focus = self.composer.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    pub fn show_appshot_error(
+        &mut self,
+        target: Option<String>,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_mode = SidebarMode::Orchestrator;
+        let key = if let Some(chat_id) = target {
+            self.route = Route::Chat;
+            if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+                self.state
+                    .update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
+            }
+            chat_id
+        } else {
+            self.open_new_session(cx);
+            String::new()
+        };
+        self.composer.update(cx, |composer, cx| {
+            composer.show_appshot_error(key, message, cx)
+        });
+        let focus = self.composer.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -3981,23 +4103,51 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Shortcuts => {
+            SettingsSection::Shortcuts | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
-                    let page = cx.new(|cx| ShortcutsPage::new(state, keymap, cx));
+                    let page = cx.new(|cx| {
+                        ShortcutsPage::new(
+                            state,
+                            keymap,
+                            self.settings.appshots_enabled,
+                            self.settings.appshot_sound_enabled,
+                            self.settings.appshot_destination,
+                            cx,
+                        )
+                    });
                     // Persist + re-apply the keymap whenever the page changes it.
                     self.shortcuts_sub = Some(cx.subscribe(
                         &page,
                         |this: &mut Shell, _, event: &ShortcutsEvent, cx| {
-                            let ShortcutsEvent::Changed(keymap) = event;
-                            this.settings.keymap = keymap.clone();
-                            apply_keymap(cx, keymap);
+                            match event {
+                                ShortcutsEvent::Changed(keymap) => {
+                                    this.settings.keymap = keymap.clone();
+                                    apply_keymap(cx, keymap);
+                                }
+                                ShortcutsEvent::AppshotsChanged {
+                                    enabled,
+                                    sound_enabled,
+                                    destination,
+                                } => {
+                                    this.settings.appshots_enabled = *enabled;
+                                    this.settings.appshot_sound_enabled = *sound_enabled;
+                                    this.settings.appshot_destination = *destination;
+                                    crate::appshots::set_enabled(*enabled);
+                                    crate::appshots::set_capture_sound_enabled(*sound_enabled);
+                                }
+                            }
                             this.schedule_save(cx);
                             cx.notify();
                         },
                     ));
                     self.shortcuts_page = Some(page);
+                }
+                if let Some(page) = &self.shortcuts_page {
+                    page.update(cx, |page, _| {
+                        page.show_appshots(section == SettingsSection::Appshots)
+                    });
                 }
                 match &self.shortcuts_page {
                     Some(page) => page.clone().into_any_element(),
@@ -4474,7 +4624,9 @@ impl Shell {
 
     /// Keyboard-owning overlays suppress session navigation shortcuts.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
-        self.add_space.is_some() || self.composer.read(cx).pickers().read(cx).is_open()
+        self.command_palette.is_some()
+            || self.add_space.is_some()
+            || self.composer.read(cx).pickers().read(cx).is_open()
     }
 
     /// Track the held modifiers so the sidebar can show its jump hints. Only a
@@ -4501,6 +4653,9 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
+        if self.last_appshot_chat.as_deref() == Some(chat_id.as_str()) {
+            self.last_appshot_chat = None;
+        }
         if let Some(tabs) = self.right_tabs.get(&chat_id) {
             for surface in tabs {
                 if let RightSurface::Browser(id) = surface {
@@ -6132,6 +6287,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Projects => icons::FOLDER,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -6318,19 +6474,28 @@ impl Shell {
         // nine chips appear together instead of leaving a hole on whichever
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
+        // Query that owns this row when rendered inside the command palette.
+        // Palette rows use namespaced ids/hover keys so they cannot mutate
+        // the matching sidebar row.
+        search_query: Option<&str>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.delete_confirm.as_deref() == Some(id.as_str()) {
             return self.render_chat_delete_confirm(&id, theme, cx);
         }
+        let row_id = if search_query.is_some() {
+            format!("palette-chat-{id}")
+        } else {
+            format!("chat-{id}")
+        };
         // Activity, not position (t3code Sidebar): status is a small colored
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
         // relative time instead. Hovering the ROW swaps the corner for the
         // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
         // accordion), t3code's settle-on-hover.
-        let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
+        let corner_hovered = self.chat_status_hover.as_deref() == Some(row_id.as_str());
         // Send-truth overrides: a send unadopted past the grace window is
         // FAILED (explicit, with the transcript's retry affordance); a send
         // whose delivery path is degraded is QUEUED, not Working — the
@@ -6446,7 +6611,7 @@ impl Shell {
                         && !undelivered
                     {
                         loaders::mini_glyph_spinner(
-                            format!("chat-working-{id}"),
+                            format!("{row_id}-working"),
                             2.0,
                             theme.glyph,
                             cx.entity_id(),
@@ -6491,7 +6656,7 @@ impl Shell {
         let corner: AnyElement = {
             let archive_id = id.clone();
             div()
-                .id(SharedString::from(format!("chat-corner-{id}")))
+                .id(SharedString::from(format!("{row_id}-corner")))
                 .flex_none()
                 // Pin the corner to line 1's text height so the archive pill
                 // (taller, padded) overflows vertically instead of growing the
@@ -6527,7 +6692,7 @@ impl Shell {
         let menu_id = id.clone();
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
-        let fade_key = format!("chat-row-{id}");
+        let fade_key = format!("{row_id}-hover");
         let rest_bg = if selected {
             selected_wash
         } else {
@@ -6540,11 +6705,19 @@ impl Shell {
         let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
         div()
-            .id(SharedString::from(format!("chat-{id}")))
+            .id(SharedString::from(row_id.clone()))
+            .h(px(chat_row_height(
+                branch.is_some(),
+                change_request.is_some(),
+            )))
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .rounded(px(8.0))
+            .rounded(px(if search_query.is_some() {
+                popover::PALETTE_ITEM_RADIUS
+            } else {
+                8.0
+            }))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
@@ -6556,7 +6729,7 @@ impl Shell {
             // hover listener per element).
             .on_hover({
                 let fade_hover = motion::hover_listener(fade_key.clone());
-                let hover_id = id.clone();
+                let hover_id = row_id.clone();
                 cx.listener(move |this, hovered: &bool, window, cx| {
                     fade_hover(hovered, window, cx);
                     if *hovered {
@@ -6601,7 +6774,7 @@ impl Shell {
                             .text_size(px(11.0))
                             .line_height(px(14.0))
                             .text_color(subline)
-                            .child(space_name),
+                            .child(popover::search_highlight(space_name, search_query, theme)),
                     )
                     .child(div().text_color(subline).child(corner)),
             )
@@ -6632,7 +6805,7 @@ impl Shell {
                             .truncate()
                             .text_size(px(13.0))
                             .line_height(px(17.0))
-                            .child(title),
+                            .child(popover::search_highlight(title, search_query, theme)),
                     ),
             )
             // Line 3 is structural, not reserved whitespace: compact states
@@ -6659,17 +6832,18 @@ impl Shell {
                                     .text_size(px(11.0))
                                     .line_height(px(14.0))
                                     .text_color(subline)
-                                    .child(branch),
+                                    .child(popover::search_highlight(branch, search_query, theme)),
                             )
                         })
                         // Stable invisible spring keeps the optional PR badge
                         // pinned right without changing no-PR paint.
                         .child(div().flex_1().min_w_0())
                         .when_some(change_request, |el, summary| {
-                            el.child(crate::change_requests::pull_request_badge(
-                                format!("chat-pr-{id}").into(),
+                            el.child(crate::change_requests::pull_request_badge_with_query(
+                                format!("{row_id}-pr").into(),
                                 summary,
                                 crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                search_query,
                                 theme,
                             ))
                         }),
@@ -7731,6 +7905,9 @@ impl Shell {
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
+        if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
+            overlays.push(overlay);
+        }
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
@@ -10061,6 +10238,9 @@ impl Render for Shell {
             .on_modifiers_changed(
                 cx.listener(|this, event, _, cx| this.on_modifiers_changed(event, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.toggle_command_palette(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
                 if this.add_space.is_some() {
                     this.add_space = None;
@@ -11781,6 +11961,41 @@ mod tests {
             Some(SettingsSection::Projects)
         );
     }
+
+    #[test]
+    fn appshot_destination_is_resolved_before_capture() {
+        use crate::appshots::AppshotDestination;
+
+        assert_eq!(
+            Shell::resolve_appshot_target(
+                AppshotDestination::Automatic,
+                Some("open"),
+                Some("last"),
+            ),
+            Some("open".into())
+        );
+        assert_eq!(
+            Shell::resolve_appshot_target(AppshotDestination::LastSession, None, Some("last")),
+            Some("last".into())
+        );
+        assert_eq!(
+            Shell::resolve_appshot_target(
+                AppshotDestination::LastSession,
+                Some("open"),
+                Some("last"),
+            ),
+            Some("open".into())
+        );
+        assert_eq!(
+            Shell::resolve_appshot_target(
+                AppshotDestination::NewSession,
+                Some("open"),
+                Some("last"),
+            ),
+            None
+        );
+    }
+
     #[test]
     fn inspector_shortcut_combo_parses() {
         let combo = platform_combo("mod-alt-i");
