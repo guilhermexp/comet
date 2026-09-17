@@ -54,9 +54,9 @@ pub fn block_gap(previous: Option<&Block>, next: Option<&Block>) -> f32 {
         _ => MD_BLOCK_GAP,
     }
 }
-/// Body text size / line height (zeron: 14px / 22px).
+/// Body text size / line height: 14px / 24px.
 pub const MD_TEXT_SIZE: f32 = 14.0;
-pub const MD_LINE_HEIGHT: f32 = 22.0;
+pub const MD_LINE_HEIGHT: f32 = 24.0;
 /// Code block metrics — height is `lines × CODE_LINE_HEIGHT + padding + header`.
 pub const CODE_TEXT_SIZE: f32 = 12.5;
 pub const CODE_LINE_HEIGHT: f32 = 18.0;

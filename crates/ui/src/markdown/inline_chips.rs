@@ -183,13 +183,10 @@ pub(super) fn render(
             .id(SharedString::from(format!("{group}-chip-{}", range.start)))
             .min_w_0()
             .max_w_full()
-            // Binds to the line box it sits in, NOT to MonoCode's literal
-            // 24px: that number belongs to MonoCode's own prose scale, and
-            // inside Comet's 14/22 body it made every chip-bearing line 2px
-            // taller than its neighbours — a paragraph's leading stuttered
-            // line by line. A chip in a heading still gets the heading's
-            // taller box for free.
-            .min_h(px(line_height))
+            // Leave breathing room around the background while retaining
+            // the full outer line box, including lines containing only chips.
+            .my(px(2.0))
+            .min_h(px(line_height - 4.0))
             .px(px(6.0))
             .flex()
             .items_center()
@@ -197,7 +194,7 @@ pub(super) fn render(
             .rounded(px(6.0))
             .bg(theme.text.opacity(0.08))
             .text_size(px(text_size * 0.8))
-            .line_height(px(line_height))
+            .line_height(px(line_height - 4.0))
             .font_family(theme.font_mono.clone())
             .text_color(theme.text)
             .when_some(tooltip, |chip, path| {

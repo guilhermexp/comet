@@ -10371,9 +10371,18 @@ impl Render for Shell {
 mod tests {
     #[test]
     fn compaction_marker_preserves_increased_and_unchanged_counts() {
-        assert_eq!(super::compaction_marker(16_000, Some(59_000)), "Context compacted · 16k → 59k");
-        assert_eq!(super::compaction_marker(258_000, Some(63_000)), "Context compacted · 258k → 63k");
-        assert_eq!(super::compaction_marker(16_000, Some(16_000)), "Context compacted · 16k → 16k");
+        assert_eq!(
+            super::compaction_marker(16_000, Some(59_000)),
+            "Context compacted · 16k → 59k"
+        );
+        assert_eq!(
+            super::compaction_marker(258_000, Some(63_000)),
+            "Context compacted · 258k → 63k"
+        );
+        assert_eq!(
+            super::compaction_marker(16_000, Some(16_000)),
+            "Context compacted · 16k → 16k"
+        );
         assert_eq!(super::compaction_marker(16_000, None), "Context compacted.");
     }
 

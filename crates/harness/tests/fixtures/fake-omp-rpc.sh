@@ -160,6 +160,7 @@ emit_chunked() {
 
 live_delegations=0
 live_state_seen=0
+local_command_completed=0
 while IFS= read -r line; do
   case "$(field type "$line")" in
     negotiate_protocol)
@@ -171,7 +172,16 @@ while IFS= read -r line; do
       ;;
     get_state)
       live_state_seen=1
-      if [ "$scenario" = "missing-session" ]; then
+      if [ "$scenario" = "local-compaction-background" ]; then
+        if [ -f "$FAKE_OMP_HOLD_PATH.done" ]; then tokens=59000; else tokens=16000; fi
+        respond "$line" "{\"sessionId\":\"s-1\",\"sessionFile\":\"/tmp/omp-session.jsonl\",\"contextUsage\":{\"tokens\":$tokens,\"contextWindow\":828000}}"
+      elif [ "$local_command_completed" = 1 ] && [ "$scenario" = "local-compaction" ]; then
+        respond "$line" '{"sessionId":"s-1","sessionFile":"/tmp/omp-session.jsonl","contextUsage":{"tokens":63000,"contextWindow":828000}}'
+      elif [ "$local_command_completed" = 1 ] && [ "$scenario" = "local-compaction-no-usage" ]; then
+        respond "$line" '{"sessionId":"s-1"}'
+      elif [ "$local_command_completed" = 1 ] && [ "$scenario" = "local-compaction-state-error" ]; then
+        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"get_state\",\"success\":false,\"error\":\"state unavailable\"}"
+      elif [ "$scenario" = "missing-session" ]; then
         respond "$line" '{"thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}}'
       else
         respond "$line" '{"sessionId":"s-1","sessionFile":"/tmp/omp-session.jsonl","thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true},"contextUsage":{"tokens":392000,"contextWindow":828000,"percent":47.34},"dumpTools":[{"name":"bash","description":"Run commands","parameters":{"type":"object"}}]}'
@@ -261,7 +271,24 @@ while IFS= read -r line; do
       ;;
     prompt)
       if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_prompt 59; fi
-      if [ "$scenario" = "local-command-output" ]; then
+      if [ "$scenario" = "local-compaction-background" ]; then
+        respond "$line" '{"agentInvoked":false}'
+        (
+          while [ ! -f "$FAKE_OMP_HOLD_PATH" ]; do sleep 0.01; done
+          touch "$FAKE_OMP_HOLD_PATH.done"
+          emit '{"type":"agent_end","messages":[]}'
+          emit '{"type":"command_output","text":"Compaction complete. Tokens: 16000 -> 59000 (saved -43000)."}'
+        ) &
+      elif [ "$scenario" = "local-compaction-hang" ]; then
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-compaction-failed" ]; then
+        respond "$line" '{"agentInvoked":false}'
+        emit '{"type":"command_output","text":"Compaction failed: provider unavailable"}'
+      elif [ "$scenario" = "local-compaction" ] || [ "$scenario" = "local-compaction-no-usage" ] || [ "$scenario" = "local-compaction-state-error" ]; then
+        local_command_completed=1
+        emit '{"type":"command_output","text":"Compaction complete."}'
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-command-output" ]; then
         emit '{"type":"command_output","text":"Context window: 1048576 tokens (3% used)\n"}'
         emit '{"type":"command_output","text":"  System prompt: 15553 tokens\n"}'
         respond "$line" '{"agentInvoked":false}'

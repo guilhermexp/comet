@@ -52,6 +52,8 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 ## Work Guidance
 
+- Comandos OMP locais bem-sucedidos publicam `contextUsage` via `get_state` antes de `Done`. **`/compact` roda em background no OMP: `agentInvoked:false` é só ACK, nunca conclusão.** O adapter espera `command_output` terminal (`Compaction complete.` / falha), ignora `agent_end` intermediário, mantém cancelamento e o deadline de prompt após o ACK, e só então lê usage. Sucesso suprime a prosa CLI duplicada; erro de argumento/provider termina com falha. Estado ausente não inventa contagem. `tests/omp_rpc.rs` cobre ACK antecipado com estado stale, aumento de tokens, resultado antes do ACK, falha, timeout e cancelamento.
+
 - Vendor mudou o formato de saída? A correção é uma fixture nova + o parse, nunca um `if` no consumidor.
 - Adicionar harness novo = implementar o trait + catálogo + fixture de transcript. Nada mais deve precisar mudar.
 

@@ -1230,6 +1230,190 @@ async fn run_reports_provider_error_honestly() {
 }
 
 #[tokio::test]
+async fn local_compaction_waits_for_background_result_and_publishes_increased_usage() {
+    let temp = tempfile::tempdir().unwrap();
+    let hold = temp.path().join("release");
+    let mut env = fake_env("local-compaction-background");
+    env.insert(
+        "FAKE_OMP_HOLD_PATH".into(),
+        hold.to_string_lossy().into_owned(),
+    );
+    let harness = fake_harness("local-compaction-background").with_env(env);
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = harness
+        .run(request("/compact snap"), controls)
+        .await
+        .unwrap();
+    // The fixture can answer get_state while compaction is blocked. An early
+    // ACK must not produce Done or publish that stale 16000-token snapshot.
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(150), stream.next()).await
+    {
+        assert!(!matches!(
+            event.unwrap(),
+            AgentEvent::Done { .. } | AgentEvent::Usage { .. }
+        ));
+    }
+    std::fs::write(&hold, "release").unwrap();
+    let events = collect_until_done(&mut stream).await;
+    let usage = events
+        .iter()
+        .position(|event| {
+            matches!(event,
+                AgentEvent::Usage { context_usage: Some(usage), .. } if usage.tokens == 59000
+            )
+        })
+        .expect("fresh post-compaction usage without another prompt");
+    let done = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(usage < done);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { .. }))
+    );
+}
+
+#[tokio::test]
+async fn local_compaction_failure_and_post_ack_timeout_are_not_success() {
+    for scenario in ["local-compaction-failed", "local-compaction-hang"] {
+        let harness = fake_harness(scenario).with_prompt_timeout(Duration::from_millis(300));
+        let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+        let mut stream = harness.run(request("/compact"), controls).await.unwrap();
+        let events = collect_until_done(&mut stream).await;
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), .. }
+            if error.contains(if scenario == "local-compaction-failed" { "provider unavailable" } else { "timed out" })
+        )), "{scenario}: {events:?}");
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )));
+    }
+}
+
+#[tokio::test]
+async fn local_compaction_can_be_cancelled_after_ack() {
+    let harness = fake_harness("local-compaction-hang");
+    let (controls, _steer, interrupt) = controls_with_answer("Yes");
+    let mut stream = harness.run(request("/compact"), controls).await.unwrap();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(150), stream.next()).await
+    {
+        assert!(!matches!(event.unwrap(), AgentEvent::Done { .. }));
+    }
+    interrupt.cancel();
+    let events = collect_until_done(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn local_compaction_publishes_reduced_context_before_completion() {
+    let harness = fake_harness("local-compaction");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = harness.run(request("/compact"), controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+    let usage = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    context_usage: Some(zeron_proto::ContextUsage {
+                        tokens: 63000,
+                        context_window: 828000
+                    }),
+                }
+            )
+        })
+        .expect("local compaction must refresh context usage");
+    let done = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(
+        usage < done,
+        "the marker must see the new usage before completion"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { .. }))
+    );
+}
+
+#[tokio::test]
+async fn local_compaction_without_usage_still_completes() {
+    for scenario in ["local-compaction-no-usage", "local-compaction-state-error"] {
+        let harness = fake_harness(scenario);
+        let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+        let mut stream = harness.run(request("/compact"), controls).await.unwrap();
+        let events = collect_until_done(&mut stream).await;
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Usage {
+                    context_usage: Some(_),
+                    ..
+                } | AgentEvent::Error { .. }
+                    | AgentEvent::TextDelta { .. }
+            )),
+            "{scenario}: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{scenario}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn local_command_output_is_preserved() {
     let harness = fake_harness("local-command-output");
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");

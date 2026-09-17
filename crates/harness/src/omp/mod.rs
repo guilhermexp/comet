@@ -877,6 +877,11 @@ async fn run_session(
     let mut pending_interactive: HashMap<String, tokio_util::sync::CancellationToken> =
         HashMap::new();
     let mut normalizer = OmpNormalizer::new(cwd, model);
+    let compacting = prompt
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.split_whitespace().next() == Some("/compact"));
+    let compaction_deadline = tokio::time::Instant::now() + prompt_timeout;
     let mut pending_agent_end: Option<Value> = None;
     let mut steering_open = true;
     let mut finished = false;
@@ -893,11 +898,21 @@ async fn run_session(
 
     while !finished {
         tokio::select! {
+            _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
+                finish_agent_end(&process, &event_tx, &mut session_id,
+                    AgentEndDisposition::Error("OMP compaction timed out before completion".into())).await;
+                finished = true;
+            }
             prompt_res = &mut prompt_fut, if prompt_pending => {
                 prompt_pending = false;
                 match prompt_res {
                     Ok(prompt_response) => {
                         if prompt_response.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
+                            // OMP runs /compact in the background. This ACK only
+                            // confirms dispatch; command_output carries completion.
+                            if compacting {
+                                continue;
+                            }
                             while let Ok(frame) = events.try_recv() {
                                 for event in normalizer.push(frame) {
                                     if !emit(&event_tx, event).await {
@@ -907,12 +922,15 @@ async fn run_session(
                                 }
                             }
                             if !finished {
-                                let _ = emit(&event_tx, AgentEvent::Done {
-                                    status: DoneStatus::Completed,
-                                    result: None,
-                                    error: None,
-                                    session_id: Some(session_id.clone()),
-                                }).await;
+                                // Local commands such as /compact change context
+                                // without agent_end. Publish their fresh usage before
+                                // Done so the Chat marker can show before → after.
+                                finish_agent_end(
+                                    &process,
+                                    &event_tx,
+                                    &mut session_id,
+                                    AgentEndDisposition::Complete,
+                                ).await;
                             }
                             finished = true;
                         }
@@ -1067,6 +1085,18 @@ async fn run_session(
                     }).await;
                     break;
                 };
+                if compacting {
+                    if let Some(disposition) = compaction_completion(&frame) {
+                        finished = finish_agent_end(
+                            &process, &event_tx, &mut session_id, disposition,
+                        ).await;
+                        continue;
+                    }
+                    // A summarizer's model turn is not the command lifecycle.
+                    if frame.get("type").and_then(Value::as_str) == Some("agent_end") {
+                        continue;
+                    }
+                }
                 if let Some(text) = user_steering_text(&frame)
                     && let Some(index) = in_flight_steers
                         .iter()
@@ -1235,6 +1265,26 @@ async fn run_session(
         let _ = workers.shutdown().await;
     }
     let _ = process.shutdown().await;
+}
+
+fn compaction_completion(frame: &Value) -> Option<AgentEndDisposition> {
+    if frame.get("type").and_then(Value::as_str) != Some("command_output") {
+        return None;
+    }
+    let text = frame.get("text")?.as_str()?.trim();
+    if text == "Compaction complete." || text.starts_with("Compaction complete. Tokens: ") {
+        Some(AgentEndDisposition::Complete)
+    } else if text.is_empty() {
+        None
+    } else {
+        // Argument validation also returns command_output, before launching
+        // the background job. Do not wait the full deadline on that error.
+        let reason = text.strip_prefix("Compaction failed:").unwrap_or(text);
+        Some(AgentEndDisposition::Error(format!(
+            "OMP compaction failed: {}",
+            protocol::sanitize_diagnostic(reason.trim())
+        )))
+    }
 }
 
 async fn finish_agent_end(
