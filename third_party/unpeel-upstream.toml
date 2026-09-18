@@ -32,4 +32,3 @@ base_revision_resolves_upstream = false
 # `AgentEndEvent.willContinue`; `adapter/setup.rs` observa Start/continuação/
 # terminal/legado. `local_modifications_count` acima NÃO foi recalculado
 # (mesma limitação da nota de 2026-09-08).
-
