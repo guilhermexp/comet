@@ -7551,7 +7551,7 @@ impl Transcript {
                 .text_color(if tool.is_error {
                     theme.danger
                 } else {
-                    theme.text.opacity(0.7)
+                    theme.text_muted
                 })
                 .tooltip(move |_, cx| {
                     cx.new(|_| {

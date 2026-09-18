@@ -707,17 +707,11 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
             .text_color(theme.text)
     } else {
         let fade_key = fade_key.into();
-        let mut row = row
-            .text_color(motion::hover_blend(
-                &fade_key,
-                theme.text.opacity(0.9),
-                theme.text,
-            ))
-            .bg(motion::hover_blend(
-                &fade_key,
-                crate::theme::wash(0.0),
-                crate::theme::card_selected_bg(),
-            ));
+        let mut row = row.text_color(theme.text).bg(motion::hover_blend(
+            &fade_key,
+            crate::theme::wash(0.0),
+            crate::theme::card_selected_bg(),
+        ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
         row.interactivity()

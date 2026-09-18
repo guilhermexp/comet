@@ -396,9 +396,9 @@ impl Shell {
                                 .text_size(px(12.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(if on_canvas {
-                                    theme.text_muted.opacity(0.7)
+                                    theme.text_muted
                                 } else {
-                                    theme.text.opacity(0.85)
+                                    theme.text
                                 })
                                 .child(title),
                         )

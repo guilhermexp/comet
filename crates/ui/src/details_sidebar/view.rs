@@ -2913,11 +2913,7 @@ impl DetailsSidebar {
                 pill.child(
                     div()
                         .text_size(px(10.0))
-                        .text_color(if active == tab {
-                            theme.text_muted.opacity(0.9)
-                        } else {
-                            theme.text_muted
-                        })
+                        .text_color(theme.text_muted)
                         .child(count.to_string()),
                 )
             })

@@ -3307,6 +3307,7 @@ impl Changes {
                     .text_color(if active {
                         theme.text
                     } else {
+                        // a11y-ok: inactive toolbar icon state, not a readable glyph
                         theme.text_muted.opacity(0.7)
                     }),
             )

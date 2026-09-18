@@ -762,11 +762,7 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .text_size(px(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
-                "spaces-filter",
-                theme.text.opacity(0.8),
-                theme.text,
-            ))
+            .text_color(theme.text)
             .bg(if open {
                 theme.glass_hover()
             } else {
@@ -1523,7 +1519,7 @@ impl Shell {
                                 .text_color(if hovered || is_selected {
                                     theme.text
                                 } else {
-                                    theme.text.opacity(0.55)
+                                    theme.text_muted
                                 })
                                 .child(title),
                         )
@@ -2501,9 +2497,9 @@ impl Shell {
                                         .px(px(3.0))
                                         .rounded(px(4.0))
                                         .text_color(if is_last {
-                                            theme.text.opacity(0.85)
+                                            theme.text
                                         } else {
-                                            theme.text_muted.opacity(0.55)
+                                            theme.text_muted
                                         })
                                         .child(SharedString::from(label));
                                     if is_last {
@@ -2914,7 +2910,7 @@ impl Shell {
                             .text_color(if show_hidden {
                                 theme.text
                             } else {
-                                theme.text_muted.opacity(0.75)
+                                theme.text_muted
                             })
                             .child("Hidden folders"),
                     )

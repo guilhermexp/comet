@@ -2,41 +2,46 @@
 # Fail when crates/ui/src paints text_color with stacked alpha on a theme
 # paper (text / text_muted / text_faint) without `// a11y-ok: <reason>` on
 # the same line or the line immediately above. Hsla::opacity multiplies.
+# The whole text_color(...) argument is scanned, so rustfmt-wrapped
+# conditionals spanning several lines are caught too.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/crates/ui/src"
-PATTERN='text_color\([^)]*theme\.text(_muted|_faint)?\.opacity\('
-MARKER='//[[:space:]]*a11y-ok:[[:space:]]*[^[:space:]]'
 
-has_marker() {
-  printf '%s\n' "$1" | grep -qE "$MARKER"
-}
-
-violations=0
-while IFS= read -r match; do
-  [ -z "$match" ] && continue
-  file="${match%%:*}"
-  rest="${match#*:}"
-  lineno="${rest%%:*}"
-  snippet="${rest#*:}"
-  rel="${file#"$ROOT/"}"
-
-  if has_marker "$snippet"; then
-    continue
-  fi
-  if [ "$lineno" -gt 1 ]; then
-    prev="$(sed -n "$((lineno - 1))p" "$file")"
-    if has_marker "$prev"; then
-      continue
-    fi
-  fi
-
-  printf '%s:%s:%s\n' "$rel" "$lineno" "$snippet"
-  violations=$((violations + 1))
-done < <(grep -R -n --include='*.rs' -E "$PATTERN" "$SRC" || true)
-
-if [ "$violations" -ne 0 ]; then
-  printf 'lint-text-alpha: %s site(s) stack opacity on theme text paper without // a11y-ok:\n' "$violations" >&2
-  exit 1
-fi
+find "$SRC" -name '*.rs' -print0 | sort -z | xargs -0 perl -e '
+  my ($root, $violations) = (shift @ARGV, 0);
+  my $marker = qr{//\s*a11y-ok:\s*\S};
+  for my $file (@ARGV) {
+    open my $fh, "<", $file or die "$file: $!";
+    my @lines = <$fh>;
+    close $fh;
+    my $src = join "", @lines;
+    (my $rel = $file) =~ s{^\Q$root\E/}{};
+    my %seen;
+    while ($src =~ /text_color\(/g) {
+      my ($start, $depth, $i) = (pos($src), 1, pos($src));
+      while ($i < length($src) && $depth > 0) {
+        my $c = substr($src, $i++, 1);
+        $depth++ if $c eq "(";
+        $depth-- if $c eq ")";
+      }
+      my $arg = substr($src, $start, $i - $start);
+      while ($arg =~ /theme\.text(?:_muted|_faint)?\.opacity\(/g) {
+        my $at = $start + $-[0];
+        my $lineno = (substr($src, 0, $at) =~ tr/\n//) + 1;
+        next if $seen{$lineno}++;
+        my $line = $lines[$lineno - 1];
+        next if $line =~ $marker;
+        next if $lineno > 1 && $lines[$lineno - 2] =~ $marker;
+        chomp $line;
+        print "$rel:$lineno:$line\n";
+        $violations++;
+      }
+    }
+  }
+  if ($violations) {
+    print STDERR "lint-text-alpha: $violations site(s) stack opacity on theme text paper without // a11y-ok:\n";
+    exit 1;
+  }
+' "$ROOT"

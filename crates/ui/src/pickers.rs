@@ -2503,11 +2503,7 @@ impl Pickers {
             // and text brighten fade over 150ms.
             .text_color(motion::hover_blend(
                 id,
-                if set {
-                    theme.text.opacity(0.9)
-                } else {
-                    theme.text_muted
-                },
+                if set { theme.text } else { theme.text_muted },
                 theme.text,
             ))
             .bg(if open {
@@ -2587,11 +2583,7 @@ impl Pickers {
             .rounded(px(6.0))
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
-                id,
-                theme.text_muted.opacity(0.7),
-                theme.text.opacity(0.8),
-            ))
+            .text_color(motion::hover_blend(id, theme.text_muted, theme.text))
             .bg(if open {
                 theme.element_hover
             } else {
@@ -3571,6 +3563,7 @@ impl Pickers {
                         .text_color(if favorites_view {
                             theme.text
                         } else {
+                            // a11y-ok: favorites tab star icon state, not a readable glyph
                             theme.text_muted.opacity(0.75)
                         }),
                 )
@@ -3961,6 +3954,7 @@ impl Pickers {
                     .text_color(if is_fav {
                         theme.warning
                     } else {
+                        // a11y-ok: unfavorited star icon state, not a readable glyph
                         theme.text_muted.opacity(0.45)
                     }),
                 ),

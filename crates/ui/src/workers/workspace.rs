@@ -1285,7 +1285,7 @@ impl WorkersSidebar {
                             .text_color(if is_child_folder {
                                 theme.text
                             } else {
-                                theme.text.opacity(0.60)
+                                theme.text_muted
                             })
                             .tooltip({
                                 let name = project_name.clone();
@@ -1673,7 +1673,7 @@ impl WorkersSidebar {
                     .text_color(if selected {
                         theme.text
                     } else if matches!(indicator, SessionIndicator::Exited) {
-                        theme.text_muted.opacity(0.82)
+                        theme.text_faint
                     } else {
                         theme.text_muted
                     })

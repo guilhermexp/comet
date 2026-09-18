@@ -3632,14 +3632,14 @@ impl Render for ContextUsageTooltip {
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .text_color(theme.text_faint)
+                        .text_color(theme.text_muted)
                         .child(self.state.detail.clone()),
                 )
                 .when(self.compactable, |el| {
                     el.child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(theme.text_muted)
+                            .text_color(theme.text_faint)
                             .child("Click to compact"),
                     )
                 }),
@@ -6936,11 +6936,7 @@ impl Composer {
                         .min_w_0()
                         .text_size(px(13.5))
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if picked {
-                            theme.text
-                        } else {
-                            theme.text.opacity(0.9)
-                        })
+                        .text_color(theme.text)
                         .child(SharedString::from(label.clone())),
                 )
                 .when(ix < 9, |el| {
@@ -6959,11 +6955,7 @@ impl Composer {
                                 crate::theme::ink(0.05)
                             })
                             .text_size(px(11.0))
-                            .text_color(if picked {
-                                theme.text
-                            } else {
-                                theme.text_muted.opacity(0.6)
-                            })
+                            .text_color(if picked { theme.text } else { theme.text_muted })
                             .child(SharedString::from(format!("{}", ix + 1))),
                     )
                 })

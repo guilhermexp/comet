@@ -314,7 +314,7 @@ impl Render for DevicesPage {
                         .text_color(if id_copied {
                             theme.success_muted.opacity(0.9)
                         } else {
-                            theme.text_muted.opacity(0.5)
+                            theme.text_faint
                         })
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text_muted))
