@@ -21,6 +21,10 @@ internal host modes (`__session_host__` et al.).
 | `session_event_journal.rs` | Session output/event journaling |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
+| `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, legacy and ledger-only reconciliation, read-only diagnosis and identity-only CAS rollback |
+| `project_ledger.rs` | Historical project metadata, grouped Settings catalog and persistent Forget suppression |
+| `checkout_lifecycle.rs` | Archive/restore and guarded physical worktree removal; launch/restart/removal coordination |
+| `git_command.rs` | Bounded Git subprocesses and pipe collection, separate read/mutation deadlines |
 | `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()` (every runtime attempted, failures accumulated instead of aborting the loop), then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
 | `maintenance.rs` | Worker CLI version detection (`--version`), npm/brew latest version querying with TTL cache, semver comparison, advisory generation, and safe update command execution |
@@ -30,6 +34,14 @@ Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`) only.
 Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
+
+- `comet_project_identity` é aditivo e local: não troca IDs de Workers nem
+  transforma contêineres/histórico em cwd executável. Common directory e seu
+  fingerprint local comprovam associação; remote/branch/nome não são chaves.
+  Git roda fora do lock; entradas são revalidadas no commit. Background usa
+  TTL/in-flight, e diagnóstico/rollback explícitos não tocam sessões. Backup
+  não autoriza restaurar o JSON inteiro sobre dados posteriores. Estado futuro
+  ou inválido é preservado, e ações de execução falham de forma conservadora.
 
 - **Settings inicializa os presets no primeiro uso.** `migrate_comet_workers_presets` popula `builtin_global_presets()` quando a lista está vazia, a versão é zero e `native_preset_overlay_migrated` está ausente/false. Elegibilidade, presets e markers são lidos/gravados sob o mesmo lock. A lista persistida alimenta o próximo bootstrap; detecção de instalação continua sendo projeção do catálogo de runtimes. Versão positiva ou marker nativo impede restaurar o catálogo completo após exclusões; migrações v1/v2 existentes continuam adicionando só seus IDs. Dados malformados falham sem sobrescrita.
 
@@ -417,11 +429,24 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `~/.codex/hooks.json` (`/private/tmp/orchestrator-…`) parecer asset stale e
   bloqueava a migração para sempre.
 
-- **Branch de contexto/PR**: `WorkersProject::change_request_branch` aceita checkout local e worktree, exclui grupos e prefere `git_branch` do snapshot ao registro de criação. Valores vazios não viram branch. O consumidor limita subscriptions ao working set; não inferir que um checkout comum está na default branch ou não possui PR.
+- **Branch de contexto/PR**: `WorkersProject::change_request_branch` aceita checkout local e worktree, mas usa somente `git_branch` atual; exclui grupos, detached, arquivados e indisponíveis. A branch de criação não serve como fallback de PR. Valores vazios não viram branch. O consumidor limita subscriptions ao working set; não inferir que um checkout comum está na default branch ou não possui PR.
 
 - `registered_projects::RegisteredProjects` lê apenas raízes absolutas do working set persistido, excluindo grupos. Não inicia host, não usa ledger histórico e não grava estado. A engine consulta esse adaptador em `spawn_blocking` para autorizar Changes em Workers sem Chat/Space.
 
 ## Work Guidance
+
+- **Checkout lifecycle:** `checkout_lifecycle` separates archive/restore from
+  physical removal. Archive preserves session manifests/output and files;
+  removal accepts only an explicitly app-owned linked Git worktree under the
+  managed root, rejects active Workers and local/ignored data, and keeps the
+  branch and history. Never restore the legacy recursive-delete/force fallback.
+  `checkout-actions.lock` serializes launch/restart/removal separately from the
+  JSON lock. Interrupted mutation remains blocked until explicit clean restore.
+- **Bounded Git commands:** use `git_command` for identity/lifecycle probes;
+  read and mutation deadlines differ. Kill the process group on deadline and
+  bound pipe collection too, because a descendant can retain stdout after Git
+  exits. Integration coverage lives in `tests/project_actions.rs` (including
+  archive, external worktree rejection and interrupted-removal recovery).
 
 - New Workers capability: extend `LocalWorkersClient` + typed models here, then
   consume from `zeron-ui/src/workers/`.

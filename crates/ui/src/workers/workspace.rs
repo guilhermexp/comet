@@ -9,8 +9,8 @@ use gpui::{
     StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
 };
 use zeron_workers_unpeel::{
-    WorkersArtifact, WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession,
-    WorkersSessionSort,
+    CheckoutKind, WorkersArtifact, WorkersLaunchRequest, WorkersPreset, WorkersProject,
+    WorkersSession, WorkersSessionSort,
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -57,7 +57,10 @@ impl Render for WorkerContextTooltip {
     }
 }
 
-use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
+use super::project_menu::{
+    ASSOCIATION_PENDING_PROJECT_ID, WorkersProjectMenuItem as ProjectMenuItem,
+    checkout_can_be_removed, checkout_is_available, checkout_is_missing, project_menu_items,
+};
 use super::recent::recent_activity_sections;
 use super::resource_monitor::{PressureAction, WorkersResourceGlobal};
 use super::session_gallery;
@@ -81,6 +84,15 @@ fn project_depth(project: &WorkersProject, projects: &[WorkersProject]) -> usize
         parent = project.parent_project_id.as_deref();
     }
     depth
+}
+
+pub fn is_association_pending_checkout(project: &WorkersProject) -> bool {
+    !project.is_group
+        && project.repository_id.is_none()
+        && matches!(
+            project.checkout_kind,
+            Some(CheckoutKind::Unresolved | CheckoutKind::Primary | CheckoutKind::Linked)
+        )
 }
 
 fn worktree_branch_slug(task_name: &str) -> String {
@@ -174,7 +186,8 @@ struct ProjectsMenu {
 /// one would hide the parent it hangs from — the row would name a project and
 /// draw a fragment of another.
 pub fn projects_menu_rows(projects: &[WorkersProject], query: &str) -> Vec<ProjectsMenuRow> {
-    let roots: Vec<&WorkersProject> = projects
+    let projected = project_tree_projection(projects);
+    let roots: Vec<&WorkersProject> = projected
         .iter()
         .filter(|project| project.parent_project_id.is_none())
         .collect();
@@ -200,12 +213,142 @@ pub fn root_project_id<'a>(project_id: &'a str, projects: &'a [WorkersProject]) 
         let Some(project) = projects.iter().find(|candidate| candidate.id == current) else {
             return current;
         };
+        if let Some(repository_id) = project.repository_id.as_deref() {
+            if let Some(primary) = projects.iter().find(|candidate| {
+                candidate.repository_id.as_deref() == Some(repository_id)
+                    && candidate.checkout_kind == Some(CheckoutKind::Primary)
+                    && !candidate.is_group
+            }) {
+                return primary.id.as_str();
+            }
+            return repository_id;
+        }
         match project.parent_project_id.as_deref() {
             Some(parent) => current = parent,
             None => return current,
         }
     }
     current
+}
+
+/// Build the presentation tree shared by Workers and the project filter.
+///
+/// The host still returns execution records, one per exact checkout path. A
+/// repository identity is a separate durable relationship, so grouping must
+/// happen here without changing the IDs used by sessions or launch requests.
+/// An existing primary checkout is the executable root. If it is absent, a
+/// synthetic group row is created as a visual container; its empty path and
+/// group flag make it impossible to launch a Worker against the container.
+pub fn project_tree_projection(projects: &[WorkersProject]) -> Vec<WorkersProject> {
+    let mut projected = projects.to_vec();
+    let mut roots = std::collections::BTreeMap::<String, String>::new();
+
+    let repository_ids: Vec<String> = projects
+        .iter()
+        .filter_map(|project| project.repository_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    for repository_id in repository_ids {
+        if let Some(primary) = projects.iter().find(|project| {
+            !project.is_group
+                && project.repository_id.as_deref() == Some(repository_id.as_str())
+                && project.checkout_kind == Some(CheckoutKind::Primary)
+        }) {
+            roots.insert(repository_id, primary.id.clone());
+            continue;
+        }
+        let Some(first) = projects.iter().find(|project| {
+            !project.is_group && project.repository_id.as_deref() == Some(repository_id.as_str())
+        }) else {
+            continue;
+        };
+        let root_id = repository_id.clone();
+        let name = first
+            .repository_name
+            .clone()
+            .or_else(|| {
+                first
+                    .repository_path
+                    .as_deref()
+                    .and_then(|path| std::path::Path::new(path).file_name())
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| first.name.clone());
+        projected.push(WorkersProject {
+            id: root_id.clone(),
+            name,
+            // A synthetic repository container is only a visual parent. Keep
+            // its path empty so every launch/reveal capability remains gated
+            // even if the identity registry knows the repository location.
+            path: String::new(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: true,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: first.folder_color_id.clone(),
+            session_sort: first.session_sort,
+            repository_id: Some(repository_id.clone()),
+            repository_name: first.repository_name.clone(),
+            repository_path: first.repository_path.clone(),
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
+        });
+        roots.insert(repository_id, root_id);
+    }
+
+    if projects.iter().any(is_association_pending_checkout) {
+        projected.push(WorkersProject {
+            id: ASSOCIATION_PENDING_PROJECT_ID.to_owned(),
+            name: "Association pending".to_owned(),
+            path: String::new(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: true,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
+        });
+        for project in projected
+            .iter_mut()
+            .filter(|project| is_association_pending_checkout(project))
+        {
+            project.parent_project_id = Some(ASSOCIATION_PENDING_PROJECT_ID.to_owned());
+        }
+    }
+
+    for project in projected.iter_mut().filter(|project| !project.is_group) {
+        let Some(repository_id) = project.repository_id.as_deref() else {
+            continue;
+        };
+        let Some(root_id) = roots.get(repository_id) else {
+            continue;
+        };
+        if project.id != *root_id {
+            project.parent_project_id = Some(root_id.clone());
+        } else {
+            project.parent_project_id = None;
+        }
+    }
+
+    projected
 }
 
 /// Whether `project` survives the tree filter: the filtered project itself and
@@ -225,7 +368,10 @@ pub fn project_in_filter(
         let Some(node) = current else {
             return false;
         };
-        if node.id == filter {
+        if node.id == filter
+            || node.repository_id.as_deref() == Some(filter)
+            || root_project_id(node.id.as_str(), projects) == filter
+        {
             return true;
         }
         current = node
@@ -320,14 +466,32 @@ pub fn project_has_working_set(
     selected_project_id: Option<&str>,
     launcher_project_id: Option<&str>,
 ) -> bool {
+    if (is_association_pending_checkout(project) && !project.checkout_archived)
+        || (project.id == ASSOCIATION_PENDING_PROJECT_ID
+            && projects.iter().any(|candidate| {
+                is_association_pending_checkout(candidate) && !candidate.checkout_archived
+            }))
+    {
+        return true;
+    }
     if selected_project_id == Some(project.id.as_str())
         || launcher_project_id == Some(project.id.as_str())
+        || selected_project_id
+            .is_some_and(|selected| root_project_id(selected, projects) == project.id)
+        || launcher_project_id
+            .is_some_and(|launcher| root_project_id(launcher, projects) == project.id)
     {
         return true;
     }
     sessions
         .iter()
-        .filter(|session| !session.archived)
+        .filter(|session| {
+            !session.archived
+                && projects
+                    .iter()
+                    .find(|owner| owner.id == session.project_id)
+                    .is_none_or(|owner| !owner.checkout_archived || session.is_live())
+        })
         .any(|session| {
             let mut current = Some(session.project_id.as_str());
             let mut depth = 0;
@@ -390,28 +554,20 @@ pub fn sidebar_row_projects(
         .collect()
 }
 
-/// The confirm the sidebar shows before removing a project row.
+/// The confirmation the sidebar shows before changing a project row.
 ///
-/// Each verb names what the host really does with the sessions, because that is
-/// the part the user cannot undo: `remove_worktree` DELETES the subtree's
-/// sessions and touches the checkout only while the app still owns it (for an
-/// adopted worktree the sessions are all it removes), `remove_project` deletes
-/// them too, and `remove_group` only archives them into the parent.
+/// Each verb names what the host really does: archive keeps the checkout,
+/// sessions and files; physical worktree removal is offered only for a managed
+/// checkout; groups retain their existing organizational behavior.
 pub fn remove_project_confirm_label(project: &WorkersProject, has_sessions: bool) -> &'static str {
-    if project.worktree_branch.is_some() {
-        if has_sessions {
-            "Remove worktree and sessions?"
-        } else {
-            "Remove worktree?"
-        }
-    // Same verdict the dispatch in `Model::remove_project` uses, so the label
-    // never promises a group removal the host would refuse.
+    if checkout_can_be_removed(project) {
+        "Remove worktree from disk?"
     } else if project.is_group {
         "Remove group?"
     } else if has_sessions {
-        "Remove project and sessions?"
+        "Archive checkout and keep sessions?"
     } else {
-        "Remove project?"
+        "Archive checkout?"
     }
 }
 
@@ -688,9 +844,10 @@ impl WorkersSidebar {
     fn render_projects_filter(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let label: SharedString = {
             let model = self.model.read(cx);
+            let projects = project_tree_projection(model.projects());
             model
                 .project_filter()
-                .and_then(|id| model.projects().iter().find(|project| project.id == id))
+                .and_then(|id| projects.iter().find(|project| project.id == id))
                 .map(|project| SharedString::from(project.name.clone()))
                 .unwrap_or_else(|| SharedString::from("All projects"))
         };
@@ -780,13 +937,13 @@ impl WorkersSidebar {
         let filter = self.model.read(cx).project_filter().map(str::to_owned);
         let labels: Vec<(ProjectsMenuRow, SharedString)> = {
             let model = self.model.read(cx);
+            let projects = project_tree_projection(model.projects());
             rows.iter()
                 .map(|row| {
                     let label = match row {
                         ProjectsMenuRow::All => SharedString::from("All projects"),
                         ProjectsMenuRow::AddProject => SharedString::from("New project…"),
-                        ProjectsMenuRow::Project(id) => model
-                            .projects()
+                        ProjectsMenuRow::Project(id) => projects
                             .iter()
                             .find(|project| &project.id == id)
                             .map(|project| SharedString::from(project.name.clone()))
@@ -1021,6 +1178,7 @@ impl WorkersSidebar {
         project: WorkersProject,
         sessions: Vec<WorkersSession>,
         presets: Vec<WorkersPreset>,
+        parent: Option<WorkersProject>,
         expanded: bool,
         selected_session_id: Option<&str>,
         depth: usize,
@@ -1095,8 +1253,10 @@ impl WorkersSidebar {
         let select_project_id = project.id.clone();
         let toggle_project_id = project.id.clone();
         let is_group = project.is_group;
-        let context = workers_titlebar(Some(&project), None);
+        let context = workers_titlebar(Some(&project), parent.as_ref());
         let is_worktree = !is_group && context.branch_is_worktree;
+        let checkout_available = checkout_is_available(&project);
+        let checkout_missing = checkout_is_missing(&project);
         let project_name: SharedString = if is_worktree {
             context
                 .branch
@@ -1200,6 +1360,7 @@ impl WorkersSidebar {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
                             quick_menu_content.update(cx, |content, cx| {
                                 content.open_project_menu(
                                     quick_menu_project.clone(),
@@ -1251,6 +1412,23 @@ impl WorkersSidebar {
                             model.toggle_project(&toggle_project_id, cx);
                         });
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if project_menu_items(&menu_project, &menu_sessions).is_empty() {
+                                return;
+                            }
+                            menu_content.update(cx, |content, cx| {
+                                content.open_project_menu(
+                                    menu_project.clone(),
+                                    menu_sessions.clone(),
+                                    event.position,
+                                    cx,
+                                )
+                            });
+                        }),
+                    )
                     .child(if is_worktree {
                         icon(icons::WORKER_BRANCH)
                             .size(px(16.0))
@@ -1302,7 +1480,24 @@ impl WorkersSidebar {
                             theme,
                         ))
                     })
-                    .when(!is_group, |el| {
+                    .when(checkout_missing, |el| {
+                        el.child(
+                            div()
+                                .id(("workers-checkout-unavailable", index))
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| WorkerContextTooltip {
+                                        text: "Checkout unavailable; history is retained".into(),
+                                    })
+                                    .into()
+                                })
+                                .child(
+                                    icon(icons::INFO_CIRCLE)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_faint),
+                                ),
+                        )
+                    })
+                    .when(!is_group && checkout_available, |el| {
                         el.child(
                             div()
                                 .absolute()
@@ -1729,6 +1924,7 @@ impl Render for WorkersSidebar {
             launcher_project_id,
             expanded,
             projects,
+            raw_projects,
             all_sessions,
             presets,
             project_filter,
@@ -1741,6 +1937,7 @@ impl Render for WorkersSidebar {
                 model.selected_project_id.clone(),
                 model.launcher_project_id.clone(),
                 model.expanded_project_ids.clone(),
+                project_tree_projection(model.projects()),
                 model.projects().to_vec(),
                 model.sessions().to_vec(),
                 model.presets().to_vec(),
@@ -1751,6 +1948,34 @@ impl Render for WorkersSidebar {
         // Presentation-only projection: the snapshot keeps the host's order, so
         // the persisted sibling order and per-project session sort on disk are
         // untouched.
+        let mut expanded = expanded;
+        let pending_has_working_set = projects.iter().any(|project| {
+            is_association_pending_checkout(project)
+                && (selected_project_id.as_deref() == Some(project.id.as_str())
+                    || launcher_project_id.as_deref() == Some(project.id.as_str())
+                    || all_sessions.iter().any(|session| {
+                        !session.archived && session.is_live() && session.project_id == project.id
+                    }))
+        });
+        for project in projects
+            .iter()
+            .filter(|project| project.parent_project_id.is_none())
+        {
+            // A repository without a registered primary checkout gets a
+            // presentation-only container. It starts expanded so the user can
+            // reach its linked checkout; the container itself has no launch
+            // target or persisted execution record.
+            if project.id != ASSOCIATION_PENDING_PROJECT_ID
+                && !raw_projects
+                    .iter()
+                    .any(|candidate| candidate.id == project.id)
+            {
+                expanded.insert(project.id.clone());
+            }
+            if project.id == ASSOCIATION_PENDING_PROJECT_ID && pending_has_working_set {
+                expanded.insert(project.id.clone());
+            }
+        }
         let ordered_projects = projects_ordered_by_activity(&projects, &all_sessions);
         let rows = sidebar_row_projects(
             &ordered_projects,
@@ -1765,10 +1990,16 @@ impl Render for WorkersSidebar {
         .enumerate()
         .map(|(index, project)| {
             let sessions = project_sessions_sorted(&project, &all_sessions);
+            let parent = project
+                .parent_project_id
+                .as_deref()
+                .and_then(|parent_id| projects.iter().find(|candidate| candidate.id == parent_id))
+                .cloned();
             self.render_project(
                 project.clone(),
                 sessions,
                 presets.clone(),
+                parent,
                 expanded.contains(&project.id),
                 selected_session_id.as_deref(),
                 project_depth(&project, &projects),
@@ -2947,7 +3178,12 @@ impl WorkersContent {
         {
             if matches!(
                 item,
-                ProjectMenuItem::RevealInFinder | ProjectMenuItem::RemoveProject
+                ProjectMenuItem::RevealInFinder
+                    | ProjectMenuItem::ArchiveCheckout
+                    | ProjectMenuItem::RestoreCheckout
+                    | ProjectMenuItem::RemoveWorktree
+                    | ProjectMenuItem::RemoveGroup
+                    | ProjectMenuItem::RemoveProject
             ) {
                 rows.push(popover::menu_separator().into_any_element());
             }
@@ -2963,6 +3199,8 @@ impl WorkersContent {
                 ProjectMenuItem::Archived => "Archived",
                 ProjectMenuItem::RevealInFinder => "Reveal in Finder",
                 ProjectMenuItem::OpenInEditor => "Open in editor",
+                ProjectMenuItem::ArchiveCheckout => "Archive checkout",
+                ProjectMenuItem::RestoreCheckout => "Restore checkout",
                 ProjectMenuItem::RemoveWorktree => "Remove worktree",
                 ProjectMenuItem::RemoveGroup => "Remove group",
                 ProjectMenuItem::RemoveProject => "Remove project",
@@ -2976,6 +3214,8 @@ impl WorkersContent {
                 ProjectMenuItem::NewGroup => icons::WORKER_FOLDER_OPEN,
                 ProjectMenuItem::StopAll => icons::STOP,
                 ProjectMenuItem::Archived => icons::ARCHIVE_MINIMALISTIC,
+                ProjectMenuItem::ArchiveCheckout => icons::ARCHIVE_MINIMALISTIC,
+                ProjectMenuItem::RestoreCheckout => icons::ARCHIVE_UP_MINIMALISTIC,
                 ProjectMenuItem::RevealInFinder | ProjectMenuItem::OpenInEditor => icons::FOLDER,
                 ProjectMenuItem::RemoveWorktree
                 | ProjectMenuItem::RemoveGroup
@@ -3052,6 +3292,12 @@ impl WorkersContent {
                         }),
                         ProjectMenuItem::OpenInEditor => this.model.update(cx, |model, cx| {
                             model.open_project_in_editor(menu_project.path.clone(), cx)
+                        }),
+                        ProjectMenuItem::ArchiveCheckout => this.model.update(cx, |model, cx| {
+                            model.archive_checkout(menu_project.id.clone(), cx)
+                        }),
+                        ProjectMenuItem::RestoreCheckout => this.model.update(cx, |model, cx| {
+                            model.restore_checkout(menu_project.id.clone(), cx)
                         }),
                         ProjectMenuItem::RemoveWorktree
                         | ProjectMenuItem::RemoveGroup
@@ -4675,14 +4921,15 @@ mod layout_tests {
 #[cfg(test)]
 mod ordering_tests {
     use super::{
-        ProjectsMenuRow, SESSION_ROW_CAP, compare_sessions_by_activity, project_activity,
-        project_has_working_set, project_in_filter, project_session_row_plan,
-        project_sessions_sorted, project_visible, projects_menu_rows, projects_ordered_by_activity,
-        prune_revealed_projects, remove_project_confirm_label, root_project_id,
-        sidebar_row_projects,
+        ProjectsMenuRow, SESSION_ROW_CAP, checkout_is_available, compare_sessions_by_activity,
+        project_activity, project_has_working_set, project_in_filter, project_session_row_plan,
+        project_sessions_sorted, project_tree_projection, project_visible, projects_menu_rows,
+        projects_ordered_by_activity, prune_revealed_projects, remove_project_confirm_label,
+        root_project_id, sidebar_row_projects,
     };
     use zeron_workers_unpeel::{
-        WorkersProject, WorkersSession, WorkersSessionCapabilities, WorkersSessionSort,
+        CheckoutAvailability, CheckoutKind, CheckoutOwnership, WorkersProject, WorkersSession,
+        WorkersSessionCapabilities, WorkersSessionSort,
     };
 
     fn project(id: &str, parent: Option<&str>) -> WorkersProject {
@@ -4698,6 +4945,14 @@ mod ordering_tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         }
     }
 
@@ -4708,18 +4963,146 @@ mod ordering_tests {
         project
     }
 
-    /// Removing a worktree row deletes every session under it, and for an
-    /// adopted checkout that is ALL it deletes — the confirm that used to be
-    /// silent about sessions was the one that only removed sessions.
+    fn repository_project(
+        id: &str,
+        repository: &str,
+        kind: CheckoutKind,
+        path: &str,
+    ) -> WorkersProject {
+        let mut project = project(id, None);
+        project.path = path.to_owned();
+        project.repository_id = Some(repository.to_owned());
+        project.repository_name = Some("Comet".into());
+        project.repository_path = Some("/repos/comet".into());
+        project.checkout_kind = Some(kind);
+        project.checkout_ownership = Some(CheckoutOwnership::External);
+        project.checkout_availability = Some(CheckoutAvailability::Available);
+        project
+    }
+
     #[test]
-    fn the_worktree_confirm_names_the_sessions_it_deletes() {
+    fn repository_projection_keeps_primary_as_root_and_nests_siblings() {
+        let primary = repository_project("main", "repo-1", CheckoutKind::Primary, "/repos/comet");
+        let branch = repository_project(
+            "feature",
+            "repo-1",
+            CheckoutKind::Linked,
+            "/repos/comet-feature",
+        );
+        let projected = project_tree_projection(&[primary.clone(), branch]);
+        let root = projected
+            .iter()
+            .find(|project| project.id == "main")
+            .unwrap();
+        let child = projected
+            .iter()
+            .find(|project| project.id == "feature")
+            .unwrap();
+        assert!(root.parent_project_id.is_none());
+        assert_eq!(child.parent_project_id.as_deref(), Some("main"));
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|project| project.id == "main")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn repository_projection_creates_non_launchable_container_without_primary() {
+        let branch = repository_project(
+            "feature",
+            "repo-1",
+            CheckoutKind::Linked,
+            "/repos/comet-feature",
+        );
+        let projected = project_tree_projection(&[branch]);
+        let root = projected.iter().find(|project| project.is_group).unwrap();
+        let child = projected
+            .iter()
+            .find(|project| project.id == "feature")
+            .unwrap();
+        assert_eq!(root.id, "repo-1");
+        assert!(root.path.is_empty());
+        assert_eq!(child.parent_project_id.as_deref(), Some("repo-1"));
+        assert!(root.is_group);
+        assert!(!checkout_is_available(root));
+    }
+
+    #[test]
+    fn manually_unlinked_git_checkout_returns_to_pending_instead_of_a_new_root() {
+        let mut checkout = project("unlinked", None);
+        checkout.checkout_kind = Some(CheckoutKind::Linked);
+        checkout.checkout_availability = Some(CheckoutAvailability::Available);
+        let projected = project_tree_projection(&[checkout]);
+        let child = projected
+            .iter()
+            .find(|project| project.id == "unlinked")
+            .unwrap();
+        assert_eq!(
+            child.parent_project_id.as_deref(),
+            Some(super::ASSOCIATION_PENDING_PROJECT_ID)
+        );
+    }
+
+    #[test]
+    fn unresolved_checkouts_live_under_a_collapsed_pending_section() {
+        let mut pending = project("legacy", None);
+        pending.checkout_kind = Some(CheckoutKind::Unresolved);
+        pending.checkout_availability = Some(CheckoutAvailability::Missing);
+        let projected = project_tree_projection(&[pending]);
+        let pending_root = projected
+            .iter()
+            .find(|project| project.id == super::ASSOCIATION_PENDING_PROJECT_ID)
+            .unwrap();
+        let checkout = projected
+            .iter()
+            .find(|project| project.id == "legacy")
+            .unwrap();
+        assert!(pending_root.is_group);
+        assert_eq!(
+            checkout.parent_project_id.as_deref(),
+            Some(super::ASSOCIATION_PENDING_PROJECT_ID)
+        );
+
+        let ordered = projects_ordered_by_activity(&projected, &[]);
+        let collapsed = sidebar_row_projects(
+            &ordered,
+            &projected,
+            &[],
+            &std::collections::HashSet::new(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            row_ids(&collapsed),
+            vec![super::ASSOCIATION_PENDING_PROJECT_ID]
+        );
+
+        let expanded =
+            std::collections::HashSet::from([super::ASSOCIATION_PENDING_PROJECT_ID.to_owned()]);
+        let visible = sidebar_row_projects(&ordered, &projected, &[], &expanded, None, None, None);
+        assert_eq!(
+            row_ids(&visible),
+            vec![super::ASSOCIATION_PENDING_PROJECT_ID, "legacy",]
+        );
+    }
+
+    /// An externally registered worktree is archived by the sidebar. The
+    /// confirmation must make it clear that its sessions and files survive;
+    /// physical deletion is reserved for a separately validated managed
+    /// worktree action.
+    #[test]
+    fn an_external_worktree_confirm_preserves_sessions_and_files() {
         assert_eq!(
             remove_project_confirm_label(&worktree("wt", "root"), true),
-            "Remove worktree and sessions?"
+            "Archive checkout and keep sessions?"
         );
         assert_eq!(
             remove_project_confirm_label(&worktree("wt", "root"), false),
-            "Remove worktree?"
+            "Archive checkout?"
         );
         // A group only archives its sessions into the parent, so it keeps the
         // shorter question.
@@ -4729,7 +5112,7 @@ mod ordering_tests {
         );
         assert_eq!(
             remove_project_confirm_label(&project("root", None), true),
-            "Remove project and sessions?"
+            "Archive checkout and keep sessions?"
         );
     }
 
@@ -4977,6 +5360,48 @@ mod ordering_tests {
     }
 
     #[test]
+    fn archived_checkout_hides_stopped_sessions_but_keeps_live_context() {
+        let mut archived_project = project("archived-checkout", None);
+        archived_project.checkout_archived = true;
+        let stopped = session("stopped", "archived-checkout", 100, 100);
+        assert!(!project_has_working_set(
+            &archived_project,
+            &[archived_project.clone()],
+            &[stopped],
+            None,
+            None
+        ));
+
+        let mut running = session("running", "archived-checkout", 200, 200);
+        running.state = "running".into();
+        running.activity = "working".into();
+        assert!(project_has_working_set(
+            &archived_project,
+            &[archived_project.clone()],
+            &[running],
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn archived_child_does_not_keep_an_idle_repository_root_visible() {
+        let root = project("root", None);
+        let mut child = project("archived-child", Some("root"));
+        child.is_group = false;
+        child.checkout_archived = true;
+        let stopped = session("stopped", "archived-child", 100, 100);
+        let projects = vec![root.clone(), child];
+        assert!(!project_has_working_set(
+            &root,
+            &projects,
+            &[stopped],
+            None,
+            None
+        ));
+    }
+
+    #[test]
     fn a_freshly_added_project_stays_until_it_owns_a_session() {
         // Just added or aimed at by the launcher: it is empty precisely because
         // the user is about to launch into it, and hiding it would hide the
@@ -5201,6 +5626,14 @@ mod ordering_tests {
                 archived_session_count: 0,
                 folder_color_id: None,
                 session_sort: WorkersSessionSort::Custom,
+                repository_id: None,
+                repository_name: None,
+                repository_path: None,
+                checkout_kind: None,
+                checkout_ownership: None,
+                checkout_availability: None,
+                checkout_archived: false,
+                checkout_detached: false,
             });
         }
         // At depth < MAX_PROJECT_DEPTH (e.g. depth 7 -> p7), visible if all ancestors expanded.
@@ -5222,6 +5655,14 @@ mod ordering_tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         };
         let cycle_b = WorkersProject {
             id: "cycle_b".into(),
@@ -5235,6 +5676,14 @@ mod ordering_tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         };
         expanded.insert("cycle_a".into());
         expanded.insert("cycle_b".into());

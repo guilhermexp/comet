@@ -27,3 +27,12 @@ base_revision_resolves_upstream = false
 # ferramenta que produziu esse número (não é a contagem de arquivos que diferem
 # de `216b61e8`, que hoje são 181), e chutar um valor aqui é pior que deixar o
 # antigo com esta nota. Quem retomar o sync recalcula pela ferramenta original.
+
+# 2026-09-18 — Comet's durable project-identity projection is read by the
+# vendored controller host without importing the adapter. The headless session
+# action path also rejects restart/resume for an unavailable or archived
+# checkout using the same raw namespace. The path-taking app-state writer
+# exposes an explicit notification hook so an isolated reconciliation can
+# announce a successful production write while fixtures remain silent. These
+# local changes live in controller_host.rs, controller_api.rs, and app_state.rs;
+# no upstream patch is implied.

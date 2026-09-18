@@ -185,6 +185,14 @@ mod tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         }
     }
 

@@ -79,6 +79,14 @@ _Avoid_: switch, move, checkout
 
 ## Projects
 
+**Logical Project**:
+A identidade local durável que reúne o checkout principal, worktrees e histórico de um repositório em Workers e Projects. Sua identidade independe da branch atual, de PR e da existência das pastas dos filhos. Um contêiner sem checkout principal cadastrado organiza os filhos, mas não é alvo de execução. Clones separados não se tornam o mesmo projeto apenas por compartilharem remote.
+_Avoid_: branch, cwd, Registered Project (quando se quer dizer o contêiner)
+
+**Worker Checkout**:
+O diretório de execução de Workers, vinculado a um Logical Project quando sua origem é comprovada. Disponibilidade, arquivamento e propriedade do diretório são fatos separados: reconhecer um worktree externo não autoriza apagá-lo. Arquivar preserva sessões; remover a pasta não elimina a identidade histórica.
+_Avoid_: novo repositório (quando se trata de worktree do mesmo repositório), main (quando se quer dizer checkout principal)
+
 **Registered Project**:
 Uma pasta que o usuário cadastrou no working set de projetos (`WorkersProject`, o que `list_projects` retorna) — o universo fechado contra o qual qualquer derivação de projeto casa. Uma pasta que o agente tocou e não está cadastrada não é um Registered Project e não existe para a UI.
 _Avoid_: workspace, folder, repo (quando se quer dizer a row cadastrada)

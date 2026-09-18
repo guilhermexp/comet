@@ -263,6 +263,20 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Work Guidance
 
+- **Workers / Projects:** ambas as telas agrupam checkouts pelo `repository_id`
+  persistido. Branch, remote e basename não são identidade do projeto. O
+  contêiner sem principal cadastrado é só apresentação: sem cwd executável ou
+  menu de grupo real. Legado sem evidência entra em `Association pending`.
+  Projects seleciona explicitamente o checkout para Path/Config/Reveal/Auto Doc;
+  erro de probe ou pasta ausente desabilita ações de filesystem.
+- **Archive checkout** preserva arquivos e sessões; sessões paradas saem do
+  working set, mas Workers ativos/selecionados continuam acessíveis. Não
+  encaminhar archive ao handler de remoção física. PR pertence ao cwd e branch
+  atualmente observados; detached/ausente não reutiliza badge antigo. Cobertura:
+  `workers::workspace`, `workers::project_menu`, `settings::projects` e
+  `change_requests`; comprovação visual em
+  `docs/verification/2026-09-18-workers-project-identity.md`.
+
 - "Não atualizou na tela" começa em `zeron-doc` (mirror), não aqui.
 - Não há harness de render: mudança visual se valida rodando `scripts/dev-demo.sh` e olhando. Screenshot antes de dizer pronto.
 - Recuperação de foco do Shell verifica o dispatch tree montado após layout: prefere o composer quando presente e usa a raiz focável quando o handle anterior ficou desmontado. Não substitui o retorno de first responder AppKit do preview nativo. Seleção no transcript suspende o follow já no mouse-down, cancelando animação e viewport pendente antes de arrastar.

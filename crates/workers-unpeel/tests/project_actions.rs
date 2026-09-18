@@ -214,7 +214,7 @@ fn worktree_registered_as_a_plain_project_is_projected_as_a_worktree()
 }
 
 #[test]
-fn worktree_lifecycle_registers_and_removes_the_child_project()
+fn worktree_lifecycle_removes_checkout_but_retains_child_history()
 -> Result<(), Box<dyn std::error::Error>> {
     let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
     let (home, _guard) = isolated_home()?;
@@ -253,12 +253,21 @@ fn worktree_lifecycle_registers_and_removes_the_child_project()
 
     client.remove_worktree(&worktree.project_id, true)?;
     assert!(!std::path::Path::new(&worktree.path).exists());
+    let snapshot = client.bootstrap()?;
+    let historical = snapshot
+        .projects
+        .iter()
+        .find(|project| project.id == worktree.project_id)
+        .expect("physical checkout removal preserves its registration and session references");
+    assert!(historical.checkout_archived);
+    assert_eq!(historical.parent_project_id.as_deref(), Some("root"));
     assert!(
-        client
-            .bootstrap()?
-            .projects
-            .iter()
-            .all(|project| project.id != worktree.project_id)
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["show-ref", "--verify", "refs/heads/feature/sidebar"])
+            .status()?
+            .success()
     );
     Ok(())
 }
@@ -614,5 +623,176 @@ fn a_child_that_is_not_a_group_removes_as_a_project() -> Result<(), Box<dyn std:
             .iter()
             .all(|project| project.id != "nested")
     );
+    Ok(())
+}
+
+#[test]
+fn archiving_and_restoring_a_checkout_preserves_session_artifacts_and_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = isolated_home()?;
+    let repo = home.path().join("archive-repo");
+    fixture_repo(&repo)?;
+    let client = LocalWorkersClient::new();
+    let id = client.add_project(&repo)?;
+    let session_dir = home.path().join("app-sessions").join("retained-worker");
+    fs::create_dir_all(&session_dir)?;
+    let manifest = serde_json::to_vec_pretty(&serde_json::json!({
+        "session": {"id":"retained-worker","project_id":id,"label":"Keep my work","command":"codex","created_at":1},
+        "cwd":repo,"state":"exited","pid":null,"exit_code":0,"updated_at":1
+    }))?;
+    fs::write(session_dir.join("manifest.json"), &manifest)?;
+    fs::write(session_dir.join("output.bin"), "retained terminal history")?;
+    client.archive_checkout(&id)?;
+    let snapshot = client.bootstrap()?;
+    assert!(
+        snapshot
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .checkout_archived
+    );
+    assert_eq!(fs::read(session_dir.join("manifest.json"))?, manifest);
+    assert_eq!(
+        fs::read_to_string(session_dir.join("output.bin"))?,
+        "retained terminal history"
+    );
+    assert!(repo.exists());
+    let restart = client
+        .session_action(
+            "retained-worker",
+            zeron_workers_unpeel::SessionAction::Restart,
+        )
+        .expect_err("an archived checkout cannot restart a Worker");
+    assert!(restart.to_string().contains("archived"), "{restart}");
+    client.restore_checkout(&id)?;
+    assert!(
+        !client
+            .bootstrap()?
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .checkout_archived
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
+    assert_eq!(state["unknown_future_field"]["keep"], true);
+    assert_eq!(client.add_project(&repo)?, id);
+    Ok(())
+}
+
+#[test]
+fn externally_registered_worktree_inside_managed_root_cannot_be_physically_removed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = isolated_home()?;
+    let repo = home.path().join("external-repo");
+    fixture_repo(&repo)?;
+    let checkout = home.path().join("worktrees").join("external");
+    fs::create_dir_all(checkout.parent().unwrap())?;
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-qb", "external"])
+            .arg(&checkout)
+            .status()?
+            .success()
+    );
+    let client = LocalWorkersClient::new();
+    let id = client.add_project(&checkout)?;
+    assert!(client.remove_worktree(&id, true).is_err());
+    assert!(checkout.exists());
+    assert!(
+        client
+            .bootstrap()?
+            .projects
+            .iter()
+            .any(|project| project.id == id)
+    );
+    Ok(())
+}
+
+#[test]
+fn forced_managed_removal_does_not_discard_untracked_work() -> Result<(), Box<dyn std::error::Error>>
+{
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = isolated_home()?;
+    let repo = home.path().join("dirty-repo");
+    fixture_repo(&repo)?;
+    let client = LocalWorkersClient::new();
+    let id = client.add_project(&repo)?;
+    let child = client.create_worktree(WorkersCreateWorktreeRequest {
+        project_id: id,
+        branch: "feature/preserve".into(),
+        name: None,
+        base_ref: Some("main".into()),
+    })?;
+    let precious = std::path::Path::new(&child.path).join("precious.txt");
+    fs::write(&precious, "uncommitted user work")?;
+    assert!(client.remove_worktree(&child.project_id, true).is_err());
+    assert_eq!(fs::read_to_string(&precious)?, "uncommitted user work");
+    assert!(
+        client
+            .bootstrap()?
+            .projects
+            .iter()
+            .any(|project| project.id == child.project_id)
+    );
+    Ok(())
+}
+
+#[test]
+fn interrupted_removal_blocks_restart_until_explicit_clean_restore()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = isolated_home()?;
+    let repo = home.path().join("interrupted-repo");
+    fixture_repo(&repo)?;
+    let client = LocalWorkersClient::new();
+    let id = client.add_project(&repo)?;
+    let session_dir = home.path().join("app-sessions/interrupted-worker");
+    fs::create_dir_all(&session_dir)?;
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "session":{"id":"interrupted-worker","project_id":id,"label":"Retained","command":"codex","created_at":1},
+        "cwd":repo,"state":"exited","pid":null,"exit_code":0,"updated_at":1
+    }))?;
+    fs::write(session_dir.join("manifest.json"), &manifest)?;
+    let mut state = read_state(home.path())?;
+    let checkout = state["comet_project_identity"]["checkouts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|c| c["projectID"] == id)
+        .unwrap();
+    checkout["removalInterrupted"] = true.into();
+    checkout["lastRemovalError"] = "interrupted test mutation".into();
+    write_state(home.path(), &state)?;
+    client.reconcile_project_identity()?;
+    let error = client
+        .session_action(
+            "interrupted-worker",
+            zeron_workers_unpeel::SessionAction::Restart,
+        )
+        .expect_err("reconciliation must not authorize an interrupted checkout");
+    assert!(error.to_string().contains("interrupted"), "{error}");
+    let unsaved = repo.join("unsaved.txt");
+    fs::write(&unsaved, "preserve me")?;
+    assert!(client.restore_checkout(&id).is_err());
+    assert_eq!(fs::read_to_string(&unsaved)?, "preserve me");
+    // Resolve the fixture's untracked work, then explicitly acknowledge recovery.
+    fs::remove_file(unsaved)?;
+    client.restore_checkout(&id)?;
+    let registry = client.project_identity_registry()?;
+    assert!(
+        !registry
+            .checkout(&id)
+            .unwrap()
+            .extra
+            .contains_key("removalInterrupted")
+    );
+    assert_eq!(fs::read(session_dir.join("manifest.json"))?, manifest);
     Ok(())
 }

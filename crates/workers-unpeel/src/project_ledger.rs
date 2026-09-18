@@ -13,9 +13,10 @@
 //! chaves que limpa (`projects`, cores de pasta, modos de ordenacao) e esta
 //! nao esta entre elas.
 //!
-//! A chave e o PATH, nunca o id: `add_project` cunha um `comet-<uuid>` novo a
-//! cada entrada, entao remover e readicionar a mesma pasta orfanaria o
-//! historico dela.
+//! A chave historica continua sendo o PATH para compatibilidade, mas a
+//! associacao logica de repositorio/checkouts vive em
+//! `comet_project_identity`. Assim a linha pode sobreviver a um id de execucao
+//! removido sem fazer a UI tratar cada worktree como um projeto novo.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -23,8 +24,13 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use super::project_identity::{CheckoutAvailability, CheckoutKind, CheckoutOwnership};
+
 /// Chave de topo do ledger em `app-state.json`.
 pub const LEDGER_KEY: &str = "comet_projects";
+/// Display name used when a repository has linked checkouts but no registered
+/// primary checkout to serve as its logical project row.
+pub const UNREGISTERED_PRIMARY_NAME: &str = "Principal not registered";
 
 /// Uma entrada do ledger — so o que NAO da pra recalcular. Estado de git,
 /// commits ancora e contagem de sessoes sao lidos frescos a cada abertura,
@@ -53,7 +59,22 @@ pub struct LiveProject {
     pub last_activity_unix_ms: Option<u64>,
 }
 
-/// Uma linha da tela de Settings > Projects.
+/// Estado da associacao duravel com um projeto logico.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AssociationState {
+    #[default]
+    Known,
+    Pending,
+    Conflict,
+}
+
+/// Uma linha de checkout da tela de Settings > Projects.
+///
+/// Os seis campos adicionados ao contrato anterior sao aditivos e possuem
+/// defaults no construtor de compatibilidade. A reconciliacao legada continua
+/// produzindo uma linha por path ate o adapter conseguir publicar a identidade
+/// do repositorio. Isso deixa a migracao incremental e evita agrupar clones
+/// distintos por nome ou remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRow {
     /// `None` quando o projeto so existe no ledger: sem id nao ha o que
@@ -64,12 +85,250 @@ pub struct ProjectRow {
     pub added_at_unix_ms: u64,
     pub last_opened_at_unix_ms: u64,
     pub icon_path: Option<String>,
+    /// Identidade local do repositorio. `None` significa legado ainda nao
+    /// reconciliado, nao que duas entradas podem ser fundidas.
+    pub repository_id: Option<String>,
+    /// ID estavel do checkout quando ele continua apenas no historico.
+    pub checkout_id: Option<String>,
+    pub checkout_kind: Option<CheckoutKind>,
+    pub checkout_ownership: Option<CheckoutOwnership>,
+    pub checkout_availability: Option<CheckoutAvailability>,
+    pub current_branch: Option<String>,
+    pub last_known_branch: Option<String>,
+    pub association: AssociationState,
+    pub archived: bool,
 }
 
 impl ProjectRow {
     pub fn is_live(&self) -> bool {
         self.project_id.is_some()
     }
+
+    /// Um registro legado sem observacao continua elegivel para as acoes
+    /// antigas; depois da reconciliacao, `Missing` e `ProbeFailed` bloqueiam
+    /// filesystem ate que o checkout volte a ser verificavel.
+    pub fn is_available(&self) -> bool {
+        !matches!(
+            self.checkout_availability,
+            Some(CheckoutAvailability::Missing)
+        ) && self.path_is_present_or_legacy()
+    }
+
+    fn path_is_present_or_legacy(&self) -> bool {
+        !matches!(
+            self.checkout_availability,
+            Some(CheckoutAvailability::Missing | CheckoutAvailability::ProbeFailed)
+        )
+    }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self.association,
+            AssociationState::Pending | AssociationState::Conflict
+        )
+    }
+
+    pub fn display_branch(&self) -> Option<&str> {
+        self.current_branch
+            .as_deref()
+            .or(self.last_known_branch.as_deref())
+    }
+}
+
+/// Um projeto logico e o agrupador usado por Settings. `checkouts` contem
+/// registros disponiveis e historicos; a tela decide como separar visualmente
+/// por `checkout_availability` sem remover o row do resultado da busca.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGroup {
+    pub id: String,
+    pub name: String,
+    pub icon_path: Option<String>,
+    pub added_at_unix_ms: u64,
+    pub last_opened_at_unix_ms: u64,
+    pub checkouts: Vec<ProjectRow>,
+}
+
+impl ProjectGroup {
+    pub fn selected_checkout(&self) -> Option<&ProjectRow> {
+        self.checkouts
+            .iter()
+            .find(|row| row.checkout_kind == Some(CheckoutKind::Primary) && row.is_available())
+            .or_else(|| self.checkouts.iter().find(|row| row.is_available()))
+            .or_else(|| {
+                self.checkouts
+                    .iter()
+                    .find(|row| row.checkout_kind == Some(CheckoutKind::Primary))
+            })
+            .or_else(|| self.checkouts.first())
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.checkouts.iter().any(ProjectRow::is_pending)
+    }
+
+    pub fn available_checkouts(&self) -> impl Iterator<Item = &ProjectRow> {
+        self.checkouts.iter().filter(|row| row.is_available())
+    }
+
+    pub fn historical_checkouts(&self) -> impl Iterator<Item = &ProjectRow> {
+        self.checkouts.iter().filter(|row| {
+            matches!(
+                row.checkout_availability,
+                Some(CheckoutAvailability::Missing)
+            )
+        })
+    }
+}
+
+/// Agrupa somente registros com a mesma identidade persistida. Linhas legadas
+/// sem `repository_id` permanecem separadas, pois path/basename/remote nao sao
+/// evidencia suficiente para juntar clones ou branches antigas.
+pub fn group_rows(rows: &[ProjectRow]) -> Vec<ProjectGroup> {
+    let mut groups: Vec<ProjectGroup> = Vec::new();
+    let mut indexes: HashMap<String, usize> = HashMap::new();
+
+    for row in rows {
+        let group_id = row
+            .repository_id
+            .clone()
+            .unwrap_or_else(|| format!("legacy:{}", key(&row.path)));
+        let index = if let Some(index) = indexes.get(&group_id).copied() {
+            index
+        } else {
+            let index = groups.len();
+            indexes.insert(group_id.clone(), index);
+            groups.push(ProjectGroup {
+                id: group_id,
+                name: row.name.clone(),
+                icon_path: row.icon_path.clone(),
+                added_at_unix_ms: row.added_at_unix_ms,
+                last_opened_at_unix_ms: row.last_opened_at_unix_ms,
+                checkouts: Vec::new(),
+            });
+            index
+        };
+
+        let group = &mut groups[index];
+        group.added_at_unix_ms = group.added_at_unix_ms.min(row.added_at_unix_ms);
+        if row.last_opened_at_unix_ms > group.last_opened_at_unix_ms {
+            group.last_opened_at_unix_ms = row.last_opened_at_unix_ms;
+        }
+        if group.icon_path.is_none() {
+            group.icon_path = row.icon_path.clone();
+        }
+        if row.checkout_kind == Some(CheckoutKind::Primary) {
+            group.name = row.name.clone();
+            group.icon_path = row.icon_path.clone().or(group.icon_path.clone());
+        }
+        group.checkouts.push(row.clone());
+    }
+
+    for group in &mut groups {
+        group.checkouts.sort_by(|left, right| {
+            let left_primary = left.checkout_kind == Some(CheckoutKind::Primary);
+            let right_primary = right.checkout_kind == Some(CheckoutKind::Primary);
+            right_primary
+                .cmp(&left_primary)
+                .then_with(|| {
+                    right
+                        .last_opened_at_unix_ms
+                        .cmp(&left.last_opened_at_unix_ms)
+                })
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        if let Some(primary) = group
+            .checkouts
+            .iter()
+            .find(|row| row.checkout_kind == Some(CheckoutKind::Primary))
+        {
+            group.name = primary.name.clone();
+            if primary.icon_path.is_some() {
+                group.icon_path = primary.icon_path.clone();
+            }
+        } else if group
+            .checkouts
+            .iter()
+            .any(|row| row.repository_id.is_some())
+        {
+            group.name = UNREGISTERED_PRIMARY_NAME.to_owned();
+        }
+    }
+
+    groups.sort_by(|left, right| {
+        right
+            .last_opened_at_unix_ms
+            .cmp(&left.last_opened_at_unix_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    groups
+}
+
+/// Busca pelo nome do projeto ou por qualquer nome, branch ou path de seus
+/// checkouts. Devolve o checkout que deve receber foco quando a query encontra
+/// um filho, preservando a navegabilidade de historicos ausentes.
+pub fn group_matches_query<'a>(group: &'a ProjectGroup, query: &str) -> Option<&'a ProjectRow> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return group.selected_checkout();
+    }
+    if group.name.to_lowercase().contains(&query) {
+        return group.selected_checkout();
+    }
+    group.checkouts.iter().find(|row| {
+        row.name.to_lowercase().contains(&query)
+            || row.path.to_lowercase().contains(&query)
+            || row
+                .display_branch()
+                .is_some_and(|branch| branch.to_lowercase().contains(&query))
+    })
+}
+
+/// Mescla a identidade duravel na projecao do ledger sem promover um checkout
+/// historico a alvo executavel. O match primario e o `project_id`; o fallback
+/// por path so e usado quando ha exatamente uma entrada da registry para esse
+/// path, o que permite recuperar rows antigas sem adivinhar por basename.
+pub fn decorate_with_identity(
+    mut rows: Vec<ProjectRow>,
+    registry: &super::project_identity::IdentityRegistry,
+) -> Vec<ProjectRow> {
+    for row in &mut rows {
+        let by_id = row
+            .project_id
+            .as_deref()
+            .and_then(|project_id| registry.checkout(project_id));
+        let by_path = if by_id.is_none() {
+            let matches = registry
+                .checkouts
+                .iter()
+                .filter(|checkout| key(&checkout.path) == key(&row.path))
+                .collect::<Vec<_>>();
+            (matches.len() == 1).then(|| matches[0])
+        } else {
+            None
+        };
+        let Some(checkout) = by_id.or(by_path) else {
+            continue;
+        };
+        row.repository_id = checkout.repository_id.clone();
+        row.checkout_id = checkout
+            .checkout_id
+            .clone()
+            .or_else(|| Some(checkout.project_id.clone()));
+        row.checkout_kind = Some(checkout.kind);
+        row.checkout_ownership = Some(checkout.ownership);
+        row.checkout_availability = Some(checkout.availability);
+        row.current_branch = checkout.branch.clone();
+        row.last_known_branch = checkout.last_known_branch.clone();
+        row.association = if checkout.conflict.is_some() {
+            AssociationState::Conflict
+        } else if checkout.repository_id.is_some() {
+            AssociationState::Known
+        } else {
+            AssociationState::Pending
+        };
+        row.archived = checkout.archived;
+    }
+    rows
 }
 
 /// O resultado de uma passada de reconciliacao.
@@ -150,6 +409,15 @@ pub fn reconcile(ledger: &[LedgerProject], live: &[LiveProject], now: u64) -> Re
             added_at_unix_ms: entry.added_at_unix_ms,
             last_opened_at_unix_ms: activity.unwrap_or(entry.last_seen_at_unix_ms),
             icon_path: entry.icon_path.clone(),
+            repository_id: None,
+            checkout_id: Some(project.id.clone()),
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            current_branch: None,
+            last_known_branch: None,
+            association: AssociationState::Pending,
+            archived: false,
         });
         next.push(entry);
     }
@@ -164,6 +432,15 @@ pub fn reconcile(ledger: &[LedgerProject], live: &[LiveProject], now: u64) -> Re
             added_at_unix_ms: entry.added_at_unix_ms,
             last_opened_at_unix_ms: entry.last_seen_at_unix_ms,
             icon_path: entry.icon_path.clone(),
+            repository_id: None,
+            checkout_id: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            current_branch: None,
+            last_known_branch: None,
+            association: AssociationState::Pending,
+            archived: false,
         });
         next.push(entry);
     }
@@ -256,14 +533,69 @@ fn state_path() -> std::path::PathBuf {
 /// contrario.
 pub fn forget_at(path: &Path, project_path: &str) -> Result<bool, String> {
     let target = key(project_path);
-    let mut entries = read_at(path)?;
-    let before = entries.len();
-    entries.retain(|entry| key(&entry.path) != target);
-    if entries.len() == before {
-        return Ok(false);
-    }
-    write_at(path, &entries)?;
-    Ok(true)
+    unpeel_core::app_state::edit_at(path, |state| {
+        let mut entries = state
+            .get(LEDGER_KEY)
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+                    .collect::<Vec<LedgerProject>>()
+            })
+            .unwrap_or_default();
+        let before = entries.len();
+        entries.retain(|entry| key(&entry.path) != target);
+        let mut changed = entries.len() != before;
+        if changed {
+            state.insert(LEDGER_KEY.to_owned(), encode(&entries)?);
+        }
+
+        // Forget is presentation metadata only, but the identity registry also
+        // needs a durable suppression marker so a later reconcile cannot
+        // recreate the row from a stale checkout registration. Unknown or
+        // future identity schemas remain untouched and the ledger deletion is
+        // still allowed to complete.
+        if let Some(identity) = state.get(super::project_identity::IDENTITY_KEY).cloned()
+            && let Ok(mut registry) =
+                serde_json::from_value::<super::project_identity::IdentityRegistry>(identity)
+            && registry.version <= super::project_identity::IDENTITY_SCHEMA_VERSION
+        {
+            let matching_checkout_ids = registry
+                .checkouts
+                .iter()
+                .filter(|checkout| key(&checkout.path) == target)
+                .map(|checkout| checkout.project_id.clone())
+                .collect::<Vec<_>>();
+            for checkout_id in matching_checkout_ids {
+                if !registry
+                    .suppressed_project_ids
+                    .iter()
+                    .any(|id| id == &checkout_id)
+                {
+                    registry.suppressed_project_ids.push(checkout_id.clone());
+                    changed = true;
+                }
+                if let Some(checkout) = registry
+                    .checkouts
+                    .iter_mut()
+                    .find(|checkout| checkout.project_id == checkout_id)
+                {
+                    if !checkout.archived {
+                        checkout.archived = true;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                state.insert(
+                    crate::project_identity::IDENTITY_KEY.to_owned(),
+                    serde_json::to_value(registry).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        Ok(changed)
+    })
 }
 
 /// Grava o caminho do icone de um projeto, criando a linha se ela nao existir.
@@ -466,6 +798,96 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_checkout_suppresses_identity_without_touching_sessions() {
+        with_state(|path| {
+            unpeel_core::app_state::edit_at(path, |state| {
+                state.insert(
+                    LEDGER_KEY.to_owned(),
+                    serde_json::json!([{
+                        "path": "/tmp/removed",
+                        "name": "removed",
+                        "added_at_unix_ms": 1,
+                        "last_seen_at_unix_ms": 2
+                    }]),
+                );
+                state.insert(
+                    crate::project_identity::IDENTITY_KEY.to_owned(),
+                    serde_json::json!({
+                        "version": 1,
+                        "repositories": [],
+                        "checkouts": [{
+                            "projectID": "checkout-1",
+                            "path": "/tmp/removed",
+                            "kind": "linked",
+                            "ownership": "external",
+                            "availability": "missing"
+                        }],
+                        "suppressedProjectIds": []
+                    }),
+                );
+                state.insert("sessions".to_owned(), serde_json::json!([{"id": "kept"}]));
+                Ok(())
+            })
+            .unwrap();
+
+            assert!(forget_at(path, "/tmp/removed").unwrap());
+            let state = unpeel_core::app_state::load_for_edit_at(path).unwrap();
+            assert!(state[LEDGER_KEY].as_array().is_some_and(Vec::is_empty));
+            assert_eq!(state["sessions"][0]["id"], "kept");
+            assert_eq!(
+                state[crate::project_identity::IDENTITY_KEY]["suppressedProjectIds"][0],
+                "checkout-1"
+            );
+            assert_eq!(
+                state[crate::project_identity::IDENTITY_KEY]["checkouts"][0]["archived"],
+                true
+            );
+        });
+    }
+
+    #[test]
+    fn forgetting_does_not_rewrite_a_future_identity_schema() {
+        with_state(|path| {
+            unpeel_core::app_state::edit_at(path, |state| {
+                state.insert(
+                    LEDGER_KEY.to_owned(),
+                    serde_json::json!([{
+                        "path": "/tmp/future",
+                        "name": "future",
+                        "added_at_unix_ms": 1,
+                        "last_seen_at_unix_ms": 2
+                    }]),
+                );
+                state.insert(
+                    crate::project_identity::IDENTITY_KEY.to_owned(),
+                    serde_json::json!({
+                        "version": 999,
+                        "futureField": {"keep": true},
+                        "repositories": [],
+                        "checkouts": [{
+                            "projectID": "future-1",
+                            "path": "/tmp/future",
+                            "kind": "linked",
+                            "ownership": "external",
+                            "availability": "missing"
+                        }],
+                        "suppressedProjectIds": []
+                    }),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+            let before = unpeel_core::app_state::load_for_edit_at(path).unwrap()
+                [crate::project_identity::IDENTITY_KEY]
+                .clone();
+            assert!(forget_at(path, "/tmp/future").unwrap());
+            let after = unpeel_core::app_state::load_for_edit_at(path).unwrap();
+            assert_eq!(after[crate::project_identity::IDENTITY_KEY], before);
+        });
+    }
+
+    #[test]
     fn an_icon_round_trips_and_survives_a_reconcile() {
         with_state(|path| {
             write_at(path, &[entry("/tmp/one", 1, 2)]).unwrap();
@@ -482,5 +904,200 @@ mod tests {
                 Some("/icons/one.png")
             );
         });
+    }
+
+    fn checkout(
+        repository_id: Option<&str>,
+        path: &str,
+        name: &str,
+        kind: CheckoutKind,
+        availability: CheckoutAvailability,
+        branch: Option<&str>,
+    ) -> ProjectRow {
+        ProjectRow {
+            project_id: Some(format!("project-{name}")),
+            path: path.to_owned(),
+            name: name.to_owned(),
+            added_at_unix_ms: 10,
+            last_opened_at_unix_ms: 20,
+            icon_path: None,
+            repository_id: repository_id.map(str::to_owned),
+            checkout_id: Some(format!("checkout-{name}")),
+            checkout_kind: Some(kind),
+            checkout_ownership: Some(CheckoutOwnership::External),
+            checkout_availability: Some(availability),
+            current_branch: branch.map(str::to_owned),
+            last_known_branch: None,
+            association: AssociationState::Known,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn grouping_uses_persisted_repository_identity_and_keeps_children() {
+        let groups = group_rows(&[
+            checkout(
+                Some("repo-1"),
+                "/tmp/comet",
+                "comet",
+                CheckoutKind::Primary,
+                CheckoutAvailability::Available,
+                Some("main"),
+            ),
+            checkout(
+                Some("repo-1"),
+                "/tmp/comet-worktree",
+                "feature/login",
+                CheckoutKind::Linked,
+                CheckoutAvailability::Available,
+                Some("feature/login"),
+            ),
+            checkout(
+                Some("repo-2"),
+                "/tmp/other",
+                "comet",
+                CheckoutKind::Primary,
+                CheckoutAvailability::Available,
+                Some("main"),
+            ),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].checkouts.len(), 2);
+        assert_eq!(groups[0].name, "comet");
+        assert_eq!(
+            group_matches_query(&groups[0], "LOGIN").map(|row| row.path.as_str()),
+            Some("/tmp/comet-worktree")
+        );
+    }
+
+    #[test]
+    fn legacy_rows_are_not_merged_by_name_or_path_shape() {
+        let groups = group_rows(&[
+            checkout(
+                None,
+                "/tmp/a/comet",
+                "comet",
+                CheckoutKind::Unresolved,
+                CheckoutAvailability::ProbeFailed,
+                None,
+            ),
+            checkout(
+                None,
+                "/tmp/b/comet",
+                "comet",
+                CheckoutKind::Unresolved,
+                CheckoutAvailability::ProbeFailed,
+                None,
+            ),
+        ]);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn missing_checkout_stays_in_history_and_does_not_count_as_available() {
+        let row = checkout(
+            Some("repo-1"),
+            "/tmp/removed",
+            "feature/old",
+            CheckoutKind::Linked,
+            CheckoutAvailability::Missing,
+            Some("feature/old"),
+        );
+        let groups = group_rows(&[row]);
+        assert_eq!(groups[0].available_checkouts().count(), 0);
+        assert_eq!(groups[0].historical_checkouts().count(), 1);
+        assert_eq!(groups[0].selected_checkout().unwrap().name, "feature/old");
+    }
+
+    #[test]
+    fn group_selection_prefers_an_available_child_when_primary_is_missing() {
+        let groups = group_rows(&[
+            checkout(
+                Some("repo-1"),
+                "/tmp/removed-main",
+                "comet",
+                CheckoutKind::Primary,
+                CheckoutAvailability::Missing,
+                Some("main"),
+            ),
+            checkout(
+                Some("repo-1"),
+                "/tmp/feature",
+                "feature/sidebar",
+                CheckoutKind::Linked,
+                CheckoutAvailability::Available,
+                Some("feature/sidebar"),
+            ),
+        ]);
+        assert_eq!(
+            groups[0].selected_checkout().map(|row| row.path.as_str()),
+            Some("/tmp/feature")
+        );
+    }
+
+    #[test]
+    fn a_repository_without_a_primary_uses_the_explicit_container_name() {
+        let groups = group_rows(&[checkout(
+            Some("repo-1"),
+            "/tmp/feature",
+            "feature/sidebar",
+            CheckoutKind::Linked,
+            CheckoutAvailability::Available,
+            Some("feature/sidebar"),
+        )]);
+        assert_eq!(groups[0].name, UNREGISTERED_PRIMARY_NAME);
+    }
+
+    #[test]
+    fn decorating_rows_preserves_legacy_fields_and_adds_identity_metadata() {
+        let row = checkout(
+            None,
+            "/tmp/feature",
+            "feature",
+            CheckoutKind::Linked,
+            CheckoutAvailability::Available,
+            None,
+        );
+        let registry = super::super::project_identity::IdentityRegistry {
+            repositories: vec![super::super::project_identity::RepositoryIdentity {
+                id: "repo-1".to_owned(),
+                common_dir: Some("/tmp/repo/.git".to_owned()),
+                common_dir_fingerprint: None,
+                name: Some("repo".to_owned()),
+                primary_path: None,
+                primary_project_id: None,
+                project_ids: vec!["project-feature".to_owned()],
+                last_seen_unix_ms: Some(30),
+                extra: Default::default(),
+            }],
+            checkouts: vec![super::super::project_identity::CheckoutIdentity {
+                project_id: "project-feature".to_owned(),
+                checkout_id: Some("checkout-feature".to_owned()),
+                repository_id: Some("repo-1".to_owned()),
+                path: "/tmp/feature".to_owned(),
+                canonical_path: None,
+                main_repo: Some("/tmp/repo".to_owned()),
+                kind: CheckoutKind::Linked,
+                ownership: CheckoutOwnership::External,
+                availability: CheckoutAvailability::Available,
+                branch: Some("feature/login".to_owned()),
+                last_known_branch: Some("feature/login".to_owned()),
+                detached_oid: None,
+                detached: false,
+                remotes: Vec::new(),
+                observed_common_dir: Some("/tmp/repo/.git".to_owned()),
+                conflict: None,
+                last_observed_unix_ms: Some(30),
+                archived: false,
+                extra: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let rows = decorate_with_identity(vec![row], &registry);
+        assert_eq!(rows[0].repository_id.as_deref(), Some("repo-1"));
+        assert_eq!(rows[0].checkout_id.as_deref(), Some("checkout-feature"));
+        assert_eq!(rows[0].display_branch(), Some("feature/login"));
+        assert_eq!(rows[0].association, AssociationState::Known);
     }
 }

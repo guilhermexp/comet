@@ -582,6 +582,14 @@ mod tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: Default::default(),
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         };
         let titlebar = workers_titlebar(Some(&project), None);
         assert_eq!(titlebar.segments, [".orchestrator"]);
@@ -595,6 +603,27 @@ mod tests {
     /// the badge beside it opens another branch's pull request.
     #[test]
     fn workers_titlebar_follows_the_branch_checked_out_in_the_worktree() {
+        let parent = WorkersProject {
+            id: "project".into(),
+            name: "Comet".into(),
+            path: "/tmp/comet".into(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: None,
+            git_branch: Some("main".into()),
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: Default::default(),
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
+        };
         let project = WorkersProject {
             id: "worktree".into(),
             name: "fix".into(),
@@ -607,8 +636,17 @@ mod tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: Default::default(),
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         };
-        let titlebar = workers_titlebar(Some(&project), None);
+        let titlebar = workers_titlebar(Some(&project), Some(&parent));
+        assert_eq!(titlebar.segments, ["Comet"]);
         assert_eq!(titlebar.branch.as_deref(), Some("change/switched"));
         assert!(titlebar.branch_is_worktree);
     }

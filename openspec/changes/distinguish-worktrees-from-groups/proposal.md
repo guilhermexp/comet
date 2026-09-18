@@ -69,3 +69,12 @@ None.
 - Out of scope: `unpeel-tui/src/sessions.rs:1712` carries the same missing
   clause on the TUI host's own projection. It is not on the `comet-local`
   route; left untouched rather than edited without evidence against comet.
+
+## Integration follow-up — 2026-09-18
+
+[`stabilize-workers-project-identity`](../stabilize-workers-project-identity/proposal.md)
+extends the Workers/Projects path with durable repository membership, explicit
+checkout ownership/availability and history-preserving lifecycle actions. Its
+[verification report](../../../docs/verification/2026-09-18-workers-project-identity.md)
+records the integrated evidence. This cross-reference does not mark this
+change's independent tasks or engine-specific checks complete.

@@ -117,6 +117,17 @@ pub fn save(state: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Notify other local frontends after a path-taking writer changed the real
+/// app-state file. Tests and isolated migration fixtures use `edit_at`, which
+/// must remain silent; production callers can opt in after their write has
+/// succeeded.
+pub fn announce_app_state_changed() {
+    crate::state_bus::announce(
+        crate::state_bus::Change::AppState,
+        crate::session_ops::own_listener_port_public(),
+    );
+}
+
 /// `save` against an explicit path — see `load_for_edit_at`.
 pub fn save_at(path: &std::path::Path, state: &Value) -> Result<(), String> {
     let object = state
@@ -126,7 +137,14 @@ pub fn save_at(path: &std::path::Path, state: &Value) -> Result<(), String> {
         if let Ok(Value::Object(previous)) = serde_json::from_slice::<Value>(&existing) {
             let dropped: Vec<&String> = previous
                 .keys()
-                .filter(|key| !object.contains_key(*key))
+                .filter(|key| {
+                    !object.contains_key(*key)
+                        // Comet's identity rollback intentionally removes its
+                        // own additive namespace when the pre-migration state
+                        // did not contain one. Other unknown keys remain
+                        // protected by the existing whole-document guard.
+                        && key.as_str() != "comet_project_identity"
+                })
                 .collect();
             if !dropped.is_empty() {
                 return Err(format!(

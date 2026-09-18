@@ -16,6 +16,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 
 - `dev-demo.sh` sobe daemon com **harness mock seeded** — offline, determinístico. `--slow` mostra o streaming. É a superfície onde mudança visual se valida. O rig também isola `UNPEEL_HOME` e semeia um Worker OMP vinculado ao primeiro Chat, com telemetria multi-modelo, para o widget Workers ter um estado visual reproduzível sem ler dados reais do usuário.
 - `dev-demo.sh` deve continuar compatível com o Bash 3.2 do macOS; não usar arrays associativos (`declare -A`).
+- `seed-project-identity-demo.py --home <diretório-vazio>` cria repositórios Git e Workers de demonstração isolados para Workers/Projects. Recusa sobrescrever perfis existentes. `--remove-observed-checkout` remove somente o checkout criado pela fixture, depois de o app registrar sua identidade, para comprovar retenção de histórico. Não aponta para `~/.unpeel` real.
 - Captura de UI (rota/dialog/picker/gate/upload fabricado) exige `ZERON_UI_CAPTURE=1` junto da knob: `ZERON_UI_CAPTURE=1 ZERON_OPEN_ROUTE=settings/agents cargo run`. Sem o umbrella a knob é ignorada de propósito — ela ficava exportada no shell e sequestrava todo run seguinte.
 - `e2e-smoke.sh` é o smoke multi-device; roda contra engine real.
 - Os scripts de packaging **consomem `dist/` da raiz**: `package-macos.sh` lê `dist/macos/Info.plist` e gera o iconset de `dist/macos/icon-1024.png`; `package-linux.sh` instala `dist/zeron.desktop` e `dist/zeron.png`. Apagar essa pasta quebra release sem quebrar build.

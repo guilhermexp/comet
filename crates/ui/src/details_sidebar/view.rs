@@ -5696,6 +5696,14 @@ mod tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         };
 
         let entry1 = SessionMessageEntry {
@@ -5764,6 +5772,14 @@ mod tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         });
         let _ = state.worked_projects(&ctx_one, &transcript_longer, &projects_modified, None);
         let key3 = state.worked_projects_cache_key().unwrap().clone();

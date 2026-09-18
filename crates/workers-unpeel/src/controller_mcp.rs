@@ -490,7 +490,15 @@ fn dispatch_action(
                     "path": project.path,
                     "is_group": project.is_group,
                     "worktree_branch": project.worktree_branch,
-                    "git_branch": project.git_branch
+                    "git_branch": project.git_branch,
+                    "repository_id": project.repository_id,
+                    "repository_name": project.repository_name,
+                    "repository_path": project.repository_path,
+                    "checkout_kind": project.checkout_kind,
+                    "checkout_ownership": project.checkout_ownership,
+                    "checkout_availability": project.checkout_availability,
+                    "checkout_archived": project.checkout_archived,
+                    "checkout_detached": project.checkout_detached
                 })).collect::<Vec<_>>()
             }))
         }

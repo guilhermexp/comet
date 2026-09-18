@@ -746,6 +746,62 @@ fn classify_restart_agent_failure(message: String) -> ControllerEffectError {
     ControllerEffectError::Failed(message)
 }
 
+// Comet owns this optional namespace. Reading the wire shape here keeps the
+// host independent of its adapter while protecting direct host transports too.
+fn ensure_checkout_restart_eligible(
+    state: &Value,
+    project_id: &str,
+    cwd: &str,
+) -> Result<(), String> {
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err("Worker checkout is unavailable; restore its folder before restarting".into());
+    }
+    let Some(identity) = state.get("comet_project_identity") else {
+        return Ok(());
+    };
+    if crate::controller_host::identity_namespace_unreadable(state) {
+        return Err("Invalid checkout identity; reconcile before restarting".into());
+    }
+    if identity.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err("Unsupported checkout identity; reconcile before restarting".into());
+    }
+    let checkouts = identity
+        .get("checkouts")
+        .and_then(Value::as_array)
+        .ok_or("Invalid checkout identity")?;
+    let checkout = checkouts
+        .iter()
+        .find(|checkout| {
+            checkout
+                .get("projectID")
+                .or_else(|| checkout.get("projectId"))
+                .and_then(Value::as_str)
+                == Some(project_id)
+        })
+        .or_else(|| {
+            checkouts
+                .iter()
+                .find(|checkout| checkout.get("path").and_then(Value::as_str) == Some(cwd))
+        });
+    if let Some(checkout) = checkout {
+        if ["archived", "removalPending", "removalInterrupted"]
+            .iter()
+            .any(|field| checkout.get(field).and_then(Value::as_bool) == Some(true))
+            || checkout
+                .get("conflict")
+                .is_some_and(|value| !value.is_null())
+            || checkout.get("availability").and_then(Value::as_str) != Some("available")
+        {
+            return Err(
+                "Worker checkout is archived, unavailable or requires recovery before restarting"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn execute_headless_session_action(
     request: ControllerSessionActionRequest,
     hook_port: Option<u16>,
@@ -753,6 +809,16 @@ pub fn execute_headless_session_action(
     let Some(manifest) = session_host::refresh_manifest_health(&request.session_id) else {
         return Err(ControllerEffectError::UnknownSession);
     };
+    if matches!(
+        request.action,
+        ControllerSessionAction::Restart
+            | ControllerSessionAction::RestartAgent
+            | ControllerSessionAction::ResumeAgent
+    ) {
+        let state = crate::app_state::load_for_edit().map_err(ControllerEffectError::Failed)?;
+        ensure_checkout_restart_eligible(&state, &manifest.session.project_id, &manifest.cwd)
+            .map_err(ControllerEffectError::Failed)?;
+    }
     match request.action {
         ControllerSessionAction::Stop
         | ControllerSessionAction::RestartAgent
@@ -1892,6 +1958,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Barrier};
     use std::thread;
+
+    #[test]
+    fn direct_restart_respects_checkout_recovery_and_legacy_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().to_str().unwrap();
+        assert!(ensure_checkout_restart_eligible(&json!({}), "project", cwd).is_ok());
+        let ready = json!({"comet_project_identity":{"version":1,"repositories":[],"checkouts":[{
+            "projectID":"project", "path":cwd, "availability":"available"
+        }]}});
+        assert!(ensure_checkout_restart_eligible(&ready, "project", cwd).is_ok());
+        for field in ["archived", "removalPending", "removalInterrupted"] {
+            let mut state = ready.clone();
+            state["comet_project_identity"]["checkouts"][0][field] = true.into();
+            assert!(
+                ensure_checkout_restart_eligible(&state, "project", cwd).is_err(),
+                "{field}"
+            );
+            assert!(
+                ensure_checkout_restart_eligible(&state, "group-alias", cwd).is_err(),
+                "cwd fallback {field}"
+            );
+        }
+        for availability in ["missing", "probe_failed"] {
+            let mut state = ready.clone();
+            state["comet_project_identity"]["checkouts"][0]["availability"] = availability.into();
+            assert!(ensure_checkout_restart_eligible(&state, "project", cwd).is_err());
+        }
+        assert!(ensure_checkout_restart_eligible(
+            &json!({}),
+            "project",
+            "/nonexistent-comet-checkout"
+        )
+        .is_err());
+    }
 
     fn request(method: &str, path: &str) -> ControllerRequest {
         ControllerRequest {

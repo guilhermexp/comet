@@ -1,4 +1,18 @@
-use zeron_workers_unpeel::{WorkersProject, WorkersSession, WorkersSessionSort};
+use zeron_workers_unpeel::{
+    CheckoutAvailability, CheckoutKind, CheckoutOwnership, WorkersProject, WorkersSession,
+    WorkersSessionSort,
+};
+
+/// Stable presentation-only parent for checkouts whose Git evidence is not
+/// sufficient to associate them with a repository. It is never written into
+/// the host project records or used as a launch target.
+pub const ASSOCIATION_PENDING_PROJECT_ID: &str = "comet-association-pending";
+
+pub fn is_presentation_container(project: &WorkersProject) -> bool {
+    project.is_group
+        && (project.id == ASSOCIATION_PENDING_PROJECT_ID
+            || (project.repository_id.is_some() && project.path.trim().is_empty()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkersProjectMenuItem {
@@ -13,22 +27,73 @@ pub enum WorkersProjectMenuItem {
     Archived,
     RevealInFinder,
     OpenInEditor,
+    ArchiveCheckout,
+    RestoreCheckout,
     RemoveWorktree,
     RemoveGroup,
     RemoveProject,
+}
+
+pub fn checkout_is_available(project: &WorkersProject) -> bool {
+    !project.is_group
+        && !project.checkout_archived
+        && project.checkout_kind != Some(CheckoutKind::Unresolved)
+        && project
+            .checkout_availability
+            .is_none_or(|availability| availability == CheckoutAvailability::Available)
+        && !project.path.trim().is_empty()
+}
+
+pub fn checkout_is_missing(project: &WorkersProject) -> bool {
+    project.checkout_kind == Some(CheckoutKind::Unresolved)
+        || matches!(
+            project.checkout_availability,
+            Some(CheckoutAvailability::Missing | CheckoutAvailability::ProbeFailed)
+        )
+}
+
+pub fn checkout_is_linked(project: &WorkersProject) -> bool {
+    !project.is_group
+        && (project.parent_project_id.is_some()
+            || project.worktree_branch.is_some()
+            || project.checkout_kind == Some(CheckoutKind::Linked))
+}
+
+pub fn checkout_can_be_removed(project: &WorkersProject) -> bool {
+    checkout_is_linked(project)
+        && !project.checkout_archived
+        && project
+            .checkout_availability
+            .is_none_or(|availability| availability == CheckoutAvailability::Available)
+        && match project.checkout_ownership {
+            Some(CheckoutOwnership::AppManaged) => project.owns_worktree_checkout(),
+            Some(CheckoutOwnership::External | CheckoutOwnership::Unknown) => false,
+            None => project.owns_worktree_checkout(),
+        }
 }
 
 pub fn project_menu_items(
     project: &WorkersProject,
     sessions: &[WorkersSession],
 ) -> Vec<WorkersProjectMenuItem> {
+    if is_presentation_container(project) {
+        return Vec::new();
+    }
     let is_child = project.parent_project_id.is_some();
-    let is_worktree = project.worktree_branch.is_some();
+    // A checkout is a non-group project row. The branch field is intentionally
+    // not used as the discriminator: adopted worktrees and a main checkout
+    // can have no persisted creation branch, while an external worktree still
+    // needs the non-destructive archive action.
+    let is_checkout = !project.is_group;
+    let is_available = checkout_is_available(project);
+    let is_managed_worktree = checkout_can_be_removed(project);
     let mut items = Vec::new();
     if is_child {
         items.push(WorkersProjectMenuItem::Rename);
     }
-    items.push(WorkersProjectMenuItem::NewSession);
+    if is_available {
+        items.push(WorkersProjectMenuItem::NewSession);
+    }
     if !is_child {
         items.push(WorkersProjectMenuItem::FolderColor);
     }
@@ -39,7 +104,7 @@ pub fn project_menu_items(
     // Same gate the "In a new worktree" section of the launcher uses: a
     // worktree branches from a ROOT project, and `worktree_branch` alone misses
     // an adopted worktree, which is a child with no branch in the registry.
-    if !is_child && !project.is_group {
+    if is_available && !is_child && !project.is_group {
         items.push(WorkersProjectMenuItem::NewWorktree);
     }
     if !is_child {
@@ -51,19 +116,27 @@ pub fn project_menu_items(
     if project.archived_session_count > 0 {
         items.push(WorkersProjectMenuItem::Archived);
     }
-    items.extend([
-        WorkersProjectMenuItem::RevealInFinder,
-        WorkersProjectMenuItem::OpenInEditor,
-        if is_worktree {
-            WorkersProjectMenuItem::RemoveWorktree
-        // Only the removal verb needs the organization verdict: an adopted
-        // worktree is a child too, and `remove_group` would reject it.
-        } else if project.is_group {
-            WorkersProjectMenuItem::RemoveGroup
-        } else {
-            WorkersProjectMenuItem::RemoveProject
-        },
-    ]);
+    if is_available {
+        items.extend([
+            WorkersProjectMenuItem::RevealInFinder,
+            WorkersProjectMenuItem::OpenInEditor,
+        ]);
+    }
+    if project.is_group {
+        items.push(WorkersProjectMenuItem::RemoveGroup);
+    } else if project.checkout_archived && !checkout_is_missing(project) {
+        items.push(WorkersProjectMenuItem::RestoreCheckout);
+    } else if is_checkout {
+        // Archive is always safe and reversible. A managed linked worktree
+        // gets a second, explicit physical-removal action; the two verbs must
+        // never share a dispatch path because archive retains sessions/files.
+        items.push(WorkersProjectMenuItem::ArchiveCheckout);
+        if is_managed_worktree {
+            items.push(WorkersProjectMenuItem::RemoveWorktree);
+        }
+    } else {
+        items.push(WorkersProjectMenuItem::RemoveProject);
+    }
     items
 }
 
@@ -71,7 +144,8 @@ pub fn project_menu_items(
 mod tests {
     use super::{WorkersProjectMenuItem as Item, project_menu_items};
     use zeron_workers_unpeel::{
-        WorkersProject, WorkersSession, WorkersSessionCapabilities, WorkersSessionSort,
+        CheckoutAvailability, CheckoutKind, WorkersProject, WorkersSession,
+        WorkersSessionCapabilities, WorkersSessionSort,
     };
 
     fn project(parent: Option<&str>, branch: Option<&str>) -> WorkersProject {
@@ -87,6 +161,14 @@ mod tests {
             archived_session_count: 2,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         }
     }
 
@@ -140,13 +222,13 @@ mod tests {
                 Item::Archived,
                 Item::RevealInFinder,
                 Item::OpenInEditor,
-                Item::RemoveProject,
+                Item::ArchiveCheckout,
             ]
         );
     }
 
     #[test]
-    fn worktree_menu_renames_and_removes_the_child_only() {
+    fn external_worktree_menu_archives_without_physical_deletion() {
         assert_eq!(
             project_menu_items(&project(Some("root"), Some("feature/sidebar")), &[]),
             vec![
@@ -156,7 +238,7 @@ mod tests {
                 Item::Archived,
                 Item::RevealInFinder,
                 Item::OpenInEditor,
-                Item::RemoveWorktree,
+                Item::ArchiveCheckout,
             ]
         );
     }
@@ -169,8 +251,58 @@ mod tests {
         let mut adopted = project(Some("root"), None);
         adopted.is_group = false;
         let items = project_menu_items(&adopted, &[]);
-        assert_eq!(items.last(), Some(&Item::RemoveProject));
+        assert_eq!(items.last(), Some(&Item::ArchiveCheckout));
         // And no worktree branches off a worktree.
         assert!(!items.contains(&Item::NewWorktree));
+    }
+
+    #[test]
+    fn unavailable_checkout_keeps_history_without_launch_or_filesystem_actions() {
+        let mut missing = project(Some("root"), Some("feature/sidebar"));
+        missing.checkout_availability = Some(CheckoutAvailability::Missing);
+        let items = project_menu_items(&missing, &[]);
+        assert!(!items.contains(&Item::NewSession));
+        assert!(!items.contains(&Item::RevealInFinder));
+        assert!(!items.contains(&Item::OpenInEditor));
+        assert!(items.contains(&Item::ArchiveCheckout));
+    }
+
+    #[test]
+    fn unresolved_checkout_is_pending_and_cannot_launch() {
+        let mut pending = project(None, None);
+        pending.checkout_kind = Some(CheckoutKind::Unresolved);
+        let items = project_menu_items(&pending, &[]);
+        assert!(!items.contains(&Item::NewSession));
+        assert!(!items.contains(&Item::RevealInFinder));
+        assert!(!items.contains(&Item::OpenInEditor));
+        assert!(super::checkout_is_missing(&pending));
+    }
+
+    #[test]
+    fn archived_checkout_offers_restore_instead_of_archive_or_delete() {
+        let mut archived = project(Some("root"), Some("feature/sidebar"));
+        archived.checkout_archived = true;
+        assert_eq!(
+            project_menu_items(&archived, &[]).last(),
+            Some(&Item::RestoreCheckout)
+        );
+    }
+
+    #[test]
+    fn archived_missing_checkout_does_not_offer_unavailable_restore() {
+        let mut archived = project(Some("root"), Some("feature/sidebar"));
+        archived.checkout_archived = true;
+        archived.checkout_availability = Some(CheckoutAvailability::Missing);
+        assert!(!project_menu_items(&archived, &[]).contains(&Item::RestoreCheckout));
+    }
+
+    #[test]
+    fn synthetic_repository_container_has_no_project_actions() {
+        let mut container = project(None, None);
+        container.id = "repo-1".into();
+        container.is_group = true;
+        container.path.clear();
+        container.repository_id = Some("repo-1".into());
+        assert!(project_menu_items(&container, &[]).is_empty());
     }
 }

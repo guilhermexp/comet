@@ -61,3 +61,12 @@ None.
 - Out of scope: `SwitchRef` takes `repo_path` from the caller without the same
   check. Its worst case is a `git checkout` in an unrelated repository, not
   data loss — worth its own pass, not a rider on this one.
+
+## Integration follow-up — 2026-09-18
+
+[`stabilize-workers-project-identity`](../stabilize-workers-project-identity/proposal.md)
+extends the Workers/Projects path with durable repository membership, explicit
+checkout ownership/availability and history-preserving lifecycle actions. Its
+[verification report](../../../docs/verification/2026-09-18-workers-project-identity.md)
+records the integrated evidence. This cross-reference does not mark this
+change's independent tasks or engine-specific checks complete.

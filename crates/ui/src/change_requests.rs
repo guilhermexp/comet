@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use gpui::{AnyElement, Context, Render, SharedString, Window, div, prelude::*, px};
 use zeron_proto::{ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, Space};
+use zeron_workers_unpeel::CheckoutAvailability;
 
 use crate::theme::Theme;
 
@@ -359,6 +360,15 @@ pub(crate) fn workers_change_request_targets(
     projects
         .iter()
         .filter_map(|project| {
+            if project.checkout_detached
+                || project.checkout_archived
+                || matches!(
+                    project.checkout_availability,
+                    Some(CheckoutAvailability::Missing | CheckoutAvailability::ProbeFailed)
+                )
+            {
+                return None;
+            }
             let branch = project.change_request_branch()?.trim();
             if branch.is_empty() || project.path.trim().is_empty() {
                 return None;
@@ -525,6 +535,14 @@ mod tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: zeron_workers_unpeel::WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         }
     }
 
@@ -552,6 +570,18 @@ mod tests {
                 .iter()
                 .any(|target| target.cwd == "/repos/wt" && target.branch == "fix/renamed")
         );
+    }
+
+    #[test]
+    fn workers_change_request_targets_skip_missing_or_archived_checkouts() {
+        let mut missing = workers_project("missing", Some("fix/missing"));
+        missing.checkout_availability = Some(CheckoutAvailability::Missing);
+        let mut archived = workers_project("archived", Some("fix/archived"));
+        archived.checkout_archived = true;
+        let mut detached = workers_project("detached", Some("deadbeef"));
+        detached.checkout_detached = true;
+        let targets = workers_change_request_targets(&[missing, archived, detached], "local");
+        assert!(targets.is_empty());
     }
 
     #[test]

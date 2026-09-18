@@ -1,11 +1,14 @@
 //! Typed Comet adapter for the pinned Unpeel local worker runtime.
 
 mod activity_bridge;
+mod checkout_lifecycle;
 mod controller_mcp;
+mod git_command;
 mod hook_migration;
 pub mod maintenance;
 mod parent_notifications;
 pub mod project_git;
+pub mod project_identity;
 pub mod project_ledger;
 pub mod registered_projects;
 pub mod resources;
@@ -37,6 +40,10 @@ pub use parent_notifications::{
     worker_parent_links, worker_parent_links_at,
 };
 pub use project_git::{AnchorCommit, ProjectGitStatus};
+pub use project_identity::{
+    CheckoutAvailability, CheckoutIdentity, CheckoutKind, CheckoutOwnership, IdentityRegistry,
+    MigrationReport, ProjectCatalog, RepositoryCatalog, RepositoryIdentity,
+};
 pub use project_ledger::{LedgerProject, LiveProject, ProjectRow};
 
 use std::future::Future;
@@ -362,33 +369,60 @@ pub struct WorkersProject {
     pub archived_session_count: usize,
     pub folder_color_id: Option<String>,
     pub session_sort: WorkersSessionSort,
+    /// Stable Comet identity of the repository containing this checkout.
+    /// `None` means that the checkout is pending association or is not Git.
+    pub repository_id: Option<String>,
+    /// Display metadata for the logical repository container.
+    pub repository_name: Option<String>,
+    pub repository_path: Option<String>,
+    pub checkout_kind: Option<project_identity::CheckoutKind>,
+    pub checkout_ownership: Option<project_identity::CheckoutOwnership>,
+    pub checkout_availability: Option<project_identity::CheckoutAvailability>,
+    pub checkout_archived: bool,
+    pub checkout_detached: bool,
 }
 
 impl WorkersProject {
     /// Current checkout branch shared by context labels and PR lookup.
     /// Group rows are organizational aliases, not additional checkouts.
     pub fn change_request_branch(&self) -> Option<&str> {
-        if self.is_group {
+        if self.is_group
+            || self.checkout_archived
+            || self.checkout_detached
+            || matches!(
+                self.checkout_availability,
+                Some(
+                    project_identity::CheckoutAvailability::Missing
+                        | project_identity::CheckoutAvailability::ProbeFailed
+                )
+            )
+            || matches!(
+                self.checkout_kind,
+                Some(
+                    project_identity::CheckoutKind::NonGit
+                        | project_identity::CheckoutKind::Unresolved
+                )
+            )
+        {
             return None;
         }
         self.git_branch
             .as_deref()
-            .or(self.worktree_branch.as_deref())
             .map(str::trim)
             .filter(|branch| !branch.is_empty())
     }
 
-    /// Whether the app may tear this checkout down — the question the removal
-    /// route has to ask, and the one `worktree_branch` cannot answer.
+    /// Whether the app may tear this checkout down.
     ///
-    /// The projection publishes `worktreeBranch` for a worktree the user added
-    /// by hand in a terminal too, and `remove_worktree` refuses that one
-    /// because deleting the row deletes every session under it. Ownership is
-    /// the path: `worktrees::create` only ever builds under the worktrees
-    /// root, which is also the only place `worktrees::remove` accepts. A row
-    /// this returns `false` for is removed as a project.
+    /// A branch name or a path under the managed directory is not enough to
+    /// establish ownership: an externally-created worktree can have both.
+    /// Identity migration supplies the explicit kind/ownership pair. A path
+    /// under the managed directory is not sufficient evidence because an
+    /// externally-created worktree can have the same path shape.
     pub fn owns_worktree_checkout(&self) -> bool {
-        self.worktree_branch.is_some() && unpeel_core::worktrees::is_managed(Path::new(&self.path))
+        !self.is_group
+            && self.checkout_kind == Some(project_identity::CheckoutKind::Linked)
+            && self.checkout_ownership == Some(project_identity::CheckoutOwnership::AppManaged)
     }
 }
 
@@ -1105,7 +1139,10 @@ fn now_unix_ms() -> u64 {
 /// Projetos de filesystem que pertencem ao ledger. Grupos sao organizacao
 /// visual e reutilizam o path do pai; inclui-los violaria a chave unica por
 /// path. Worktrees permanecem porque apontam para checkouts distintos.
-fn live_projects_for_ledger(bootstrap: &WorkersBootstrap) -> Vec<LiveProject> {
+fn live_projects_for_ledger_filtered(
+    bootstrap: &WorkersBootstrap,
+    suppressed_project_ids: &std::collections::HashSet<String>,
+) -> Vec<LiveProject> {
     let mut activity: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
     for session in &bootstrap.sessions {
         let latest = activity.entry(session.project_id.as_str()).or_default();
@@ -1114,13 +1151,45 @@ fn live_projects_for_ledger(bootstrap: &WorkersBootstrap) -> Vec<LiveProject> {
     bootstrap
         .projects
         .iter()
-        .filter(|project| !project.is_group)
+        .filter(|project| !project.is_group && !suppressed_project_ids.contains(&project.id))
         .map(|project| LiveProject {
             id: project.id.clone(),
             path: project.path.clone(),
             name: project.name.clone(),
             last_activity_unix_ms: activity.get(project.id.as_str()).copied(),
         })
+        .collect()
+}
+
+fn suppression_paths(
+    registry: &project_identity::IdentityRegistry,
+) -> std::collections::HashSet<String> {
+    registry
+        .suppressed_project_ids
+        .iter()
+        .filter_map(|project_id| registry.checkout(project_id))
+        .map(|checkout| normalize_ledger_path(&checkout.path))
+        .collect()
+}
+
+fn normalize_ledger_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        "/".to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn without_suppressed_ledger_entries(
+    ledger: &[LedgerProject],
+    suppressed_paths: &std::collections::HashSet<String>,
+) -> Vec<LedgerProject> {
+    ledger
+        .iter()
+        .filter(|entry| !suppressed_paths.contains(&normalize_ledger_path(&entry.path)))
+        .cloned()
         .collect()
 }
 
@@ -1134,7 +1203,7 @@ fn live_projects_for_ledger(bootstrap: &WorkersBootstrap) -> Vec<LiveProject> {
 /// Delega para `reconcile`, a mesma funcao pura de Settings: normalizacao de
 /// path, "a primeira vista fixa o `added_at`" e a preservacao das entradas
 /// orfas continuam definidas em UM lugar. Grupos nao passam por aqui de
-/// proposito (ver [`live_projects_for_ledger`]).
+/// proposito (ver [`live_projects_for_ledger_filtered`]).
 fn record_in_ledger(
     state: &mut serde_json::Map<String, Value>,
     project_id: &str,
@@ -1187,12 +1256,27 @@ fn backfill_ledger_once(bootstrap: &WorkersBootstrap) {
 /// resolve the path once and skip the cross-frontend broadcast `save()` does:
 /// no other frontend renders this key live, Settings reads it when it opens.
 fn backfill_ledger_at(state_path: &Path, bootstrap: &WorkersBootstrap) {
+    let Ok(identity) = project_identity::read_registry_at(state_path) else {
+        // A malformed or future identity namespace is fail-safe: do not
+        // rebuild the ledger from live projects until the state is readable.
+        return;
+    };
+    let suppressed_project_ids = identity
+        .suppressed_project_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let suppressed_paths = suppression_paths(&identity);
     let Ok(ledger) = project_ledger::read_at(state_path) else {
         return;
     };
-    let outcome =
-        project_ledger::reconcile(&ledger, &live_projects_for_ledger(bootstrap), now_unix_ms());
-    if outcome.dirty {
+    let visible_ledger = without_suppressed_ledger_entries(&ledger, &suppressed_paths);
+    let outcome = project_ledger::reconcile(
+        &visible_ledger,
+        &live_projects_for_ledger_filtered(bootstrap, &suppressed_project_ids),
+        now_unix_ms(),
+    );
+    if outcome.dirty || visible_ledger.len() != ledger.len() {
         let _ = project_ledger::write_at(state_path, &outcome.ledger);
     }
 }
@@ -1261,12 +1345,84 @@ impl LocalWorkersClient {
                 "Comet managed hook migration is incomplete: {error}"
             ));
         }
+        if hook_migration::is_comet_application_process() {
+            project_identity::schedule_background_reconcile();
+        }
         Self {
             next_request_id: shared_next_request_id(),
             activity: activity_bridge::shared_activity_bridge(),
             last_displayed_grid: shared_displayed_grid(),
             resource_sampler: shared_resource_sampler(),
         }
+    }
+
+    /// Read the durable repository/check-out registry used by Workers and
+    /// Settings. This is intentionally separate from `bootstrap.projects`,
+    /// whose paths remain the exact launch targets.
+    pub fn project_identity_registry(
+        &self,
+    ) -> Result<project_identity::IdentityRegistry, WorkersError> {
+        project_identity::read_registry_at(&unpeel_core::app_paths::app_state_path())
+            .map_err(WorkersError::State)
+    }
+
+    /// Reconcile local Git observations with the durable registry. Git probes
+    /// happen before the app-state edit; the edit re-reads under its lock and
+    /// applies only the identity namespace, preserving sessions and unknown
+    /// state keys.
+    pub fn reconcile_project_identity(
+        &self,
+    ) -> Result<project_identity::MigrationReport, WorkersError> {
+        project_identity::reconcile_at(&unpeel_core::app_paths::app_state_path())
+            .map_err(WorkersError::State)
+    }
+
+    pub fn diagnose_project_identity(
+        &self,
+    ) -> Result<project_identity::MigrationReport, WorkersError> {
+        project_identity::diagnose_at(&unpeel_core::app_paths::app_state_path())
+            .map_err(WorkersError::State)
+    }
+
+    pub fn rollback_project_identity(&self) -> Result<bool, WorkersError> {
+        project_identity::rollback_identity_at(&unpeel_core::app_paths::app_state_path())
+            .map_err(WorkersError::State)
+    }
+
+    /// Associate a historical checkout with a repository selected by the
+    /// user. No filesystem or session data is touched.
+    pub fn associate_checkout(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<(), WorkersError> {
+        unpeel_core::app_state::edit(|state| {
+            let mut value = Value::Object(state.clone());
+            project_identity::associate_checkout_in_state(&mut value, project_id, repository_id)
+                .map_err(|error| error.to_string())?;
+            *state = value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| "identity state is not an object".to_owned())?;
+            Ok(())
+        })
+        .map_err(WorkersError::State)
+    }
+
+    /// Remove a manual checkout association while retaining its project,
+    /// path, sessions and last-known metadata.
+    pub fn undo_checkout_association(&self, project_id: &str) -> Result<(), WorkersError> {
+        unpeel_core::app_state::edit(|state| {
+            let mut value = Value::Object(state.clone());
+            project_identity::undo_checkout_association_in_state(&mut value, project_id)
+                .map_err(|error| error.to_string())?;
+            *state = value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| "identity state is not an object".to_owned())?;
+            Ok(())
+        })
+        .map_err(WorkersError::State)
     }
 
     /// Monotonic signal updated as soon as a lifecycle hook is accepted.
@@ -1311,6 +1467,10 @@ impl LocalWorkersClient {
     }
 
     pub fn bootstrap(&self) -> Result<WorkersBootstrap, WorkersError> {
+        // Bootstrap is the Workers polling boundary. The identity refresh is
+        // non-blocking and internally TTL-limited, so removed directories are
+        // noticed during an open sidebar without running Git on every poll.
+        project_identity::schedule_background_reconcile();
         let body = self.request("GET", "/mobile/bootstrap", Vec::new(), Value::Null)?;
         let wire: BootstrapWire = serde_json::from_value(body)?;
         let mut bootstrap = WorkersBootstrap {
@@ -1359,10 +1519,21 @@ impl LocalWorkersClient {
     /// working set nao tem sessao nenhuma — mostra o valor congelado no ledger.
     pub fn projects_with_ledger(&self) -> Result<Vec<ProjectRow>, WorkersError> {
         let bootstrap = self.bootstrap()?;
-        let live = live_projects_for_ledger(&bootstrap);
+        let identity = self.project_identity_registry()?;
+        let suppressed_project_ids = identity
+            .suppressed_project_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let suppressed_paths = suppression_paths(&identity);
         let ledger = project_ledger::read().map_err(WorkersError::State)?;
-        let outcome = project_ledger::reconcile(&ledger, &live, now_unix_ms());
-        if outcome.dirty {
+        let visible_ledger = without_suppressed_ledger_entries(&ledger, &suppressed_paths);
+        let outcome = project_ledger::reconcile(
+            &visible_ledger,
+            &live_projects_for_ledger_filtered(&bootstrap, &suppressed_project_ids),
+            now_unix_ms(),
+        );
+        if outcome.dirty || visible_ledger.len() != ledger.len() {
             project_ledger::write(&outcome.ledger).map_err(WorkersError::State)?;
         }
         Ok(outcome.rows)
@@ -1439,6 +1610,7 @@ impl LocalWorkersClient {
     }
 
     pub fn launch_session(&self, launch: &WorkersLaunchRequest) -> Result<String, WorkersError> {
+        let _checkout_action = checkout_lifecycle::lock_checkout_actions()?;
         // A pi-family launch resolves `--extension` under the legacy hook
         // root at spawn time; a missing asset means the session never emits
         // lifecycle events and stays visually idle forever. Best-effort:
@@ -1756,6 +1928,8 @@ impl LocalWorkersClient {
             .filter(|value| !value.is_empty())
             .unwrap_or("Project")
             .to_owned();
+        let mut identity_observation = project_identity::probe_checkout(&canonical);
+        identity_observation.ownership = Some(project_identity::CheckoutOwnership::External);
         unpeel_core::app_state::edit(|state| {
             let projects_value = state
                 .entry("projects")
@@ -1786,6 +1960,12 @@ impl LocalWorkersClient {
                 }
             };
             record_in_ledger(state, &id, &canonical_string, &name)?;
+            project_identity::register_observation_in_state(
+                state,
+                &id,
+                identity_observation.clone(),
+            )
+            .map(|_| ())?;
             Ok(id)
         })
         .map_err(WorkersError::State)
@@ -1891,6 +2071,12 @@ impl LocalWorkersClient {
             .unwrap_or(branch)
             .to_owned();
         let path = worktree.path.clone();
+        let mut identity_observation = project_identity::probe_checkout(Path::new(&path));
+        identity_observation.ownership = Some(if adopted {
+            project_identity::CheckoutOwnership::External
+        } else {
+            project_identity::CheckoutOwnership::AppManaged
+        });
         let register = unpeel_core::app_state::edit_at(state_path, |state| {
             let projects = state
                 .get_mut("projects")
@@ -1906,7 +2092,14 @@ impl LocalWorkersClient {
                 "is_folder": true,
                 "worktree_branch": branch,
             }));
-            record_in_ledger(state, &project_id, &path, &display_name)
+            record_in_ledger(state, &project_id, &path, &display_name).and_then(|_| {
+                project_identity::register_observation_in_state(
+                    state,
+                    &project_id,
+                    identity_observation.clone(),
+                )
+                .map(|_| ())
+            })
         });
         if let Err(error) = register {
             // Only undo what THIS call created. An adopted checkout predates
@@ -1916,6 +2109,9 @@ impl LocalWorkersClient {
                 let _ = unpeel_core::worktrees::remove(&worktree.path, true);
             }
             return Err(WorkersError::State(error));
+        }
+        if state_path == unpeel_core::app_paths::app_state_path() {
+            unpeel_core::app_state::announce_app_state_changed();
         }
         // O setup do projeto roda AQUI, depois do registro: um worktree que
         // existe mas nao foi registrado nao e um worktree, e o setup que
@@ -2060,49 +2256,8 @@ impl LocalWorkersClient {
         rename_project_record(project_id, name)
     }
 
-    pub fn remove_worktree(&self, project_id: &str, force: bool) -> Result<(), WorkersError> {
-        let state = unpeel_core::app_state::load().map_err(WorkersError::State)?;
-        let project = state
-            .get("projects")
-            .and_then(Value::as_array)
-            .and_then(|projects| {
-                projects
-                    .iter()
-                    .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
-            })
-            .ok_or_else(|| WorkersError::State(format!("unknown worktree id: {project_id}")))?;
-        let path = project
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| WorkersError::State("worktree path is missing".into()))?
-            .to_owned();
-        // The registry is what makes this OURS to tear down. The projection
-        // also derives `worktreeBranch` from disk, for a worktree the user
-        // added by hand in a terminal, and the menu offers "Remove worktree"
-        // off that projected value — but this call deletes every session under
-        // the project (transcripts and the runtime's managed storage), so when
-        // the two disagree it must refuse instead of quietly wiping months of
-        // history behind a label that promised to remove a checkout. Removing
-        // such a row is `remove_project`, and the caller has to say so.
-        if project
-            .get("worktree_branch")
-            .and_then(Value::as_str)
-            .is_none()
-        {
-            return Err(WorkersError::State(
-                "project is not a worktree this app created; remove it as a project".into(),
-            ));
-        }
-        // The checkout only goes when it still lives under the worktrees root —
-        // the same predicate `worktrees::remove` refuses on. A record whose
-        // checkout was moved or deleted by hand stays removable from the
-        // sidebar instead of erroring forever on a git call that cannot work.
-        if unpeel_core::worktrees::is_managed(Path::new(&path)) {
-            unpeel_core::worktrees::remove(&path, force).map_err(WorkersError::State)?;
-        }
-        let removed = project_tree_ids(project_id)?;
-        self.remove_sessions_in_projects(&removed)?;
-        remove_project_tree(project_id)
+    pub fn remove_worktree(&self, project_id: &str, _force: bool) -> Result<(), WorkersError> {
+        checkout_lifecycle::remove_owned_checkout(self, project_id)
     }
 
     pub fn remove_group(&self, project_id: &str) -> Result<(), WorkersError> {
@@ -2228,6 +2383,16 @@ impl LocalWorkersClient {
         session_id: &str,
         action: SessionAction,
     ) -> Result<(), WorkersError> {
+        let _checkout_action = if matches!(
+            action,
+            SessionAction::Restart | SessionAction::RestartAgent | SessionAction::ResumeAgent
+        ) {
+            let guard = checkout_lifecycle::lock_checkout_actions()?;
+            checkout_lifecycle::ensure_session_checkout_available(self, session_id)?;
+            Some(guard)
+        } else {
+            None
+        };
         self.mutate(
             "/mobile/session-action",
             json!({ "sessionID": session_id, "action": action.wire_name() }),
@@ -2599,6 +2764,22 @@ struct ProjectWire {
     archived_session_count: usize,
     #[serde(default)]
     date_sorted: bool,
+    #[serde(default, rename = "repositoryID", alias = "repositoryId")]
+    repository_id: Option<String>,
+    #[serde(default)]
+    repository_name: Option<String>,
+    #[serde(default)]
+    repository_path: Option<String>,
+    #[serde(default)]
+    checkout_kind: Option<project_identity::CheckoutKind>,
+    #[serde(default)]
+    checkout_ownership: Option<project_identity::CheckoutOwnership>,
+    #[serde(default)]
+    checkout_availability: Option<project_identity::CheckoutAvailability>,
+    #[serde(default)]
+    checkout_archived: bool,
+    #[serde(default)]
+    checkout_detached: bool,
 }
 
 impl From<ProjectWire> for WorkersProject {
@@ -2619,6 +2800,14 @@ impl From<ProjectWire> for WorkersProject {
             } else {
                 WorkersSessionSort::Custom
             },
+            repository_id: value.repository_id,
+            repository_name: value.repository_name,
+            repository_path: value.repository_path,
+            checkout_kind: value.checkout_kind,
+            checkout_ownership: value.checkout_ownership,
+            checkout_availability: value.checkout_availability,
+            checkout_archived: value.checkout_archived,
+            checkout_detached: value.checkout_detached,
         }
     }
 }
@@ -3764,6 +3953,14 @@ mod project_ledger_projection_tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         }
     }
 
@@ -3796,7 +3993,7 @@ mod project_ledger_projection_tests {
     fn ledger_projection_keeps_projects_and_worktrees_but_not_groups() {
         let bootstrap = working_set();
 
-        let live = live_projects_for_ledger(&bootstrap);
+        let live = live_projects_for_ledger_filtered(&bootstrap, &std::collections::HashSet::new());
         let ids = live
             .iter()
             .map(|project| project.id.as_str())
@@ -3804,11 +4001,46 @@ mod project_ledger_projection_tests {
         assert_eq!(ids, vec!["project", "worktree"]);
     }
 
+    #[test]
+    fn forgotten_checkout_stays_out_of_ledger_reconciliation() {
+        let bootstrap = working_set();
+        let suppressed = std::collections::HashSet::from(["worktree".to_owned()]);
+        let live = live_projects_for_ledger_filtered(&bootstrap, &suppressed);
+        assert_eq!(
+            live.iter()
+                .map(|project| project.id.as_str())
+                .collect::<Vec<_>>(),
+            ["project"]
+        );
+
+        let ledger = vec![
+            LedgerProject {
+                path: "/tmp/repo".into(),
+                name: "project".into(),
+                added_at_unix_ms: 1,
+                last_seen_at_unix_ms: 1,
+                icon_path: None,
+            },
+            LedgerProject {
+                path: "/tmp/repo-wt/".into(),
+                name: "worktree".into(),
+                added_at_unix_ms: 1,
+                last_seen_at_unix_ms: 1,
+                icon_path: None,
+            },
+        ];
+        let paths = std::collections::HashSet::from([normalize_ledger_path("/tmp/repo-wt")]);
+        let visible = without_suppressed_ledger_entries(&ledger, &paths);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].path, "/tmp/repo");
+    }
+
     /// Local checkouts and worktrees both follow the current branch; group
     /// aliases do not create duplicate pull-request subscriptions.
     #[test]
     fn change_request_branch_uses_current_checkout_including_local_branches() {
         let mut worktree = project("worktree", "/tmp/wt", false, Some("fix/correios"));
+        worktree.git_branch = Some("fix/correios".into());
         assert_eq!(worktree.change_request_branch(), Some("fix/correios"));
         worktree.git_branch = Some("fix/renamed".into());
         assert_eq!(worktree.change_request_branch(), Some("fix/renamed"));
@@ -3823,6 +4055,15 @@ mod project_ledger_projection_tests {
 
         let blank = project("blank", "/tmp/wt", false, Some("   "));
         assert_eq!(blank.change_request_branch(), None);
+
+        let mut detached = project("detached", "/tmp/wt", false, Some("stale"));
+        detached.checkout_detached = true;
+        detached.git_branch = Some("stale".into());
+        assert_eq!(detached.change_request_branch(), None);
+
+        let mut missing = project("missing", "/tmp/wt", false, Some("stale"));
+        missing.checkout_availability = Some(project_identity::CheckoutAvailability::Missing);
+        assert_eq!(missing.change_request_branch(), None);
     }
 
     /// A semantica pura do espelho: readicionar a mesma pasta nao reescreve o

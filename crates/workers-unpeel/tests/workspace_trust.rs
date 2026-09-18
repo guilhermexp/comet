@@ -96,6 +96,14 @@ fn launch_trust_resolves_preset_and_prefers_worktree_path() {
         archived_session_count: 0,
         folder_color_id: None,
         session_sort: WorkersSessionSort::Custom,
+        repository_id: None,
+        repository_name: None,
+        repository_path: None,
+        checkout_kind: None,
+        checkout_ownership: None,
+        checkout_availability: None,
+        checkout_archived: false,
+        checkout_detached: false,
     }];
     let presets = vec![WorkersPreset {
         id: "claude-review".into(),
@@ -291,6 +299,14 @@ fn gemini_and_pi_presets_use_native_session_trust_without_store_writes() {
         archived_session_count: 0,
         folder_color_id: None,
         session_sort: WorkersSessionSort::Custom,
+        repository_id: None,
+        repository_name: None,
+        repository_path: None,
+        checkout_kind: None,
+        checkout_ownership: None,
+        checkout_availability: None,
+        checkout_archived: false,
+        checkout_detached: false,
     }];
     let presets = vec![
         WorkersPreset {

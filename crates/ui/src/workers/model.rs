@@ -24,7 +24,11 @@ use super::archive::{archived_sessions_for_project, restore_action};
 use super::notification_policy::{
     NotificationSample, NotificationState, WorkerNotification, reduce_notification,
 };
-use super::workspace::root_project_id;
+use super::project_menu::{
+    ASSOCIATION_PENDING_PROJECT_ID, checkout_can_be_removed, checkout_is_available,
+    is_presentation_container,
+};
+use super::workspace::{is_association_pending_checkout, root_project_id};
 use crate::workers::presentation::compare_sessions_by_activity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,7 +445,15 @@ pub fn filter_after_snapshot(
     filter: Option<String>,
     projects: &[WorkersProject],
 ) -> Option<String> {
-    filter.filter(|id| projects.iter().any(|project| &project.id == id))
+    filter.filter(|id| {
+        (id == ASSOCIATION_PENDING_PROJECT_ID
+            && projects.iter().any(is_association_pending_checkout))
+            || projects.iter().any(|project| {
+                &project.id == id
+                    || project.repository_id.as_deref() == Some(id.as_str())
+                    || root_project_id(project.id.as_str(), projects) == id
+            })
+    })
 }
 
 /// Where the selection lands when the user picks a filter root, or `None` to
@@ -1531,11 +1543,18 @@ impl WorkersModel {
         );
     }
 
+    pub fn archive_checkout(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.run_unit_action(move |client| client.archive_checkout(&project_id), cx);
+    }
+
     pub fn remove_project(&mut self, project: WorkersProject, cx: &mut Context<Self>) {
+        if is_presentation_container(&project) {
+            return;
+        }
         let selected_id = project.id.clone();
         self.run_action(
             move |client| {
-                if project.worktree_branch.is_some() {
+                if checkout_can_be_removed(&project) {
                     client.remove_worktree(&project.id, false)
                 // `is_group` is the projection's verdict on organization;
                 // `parent_project_id` is not, because an adopted worktree gets
@@ -1543,7 +1562,7 @@ impl WorkersModel {
                 } else if project.is_group {
                     client.remove_group(&project.id)
                 } else {
-                    client.remove_project(&project.id)
+                    client.archive_checkout(&project.id)
                 }
             },
             move |model, ()| {
@@ -1568,6 +1587,10 @@ impl WorkersModel {
     pub fn cancel_remove_project(&mut self, cx: &mut Context<Self>) {
         self.confirming_remove_project = None;
         cx.notify();
+    }
+
+    pub fn restore_checkout(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.run_unit_action(move |client| client.restore_checkout(&project_id), cx);
     }
 
     pub fn confirm_remove_project(&mut self, cx: &mut Context<Self>) {
@@ -2070,6 +2093,9 @@ impl WorkersModel {
         project: &WorkersProject,
         cx: &App,
     ) -> Option<zeron_proto::ChangeRequestSummary> {
+        if project.checkout_detached || !checkout_is_available(project) {
+            return None;
+        }
         let branch = project.change_request_branch()?;
         self.state
             .read(cx)
@@ -2408,6 +2434,14 @@ mod tests {
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: zeron_workers_unpeel::WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
         }
     }
 

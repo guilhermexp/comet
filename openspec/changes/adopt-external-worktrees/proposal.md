@@ -52,3 +52,12 @@ falls out of the path the projection has already read.
 - Out of scope: worktrees whose folder no longer exists on disk (17 of the 46
   records here). Disk is the only evidence this change has, and they leave
   none.
+
+## Integration follow-up — 2026-09-18
+
+[`stabilize-workers-project-identity`](../stabilize-workers-project-identity/proposal.md)
+extends the Workers/Projects path with durable repository membership, explicit
+checkout ownership/availability and history-preserving lifecycle actions. Its
+[verification report](../../../docs/verification/2026-09-18-workers-project-identity.md)
+records the integrated evidence. This cross-reference does not mark this
+change's independent tasks or engine-specific checks complete.

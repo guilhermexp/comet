@@ -258,6 +258,11 @@ impl DiskCatalog {
         // same one `known_ids` membership would resolve to.
         let project_ids_by_path: HashMap<String, &str> = projects
             .iter()
+            .filter(|project| {
+                !(project.is_folder
+                    && project.parent_id.is_some()
+                    && project.worktree_branch.is_none())
+            })
             .map(|project| (real_path(&project.path), project.id.as_str()))
             .collect();
         let mut wire_projects = Vec::new();
@@ -284,6 +289,15 @@ impl DiskCatalog {
                 "mcpBlocked": false,
                 "archivedSessionCount": archived_count,
             });
+            let identity_checkout = identity_checkout(&state, &project.id);
+            let identity_repository = identity_checkout
+                .and_then(|checkout| {
+                    checkout
+                        .get("repositoryID")
+                        .or_else(|| checkout.get("repositoryId"))
+                        .and_then(Value::as_str)
+                })
+                .and_then(|repository_id| identity_repository(&state, repository_id));
             let checkout = git_checkout(&project.path);
             // ONE verdict per project, decided here because the creation
             // catalog below is built outside the wire object.
@@ -317,6 +331,9 @@ impl DiskCatalog {
                 if let Some(branch) = checkout.branch.as_deref() {
                     object.insert("gitBranch".into(), branch.into());
                 }
+                if checkout.detached {
+                    object.insert("checkoutDetached".into(), true.into());
+                }
                 // The registry only knows what it was told at registration: a
                 // worktree created by `git worktree add` in a terminal and then
                 // added as a project carries neither branch nor parent, and
@@ -346,19 +363,87 @@ impl DiskCatalog {
                 if date_sorted_projects.contains(&project.id) {
                     object.insert("dateSorted".into(), true.into());
                 }
+                if let Some(checkout_identity) = identity_checkout {
+                    copy_identity_string(object, checkout_identity, "repositoryID");
+                    copy_identity_string_as(object, checkout_identity, "kind", "checkoutKind");
+                    copy_identity_string_as(
+                        object,
+                        checkout_identity,
+                        "ownership",
+                        "checkoutOwnership",
+                    );
+                    copy_identity_string_as(
+                        object,
+                        checkout_identity,
+                        "availability",
+                        "checkoutAvailability",
+                    );
+                    if checkout_identity.get("availability").is_none() {
+                        object.insert("checkoutAvailability".into(), "missing".into());
+                    }
+                    if identity_requires_recovery(checkout_identity) {
+                        object.insert("checkoutAvailability".into(), "probe_failed".into());
+                    }
+                    if checkout_identity
+                        .get("detached")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        object.insert("checkoutDetached".into(), true.into());
+                    }
+                    copy_identity_string(object, checkout_identity, "lastKnownBranch");
+                    if checkout_identity
+                        .get("archived")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        object.insert("checkoutArchived".into(), true.into());
+                    }
+                }
+                if let Some(repository_identity) = identity_repository {
+                    copy_identity_string_as(object, repository_identity, "name", "repositoryName");
+                    copy_identity_string_as(
+                        object,
+                        repository_identity,
+                        "primaryPath",
+                        "repositoryPath",
+                    );
+                }
+                if identity_namespace_unreadable(&state) {
+                    object.insert("checkoutAvailability".into(), "probe_failed".into());
+                }
             }
             wire_projects.push(value);
-            create_projects.push(HostCreateProject {
-                id: project.id.clone(),
-                path: project.path.clone(),
-                // The creation catalog gets the SAME verdict the wire did:
-                // only organization is a folder (root folders never reach this
-                // loop), and a worktree carries the path/branch a launch has
-                // to echo back.
-                is_folder: is_group,
-                worktree_path: worktree_branch.as_ref().map(|_| project.path.clone()),
-                worktree_branch,
-            });
+            // A repository container, archived checkout, missing checkout,
+            // or checkout being physically removed is still visible in the
+            // wire history but is intentionally absent from the executable
+            // create catalog. This keeps a Controller from silently falling
+            // back to the principal cwd.
+            let blocked_by_identity = identity_namespace_unreadable(&state)
+                || identity_checkout.is_some_and(|identity| {
+                    identity
+                        .get("archived")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        || identity
+                            .get("availability")
+                            .and_then(Value::as_str)
+                            .is_none_or(|availability| availability != "available")
+                        || identity_requires_recovery(identity)
+                });
+            if !is_group && !blocked_by_identity {
+                create_projects.push(HostCreateProject {
+                    id: project.id.clone(),
+                    path: project.path.clone(),
+                    // The creation catalog gets the SAME verdict the wire did:
+                    // only organization is a folder (root folders never reach
+                    // this loop), and a worktree carries the path/branch a
+                    // launch has to echo back.
+                    is_folder: is_group,
+                    worktree_path: worktree_branch.as_ref().map(|_| project.path.clone()),
+                    worktree_branch,
+                });
+            }
         }
 
         let (wire_presets, create_presets) = presets(&state);
@@ -711,6 +796,134 @@ fn worktree_main_repo(gitdir: &std::path::Path) -> Option<String> {
         .then(|| dot_git.parent())
         .flatten()
         .map(|main| main.to_string_lossy().into_owned())
+}
+
+/// Read Comet's optional durable identity projection without depending on the
+/// adapter crate. Older state files simply have no such namespace and retain
+/// the legacy disk-derived behavior above.
+fn identity_checkout<'a>(state: &'a Value, project_id: &str) -> Option<&'a Value> {
+    if identity_namespace_unreadable(state) {
+        return None;
+    }
+    state
+        .get("comet_project_identity")?
+        .get("checkouts")?
+        .as_array()?
+        .iter()
+        .find(|checkout| {
+            checkout
+                .get("projectID")
+                .or_else(|| checkout.get("projectId"))
+                .and_then(Value::as_str)
+                == Some(project_id)
+        })
+}
+
+fn identity_repository<'a>(state: &'a Value, repository_id: &str) -> Option<&'a Value> {
+    if identity_namespace_unreadable(state) {
+        return None;
+    }
+    state
+        .get("comet_project_identity")?
+        .get("repositories")?
+        .as_array()?
+        .iter()
+        .find(|repository| repository.get("id").and_then(Value::as_str) == Some(repository_id))
+}
+
+pub(crate) fn identity_namespace_unreadable(state: &Value) -> bool {
+    state.get("comet_project_identity").is_some_and(|identity| {
+        identity.get("version").and_then(Value::as_u64) != Some(1)
+            || !identity.get("checkouts").is_some_and(Value::is_array)
+            || !identity.get("repositories").is_some_and(Value::is_array)
+            || identity
+                .get("repositories")
+                .and_then(Value::as_array)
+                .is_some_and(|repositories| {
+                    repositories
+                        .iter()
+                        .any(|repository| !repository.get("id").is_some_and(Value::is_string))
+                })
+            || identity
+                .get("checkouts")
+                .and_then(Value::as_array)
+                .is_some_and(|checkouts| {
+                    checkouts.iter().any(|checkout| {
+                        !checkout
+                            .get("projectID")
+                            .or_else(|| checkout.get("projectId"))
+                            .is_some_and(Value::is_string)
+                            || checkout.get("path").is_some_and(|value| !value.is_string())
+                            || [
+                                "archived",
+                                "detached",
+                                "removalPending",
+                                "removalInterrupted",
+                            ]
+                            .iter()
+                            .any(|field| {
+                                checkout.get(field).is_some_and(|value| !value.is_boolean())
+                            })
+                            || checkout.get("availability").is_some_and(|value| {
+                                !matches!(
+                                    value.as_str(),
+                                    Some("available" | "missing" | "probe_failed")
+                                )
+                            })
+                            || checkout.get("kind").is_some_and(|value| {
+                                !matches!(
+                                    value.as_str(),
+                                    Some("primary" | "linked" | "non_git" | "unresolved")
+                                )
+                            })
+                            || checkout.get("ownership").is_some_and(|value| {
+                                !matches!(
+                                    value.as_str(),
+                                    Some("app_managed" | "external" | "unknown")
+                                )
+                            })
+                            || [
+                                "repositoryID",
+                                "repositoryId",
+                                "checkoutID",
+                                "checkoutId",
+                                "conflict",
+                            ]
+                            .iter()
+                            .any(|field| {
+                                checkout
+                                    .get(field)
+                                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                            })
+                    })
+                })
+    })
+}
+
+fn identity_requires_recovery(checkout: &Value) -> bool {
+    ["removalPending", "removalInterrupted"]
+        .iter()
+        .any(|field| checkout.get(field).and_then(Value::as_bool) == Some(true))
+        || checkout
+            .get("conflict")
+            .is_some_and(|value| !value.is_null())
+}
+
+fn copy_identity_string(object: &mut serde_json::Map<String, Value>, source: &Value, field: &str) {
+    if let Some(value) = source.get(field).and_then(Value::as_str) {
+        object.insert(field.to_owned(), value.to_owned().into());
+    }
+}
+
+fn copy_identity_string_as(
+    object: &mut serde_json::Map<String, Value>,
+    source: &Value,
+    source_field: &str,
+    target_field: &str,
+) {
+    if let Some(value) = source.get(source_field).and_then(Value::as_str) {
+        object.insert(target_field.to_owned(), value.to_owned().into());
+    }
 }
 
 fn project_records(state: &Value) -> Vec<ProjectRecord> {

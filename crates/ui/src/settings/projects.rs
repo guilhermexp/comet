@@ -1,11 +1,10 @@
 //! Settings → Projects: a lista durável de tudo que o app já viu, e o detalhe
 //! do projeto selecionado.
 //!
-//! Duas colunas dentro da página: a lista à esquerda (busca + adicionar) e os
-//! cards à direita. A lista NÃO é a mesma da sidebar de Workers — aquela mostra
-//! o working set, que `remove_project` poda junto com as sessões; esta mostra o
-//! ledger (`zeron_workers_unpeel::project_ledger`), que sobrevive à poda. Um
-//! projeto some daqui só pelo Danger Zone.
+//! A lista agrupa os checkouts pelo projeto lógico persistido; o detalhe
+//! seleciona o checkout exato para configuração e ações. Workers usa a mesma
+//! identidade, mas exibe o working set. Arquivar preserva sessões e arquivos;
+//! Forget suprime metadados históricos sem apagar diretórios ou sessões.
 //!
 //! Git é lido apenas para o projeto SELECIONADO: `status` e os dois commits
 //! âncora custam processos, e o reference faz igual — `getGitStatus` e
@@ -25,7 +24,7 @@ use std::sync::Arc;
 use zeron_workers_unpeel::project_git::{self, ProjectGitStatus, Visibility};
 use zeron_workers_unpeel::project_ledger;
 use zeron_workers_unpeel::worktree_config::{self, ConfigTarget, WorktreeConfig};
-use zeron_workers_unpeel::{AnchorCommit, LocalWorkersClient, ProjectRow};
+use zeron_workers_unpeel::{AnchorCommit, LocalWorkersClient, ProjectRow, RepositoryIdentity};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::settings::widgets;
@@ -85,7 +84,11 @@ pub fn matches_query(row: &ProjectRow, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    row.name.to_lowercase().contains(&query) || row.path.to_lowercase().contains(&query)
+    row.name.to_lowercase().contains(&query)
+        || row.path.to_lowercase().contains(&query)
+        || row
+            .display_branch()
+            .is_some_and(|branch| branch.to_lowercase().contains(&query))
 }
 
 /// O novo nome, ou `None` quando não há o que salvar. Vazio e inalterado voltam
@@ -345,6 +348,7 @@ struct Detail {
 pub struct ProjectsPage {
     client: LocalWorkersClient,
     rows: Vec<ProjectRow>,
+    repositories: Vec<RepositoryIdentity>,
     /// Path canônico do selecionado — id não serve: uma linha só do ledger não
     /// tem id.
     selected: Option<String>,
@@ -417,6 +421,7 @@ impl ProjectsPage {
         let mut page = Self {
             client: crate::workers::client::shared(),
             rows: Vec::new(),
+            repositories: Vec::new(),
             selected: None,
             search,
             name_input,
@@ -449,7 +454,16 @@ impl ProjectsPage {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
+                    // Existing installs may predate the identity namespace.
+                    // Reconcile before constructing the catalog so the first
+                    // Settings render already groups known worktrees. A
+                    // failed probe remains visible as a row; it never erases
+                    // the ledger or changes the selected cwd.
+                    let reconciliation_error = client.reconcile_project_identity().err();
                     let rows = client.projects_with_ledger()?;
+                    let identity = client.project_identity_registry()?;
+                    let rows = project_ledger::decorate_with_identity(rows, &identity);
+                    let repositories = identity.repositories.clone();
                     let icons = rows
                         .iter()
                         .filter_map(|row| {
@@ -457,18 +471,29 @@ impl ProjectsPage {
                             load_project_icon(recorded).map(|image| (row.path.clone(), image))
                         })
                         .collect::<HashMap<_, _>>();
-                    Ok::<_, zeron_workers_unpeel::WorkersError>((rows, icons))
+                    Ok::<_, zeron_workers_unpeel::WorkersError>((
+                        rows,
+                        icons,
+                        repositories,
+                        reconciliation_error,
+                    ))
                 })
                 .await;
             this.update(cx, |page, cx| {
                 page.loading = false;
                 match loaded {
-                    Ok((rows, icons)) => {
-                        page.error = None;
-                        if page.selected.is_none() {
+                    Ok((rows, icons, repositories, reconciliation_error)) => {
+                        page.error =
+                            reconciliation_error.map(|error| SharedString::from(error.to_string()));
+                        if page.selected.is_none()
+                            || page.selected.as_deref().is_some_and(|selected| {
+                                !rows.iter().any(|row| row.path == selected)
+                            })
+                        {
                             page.selected = rows.first().map(|row| row.path.clone());
                         }
                         page.icon_images = icons;
+                        page.repositories = repositories;
                         page.rows = rows;
                         page.load_detail(cx);
                     }
@@ -483,6 +508,13 @@ impl ProjectsPage {
     fn selected_row(&self) -> Option<&ProjectRow> {
         let path = self.selected.as_deref()?;
         self.rows.iter().find(|row| row.path == path)
+    }
+
+    fn selected_group(&self) -> Option<project_ledger::ProjectGroup> {
+        let path = self.selected.as_deref()?;
+        project_ledger::group_rows(&self.rows)
+            .into_iter()
+            .find(|group| group.checkouts.iter().any(|row| row.path == path))
     }
 
     fn load_detail(&mut self, cx: &mut Context<Self>) {
@@ -715,10 +747,42 @@ impl ProjectsPage {
                 .await;
             this.update(cx, |page, cx| {
                 match done {
-                    Ok(()) => page.notice = Some(SharedString::from(success)),
+                    Ok(()) => {
+                        page.notice = Some(SharedString::from(success));
+                        page.reload(cx);
+                    }
                     Err(error) => page.error = Some(SharedString::from(error)),
                 }
-                page.reload(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn reconcile_identity(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        self.notice = None;
+        self.error = None;
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move { client.reconcile_project_identity() })
+                .await;
+            this.update(cx, |page, cx| {
+                match done {
+                    Ok(report) => {
+                        page.notice = Some(SharedString::from(format!(
+                            "Reconciled {} checkout{} · {} associated · {} pending · {} missing",
+                            report.examined,
+                            if report.examined == 1 { "" } else { "s" },
+                            report.associated,
+                            report.pending,
+                            report.missing,
+                        )));
+                        page.reload(cx);
+                    }
+                    Err(error) => page.error = Some(SharedString::from(error.to_string())),
+                }
                 cx.notify();
             })
             .ok();
@@ -859,11 +923,10 @@ impl Render for ProjectsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let query = self.search.read(cx).text().to_owned();
-        let visible: Vec<ProjectRow> = self
-            .rows
-            .iter()
-            .filter(|row| matches_query(row, &query))
-            .cloned()
+        let groups = project_ledger::group_rows(&self.rows);
+        let visible: Vec<project_ledger::ProjectGroup> = groups
+            .into_iter()
+            .filter(|group| project_ledger::group_matches_query(group, &query).is_some())
             .collect();
         let now_ms = Utc::now().timestamp_millis().max(0) as u64;
 
@@ -872,7 +935,7 @@ impl Render for ProjectsPage {
             .flex_row()
             .size_full()
             .overflow_hidden()
-            .child(self.render_list(&theme, &visible, now_ms, cx))
+            .child(self.render_list(&theme, &visible, &query, now_ms, cx))
             .child(self.render_detail(&theme, now_ms, cx))
     }
 }
@@ -881,74 +944,97 @@ impl ProjectsPage {
     fn render_list(
         &mut self,
         theme: &Theme,
-        visible: &[ProjectRow],
+        visible: &[project_ledger::ProjectGroup],
+        query: &str,
         now_ms: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let empty_all = self.rows.is_empty();
-        let rows: Vec<AnyElement> = visible
+        let (regular_groups, pending_groups): (Vec<_>, Vec<_>) =
+            visible.iter().partition(|group| !group.has_pending());
+        let render_group = |group: &project_ledger::ProjectGroup| {
+            let target = project_ledger::group_matches_query(group, query)
+                .or_else(|| group.selected_checkout());
+            let selected = group
+                .checkouts
+                .iter()
+                .any(|row| self.selected.as_deref() == Some(row.path.as_str()));
+            let path = target.map(|row| row.path.clone()).unwrap_or_default();
+            let project_icon = target
+                .and_then(|row| self.icon_images.get(&row.path).cloned())
+                .or_else(|| {
+                    group
+                        .icon_path
+                        .as_deref()
+                        .and_then(|path| self.icon_images.get(path).cloned())
+                });
+            let checkout_count = group.checkouts.len();
+            let subtitle = format!(
+                "{} checkout{} · Last opened {}",
+                checkout_count,
+                if checkout_count == 1 { "" } else { "s" },
+                format_last_opened(group.last_opened_at_unix_ms, now_ms)
+            );
+            div()
+                .id(SharedString::from(format!("project-row-{}", group.id)))
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
+                .hover(|s| s.bg(theme.glass_hover()))
+                .on_click(cx.listener(move |page, _, _, cx| page.select(path.clone(), cx)))
+                .child(match project_icon {
+                    Some(image) => img(image)
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded(px(4.0))
+                        .object_fit(ObjectFit::Cover)
+                        .into_any_element(),
+                    None => crate::icons::icon(crate::icons::FOLDER)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted)
+                        .into_any_element(),
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .flex_1()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .text_color(if selected {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                })
+                                .child(SharedString::from(group.name.clone())),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted.opacity(0.5))
+                                .child(SharedString::from(subtitle)),
+                        ),
+                )
+                .into_any_element()
+        };
+        let rows: Vec<AnyElement> = regular_groups
             .iter()
-            .map(|row| {
-                let selected = self.selected.as_deref() == Some(row.path.as_str());
-                let path = row.path.clone();
-                let project_icon = self.icon_images.get(&row.path).cloned();
-                let subtitle = format!(
-                    "Last opened {}",
-                    format_last_opened(row.last_opened_at_unix_ms, now_ms)
-                );
-                div()
-                    .id(SharedString::from(format!("project-row-{}", row.path)))
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .py(px(6.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
-                    .hover(|s| s.bg(theme.glass_hover()))
-                    .on_click(cx.listener(move |page, _, _, cx| page.select(path.clone(), cx)))
-                    .child(match project_icon {
-                        Some(image) => img(image)
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .rounded(px(4.0))
-                            .object_fit(ObjectFit::Cover)
-                            .into_any_element(),
-                        None => crate::icons::icon(crate::icons::FOLDER)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted)
-                            .into_any_element(),
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .min_w_0()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(13.0))
-                                    .text_color(if selected {
-                                        theme.text
-                                    } else {
-                                        theme.text_muted
-                                    })
-                                    .child(SharedString::from(row.name.clone())),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
-                                    .child(SharedString::from(subtitle)),
-                            ),
-                    )
-                    .into_any_element()
-            })
+            .map(|group| render_group(group))
+            .collect();
+        let pending_rows: Vec<AnyElement> = pending_groups
+            .iter()
+            .map(|group| render_group(group))
             .collect();
 
         div()
@@ -968,6 +1054,11 @@ impl ProjectsPage {
                     .px(px(8.0))
                     .pt(px(8.0))
                     .child(div().flex_1().min_w_0().child(self.search.clone()))
+                    .child(action_button(
+                        theme,
+                        "Reconcile",
+                        cx.listener(|page, _, _, cx| page.reconcile_identity(cx)),
+                    ))
                     .child(
                         div()
                             .id("projects-add")
@@ -1002,10 +1093,22 @@ impl ProjectsPage {
                         el.child(quiet(theme, "No projects"))
                             .child(quiet(theme, "Add one with the + above"))
                     })
-                    .when(!empty_all && rows.is_empty(), |el| {
+                    .when(!empty_all && visible.is_empty(), |el| {
                         el.child(quiet(theme, "No results found"))
                     })
-                    .children(rows),
+                    .children(rows)
+                    .when(!pending_rows.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .px(px(8.0))
+                                .pt(px(10.0))
+                                .pb(px(4.0))
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child("Association pending"),
+                        )
+                        .children(pending_rows)
+                    }),
             )
             .into_any_element()
     }
@@ -1024,7 +1127,9 @@ impl ProjectsPage {
                 .into_any_element();
         };
         let detail = self.detail.clone().unwrap_or_default();
-        let live = row.is_live();
+        let filesystem_available = row.is_available() && detail.folder_exists;
+        let runnable = row.is_live() && filesystem_available && !row.archived;
+        let selected_group = self.selected_group();
         let config_error = self
             .config_writes
             .error_for(&row.path)
@@ -1049,15 +1154,128 @@ impl ProjectsPage {
                     .when_some(self.notice.clone(), |el, message| {
                         el.child(widgets::page_subtitle(theme, message))
                     })
-                    .child(self.render_general(theme, &row, &detail, now_ms, live, cx))
+                    .when_some(selected_group, |el, group| {
+                        el.child(self.render_checkout_picker(theme, &group, cx))
+                    })
+                    .child(self.render_general(
+                        theme,
+                        &row,
+                        &detail,
+                        now_ms,
+                        filesystem_available,
+                        cx,
+                    ))
                     .child(widgets::page_header(theme, "Config", None))
-                    .child(self.render_config(theme, &detail, cx))
+                    .child(self.render_config(theme, &detail, filesystem_available, cx))
                     .child(widgets::page_header(theme, "Worktree", None))
-                    .child(self.render_worktree(theme, &row, &detail, live, cx))
+                    .child(self.render_worktree(theme, &row, &detail, runnable, cx))
                     .child(widgets::page_header(theme, "Auto Doc", None))
-                    .child(self.render_auto_doc(theme, &row, &detail, live, cx))
+                    .child(self.render_auto_doc(theme, &row, &detail, runnable, cx))
                     .child(widgets::page_header(theme, "Danger Zone", None))
                     .child(self.render_danger(theme, &row, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_checkout_picker(
+        &mut self,
+        theme: &Theme,
+        group: &project_ledger::ProjectGroup,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.selected.as_deref();
+        let rows: Vec<AnyElement> = group
+            .checkouts
+            .iter()
+            .map(|checkout| {
+                let path = checkout.path.clone();
+                let is_selected = selected == Some(checkout.path.as_str());
+                let branch = checkout
+                    .display_branch()
+                    .map(|branch| format!(" · {branch}"))
+                    .unwrap_or_default();
+                let status = match checkout.checkout_availability {
+                    Some(project_ledger::CheckoutAvailability::Available) => "Available",
+                    Some(project_ledger::CheckoutAvailability::Missing) => "Unavailable",
+                    Some(project_ledger::CheckoutAvailability::ProbeFailed) => "Probe failed",
+                    None => "Status unknown",
+                };
+                div()
+                    .id(SharedString::from(format!(
+                        "checkout-row-{}",
+                        checkout.path
+                    )))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .when(is_selected, |el| el.bg(crate::theme::glass_selected_bg()))
+                    .hover(|s| s.bg(theme.glass_hover()))
+                    .on_click(cx.listener(move |page, _, _, cx| page.select(path.clone(), cx)))
+                    .child(
+                        crate::icons::icon(
+                            if checkout.checkout_kind == Some(project_ledger::CheckoutKind::Primary)
+                            {
+                                crate::icons::FOLDER
+                            } else {
+                                crate::icons::GIT_BRANCH
+                            },
+                        )
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(format!(
+                                        "{}{}",
+                                        checkout.name, branch
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted.opacity(0.65))
+                                    .child(SharedString::from(format!(
+                                        "{status} · {}",
+                                        checkout.path
+                                    ))),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        widgets::section_card(theme)
+            .child(
+                widgets::card_row(theme, true)
+                    .child(label_block(
+                        theme,
+                        "Checkouts",
+                        "Select the exact checkout used for settings and worker actions",
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .w(px(420.0))
+                            .gap(px(2.0))
+                            .children(rows),
+                    ),
             )
             .into_any_element()
     }
@@ -1068,7 +1286,7 @@ impl ProjectsPage {
         row: &ProjectRow,
         detail: &Detail,
         now_ms: u64,
-        live: bool,
+        available: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let reveal_path = row.path.clone();
@@ -1136,20 +1354,28 @@ impl ProjectsPage {
             .child(
                 widgets::card_row(theme, false)
                     .child(label_block(theme, "Path", &row.path))
-                    .child(action_button(
-                        theme,
-                        "Reveal",
-                        cx.listener(move |page, _, _, cx| {
-                            let path = reveal_path.clone();
-                            page.run_action(
-                                cx,
-                                move |client| {
-                                    client.reveal_project(&path).map_err(|e| e.to_string())
-                                },
-                                "Revealed in Finder",
-                            );
-                        }),
-                    )),
+                    .when(available, |el| {
+                        el.child(action_button(
+                            theme,
+                            "Reveal",
+                            cx.listener(move |page, _, _, cx| {
+                                let path = reveal_path.clone();
+                                page.run_action(
+                                    cx,
+                                    move |client| {
+                                        client.reveal_project(&path).map_err(|e| e.to_string())
+                                    },
+                                    "Revealed in Finder",
+                                );
+                            }),
+                        ))
+                    })
+                    .when(!available, |el| {
+                        el.child(quiet(
+                            theme,
+                            "Checkout unavailable — filesystem actions are disabled",
+                        ))
+                    }),
             )
             .child(
                 widgets::card_row(theme, false)
@@ -1169,7 +1395,7 @@ impl ProjectsPage {
                         detail.opened_commit.as_ref(),
                     )),
             )
-            .child(self.render_repository(theme, row, detail, live, cx))
+            .child(self.render_repository(theme, row, detail, available, cx))
             .into_any_element()
     }
 
@@ -1181,6 +1407,15 @@ impl ProjectsPage {
         _live: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if row.checkout_availability == Some(project_ledger::CheckoutAvailability::ProbeFailed) {
+            return widgets::card_row(theme, false)
+                .child(label_block(
+                    theme,
+                    "Repository",
+                    "Git probe failed — retry reconciliation before taking repository actions",
+                ))
+                .into_any_element();
+        }
         let state = repository_state(&detail.git, detail.folder_exists);
         let path = row.path.clone();
         let base = widgets::card_row(theme, false);
@@ -1274,6 +1509,7 @@ impl ProjectsPage {
         &mut self,
         theme: &Theme,
         detail: &Detail,
+        available: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let current = self.config_target.relative_path();
@@ -1297,27 +1533,35 @@ impl ProjectsPage {
                             .text_color(theme.text)
                             .child(SharedString::from(current.to_string())),
                     )
-                    .child(action_button(
-                        theme,
-                        "Use .comet",
-                        cx.listener(|page, _, _, cx| {
-                            page.select_config_target(ConfigTarget::Comet, cx)
-                        }),
-                    ))
-                    .when(detail.cursor_available, |el| {
+                    .when(available, |el| {
                         el.child(action_button(
                             theme,
-                            "Use .cursor",
+                            "Use .comet",
                             cx.listener(|page, _, _, cx| {
-                                page.select_config_target(ConfigTarget::Cursor, cx)
+                                page.select_config_target(ConfigTarget::Comet, cx)
                             }),
                         ))
+                        .when(detail.cursor_available, |el| {
+                            el.child(action_button(
+                                theme,
+                                "Use .cursor",
+                                cx.listener(|page, _, _, cx| {
+                                    page.select_config_target(ConfigTarget::Cursor, cx)
+                                }),
+                            ))
+                        })
+                        .child(action_button(
+                            theme,
+                            "Save config",
+                            cx.listener(|page, _, _, cx| page.save_config(cx)),
+                        ))
                     })
-                    .child(action_button(
-                        theme,
-                        "Save config",
-                        cx.listener(|page, _, _, cx| page.save_config(cx)),
-                    )),
+                    .when(!available, |el| {
+                        el.child(quiet(
+                            theme,
+                            "Checkout unavailable — config actions are disabled",
+                        ))
+                    }),
             )
             .into_any_element()
     }
@@ -1327,7 +1571,7 @@ impl ProjectsPage {
         theme: &Theme,
         row: &ProjectRow,
         _detail: &Detail,
-        live: bool,
+        runnable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let project_id = row.project_id.clone();
@@ -1338,7 +1582,7 @@ impl ProjectsPage {
                     "Setup Commands",
                     "Run after worktree creation. $ROOT_WORKTREE_PATH points at the main checkout.",
                 ))
-                .when(live, |el| {
+                .when(runnable, |el| {
                     el.child(action_button(
                         theme,
                         "Fill with AI",
@@ -1385,10 +1629,10 @@ impl ProjectsPage {
         theme: &Theme,
         row: &ProjectRow,
         detail: &Detail,
-        live: bool,
+        runnable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let runnable = live && detail.git.is_repo;
+        let runnable = runnable && detail.git.is_repo;
         let project_id = row.project_id.clone();
         let prompt = auto_doc_prompt(detail.added_commit.as_ref(), detail.opened_commit.as_ref());
         widgets::section_card(theme)
@@ -1427,6 +1671,17 @@ impl ProjectsPage {
         let name = row.name.clone();
         let recorded_icon = row.icon_path.clone();
         let confirming = self.confirm_forget;
+        let checkout_id = row.checkout_id.clone();
+        let repository_id = row.repository_id.clone();
+        let repositories = self.repositories.clone();
+        let identity_known = row.checkout_kind.is_some();
+        // A registered checkout may only be forgotten after it has been
+        // archived. Archiving keeps its project/session identity while making
+        // the presentation metadata inactive, so an archived live row is
+        // intentionally eligible here.
+        let can_forget = !row.is_live() || row.archived;
+        let can_restore =
+            row.archived && row.is_available() && identity_known && checkout_id.is_some();
         widgets::section_card(theme)
             .child(
                 widgets::card_row(theme, true)
@@ -1439,7 +1694,7 @@ impl ProjectsPage {
                             "Remove this project's recorded metadata. Files on disk are kept."
                         },
                     ))
-                    .when(!confirming, |el| {
+                    .when(!confirming && can_forget, |el| {
                         el.child(action_button(
                             theme,
                             "Forget",
@@ -1449,6 +1704,126 @@ impl ProjectsPage {
                             }),
                         ))
                     })
+                    .when(!confirming && !can_forget, |el| {
+                        el.child(quiet(
+                            theme,
+                            "Archive the active checkout before forgetting metadata",
+                        ))
+                    })
+                    .when(!confirming && can_restore, |el| {
+                        let id = checkout_id.clone().expect("restore checkout id");
+                        el.child(action_button(
+                            theme,
+                            "Restore checkout",
+                            cx.listener(move |page, _, _, cx| {
+                                let id = id.clone();
+                                page.run_action(
+                                    cx,
+                                    move |client| {
+                                        client.restore_checkout(&id).map_err(|e| e.to_string())
+                                    },
+                                    "Checkout restored",
+                                );
+                            }),
+                        ))
+                    })
+                    .when(
+                        !confirming && !row.archived && identity_known && checkout_id.is_some(),
+                        |el| {
+                        let id = checkout_id.clone().expect("archive checkout id");
+                        el.child(action_button(
+                            theme,
+                            "Archive checkout",
+                            cx.listener(move |page, _, _, cx| {
+                                let id = id.clone();
+                                page.run_action(
+                                    cx,
+                                    move |client| {
+                                        client.archive_checkout(&id).map_err(|e| e.to_string())
+                                    },
+                                    "Checkout archived",
+                                );
+                            }),
+                        ))
+                    })
+                    .when(
+                        !confirming && row.is_pending() && identity_known && checkout_id.is_some(),
+                        |el| {
+                        let checkout_id = checkout_id.clone().expect("pending checkout id");
+                        if repositories.is_empty() {
+                            return el.child(quiet(
+                                theme,
+                                "Association pending — no repository identity is available yet",
+                            ));
+                        }
+                        let links = repositories
+                            .iter()
+                            .map(|repository| {
+                                let repository_id = repository.id.clone();
+                                let checkout_id = checkout_id.clone();
+                                let label = format!(
+                                    "Link to {}",
+                                    repository
+                                        .name
+                                        .as_deref()
+                                        .unwrap_or(repository.id.as_str())
+                                );
+                                action_button(
+                                    theme,
+                                    &label,
+                                    cx.listener(move |page, _, _, cx| {
+                                        let checkout_id = checkout_id.clone();
+                                        let repository_id = repository_id.clone();
+                                        page.run_action(
+                                            cx,
+                                            move |client| {
+                                                client
+                                                    .associate_checkout(
+                                                        &checkout_id,
+                                                        &repository_id,
+                                                    )
+                                                    .map_err(|e| e.to_string())
+                                            },
+                                            "Checkout associated",
+                                        );
+                                    }),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(6.0))
+                                .children(links),
+                        )
+                    })
+                    .when(
+                        !confirming
+                            && row.association == project_ledger::AssociationState::Known
+                            && identity_known
+                            && repository_id.is_some()
+                            && checkout_id.is_some(),
+                        |el| {
+                            let checkout_id = checkout_id.clone().expect("known checkout id");
+                            el.child(action_button(
+                                theme,
+                                "Undo association",
+                                cx.listener(move |page, _, _, cx| {
+                                    let checkout_id = checkout_id.clone();
+                                    page.run_action(
+                                        cx,
+                                        move |client| {
+                                            client
+                                                .undo_checkout_association(&checkout_id)
+                                                .map_err(|e| e.to_string())
+                                        },
+                                        "Checkout association removed",
+                                    );
+                                }),
+                            ))
+                        },
+                    )
                     .when(confirming, |el| {
                         el.child(action_button(
                             theme,
@@ -1633,6 +2008,15 @@ mod tests {
             added_at_unix_ms: 1_000,
             last_opened_at_unix_ms: 2_000,
             icon_path: None,
+            repository_id: None,
+            checkout_id: live.then(|| "checkout-1".to_owned()),
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            current_branch: None,
+            last_known_branch: None,
+            association: zeron_workers_unpeel::project_ledger::AssociationState::Pending,
+            archived: !live,
         }
     }
 
@@ -1653,6 +2037,33 @@ mod tests {
         assert!(matches_query(&entry, "CHECKLIST"));
         assert!(matches_query(&entry, "clients"), "path tambem conta");
         assert!(!matches_query(&entry, "surf"));
+    }
+
+    #[test]
+    fn search_matches_the_current_or_last_known_branch() {
+        let mut entry = row("Comet", "/Users/me/comet", true);
+        entry.current_branch = Some("fix/projects-sidebar".to_owned());
+        assert!(matches_query(&entry, "PROJECTS-SIDEBAR"));
+        entry.current_branch = None;
+        entry.last_known_branch = Some("fix/old-sidebar".to_owned());
+        assert!(matches_query(&entry, "old-sidebar"));
+    }
+
+    #[test]
+    fn settings_search_returns_one_logical_row_for_multiple_checkouts() {
+        let mut primary = row("Comet", "/Users/me/comet", true);
+        primary.repository_id = Some("repo-1".to_owned());
+        primary.checkout_kind = Some(project_ledger::CheckoutKind::Primary);
+        let mut child = row("fix/projects-sidebar", "/tmp/comet-sidebar", true);
+        child.repository_id = Some("repo-1".to_owned());
+        child.checkout_kind = Some(project_ledger::CheckoutKind::Linked);
+        child.current_branch = Some("fix/projects-sidebar".to_owned());
+        let groups = project_ledger::group_rows(&[primary, child]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            project_ledger::group_matches_query(&groups[0], "sidebar").map(|row| row.path.as_str()),
+            Some("/tmp/comet-sidebar")
+        );
     }
 
     /// A linha nunca some por causa de git: cada estado tem uma forma.

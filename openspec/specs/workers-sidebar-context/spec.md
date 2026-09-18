@@ -23,6 +23,21 @@ Test: none — native demo screenshot; no automated GPUI render harness.
 - **THEN** the base retains its folder icon, local Workers sit directly inside it, and the nested worktree uses the worktree icon and branch name with its Workers underneath
 - **AND** no Local/main subtitle or repeated per-Worker Git glyph is shown
 
+#### Scenario: A worktree disappears after registration
+- **WHEN** a linked checkout becomes unavailable
+- **THEN** its project membership persists and its history does not become a new root folder
+- **AND** a running or selected Worker remains reachable with an unavailable-checkout indication
+- **AND** inactive unavailable checkouts are grouped in collapsed history
+
+#### Scenario: PR state belongs to the exact checkout
+- **WHEN** sibling checkouts have different branches or one is unavailable
+- **THEN** each available checkout uses its own current branch and cwd for confirmed PR state
+- **AND** neither a parent's PR nor last-known metadata is presented as the unavailable checkout's live PR
+
+#### Scenario: Filtering a project includes its child checkouts
+- **WHEN** the user filters Workers by a logical project
+- **THEN** its principal and linked checkouts remain in scope, including a project whose principal has no execution registration
+
 ### Requirement: Empty inactive projects do not remain selected automatically
 The model SHALL NOT select a project merely because it is first in the registry. When the selected session is removed or archived without a remaining sibling, its implicit project selection SHALL clear. Explicit project/launcher navigation SHALL remain supported without deleting project records.
 
