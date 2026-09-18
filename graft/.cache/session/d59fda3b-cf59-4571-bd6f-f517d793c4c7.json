@@ -1,0 +1,12 @@
+{
+  "lastQuery": "<task-notification>\n<task-id>b85dk4ich</task-id>\n<tool-use-id>toolu_01UJy9DfkfGyKtdj1B8ei7tK</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-guilhermevarela--no-mistakes-worktrees-6fec5bb7ba85-01M2SAY35QJSGQM2BXE389DMJ0/d59fda3b-cf59-4571-bd6f-f517d793c4c7/tasks/b85dk4ich.output</output-file>\n<status>completed</status>\n<summary>Background command \"cd third_party/unpeel/crates &amp;&amp; cargo test -p unpeel-core lifecycle_extension 2&gt;&amp;1 | tail -15\" completed (exit code 0)</summary>\n</task-notification>",
+  "perAgentQuery": {},
+  "graftReads": 0,
+  "sourceReads": 0,
+  "savedTokens": 0,
+  "injectedPointers": [],
+  "nudges": 0,
+  "inputCostMicros": 1089697,
+  "inputTokensBilled": 1584804,
+  "lastBillingUuid": "cde3d198-ee61-47c4-9363-f1ffc3f40568"
+}

@@ -401,6 +401,14 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   runtime, porque `pi` tem resume/context próprios e não inclui o `mod.rs`
   compartilhado. Runtime sem hooks no catálogo hoje é o `agy` — é ele que os
   testes usam para exercitar o ramo hookless de `derive_activity`.
+  **`agent_end` com `willContinue === true` não é Stop.** Na API pública de
+  extensão (`AgentEndEvent`), isso marca continuação já agendada (auto-retry,
+  empty/unexpected-stop retry), não settle terminal. O emitter anuncia `Start`
+  em `agent_start` e só anuncia `Stop` no fim terminal (`willContinue === false`)
+  ou no legado sem a flag, preservando id de conversa e transcript. Não
+  confundir com `isTerminal` do RPC nem com `session_stop` (pré-settle, pode
+  pedir continuação). A regressão permanente é
+  `lifecycle_extension_reports_provider_session_identity` no adapter vendorizado.
 - **Reinstalação limpa de CLI é o caso normal, não a exceção.** Apagar
   `~/.unpeel` (ou a poda do root legado) some com o diretório onde a extensão
   de lifecycle é escrita, e `write_file_atomic` falhava com `No such file or
@@ -458,6 +466,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
+| extensão de lifecycle pi-family (`third_party/unpeel/runtimes/_shared/pi-family/adapter/setup.rs`) | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib lifecycle_extension_reports_provider_session_identity` |
 
 ## Child DOX Index
 

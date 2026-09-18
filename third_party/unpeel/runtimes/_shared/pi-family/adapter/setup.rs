@@ -58,14 +58,22 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    #[test]
-    fn lifecycle_extension_reports_provider_session_identity() {
+    fn identity_payload(hook_event_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hook_event_name": hook_event_name,
+            "session_id": "omp-provider-1",
+            "provider_transcript_path": "/trusted/omp-provider-1.jsonl"
+        })
+    }
+
+    fn run_lifecycle_harness(script: &str) -> Vec<serde_json::Value> {
         let directory = tempfile::tempdir().expect("temporary extension harness");
-        let capture_path = directory.path().join("payload.json");
+        let capture_path = directory.path().join("events.jsonl");
+        std::fs::write(&capture_path, "").expect("init capture");
         let notify_path = directory.path().join("notify.sh");
         std::fs::write(
             &notify_path,
-            "#!/bin/bash\nprintf '%s' \"$1\" > \"$CAPTURE_PATH\"\n",
+            "#!/bin/bash\nprintf '%s\\n' \"$1\" >> \"$CAPTURE_PATH\"\n",
         )
         .expect("write capture notifier");
         let extension_path = directory.path().join("lifecycle-extension.mjs");
@@ -85,7 +93,7 @@ const context = {{ sessionManager: {{
   getSessionId() {{ return "omp-provider-1"; }},
   getSessionFile() {{ return "/trusted/omp-provider-1.jsonl"; }},
 }} }};
-await handlers.get("agent_end")({{}}, context);
+{script}
 "#,
                 serde_json::to_string(&extension_path.to_string_lossy()).unwrap()
             ),
@@ -103,17 +111,31 @@ await handlers.get("agent_end")({{}}, context);
             "bun failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let payload: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(capture_path).expect("captured hook payload"),
-        )
-        .expect("valid captured hook JSON");
-        assert_eq!(
-            payload,
-            serde_json::json!({
-                "hook_event_name": "Stop",
-                "session_id": "omp-provider-1",
-                "provider_transcript_path": "/trusted/omp-provider-1.jsonl"
-            })
+        let raw = std::fs::read_to_string(&capture_path).expect("captured hook payload");
+        raw.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("valid captured hook JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn lifecycle_extension_reports_provider_session_identity() {
+        let continuation = run_lifecycle_harness(
+            r#"
+await handlers.get("agent_start")({ type: "agent_start" }, context);
+await handlers.get("agent_end")({ type: "agent_end", messages: [], willContinue: true }, context);
+await handlers.get("agent_end")({ type: "agent_end", messages: [], willContinue: false }, context);
+"#,
         );
+        assert_eq!(
+            continuation,
+            vec![identity_payload("Start"), identity_payload("Stop")],
+            "continuation must not announce Stop; a real terminal end still must"
+        );
+
+        let legacy = run_lifecycle_harness(
+            r#"await handlers.get("agent_end")({}, context);"#,
+        );
+        assert_eq!(legacy, vec![identity_payload("Stop")]);
     }
 }

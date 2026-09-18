@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "71bf33c1a72215f8a09f16ff6a4c8dd70128cc4a"
+vendored_tree = "7cc8beb71e426476121b91aeb98e248e3218a0e9"
 vendored_from = "working-tree"
 local_modifications_count = 31
 local_deletions = ["apps/website"]
@@ -27,3 +27,8 @@ base_revision_resolves_upstream = false
 # ferramenta que produziu esse número (não é a contagem de arquivos que diferem
 # de `216b61e8`, que hoje são 181), e chutar um valor aqui é pior que deixar o
 # antigo com esta nota. Quem retomar o sync recalcula pela ferramenta original.
+#
+# 2026-09-13 — fix-worker-turn-lifecycle: `lifecycle-extension.js` respeita
+# `AgentEndEvent.willContinue`; `adapter/setup.rs` observa Start/continuação/
+# terminal/legado. `local_modifications_count` acima NÃO foi recalculado
+# (mesma limitação da nota de 2026-09-08).

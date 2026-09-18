@@ -36,7 +36,10 @@ export default function registerUnpeelLifecycle(extension) {
   extension.on("agent_start", async (_event, ctx) => {
     await notify("Start", ctx);
   });
-  extension.on("agent_end", async (_event, ctx) => {
+  extension.on("agent_end", async (event, ctx) => {
+    if (event?.willContinue === true) {
+      return;
+    }
     await notify("Stop", ctx);
   });
 }
