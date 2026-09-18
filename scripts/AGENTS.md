@@ -12,7 +12,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 
 ## Local Contracts
 
-- `lint-text-alpha.sh` falha se `crates/ui/src/**/*.rs` pinta `text_color` com `theme.text` / `text_muted` / `text_faint` + `.opacity(...)` sem `// a11y-ok: <motivo>` na mesma linha ou na imediatamente acima. Só bash/grep/sed.
+- `lint-text-alpha.sh` falha se `crates/ui/src/**/*.rs` pinta `text_color` com `theme.text` / `text_muted` / `text_faint` + `.opacity(...)` sem `// a11y-ok: <motivo>` na mesma linha ou na imediatamente acima, varrendo o argumento inteiro de `text_color(...)` mesmo quebrado em várias linhas. Só bash + perl.
 
 - `run-macos-browser-fixture.sh` recebe `target/debug/{browser,preview}-fixture` compilado com `cargo build -p zeron --features browser-fixture --bin <fixture>` e empacota somente a fixture local com o Info.plist real para validar política HTTP no macOS. Não assina nem publica; evidência nativa continua separada de unit tests.
 
