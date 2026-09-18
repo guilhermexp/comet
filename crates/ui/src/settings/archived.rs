@@ -141,6 +141,7 @@ impl Render for ArchivedPage {
                             .child(
                                 crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
                                     .size(px(16.0))
+                                    // a11y-ok: archive-row SVG beside the session title, not a glyph to read
                                     .text_color(theme.text_muted.opacity(0.6)),
                             ),
                     )
@@ -169,7 +170,7 @@ impl Render for ArchivedPage {
                                         div()
                                             .flex_none()
                                             .text_size(px(11.0))
-                                            .text_color(theme.text_muted.opacity(0.5))
+                                            .text_color(theme.text_faint)
                                             .child(time_ago),
                                     ),
                             )
@@ -184,7 +185,7 @@ impl Render for ArchivedPage {
                                     .items_center()
                                     .gap(px(6.0))
                                     .text_size(px(11.0))
-                                    .text_color(theme.text_muted.opacity(0.55));
+                                    .text_color(theme.text_faint);
                                 let both = device.is_some() && location.is_some();
                                 if let Some(device) = device {
                                     meta = meta.child(device);
@@ -246,12 +247,13 @@ impl Render for ArchivedPage {
                 .flex_col()
                 .items_center()
                 .text_center()
-                .text_color(theme.text_muted.opacity(0.5))
+                .text_color(theme.text_muted)
                 .child(
                     // `opacity-40` on top of the inherited muted/50 — an
                     // effectively ~20% glyph (zeron settings.archived.tsx).
                     crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
                         .size(px(28.0))
+                        // a11y-ok: empty-state ornament icon, not a readable glyph
                         .text_color(theme.text_muted.opacity(0.2)),
                 )
                 .child(
@@ -264,7 +266,7 @@ impl Render for ArchivedPage {
                     div()
                         .mt(px(4.0))
                         .text_size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.4))
+                        .text_color(theme.text_faint)
                         .child(SharedString::from(
                             "Right-click a session in the sidebar to archive it.",
                         )),

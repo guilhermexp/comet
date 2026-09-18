@@ -943,7 +943,7 @@ impl ProjectsPage {
                                 div()
                                     .truncate()
                                     .text_size(px(11.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
+                                    .text_color(theme.text_faint)
                                     .child(SharedString::from(subtitle)),
                             ),
                     )
@@ -1579,7 +1579,7 @@ fn value_block(theme: &Theme, value: &str, commit: Option<&AnchorCommit>) -> Any
                 div()
                     .truncate()
                     .text_size(px(11.0))
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_faint)
                     .child(SharedString::from(format!(
                         "{} · {}",
                         commit.short_hash, commit.subject
@@ -1616,7 +1616,7 @@ fn quiet(theme: &Theme, copy: &str) -> AnyElement {
         .px(px(8.0))
         .py(px(10.0))
         .text_size(px(12.0))
-        .text_color(theme.text_muted.opacity(0.7))
+        .text_color(theme.text_muted)
         .child(SharedString::from(copy.to_string()))
         .into_any_element()
 }

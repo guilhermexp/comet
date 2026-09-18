@@ -45,7 +45,7 @@ pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Di
             el.child(
                 div()
                     .text_size(px(13.0))
-                    .text_color(theme.text_muted.opacity(0.7))
+                    .text_color(theme.text_faint)
                     .child(SharedString::from(format!("{count}"))),
             )
         })
@@ -214,12 +214,13 @@ pub fn meta_line(theme: &Theme, fragments: Vec<AnyElement>) -> gpui::Div {
         .gap_x(px(8.0))
         .gap_y(px(2.0))
         .text_size(px(ROW_DESCRIPTION_SIZE))
-        .text_color(theme.text_muted.opacity(0.65));
+        .text_color(theme.text_faint);
     let mut first = true;
     for fragment in fragments {
         if !first {
             line = line.child(
                 div()
+                    // a11y-ok: middle-dot separator between meta fragments, not a word
                     .text_color(theme.text_muted.opacity(0.3))
                     .child(SharedString::from("·")),
             );

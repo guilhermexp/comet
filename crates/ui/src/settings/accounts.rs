@@ -369,6 +369,7 @@ impl AccountsPage {
                     icon(icons::SORT_VERTICAL)
                         .size(px(14.0))
                         .flex_none()
+                        // a11y-ok: disclosure chevron; open vs closed state, not a readable glyph
                         .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
                 );
 
@@ -409,7 +410,7 @@ impl AccountsPage {
                                 div()
                                     .flex_none()
                                     .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
+                                    .text_color(theme.text_faint)
                                     .child(SharedString::from("You")),
                             )
                         })
@@ -715,7 +716,7 @@ impl AccountsPage {
             .items_center()
             .gap(px(8.0))
             .text_size(px(11.5))
-            .text_color(theme.text_muted.opacity(0.7))
+            .text_color(theme.text_muted)
             .child(
                 div()
                     .w(px(48.0))
@@ -759,7 +760,7 @@ impl AccountsPage {
                     div()
                         .flex_none()
                         .truncate()
-                        .text_color(theme.text_muted.opacity(0.45))
+                        .text_color(theme.text_faint)
                         .child(SharedString::from(reset)),
                 )
             })
@@ -903,7 +904,7 @@ impl AccountsPage {
                                     .mt(px(6.0))
                                     .truncate()
                                     .text_size(px(11.5))
-                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .text_color(theme.text_muted)
                                     .child(SharedString::from(
                                         if account.switchable
                                             || account.harness == HarnessId::Kimi
@@ -974,7 +975,7 @@ impl AccountsPage {
                     .id(id)
                     .mt(px(6.0))
                     .text_size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_muted)
                     .truncate()
                     .cursor_pointer()
                     .hover(|s| s.text_color(theme.text))
@@ -1107,7 +1108,7 @@ impl AccountsPage {
                                 .child(
                                     div()
                                         .text_size(px(12.5))
-                                        .text_color(theme.text_muted.opacity(0.7))
+                                        .text_color(theme.text_muted)
                                         .child(message.clone().unwrap_or_else(|| {
                                             SharedString::from("Waiting for the browser…")
                                         })),
@@ -1394,7 +1395,7 @@ impl Render for AccountsPage {
                                     .py(px(32.0))
                                     .text_center()
                                     .text_size(px(14.0))
-                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .text_color(theme.text_muted)
                                     .child(SharedString::from(empty_copy)),
                             )
                         } else {
@@ -1510,7 +1511,7 @@ impl Render for AccountsPage {
                             .mt(px(24.0))
                             .text_size(px(12.0))
                             .line_height(px(19.0))
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_muted)
                             .child(SharedString::from(
                                 "Switching rewrites the CLI\u{2019}s stored login, so new \
                                  agent sessions use the selected account immediately. On \

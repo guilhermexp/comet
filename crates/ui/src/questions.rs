@@ -289,10 +289,10 @@ pub fn render(
         .font_weight(gpui::FontWeight::NORMAL);
     if history.loading {
         let phase = crate::motion::pulse_delta(&crate::motion::ACTIVITY_SHIMMER, view, cx);
-        let opacity = 0.55 + 0.45 * (phase * std::f32::consts::PI).sin();
+        let pulse = (phase * std::f32::consts::PI).sin();
         body = body.child(
             div()
-                .text_color(theme.text_muted.opacity(opacity))
+                .text_color(crate::motion::mix(theme.text_muted, theme.text, pulse))
                 .child("Asking question…"),
         );
     }

@@ -707,17 +707,11 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
             .text_color(theme.text)
     } else {
         let fade_key = fade_key.into();
-        let mut row = row
-            .text_color(motion::hover_blend(
-                &fade_key,
-                theme.text.opacity(0.9),
-                theme.text,
-            ))
-            .bg(motion::hover_blend(
-                &fade_key,
-                crate::theme::wash(0.0),
-                crate::theme::card_selected_bg(),
-            ));
+        let mut row = row.text_color(theme.text).bg(motion::hover_blend(
+            &fade_key,
+            crate::theme::wash(0.0),
+            crate::theme::card_selected_bg(),
+        ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
         row.interactivity()
@@ -756,7 +750,7 @@ pub fn menu_heading(theme: &Theme, label: &str) -> gpui::Div {
         .pt(px(6.0))
         .text_size(px(10.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.text_muted.opacity(0.6))
+        .text_color(theme.text_muted)
         .child(SharedString::from(tracked_upper(label)))
 }
 
@@ -836,7 +830,7 @@ pub fn key_cap(_theme: &Theme) -> gpui::Div {
 fn key_hint_label(theme: &Theme, label: &'static str) -> gpui::Div {
     div()
         .text_size(px(10.5))
-        .text_color(theme.text_muted.opacity(0.45))
+        .text_color(theme.text_muted)
         .child(SharedString::from(label))
 }
 
@@ -852,6 +846,7 @@ pub fn key_hint(theme: &Theme, icon_path: &'static str, label: &'static str) -> 
             key_cap(theme).child(
                 crate::icons::icon(icon_path)
                     .size(px(12.5))
+                    // a11y-ok: key-cap icon in the footer legend, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.7)),
             ),
         )
@@ -870,7 +865,7 @@ pub fn key_hint_text(theme: &Theme, cap: &'static str, label: &'static str) -> g
             key_cap(theme)
                 .text_size(px(11.0))
                 .font_family(theme.font_mono.clone())
-                .text_color(theme.text_muted.opacity(0.7))
+                .text_color(theme.text_muted)
                 .child(SharedString::from(cap)),
         )
         .child(key_hint_label(theme, label))
@@ -894,12 +889,14 @@ pub fn key_hint_pair(
                 .child(
                     crate::icons::icon(first)
                         .size(px(12.5))
+                        // a11y-ok: first key-cap pictogram in a chord hint; the verb is the sibling label
                         .text_color(theme.text_muted.opacity(0.7)),
                 )
                 .child(div().w(px(1.0)).h(px(11.0)).bg(hairline(0.10)))
                 .child(
                     crate::icons::icon(second)
                         .size(px(12.5))
+                        // a11y-ok: second key-cap pictogram in a chord hint; the verb is the sibling label
                         .text_color(theme.text_muted.opacity(0.7)),
                 ),
         )
@@ -916,7 +913,7 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .bg(ink(0.05))
         .text_size(px(10.0))
         .font_family(theme.font_mono.clone())
-        .text_color(theme.text_muted.opacity(0.6))
+        .text_color(theme.text_muted)
         .child(SharedString::from(label.to_string()))
 }
 

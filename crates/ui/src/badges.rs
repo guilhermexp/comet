@@ -85,6 +85,7 @@ pub fn render(
         .child(
             crate::icons::icon(badge.icon)
                 .size(px(ICON_SIZE))
+                // a11y-ok: decorative badge SVG beside the readable label, not a glyph to read
                 .text_color(theme.text_muted.opacity(0.7)),
         )
         .child(badge.label.clone())

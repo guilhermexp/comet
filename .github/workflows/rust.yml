@@ -64,6 +64,8 @@ jobs:
           workspaces: |
             . -> target
             third_party/unpeel/crates -> target
+      - name: lint text alpha
+        run: bash scripts/lint-text-alpha.sh
       - name: fmt
         run: cargo fmt --all -- --check
       - name: test

@@ -164,7 +164,7 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
                 .flex_none()
                 .text_size(px(12.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text_muted.opacity(0.5))
+                .text_color(theme.text_muted)
                 .child(label),
         )
         .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
@@ -338,6 +338,7 @@ impl Shell {
         let resting_reveal = if open { 1.0 } else { 0.0 };
         let chevron = icon(icons::ALT_ARROW_RIGHT)
             .size(px(12.0))
+            // a11y-ok: sidebar disclosure chevron, not a readable glyph
             .text_color(theme.text_muted.opacity(0.5));
         if let Some(tween) = self
             .sidebar_disclosure_motion
@@ -678,6 +679,7 @@ impl Shell {
                     icon(icons[ix])
                         .size(px(15.0))
                         .flex_none()
+                        // a11y-ok: view-switcher pictogram beside the readable label, not a glyph to read
                         .text_color(theme.text_muted.opacity(0.8)),
                 )
                 .child(div().flex_1().child(SharedString::from(labels[ix])))
@@ -760,11 +762,7 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .text_size(px(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
-                "spaces-filter",
-                theme.text.opacity(0.8),
-                theme.text,
-            ))
+            .text_color(theme.text)
             .bg(if open {
                 theme.glass_hover()
             } else {
@@ -813,7 +811,7 @@ impl Shell {
                                 .flex_none()
                                 .text_size(px(10.0))
                                 .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(theme.text_muted.opacity(0.45))
+                                .text_color(theme.text_faint)
                                 .child(tag),
                         )
                         // Disconnected glyph, not the word (user request).
@@ -831,6 +829,7 @@ impl Shell {
                 icon(icons::ALT_ARROW_DOWN)
                     .size(px(14.0))
                     .flex_none()
+                    // a11y-ok: spaces-menu chevron beside the filter label, not a readable glyph
                     .text_color(theme.text_muted.opacity(0.6)),
             );
         let trigger = if self.spaces_menu.get().is_some() {
@@ -1024,6 +1023,7 @@ impl Shell {
                             icon(leading)
                                 .size(px(15.0))
                                 .flex_none()
+                                // a11y-ok: leading pictogram beside the row label, not a glyph to read
                                 .text_color(theme.text_muted.opacity(0.8)),
                         )
                         .child(div().flex_1().min_w_0().truncate().child(label))
@@ -1032,7 +1032,7 @@ impl Shell {
                                 div()
                                     .flex_none()
                                     .text_size(px(10.0))
-                                    .text_color(theme.text_muted.opacity(0.45))
+                                    .text_color(theme.text_faint)
                                     .child(tag),
                             )
                             // Disconnected glyph, not the word (user request).
@@ -1451,7 +1451,7 @@ impl Shell {
                 } else {
                     div()
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(theme.text_faint)
                         .child(time_ago)
                         .into_any_element()
                 };
@@ -1519,7 +1519,7 @@ impl Shell {
                                 .text_color(if hovered || is_selected {
                                     theme.text
                                 } else {
-                                    theme.text.opacity(0.55)
+                                    theme.text_muted
                                 })
                                 .child(title),
                         )
@@ -1543,7 +1543,7 @@ impl Shell {
                         .px(px(Theme::SPACE_SM))
                         .rounded(px(6.0))
                         .text_size(px(13.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2299,7 +2299,7 @@ impl Shell {
                 .bg(crate::theme::ink(0.05))
                 .text_size(px(11.0))
                 .font_family(theme.font_mono.clone())
-                .text_color(theme.text_muted.opacity(0.7))
+                .text_color(theme.text_muted)
         };
 
         // ── search bar (the ⌘K bar): summon chip · input · "⌘ Enter" add ·
@@ -2353,6 +2353,7 @@ impl Shell {
                     .child(
                         icon(icons::COMMAND)
                             .size(px(11.0))
+                            // a11y-ok: command-key pictogram in the key chip; the readable letter is the sibling K
                             .text_color(theme.text_muted.opacity(0.7)),
                     )
                     .child(SharedString::from("K")),
@@ -2424,12 +2425,10 @@ impl Shell {
                         if at_home {
                             // Standing at home — the device crumb IS the
                             // current folder.
-                            crumb
-                                .text_color(theme.text.opacity(0.85))
-                                .into_any_element()
+                            crumb.text_color(theme.text).into_any_element()
                         } else {
                             crumb
-                                .text_color(theme.text_muted.opacity(0.55))
+                                .text_color(theme.text_muted)
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(theme.text))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -2449,6 +2448,7 @@ impl Shell {
                                 .items_center()
                                 .child(
                                     div()
+                                        // a11y-ok: breadcrumb slash, not a word
                                         .text_color(theme.text_faint.opacity(0.7))
                                         .child(SharedString::from("/")),
                                 )
@@ -2461,12 +2461,10 @@ impl Shell {
                                     if at_mount {
                                         // Standing at the mount — the drive
                                         // crumb IS the current folder.
-                                        crumb
-                                            .text_color(theme.text.opacity(0.85))
-                                            .into_any_element()
+                                        crumb.text_color(theme.text).into_any_element()
                                     } else {
                                         crumb
-                                            .text_color(theme.text_muted.opacity(0.55))
+                                            .text_color(theme.text_muted)
                                             .cursor_pointer()
                                             .hover(|s| s.text_color(theme.text))
                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2489,6 +2487,7 @@ impl Shell {
                                 .items_center()
                                 .child(
                                     div()
+                                        // a11y-ok: breadcrumb slash, not a word
                                         .text_color(theme.text_faint.opacity(0.7))
                                         .child(SharedString::from("/")),
                                 )
@@ -2498,9 +2497,9 @@ impl Shell {
                                         .px(px(3.0))
                                         .rounded(px(4.0))
                                         .text_color(if is_last {
-                                            theme.text.opacity(0.85)
+                                            theme.text
                                         } else {
-                                            theme.text_muted.opacity(0.55)
+                                            theme.text_muted
                                         })
                                         .child(SharedString::from(label));
                                     if is_last {
@@ -2628,6 +2627,7 @@ impl Shell {
                                 icon(icons::FOLDER)
                                     .size(px(15.0))
                                     .flex_none()
+                                    // a11y-ok: folder pictogram beside the folder name, not a glyph to read
                                     .text_color(theme.text_muted.opacity(0.8)),
                             )
                             .child(div().flex_1().min_w_0().truncate().child(name))
@@ -2638,6 +2638,7 @@ impl Shell {
                                     icon(icons::GIT_BRANCH)
                                         .size(px(13.0))
                                         .flex_none()
+                                        // a11y-ok: git-branch pictogram marking a repo row, not a word
                                         .text_color(theme.text_muted.opacity(0.5)),
                                 )
                             })
@@ -2690,7 +2691,7 @@ impl Shell {
                     .pb(px(4.0))
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_muted)
                     .child(SharedString::from("Devices")),
             )
             .children(devices.into_iter().enumerate().map(|(ix, dev)| {
@@ -2724,7 +2725,7 @@ impl Shell {
                             .text_color(theme.text)
                     })
                     .when(!is_active, |el| {
-                        el.text_color(theme.text_muted.opacity(0.7))
+                        el.text_color(theme.text_muted)
                             .hover(|s| s.bg(theme.element_hover))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2734,6 +2735,7 @@ impl Shell {
                         icon(platform_icon)
                             .size(px(14.0))
                             .flex_none()
+                            // a11y-ok: platform pictogram beside the device name, not a glyph to read
                             .text_color(theme.text_muted.opacity(0.8)),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name))
@@ -2770,7 +2772,7 @@ impl Shell {
                             .pb(px(4.0))
                             .text_size(px(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_muted)
                             .child(SharedString::from("Locations")),
                     )
                     .children(location_rows.into_iter().enumerate().map(
@@ -2795,7 +2797,7 @@ impl Shell {
                                         .text_color(theme.text)
                                 })
                                 .when(!is_active, |el| {
-                                    el.text_color(theme.text_muted.opacity(0.7))
+                                    el.text_color(theme.text_muted)
                                         .hover(|s| s.bg(theme.element_hover))
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2805,6 +2807,7 @@ impl Shell {
                                     icon(glyph)
                                         .size(px(14.0))
                                         .flex_none()
+                                        // a11y-ok: location pictogram beside the folder name, not a glyph to read
                                         .text_color(theme.text_muted.opacity(0.8)),
                                 )
                                 .child(div().flex_1().min_w_0().truncate().child(name))
@@ -2821,12 +2824,13 @@ impl Shell {
                     .gap(px(6.0))
                     .text_size(px(11.0))
                     .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.5))
+                    .text_color(theme.text_muted)
                     .child(
                         icon(icons::INFO_CIRCLE)
                             .size(px(12.0))
                             .flex_none()
                             .mt(px(1.0))
+                            // a11y-ok: info pictogram beside the readable filter sentence, not a glyph to read
                             .text_color(theme.text_muted.opacity(0.5)),
                     )
                     .child(div().min_w_0().child(SharedString::from(format!(
@@ -2896,7 +2900,7 @@ impl Shell {
                         popover::key_cap(&theme).child(
                             div()
                                 .text_size(px(10.5))
-                                .text_color(theme.text_muted.opacity(0.7))
+                                .text_color(theme.text_muted)
                                 .child("⇧⌘."),
                         ),
                     )
@@ -2906,7 +2910,7 @@ impl Shell {
                             .text_color(if show_hidden {
                                 theme.text
                             } else {
-                                theme.text_muted.opacity(0.75)
+                                theme.text_muted
                             })
                             .child("Hidden folders"),
                     )

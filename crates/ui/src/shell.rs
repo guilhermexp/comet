@@ -5279,6 +5279,7 @@ impl Shell {
                                 div()
                                     .text_size(px(13.0))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    // a11y-ok: titlebar path separator slash, not a word
                                     .text_color(theme.text_muted.opacity(0.55))
                                     .child("/")
                             });
@@ -5308,11 +5309,12 @@ impl Shell {
                                 .items_center()
                                 .gap(px(3.0))
                                 .ml(px(2.0))
-                                .text_color(theme.text_muted.opacity(0.55))
+                                .text_color(theme.text_muted)
                                 .child(
                                     icon(branch_icon)
                                         .size(px(12.0))
                                         .flex_none()
+                                        // a11y-ok: branch pictogram beside the branch name, not a glyph to read
                                         .text_color(theme.text_muted.opacity(0.55)),
                                 )
                                 .child(
@@ -6157,7 +6159,7 @@ impl Shell {
                             .pb(px(4.0))
                             .text_size(px(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_muted)
                             .child(SharedString::from("Settings")),
                     )
                     .child(div().flex().flex_col().gap(px(2.0)).children(
@@ -7031,7 +7033,7 @@ impl Shell {
                         .pt(px(6.0))
                         .pb(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.7))
+                        .text_color(theme.text_muted)
                         .truncate()
                         .child(menu_identity),
                 )
@@ -7552,6 +7554,7 @@ impl Shell {
                             .child(
                                 icon(icons::ALT_ARROW_RIGHT)
                                     .size(px(14.0))
+                                    // a11y-ok: submenu chevron after Copy, not a readable glyph
                                     .text_color(theme.text_muted.opacity(0.7)),
                             ),
                     )
@@ -7877,6 +7880,7 @@ impl Shell {
                             icon(icons::ZERON_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
+                                // a11y-ok: onboarding watermark logo, not a readable glyph
                                 .text_color(theme.text.opacity(0.09)),
                         )
                         .child(
@@ -7891,7 +7895,7 @@ impl Shell {
                             div()
                                 .mt(px(6.0))
                                 .text_size(px(13.0))
-                                .text_color(theme.text_muted.opacity(0.7))
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(
                                     "A project is a folder on one of your devices.",
                                 )),
@@ -9336,7 +9340,7 @@ impl Shell {
                             .pb(px(8.0))
                             .text_size(px(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_muted)
                             .child(SharedString::from(
                                 "Or continue in a workspace you belong to",
                             )),
@@ -9472,7 +9476,7 @@ impl Shell {
                     div()
                         .id("org-signout")
                         .text_size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_auth_setup(cx)))
@@ -9768,6 +9772,7 @@ fn nav_history_button(
             .child(
                 icon(icon_path)
                     .size(px(16.0))
+                    // a11y-ok: disabled window-control glyph; fade marks the control unavailable
                     .text_color(theme.text_muted.opacity(0.35)),
             )
             .into_any_element();
@@ -10371,9 +10376,18 @@ impl Render for Shell {
 mod tests {
     #[test]
     fn compaction_marker_preserves_increased_and_unchanged_counts() {
-        assert_eq!(super::compaction_marker(16_000, Some(59_000)), "Context compacted · 16k → 59k");
-        assert_eq!(super::compaction_marker(258_000, Some(63_000)), "Context compacted · 258k → 63k");
-        assert_eq!(super::compaction_marker(16_000, Some(16_000)), "Context compacted · 16k → 16k");
+        assert_eq!(
+            super::compaction_marker(16_000, Some(59_000)),
+            "Context compacted · 16k → 59k"
+        );
+        assert_eq!(
+            super::compaction_marker(258_000, Some(63_000)),
+            "Context compacted · 258k → 63k"
+        );
+        assert_eq!(
+            super::compaction_marker(16_000, Some(16_000)),
+            "Context compacted · 16k → 16k"
+        );
         assert_eq!(super::compaction_marker(16_000, None), "Context compacted.");
     }
 

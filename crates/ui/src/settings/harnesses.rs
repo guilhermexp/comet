@@ -524,6 +524,7 @@ impl HarnessesPage {
                     icon(icons::SORT_VERTICAL)
                         .size(px(14.0))
                         .flex_none()
+                        // a11y-ok: disclosure chevron; open vs closed state, not a readable glyph
                         .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
                 );
 
@@ -564,7 +565,7 @@ impl HarnessesPage {
                                 div()
                                     .flex_none()
                                     .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
+                                    .text_color(theme.text_faint)
                                     .child(SharedString::from("You")),
                             )
                         })

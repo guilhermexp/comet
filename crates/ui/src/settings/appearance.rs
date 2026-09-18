@@ -779,6 +779,7 @@ impl AppearancePage {
             .child(
                 icons::icon(icons::SORT_VERTICAL)
                     .size(px(14.0))
+                    // a11y-ok: disclosure chevron; open vs closed state, not a readable glyph
                     .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.45 })),
             );
 
@@ -912,7 +913,7 @@ impl AppearancePage {
                         div()
                             .mt(px(1.0))
                             .text_size(px(10.5))
-                            .text_color(theme.text_muted.opacity(0.55))
+                            .text_color(theme.text_faint)
                             .child(description),
                     ),
             )
@@ -981,6 +982,7 @@ impl AppearancePage {
                 popover::key_cap(theme).child(
                     icons::icon(icons::DOCUMENT_ADD)
                         .size(px(13.0))
+                        // a11y-ok: document-add pictogram in the import key-cap, not a readable glyph
                         .text_color(theme.text_muted.opacity(0.75)),
                 ),
             )
@@ -1013,7 +1015,7 @@ impl AppearancePage {
                     }))
                     .text_size(px(11.0))
                     .font_family(theme.font_mono.clone())
-                    .text_color(theme.text_muted.opacity(0.7))
+                    .text_color(theme.text_muted)
                     .child("esc"),
             );
 
@@ -1037,7 +1039,7 @@ impl AppearancePage {
                         .px(px(8.0))
                         .pb(px(5.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_color(theme.text_muted)
                         .child(SharedString::from(format!(
                             "{} · Select the variants to keep",
                             compilation.family.name
@@ -1124,7 +1126,7 @@ impl AppearancePage {
                                     .child(
                                         div()
                                             .text_size(px(11.0))
-                                            .text_color(theme.text_muted.opacity(0.65))
+                                            .text_color(theme.text_faint)
                                             .child(appearance),
                                     ),
                             )
@@ -1193,6 +1195,7 @@ impl AppearancePage {
                             icons::icon(icons::FOLDER_WITH_FILES)
                                 .size(px(15.0))
                                 .flex_none()
+                                // a11y-ok: folder pictogram beside the import-source label, not a glyph to read
                                 .text_color(theme.text_muted.opacity(0.8)),
                         )
                         .child(
@@ -1209,7 +1212,7 @@ impl AppearancePage {
                                     div()
                                         .mt(px(1.0))
                                         .text_size(px(10.5))
-                                        .text_color(theme.text_muted.opacity(0.55))
+                                        .text_color(theme.text_muted)
                                         .child("Theme file, package.json, or extension folder"),
                                 ),
                         )
@@ -1224,7 +1227,7 @@ impl AppearancePage {
                         .border_color(hairline)
                         .text_size(px(11.0))
                         .line_height(px(16.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(theme.text_faint)
                         .child(
                             "Zeron detects light and dark variants, maps the palette, and validates contrast before import.",
                         ),
@@ -1262,7 +1265,7 @@ impl AppearancePage {
                     .gap(px(6.0))
                     .text_size(px(10.5))
                     .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.5))
+                    .text_color(theme.text_muted)
                     .child(
                         icons::icon(icons::INFO_CIRCLE)
                             .size(px(12.0))
