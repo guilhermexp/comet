@@ -21,7 +21,7 @@ internal host modes (`__session_host__` et al.).
 | `session_event_journal.rs` | Session output/event journaling |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
-| `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, legacy and ledger-only reconciliation, read-only diagnosis and identity-only CAS rollback |
+| `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
 | `project_ledger.rs` | Historical project metadata, grouped Settings catalog and persistent Forget suppression |
 | `checkout_lifecycle.rs` | Archive/restore and guarded physical worktree removal; launch/restart/removal coordination |
 | `git_command.rs` | Bounded Git subprocesses and pipe collection, separate read/mutation deadlines |
@@ -471,6 +471,40 @@ lifecycle perdido em produção, flake sob paralelismo na suíte (falhava 5/5
 rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 `read`: exatamente um `WouldBlock` por falha.
 
+### Checkout identity regression and MCP recipe
+
+The checkout identity integration coverage runs with disposable repositories and
+private `UNPEEL_HOME` and `COMET_WORKERS_HOOKS_DIR` values. The focused command
+is:
+
+```sh
+cargo test -p zeron-workers-unpeel --test checkout_identity_recovery
+```
+
+The regression surface covers a stable macOS identity field, legacy
+device/inode conflicts, explicit recovery, stale expected identities, unrelated
+conflict preservation, idempotent recovery, known blocked projects, and the
+unknown-project control. A known registered blocker must remain absent from the
+runnable create catalog but return HTTP 409 with the diagnose/recover action in
+the message; an ID absent from durable state remains the ordinary HTTP 400
+unknown-project error.
+
+For the supported controller smoke, point the process at the same isolated
+profile and hook directory. Use a short profile path such as a uniquely owned
+`/tmp/cwi-<run>/p` so macOS Unix socket paths fit; keep evidence separately in
+`.tmp/verify/`. Then start the controller with
+`COMET_WORKERS_CONTROLLER=1 zeron __workers_mcp__`. Call
+`diagnose_project_identity` first. Its result is `{ "report": ... }`; use each
+`report.recoveryCandidates[]` entry's values to supply `project_id` from
+`projectId`, `expected_old_fingerprint` from `expectedOldFingerprint`, and
+`expected_current_fingerprint` from `expectedCurrentFingerprint` to
+`recover_project_identity`. `repositoryId` is informational, not an argument.
+The recovery result reports `repairedProjectIds`,
+`currentFingerprint`, and `changed`. Re-list the project and exercise the
+normal launch path only after recovery; verify the selected checkout's exact
+cwd and that the recovery did not create or remove session, preset, or unrelated
+state. Do not calculate fingerprints from outside the diagnostic response.
+
 ### Test Coverage Matrix
 
 | Camada / path | Tier exigido | Como rodar |
@@ -478,6 +512,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
 | `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |

@@ -44,6 +44,8 @@ const ACTIONS: &[&str] = &[
     "help",
     "list_projects",
     "add_project",
+    "diagnose_project_identity",
+    "recover_project_identity",
     "list_presets",
     "launch_worker",
     "list_workers",
@@ -501,6 +503,21 @@ fn dispatch_action(
                     "checkout_detached": project.checkout_detached
                 })).collect::<Vec<_>>()
             }))
+        }
+        "diagnose_project_identity" => {
+            let report = client
+                .diagnose_project_identity()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({ "report": report }))
+        }
+        "recover_project_identity" => {
+            let project_id = required_string(arguments, "project_id")?;
+            let expected_old = required_string(arguments, "expected_old_fingerprint")?;
+            let expected_current = required_string(arguments, "expected_current_fingerprint")?;
+            let report = client
+                .recover_project_identity(&project_id, &expected_old, &expected_current)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(report).map_err(|error| error.to_string())
         }
         "add_project" => {
             // Registering the checkout is the only way to launch into it:
@@ -1267,7 +1284,7 @@ fn tool_definition() -> Value {
             "required": ["action"],
             "properties": {
                 "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
-                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter." },
+                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter. diagnose_project_identity: optional scope for a registered checkout. recover_project_identity: the registered checkout whose diagnosed conflict is being repaired." },
                 "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
                 "preset_id": { "type": "string", "description": "launch_worker: required — which worker preset to launch, from list_presets, and the only launch mode here. Its rows carry `fallback_order` (1-based, the fallback order exactly as the Presets screen lists them) and `preferred` (the starred favorite). A preset launches exactly as the user configured it; if no enabled preset fits the work, ask the user instead of assembling a command." },
                 "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker, archive_worker and restart_worker." },
@@ -1279,7 +1296,9 @@ fn tool_definition() -> Value {
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
                 "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing submitted once the worker is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
                 "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },
-                "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." }
+                "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." },
+                "expected_old_fingerprint": { "type": "string", "description": "recover_project_identity: required fingerprint reported as the old side of the diagnosed conflict." },
+                "expected_current_fingerprint": { "type": "string", "description": "recover_project_identity: required fingerprint freshly observed for the current checkout and repository." }
             },
             "additionalProperties": false
         }

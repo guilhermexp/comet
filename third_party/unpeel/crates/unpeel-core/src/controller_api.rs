@@ -200,6 +200,10 @@ pub type HostCreateExecutor =
 pub struct HostCreateContext {
     pub projects: Vec<HostCreateProject>,
     pub presets: Vec<HostCreatePreset>,
+    /// Registered projects omitted from `projects` because the Host found an
+    /// identity blocker. Keeping this separate lets create return an
+    /// actionable conflict instead of misdiagnosing the known id as unknown.
+    pub blocked_projects: HashMap<String, String>,
     executor: HostCreateExecutor,
 }
 
@@ -212,8 +216,14 @@ impl HostCreateContext {
         Self {
             projects,
             presets,
+            blocked_projects: HashMap::new(),
             executor,
         }
+    }
+
+    pub fn with_blocked_projects(mut self, blocked_projects: HashMap<String, String>) -> Self {
+        self.blocked_projects = blocked_projects;
+        self
     }
 
     fn execute(&self, request: ResolvedHostCreate) -> Result<HostCreateOutcome, String> {
@@ -515,8 +525,19 @@ fn resolve_host_create(
     let project = context
         .projects
         .iter()
-        .find(|candidate| candidate.id == project_id)
-        .ok_or_else(|| ControllerApiError::new(400, format!("unknown project id: {project_id}")))?;
+        .find(|candidate| candidate.id == project_id);
+    let Some(project) = project else {
+        if let Some(reason) = context.blocked_projects.get(&project_id) {
+            return Err(ControllerApiError::new(
+                409,
+                format!("project {project_id} is registered but blocked: {reason}"),
+            ));
+        }
+        return Err(ControllerApiError::new(
+            400,
+            format!("unknown project id: {project_id}"),
+        ));
+    };
     if project.is_folder {
         return Err(ControllerApiError::new(400, "project is a folder"));
     }

@@ -1064,6 +1064,7 @@ mod tests {
                 id: "repo-1".to_owned(),
                 common_dir: Some("/tmp/repo/.git".to_owned()),
                 common_dir_fingerprint: None,
+                common_dir_stable_fingerprint: None,
                 name: Some("repo".to_owned()),
                 primary_path: None,
                 primary_project_id: None,

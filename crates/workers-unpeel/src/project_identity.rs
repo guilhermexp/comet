@@ -83,6 +83,10 @@ pub struct CheckoutObservation {
     /// filesystem metadata rather than a commit, branch, remote, or path:
     /// replacing a repository in the same folder must become a conflict.
     pub common_dir_fingerprint: Option<String>,
+    /// Stable macOS volume UUID plus common-directory inode. The legacy
+    /// `common_dir_fingerprint` remains persisted for old Comet binaries and
+    /// is refreshed to the current tuple when the stable identity agrees.
+    pub common_dir_stable_fingerprint: Option<String>,
     pub main_repo: Option<String>,
     pub branch: Option<String>,
     pub detached_oid: Option<String>,
@@ -102,6 +106,8 @@ pub struct RepositoryIdentity {
     pub common_dir: Option<String>,
     #[serde(default)]
     pub common_dir_fingerprint: Option<String>,
+    #[serde(default)]
+    pub common_dir_stable_fingerprint: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -280,6 +286,15 @@ impl ReconciliationPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRecoveryCandidate {
+    pub project_id: String,
+    pub repository_id: String,
+    pub expected_old_fingerprint: String,
+    pub expected_current_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MigrationReport {
     pub schema_version: u32,
     pub examined: usize,
@@ -288,6 +303,21 @@ pub struct MigrationReport {
     pub missing: usize,
     pub pending: usize,
     pub conflicts: usize,
+    pub changed: bool,
+    #[serde(rename = "recoveryCandidates")]
+    pub recovery_candidates: Vec<IdentityRecoveryCandidate>,
+}
+
+/// The result of an explicit, guarded identity repair. A repair only changes
+/// the Comet identity namespace; project rows, sessions, presets and unknown
+/// app-state keys remain outside this report and outside the mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRecoveryReport {
+    pub project_id: String,
+    pub repository_id: String,
+    pub repaired_project_ids: Vec<String>,
+    pub current_fingerprint: String,
     pub changed: bool,
 }
 
@@ -353,6 +383,82 @@ fn common_dir_fingerprint(path: &str) -> Option<String> {
     }
 }
 
+/// Return a persistent identity for a directory on macOS. `st_dev` is a
+/// mount-local device number and can change after a volume is remounted, so it
+/// is deliberately kept out of this value. `getattrlist(2)` is the verified
+/// macOS volume API for the filesystem UUID; the common-directory inode then
+/// distinguishes replacement on that same volume.
+#[cfg(target_os = "macos")]
+fn macos_volume_uuid(path: &Path) -> Option<uuid::Uuid> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // Volume attributes are only valid when the path is the volume root. The
+    // mount point from statfs is the stable OS-resolved root even when the
+    // checkout is below a symlink or a remounted volume.
+    let mut filesystem = unsafe { std::mem::zeroed::<libc::statfs>() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut filesystem) } != 0 {
+        return None;
+    }
+    let mountpoint = unsafe { CStr::from_ptr(filesystem.f_mntonname.as_ptr()) };
+    let mountpoint = CString::new(mountpoint.to_bytes()).ok()?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT as u16,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // The only requested value is a 16-byte UUID following a four-byte length.
+    // A missing/unsupported attribute produces a shorter result and is refused.
+    #[repr(C, align(4))]
+    struct VolumeUuidAttributes {
+        length: u32,
+        uuid: libc::uuid_t,
+    }
+    let mut buffer: VolumeUuidAttributes = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::getattrlist(
+            mountpoint.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            (&mut buffer as *mut VolumeUuidAttributes).cast(),
+            std::mem::size_of::<VolumeUuidAttributes>(),
+            0,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    let length = buffer.length as usize;
+    if length != std::mem::size_of::<VolumeUuidAttributes>() {
+        return None;
+    }
+    let bytes = buffer.uuid;
+    (!bytes.iter().all(|byte| *byte == 0)).then(|| uuid::Uuid::from_bytes(bytes))
+}
+
+fn common_dir_stable_fingerprint(path: &str) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let volume_uuid = macos_volume_uuid(Path::new(path))?;
+        return Some(format!(
+            "macos:{}:{}",
+            volume_uuid.hyphenated(),
+            metadata.ino()
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 fn command_output(path: &Path, args: &[&str]) -> Result<String, String> {
     crate::git_command::run_git(path, args).map(|output| output.trim().to_owned())
 }
@@ -398,6 +504,7 @@ pub fn probe_checkout(path: &Path) -> CheckoutObservation {
             canonical_path: canonical,
             common_dir: None,
             common_dir_fingerprint: None,
+            common_dir_stable_fingerprint: None,
             main_repo: None,
             branch: None,
             detached_oid: None,
@@ -416,6 +523,7 @@ pub fn probe_checkout(path: &Path) -> CheckoutObservation {
             canonical_path: canonical,
             common_dir: None,
             common_dir_fingerprint: None,
+            common_dir_stable_fingerprint: None,
             main_repo: None,
             branch: None,
             detached_oid: None,
@@ -436,6 +544,7 @@ pub fn probe_checkout(path: &Path) -> CheckoutObservation {
             canonical_path: canonical,
             common_dir: None,
             common_dir_fingerprint: None,
+            common_dir_stable_fingerprint: None,
             main_repo: None,
             branch: None,
             detached_oid: None,
@@ -466,6 +575,9 @@ pub fn probe_checkout(path: &Path) -> CheckoutObservation {
             canonical_path(&value).or_else(|| Some(value.to_string_lossy().into_owned()))
         });
     let common_dir_fingerprint = common_dir.as_deref().and_then(common_dir_fingerprint);
+    let common_dir_stable_fingerprint = common_dir
+        .as_deref()
+        .and_then(common_dir_stable_fingerprint);
     let git_dir_string = git_dir
         .as_deref()
         .and_then(canonical_path)
@@ -502,6 +614,7 @@ pub fn probe_checkout(path: &Path) -> CheckoutObservation {
         canonical_path: canonical,
         common_dir,
         common_dir_fingerprint,
+        common_dir_stable_fingerprint,
         main_repo,
         branch,
         detached_oid,
@@ -688,6 +801,7 @@ fn missing_observation(project_id: &str, path: &str) -> CheckoutObservation {
         canonical_path: None,
         common_dir: None,
         common_dir_fingerprint: None,
+        common_dir_stable_fingerprint: None,
         main_repo: None,
         branch: None,
         detached_oid: None,
@@ -813,17 +927,54 @@ fn build_patch(
         }
     }
     if let Some(repository_id) = repository_id.as_deref() {
-        let previous_fingerprint = registry
-            .repository(repository_id)
-            .and_then(|repository| repository.common_dir_fingerprint.as_deref());
-        if let (Some(previous), Some(current)) = (
-            previous_fingerprint,
-            observation.common_dir_fingerprint.as_deref(),
-        ) {
-            if previous != current {
-                conflict = Some(format!(
-                    "common directory fingerprint changed from {previous} to {current}"
-                ));
+        let repository = registry.repository(repository_id);
+        let previous_stable =
+            repository.and_then(|repository| repository.common_dir_stable_fingerprint.as_deref());
+        let current_stable = observation.common_dir_stable_fingerprint.as_deref();
+        let previous_legacy =
+            repository.and_then(|repository| repository.common_dir_fingerprint.as_deref());
+        let current_legacy = observation.common_dir_fingerprint.as_deref();
+        if observation.availability == CheckoutAvailability::Available
+            && observation.common_dir.is_some()
+        {
+            match (previous_stable, current_stable) {
+                (Some(previous), Some(current)) => {
+                    if previous != current {
+                        conflict = Some(format!(
+                            "stable common directory identity changed from {previous} to {current}"
+                        ));
+                    } else if conflict.as_deref()
+                        == Some("stable common directory identity is unavailable")
+                        || legacy_conflict_targets(
+                            conflict.as_deref(),
+                            current_legacy.unwrap_or_default(),
+                        )
+                    {
+                        // An older binary can reintroduce its device-number
+                        // conflict after the stable identity already agrees.
+                        // Clear that recognized stale legacy conflict while
+                        // preserving every unrelated/manual conflict string.
+                        conflict = None;
+                    }
+                }
+                (Some(_), None) => {
+                    if conflict.is_none() {
+                        conflict =
+                            Some("stable common directory identity is unavailable".to_owned());
+                    }
+                }
+                (None, Some(_)) | (None, None) => {
+                    // A legacy tuple can only be upgraded when its full value
+                    // still matches. A device-number mismatch remains an explicit
+                    // recovery case even when the inode happens to be unchanged.
+                    if let (Some(previous), Some(current)) = (previous_legacy, current_legacy)
+                        && previous != current
+                    {
+                        conflict = Some(format!(
+                            "common directory fingerprint changed from {previous} to {current}"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -833,6 +984,7 @@ fn build_patch(
             id: id.clone(),
             common_dir: observation.common_dir.clone(),
             common_dir_fingerprint: observation.common_dir_fingerprint.clone(),
+            common_dir_stable_fingerprint: observation.common_dir_stable_fingerprint.clone(),
             name: observation
                 .main_repo
                 .as_deref()
@@ -892,6 +1044,9 @@ fn build_patch(
             if conflict.is_none() {
                 if let Some(fingerprint) = observation.common_dir_fingerprint.as_ref() {
                     repository.common_dir_fingerprint = Some(fingerprint.clone());
+                }
+                if let Some(fingerprint) = observation.common_dir_stable_fingerprint.as_ref() {
+                    repository.common_dir_stable_fingerprint = Some(fingerprint.clone());
                 }
             }
             if observation_changed {
@@ -1066,6 +1221,44 @@ fn report(plan: &ReconciliationPlan, changed: bool) -> MigrationReport {
         .iter()
         .filter(|patch| patch.conflict.is_some())
         .count();
+    let recovery_candidates = plan
+        .patches
+        .iter()
+        .filter_map(|patch| {
+            let conflict = patch.conflict.as_deref()?;
+            let repository_id = patch.repository_id.as_deref()?;
+            let repository = plan.next_registry.repository(repository_id)?;
+            let (expected_old, expected_current) = if conflict
+                .strip_prefix("stable common directory identity changed from ")
+                .is_some()
+            {
+                (
+                    repository.common_dir_stable_fingerprint.as_deref()?,
+                    patch.observation.common_dir_stable_fingerprint.as_deref()?,
+                )
+            } else if conflict
+                .strip_prefix("common directory fingerprint changed from ")
+                .is_some()
+            {
+                (
+                    repository.common_dir_fingerprint.as_deref()?,
+                    patch
+                        .observation
+                        .common_dir_stable_fingerprint
+                        .as_deref()
+                        .or(patch.observation.common_dir_fingerprint.as_deref())?,
+                )
+            } else {
+                return None;
+            };
+            Some(IdentityRecoveryCandidate {
+                project_id: patch.project_id.clone(),
+                repository_id: repository_id.to_owned(),
+                expected_old_fingerprint: expected_old.to_owned(),
+                expected_current_fingerprint: expected_current.to_owned(),
+            })
+        })
+        .collect();
     MigrationReport {
         schema_version: IDENTITY_SCHEMA_VERSION,
         examined: plan.patches.len(),
@@ -1083,6 +1276,7 @@ fn report(plan: &ReconciliationPlan, changed: bool) -> MigrationReport {
         pending,
         conflicts,
         changed,
+        recovery_candidates,
     }
 }
 
@@ -1346,6 +1540,398 @@ pub fn diagnose_at(path: &Path) -> Result<MigrationReport, String> {
         return apply_reconciliation(&mut unchanged, &plan).map_err(|error| error.to_string());
     }
     Ok(report(&plan, plan.changed()))
+}
+
+fn conflict_matches_fingerprint(conflict: Option<&str>, expected_old: &str) -> bool {
+    conflict.is_some_and(|conflict| {
+        [
+            "common directory fingerprint changed from ",
+            "stable common directory identity changed from ",
+        ]
+        .iter()
+        .filter_map(|prefix| conflict.strip_prefix(prefix))
+        .any(|rest| {
+            rest.starts_with(expected_old)
+                && rest
+                    .get(expected_old.len()..)
+                    .is_some_and(|suffix| suffix.starts_with(" to "))
+        })
+    })
+}
+
+fn legacy_conflict_targets(conflict: Option<&str>, expected_current: &str) -> bool {
+    conflict
+        .and_then(|conflict| {
+            conflict
+                .strip_prefix("common directory fingerprint changed from ")
+                .and_then(|transition| transition.rsplit_once(" to "))
+        })
+        .is_some_and(|(_, current)| current == expected_current)
+}
+
+fn observation_matches_fingerprint(observation: &CheckoutObservation, expected: &str) -> bool {
+    observation
+        .common_dir_stable_fingerprint
+        .as_deref()
+        .or(observation.common_dir_fingerprint.as_deref())
+        == Some(expected)
+}
+
+fn repository_matches_fingerprint(repository: &RepositoryIdentity, expected: &str) -> bool {
+    repository
+        .common_dir_stable_fingerprint
+        .as_deref()
+        .or(repository.common_dir_fingerprint.as_deref())
+        == Some(expected)
+}
+
+fn checkout_is_recoverable(checkout: &CheckoutIdentity) -> bool {
+    !checkout.archived
+        && !["removalPending", "removalInterrupted"]
+            .iter()
+            .any(|field| checkout.extra.get(*field).and_then(Value::as_bool) == Some(true))
+}
+
+fn recovery_observations(
+    registry: &IdentityRegistry,
+    repository_id: &str,
+    repository_common_dir: &str,
+    project_id: &str,
+    expected_old: &str,
+    expected_current: &str,
+) -> Result<BTreeMap<String, CheckoutObservation>, String> {
+    let mut observations = BTreeMap::new();
+    for checkout in registry.checkouts.iter().filter(|checkout| {
+        checkout.repository_id.as_deref() == Some(repository_id)
+            && checkout_is_recoverable(checkout)
+            && (checkout.project_id == project_id
+                || conflict_matches_fingerprint(checkout.conflict.as_deref(), expected_old))
+    }) {
+        let mut observation = probe_checkout(Path::new(&checkout.path));
+        observation.project_id = Some(checkout.project_id.clone());
+        if observation.availability != CheckoutAvailability::Available {
+            return Err(format!(
+                "project {} could not be freshly probed; retry after its checkout is available",
+                checkout.project_id
+            ));
+        }
+        if observation.common_dir.as_deref() != Some(repository_common_dir) {
+            return Err(format!(
+                "project {} no longer resolves to repository {}; refusing recovery",
+                checkout.project_id, repository_id
+            ));
+        }
+        if !observation_matches_fingerprint(&observation, expected_current) {
+            return Err(format!(
+                "project {} does not match expected current identity {expected_current}; retry diagnosis",
+                checkout.project_id
+            ));
+        }
+        observations.insert(checkout.project_id.clone(), observation);
+    }
+    observations.get(project_id).ok_or_else(|| {
+        format!("project {project_id} is not an active checkout of repository {repository_id}")
+    })?;
+    Ok(observations)
+}
+
+fn recheck_recovery_fingerprints(
+    observations: &BTreeMap<String, CheckoutObservation>,
+) -> Result<(), String> {
+    for observation in observations.values() {
+        let common_dir = observation.common_dir.as_deref().ok_or_else(|| {
+            format!(
+                "project {} lost its common directory before recovery",
+                observation.project_id.as_deref().unwrap_or("<unknown>")
+            )
+        })?;
+        let legacy = common_dir_fingerprint(common_dir);
+        let stable = common_dir_stable_fingerprint(common_dir);
+        let fingerprint_unchanged = if observation.common_dir_stable_fingerprint.is_some() {
+            stable == observation.common_dir_stable_fingerprint
+        } else {
+            legacy == observation.common_dir_fingerprint
+        };
+        if !fingerprint_unchanged {
+            return Err(format!(
+                "project {} changed filesystem identity after diagnosis; retry diagnosis",
+                observation.project_id.as_deref().unwrap_or("<unknown>")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn project_row_path(state: &Value, project_id: &str) -> Option<String> {
+    state
+        .get("projects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
+        .and_then(|project| project.get("path").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn removal_flags(checkout: &CheckoutIdentity) -> (bool, bool) {
+    (
+        checkout
+            .extra
+            .get("removalPending")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        checkout
+            .extra
+            .get("removalInterrupted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+/// Recover a known identity conflict after probing every active matching
+/// checkout outside the app-state lock. The guarded edit revalidates the
+/// repository, project paths and expected old fingerprint before it clears any
+/// conflict, so a stale diagnosis cannot overwrite a newer registration.
+pub fn recover_project_identity_at(
+    path: &Path,
+    project_id: &str,
+    expected_old: &str,
+    expected_current: &str,
+) -> Result<IdentityRecoveryReport, String> {
+    if expected_old.is_empty() || expected_current.is_empty() {
+        return Err("expected old and current fingerprints are required".to_owned());
+    }
+    let initial_state = unpeel_core::app_state::load_for_edit_at(path)?;
+    let initial_registry = read_registry(&initial_state).map_err(|error| error.to_string())?;
+    let target = initial_registry
+        .checkout(project_id)
+        .ok_or_else(|| format!("unknown project {project_id}"))?;
+    let repository_id = target
+        .repository_id
+        .clone()
+        .ok_or_else(|| format!("project {project_id} has no repository identity to recover"))?;
+    let repository = initial_registry
+        .repository(&repository_id)
+        .ok_or_else(|| format!("unknown repository {repository_id}"))?;
+    let repository_common_dir = repository
+        .common_dir
+        .as_deref()
+        .ok_or_else(|| format!("repository {repository_id} has no common directory"))?;
+    let target_has_matching_conflict =
+        conflict_matches_fingerprint(target.conflict.as_deref(), expected_old);
+    let repository_is_current = repository_matches_fingerprint(repository, expected_current);
+    let repository_is_old = repository_matches_fingerprint(repository, expected_old);
+    if !target_has_matching_conflict && !repository_is_current && !repository_is_old {
+        return Err(format!(
+            "project {project_id} has no conflict or repository fingerprint matching expected old value {expected_old}"
+        ));
+    }
+    if !repository_is_current && !repository_is_old {
+        return Err(
+            "identity state changed before recovery; repository fingerprint no longer matches the expected old value; retry diagnosis"
+                .to_owned(),
+        );
+    }
+    let observations = recovery_observations(
+        &initial_registry,
+        &repository_id,
+        repository_common_dir,
+        project_id,
+        expected_old,
+        expected_current,
+    )?;
+    let observed_checkouts: BTreeMap<String, CheckoutIdentity> = observations
+        .keys()
+        .filter_map(|checkout_id| {
+            initial_registry
+                .checkout(checkout_id)
+                .cloned()
+                .map(|checkout| (checkout_id.clone(), checkout))
+        })
+        .collect();
+    let observed_project_paths: BTreeMap<String, Option<String>> = observations
+        .keys()
+        .map(|checkout_id| {
+            (
+                checkout_id.clone(),
+                project_row_path(&initial_state, checkout_id),
+            )
+        })
+        .collect();
+    let initial_repository = initial_registry
+        .repository(&repository_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown repository {repository_id}"))?;
+    let current_fingerprint = expected_current.to_owned();
+    let report = unpeel_core::app_state::edit_at(path, |state| {
+        let current = Value::Object(state.clone());
+        let mut registry = read_registry(&current).map_err(|error| error.to_string())?;
+        let current_target = registry
+            .checkout(project_id)
+            .ok_or_else(|| format!("project {project_id} disappeared during recovery"))?;
+        if current_target.path != target.path {
+            return Err(format!(
+                "project {project_id} changed path during recovery; retry diagnosis"
+            ));
+        }
+        let current_repository_id = current_target.repository_id.as_deref().ok_or_else(|| {
+            format!("project {project_id} lost its repository identity during recovery")
+        })?;
+        if current_repository_id != repository_id {
+            return Err(format!(
+                "project {project_id} changed repository during recovery; retry diagnosis"
+            ));
+        }
+        let current_repository = registry
+            .repository(&repository_id)
+            .ok_or_else(|| format!("repository {repository_id} disappeared during recovery"))?;
+        if current_repository.common_dir.as_deref() != Some(repository_common_dir) {
+            return Err(format!(
+                "repository {repository_id} changed common directory during recovery; retry diagnosis"
+            ));
+        }
+        if current_repository.common_dir_stable_fingerprint
+            != initial_repository.common_dir_stable_fingerprint
+            || current_repository.common_dir_fingerprint
+                != initial_repository.common_dir_fingerprint
+            || current_repository.project_ids != initial_repository.project_ids
+            || current_repository.primary_project_id != initial_repository.primary_project_id
+        {
+            return Err(
+                "identity state changed during recovery; repository membership or fingerprint changed; retry diagnosis"
+                    .to_owned(),
+            );
+        }
+        let repository_is_current =
+            repository_matches_fingerprint(current_repository, expected_current);
+        if !repository_is_current
+            && !repository_matches_fingerprint(current_repository, expected_old)
+        {
+            return Err(
+                "identity state changed during recovery; repository fingerprint no longer matches the expected old value; retry diagnosis"
+                    .to_owned(),
+            );
+        }
+        for (checkout_id, observation) in &observations {
+            let current_checkout = registry
+                .checkout(checkout_id)
+                .ok_or_else(|| format!("project {checkout_id} disappeared during recovery"))?;
+            let expected_checkout = observed_checkouts
+                .get(checkout_id)
+                .ok_or_else(|| format!("project {checkout_id} was not in the recovery snapshot"))?;
+            if current_checkout.path != expected_checkout.path
+                || current_checkout.repository_id != expected_checkout.repository_id
+                || current_checkout.archived != expected_checkout.archived
+                || current_checkout.availability != expected_checkout.availability
+                || current_checkout.conflict != expected_checkout.conflict
+                || removal_flags(current_checkout) != removal_flags(expected_checkout)
+            {
+                return Err(format!(
+                    "project {checkout_id} identity flags changed during recovery; retry diagnosis"
+                ));
+            }
+            if project_row_path(&current, checkout_id)
+                != observed_project_paths.get(checkout_id).cloned().flatten()
+            {
+                return Err(format!(
+                    "project {checkout_id} changed its app-state row during recovery; retry diagnosis"
+                ));
+            }
+            if current_checkout.path != observation.path {
+                return Err(format!(
+                    "project {checkout_id} changed path during recovery; retry diagnosis"
+                ));
+            }
+        }
+        let current_matching_ids = registry
+            .checkouts
+            .iter()
+            .filter(|checkout| {
+                checkout.repository_id.as_deref() == Some(&repository_id)
+                    && checkout_is_recoverable(checkout)
+                    && conflict_matches_fingerprint(checkout.conflict.as_deref(), expected_old)
+            })
+            .map(|checkout| checkout.project_id.clone())
+            .collect::<Vec<_>>();
+        // The state lock may have been contended since the Git probes. Verify
+        // filesystem identity at the guarded commit point as well.
+        recheck_recovery_fingerprints(&observations)?;
+        if current_matching_ids.is_empty() && repository_is_current {
+            return Ok(IdentityRecoveryReport {
+                project_id: project_id.to_owned(),
+                repository_id: repository_id.clone(),
+                repaired_project_ids: Vec::new(),
+                current_fingerprint: current_fingerprint.clone(),
+                changed: false,
+            });
+        }
+        if current_matching_ids
+            .iter()
+            .any(|checkout_id| !observations.contains_key(checkout_id))
+        {
+            return Err(
+                "identity state changed during recovery; a new matching conflict appeared; retry diagnosis"
+                    .to_owned(),
+            );
+        }
+        let before = serde_json::to_value(&registry).map_err(|error| error.to_string())?;
+        let selected_observation = observations
+            .get(project_id)
+            .ok_or_else(|| format!("project {project_id} was not freshly observed"))?;
+        let repository = registry
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .ok_or_else(|| format!("repository {repository_id} disappeared during recovery"))?;
+        if let Some(fingerprint) = selected_observation.common_dir_fingerprint.as_ref() {
+            repository.common_dir_fingerprint = Some(fingerprint.clone());
+        }
+        if selected_observation.common_dir_stable_fingerprint.is_some() {
+            repository.common_dir_stable_fingerprint =
+                selected_observation.common_dir_stable_fingerprint.clone();
+        }
+        if !repository_is_current {
+            repository.last_seen_unix_ms = Some(selected_observation.observed_at_unix_ms);
+        }
+
+        let mut repaired_project_ids = Vec::new();
+        for checkout in &mut registry.checkouts {
+            if checkout.repository_id.as_deref() != Some(&repository_id)
+                || !checkout_is_recoverable(checkout)
+                || !conflict_matches_fingerprint(checkout.conflict.as_deref(), expected_old)
+            {
+                continue;
+            }
+            let observation = observations.get(&checkout.project_id).ok_or_else(|| {
+                format!(
+                    "project {} was not freshly verified; refusing partial recovery",
+                    checkout.project_id
+                )
+            })?;
+            checkout.conflict = None;
+            checkout.observed_common_dir = observation.common_dir.clone();
+            checkout.availability = CheckoutAvailability::Available;
+            if !repository_is_current {
+                checkout.last_observed_unix_ms = Some(observation.observed_at_unix_ms);
+            }
+            repaired_project_ids.push(checkout.project_id.clone());
+        }
+        repaired_project_ids.sort();
+        let after = serde_json::to_value(&registry).map_err(|error| error.to_string())?;
+        let changed = before != after;
+        state.insert(IDENTITY_KEY.to_owned(), after);
+        Ok(IdentityRecoveryReport {
+            project_id: project_id.to_owned(),
+            repository_id: repository_id.clone(),
+            repaired_project_ids,
+            current_fingerprint: current_fingerprint.clone(),
+            changed,
+        })
+    })?;
+    if path == unpeel_core::app_paths::app_state_path() && report.changed {
+        unpeel_core::app_state::announce_app_state_changed();
+    }
+    Ok(report)
 }
 
 /// Schedule a bounded reconciliation for the current state file. Bootstrap
@@ -1715,6 +2301,141 @@ mod tests {
         apply_reconciliation(&mut state, &plan).unwrap();
         let second = plan_reconciliation(&state, &[observation]);
         assert!(!second.changed());
+    }
+
+    #[test]
+    fn stable_identity_recovers_all_legacy_siblings_but_blocks_replacement() {
+        let (_dir, main, worktree) = fixture();
+        let mut state = serde_json::json!({"projects": [
+            {"id": "main", "path": main}, {"id": "child", "path": worktree}
+        ]});
+        let mut observations = vec![probe_checkout(&main), probe_checkout(&worktree)];
+        for (observation, id) in observations.iter_mut().zip(["main", "child"]) {
+            observation.project_id = Some(id.to_owned());
+            observation.common_dir_fingerprint = Some("unix:1:9".into());
+            observation.common_dir_stable_fingerprint = Some("macos:volume-a:9".into());
+        }
+        let initial = plan_reconciliation(&state, &observations);
+        apply_reconciliation(&mut state, &initial).unwrap();
+        let mut with_missing_sibling = observations.clone();
+        with_missing_sibling[1].availability = CheckoutAvailability::Missing;
+        with_missing_sibling[1].common_dir = None;
+        with_missing_sibling[1].common_dir_fingerprint = None;
+        with_missing_sibling[1].common_dir_stable_fingerprint = None;
+        let missing = plan_reconciliation(&state, &with_missing_sibling);
+        assert_eq!(
+            missing.next_registry.repositories[0]
+                .common_dir_stable_fingerprint
+                .as_deref(),
+            Some("macos:volume-a:9")
+        );
+        for checkout in state[IDENTITY_KEY]["checkouts"].as_array_mut().unwrap() {
+            checkout["conflict"] =
+                "common directory fingerprint changed from unix:1:9 to unix:2:9".into();
+        }
+        for observation in &mut observations {
+            observation.common_dir_fingerprint = Some("unix:2:9".into());
+        }
+        let remounted = plan_reconciliation(&state, &observations);
+        assert!(
+            remounted
+                .next_registry
+                .checkouts
+                .iter()
+                .all(|c| c.conflict.is_none())
+        );
+        apply_reconciliation(&mut state, &remounted).unwrap();
+        assert_eq!(
+            state[IDENTITY_KEY]["repositories"][0]["commonDirFingerprint"],
+            "unix:2:9"
+        );
+        for observation in &mut observations {
+            observation.common_dir_stable_fingerprint = Some("macos:volume-b:9".into());
+        }
+        let replaced = plan_reconciliation(&state, &observations);
+        assert!(replaced.next_registry.checkouts.iter().all(|c| {
+            c.conflict
+                .as_deref()
+                .unwrap()
+                .contains("stable common directory identity changed")
+        }));
+    }
+
+    #[test]
+    fn temporary_stable_probe_failure_clears_only_its_own_conflict() {
+        let (_dir, main, _) = fixture();
+        let mut state = serde_json::json!({"projects": [{"id": "main", "path": main}]});
+        let mut observed = probe_checkout(&main);
+        observed.project_id = Some("main".into());
+        observed.common_dir_stable_fingerprint = Some("macos:volume-a:9".into());
+        let initial = plan_reconciliation(&state, &[observed.clone()]);
+        apply_reconciliation(&mut state, &initial).unwrap();
+        let mut unavailable = observed.clone();
+        unavailable.common_dir_stable_fingerprint = None;
+        let failed = plan_reconciliation(&state, &[unavailable]);
+        apply_reconciliation(&mut state, &failed).unwrap();
+        assert_eq!(
+            state[IDENTITY_KEY]["checkouts"][0]["conflict"],
+            "stable common directory identity is unavailable"
+        );
+        let restored = plan_reconciliation(&state, &[observed.clone()]);
+        assert!(
+            restored
+                .next_registry
+                .checkout("main")
+                .unwrap()
+                .conflict
+                .is_none()
+        );
+        state[IDENTITY_KEY]["checkouts"][0]["conflict"] = "manual conflict".into();
+        let mut unavailable_again = observed.clone();
+        unavailable_again.common_dir_stable_fingerprint = None;
+        let manual_unavailable = plan_reconciliation(&state, &[unavailable_again]);
+        apply_reconciliation(&mut state, &manual_unavailable).unwrap();
+        assert_eq!(
+            state[IDENTITY_KEY]["checkouts"][0]["conflict"],
+            "manual conflict"
+        );
+        let manual = plan_reconciliation(&state, &[observed]);
+        assert_eq!(
+            manual
+                .next_registry
+                .checkout("main")
+                .unwrap()
+                .conflict
+                .as_deref(),
+            Some("manual conflict")
+        );
+    }
+
+    #[test]
+    fn read_only_diagnosis_can_recover_without_background_reconciliation() {
+        let (dir, main, _) = fixture();
+        let path = dir.path().join("app-state.json");
+        let mut state =
+            serde_json::json!({"projects": [{"id": "main", "path": main}], "sentinel": 42});
+        let mut observed = probe_checkout(&main);
+        observed.project_id = Some("main".into());
+        let initial = plan_reconciliation(&state, &[observed]);
+        apply_reconciliation(&mut state, &initial).unwrap();
+        state[IDENTITY_KEY]["repositories"][0]["commonDirStableFingerprint"] = Value::Null;
+        state[IDENTITY_KEY]["repositories"][0]["commonDirFingerprint"] = "unix:0:old".into();
+        let raw = serde_json::to_vec(&state).unwrap();
+        fs::write(&path, &raw).unwrap();
+        let diagnosis = diagnose_at(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), raw);
+        let candidate = &diagnosis.recovery_candidates[0];
+        let recovery = recover_project_identity_at(
+            &path,
+            "main",
+            &candidate.expected_old_fingerprint,
+            &candidate.expected_current_fingerprint,
+        )
+        .unwrap();
+        assert!(recovery.changed);
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["sentinel"], 42);
+        assert!(diagnose_at(&path).unwrap().recovery_candidates.is_empty());
     }
 
     #[test]

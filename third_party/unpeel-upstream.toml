@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "71bf33c1a72215f8a09f16ff6a4c8dd70128cc4a"
+vendored_tree = "691ec40f54b483e53af0fefa9f966e676148b385"
 vendored_from = "working-tree"
 local_modifications_count = 31
 local_deletions = ["apps/website"]
@@ -36,3 +36,7 @@ base_revision_resolves_upstream = false
 # announce a successful production write while fixtures remain silent. These
 # local changes live in controller_host.rs, controller_api.rs, and app_state.rs;
 # no upstream patch is implied.
+
+# 2026-09-20 — controller_host retains reasons for registered projects omitted
+# from the executable catalog; controller_api returns 409 with that reason,
+# reserving unknown-project 400 for IDs that were never registered.

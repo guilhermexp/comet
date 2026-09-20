@@ -41,8 +41,9 @@ pub use parent_notifications::{
 };
 pub use project_git::{AnchorCommit, ProjectGitStatus};
 pub use project_identity::{
-    CheckoutAvailability, CheckoutIdentity, CheckoutKind, CheckoutOwnership, IdentityRegistry,
-    MigrationReport, ProjectCatalog, RepositoryCatalog, RepositoryIdentity,
+    CheckoutAvailability, CheckoutIdentity, CheckoutKind, CheckoutOwnership,
+    IdentityRecoveryReport, IdentityRegistry, MigrationReport, ProjectCatalog, RepositoryCatalog,
+    RepositoryIdentity,
 };
 pub use project_ledger::{LedgerProject, LiveProject, ProjectRow};
 
@@ -1382,6 +1383,25 @@ impl LocalWorkersClient {
     ) -> Result<project_identity::MigrationReport, WorkersError> {
         project_identity::diagnose_at(&unpeel_core::app_paths::app_state_path())
             .map_err(WorkersError::State)
+    }
+
+    /// Repair a diagnosed repository identity conflict after a caller has
+    /// confirmed the expected old and current fingerprints. Filesystem probes
+    /// happen before the guarded app-state edit; the edit revalidates paths and
+    /// fingerprints before clearing matching conflicts.
+    pub fn recover_project_identity(
+        &self,
+        project_id: &str,
+        expected_old_fingerprint: &str,
+        expected_current_fingerprint: &str,
+    ) -> Result<project_identity::IdentityRecoveryReport, WorkersError> {
+        project_identity::recover_project_identity_at(
+            &unpeel_core::app_paths::app_state_path(),
+            project_id,
+            expected_old_fingerprint,
+            expected_current_fingerprint,
+        )
+        .map_err(WorkersError::State)
     }
 
     pub fn rollback_project_identity(&self) -> Result<bool, WorkersError> {

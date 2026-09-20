@@ -205,6 +205,7 @@ struct DiskCatalog {
     bootstrap: Value,
     archives: HashMap<String, Vec<Value>>,
     projects: Vec<HostCreateProject>,
+    blocked_projects: HashMap<String, String>,
     presets: Vec<HostCreatePreset>,
 }
 
@@ -267,6 +268,7 @@ impl DiskCatalog {
             .collect();
         let mut wire_projects = Vec::new();
         let mut create_projects = Vec::new();
+        let mut blocked_projects = HashMap::new();
         for (display_rank, project) in projects
             .iter()
             .filter(|project| !folder_ids.contains(&project.id))
@@ -419,30 +421,22 @@ impl DiskCatalog {
             // wire history but is intentionally absent from the executable
             // create catalog. This keeps a Controller from silently falling
             // back to the principal cwd.
-            let blocked_by_identity = identity_namespace_unreadable(&state)
-                || identity_checkout.is_some_and(|identity| {
-                    identity
-                        .get("archived")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                        || identity
-                            .get("availability")
-                            .and_then(Value::as_str)
-                            .is_none_or(|availability| availability != "available")
-                        || identity_requires_recovery(identity)
-                });
-            if !is_group && !blocked_by_identity {
-                create_projects.push(HostCreateProject {
-                    id: project.id.clone(),
-                    path: project.path.clone(),
-                    // The creation catalog gets the SAME verdict the wire did:
-                    // only organization is a folder (root folders never reach
-                    // this loop), and a worktree carries the path/branch a
-                    // launch has to echo back.
-                    is_folder: is_group,
-                    worktree_path: worktree_branch.as_ref().map(|_| project.path.clone()),
-                    worktree_branch,
-                });
+            if !is_group {
+                if let Some(reason) = identity_block_reason(&state, identity_checkout) {
+                    blocked_projects.insert(project.id.clone(), reason);
+                } else {
+                    create_projects.push(HostCreateProject {
+                        id: project.id.clone(),
+                        path: project.path.clone(),
+                        // The creation catalog gets the SAME verdict the wire did:
+                        // only organization is a folder (root folders never reach
+                        // this loop), and a worktree carries the path/branch a
+                        // launch has to echo back.
+                        is_folder: is_group,
+                        worktree_path: worktree_branch.as_ref().map(|_| project.path.clone()),
+                        worktree_branch,
+                    });
+                }
             }
         }
 
@@ -501,6 +495,7 @@ impl DiskCatalog {
             }),
             archives,
             projects: create_projects,
+            blocked_projects,
             presets: create_presets,
         })
     }
@@ -532,6 +527,7 @@ impl DiskCatalog {
                 crate::controller_api::execute_headless_session_create(request, hook_port)
             }),
         )
+        .with_blocked_projects(self.blocked_projects.clone())
     }
 }
 
@@ -907,6 +903,42 @@ fn identity_requires_recovery(checkout: &Value) -> bool {
         || checkout
             .get("conflict")
             .is_some_and(|value| !value.is_null())
+}
+
+fn identity_block_reason(state: &Value, checkout: Option<&Value>) -> Option<String> {
+    if identity_namespace_unreadable(state) {
+        return Some(
+            "project identity metadata could not be read; run workers diagnose_project_identity"
+                .to_owned(),
+        );
+    }
+    let checkout = checkout?;
+    if checkout
+        .get("archived")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some("checkout is archived".to_owned());
+    }
+    if checkout.get("removalPending").and_then(Value::as_bool) == Some(true)
+        || checkout.get("removalInterrupted").and_then(Value::as_bool) == Some(true)
+    {
+        return Some("checkout removal is incomplete".to_owned());
+    }
+    if let Some(conflict) = checkout.get("conflict").and_then(Value::as_str) {
+        return Some(format!(
+            "identity conflict: {conflict}; run workers diagnose_project_identity and recover_project_identity"
+        ));
+    }
+    let availability = checkout
+        .get("availability")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    (availability != "available").then(|| {
+        format!(
+            "checkout is {availability}; make the path available and run workers diagnose_project_identity"
+        )
+    })
 }
 
 fn copy_identity_string(object: &mut serde_json::Map<String, Value>, source: &Value, field: &str) {

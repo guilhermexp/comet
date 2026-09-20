@@ -64,6 +64,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   sejam dependências binárias intencionais já documentadas.
 - Mudanças em `third_party/unpeel` precisam provar o consumidor real com
   `cargo test -p zeron-workers-unpeel`.
+- O catálogo de criação distingue ID desconhecido (400) de projeto cadastrado
+  bloqueado por identidade (409 com motivo). `checkout_identity_recovery`
+  verifica esse contrato pelo adapter; `controller_` verifica o host vendorizado.
 - **A máquina de estados de atividade é lida por dois consumidores, e o sweep
   não é fim de turno.** `unpeel-tui/src/activity.rs` é incluída por `#[path]`
   no `activity_bridge` do Comet, então acessor novo se acrescenta AQUI, nunca
