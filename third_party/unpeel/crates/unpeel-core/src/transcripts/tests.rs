@@ -6,7 +6,6 @@ use super::*;
 use crate::session_host::HostedSessionState;
 use crate::state::{SessionInfo, TranscriptSettings};
 use std::fs;
-use std::sync::Mutex;
 
 fn provider(slug: &str) -> TranscriptProvider {
     TranscriptProvider::for_legacy_slug(slug).expect("test provider is registered")
@@ -50,8 +49,6 @@ fn generated_adapter_registry_matches_runtime_catalog() {
     );
 }
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
 #[test]
 fn omp_transcript_adapter_resolves() {
     assert!(
@@ -69,27 +66,27 @@ fn omp_transcript_adapter_resolves() {
         Some(provider("omp"))
     );
 
-    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let home = tempfile::tempdir().expect("unpeel home");
-    let previous = std::env::var_os("UNPEEL_HOME");
-    unsafe {
-        std::env::set_var("UNPEEL_HOME", home.path());
-    }
-    struct Restore(Option<std::ffi::OsString>);
-    impl Drop for Restore {
+    // Do not swap process-global UNPEEL_HOME: sibling tests read unpeel_home()
+    // without a lock (lifecycle extension idempotency).
+    let session_id = format!(
+        "omp-transcript-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let session_dir = crate::app_paths::unpeel_home()
+        .join("pi-sessions")
+        .join(&session_id);
+    fs::create_dir_all(&session_dir).expect("managed pi-sessions dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
         fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("UNPEEL_HOME", value),
-                    None => std::env::remove_var("UNPEEL_HOME"),
-                }
-            }
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
-    let _restore = Restore(previous);
-
-    let session_dir = home.path().join("pi-sessions").join("worker-1");
-    fs::create_dir_all(&session_dir).expect("managed pi-sessions dir");
+    let _cleanup = Cleanup(session_dir.clone());
     let transcript = session_dir.join("20260920_omp-provider-1.jsonl");
     let raw = concat!(
         r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello from user"}]}}"#,
@@ -102,7 +99,7 @@ fn omp_transcript_adapter_resolves() {
     fs::write(&transcript, raw).expect("pi-family jsonl");
 
     let mut manifest = test_manifest("omp");
-    manifest.session.id = "worker-1".into();
+    manifest.session.id = session_id;
     manifest.managed_storage_path = Some(session_dir.to_string_lossy().into_owned());
     manifest.provider_transcript_path = Some(transcript.to_string_lossy().into_owned());
     let resolved = resolve_provider_transcript(&manifest).expect("omp transcript resolves");
