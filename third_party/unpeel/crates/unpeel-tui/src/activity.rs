@@ -68,7 +68,9 @@ struct Entry {
     /// opener. A lone untagged Stop never sets this field.
     legacy_turn_started_at: Option<SystemTime>,
     /// Attention from an explicit PermissionRequest must survive TUI repaint
-    /// (cursor, spinner) until a turn-start, controller input, or turn-end.
+    /// (cursor, spinner) until a turn-start, controller input, turn-end, or
+    /// the HOOK_IDLE_TIMEOUT ceiling. Screen growth does not re-arm that
+    /// deadline.
     explicit_prompt_attention: bool,
 }
 
@@ -138,10 +140,10 @@ impl ActivityEngine {
         let latch_only = is_latch_only(&canonical, tool_name);
         let entry = self.entries.entry(session_id.to_string()).or_default();
         entry.hook_seen = true;
-        entry.last_hook_at = Some(now);
         if latch_only {
             return;
         }
+        entry.last_hook_at = Some(now);
         match canonical.as_str() {
             "Start" | "UserPromptSubmit" => {
                 entry.state = Some(HookState::Busy);
@@ -160,7 +162,7 @@ impl ActivityEngine {
             "PermissionRequest" => {
                 entry.state = Some(HookState::Attention);
                 entry.explicit_prompt_attention = true;
-                entry.deadline_at = None;
+                entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
                 entry.stopped_at = None;
                 entry.stop_rearm_at = None;
                 // Re-baseline output tracking so the answer's redraw counts
@@ -361,6 +363,13 @@ impl ActivityEngine {
             {
                 entry.state = Some(HookState::Busy);
                 entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
+            }
+            Some(HookState::Attention) => {
+                if entry.deadline_at.is_some_and(|deadline| deadline <= now) {
+                    entry.state = Some(HookState::Idle);
+                    entry.explicit_prompt_attention = false;
+                    entry.deadline_at = None;
+                }
             }
             Some(HookState::Busy) => {
                 if grew {
@@ -870,5 +879,47 @@ mod tests {
             2,
             Some(launch_ms),
         ));
+    }
+
+    #[test]
+    fn attention_latch_expires_and_completion_still_notifies() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+        engine.apply_hook_event("s", "PermissionRequest", Some("AskUserQuestion"), t0);
+        engine.apply_hook_event("s", "Notification", None, t0 + Duration::from_secs(5));
+        engine.note_controller_input("s", t0 + Duration::from_secs(2));
+        assert_eq!(
+            engine.hook_owned_state("s"),
+            Some(HookState::Busy),
+            "latch-only hooks must not move last_hook_at past the operator's answer"
+        );
+
+        engine.apply_hook_event("c", "PermissionRequest", Some("AskUserQuestion"), t0);
+        engine.note_output_and_sweep("c", 1, true, false, t0 + Duration::from_secs(1));
+        engine.note_output_and_sweep("c", 2, true, false, t0 + Duration::from_secs(2));
+        engine.note_output_and_sweep("c", 2, true, false, t0 + HOOK_IDLE_TIMEOUT);
+        assert_eq!(
+            engine.hook_owned_state("c"),
+            Some(HookState::Idle),
+            "explicit attention must expire at the idle ceiling even if the screen kept changing"
+        );
+        assert_eq!(
+            engine.hook_confirmed_idle("c"),
+            false,
+            "timeout is not a runtime Stop"
+        );
+
+        engine.apply_hook_event(
+            "c",
+            "Stop",
+            None,
+            t0 + HOOK_IDLE_TIMEOUT + Duration::from_secs(1),
+        );
+        assert_eq!(engine.hook_owned_state("c"), Some(HookState::Idle));
+        assert!(
+            engine.hook_confirmed_idle("c"),
+            "a real Stop after an attention episode must still confirm completion"
+        );
     }
 }

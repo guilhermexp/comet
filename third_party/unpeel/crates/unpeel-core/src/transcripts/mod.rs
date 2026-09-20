@@ -296,7 +296,7 @@ pub fn resolve_provider_transcript(
     }
 
     if let Some(provider_id) = manifest.provider_session_id.as_deref() {
-        if let Some(path) = find_transcript_by_provider_id(provider, &manifest.cwd, provider_id) {
+        if let Some(path) = find_transcript_by_provider_id(provider, manifest, provider_id) {
             return Ok(ProviderTranscript {
                 provider,
                 path,
@@ -307,7 +307,7 @@ pub fn resolve_provider_transcript(
     }
 
     if let Some(resume_id) = resume_id_from_command(provider, &manifest.session.command) {
-        if let Some(path) = find_transcript_by_provider_id(provider, &manifest.cwd, &resume_id) {
+        if let Some(path) = find_transcript_by_provider_id(provider, manifest, &resume_id) {
             return Ok(ProviderTranscript {
                 provider,
                 path,
@@ -1610,15 +1610,32 @@ fn trusted_provider_transcript_path(provider: TranscriptProvider, path: &Path) -
             .any(|root| path_within_root(path, root))
 }
 
+fn provider_id_search_cwd(
+    provider: TranscriptProvider,
+    manifest: &HostedSessionManifest,
+) -> String {
+    if provider.as_str() == "omp" {
+        if let Some(path) = manifest.managed_storage_path.clone() {
+            return path;
+        }
+        return crate::app_paths::unpeel_home()
+            .join("pi-sessions")
+            .join(&manifest.session.id)
+            .to_string_lossy()
+            .into_owned();
+    }
+    manifest.cwd.clone()
+}
+
 fn find_transcript_by_provider_id(
     provider: TranscriptProvider,
-    cwd: &str,
+    manifest: &HostedSessionManifest,
     provider_id: &str,
 ) -> Option<PathBuf> {
     if provider_id.trim().is_empty() {
         return None;
     }
-    (provider.adapter().find_by_id)(cwd, provider_id)
+    (provider.adapter().find_by_id)(&provider_id_search_cwd(provider, manifest), provider_id)
         .filter(|path| trusted_provider_transcript_path(provider, path))
 }
 

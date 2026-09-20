@@ -89,7 +89,7 @@ fn manifest(session_id: &str) -> Result<HostedSessionManifest, String> {
 /// path before destructive cleanup so a damaged or hand-edited manifest can
 /// never point removal outside the active Unpeel home. Older manifests fall
 /// back to the runtime adapter's command parser.
-fn managed_storage_for_manifest(manifest: &HostedSessionManifest) -> Option<PathBuf> {
+pub(crate) fn managed_storage_for_manifest(manifest: &HostedSessionManifest) -> Option<PathBuf> {
     let home = app_paths::unpeel_home();
     let candidate = manifest
         .managed_storage_path

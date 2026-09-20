@@ -116,6 +116,83 @@ fn omp_transcript_adapter_resolves() {
     assert_eq!(entries.len(), 2);
 }
 
+#[test]
+fn transcript_lookup_is_scoped_to_the_session_directory() {
+    // Do not swap process-global UNPEEL_HOME: sibling tests read unpeel_home()
+    // without a lock (lifecycle extension idempotency).
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let session_a = format!("a-scope-{unique}");
+    let session_b = format!("z-scope-{unique}");
+    let provider_id = format!("needle-{unique}");
+    let root = crate::app_paths::unpeel_home().join("pi-sessions");
+    let dir_a = root.join(&session_a);
+    let dir_b = root.join(&session_b);
+    let escaped = crate::app_paths::unpeel_home().join(format!("escaped-{unique}"));
+    fs::create_dir_all(&dir_a).expect("session A dir");
+    fs::create_dir_all(&dir_b).expect("session B dir");
+    fs::create_dir_all(&escaped).expect("escaped walk root");
+    struct Cleanup(Vec<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
+    let _cleanup = Cleanup(vec![dir_a.clone(), dir_b.clone(), escaped.clone()]);
+
+    let file_a = dir_a.join(format!("{provider_id}.jsonl"));
+    let file_b = dir_b.join(format!("zzz_{provider_id}.jsonl"));
+    let file_escape = escaped.join("escaped.jsonl");
+    let jsonl = |marker: &str| {
+        format!(
+            "{}\n{}\n",
+            format!(
+                r#"{{"type":"message","message":{{"role":"user","content":[{{"type":"text","text":"{marker}"}}]}}}}"#
+            ),
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#
+        )
+    };
+    fs::write(&file_a, jsonl("FROM_A")).expect("A transcript");
+    fs::write(&file_b, jsonl("FROM_B")).expect("B suffix trap");
+    fs::write(&file_escape, jsonl("FROM_ESCAPE")).expect("escaped transcript");
+
+    let mut by_id = test_manifest("omp");
+    by_id.session.id = session_a.clone();
+    by_id.managed_storage_path = Some(dir_a.to_string_lossy().into_owned());
+    by_id.provider_session_id = Some(provider_id);
+    let resolved = resolve_provider_transcript(&by_id).expect("A must resolve inside A");
+    assert_eq!(
+        resolved.path, file_a,
+        "suffix match must not leave session A"
+    );
+    let snapshot = read_transcript_snapshot(&by_id, 50, false, None).expect("read A");
+    assert_eq!(snapshot.entries[0].text, "FROM_A");
+
+    let mut leaked_root = test_manifest("omp");
+    leaked_root.session.id = session_a;
+    leaked_root.managed_storage_path = Some(
+        root.join("..")
+            .join(format!("escaped-{unique}"))
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let resolved = resolve_provider_transcript(&leaked_root)
+        .expect("rejected managed_storage_path falls back to the session directory");
+    assert_eq!(
+        resolved.path, file_a,
+        "lexical prefix with .. must not walk outside pi-sessions"
+    );
+    assert_ne!(resolved.path, file_escape);
+}
+
 fn test_manifest(command: &str) -> HostedSessionManifest {
     HostedSessionManifest {
         session: SessionInfo {

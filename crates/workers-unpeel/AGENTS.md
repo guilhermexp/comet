@@ -321,21 +321,25 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `PermissionRequest` (incluindo `AskUserQuestion`) toma `HookState::Attention`
   — a supressão latch-only saiu, porque no Worker lançado por Orquestrador o
   sinal não é duplicado, é o único. Atenção de prompt explícito sobrevive a
-  crescimento de sinal (cursor/spinner/repaint) e só termina em início de
-  turno, marker `controller-input-activity.json` ou fim de turno. A extensão
-  da família pi emite `PermissionRequest` em `ui_prompt_start` e
-  `UserPromptSubmit` em `ui_prompt_end` (nunca `Stop` no fim do prompt).
+  crescimento de sinal (cursor/spinner/repaint) e termina em início de
+  turno, marker `controller-input-activity.json`, fim de turno, ou o teto
+  `HOOK_IDLE_TIMEOUT` — crescimento de tela não rearma esse prazo. Evento
+  latch-only não carimba `last_hook_at`. A extensão da família pi emite
+  `PermissionRequest` em `ui_prompt_start` e `UserPromptSubmit` em
+  `ui_prompt_end` (nunca `Stop` no fim do prompt).
   `derive_activity` projeta isso como `blocked` sem `menu_prompt_active`.
   `parent_notifications` emite `WaitingForInput` uma vez por episódio de
-  bloqueio (sequência de journal); `unread` no snapshot é overlay das
+  bloqueio, chaveado pela sequência do último `Start`/`UserPromptSubmit`,
+  não por cada `PermissionRequest`; `unread` no snapshot é overlay das
   notificações pendentes, **substitui** o arquivo nativo `activity-state.json`
   que o Comet nunca escreve. A montagem do prompt lê a grade semântica do
   controller MCP e cai no PTY cru se a grade vier vazia; `safe_output_block`
   descarta o `\r` final antes de escolher o segmento, senão uma linha
   terminada em retorno de carro virava `none`. `omp` declara a capability
-  `transcript` e o adaptador em `runtimes/omp/adapter/transcript.rs` reusa o
-  leitor JSONL da família com raízes em `<unpeel_home>/pi-sessions`;
-  `read_transcript` do controller MCP passa a resolver manifesto `omp`.
+  `transcript` e o adaptador em `runtimes/omp/adapter/transcript.rs` resolve
+  só o diretório gerenciado da sessão (stem exato, sem walk global nem
+  `starts_with` lexical); `read_transcript` do controller MCP passa a
+  resolver manifesto `omp`.
 - **`\r` no output tail é retorno de carro, não "mais um controle".** Um TUI
   repinta a status line dezenas de vezes e o journal guarda cada repaint;
   `clean_output` tira o ANSI mas mantém o `\r`, então mapeá-lo para espaço junto
@@ -348,9 +352,11 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   aqui.
 - **O prompt de notificação é markdown, e a quebra de linha do output tail é
   conteúdo.** `build_worker_parent_notification_prompt` monta título + bullets +
-  bloco de código cercado; `safe_prompt_field` continua achatando os campos de
-  uma linha (e troca crase por apóstrofo, pois eles entram em `code` inline),
-  mas o tail passa por `safe_output_block`, que **preserva `\n`**. Achatar o
+  bloco de código cercado; `safe_prompt_field` achata campos de uma linha
+  (crase vira apóstrofo; aspa dupla no título vira apóstrofo porque o header
+  é um span entre aspas) e o project fica em `code` inline. O tail passa por
+  `safe_output_block`, que **preserva `\n`**, troca U+2028/U+2029 por quebra
+  visível e remove formato invisível (Cf, bidi, tags, zero-width). Achatar o
   tail junto com os campos era o que entregava uma parede de texto de milhares
   de caracteres numa linha só — ilegível no overlay do chat e sem estrutura
   para o agente. A cerca vem de `code_fence_for`: crases dentro do tail
@@ -533,11 +539,11 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato, + atenção confiável da família pi), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (30 local + 13 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato, + atenção confiável da família pi), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (30 local + 14 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
 | `tests/controller_mcp.rs` (33) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
-| `tests/parent_notifications.rs` (34) | integration | `--test parent_notifications` |
+| `tests/parent_notifications.rs` (37) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |

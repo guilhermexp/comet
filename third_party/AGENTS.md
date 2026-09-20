@@ -87,7 +87,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   turno acabou. `PermissionRequest` (incluindo prompt de pergunta ao usuário)
   toma atenção: a regra latch-only para `AskUserQuestion` saiu. Atenção de
   prompt explícito não é limpa por crescimento de sinal de tela; encerra em
-  Start/`UserPromptSubmit`, marker de input do controller, ou Stop.
+  Start/`UserPromptSubmit`, marker de input do controller, Stop, ou o teto
+  `HOOK_IDLE_TIMEOUT` (crescimento não rearma). Evento latch-only não avança
+  `last_hook_at`.
   `ResumeAdapter::embedded_conversation_id` (patch local, um
   callback por runtime) expõe o id de conversa que o comando já fixa, para a
   sonda de retomada do Comet não depender de comparar receitas.
@@ -128,8 +130,8 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   inclui o `mod.rs` compartilhado. `runtime.toml` com `source = "hooks"` exige
   a capability `lifecycle_hooks` (e `completion_reliable` exige
   `notify_when_done`) — o catálogo valida os dois pares. `omp` também declara
-  `transcript`; o adaptador lê JSONL gerenciado sob
-  `<unpeel_home>/pi-sessions`.
+  `transcript`; o adaptador lê JSONL só no diretório gerenciado da sessão
+  sob `<unpeel_home>/pi-sessions` (stem exato, sem walk global).
 - **Asset gerenciado cria o diretório dele.** `hook_assets::write_file_atomic`
   faz `create_dir_all` do pai: um root apagado (reinstalação limpa de CLI,
   poda do root legado) fazia a instalação inteira morrer com `No such file or

@@ -45,3 +45,8 @@ base_revision_resolves_upstream = false
 # attention in vendored activity.rs; pi-family lifecycle-extension emits
 # ui_prompt_start/end; omp declares transcript + adapter under pi-sessions.
 # Same-commit local form; no upstream patch (history rewritten, no common ancestor).
+
+# 2026-09-20 — onda 2 do canal de pergunta: latch de atenção expira no teto
+# HOOK_IDLE_TIMEOUT sem rearmar por crescimento; last_hook_at não avança em
+# latch-only; transcript omp casa stem exato no diretório da sessão (sem walk
+# global nem starts_with lexical). Same-commit local form; no upstream patch.
