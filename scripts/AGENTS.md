@@ -4,13 +4,15 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-Os scripts que fazem o repo rodar fora do `cargo`: `dev-demo.sh` (demo local offline), `e2e-smoke.sh` (smoke multi-device), `package-linux.sh`/`package-macos.sh` (distribuição) e `omp-dev` (launcher de OMP para desenvolvimento).
+Os scripts de execução e distribuição, incluindo o runner nativo do Cargo: `cargo-macos-runner` (identidade macOS), `dev-demo.sh` (demo local offline), `e2e-smoke.sh` (smoke multi-device), `package-linux.sh`/`package-macos.sh` (distribuição) e `omp-dev` (launcher de OMP para desenvolvimento).
 
 ## Ownership
 
 Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto — se um script começou a decidir comportamento, o lugar é uma crate.
 
 ## Local Contracts
+
+- `.cargo/config.toml` usa `cargo-macos-runner` somente no macOS. O headed `zeron` sem argumentos ou com URL `zeron://` executa de `Zeron.app` ao lado do artefato Cargo, com manifest/ícone de `dist/macos`. Isso evita que cmux reconheça o binário cru como instância duplicada do terminal e o encerre. O runner faz exec direto, preserva perfil, cwd, ambiente, stdio, argumentos e sinais; CLI, fixtures e testes passam diretamente. Não usa `open`, não intercepta SIGTERM e não altera OMP. Requer Python 3 e ferramentas macOS `sips`/`iconutil`.
 
 - `run-macos-browser-fixture.sh` recebe `target/debug/{browser,preview}-fixture` compilado com `cargo build -p zeron --features browser-fixture --bin <fixture>` e empacota somente a fixture local com o Info.plist real para validar política HTTP no macOS. Não assina nem publica; evidência nativa continua separada de unit tests.
 
@@ -35,6 +37,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `e2e-smoke.sh` | e2e — é o próprio teste | `scripts/e2e-smoke.sh` |
+| `cargo-macos-runner` | integration + QA nativo: bundle, argumentos, cwd/env/stdio/status, CLI/test passthrough, rebuild e sinais | `python3 scripts/test-cargo-macos-runner.py` · `cargo run` no cmux |
 | `dev-demo.sh` | none — ferramenta de dev; validação é usar | `scripts/dev-demo.sh` |
 | `seed-demo-workers.py` | integration — fixture consumido pelo bootstrap real | `cargo test -p zeron-workers-unpeel --test dev_demo_fixture` |
 | `package-*.sh` | none — sem suite; validação é gerar o pacote e abrir | execução manual |

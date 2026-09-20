@@ -12,6 +12,8 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 ## Local Contracts
 
+- Contexto Claude vem do input + cache da mensagem assistant principal; frames de filhos e totais agregados do result não medem ocupação. Capacidade vem de `modelUsage`, casando o modelo principal/canonicalModel ou a única entrada disponível, sem fallback fixo 200k/1m. Codex publica contexto ao receber tokenUsage (incluindo zero/campos parciais), mantendo accounting do turno separado e emitido antes de Done.
+
 - **O gate de preview parcial É a janela de commit do doc** (`partial_tool_input::PREVIEW_GATE` = `zeron_doc::STREAM_COMMIT_MS`), importado e nunca reescrito. Era literal `100ms` enquanto o host commitava a cada `120ms`: dois throttles em série com períodos que não se dividem fazem *aliasing* — preview emitido logo após a janela fechar espera a janela inteira, dois dentro da mesma janela colapsam em um, e a cadência visível pulsa no MMC (600ms) em vez de ficar firme. Era isso que fazia o texto do card de Write/Edit parecer travado. **Não remover o gate**: ele limita o fluxo de EVENTOS, não só o doc — sem ele um corpo de 1 MiB emite um evento por delta, e as suítes de linearidade cravam teto de 70 refreshes por megabyte. O sleep do teste de tempo também deriva de `PREVIEW_GATE`, não de literal.
 - Edições hashline do OMP aceitam `input` com headers `[PATH#TAG]` quando `path` falta. Um alvo único vira EditFile; múltiplos viram ApplyPatch sem path único inventado; path explícito prevalece.
 

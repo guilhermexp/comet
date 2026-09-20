@@ -281,23 +281,21 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         2
     );
 
-    // Usage rides just before the terminal Done.
+    // Context is published immediately; billing remains at turn completion.
     let usage_pos = events
         .iter()
         .position(|e| {
-            matches!(
-                e,
-                AgentEvent::Usage {
-                    input_tokens: 42,
-                    output_tokens: 7,
-                    context_usage: Some(zeron_proto::ContextUsage {
-                        tokens: 49,
-                        context_window: 258_400,
-                    }),
-                }
+            matches!(e,
+                AgentEvent::Usage { input_tokens: 0, output_tokens: 0, context_usage: Some(usage) }
+                if *usage == zeron_proto::ContextUsage::reported(Some(49), Some(258_400))
             )
         })
-        .expect("usage emitted");
+        .expect("context emitted");
+    assert!(events.contains(&AgentEvent::Usage {
+        input_tokens: 42,
+        output_tokens: 7,
+        context_usage: None
+    }));
     let done_pos = events
         .iter()
         .position(|e| matches!(e, AgentEvent::Done { .. }))

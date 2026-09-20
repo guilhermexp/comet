@@ -1198,6 +1198,7 @@ async fn run_streams_resumes_steers_answers_and_completes_once() {
             context_usage: Some(zeron_proto::ContextUsage {
                 tokens: 392_000,
                 context_window: 828_000,
+                tokens_reported: None,
             }),
             ..
         }
@@ -1342,7 +1343,8 @@ async fn local_compaction_publishes_reduced_context_before_completion() {
                     output_tokens: 0,
                     context_usage: Some(zeron_proto::ContextUsage {
                         tokens: 63000,
-                        context_window: 828000
+                        context_window: 828000,
+                        tokens_reported: None,
                     }),
                 }
             )

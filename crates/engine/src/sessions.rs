@@ -139,6 +139,7 @@ fn apply_context_usage_to_session(
     session: &mut Session,
     context_usage: zeron_proto::ContextUsage,
 ) -> bool {
+    let context_usage = context_usage.merge(session.context_usage);
     if session.context_usage == Some(context_usage) {
         return false;
     }
@@ -4230,6 +4231,7 @@ mod tests {
         let usage = ContextUsage {
             tokens: 392_000,
             context_window: 828_000,
+            tokens_reported: None,
         };
         assert!(apply_context_usage_to_session(&mut session, usage));
         assert_eq!(session.context_usage, Some(usage));
@@ -4238,9 +4240,26 @@ mod tests {
         let next = ContextUsage {
             tokens: 410_000,
             context_window: 828_000,
+            tokens_reported: None,
         };
         assert!(apply_context_usage_to_session(&mut session, next));
         assert_eq!(session.context_usage, Some(next));
+        assert!(apply_context_usage_to_session(
+            &mut session,
+            ContextUsage::reported(None, Some(1_000_000))
+        ));
+        assert_eq!(
+            session.context_usage,
+            Some(ContextUsage::reported(Some(410_000), Some(1_000_000)))
+        );
+        assert!(apply_context_usage_to_session(
+            &mut session,
+            ContextUsage::reported(Some(0), None)
+        ));
+        assert_eq!(
+            session.context_usage,
+            Some(ContextUsage::reported(Some(0), Some(1_000_000)))
+        );
     }
 
     #[test]

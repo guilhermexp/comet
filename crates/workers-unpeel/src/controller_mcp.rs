@@ -1241,7 +1241,9 @@ fn tool_definition() -> Value {
         "name": "workers",
         "description": "Launch and coordinate Comet CLI Workers — separate agent \
         processes that do implementation work inside a target project's own checkout \
-        or worktree. Every change to a real project goes through a worker; `task` \
+        or worktree. Simple, local, low-risk work — especially harness \
+        maintenance — stays in the orchestrator session; complex, large, or \
+        isolation-requiring work goes through a worker. `task` \
         subagents stay inside the caller's session for read-only research and never \
         write to a project. Loop: `list_projects` to resolve the project — when no \
         listed project's path IS the target checkout, `add_project` it and launch \

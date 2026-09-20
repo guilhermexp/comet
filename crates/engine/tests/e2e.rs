@@ -3212,6 +3212,7 @@ async fn context_usage_survives_the_turn_boundary_until_a_new_measurement() {
                     context_usage: Some(zeron_proto::ContextUsage {
                         tokens: 120_000,
                         context_window: 200_000,
+                        tokens_reported: None,
                     }),
                 });
             }
@@ -3226,6 +3227,7 @@ async fn context_usage_survives_the_turn_boundary_until_a_new_measurement() {
     let measured = zeron_proto::ContextUsage {
         tokens: 120_000,
         context_window: 200_000,
+        tokens_reported: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(MeasuresOnlyOnFirstTurn));
@@ -3364,6 +3366,7 @@ async fn context_usage_survives_an_engine_restart() {
                     context_usage: Some(zeron_proto::ContextUsage {
                         tokens: 120_000,
                         context_window: 200_000,
+                        tokens_reported: None,
                     }),
                 },
                 AgentEvent::TextDelta {
@@ -3378,6 +3381,7 @@ async fn context_usage_survives_an_engine_restart() {
     let measured = zeron_proto::ContextUsage {
         tokens: 120_000,
         context_window: 200_000,
+        tokens_reported: None,
     };
     let dir = tempfile::tempdir().unwrap();
 

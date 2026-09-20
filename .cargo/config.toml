@@ -1,3 +1,7 @@
 # Normal cargo run uses the installed OMP, resolved by the harness.
 # Opt into the sibling development checkout explicitly when needed:
 # OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run
+
+# Give the native headed app its own identity; CLI and test targets pass through.
+[target.'cfg(target_os = "macos")']
+runner = "scripts/cargo-macos-runner"

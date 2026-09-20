@@ -208,10 +208,7 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
     assert!(events.contains(&AgentEvent::Usage {
         input_tokens: 10,
         output_tokens: 20,
-        context_usage: Some(zeron_proto::ContextUsage {
-            tokens: 30,
-            context_window: 200_000,
-        }),
+        context_usage: None,
     }));
     assert_eq!(
         events.last(),

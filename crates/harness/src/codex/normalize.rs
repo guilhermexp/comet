@@ -123,31 +123,23 @@ pub(crate) fn turn_error_message(params: &Value) -> Option<String> {
 }
 
 /// `thread/tokenUsage/updated` → a [`AgentEvent::Usage`] snapshot of the LAST
-/// turn's tokens (held by the session loop, emitted before `Done`).
+/// turn's tokens. Context is published immediately; accounting is held until `Done`.
 pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
     let usage = field(params, &["tokenUsage", "token_usage"])?;
-    let last = usage.get("last")?;
-    let count = |keys: &[&str]| {
-        field(last, keys)
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-    };
-    let input_tokens = count(&["inputTokens", "input_tokens"]);
-    let output_tokens = count(&["outputTokens", "output_tokens"]);
+    let last = usage.get("last").unwrap_or(&Value::Null);
+    let input = field(last, &["inputTokens", "input_tokens"]).and_then(Value::as_u64);
+    let output = field(last, &["outputTokens", "output_tokens"]).and_then(Value::as_u64);
     let tokens = field(last, &["totalTokens", "total_tokens"])
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
-    let context_window = field(usage, &["modelContextWindow", "model_context_window"])
+        .or_else(|| input.map(|n| n.saturating_add(output.unwrap_or_default())));
+    let window = field(usage, &["modelContextWindow", "model_context_window"])
         .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let context_usage = (tokens > 0 && context_window > 0).then_some(zeron_proto::ContextUsage {
-        tokens,
-        context_window,
-    });
+        .filter(|n| *n > 0);
     Some(AgentEvent::Usage {
-        input_tokens,
-        output_tokens,
-        context_usage,
+        input_tokens: input.unwrap_or_default(),
+        output_tokens: output.unwrap_or_default(),
+        context_usage: (tokens.is_some() || window.is_some())
+            .then(|| zeron_proto::ContextUsage::reported(tokens, window)),
     })
 }
 
@@ -875,6 +867,28 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_accepts_partial_and_zero_reports() {
+        for (raw, expected) in [
+            (
+                json!({"tokenUsage":{"last":{"totalTokens":0},"modelContextWindow":200000}}),
+                zeron_proto::ContextUsage::reported(Some(0), Some(200000)),
+            ),
+            (
+                json!({"tokenUsage":{"last":{"inputTokens":12}}}),
+                zeron_proto::ContextUsage::reported(Some(12), None),
+            ),
+            (
+                json!({"tokenUsage":{"modelContextWindow":200000}}),
+                zeron_proto::ContextUsage::reported(None, Some(200000)),
+            ),
+        ] {
+            assert!(
+                matches!(usage_event(&raw), Some(AgentEvent::Usage { context_usage: Some(usage), .. }) if usage == expected)
+            );
+        }
+    }
+
+    #[test]
     fn usage_reads_last_snapshot_under_both_spellings() {
         assert_eq!(
             usage_event(&json!({"tokenUsage": {
@@ -887,6 +901,7 @@ mod tests {
                 context_usage: Some(zeron_proto::ContextUsage {
                     tokens: 49,
                     context_window: 258_400,
+                    tokens_reported: None,
                 }),
             })
         );
@@ -901,6 +916,7 @@ mod tests {
                 context_usage: Some(zeron_proto::ContextUsage {
                     tokens: 3,
                     context_window: 128_000,
+                    tokens_reported: None,
                 }),
             })
         );

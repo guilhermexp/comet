@@ -114,36 +114,43 @@ pub fn compact_token_count(tokens: u64) -> String {
 }
 
 fn context_indicator_state(usage: Option<zeron_proto::ContextUsage>) -> ContextIndicatorState {
-    let Some(usage) = usage.filter(|usage| usage.context_window > 0) else {
-        return ContextIndicatorState {
-            used_fraction: 0.0,
-            used_percent: None,
-            remaining_percent: None,
-            detail: "Waiting for the first turn".into(),
-            level: ContextIndicatorLevel::Neutral,
-        };
-    };
-    let used_fraction = (usage.tokens as f64 / usage.context_window as f64).clamp(0.0, 1.0) as f32;
-    let used_percent = (used_fraction * 100.0).round() as u32;
-    let level = if used_fraction >= 0.95 {
-        ContextIndicatorLevel::Critical
-    } else if used_fraction >= 0.80 {
-        ContextIndicatorLevel::Warning
-    } else {
-        ContextIndicatorLevel::Normal
+    let tokens = usage.and_then(zeron_proto::ContextUsage::reported_tokens);
+    let window = usage.and_then(zeron_proto::ContextUsage::reported_window);
+    let fraction = tokens
+        .zip(window)
+        .map(|(tokens, window)| tokens as f64 / window as f64);
+    let used_percent = fraction.map(|f| (f * 100.0).round() as u32);
+    let detail = match (tokens, window) {
+        (Some(tokens), Some(window)) => format!(
+            "{tokens} / {window} tokens\n{} tokens remaining",
+            window.saturating_sub(tokens)
+        ),
+        (Some(tokens), None) => format!("{tokens} tokens used\nContext limit not reported"),
+        (None, Some(window)) => format!("{window} token capacity\nWaiting for context usage"),
+        (None, None) => "Context usage not reported yet".into(),
     };
     ContextIndicatorState {
-        used_fraction,
-        used_percent: Some(used_percent),
-        remaining_percent: Some(100 - used_percent),
-        detail: format!(
-            "{} / {} tokens",
-            compact_token_count(usage.tokens),
-            compact_token_count(usage.context_window)
-        )
-        .into(),
-        level,
+        used_fraction: fraction.unwrap_or_default().clamp(0.0, 1.0) as f32,
+        used_percent,
+        remaining_percent: used_percent.map(|n| 100u32.saturating_sub(n)),
+        detail: detail.into(),
+        level: match fraction {
+            Some(f) if f >= 0.90 => ContextIndicatorLevel::Critical,
+            Some(f) if f >= 0.75 => ContextIndicatorLevel::Warning,
+            Some(_) => ContextIndicatorLevel::Normal,
+            None => ContextIndicatorLevel::Neutral,
+        },
     }
+}
+
+fn selected_context_indicator(state: &AppState) -> ContextIndicatorState {
+    context_indicator_state(
+        state
+            .selected_chat
+            .as_deref()
+            .and_then(|id| state.session_for(id))
+            .and_then(|session| session.context_usage),
+    )
 }
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
@@ -3633,19 +3640,24 @@ struct MentionPathTooltip {
 }
 
 struct ContextUsageTooltip {
-    state: ContextIndicatorState,
-    /// Whether clicking the ring will run `/compact` right now.
-    compactable: bool,
+    state: Entity<AppState>,
+    composer: gpui::WeakEntity<Composer>,
+    _subscription: Subscription,
 }
 
 impl Render for ContextUsageTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
+        let indicator = selected_context_indicator(self.state.read(cx));
+        let compactable = self
+            .composer
+            .upgrade()
+            .is_some_and(|composer| composer.read(cx).can_compact(cx));
         crate::frost::frosted(
             10.0,
             theme.frost_blur_or(16.0),
             div()
-                .w(px(220.0))
+                .w(px(280.0))
                 .px(px(14.0))
                 .py(px(12.0))
                 .flex()
@@ -3667,7 +3679,7 @@ impl Render for ContextUsageTooltip {
                         .child("Context window"),
                 )
                 .when_some(
-                    self.state.used_percent.zip(self.state.remaining_percent),
+                    indicator.used_percent.zip(indicator.remaining_percent),
                     |el, (used, remaining)| {
                         el.child(
                             div()
@@ -3684,9 +3696,9 @@ impl Render for ContextUsageTooltip {
                     div()
                         .text_size(px(11.5))
                         .text_color(theme.text_muted.opacity(0.82))
-                        .child(self.state.detail.clone()),
+                        .child(indicator.detail.clone()),
                 )
-                .when(self.compactable, |el| {
+                .when(compactable, |el| {
                     el.child(
                         div()
                             .text_size(px(11.0))
@@ -7578,15 +7590,7 @@ impl Composer {
     }
 
     fn render_context_indicator(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let usage = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat
-                .as_deref()
-                .and_then(|chat_id| state.session_for(chat_id))
-                .and_then(|session| session.context_usage)
-        };
-        let indicator = context_indicator_state(usage);
+        let indicator = selected_context_indicator(self.state.read(cx));
         let fill = match indicator.level {
             ContextIndicatorLevel::Neutral => theme.text_muted.opacity(0.28),
             ContextIndicatorLevel::Normal => theme.text_muted.opacity(0.82),
@@ -7625,13 +7629,16 @@ impl Composer {
                 )
                 .into_any_element();
         }
-        let tooltip = indicator.clone();
+        let tooltip_state = self.state.clone();
+        let composer = cx.entity().downgrade();
         // The ring IS the /compact affordance: one click runs the command on
         // the selected chat, so nobody has to type it into the input.
         let compactable = self.can_compact(cx);
         div()
             .id("composer-context-window")
-            .size(px(28.0))
+            .h(px(28.0))
+            .px(px(5.0))
+            .gap(px(5.0))
             .flex_none()
             .flex()
             .items_center()
@@ -7641,9 +7648,10 @@ impl Composer {
                     .on_click(cx.listener(|this, _, _, cx| this.compact_now(cx)))
             })
             .tooltip(move |_, cx| {
-                cx.new(|_| ContextUsageTooltip {
-                    state: tooltip.clone(),
-                    compactable,
+                cx.new(|cx| ContextUsageTooltip {
+                    _subscription: cx.observe(&tooltip_state, |_, _, cx| cx.notify()),
+                    state: tooltip_state.clone(),
+                    composer: composer.clone(),
                 })
                 .into()
             })
@@ -7654,6 +7662,17 @@ impl Composer {
                 theme.text_muted.opacity(0.16),
                 fill,
             ))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(fill)
+                    .child(SharedString::from(
+                        indicator
+                            .used_percent
+                            .map(|n| format!("{n}%"))
+                            .unwrap_or_else(|| "—".into()),
+                    )),
+            )
             .into_any_element()
     }
 
@@ -9561,20 +9580,111 @@ mod tests {
     }
 
     #[test]
+    fn context_indicator_distinguishes_partial_zero_and_overflow() {
+        use zeron_proto::ContextUsage;
+        let tokens = context_indicator_state(Some(ContextUsage::reported(Some(59_123), None)));
+        assert_eq!(tokens.used_percent, None);
+        assert!(tokens.detail.contains("59123 tokens used"));
+        let capacity = context_indicator_state(Some(ContextUsage::reported(None, Some(200_000))));
+        assert_eq!(capacity.used_percent, None);
+        assert!(capacity.detail.contains("200000 token capacity"));
+        let zero = context_indicator_state(Some(ContextUsage::reported(Some(0), Some(200_000))));
+        assert_eq!(zero.used_percent, Some(0));
+        assert!(zero.detail.contains("200000 tokens remaining"));
+        for (tokens, level) in [
+            (74, ContextIndicatorLevel::Normal),
+            (75, ContextIndicatorLevel::Warning),
+            (90, ContextIndicatorLevel::Critical),
+        ] {
+            assert_eq!(
+                context_indicator_state(Some(ContextUsage::reported(Some(tokens), Some(100))))
+                    .level,
+                level
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn context_tooltip_observes_usage_without_reopening(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let tooltip = handle
+            .update(cx, |composer, _, cx| {
+                let state = composer.state.clone();
+                state.update(cx, |state, cx| {
+                    state.selected_chat = Some("context-chat".into());
+                    state.sessions = vec![zeron_proto::Session {
+                        chat_id: "context-chat".into(),
+                        device_id: "device".into(),
+                        status: zeron_proto::SessionStatus::Idle,
+                        started_at: None,
+                        updated_at: chrono::Utc::now(),
+                        context_usage: Some(zeron_proto::ContextUsage::reported(
+                            Some(16000),
+                            Some(200000),
+                        )),
+                        error: None,
+                        last_completed_turn: None,
+                    }];
+                    cx.notify();
+                });
+                let composer = cx.entity().downgrade();
+                cx.new(|cx| ContextUsageTooltip {
+                    _subscription: cx.observe(&state, |_, _, cx| cx.notify()),
+                    state,
+                    composer,
+                })
+            })
+            .unwrap();
+        let notifications = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = notifications.clone();
+        let observer = cx.new(|cx| {
+            cx.observe(&tooltip, move |_: &mut gpui::Subscription, _, _| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        cx.run_until_parked();
+        notifications.store(0, std::sync::atomic::Ordering::SeqCst);
+        tooltip.update(cx, |tooltip, cx| {
+            tooltip.state.update(cx, |state, cx| {
+                let mut sessions = state.sessions.clone();
+                sessions[0].context_usage = Some(zeron_proto::ContextUsage::reported(
+                    Some(59000),
+                    Some(200000),
+                ));
+                assert!(state.apply_sessions(sessions));
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert!(notifications.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        tooltip.read_with(cx, |tooltip, cx| {
+            assert_eq!(
+                selected_context_indicator(tooltip.state.read(cx)).used_percent,
+                Some(30)
+            );
+        });
+        drop(observer);
+    }
+
+    #[test]
     fn context_indicator_formats_neutral_and_reported_snapshots() {
         let neutral = context_indicator_state(None);
         assert_eq!(neutral.level, ContextIndicatorLevel::Neutral);
         assert_eq!(neutral.used_fraction, 0.0);
-        assert_eq!(neutral.detail.as_ref(), "Waiting for the first turn");
+        assert_eq!(neutral.detail.as_ref(), "Context usage not reported yet");
 
         let ready = context_indicator_state(Some(zeron_proto::ContextUsage {
             tokens: 392_000,
             context_window: 828_000,
+            tokens_reported: None,
         }));
         assert_eq!(ready.level, ContextIndicatorLevel::Normal);
         assert_eq!(ready.used_percent, Some(47));
         assert_eq!(ready.remaining_percent, Some(53));
-        assert_eq!(ready.detail.as_ref(), "392k / 828k tokens");
+        assert_eq!(
+            ready.detail.as_ref(),
+            "392000 / 828000 tokens\n436000 tokens remaining"
+        );
     }
 
     #[test]
@@ -9591,16 +9701,18 @@ mod tests {
         let warning = context_indicator_state(Some(zeron_proto::ContextUsage {
             tokens: 800,
             context_window: 1_000,
+            tokens_reported: None,
         }));
         assert_eq!(warning.level, ContextIndicatorLevel::Warning);
 
         let critical = context_indicator_state(Some(zeron_proto::ContextUsage {
             tokens: 2_000,
             context_window: 1_000,
+            tokens_reported: None,
         }));
         assert_eq!(critical.level, ContextIndicatorLevel::Critical);
         assert_eq!(critical.used_fraction, 1.0);
-        assert_eq!(critical.used_percent, Some(100));
+        assert_eq!(critical.used_percent, Some(200));
         assert_eq!(critical.remaining_percent, Some(0));
     }
 

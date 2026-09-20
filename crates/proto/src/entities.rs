@@ -1202,6 +1202,7 @@ mod tests {
             context_usage: Some(crate::ContextUsage {
                 tokens: 392_000,
                 context_window: 828_000,
+                tokens_reported: None,
             }),
             ..old
         };

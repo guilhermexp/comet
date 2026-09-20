@@ -85,7 +85,7 @@ const OMP_ORCHESTRATOR_DELEGATION_APPEND: &str = r#"
 
 Delegation — two substances, never interchangeable:
 - `task` subagents run inside this session and share this cwd. They are for read-only work: research, code mapping, auditing, parallel review. They never write to a target project.
-- `workers` are separate CLI processes in the target project's own checkout or worktree. Every change to a real project goes there. Size never overrides risk: auth, permissions, security, billing, multi-tenant, and critical data are always a worker, however small the edit looks.
+- `workers` are separate CLI processes in the target project's own checkout or worktree. Simple, local, low-risk work — especially harness maintenance — stays in this session. Complex, large, or isolation-requiring work goes to a worker. Auth, permissions, security, billing, multi-tenant, and critical data are always a worker, however small the edit looks.
 - The remaining host tools are for this workspace and for surgical edits you can verify immediately. Do not accumulate large local Bash, editing, or implementation loops in the orchestrator session.
 - Independent slices launch as one `launch_worker` call each. N calls for N slices is the expected shape of parallel delegation, not a smell — define ownership and shared contracts before launching workers that touch adjacent areas.
 
@@ -804,6 +804,7 @@ fn context_usage_from_state(state: &Value) -> Option<zeron_proto::ContextUsage> 
     (context_window > 0).then_some(zeron_proto::ContextUsage {
         tokens,
         context_window,
+        tokens_reported: None,
     })
 }
 

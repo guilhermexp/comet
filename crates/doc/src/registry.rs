@@ -1159,8 +1159,16 @@ impl RegistryDoc {
         // same LWW delete the legacy WorkspaceDoc row used).
         let (context_tokens, context_window) = match session.context_usage {
             Some(usage) => (
-                json!(i64::try_from(usage.tokens).unwrap_or(i64::MAX)),
-                json!(i64::try_from(usage.context_window).unwrap_or(i64::MAX)),
+                json!(
+                    usage
+                        .reported_tokens()
+                        .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+                ),
+                json!(
+                    usage
+                        .reported_window()
+                        .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+                ),
             ),
             None => (Value::Null, Value::Null),
         };

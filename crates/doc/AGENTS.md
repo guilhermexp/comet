@@ -12,6 +12,8 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 ## Local Contracts
 
+- Contexto parcial usa os mesmos campos opcionais `contextTokens`/`contextWindow`: Registry grava null e Workspace remove o campo não reportado. `RawSession` aceita tokens sem limite, limite sem tokens e zero real; restart não transforma ausência em zero.
+
 - `MessagePart::Image` é atômica e idempotente por id; fold encerra reasoning anterior e preserva ordem. Schema e salvage validam path/nome não vazios e MIME PNG/JPEG/WebP/GIF, nunca SVG. O gêmeo Edge preserva os mesmos campos.
 
 - Tools `workers` preservam `preset_id` junto de `action`, `session_id`, `project_id`, `name` e `project`, usando o mesmo limite/trim dos identificadores. Briefing, comandos e args adicionais continuam fora do transcript; sanitização repetida conserva o identificador. Histórico já salvo sem `preset_id` não é reconstruído.

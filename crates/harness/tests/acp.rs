@@ -227,6 +227,7 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         context_usage: Some(zeron_proto::ContextUsage {
             tokens: 1_200,
             context_window: 500_000,
+            tokens_reported: None,
         }),
     }));
 

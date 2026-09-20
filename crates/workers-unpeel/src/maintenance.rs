@@ -222,7 +222,7 @@ pub static MAINTAINED_RUNTIMES: &[RuntimeMaintenanceDefinition] = &[
         homebrew: None,
         native_update: Some(NativeUpdateDefinition {
             executable: "pi",
-            args: &["update"],
+            args: &["update", "--extensions"],
             strategy: NativeUpdateStrategy::Always,
         }),
         probe_args: &["--version"],
@@ -1028,7 +1028,10 @@ mod tests {
         );
         assert_eq!(adv_behind.status, RuntimeUpdateStatus::BehindLatest);
         assert!(adv_behind.can_update);
-        assert_eq!(adv_behind.update_command.as_deref(), Some("pi update"));
+        assert_eq!(
+            adv_behind.update_command.as_deref(),
+            Some("pi update --extensions")
+        );
 
         let adv_current = build_advisory(
             def,

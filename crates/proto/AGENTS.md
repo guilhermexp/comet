@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `ContextUsage` conserva `tokens`/`contextWindow` numéricos no fio; `tokensReported: false` é aditivo e distingue tokens ausentes de zero (ausência do flag mantém semântica legada). `reported_tokens`/`reported_window` e `merge` são a fonte compartilhada para snapshots parciais. Contexto do Chat é distinto de Managed Provider Usage e continua sincronizado nas rows de Session.
+
 - `GeneratedImage` transporta referência raster (`id`, `path`, `name`, `mimeType`). Paths emitidos pelo runtime são entrada privada da engine: antes de journal/sync ela importa para uploads do perfil. O evento não carrega bytes/base64.
 
 - `GenerateCommitMessageRequest { cwd }` e `GeneratedCommitMessage { message }` são tipos aditivos de rascunho; a mensagem preserva título/corpo com quebras de linha, sem mutação Git implícita.
@@ -32,7 +34,7 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - Trajectory types e snapshots contêm apenas representações sanitizadas e referências opacas; nunca duplicam payloads brutos nem entram no Loro/sync. **Sanitizado aqui é derivado, não truncado**: todo summary/preview passa por redação de formatos de segredo (tokens `ghp_`/`sk-`/`xox*`, `AKIA`, `Bearer`, header `Authorization`, atribuições `password=`/`token=`/`api_key=`, blobs opacos ≥32 chars, userinfo em URLs e query params sensíveis como `key=`/`sig=`/`secret=`/`code=`), input de MCP/tool desconhecido vira nome dos argumentos + byte count (ou size unavailable se ausente), e conteúdo de arquivo e resultado de tool nunca entram. O texto cru só existe atrás do Raw Reveal, que lê o Run Journal.
 - `TrajectoryStatus`/`TrajectoryLane` têm variante `Unknown` e `TrajectoryRecordKind` desconhecido cai em `Custom { name }` via shim untagged: linha gravada por build mais novo degrada um campo, não reprova o record inteiro na volta pra build antiga. `default_raw_source_version()` é o literal `1`, nunca a constante corrente — senão bumpar a versão reinterpreta silenciosamente ref antiga.
 - A projeção pura de `group_records` identifica runs legadas pelo prefixo `legacy` do `run_id` e numera apenas runs não-legadas sequencialmente (`Run 1`, `Run 2`, etc.), já que o formato de `TrajectoryRecord` não carrega campo `is_legacy`.
-- Tipos de usage são compatíveis por serde e cruzam apenas engine↔UI; não são persistidos em Loro nem sincronizados pelo edge.
+- Tipos de Managed Provider Usage são compatíveis por serde e cruzam apenas engine↔UI; não são persistidos em Loro nem sincronizados pelo edge.
 - `HarnessId` também chaveia providers device-local de conta/Usage. Uma variante não torna um runtime executável — só o registry de harness da engine publica descritores runnable. Snapshots do Kimi carregam apenas campos normalizados de conta/quota, nunca material de credencial.
 
 - `Session.last_completed_turn` is optional/defaulted completion evidence. Interrupts, errors and liveness expiry do not advance it; subsequent Working and heartbeat rows retain it.

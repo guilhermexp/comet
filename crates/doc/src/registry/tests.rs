@@ -381,6 +381,7 @@ fn session_context_usage_persists_and_survives_a_snapshot_reload() {
     with_usage.context_usage = Some(zeron_proto::ContextUsage {
         tokens: 392_000,
         context_window: 828_000,
+        tokens_reported: None,
     });
     doc.upsert_session(&with_usage).unwrap();
     assert_eq!(doc.read_sessions().unwrap(), vec![with_usage.clone()]);
@@ -925,4 +926,24 @@ fn completion_marker_replicates_and_survives_next_turn() {
     source.upsert_session(&row).unwrap();
     server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
     assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
+}
+
+#[cfg(test)]
+mod partial_context_tests {
+    use super::*;
+    #[test]
+    fn partial_context_usage_survives_persistence() {
+        for usage in [
+            zeron_proto::ContextUsage::reported(Some(0), Some(200000)),
+            zeron_proto::ContextUsage::reported(None, Some(200000)),
+            zeron_proto::ContextUsage::reported(Some(59000), None),
+        ] {
+            let mut doc = RegistryDoc::new("device");
+            let mut row = session("chat", "device", SessionStatus::Idle);
+            row.context_usage = Some(usage);
+            doc.upsert_session(&row).unwrap();
+            let doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "device").unwrap();
+            assert_eq!(doc.read_sessions().unwrap()[0].context_usage, Some(usage));
+        }
+    }
 }

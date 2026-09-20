@@ -111,6 +111,10 @@ pub(crate) struct MessageFrame {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageBody {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub usage: Option<Value>,
     /// Either a plain string or an array of content blocks.
     #[serde(default)]
     pub content: Value,
@@ -163,6 +167,8 @@ pub(crate) struct RateLimitInfo {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ResultFrame {
+    #[serde(default, rename = "modelUsage")]
+    pub model_usage: std::collections::HashMap<String, Value>,
     #[serde(default)]
     pub subtype: String,
     #[serde(default)]
@@ -179,10 +185,6 @@ pub(crate) struct ResultFrame {
 pub(crate) struct UsageBody {
     #[serde(default)]
     pub input_tokens: u64,
-    #[serde(default)]
-    pub cache_read_input_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
 }

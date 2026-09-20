@@ -22,6 +22,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Ação | Comando |
 |---|---|
 | Build do app (membro padrão do workspace) | `cargo build` |
+| Dev nativo (macOS com identidade Zeron) | `cargo run` |
 | Suite completa | `cargo test --workspace` |
 | Testes de uma crate | `cargo test -p zeron-ui` |
 | Formatação (obrigatória antes de merge do upstream) | `cargo fmt --all` |
@@ -86,6 +87,28 @@ A seção **Verification** carrega a **Test Coverage Matrix** local (`camada/pat
 2. Atualizar docs donos + pais/filhos afetados + cada Child DOX Index.
 3. Remover texto stale/contraditório.
 4. Rodar verificação existente (testes/lint) + ciclo OpenSpec se mudou comportamento.
+
+## Verification
+
+Suítes canônicas por superfície (detalhe e matriz `Test:` ficam no `AGENTS.md` dono):
+
+| Superfície | Comando |
+|---|---|
+| Workspace Rust | `cargo test --workspace` |
+| Edge Cloudflare | `npm -C edge run test` (unit + workerd) |
+| Cliente iOS | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=<device do runtime instalado>'` |
+| Fluxo headed/headless | `scripts/e2e-smoke.sh` |
+
+### Build
+
+```json
+{
+  "command": {
+    "argv": ["cargo", "build"],
+    "cwd": "."
+  }
+}
+```
 
 ## Child DOX Index
 

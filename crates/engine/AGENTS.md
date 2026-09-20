@@ -12,6 +12,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
+- Atualizações de contexto mesclam campos reportados individualmente (`ContextUsage::merge`) antes de publicar WatchSessions e persistir. Tokens zero substituem a medição anterior; limite isolado não apaga tokens. Usage intermediário de contexto não muda status nem exige outro turno.
+
 - Login Codex reutiliza o resolvedor de executável do harness (`CODEX_EXECUTABLE` e PATH) e compõe o PATH do filho com o diretório resolvido; não assume que o daemon herdou o PATH do shell interativo. Cobertura: `tests/codex_login_resolver.rs`.
 
 - Imagens geradas são importadas antes de qualquer journal/broadcast/fold, inclusive eventos de subagente. Intake limita a 24 MiB, identifica raster pelo header, prende a abertura ao diretório permitido do Codex e publica somente o path em uploads do perfil. Replay de imagem já persistida não exige que a fonte ainda exista; erro vira resultado de tool falho e aviso visível. Cobertura: `uploads::generated_image_tests`, `tests/e2e.rs::generated_image_is_materialized_before_publication_and_survives_reopen` e relay em `tests/device_routing.rs::target_device_id_routes_over_the_relay`.

@@ -876,8 +876,16 @@ async fn run_session(session: Session) {
                     }
 
                     "thread/tokenUsage/updated" => {
-                        if let Some(usage) = usage_event(&params) {
-                            pending_usage = Some(usage);
+                        if let Some(AgentEvent::Usage { input_tokens, output_tokens, context_usage }) = usage_event(&params) {
+                            // Publish occupancy immediately, independently of end-of-turn accounting.
+                            if context_usage.is_some() && !send(&event_tx, AgentEvent::Usage {
+                                input_tokens: 0, output_tokens: 0, context_usage,
+                            }).await {
+                                break 'main;
+                            }
+                            if params.get("tokenUsage").or_else(|| params.get("token_usage")).and_then(|usage| usage.get("last")).is_some() {
+                                pending_usage = Some(AgentEvent::Usage { input_tokens, output_tokens, context_usage: None });
+                            }
                         }
                     }
 

@@ -158,6 +158,7 @@ async fn happy_path_maps_shim_frames_and_tags_subagents() {
         context_usage: Some(zeron_proto::ContextUsage {
             tokens: 16_000,
             context_window: 200_000,
+            tokens_reported: None,
         }),
     }));
     assert!(matches!(

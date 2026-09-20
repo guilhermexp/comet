@@ -12,6 +12,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Local Contracts
 
+- O círculo de contexto mostra percentual ao lado (— quando desconhecido), com warning em 75% e critical em 90%. Tooltip observa AppState, deriva o Chat selecionado em cada render e mostra tokens exatos usados/capacidade/restantes; ausência não é zero. Só o arco é clampado a 100%, nunca o percentual. Estilo glass e clique /compact permanecem; OMP continua exibindo a última medição reportada até a próxima consulta ao runtime.
+
 - Enter vazio durante run ativo é no-op; interrupção continua pelo Stop explícito. Seleção de blocos de código participa do registro compartilhado do Markdown e conserva linhas vazias/copiar grupos inline.
 - Tipografia de terminal e código/diff é device-local e independente (`terminalFontFamily/Size`, `codeFontFamily/Size`). Terminal aceita só catálogo fixed-width; código aceita o catálogo completo. Alterações invalidam medidas e atualizam geometria/scroll; defaults do fork permanecem 13px no terminal, 12.5px no código e 14px/24px no corpo de conversa.
 

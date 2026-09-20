@@ -861,6 +861,7 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                 .map(|(tokens, context_window)| zeron_proto::ContextUsage {
                     tokens,
                     context_window,
+                    tokens_reported: None,
                 }),
         }],
         "turn" => {

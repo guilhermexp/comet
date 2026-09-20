@@ -341,7 +341,7 @@ pub(crate) struct Normalizer {
     assistant_message_id: String,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
-    context_window: Option<u64>,
+    last_model: Option<String>,
     streaming_tools: std::collections::HashMap<usize, StreamingToolInput>,
 }
 
@@ -354,15 +354,8 @@ impl Normalizer {
             agent_spawn_tools: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
-            context_window: None,
+            last_model: None,
             streaming_tools: std::collections::HashMap::new(),
-        }
-    }
-
-    pub fn with_context_window(context_window: u64) -> Self {
-        Self {
-            context_window: Some(context_window),
-            ..Self::new()
         }
     }
 
@@ -703,6 +696,31 @@ impl Normalizer {
                         std::iter::once(call).chain(opening).chain(steer)
                     })
                     .collect();
+                self.last_model = f.message.model.clone().or(self.last_model.take());
+                if let Some(usage) = &f.message.usage {
+                    let fields = [
+                        "input_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    ];
+                    if fields
+                        .iter()
+                        .any(|key| usage.get(*key).and_then(Value::as_u64).is_some())
+                    {
+                        let tokens = fields
+                            .iter()
+                            .filter_map(|key| usage.get(*key).and_then(Value::as_u64))
+                            .fold(0u64, u64::saturating_add);
+                        out.push(AgentEvent::Usage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            context_usage: Some(zeron_proto::ContextUsage::reported(
+                                Some(tokens),
+                                None,
+                            )),
+                        });
+                    }
+                }
                 // A failed turn (usage limit, billing, auth, overloaded, …)
                 // carries a terse `error` code here — often with empty content
                 // and no `result` error — so surface it visibly.
@@ -792,21 +810,33 @@ impl Normalizer {
                 if let Some(id) = &f.session_id {
                     self.session_id = Some(id.clone());
                 }
+                // Upstream 8ee7a622: capacity belongs to the primary model; result
+                // totals may aggregate several requests and child agents.
+                let model_usage = self
+                    .last_model
+                    .as_ref()
+                    .and_then(|model| {
+                        f.model_usage.get(model).or_else(|| {
+                            f.model_usage.values().find(|entry| {
+                                entry.get("canonicalModel").and_then(Value::as_str)
+                                    == Some(model.as_str())
+                            })
+                        })
+                    })
+                    .or_else(|| {
+                        (f.model_usage.len() == 1)
+                            .then(|| f.model_usage.values().next())
+                            .flatten()
+                    });
+                let window = model_usage
+                    .and_then(|entry| entry.get("contextWindow"))
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n > 0);
                 let usage = AgentEvent::Usage {
                     input_tokens: f.usage.input_tokens,
                     output_tokens: f.usage.output_tokens,
-                    context_usage: self.context_window.and_then(|context_window| {
-                        let tokens = f
-                            .usage
-                            .input_tokens
-                            .saturating_add(f.usage.cache_read_input_tokens)
-                            .saturating_add(f.usage.cache_creation_input_tokens)
-                            .saturating_add(f.usage.output_tokens);
-                        (tokens > 0 && context_window > 0).then_some(zeron_proto::ContextUsage {
-                            tokens,
-                            context_window,
-                        })
-                    }),
+                    context_usage: window
+                        .map(|window| zeron_proto::ContextUsage::reported(None, Some(window))),
                 };
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
@@ -940,23 +970,38 @@ mod tests {
     }
 
     #[test]
-    fn result_usage_reports_current_context_including_cache_tokens() {
-        let frame = crate::claude::wire::parse_frame(
-            r#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"cache_read_input_tokens":80,"cache_creation_input_tokens":5,"output_tokens":7}}"#,
-        )
-        .unwrap();
-        let events = Normalizer::with_context_window(200_000).normalize(frame, false);
-        assert_eq!(
-            events.first(),
-            Some(&AgentEvent::Usage {
-                input_tokens: 10,
-                output_tokens: 7,
-                context_usage: Some(zeron_proto::ContextUsage {
-                    tokens: 102,
-                    context_window: 200_000,
-                }),
-            })
+    fn context_uses_primary_prompt_and_reported_capacity() {
+        let mut normalizer = Normalizer::new();
+        let mut run =
+            |raw: &str| normalizer.normalize(crate::claude::wire::parse_frame(raw).unwrap(), false);
+        let events = run(
+            r#"{"type":"assistant","message":{"model":"primary","usage":{"input_tokens":200,"cache_read_input_tokens":40000,"cache_creation_input_tokens":1800,"output_tokens":100},"content":[]}}"#,
         );
+        assert!(events.contains(&AgentEvent::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            context_usage: Some(zeron_proto::ContextUsage::reported(Some(42000), None))
+        }));
+        let events = run(
+            r#"{"type":"assistant","parent_tool_use_id":"child","message":{"model":"child","usage":{"input_tokens":999999},"content":[]}}"#,
+        );
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
+        let events = run(
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":999999},"modelUsage":{"primary":{"contextWindow":200000},"child":{"contextWindow":1000000}}}"#,
+        );
+        assert!(events.contains(&AgentEvent::Usage {
+            input_tokens: 999999,
+            output_tokens: 0,
+            context_usage: Some(zeron_proto::ContextUsage::reported(None, Some(200000)))
+        }));
+        let events = run(r#"{"type":"result","subtype":"success","usage":{"input_tokens":123}}"#);
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::Usage {
+                context_usage: None,
+                ..
+            })
+        ));
     }
 
     #[test]

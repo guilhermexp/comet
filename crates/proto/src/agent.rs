@@ -361,6 +361,37 @@ pub enum DoneStatus {
 pub struct ContextUsage {
     pub tokens: u64,
     pub context_window: u64,
+    /// Absent in legacy complete snapshots. False distinguishes unknown from zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_reported: Option<bool>,
+}
+
+impl ContextUsage {
+    pub fn reported(tokens: Option<u64>, window: Option<u64>) -> Self {
+        Self {
+            tokens: tokens.unwrap_or_default(),
+            context_window: window.unwrap_or_default(),
+            tokens_reported: tokens.is_none().then_some(false),
+        }
+    }
+
+    pub fn reported_tokens(self) -> Option<u64> {
+        (self.tokens_reported != Some(false)).then_some(self.tokens)
+    }
+
+    pub fn reported_window(self) -> Option<u64> {
+        (self.context_window > 0).then_some(self.context_window)
+    }
+
+    /// Updates are snapshots of independently reported fields, never cumulative totals.
+    pub fn merge(self, previous: Option<Self>) -> Self {
+        Self::reported(
+            self.reported_tokens()
+                .or_else(|| previous.and_then(Self::reported_tokens)),
+            self.reported_window()
+                .or_else(|| previous.and_then(Self::reported_window)),
+        )
+    }
 }
 
 /// Optional execution facts reported by command-shaped tools. Absence means the
@@ -736,6 +767,7 @@ mod tests {
             context_usage: Some(ContextUsage {
                 tokens: 392_000,
                 context_window: 828_000,
+                tokens_reported: None,
             }),
         };
         let value = serde_json::to_value(&usage).unwrap();
@@ -930,5 +962,36 @@ mod generated_image_tests {
         assert_eq!(value["type"], "generatedImage");
         assert_eq!(value["mimeType"], "image/png");
         assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+    }
+}
+
+#[cfg(test)]
+mod context_usage_tests {
+    use super::ContextUsage;
+    #[test]
+    fn context_usage_preserves_legacy_wire_and_distinguishes_missing_zero() {
+        let legacy = serde_json::json!({"tokens":0,"contextWindow":200000});
+        let usage: ContextUsage = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(usage.reported_tokens(), Some(0));
+        assert_eq!(serde_json::to_value(usage).unwrap(), legacy);
+        let partial = ContextUsage::reported(None, Some(200000));
+        let encoded = serde_json::to_value(partial).unwrap();
+        assert_eq!(encoded["tokens"], 0);
+        assert_eq!(encoded["tokensReported"], false);
+        assert_eq!(
+            serde_json::from_value::<ContextUsage>(encoded)
+                .unwrap()
+                .reported_tokens(),
+            None
+        );
+        let merged = ContextUsage::reported(Some(0), None)
+            .merge(Some(ContextUsage::reported(Some(59000), Some(200000))));
+        assert_eq!(merged, usage);
+        assert_eq!(
+            ContextUsage::reported(None, Some(1000000))
+                .merge(Some(merged))
+                .reported_tokens(),
+            Some(0)
+        );
     }
 }

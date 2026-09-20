@@ -1,13 +1,4 @@
-# context-usage-continuity Specification
-
-## Purpose
-
-Keep the composer's context-window indicator on the last measurement reported
-for a chat while the next turn waits for a newer runtime snapshot, so the gauge
-never falls back to its neutral first-turn state mid-conversation.
-
-## Requirements
-
+## MODIFIED Requirements
 ### Requirement: Retain the last context measurement between turns
 The engine SHALL preserve the last context usage snapshot for each Chat while a new turn waits for a newer runtime measurement, merging independently reported tokens and capacity without treating missing values as zero.
 
@@ -27,6 +18,7 @@ Test: proto, doc and engine unit.
 - **THEN** missing fields retain previous measurements and real zero replaces prior token usage
 - **AND** partial state survives persistence and older complete snapshots remain readable
 
+## ADDED Requirements
 ### Requirement: Present current reported context clearly
 The composer SHALL show a percentage beside the circle and an observing tooltip with exact used/capacity/remaining tokens, explicit missing data, and percentages above 100 when reported.
 

@@ -4508,7 +4508,7 @@ impl Shell {
             .read(cx)
             .session_for(&chat_id)
             .and_then(|session| session.context_usage)
-            .map(|usage| usage.tokens);
+            .and_then(zeron_proto::ContextUsage::reported_tokens);
         let text = compaction_marker(before, after);
         cx.spawn(async move |_, _| {
             let params = serde_json::json!({

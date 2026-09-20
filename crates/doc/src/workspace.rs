@@ -470,20 +470,24 @@ impl WorkspaceDoc {
         )?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
-        match session.context_usage {
-            Some(usage) => {
-                row.insert(
-                    "contextTokens",
-                    i64::try_from(usage.tokens).unwrap_or(i64::MAX),
-                )?;
-                row.insert(
-                    "contextWindow",
-                    i64::try_from(usage.context_window).unwrap_or(i64::MAX),
-                )?;
-            }
-            None => {
-                row.delete("contextTokens")?;
-                row.delete("contextWindow")?;
+        for (key, value) in [
+            (
+                "contextTokens",
+                session
+                    .context_usage
+                    .and_then(zeron_proto::ContextUsage::reported_tokens),
+            ),
+            (
+                "contextWindow",
+                session
+                    .context_usage
+                    .and_then(zeron_proto::ContextUsage::reported_window),
+            ),
+        ] {
+            if let Some(value) = value {
+                row.insert(key, i64::try_from(value).unwrap_or(i64::MAX))?;
+            } else {
+                row.delete(key)?;
             }
         }
         self.doc.commit();
@@ -776,16 +780,15 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
-            context_usage: raw
-                .context_tokens
-                .zip(raw.context_window)
-                .and_then(|(tokens, context_window)| {
-                    Some(zeron_proto::ContextUsage {
-                        tokens: u64::try_from(tokens).ok()?,
-                        context_window: u64::try_from(context_window).ok()?,
-                    })
-                })
-                .filter(|usage| usage.context_window > 0),
+            context_usage: {
+                let tokens = raw.context_tokens.and_then(|n| u64::try_from(n).ok());
+                let window = raw
+                    .context_window
+                    .and_then(|n| u64::try_from(n).ok())
+                    .filter(|n| *n > 0);
+                (tokens.is_some() || window.is_some())
+                    .then(|| zeron_proto::ContextUsage::reported(tokens, window))
+            },
             // Live-only: the failure reason rides `WatchSessions` for the
             // status strip on the device that ran the turn. The synced row
             // carries status alone — remote sidebars show a dot, not a cause.
@@ -875,6 +878,7 @@ mod tests {
         row.context_usage = Some(zeron_proto::ContextUsage {
             tokens: 392_000,
             context_window: 828_000,
+            tokens_reported: None,
         });
         ws.upsert_session(&row).unwrap();
         assert_eq!(ws.read_sessions().unwrap(), vec![row]);
@@ -1219,5 +1223,33 @@ mod tests {
         ));
         // Everything else on the row survived the conflict.
         assert_eq!(a.chat("chat-1").unwrap().unwrap().device_id, "dev-a");
+    }
+}
+
+#[cfg(test)]
+mod partial_context_tests {
+    use super::*;
+    #[test]
+    fn partial_context_usage_survives_persistence() {
+        for usage in [
+            zeron_proto::ContextUsage::reported(Some(0), Some(200000)),
+            zeron_proto::ContextUsage::reported(None, Some(200000)),
+            zeron_proto::ContextUsage::reported(Some(59000), None),
+        ] {
+            let doc = WorkspaceDoc::new();
+            let mut row = Session {
+                chat_id: "chat".into(),
+                device_id: "device".into(),
+                status: SessionStatus::Idle,
+                started_at: None,
+                updated_at: Utc::now(),
+                context_usage: None,
+                error: None,
+                last_completed_turn: None,
+            };
+            row.context_usage = Some(usage);
+            doc.upsert_session(&row).unwrap();
+            assert_eq!(doc.read_sessions().unwrap()[0].context_usage, Some(usage));
+        }
     }
 }

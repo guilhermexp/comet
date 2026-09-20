@@ -624,6 +624,7 @@ fn map_update_frame(update: &Value) -> Vec<AgentEvent> {
                     context_usage: Some(ContextUsage {
                         tokens,
                         context_window,
+                        tokens_reported: None,
                     }),
                 })
                 .into_iter()

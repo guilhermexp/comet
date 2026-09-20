@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Run the headed Cargo artifact with native identity; pass CLI/test targets through."""
+
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def main():
+    binary = Path(sys.argv[1])
+    arguments = sys.argv[2:]
+    headed = not arguments or (
+        len(arguments) == 1 and arguments[0].startswith("zeron://")
+    )
+    if binary.name != "zeron" or not headed:
+        os.execv(str(binary), [str(binary), *arguments])
+
+    binary = binary.resolve()
+    root = Path(__file__).resolve().parent.parent
+    contents = binary.parent / "Zeron.app" / "Contents"
+    executable = contents / "MacOS" / "zeron"
+    resources = contents / "Resources"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    resources.mkdir(parents=True, exist_ok=True)
+
+    # Replace the inode: another development instance may still be executing it.
+    descriptor, temporary = tempfile.mkstemp(dir=executable.parent)
+    os.close(descriptor)
+    try:
+        shutil.copy2(binary, temporary)
+        os.replace(temporary, executable)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+    manifest = plistlib.loads((root / "dist/macos/Info.plist").read_bytes())
+    version = re.search(r'^version\s*=\s*"([^"]+)"',
+                        (root / "Cargo.toml").read_text(), re.MULTILINE).group(1)
+    manifest["CFBundleShortVersionString"] = version
+    manifest["CFBundleVersion"] = version
+    descriptor, temporary = tempfile.mkstemp(dir=contents)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            plistlib.dump(manifest, output)
+        os.replace(temporary, contents / "Info.plist")
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+    source_icon = root / "dist/macos/icon-1024.png"
+    icon = resources / "zeron.icns"
+    if not icon.exists() or icon.stat().st_mtime_ns < source_icon.stat().st_mtime_ns:
+        with tempfile.TemporaryDirectory(dir=resources) as directory:
+            iconset = Path(directory) / "zeron.iconset"
+            iconset.mkdir()
+            shutil.copy2(source_icon, iconset / "icon_512x512@2x.png")
+            subprocess.run(["sips", "-z", "512", "512", str(source_icon),
+                            "--out", str(iconset / "icon_512x512.png")],
+                           check=True, stdout=subprocess.DEVNULL)
+            generated_icon = Path(directory) / "zeron.icns"
+            subprocess.run(["iconutil", "-c", "icns", str(iconset),
+                            "-o", str(generated_icon)], check=True)
+            os.replace(generated_icon, icon)
+
+    # No `open` intermediary: retain Cargo's stdio, environment and signal semantics.
+    os.execv(str(executable), [str(executable), *arguments])
+
+
+if __name__ == "__main__":
+    main()
