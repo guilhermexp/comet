@@ -14,7 +14,8 @@ use zeron_workers_unpeel::{
     WorkersSessionCommand, WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
     WorkersWorktreeResult, ack_worker_parent_notification, build_worker_parent_notification_prompt,
     get_all_advisories_blocking, hibernate_confirmed_candidates, hibernation_candidates,
-    pending_worker_parent_notifications, run_runtime_update_blocking, worker_parent_links,
+    parent_notification_output_tail, pending_worker_parent_notifications,
+    run_runtime_update_blocking, worker_parent_links,
 };
 
 use crate::change_requests::workers_change_request_targets;
@@ -1073,10 +1074,14 @@ impl WorkersModel {
                             {
                                 notification.project_name = (*project_name).to_owned();
                             }
-                            let output = client
+                            let raw = client
                                 .read_output(&notification.worker_session_id, None, 0)
                                 .map(|output| String::from_utf8_lossy(&output.data).into_owned())
                                 .unwrap_or_default();
+                            let output = parent_notification_output_tail(
+                                &notification.worker_session_id,
+                                &raw,
+                            );
                             let prompt =
                                 build_worker_parent_notification_prompt(&notification, &output);
                             WorkerParentDelivery {

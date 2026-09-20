@@ -67,6 +67,9 @@ struct Entry {
     /// the replacement launch timestamp, the generation edge may rebind this
     /// opener. A lone untagged Stop never sets this field.
     legacy_turn_started_at: Option<SystemTime>,
+    /// Attention from an explicit PermissionRequest must survive TUI repaint
+    /// (cursor, spinner) until a turn-start, controller input, or turn-end.
+    explicit_prompt_attention: bool,
 }
 
 /// Canonical event name from the wire's case/dash/space/underscore-insensitive
@@ -98,12 +101,12 @@ fn starts_turn(canonical: &str) -> bool {
     matches!(canonical, "Start" | "UserPromptSubmit")
 }
 
-/// AskUserQuestion permission prompts latch hook ownership but change no
-/// state (the question renders in-terminal; attention would double-signal).
-fn is_latch_only(canonical: &str, tool_name: Option<&str>) -> bool {
+/// Unknown hook names latch ownership without changing busy/idle/attention.
+/// PermissionRequest always takes attention, including prompts that ask the
+/// user a question: that is the only signal an orchestrator gets.
+fn is_latch_only(canonical: &str, _tool_name: Option<&str>) -> bool {
     match canonical {
-        "Start" | "UserPromptSubmit" | "Stop" | "StopFailure" => false,
-        "PermissionRequest" => tool_name == Some("AskUserQuestion"),
+        "Start" | "UserPromptSubmit" | "Stop" | "StopFailure" | "PermissionRequest" => false,
         _ => true,
     }
 }
@@ -142,18 +145,21 @@ impl ActivityEngine {
         match canonical.as_str() {
             "Start" | "UserPromptSubmit" => {
                 entry.state = Some(HookState::Busy);
+                entry.explicit_prompt_attention = false;
                 entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
                 entry.stopped_at = None;
                 entry.stop_rearm_at = None;
             }
             "Stop" | "StopFailure" => {
                 entry.state = Some(HookState::Idle);
+                entry.explicit_prompt_attention = false;
                 entry.deadline_at = None;
                 entry.stopped_at = Some(now);
                 entry.stop_rearm_at = Some(now);
             }
             "PermissionRequest" => {
                 entry.state = Some(HookState::Attention);
+                entry.explicit_prompt_attention = true;
                 entry.deadline_at = None;
                 entry.stopped_at = None;
                 entry.stop_rearm_at = None;
@@ -249,6 +255,7 @@ impl ActivityEngine {
         entry.hook_seen = true;
         entry.last_hook_at = Some(now);
         entry.state = Some(HookState::Idle);
+        entry.explicit_prompt_attention = false;
         entry.deadline_at = None;
         entry.stopped_at = None;
         entry.stop_rearm_at = None;
@@ -310,6 +317,25 @@ impl ActivityEngine {
         }
     }
 
+    /// Controller/MCP input arrived after the prompt: the wait is over.
+    pub fn note_controller_input(&mut self, session_id: &str, input_at: SystemTime) {
+        let entry = self.entries.entry(session_id.to_string()).or_default();
+        if entry.state != Some(HookState::Attention) || !entry.explicit_prompt_attention {
+            return;
+        }
+        let Some(hook_at) = entry.last_hook_at else {
+            return;
+        };
+        if input_at <= hook_at {
+            return;
+        }
+        entry.state = Some(HookState::Busy);
+        entry.explicit_prompt_attention = false;
+        entry.deadline_at = Some(input_at + HOOK_IDLE_TIMEOUT);
+        entry.stopped_at = None;
+        entry.stop_rearm_at = None;
+    }
+
     /// Per-tick output observation + timeout sweep for hook-owned sessions.
     /// `allow_attention_clear` is false for tools that repaint their ask-user
     /// UI to the terminal (grok), where growth doesn't mean "user answered".
@@ -330,7 +356,9 @@ impl ActivityEngine {
             .is_some_and(|previous| previous != activity_signal);
         entry.last_signal = Some(activity_signal);
         match entry.state {
-            Some(HookState::Attention) if allow_attention_clear && grew => {
+            Some(HookState::Attention)
+                if allow_attention_clear && grew && !entry.explicit_prompt_attention =>
+            {
                 entry.state = Some(HookState::Busy);
                 entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
             }
@@ -515,15 +543,50 @@ mod tests {
         assert!(engine.is_latched("s2"));
         assert!(engine.hook_owned_state("s2").is_none());
 
-        // AskUserQuestion permission prompts are latch-only.
+        // AskUserQuestion is a blocking prompt: latch AND take attention.
         engine.apply_hook_event("s3", "PermissionRequest", Some("AskUserQuestion"), now);
         assert!(engine.is_latched("s3"));
-        assert!(engine.hook_owned_state("s3").is_none());
+        assert_eq!(engine.hook_owned_state("s3"), Some(HookState::Attention));
 
         // Grok/Claude SessionStart is open/resume, not a turn.
         engine.apply_hook_event("s4", "session_start", None, now);
         assert!(engine.is_latched("s4"));
         assert!(engine.hook_owned_state("s4").is_none());
+    }
+
+    #[test]
+    fn ask_prompt_moves_worker_to_blocked() {
+        let mut engine = ActivityEngine::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("s", "Start", None, now);
+        engine.apply_hook_event(
+            "s",
+            "PermissionRequest",
+            Some("AskUserQuestion"),
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Attention));
+        assert!(engine.is_latched("s"));
+    }
+
+    #[test]
+    fn attention_survives_screen_repaint_while_prompt_is_open() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("s", "PermissionRequest", Some("AskUserQuestion"), t0);
+        engine.note_output_and_sweep("s", 100, true, false, t0 + Duration::from_secs(1));
+        engine.note_output_and_sweep("s", 140, true, false, t0 + Duration::from_secs(2));
+        engine.note_output_and_sweep("s", 180, true, false, t0 + Duration::from_secs(3));
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Attention));
+
+        engine.apply_hook_event("s", "Start", None, t0 + Duration::from_secs(4));
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
+
+        engine.apply_hook_event("p", "PermissionRequest", Some("AskUserQuestion"), t0);
+        engine.note_controller_input("p", t0); // not newer than the hook
+        assert_eq!(engine.hook_owned_state("p"), Some(HookState::Attention));
+        engine.note_controller_input("p", t0 + Duration::from_secs(2));
+        assert_eq!(engine.hook_owned_state("p"), Some(HookState::Busy));
     }
 
     #[test]
@@ -558,7 +621,7 @@ mod tests {
         engine.note_output_and_sweep("s", 100, true, false, t0 + Duration::from_secs(1));
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Attention));
         engine.note_output_and_sweep("s", 150, true, false, t0 + Duration::from_secs(2));
-        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Attention));
 
         // Grok-style: growth never clears attention.
         engine.apply_hook_event("g", "PermissionRequest", None, t0);

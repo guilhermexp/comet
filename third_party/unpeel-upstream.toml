@@ -40,3 +40,8 @@ base_revision_resolves_upstream = false
 # 2026-09-20 — controller_host retains reasons for registered projects omitted
 # from the executable catalog; controller_api returns 409 with that reason,
 # reserving unknown-project 400 for IDs that were never registered.
+
+# 2026-09-20 — worker question channel: PermissionRequest/AskUserQuestion takes
+# attention in vendored activity.rs; pi-family lifecycle-extension emits
+# ui_prompt_start/end; omp declares transcript + adapter under pi-sessions.
+# Same-commit local form; no upstream patch (history rewritten, no common ancestor).

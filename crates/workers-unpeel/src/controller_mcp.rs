@@ -469,6 +469,42 @@ fn semantic_output(session_id: &str, raw: &str, max_bytes: usize) -> String {
     choose_semantic_output(raw, rows, max_bytes)
 }
 
+/// Semantic MCP viewport first; raw PTY bytes if the grid is empty.
+pub(crate) fn parent_notification_output_tail(session_id: &str, raw: &str) -> String {
+    parent_notification_output_tail_from(raw, viewport_rows(session_id))
+}
+
+pub(crate) fn parent_notification_output_tail_from(
+    raw: &str,
+    screen_rows: Option<Vec<String>>,
+) -> String {
+    let semantic = choose_semantic_output(raw, screen_rows, 4 * 1024);
+    if semantic.is_empty() {
+        raw.to_owned()
+    } else {
+        semantic
+    }
+}
+
+fn viewport_rows(session_id: &str) -> Option<Vec<String>> {
+    unpeel_core::terminal_viewport::read_terminal_viewport_snapshot(
+        session_id.to_owned(),
+        220,
+        120,
+        Some(256 * 1024),
+        Some(0),
+        Some(120),
+    )
+    .ok()
+    .map(|snapshot| {
+        snapshot
+            .viewport_rows
+            .into_iter()
+            .map(|row| row.text)
+            .collect()
+    })
+}
+
 fn dispatch_action(
     client: &LocalWorkersClient,
     arguments: &Value,

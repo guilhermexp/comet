@@ -14,8 +14,8 @@ use zeron_workers_unpeel::{
     controller_mcp_replacement_session_id, controller_mcp_sanitize_text,
     controller_mcp_startup_prompt_response, controller_mcp_take_parent_chat_id,
     controller_mcp_tracks_task_episode, current_episode_completed_with_evidence_at,
-    ensure_controller_mcp_host_launcher, is_session_host_mode, register_worker_parent_at,
-    worker_parent_links_at,
+    ensure_controller_mcp_host_launcher, is_session_host_mode,
+    parent_notification_output_tail_from, register_worker_parent_at, worker_parent_links_at,
 };
 
 #[test]
@@ -225,6 +225,25 @@ fn semantic_fallback_interprets_repaints_and_removes_controls() {
 
     assert_eq!(semantic, "Final report");
     assert!(!semantic.chars().any(char::is_control));
+}
+
+#[test]
+fn parent_notification_assembly_consumes_semantic_viewport_when_present() {
+    let raw = "stale paint\rAsk the user a question\r";
+    let tail =
+        parent_notification_output_tail_from(raw, Some(vec!["Ask the user a question".into()]));
+    assert_eq!(tail, "Ask the user a question");
+    assert!(!tail.contains("stale paint"));
+}
+
+#[test]
+fn parent_notification_assembly_falls_back_to_raw_when_semantic_is_empty() {
+    let raw = "Ask the user a question\r";
+    let tail = parent_notification_output_tail_from(raw, None);
+    assert!(
+        tail.contains("Ask the user a question"),
+        "raw fallback must keep the last paint when the grid is empty: {tail:?}"
+    );
 }
 
 #[test]

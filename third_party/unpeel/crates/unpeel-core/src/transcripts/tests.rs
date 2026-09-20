@@ -6,6 +6,7 @@ use super::*;
 use crate::session_host::HostedSessionState;
 use crate::state::{SessionInfo, TranscriptSettings};
 use std::fs;
+use std::sync::Mutex;
 
 fn provider(slug: &str) -> TranscriptProvider {
     TranscriptProvider::for_legacy_slug(slug).expect("test provider is registered")
@@ -47,6 +48,75 @@ fn generated_adapter_registry_matches_runtime_catalog() {
         "planned",
         "the non-file-backed compatibility adapter preserves the shipped hint"
     );
+}
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn omp_transcript_adapter_resolves() {
+    assert!(
+        TRANSCRIPT_ADAPTERS
+            .iter()
+            .any(|adapter| adapter.legacy_slug == "omp"),
+        "omp must be in the generated adapter table"
+    );
+    assert_eq!(
+        transcript_provider_for_command("omp"),
+        Some(provider("omp"))
+    );
+    assert_eq!(
+        transcript_provider_for_command("omp --model x"),
+        Some(provider("omp"))
+    );
+
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let home = tempfile::tempdir().expect("unpeel home");
+    let previous = std::env::var_os("UNPEEL_HOME");
+    unsafe {
+        std::env::set_var("UNPEEL_HOME", home.path());
+    }
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("UNPEEL_HOME", value),
+                    None => std::env::remove_var("UNPEEL_HOME"),
+                }
+            }
+        }
+    }
+    let _restore = Restore(previous);
+
+    let session_dir = home.path().join("pi-sessions").join("worker-1");
+    fs::create_dir_all(&session_dir).expect("managed pi-sessions dir");
+    let transcript = session_dir.join("20260920_omp-provider-1.jsonl");
+    let raw = concat!(
+        r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello from user"}]}}"#,
+        "
+",
+        r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"hello from assistant"}]}}"#,
+        "
+",
+    );
+    fs::write(&transcript, raw).expect("pi-family jsonl");
+
+    let mut manifest = test_manifest("omp");
+    manifest.session.id = "worker-1".into();
+    manifest.managed_storage_path = Some(session_dir.to_string_lossy().into_owned());
+    manifest.provider_transcript_path = Some(transcript.to_string_lossy().into_owned());
+    let resolved = resolve_provider_transcript(&manifest).expect("omp transcript resolves");
+    assert_eq!(resolved.provider, provider("omp"));
+    assert_eq!(resolved.path, transcript);
+
+    let snapshot = read_transcript_snapshot(&manifest, 50, false, None).expect("read omp jsonl");
+    assert_eq!(snapshot.entries[0].role, "User");
+    assert_eq!(snapshot.entries[0].text, "hello from user");
+    assert_eq!(snapshot.entries[1].role, "Assistant");
+    assert_eq!(snapshot.entries[1].text, "hello from assistant");
+
+    let entries = collect_transcript_entries(provider("omp"), raw, false);
+    assert_eq!(entries.len(), 2);
 }
 
 fn test_manifest(command: &str) -> HostedSessionManifest {

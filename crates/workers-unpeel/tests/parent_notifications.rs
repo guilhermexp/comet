@@ -6,8 +6,9 @@ use zeron_workers_unpeel::{
     ack_worker_parent_notification_compacted_at, activate_worker_parent_task_at,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task_at, current_episode_completed_with_evidence_at,
-    pending_worker_parent_notifications_at, pending_worker_parent_notifications_with_evidence_at,
-    prepare_worker_parent_task_at, register_worker_parent_at,
+    overlay_unread_from_parent_notifications, pending_worker_parent_notifications_at,
+    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task_at,
+    register_worker_parent_at,
 };
 
 fn session(id: &str, generation: u64, activity: &str, state: &str) -> WorkersSession {
@@ -614,6 +615,157 @@ fn a_status_line_redrawn_with_carriage_returns_keeps_only_the_last_paint() {
         "repaints antigos nao podem sobreviver ao lado do ultimo: {prompt}"
     );
     assert!(prompt.contains("terminou"));
+}
+
+#[test]
+fn output_tail_survives_trailing_carriage_return() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    let notification = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &[session("worker-1", 7, "done", "running")],
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap()
+    .remove(0);
+    let prompt = build_worker_parent_notification_prompt(
+        &notification,
+        "prompt line\r\nAsk the user a question\r",
+    );
+    assert!(
+        prompt.contains("Ask the user a question"),
+        "trailing CR must not wipe the last paint: {prompt}"
+    );
+    let declares_none = prompt.contains("```\nnone\n");
+    assert!(
+        declares_none == false,
+        "notification must not declare absence of content: {prompt}"
+    );
+}
+
+#[test]
+fn empty_output_tail_still_declares_absence() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    let notification = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &[session("worker-1", 7, "done", "running")],
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap()
+    .remove(0);
+    let prompt = build_worker_parent_notification_prompt(&notification, "\r\n  \r");
+    assert!(
+        prompt.contains("```\nnone\n"),
+        "a tail with no visible text still declares absence: {prompt}"
+    );
+}
+
+#[test]
+fn blocked_worker_notifies_parent_once_per_episode() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook_at(&sessions_root, "worker-1", "PermissionRequest", 7, 1_000);
+
+    let sessions = [session("worker-1", 7, "blocked", "running")];
+    let first = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &sessions,
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].kind, WorkerParentNotificationKind::WaitingForInput);
+
+    let again = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &sessions,
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].event_id, first[0].event_id);
+
+    ack_worker_parent_notification_at(&path, &first[0]).unwrap();
+    assert!(
+        pending_worker_parent_notifications_with_evidence_at(
+            &path,
+            &sessions,
+            &sessions_root,
+            |_| WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+        .is_empty()
+    );
+
+    write_hook_at(&sessions_root, "worker-1", "UserPromptSubmit", 7, 1_100);
+    write_hook_at(&sessions_root, "worker-1", "PermissionRequest", 7, 1_200);
+    let second = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &sessions,
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0].kind,
+        WorkerParentNotificationKind::WaitingForInput
+    );
+    assert_ne!(second[0].event_id, first[0].event_id);
+}
+
+#[test]
+fn unread_tracks_pending_parent_notification() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    let mut sessions = [session("worker-1", 7, "working", "running")];
+    let pending = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &sessions,
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    overlay_unread_from_parent_notifications(&mut sessions, &pending);
+    assert!(!sessions[0].unread);
+
+    write_hook_at(&sessions_root, "worker-1", "PermissionRequest", 7, 1_000);
+    sessions[0].activity = "blocked".into();
+    let pending = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &sessions,
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    overlay_unread_from_parent_notifications(&mut sessions, &pending);
+    assert!(sessions[0].unread);
+
+    ack_worker_parent_notification_at(&path, &pending[0]).unwrap();
+    let pending = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &sessions,
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    overlay_unread_from_parent_notifications(&mut sessions, &pending);
+    assert!(!sessions[0].unread);
 }
 
 #[test]

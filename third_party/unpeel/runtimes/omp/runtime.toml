@@ -7,7 +7,13 @@ adapter = "builtin:omp"
 legacy_order = 13
 platforms = ["macos", "linux"]
 supports_quick_launch = true
-capabilities = ["lifecycle_hooks", "notify_when_done", "resume", "restart_agent"]
+capabilities = [
+  "lifecycle_hooks",
+  "notify_when_done",
+  "resume",
+  "restart_agent",
+  "transcript",
+]
 
 [display]
 icon = "agent"
@@ -26,7 +32,7 @@ source = "hooks"
 authority = "partial"
 fallback = "none"
 completion_reliable = true
-attention_reliable = false
+attention_reliable = true
 
 [[suggested_presets]]
 id = "omp"

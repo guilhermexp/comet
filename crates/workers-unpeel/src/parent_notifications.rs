@@ -881,7 +881,11 @@ fn safe_output_block(value: &str, max_bytes: usize) -> String {
             // status line redesenha do mesmo tamanho, entao nao paga um
             // emulador aqui. Se algum dia pagar, o caminho e alimentar o
             // `Emulator` e ler a grade, como o painel de terminal ja faz.
-            let line = line.rsplit('\r').next().unwrap_or(line);
+            let line = line
+                .trim_end_matches('\r')
+                .rsplit('\r')
+                .next()
+                .unwrap_or(line);
             line.chars()
                 .map(|character| {
                     if character.is_control() {
@@ -912,6 +916,21 @@ fn code_fence_for(body: &str) -> String {
         })
         .0;
     "`".repeat(longest.saturating_add(1).max(3))
+}
+
+/// Replace `unread` with whether this worker has an unacked parent
+/// notification. The native `activity-state.json` file is never written here.
+pub fn overlay_unread_from_parent_notifications(
+    sessions: &mut [WorkersSession],
+    pending: &[WorkerParentNotification],
+) {
+    let pending_ids = pending
+        .iter()
+        .map(|notification| notification.worker_session_id.as_str())
+        .collect::<HashSet<_>>();
+    for session in sessions {
+        session.unread = pending_ids.contains(session.id.as_str());
+    }
 }
 
 pub fn build_worker_parent_notification_prompt(
