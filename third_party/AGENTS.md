@@ -113,11 +113,13 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   resume adapter e ícone autoral. Validação usa `bun run validate:runtimes`
   em `third_party/unpeel`.
 - **OMP `initial_text` is native startup, not PTY follow-up.**
-  `unpeel_core::omp_native_initial` stages a 0600 one-shot file under the
-  session dir and `apply_native_initial_prompt` appends `@file` to the first
-  spawn argv only. `execute_headless_session_create` skips the historical
-  initial-text PTY thread for OMP. Restart must not see a pending file.
-  Prime-agent and other pi-family CLIs keep interactive delivery.
+  `unpeel_core::omp_native_initial` stages a 0600 file under a 0700 session
+  dir. `prepare_native_initial_argv` appends `@file` without ACK;
+  `ack_native_initial_prompt` renames `.pending` → `.attached` only after
+  spawn or resume PTY submit succeeds. Native is PasteAndSubmit-only.
+  `execute_headless_session_create` skips the historical PTY thread for OMP.
+  Restart must not see a pending file. Prime-agent and other pi-family CLIs
+  keep interactive delivery.
 - **A extensão de lifecycle da família pi serve os três CLIs.** `pi`, `omp` e
   `prime-agent` recebem `--extension
   <unpeel_home>/hooks/pi-family-lifecycle-extension.js` e emitem `Start`/`Stop`

@@ -251,6 +251,15 @@ pub fn controller_mcp_is_booting_screen(screen: &str) -> bool {
 }
 
 #[doc(hidden)]
+pub fn controller_mcp_native_initial_from_presets(
+    project_id: &str,
+    preset_id: &str,
+    presets: &[WorkersPresetSetting],
+) -> bool {
+    controller_mcp::native_initial_from_presets(project_id, preset_id, presets)
+}
+
+#[doc(hidden)]
 pub fn controller_mcp_sanitize_text(text: &str) -> String {
     controller_mcp::sanitize_text(text)
 }

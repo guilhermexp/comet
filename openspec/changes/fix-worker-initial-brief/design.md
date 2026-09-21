@@ -17,6 +17,7 @@ Non-goals: new retry orchestration, changes to preset configuration, permission 
 3. Persist parent/task ownership before the first turn can finish. Preserve the current generation/episode completion contract even for fast workers. Do not declare submission merely because a process id exists.
 4. Treat initial task as one-shot launch data, not a durable part of the resume command. A retry must not duplicate a submitted task; a restart must not replay the original prompt. Temporary task material stays private and has defined cleanup.
 5. Regression seam: `crates/workers-unpeel/tests/worker_initial_briefing.rs`, using the existing isolated subprocess/profile pattern. Test the consumer-observed task and execution count, not source strings. Real controller/OMP smoke complements a deterministic CLI fixture.
+6. ACK is not argv calculation. `prepare_native_initial_argv` is idempotent; `ack_native_initial_prompt` renames `.pending` → `.attached` only after spawn or resume PTY submit. Native startup is PasteAndSubmit only. MCP native eligibility uses Host's enabled project-scoped-then-global command, never `cli_id`.
 
 ## Risks / Trade-offs
 

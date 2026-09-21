@@ -839,23 +839,31 @@ fn wait_for_session_runtime(session_id: &str, wait: Duration) -> Result<String, 
 }
 
 fn launch_uses_native_initial(client: &LocalWorkersClient, request: &WorkersLaunchRequest) -> bool {
-    let Ok(bootstrap) = client.bootstrap() else {
-        return false;
-    };
     let Some(preset_id) = request.preset_id.as_deref() else {
         return false;
     };
-    bootstrap
-        .presets
+    let Ok(settings) = client.settings() else {
+        return false;
+    };
+    native_initial_from_presets(&request.project_id, preset_id, &settings.presets)
+}
+
+pub fn native_initial_from_presets(
+    project_id: &str,
+    preset_id: &str,
+    presets: &[crate::WorkersPresetSetting],
+) -> bool {
+    let catalog: Vec<unpeel_core::omp_native_initial::CatalogPreset<'_>> = presets
         .iter()
-        .find(|preset| preset.id == preset_id)
-        .is_some_and(|preset| {
-            preset
-                .cli_id
-                .as_deref()
-                .is_some_and(unpeel_core::omp_native_initial::uses_native_initial_delivery)
-                || unpeel_core::omp_native_initial::uses_native_initial_delivery(&preset.command)
+        .map(|preset| unpeel_core::omp_native_initial::CatalogPreset {
+            id: &preset.id,
+            command: &preset.command,
+            enabled: preset.enabled,
+            project_id: preset.project_id.as_deref(),
         })
+        .collect();
+    unpeel_core::omp_native_initial::resolve_enabled_preset_command(project_id, preset_id, &catalog)
+        .is_some_and(unpeel_core::omp_native_initial::uses_native_initial_delivery)
 }
 
 fn confirm_native_initial_briefing(

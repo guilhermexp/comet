@@ -571,26 +571,26 @@ fn resolve_host_create(
         // Prefer a project-scoped row if a legacy catalog happens to contain
         // the same id globally too. Either way, preset selection wins over an
         // explicit command in the wire request, matching shipped clients.
-        let preset = context
+        let catalog: Vec<crate::omp_native_initial::CatalogPreset<'_>> = context
             .presets
             .iter()
-            .find(|preset| {
-                preset.id == preset_id
-                    && preset.enabled
-                    && preset.project_id.as_deref() == Some(project_id.as_str())
+            .map(|preset| crate::omp_native_initial::CatalogPreset {
+                id: &preset.id,
+                command: &preset.command,
+                enabled: preset.enabled,
+                project_id: preset.project_id.as_deref(),
             })
-            .or_else(|| {
-                context.presets.iter().find(|preset| {
-                    preset.id == preset_id && preset.enabled && preset.project_id.is_none()
-                })
-            })
-            .ok_or_else(|| {
-                ControllerApiError::new(400, format!("unknown preset id: {preset_id}"))
-            })?;
-        if preset.command.len() > MAX_CREATE_COMMAND_BYTES || preset.command.contains('\0') {
+            .collect();
+        let command = crate::omp_native_initial::resolve_enabled_preset_command(
+            project_id.as_str(),
+            &preset_id,
+            &catalog,
+        )
+        .ok_or_else(|| ControllerApiError::new(400, format!("unknown preset id: {preset_id}")))?;
+        if command.len() > MAX_CREATE_COMMAND_BYTES || command.contains('\0') {
             return Err(ControllerApiError::new(500, "invalid Host preset command"));
         }
-        preset.command.clone()
+        command.to_owned()
     } else if let Some(command) = request.command {
         command.trim().to_owned()
     } else {
@@ -693,7 +693,13 @@ pub fn execute_headless_session_create(
         role: None,
         task: None,
     };
-    let native_initial = crate::omp_native_initial::uses_native_initial_delivery(&session.command);
+    let native_initial = crate::omp_native_initial::native_initial_is_authorized(
+        &session.command,
+        matches!(
+            initial_text_submit_mode,
+            HostCreateSubmitMode::PasteAndSubmit
+        ),
+    );
     if native_initial {
         if let Some(text) = initial_text.as_deref().filter(|text| !text.is_empty()) {
             if let Err(error) = crate::omp_native_initial::stage_native_initial_prompt(

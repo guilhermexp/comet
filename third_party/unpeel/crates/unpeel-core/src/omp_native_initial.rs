@@ -29,6 +29,44 @@ pub fn native_initial_prompt_attached(session_id: &str) -> bool {
         .is_file()
 }
 
+pub fn native_initial_prompt_pending(session_id: &str) -> bool {
+    session_host::session_dir(session_id)
+        .join(NATIVE_INITIAL_PENDING_FILE)
+        .is_file()
+}
+
+/// Host-equivalent catalog row. MCP must resolve the same enabled
+/// project-scoped-then-global command the Host will spawn — never `cli_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogPreset<'a> {
+    pub id: &'a str,
+    pub command: &'a str,
+    pub enabled: bool,
+    pub project_id: Option<&'a str>,
+}
+
+pub fn resolve_enabled_preset_command<'a>(
+    project_id: &str,
+    preset_id: &str,
+    presets: &[CatalogPreset<'a>],
+) -> Option<&'a str> {
+    presets
+        .iter()
+        .find(|preset| {
+            preset.enabled && preset.id == preset_id && preset.project_id == Some(project_id)
+        })
+        .or_else(|| {
+            presets.iter().find(|preset| {
+                preset.enabled && preset.id == preset_id && preset.project_id.is_none()
+            })
+        })
+        .map(|preset| preset.command)
+}
+
+pub fn native_initial_is_authorized(command: &str, submit_and_run: bool) -> bool {
+    submit_and_run && uses_native_initial_delivery(command)
+}
+
 pub fn stage_native_initial_prompt(
     runtime_or_command: &str,
     session_id: &str,
@@ -46,11 +84,7 @@ pub fn stage_native_initial_prompt(
     let directory = session_host::session_dir(session_id);
     fs::create_dir_all(&directory)
         .map_err(|error| format!("Failed to create session dir for native prompt: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
-    }
+    enforce_private_mode(&directory, 0o700)?;
     let body = directory.join(NATIVE_INITIAL_MESSAGE_FILE);
     write_private_file(&body, text.as_bytes())?;
     write_private_file(&directory.join(NATIVE_INITIAL_PENDING_FILE), b"")?;
@@ -63,28 +97,58 @@ pub fn apply_native_initial_prompt(
     command: &str,
     session_id: &str,
 ) -> String {
-    if !(uses_native_initial_delivery(runtime_or_command) || uses_native_initial_delivery(command))
-    {
-        return command.to_string();
-    }
-    consume_pending_and_attach(command, session_id)
+    prepare_native_initial_argv(runtime_or_command, command, session_id)
+        .unwrap_or_else(|_| command.to_string())
 }
 
-fn consume_pending_and_attach(command: &str, session_id: &str) -> String {
+/// Compute the first-spawn argv. Must not ACK: `.attached` is written only
+/// after the real spawn/PTY submit succeeds.
+pub fn prepare_native_initial_argv(
+    runtime_or_command: &str,
+    command: &str,
+    session_id: &str,
+) -> Result<String, String> {
+    if !(uses_native_initial_delivery(runtime_or_command) || uses_native_initial_delivery(command))
+    {
+        return Ok(command.to_string());
+    }
     let directory = session_host::session_dir(session_id);
     let pending = directory.join(NATIVE_INITIAL_PENDING_FILE);
     let body = directory.join(NATIVE_INITIAL_MESSAGE_FILE);
     if !pending.is_file() || !body.is_file() {
-        let _ = fs::remove_file(&pending);
-        return command.to_string();
+        return Ok(command.to_string());
     }
     let token = format!("@{}", body.display());
-    let attached_command = format!("{} {}", command.trim(), shared::shell_quote(&token));
-    if write_private_file(&directory.join(NATIVE_INITIAL_ATTACHED_FILE), b"").is_err() {
-        return command.to_string();
+    Ok(format!(
+        "{} {}",
+        command.trim(),
+        shared::shell_quote(&token)
+    ))
+}
+
+/// Commit the one-shot after the host actually spawned or submitted.
+/// Rename pending → attached so a failed ACK cannot both claim success and
+/// leave a replayable pending file.
+pub fn ack_native_initial_prompt(session_id: &str) -> Result<(), String> {
+    let directory = session_host::session_dir(session_id);
+    let pending = directory.join(NATIVE_INITIAL_PENDING_FILE);
+    let attached = directory.join(NATIVE_INITIAL_ATTACHED_FILE);
+    if attached.is_file() {
+        if pending.is_file() {
+            fs::remove_file(&pending).map_err(|error| {
+                format!("native initial pending survived ack and would replay: {error}")
+            })?;
+        }
+        enforce_private_mode(&attached, 0o600)?;
+        return Ok(());
     }
-    let _ = fs::remove_file(&pending);
-    attached_command
+    if !pending.is_file() {
+        return Ok(());
+    }
+    fs::rename(&pending, &attached)
+        .map_err(|error| format!("Failed to ack native initial prompt: {error}"))?;
+    enforce_private_mode(&attached, 0o600)?;
+    Ok(())
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -100,6 +164,20 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
     file.write_all(bytes)
         .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+    drop(file);
+    enforce_private_mode(path, 0o600)?;
+    Ok(())
+}
+
+fn enforce_private_mode(path: &Path, mode: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
+            format!("Failed to set mode {mode:o} on {}: {error}", path.display())
+        })?;
+    }
+    let _ = mode;
     Ok(())
 }
 
@@ -137,6 +215,8 @@ mod tests {
         assert!(!first.contains(briefing), "{first}");
         assert!(!first.contains("--auto-approve"), "{first}");
         assert_eq!(std::fs::read_to_string(&path).expect("body"), briefing);
+        assert!(!native_initial_prompt_attached("s1"));
+        ack_native_initial_prompt("s1").expect("ack");
         assert!(native_initial_prompt_attached("s1"));
 
         let second = apply_native_initial_prompt("omp", "omp --yolo --continue", "s1");

@@ -83,11 +83,14 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `workers_mcp.rs` and rendered into each runtime's dialect); it is NOT
   Unpeel's worker-to-worker MCP host.
 - **OMP receives `initial_text` at native startup.** `launch_worker` stages a
-  private one-shot file and the Host attaches `@file` on the first spawn argv
-  only. The stored Session command never carries the brief; restart/resume must
-  not replay it; `--auto-approve` is never added. Other runtimes keep the
-  guarded interactive PTY path. `tests/worker_initial_briefing.rs` is the
-  regression seam.
+  private one-shot file. The Host prepares `@file` argv without ACK, then
+  renames `.pending` → `.attached` only after spawn/PTY submit succeeds.
+  MCP decides native from the same enabled project-scoped-then-global
+  *command* Host will spawn, never stale `cli_id`. Only PasteAndSubmit uses
+  native startup; PasteOnly/Raw keep the Host PTY contracts. Confirm
+  `.attached` before `briefing_submitted`. Capture parent
+  `registered_at_unix_ms` before spawn. Restart must not replay.
+  `tests/worker_initial_briefing.rs` is the regression seam.
 - **Activity state machine is shared by include.** `activity_bridge.rs`
   includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
   nao forke a maquina de estados numa copia local; mude no proprio
@@ -458,11 +461,13 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   consume from `zeron-ui/src/workers/`.
 - **OMP launch briefing is native, not viewport-wait.** `launch_worker`
   attaches sanitized `initial_text` onto the create request for OMP presets
-  only. The Host stages a one-shot file and consumes it via `@file` on first
-  spawn. Confirm `.attached` before claiming `briefing_submitted`; never infer
-  submit from PID. Capture parent `registered_at_unix_ms` before spawn so a
-  fast Stop still belongs to the episode. Restart must not replay. Interactive
-  PTY submit stays for other runtimes.
+  whose resolved command is OMP and whose submit mode is PasteAndSubmit.
+  Prepare `@file` without claiming delivery; ACK `.attached` only after spawn
+  succeeds. A failed spawn leaves `.pending` and `briefing_submitted=false`.
+  Preset resolution matches Host (enabled project-scoped, then global, by
+  command). Capture parent `registered_at_unix_ms` before spawn so a fast Stop
+  still belongs to the episode. Restart must not replay. Interactive PTY
+  submit stays for other runtimes and for PasteOnly/Raw.
 - Changes that touch session lifecycle must preserve the durable-seed /
   runtime-generation semantics of the included activity state machine.
 - Platform-specific resource code goes in `resources/macos.rs` with the

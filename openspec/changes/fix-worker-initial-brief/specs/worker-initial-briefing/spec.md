@@ -38,6 +38,21 @@ The system SHALL distinguish a created process from delivered work. A failed del
 - **THEN** the result identifies the Worker and reports the actual delivery failure without claiming successful submission
 - Test: integration — partial launch reports delivery failure and session identity
 
+#### Scenario: Spawn fails before ACK
+- **WHEN** native argv is prepared but spawn or transport fails
+- **THEN** `.attached` is absent, `.pending` remains, and `briefing_submitted` is false
+- Test: integration — failed spawn does not report briefing_submitted
+
+#### Scenario: Unauthorized submit modes keep PTY contracts
+- **WHEN** Host create uses PasteOnly or Raw with an OMP command
+- **THEN** native startup is not used and those submit-mode contracts remain
+- Test: integration — PasteOnly/Raw do not use native startup
+
+#### Scenario: MCP native decision matches Host command resolution
+- **WHEN** a preset id is duplicated or carries a stale cli_id
+- **THEN** MCP uses the enabled project-scoped then global command Host will spawn
+- Test: integration — MCP native decision matches host command resolution
+
 #### Scenario: Interactive runtime is not ready
 - **WHEN** a runtime using interactive submission shows a shell, startup screen or blocking menu
 - **THEN** the initial brief is not typed into that surface

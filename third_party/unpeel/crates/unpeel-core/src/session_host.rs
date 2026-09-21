@@ -1198,11 +1198,11 @@ fn resume_agent_in_place(
         browser_mcp_enabled,
         computer_mcp_enabled,
     );
-    let startup_command = crate::omp_native_initial::apply_native_initial_prompt(
+    let startup_command = crate::omp_native_initial::prepare_native_initial_argv(
         expected_runtime_id,
         &startup_command,
         session_id,
-    );
+    )?;
 
     let guard = runtime
         .lock()
@@ -1380,6 +1380,7 @@ fn resume_agent_in_place(
         }
         return Err(format!("Failed to submit agent relaunch command: {error}"));
     }
+    crate::omp_native_initial::ack_native_initial_prompt(session_id)?;
     drop(guard);
 
     let manifest_update = update_manifest_session(session_id, |manifest| {
@@ -4762,11 +4763,11 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                 launch.browser_mcp_enabled,
                 launch.computer_mcp_enabled,
             );
-            let startup_command = crate::omp_native_initial::apply_native_initial_prompt(
+            let startup_command = crate::omp_native_initial::prepare_native_initial_argv(
                 runtime_id,
                 &startup_command,
                 &launch.session.id,
-            );
+            )?;
             let startup_command =
                 runtime_generation_scoped_command(ShellFamily::Posix, &startup_command, 1);
             let startup_command = if launches_resume_agent_runtime {
@@ -4796,6 +4797,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn command: {e}"))?;
+        crate::omp_native_initial::ack_native_initial_prompt(&launch.session.id)?;
         drop(pair.slave);
 
         let writer = pair
