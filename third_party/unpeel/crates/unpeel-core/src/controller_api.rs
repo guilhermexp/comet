@@ -574,14 +574,15 @@ fn resolve_host_create(
         let command = crate::omp_native_initial::resolve_enabled_preset_command(
             project_id.as_str(),
             &preset_id,
-            context.presets.iter().map(|preset| {
-                crate::omp_native_initial::CatalogPreset {
+            context
+                .presets
+                .iter()
+                .map(|preset| crate::omp_native_initial::CatalogPreset {
                     id: &preset.id,
                     command: &preset.command,
                     enabled: preset.enabled,
                     project_id: preset.project_id.as_deref(),
-                }
-            }),
+                }),
         )
         .ok_or_else(|| ControllerApiError::new(400, format!("unknown preset id: {preset_id}")))?;
         if command.len() > MAX_CREATE_COMMAND_BYTES || command.contains('\0') {
