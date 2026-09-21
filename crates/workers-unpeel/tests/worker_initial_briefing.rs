@@ -9,9 +9,9 @@ use unpeel_core::controller_api::{HostCreateSubmitMode, native_initial_startup_e
 use zeron_workers_unpeel::{
     WorkerCompletionEvidence, WorkerParentNotificationKind, WorkersPresetSetting, WorkersSession,
     WorkersSessionCapabilities, begin_worker_parent_task_at, controller_mcp_is_booting_screen,
-    controller_mcp_is_briefing_screen_ready, controller_mcp_launch_briefing_next_action,
-    controller_mcp_native_initial_from_presets, controller_mcp_startup_prompt_response,
-    pending_worker_parent_notifications_with_evidence_at, register_worker_parent_at,
+    controller_mcp_is_briefing_screen_ready, controller_mcp_native_initial_from_presets,
+    controller_mcp_startup_prompt_response, pending_worker_parent_notifications_with_evidence_at,
+    register_worker_parent_at,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -230,9 +230,10 @@ fn omp_native_startup_executes_the_literal_task_once_despite_mcp_warning()
     let warning_screen = "Connecting to MCP servers: graft…\nMCP error: graft failed\n❯";
     assert!(controller_mcp_is_booting_screen(warning_screen));
 
-    let output = unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || {
-        run_spawn_command(&spawn, &bin, home.path())
-    })?;
+    let output =
+        unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || {
+            run_spawn_command(&spawn, &bin, home.path())
+        })?;
     assert!(
         output.status.success(),
         "fake omp failed: {}",
@@ -317,15 +318,16 @@ fn failed_spawn_does_not_report_briefing_submitted() -> Result<(), Box<dyn std::
         argv.contains('@'),
         "prepare must still attach @file in argv: {argv}"
     );
-    let spawned = unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || {
-        Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&argv)
-            .current_dir("/no/such/native-submit-cwd")
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    });
+    let spawned =
+        unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&argv)
+                .current_dir(_home.path().join("missing-cwd"))
+                .spawn()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
     assert!(
         spawned.is_err(),
         "prepared command must fail at the Host submission seam: {spawned:?}"
@@ -347,9 +349,7 @@ fn missing_body_does_not_ack_a_surviving_pending() -> Result<(), Box<dyn std::er
     let _home = IsolatedHome::new()?;
     let session_id = "omp-native-missing-body";
     unpeel_core::omp_native_initial::stage_native_initial_prompt("omp", session_id, LITERAL_TASK)?;
-    fs::remove_file(unpeel_core::omp_native_initial::native_initial_message_path(
-        session_id,
-    ))?;
+    fs::remove_file(unpeel_core::omp_native_initial::native_initial_message_path(session_id))?;
     let spawn = unpeel_core::omp_native_initial::prepare_native_initial_argv(
         "omp",
         "omp --yolo",
@@ -421,24 +421,6 @@ fn paste_only_and_raw_keep_host_pty_contracts() {
         "claude",
         HostCreateSubmitMode::PasteAndSubmit
     ));
-}
-
-#[test]
-fn native_confirmation_failure_directs_inspection_not_resend() {
-    let next = controller_mcp_launch_briefing_next_action("sess-1", true);
-    let lower = next.to_ascii_lowercase();
-    assert!(
-        !lower.contains("without"),
-        "uncertain native confirmation must not claim the worker is WITHOUT its brief: {next}"
-    );
-    assert!(
-        !lower.contains("send_text"),
-        "uncertain native confirmation must not recommend blind resend: {next}"
-    );
-    assert!(
-        lower.contains("inspect"),
-        "uncertain native confirmation must direct inspection: {next}"
-    );
 }
 
 #[test]

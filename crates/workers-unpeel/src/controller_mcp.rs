@@ -862,7 +862,7 @@ pub fn native_initial_from_presets(
     .is_some_and(unpeel_core::omp_native_initial::uses_native_initial_delivery)
 }
 
-pub fn launch_briefing_next_action(session_id: &str, native: bool) -> String {
+fn launch_briefing_next_action(session_id: &str, native: bool) -> String {
     if native {
         format!(
             "Worker {session_id} launched; native briefing confirmation is incomplete. Inspect the worker with inspect_worker or read_output before sending more input or assuming the task is missing."
