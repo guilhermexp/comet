@@ -260,6 +260,11 @@ pub fn controller_mcp_native_initial_from_presets(
 }
 
 #[doc(hidden)]
+pub fn controller_mcp_launch_briefing_next_action(session_id: &str, native: bool) -> String {
+    controller_mcp::launch_briefing_next_action(session_id, native)
+}
+
+#[doc(hidden)]
 pub fn controller_mcp_sanitize_text(text: &str) -> String {
     controller_mcp::sanitize_text(text)
 }

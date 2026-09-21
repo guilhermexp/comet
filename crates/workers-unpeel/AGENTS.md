@@ -83,13 +83,17 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `workers_mcp.rs` and rendered into each runtime's dialect); it is NOT
   Unpeel's worker-to-worker MCP host.
 - **OMP receives `initial_text` at native startup.** `launch_worker` stages a
-  private one-shot file. The Host prepares `@file` argv without ACK, then
-  renames `.pending` → `.attached` only after spawn/PTY submit succeeds.
-  MCP decides native from the same enabled project-scoped-then-global
-  *command* Host will spawn, never stale `cli_id`. Only PasteAndSubmit uses
-  native startup; PasteOnly/Raw keep the Host PTY contracts. Confirm
-  `.attached` before `briefing_submitted`. Capture parent
-  `registered_at_unix_ms` before spawn. Restart must not replay.
+  private one-shot file. The Host prepares `@file` only when a body exists,
+  then claims `.pending` → `.claimed` immediately before spawn/PTY submit.
+  Successful submit never restores pending; ACK persists `.claimed` →
+  `.attached` without `?` after the child is live. Missing body cannot ACK.
+  Pre-submit failure restores pending. MCP decides native from the same
+  enabled project-scoped-then-global *command* Host will spawn, never stale
+  `cli_id`, via a shared iterator (no collected catalog Vec). Only
+  PasteAndSubmit uses native startup (`native_initial_startup_enabled` on
+  `HostCreateSubmitMode`). Confirm `.attached` before `briefing_submitted`;
+  unconfirmed `.claimed` is inspect-only, never WITHOUT/resend. Capture
+  parent `registered_at_unix_ms` before spawn. Restart must not replay.
   `tests/worker_initial_briefing.rs` is the regression seam.
 - **Activity state machine is shared by include.** `activity_bridge.rs`
   includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
@@ -462,8 +466,10 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 - **OMP launch briefing is native, not viewport-wait.** `launch_worker`
   attaches sanitized `initial_text` onto the create request for OMP presets
   whose resolved command is OMP and whose submit mode is PasteAndSubmit.
-  Prepare `@file` without claiming delivery; ACK `.attached` only after spawn
-  succeeds. A failed spawn leaves `.pending` and `briefing_submitted=false`.
+  Prepare `@file` only with a real body, then claim `.pending` → `.claimed`
+  at the Host submit seam. A failed spawn restores `.pending` and
+  `briefing_submitted=false`. ACK failure after success keeps Host alive with
+  a consumed reservation.
   Preset resolution matches Host (enabled project-scoped, then global, by
   command). Capture parent `registered_at_unix_ms` before spawn so a fast Stop
   still belongs to the episode. Restart must not replay. Interactive PTY
@@ -530,7 +536,7 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 | `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
 | `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
-| `tests/worker_initial_briefing.rs` (5) — OMP native startup delivery, literal `@file` task, restart without replay, honest missing receipt, other-runtime shell/boot/menu guards | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
+| `tests/worker_initial_briefing.rs` (12) — OMP native startup delivery, Host submit seam spawn failure, missing-body/ACK-failure no replay, HostCreateSubmitMode PasteOnly/Raw, inspect-on-uncertain-confirmation, restart without replay, other-runtime shell/boot/menu guards | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

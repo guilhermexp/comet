@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub const NATIVE_INITIAL_MESSAGE_FILE: &str = "native-initial-message";
 pub const NATIVE_INITIAL_PENDING_FILE: &str = "native-initial-message.pending";
+pub const NATIVE_INITIAL_CLAIMED_FILE: &str = "native-initial-message.claimed";
 pub const NATIVE_INITIAL_ATTACHED_FILE: &str = "native-initial-message.attached";
 
 pub fn uses_native_initial_delivery(runtime_or_command: &str) -> bool {
@@ -35,6 +36,12 @@ pub fn native_initial_prompt_pending(session_id: &str) -> bool {
         .is_file()
 }
 
+pub fn native_initial_prompt_claimed(session_id: &str) -> bool {
+    session_host::session_dir(session_id)
+        .join(NATIVE_INITIAL_CLAIMED_FILE)
+        .is_file()
+}
+
 /// Host-equivalent catalog row. MCP must resolve the same enabled
 /// project-scoped-then-global command the Host will spawn — never `cli_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,26 +52,26 @@ pub struct CatalogPreset<'a> {
     pub project_id: Option<&'a str>,
 }
 
-pub fn resolve_enabled_preset_command<'a>(
+pub fn resolve_enabled_preset_command<'a, I>(
     project_id: &str,
     preset_id: &str,
-    presets: &[CatalogPreset<'a>],
-) -> Option<&'a str> {
-    presets
-        .iter()
-        .find(|preset| {
-            preset.enabled && preset.id == preset_id && preset.project_id == Some(project_id)
-        })
-        .or_else(|| {
-            presets.iter().find(|preset| {
-                preset.enabled && preset.id == preset_id && preset.project_id.is_none()
-            })
-        })
-        .map(|preset| preset.command)
-}
-
-pub fn native_initial_is_authorized(command: &str, submit_and_run: bool) -> bool {
-    submit_and_run && uses_native_initial_delivery(command)
+    presets: I,
+) -> Option<&'a str>
+where
+    I: IntoIterator<Item = CatalogPreset<'a>>,
+{
+    let mut global = None;
+    for preset in presets {
+        if !preset.enabled || preset.id != preset_id {
+            continue;
+        }
+        match preset.project_id {
+            Some(id) if id == project_id => return Some(preset.command),
+            None if global.is_none() => global = Some(preset.command),
+            _ => {}
+        }
+    }
+    global
 }
 
 pub fn stage_native_initial_prompt(
@@ -88,21 +95,14 @@ pub fn stage_native_initial_prompt(
     let body = directory.join(NATIVE_INITIAL_MESSAGE_FILE);
     write_private_file(&body, text.as_bytes())?;
     write_private_file(&directory.join(NATIVE_INITIAL_PENDING_FILE), b"")?;
+    let _ = fs::remove_file(directory.join(NATIVE_INITIAL_CLAIMED_FILE));
     let _ = fs::remove_file(directory.join(NATIVE_INITIAL_ATTACHED_FILE));
     Ok(body)
 }
 
-pub fn apply_native_initial_prompt(
-    runtime_or_command: &str,
-    command: &str,
-    session_id: &str,
-) -> String {
-    prepare_native_initial_argv(runtime_or_command, command, session_id)
-        .unwrap_or_else(|_| command.to_string())
-}
-
 /// Compute the first-spawn argv. Must not ACK: `.attached` is written only
-/// after the real spawn/PTY submit succeeds.
+/// after the real spawn/PTY submit succeeds. `@file` is added only when the
+/// pending reservation still has a body to attach.
 pub fn prepare_native_initial_argv(
     runtime_or_command: &str,
     command: &str,
@@ -126,29 +126,107 @@ pub fn prepare_native_initial_argv(
     ))
 }
 
-/// Commit the one-shot after the host actually spawned or submitted.
-/// Rename pending → attached so a failed ACK cannot both claim success and
-/// leave a replayable pending file.
-pub fn ack_native_initial_prompt(session_id: &str) -> Result<(), String> {
+/// Claim a non-replayable reservation, run the Host's irreversible spawn/PTY
+/// submit, then persist the receipt. Missing body never claims. Pre-submit
+/// failure restores pending. Successful submit never restores pending; an ACK
+/// failure keeps the Host result and leaves the reservation consumed.
+pub fn submit_with_native_reservation<T>(
+    session_id: &str,
+    submit: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let reservation = claim_native_initial(session_id)?;
+    match submit() {
+        Err(error) => {
+            if let Some(reservation) = reservation {
+                if let Err(restore_error) = reservation.restore_pending() {
+                    return Err(format!(
+                        "{error}; additionally failed to restore native initial reservation: {restore_error}"
+                    ));
+                }
+            }
+            Err(error)
+        }
+        Ok(value) => {
+            if let Some(reservation) = reservation {
+                if let Err(error) = reservation.consume() {
+                    log::warn!(
+                        "session {session_id} native initial was submitted but the confirmation receipt could not be persisted: {error}"
+                    );
+                }
+            }
+            Ok(value)
+        }
+    }
+}
+
+struct NativeInitialReservation {
+    session_id: String,
+}
+
+fn claim_native_initial(session_id: &str) -> Result<Option<NativeInitialReservation>, String> {
     let directory = session_host::session_dir(session_id);
     let pending = directory.join(NATIVE_INITIAL_PENDING_FILE);
-    let attached = directory.join(NATIVE_INITIAL_ATTACHED_FILE);
-    if attached.is_file() {
-        if pending.is_file() {
-            fs::remove_file(&pending).map_err(|error| {
-                format!("native initial pending survived ack and would replay: {error}")
-            })?;
-        }
-        enforce_private_mode(&attached, 0o600)?;
-        return Ok(());
+    let claimed = directory.join(NATIVE_INITIAL_CLAIMED_FILE);
+    let body = directory.join(NATIVE_INITIAL_MESSAGE_FILE);
+    if claimed.is_file() {
+        return Ok(None);
     }
     if !pending.is_file() {
-        return Ok(());
+        return Ok(None);
     }
-    fs::rename(&pending, &attached)
-        .map_err(|error| format!("Failed to ack native initial prompt: {error}"))?;
-    enforce_private_mode(&attached, 0o600)?;
-    Ok(())
+    if !body.is_file() {
+        return Ok(None);
+    }
+    fs::rename(&pending, &claimed)
+        .map_err(|error| format!("Failed to claim native initial reservation: {error}"))?;
+    enforce_private_mode(&claimed, 0o600)?;
+    Ok(Some(NativeInitialReservation {
+        session_id: session_id.to_owned(),
+    }))
+}
+
+impl NativeInitialReservation {
+    fn restore_pending(self) -> Result<(), String> {
+        let directory = session_host::session_dir(&self.session_id);
+        let pending = directory.join(NATIVE_INITIAL_PENDING_FILE);
+        let claimed = directory.join(NATIVE_INITIAL_CLAIMED_FILE);
+        if pending.is_file() {
+            let _ = fs::remove_file(&claimed);
+            return Ok(());
+        }
+        if !claimed.is_file() {
+            return Ok(());
+        }
+        fs::rename(&claimed, &pending).map_err(|error| {
+            format!("Failed to restore native initial reservation to pending: {error}")
+        })?;
+        enforce_private_mode(&pending, 0o600)?;
+        Ok(())
+    }
+
+    fn consume(self) -> Result<(), String> {
+        let directory = session_host::session_dir(&self.session_id);
+        let claimed = directory.join(NATIVE_INITIAL_CLAIMED_FILE);
+        let attached = directory.join(NATIVE_INITIAL_ATTACHED_FILE);
+        let pending = directory.join(NATIVE_INITIAL_PENDING_FILE);
+        if pending.is_file() {
+            fs::remove_file(&pending).map_err(|error| {
+                format!("native initial pending survived submit and would replay: {error}")
+            })?;
+        }
+        if attached.is_file() {
+            let _ = fs::remove_file(&claimed);
+            enforce_private_mode(&attached, 0o600)?;
+            return Ok(());
+        }
+        if !claimed.is_file() {
+            return Ok(());
+        }
+        fs::rename(&claimed, &attached)
+            .map_err(|error| format!("Failed to ack native initial prompt: {error}"))?;
+        enforce_private_mode(&attached, 0o600)?;
+        Ok(())
+    }
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -210,16 +288,17 @@ mod tests {
         let (_dir, previous) = isolated_home();
         let briefing = "hello \"world\"\n--flag\n@other";
         let path = stage_native_initial_prompt("omp", "s1", briefing).expect("stage");
-        let first = apply_native_initial_prompt("omp", "omp --yolo", "s1");
+        let first = prepare_native_initial_argv("omp", "omp --yolo", "s1").expect("prepare");
         assert!(first.contains(&format!("'@{}'", path.display())), "{first}");
         assert!(!first.contains(briefing), "{first}");
         assert!(!first.contains("--auto-approve"), "{first}");
         assert_eq!(std::fs::read_to_string(&path).expect("body"), briefing);
         assert!(!native_initial_prompt_attached("s1"));
-        ack_native_initial_prompt("s1").expect("ack");
+        submit_with_native_reservation("s1", || Ok(())).expect("submit");
         assert!(native_initial_prompt_attached("s1"));
 
-        let second = apply_native_initial_prompt("omp", "omp --yolo --continue", "s1");
+        let second =
+            prepare_native_initial_argv("omp", "omp --yolo --continue", "s1").expect("prepare");
         assert_eq!(second, "omp --yolo --continue");
         restore_home(previous);
     }
@@ -229,7 +308,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().expect("lock");
         let (_dir, previous) = isolated_home();
         stage_native_initial_prompt("omp", "s2", "secret").expect("stage");
-        let command = apply_native_initial_prompt("claude", "claude", "s2");
+        let command = prepare_native_initial_argv("claude", "claude", "s2").expect("prepare");
         assert_eq!(command, "claude");
         restore_home(previous);
     }

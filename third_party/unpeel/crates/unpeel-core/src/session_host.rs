@@ -1360,11 +1360,13 @@ fn resume_agent_in_place(
         }
         return Err(error);
     }
-    if let Err(error) = guard
-        .writer
-        .write_all(&payload)
-        .and_then(|_| guard.writer.flush())
-    {
+    if let Err(error) = crate::omp_native_initial::submit_with_native_reservation(session_id, || {
+        guard
+            .writer
+            .write_all(&payload)
+            .and_then(|_| guard.writer.flush())
+            .map_err(|error| format!("Failed to submit agent relaunch command: {error}"))
+    }) {
         clear_runtime_launch_pending(
             session_id,
             expected_generation,
@@ -1378,9 +1380,8 @@ fn resume_agent_in_place(
         if let Some(marker) = hook_seed {
             marker.rollback();
         }
-        return Err(format!("Failed to submit agent relaunch command: {error}"));
+        return Err(error);
     }
-    crate::omp_native_initial::ack_native_initial_prompt(session_id)?;
     drop(guard);
 
     let manifest_update = update_manifest_session(session_id, |manifest| {
@@ -4793,11 +4794,14 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             cmd.args(["-l", "-i", "-c", &script_arg]);
         }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("Failed to spawn command: {e}"))?;
-        crate::omp_native_initial::ack_native_initial_prompt(&launch.session.id)?;
+        let child = crate::omp_native_initial::submit_with_native_reservation(
+            &launch.session.id,
+            || {
+                pair.slave
+                    .spawn_command(cmd)
+                    .map_err(|e| format!("Failed to spawn command: {e}"))
+            },
+        )?;
         drop(pair.slave);
 
         let writer = pair

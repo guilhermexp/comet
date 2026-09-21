@@ -5,12 +5,13 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use tempfile::TempDir;
+use unpeel_core::controller_api::{HostCreateSubmitMode, native_initial_startup_enabled};
 use zeron_workers_unpeel::{
     WorkerCompletionEvidence, WorkerParentNotificationKind, WorkersPresetSetting, WorkersSession,
     WorkersSessionCapabilities, begin_worker_parent_task_at, controller_mcp_is_booting_screen,
-    controller_mcp_is_briefing_screen_ready, controller_mcp_native_initial_from_presets,
-    controller_mcp_startup_prompt_response, pending_worker_parent_notifications_with_evidence_at,
-    register_worker_parent_at,
+    controller_mcp_is_briefing_screen_ready, controller_mcp_launch_briefing_next_action,
+    controller_mcp_native_initial_from_presets, controller_mcp_startup_prompt_response,
+    pending_worker_parent_notifications_with_evidence_at, register_worker_parent_at,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -100,8 +101,8 @@ fn run_spawn_command(
     command: &str,
     bin_dir: &Path,
     cwd: &Path,
-) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-    Ok(Command::new("sh")
+) -> Result<std::process::Output, String> {
+    Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -113,7 +114,8 @@ fn run_spawn_command(
                 std::env::var("PATH").unwrap_or_default()
             ),
         )
-        .output()?)
+        .output()
+        .map_err(|error| error.to_string())
 }
 
 fn native_executions(probe: &Path) -> u64 {
@@ -228,13 +230,14 @@ fn omp_native_startup_executes_the_literal_task_once_despite_mcp_warning()
     let warning_screen = "Connecting to MCP servers: graft…\nMCP error: graft failed\n❯";
     assert!(controller_mcp_is_booting_screen(warning_screen));
 
-    let output = run_spawn_command(&spawn, &bin, home.path())?;
+    let output = unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || {
+        run_spawn_command(&spawn, &bin, home.path())
+    })?;
     assert!(
         output.status.success(),
         "fake omp failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    unpeel_core::omp_native_initial::ack_native_initial_prompt(session_id)?;
     assert_eq!(
         native_executions(&probe),
         1,
@@ -242,6 +245,10 @@ fn omp_native_startup_executes_the_literal_task_once_despite_mcp_warning()
         String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(fs::read_to_string(probe.join("task"))?, LITERAL_TASK);
+    assert!(
+        unpeel_core::omp_native_initial::native_initial_prompt_attached(session_id),
+        "successful Host submit must persist the native receipt"
+    );
     Ok(())
 }
 
@@ -261,8 +268,9 @@ fn restart_does_not_replay_the_native_initial_task() -> Result<(), Box<dyn std::
         "omp --yolo",
         session_id,
     )?;
-    run_spawn_command(&first, &bin, home.path())?;
-    unpeel_core::omp_native_initial::ack_native_initial_prompt(session_id)?;
+    unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || {
+        run_spawn_command(&first, &bin, home.path())
+    })?;
     assert_eq!(native_executions(&probe), 1);
 
     fs::write(probe.join("native_executions"), "0\n")?;
@@ -300,24 +308,30 @@ fn failed_spawn_does_not_report_briefing_submitted() -> Result<(), Box<dyn std::
     let _home = IsolatedHome::new()?;
     let session_id = "omp-native-spawn-fail";
     unpeel_core::omp_native_initial::stage_native_initial_prompt("omp", session_id, LITERAL_TASK)?;
-
-    // Host currently ACKs inside apply before spawn. The public launch result
-    // must stay false when the real spawn/transport fails.
-    let argv = unpeel_core::omp_native_initial::apply_native_initial_prompt(
+    let argv = unpeel_core::omp_native_initial::prepare_native_initial_argv(
         "omp",
         "omp --yolo",
         session_id,
-    );
+    )?;
     assert!(
         argv.contains('@'),
         "prepare must still attach @file in argv: {argv}"
     );
-    let spawned = Command::new("sh").arg("-c").arg("exit 127").status()?;
-    assert!(!spawned.success(), "transport/spawn must actually fail");
-    let briefing_submitted =
-        unpeel_core::omp_native_initial::native_initial_prompt_attached(session_id);
+    let spawned = unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || {
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&argv)
+            .current_dir("/no/such/native-submit-cwd")
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
     assert!(
-        !briefing_submitted,
+        spawned.is_err(),
+        "prepared command must fail at the Host submission seam: {spawned:?}"
+    );
+    assert!(
+        !unpeel_core::omp_native_initial::native_initial_prompt_attached(session_id),
         "failed spawn must not report briefing_submitted"
     );
     assert!(
@@ -328,18 +342,108 @@ fn failed_spawn_does_not_report_briefing_submitted() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn paste_only_and_raw_do_not_use_native_startup() {
+fn missing_body_does_not_ack_a_surviving_pending() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = env_lock();
+    let _home = IsolatedHome::new()?;
+    let session_id = "omp-native-missing-body";
+    unpeel_core::omp_native_initial::stage_native_initial_prompt("omp", session_id, LITERAL_TASK)?;
+    fs::remove_file(unpeel_core::omp_native_initial::native_initial_message_path(
+        session_id,
+    ))?;
+    let spawn = unpeel_core::omp_native_initial::prepare_native_initial_argv(
+        "omp",
+        "omp --yolo",
+        session_id,
+    )?;
+    assert_eq!(spawn, "omp --yolo");
+    unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || Ok(()))?;
     assert!(
-        !unpeel_core::omp_native_initial::native_initial_is_authorized("omp", false),
-        "PasteOnly/Raw must keep their Host contracts; native startup is PasteAndSubmit only"
+        !unpeel_core::omp_native_initial::native_initial_prompt_attached(session_id),
+        "body ausente must not turn pending into attached"
     );
-    assert!(unpeel_core::omp_native_initial::native_initial_is_authorized("omp", true));
-    assert!(!unpeel_core::omp_native_initial::native_initial_is_authorized("claude", true));
+    Ok(())
+}
+
+#[test]
+fn ack_failure_after_submit_keeps_result_and_does_not_replay()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = env_lock();
+    let _home = IsolatedHome::new()?;
+    let session_id = "omp-native-ack-fail";
+    unpeel_core::omp_native_initial::stage_native_initial_prompt("omp", session_id, LITERAL_TASK)?;
+    let first = unpeel_core::omp_native_initial::prepare_native_initial_argv(
+        "omp",
+        "omp --yolo",
+        session_id,
+    )?;
+    assert!(first.contains('@'), "{first}");
+    let attached = unpeel_core::session_host::session_dir(session_id)
+        .join(unpeel_core::omp_native_initial::NATIVE_INITIAL_ATTACHED_FILE);
+    fs::create_dir(&attached)?;
+    let result =
+        unpeel_core::omp_native_initial::submit_with_native_reservation(session_id, || Ok("child"));
+    assert_eq!(
+        result.as_deref(),
+        Ok("child"),
+        "ACK failure after successful submit must keep the Host result: {result:?}"
+    );
+    assert!(
+        !unpeel_core::omp_native_initial::native_initial_prompt_pending(session_id),
+        "successful submit must consume the reservation even when the receipt cannot be persisted"
+    );
+    let second = unpeel_core::omp_native_initial::prepare_native_initial_argv(
+        "omp",
+        "omp --yolo --continue",
+        session_id,
+    )?;
+    assert!(
+        !second.contains('@'),
+        "ACK failure must not leave a replayable pending file: {second}"
+    );
+    Ok(())
+}
+
+#[test]
+fn paste_only_and_raw_keep_host_pty_contracts() {
+    assert!(
+        !native_initial_startup_enabled("omp", HostCreateSubmitMode::PasteOnly),
+        "PasteOnly must keep Host PTY contracts; native startup is PasteAndSubmit only"
+    );
+    assert!(
+        !native_initial_startup_enabled("omp", HostCreateSubmitMode::Raw),
+        "Raw must keep Host PTY contracts; native startup is PasteAndSubmit only"
+    );
+    assert!(native_initial_startup_enabled(
+        "omp",
+        HostCreateSubmitMode::PasteAndSubmit
+    ));
+    assert!(!native_initial_startup_enabled(
+        "claude",
+        HostCreateSubmitMode::PasteAndSubmit
+    ));
+}
+
+#[test]
+fn native_confirmation_failure_directs_inspection_not_resend() {
+    let next = controller_mcp_launch_briefing_next_action("sess-1", true);
+    let lower = next.to_ascii_lowercase();
+    assert!(
+        !lower.contains("without"),
+        "uncertain native confirmation must not claim the worker is WITHOUT its brief: {next}"
+    );
+    assert!(
+        !lower.contains("send_text"),
+        "uncertain native confirmation must not recommend blind resend: {next}"
+    );
+    assert!(
+        lower.contains("inspect"),
+        "uncertain native confirmation must direct inspection: {next}"
+    );
 }
 
 #[test]
 fn mcp_native_decision_matches_host_command_resolution() {
-    let presets = vec![
+    let presets = [
         catalog_preset("omp", "omp --yolo", true, None, Some("omp")),
         catalog_preset(
             "omp",

@@ -42,6 +42,8 @@ base_revision_resolves_upstream = false
 # reserving unknown-project 400 for IDs that were never registered.
 
 # 2026-09-21 — OMP native initial prompt: one-shot file + @file on first spawn
-# argv only (omp_native_initial). Prepare does not ACK; Host acks after spawn
-# or resume PTY submit. Native is PasteAndSubmit-only. Stored Session.command
-# is unchanged; restart does not replay. Does not bump local_modifications_count.
+# argv only (omp_native_initial). Prepare attaches only with a body. Host
+# claims `.pending` → `.claimed` immediately before spawn/PTY write via
+# submit_with_native_reservation; ACK after success must not drop the child.
+# Native is PasteAndSubmit-only. Stored Session.command is unchanged; restart
+# does not replay. Does not bump local_modifications_count.

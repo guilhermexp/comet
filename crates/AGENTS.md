@@ -18,7 +18,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
 - **OMP `launch_worker` briefing is native startup.** The Comet-owned controller
   lives in `workers-unpeel`; prepare/ACK of the one-shot `@file` lives in
-  vendored `unpeel-core::omp_native_initial` (ACK only after spawn). Regression
+  vendored `unpeel-core::omp_native_initial` (claim before spawn; ACK after
+  submit without abandoning the child). Regression
   seam: `cargo test -p zeron-workers-unpeel --test worker_initial_briefing`.
 - Live Voice é lifecycle da `engine`; a `ui` só projeta e controla, e navegação de Chat nunca manda stop. Em `Working`/`AwaitingInput`, a elegibilidade exige suporte OMP a contexto operacional silencioso; em `Idle`, um handle OMP estacionado permanece elegível com Live básico.
 

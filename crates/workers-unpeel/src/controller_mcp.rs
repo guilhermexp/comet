@@ -633,13 +633,7 @@ fn dispatch_action(
             });
             if let Some(error) = briefing_error {
                 response["briefing_error"] = error.into();
-                // A live worker with no instruction is worse than a failed
-                // launch: a caller that reads only `launched` leaves it idle,
-                // and its next send_text lands in whatever the runtime happens
-                // to be showing (observed 2026-08-27: the login shell).
-                response["next_action"] = json!(format!(
-                    "Worker {session_id} is live WITHOUT its brief. Deliver it with send_text_to_worker or call stop_worker; do not treat this launch as done."
-                ));
+                response["next_action"] = json!(launch_briefing_next_action(&session_id, native));
             }
             Ok(response)
         }
@@ -853,17 +847,31 @@ pub fn native_initial_from_presets(
     preset_id: &str,
     presets: &[crate::WorkersPresetSetting],
 ) -> bool {
-    let catalog: Vec<unpeel_core::omp_native_initial::CatalogPreset<'_>> = presets
-        .iter()
-        .map(|preset| unpeel_core::omp_native_initial::CatalogPreset {
-            id: &preset.id,
-            command: &preset.command,
-            enabled: preset.enabled,
-            project_id: preset.project_id.as_deref(),
-        })
-        .collect();
-    unpeel_core::omp_native_initial::resolve_enabled_preset_command(project_id, preset_id, &catalog)
-        .is_some_and(unpeel_core::omp_native_initial::uses_native_initial_delivery)
+    unpeel_core::omp_native_initial::resolve_enabled_preset_command(
+        project_id,
+        preset_id,
+        presets
+            .iter()
+            .map(|preset| unpeel_core::omp_native_initial::CatalogPreset {
+                id: &preset.id,
+                command: &preset.command,
+                enabled: preset.enabled,
+                project_id: preset.project_id.as_deref(),
+            }),
+    )
+    .is_some_and(unpeel_core::omp_native_initial::uses_native_initial_delivery)
+}
+
+pub fn launch_briefing_next_action(session_id: &str, native: bool) -> String {
+    if native {
+        format!(
+            "Worker {session_id} launched; native briefing confirmation is incomplete. Inspect the worker with inspect_worker or read_output before sending more input or assuming the task is missing."
+        )
+    } else {
+        format!(
+            "Worker {session_id} is live WITHOUT its brief. Deliver it with send_text_to_worker or call stop_worker; do not treat this launch as done."
+        )
+    }
 }
 
 fn confirm_native_initial_briefing(
@@ -877,6 +885,11 @@ fn confirm_native_initial_briefing(
             break;
         }
         if Instant::now() >= deadline {
+            if unpeel_core::omp_native_initial::native_initial_prompt_claimed(session_id) {
+                return Err(
+                    "native initial submission receipt is unconfirmed; inspect the worker before acting".into(),
+                );
+            }
             return Err("native initial task was not attached at startup".into());
         }
         std::thread::sleep(Duration::from_millis(50));

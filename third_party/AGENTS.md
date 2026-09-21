@@ -114,9 +114,12 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   em `third_party/unpeel`.
 - **OMP `initial_text` is native startup, not PTY follow-up.**
   `unpeel_core::omp_native_initial` stages a 0600 file under a 0700 session
-  dir. `prepare_native_initial_argv` appends `@file` without ACK;
-  `ack_native_initial_prompt` renames `.pending` → `.attached` only after
-  spawn or resume PTY submit succeeds. Native is PasteAndSubmit-only.
+  dir. `prepare_native_initial_argv` appends `@file` only when the body
+  exists. `submit_with_native_reservation` claims `.pending` → `.claimed`
+  immediately before spawn/PTY write, restores pending only on observed
+  pre-submit failure, and never ACKs a missing body. Successful submit keeps
+  the Host alive if receipt persistence fails (reservation stays consumed).
+  Native is PasteAndSubmit-only via `native_initial_startup_enabled`.
   `execute_headless_session_create` skips the historical PTY thread for OMP.
   Restart must not see a pending file. Prime-agent and other pi-family CLIs
   keep interactive delivery.

@@ -571,20 +571,17 @@ fn resolve_host_create(
         // Prefer a project-scoped row if a legacy catalog happens to contain
         // the same id globally too. Either way, preset selection wins over an
         // explicit command in the wire request, matching shipped clients.
-        let catalog: Vec<crate::omp_native_initial::CatalogPreset<'_>> = context
-            .presets
-            .iter()
-            .map(|preset| crate::omp_native_initial::CatalogPreset {
-                id: &preset.id,
-                command: &preset.command,
-                enabled: preset.enabled,
-                project_id: preset.project_id.as_deref(),
-            })
-            .collect();
         let command = crate::omp_native_initial::resolve_enabled_preset_command(
             project_id.as_str(),
             &preset_id,
-            &catalog,
+            context.presets.iter().map(|preset| {
+                crate::omp_native_initial::CatalogPreset {
+                    id: &preset.id,
+                    command: &preset.command,
+                    enabled: preset.enabled,
+                    project_id: preset.project_id.as_deref(),
+                }
+            }),
         )
         .ok_or_else(|| ControllerApiError::new(400, format!("unknown preset id: {preset_id}")))?;
         if command.len() > MAX_CREATE_COMMAND_BYTES || command.contains('\0') {
@@ -650,6 +647,13 @@ fn create_session(
     Ok(body)
 }
 
+/// Native `@file` startup is only for OMP PasteAndSubmit. PasteOnly/Raw keep
+/// the Host PTY contracts inside [`execute_headless_session_create`].
+pub fn native_initial_startup_enabled(command: &str, mode: HostCreateSubmitMode) -> bool {
+    crate::omp_native_initial::uses_native_initial_delivery(command)
+        && matches!(mode, HostCreateSubmitMode::PasteAndSubmit)
+}
+
 /// Standard TUI/headless create effect. Adapters wrap this in a
 /// [`HostCreateExecutor`] so they can capture their hook-listener port while
 /// router tests substitute a side-effect-free callback.
@@ -693,13 +697,7 @@ pub fn execute_headless_session_create(
         role: None,
         task: None,
     };
-    let native_initial = crate::omp_native_initial::native_initial_is_authorized(
-        &session.command,
-        matches!(
-            initial_text_submit_mode,
-            HostCreateSubmitMode::PasteAndSubmit
-        ),
-    );
+    let native_initial = native_initial_startup_enabled(&session.command, initial_text_submit_mode);
     if native_initial {
         if let Some(text) = initial_text.as_deref().filter(|text| !text.is_empty()) {
             if let Err(error) = crate::omp_native_initial::stage_native_initial_prompt(
