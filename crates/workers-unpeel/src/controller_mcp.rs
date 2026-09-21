@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::{
-    LocalWorkersClient, SessionAction, WorkersLaunchRequest, WorkersSession, WorkersSessionCommand,
+    InitialTextSubmitMode, LocalWorkersClient, SessionAction, WorkersLaunchRequest, WorkersSession,
+    WorkersSessionCommand,
 };
 
 pub const CONTROLLER_MCP_ARG: &str = "__workers_mcp__";
@@ -572,7 +573,7 @@ fn dispatch_action(
             }))
         }
         "launch_worker" => {
-            let (request, briefing) = parse_launch_briefing(arguments.clone())?;
+            let (mut request, briefing) = parse_launch_briefing(arguments.clone())?;
             validate_launch_target(client, &request)?;
             // Capture before spawning: a fast-failing CLI can exit before
             // `launch_session` returns its id. The id is unique, so this earlier
@@ -581,6 +582,15 @@ fn dispatch_action(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
+            let native = briefing
+                .as_ref()
+                .is_some_and(|_| launch_uses_native_initial(client, &request));
+            if native {
+                if let Some(text) = briefing.clone() {
+                    request =
+                        request.with_initial_text(text, InitialTextSubmitMode::PasteAndSubmit);
+                }
+            }
             let session_id = client
                 .launch_session(&request)
                 .map_err(|error| error.to_string())?;
@@ -603,9 +613,16 @@ fn dispatch_action(
             let mut briefing_error = None;
             if let Some(briefing) = &briefing {
                 let track_episode = tracks_task_episode(parent_chat_id, true);
-                if let Err(error) =
+                let delivery = if native {
+                    confirm_native_initial_briefing(
+                        &session_id,
+                        track_episode,
+                        registered_at_unix_ms,
+                    )
+                } else {
                     submit_initial_briefing(client, &session_id, briefing, track_episode)
-                {
+                };
+                if let Err(error) = delivery {
                     briefing_error = Some(error);
                 }
             }
@@ -819,6 +836,48 @@ fn wait_for_session_runtime(session_id: &str, wait: Duration) -> Result<String, 
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn launch_uses_native_initial(client: &LocalWorkersClient, request: &WorkersLaunchRequest) -> bool {
+    let Ok(bootstrap) = client.bootstrap() else {
+        return false;
+    };
+    let Some(preset_id) = request.preset_id.as_deref() else {
+        return false;
+    };
+    bootstrap
+        .presets
+        .iter()
+        .find(|preset| preset.id == preset_id)
+        .is_some_and(|preset| {
+            preset
+                .cli_id
+                .as_deref()
+                .is_some_and(unpeel_core::omp_native_initial::uses_native_initial_delivery)
+                || unpeel_core::omp_native_initial::uses_native_initial_delivery(&preset.command)
+        })
+}
+
+fn confirm_native_initial_briefing(
+    session_id: &str,
+    track_episode: bool,
+    submitted_at_unix_ms: u64,
+) -> Result<(), String> {
+    let deadline = Instant::now() + MANIFEST_WAIT;
+    loop {
+        if unpeel_core::omp_native_initial::native_initial_prompt_attached(session_id) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("native initial task was not attached at startup".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if track_episode {
+        let episode = crate::prepare_worker_parent_task(session_id, submitted_at_unix_ms)?;
+        crate::confirm_worker_parent_task_submission(session_id, episode)?;
+    }
+    Ok(())
 }
 
 fn submit_initial_briefing(
@@ -1294,7 +1353,7 @@ fn tool_definition() -> Value {
                 "status": { "type": "string", "description": "wait_for_status: the worker status to block on, as reported by list_workers and inspect_worker." },
                 "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: how long to block, chosen by you to fit the work (default 30, maximum 4h); expiration returns timed_out: true with a worker snapshot and a next hint as a normal read, not a failure. The wait is cancellable and does not block other actions." },
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
-                "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing submitted once the worker is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
+                "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing delivered once at launch. OMP receives it through native startup; other runtimes wait until the agent prompt is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
                 "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },
                 "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." },
                 "expected_old_fingerprint": { "type": "string", "description": "recover_project_identity: required fingerprint reported as the old side of the diagnosed conflict." },

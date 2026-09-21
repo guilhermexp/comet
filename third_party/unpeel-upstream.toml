@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "691ec40f54b483e53af0fefa9f966e676148b385"
+vendored_tree = "7ab336ebf058e52d1f807a0b79e49f2016f76be3"
 vendored_from = "working-tree"
 local_modifications_count = 31
 local_deletions = ["apps/website"]
@@ -40,3 +40,8 @@ base_revision_resolves_upstream = false
 # 2026-09-20 — controller_host retains reasons for registered projects omitted
 # from the executable catalog; controller_api returns 409 with that reason,
 # reserving unknown-project 400 for IDs that were never registered.
+
+# 2026-09-21 — OMP native initial prompt: one-shot file + @file on first spawn
+# argv only (omp_native_initial). Stored Session.command is unchanged; restart
+# does not replay. controller_api skips the historical PTY initial-text thread
+# for OMP. Does not bump local_modifications_count; vendored_tree is 7ab336eb.

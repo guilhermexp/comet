@@ -82,6 +82,12 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   process in their `mcpServers` list (resolved by zeron-harness's
   `workers_mcp.rs` and rendered into each runtime's dialect); it is NOT
   Unpeel's worker-to-worker MCP host.
+- **OMP receives `initial_text` at native startup.** `launch_worker` stages a
+  private one-shot file and the Host attaches `@file` on the first spawn argv
+  only. The stored Session command never carries the brief; restart/resume must
+  not replay it; `--auto-approve` is never added. Other runtimes keep the
+  guarded interactive PTY path. `tests/worker_initial_briefing.rs` is the
+  regression seam.
 - **Activity state machine is shared by include.** `activity_bridge.rs`
   includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
   nao forke a maquina de estados numa copia local; mude no proprio
@@ -450,6 +456,13 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 - New Workers capability: extend `LocalWorkersClient` + typed models here, then
   consume from `zeron-ui/src/workers/`.
+- **OMP launch briefing is native, not viewport-wait.** `launch_worker`
+  attaches sanitized `initial_text` onto the create request for OMP presets
+  only. The Host stages a one-shot file and consumes it via `@file` on first
+  spawn. Confirm `.attached` before claiming `briefing_submitted`; never infer
+  submit from PID. Capture parent `registered_at_unix_ms` before spawn so a
+  fast Stop still belongs to the episode. Restart must not replay. Interactive
+  PTY submit stays for other runtimes.
 - Changes that touch session lifecycle must preserve the durable-seed /
   runtime-generation semantics of the included activity state machine.
 - Platform-specific resource code goes in `resources/macos.rs` with the
@@ -512,6 +525,7 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 | `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
 | `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/worker_initial_briefing.rs` (5) — OMP native startup delivery, literal `@file` task, restart without replay, honest missing receipt, other-runtime shell/boot/menu guards | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

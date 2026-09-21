@@ -1198,6 +1198,11 @@ fn resume_agent_in_place(
         browser_mcp_enabled,
         computer_mcp_enabled,
     );
+    let startup_command = crate::omp_native_initial::apply_native_initial_prompt(
+        expected_runtime_id,
+        &startup_command,
+        session_id,
+    );
 
     let guard = runtime
         .lock()
@@ -4756,6 +4761,11 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                 launch.mcp_enabled,
                 launch.browser_mcp_enabled,
                 launch.computer_mcp_enabled,
+            );
+            let startup_command = crate::omp_native_initial::apply_native_initial_prompt(
+                runtime_id,
+                &startup_command,
+                &launch.session.id,
             );
             let startup_command =
                 runtime_generation_scoped_command(ShellFamily::Posix, &startup_command, 1);

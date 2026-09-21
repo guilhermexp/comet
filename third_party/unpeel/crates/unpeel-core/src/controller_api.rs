@@ -693,7 +693,25 @@ pub fn execute_headless_session_create(
         role: None,
         task: None,
     };
+    let native_initial = crate::omp_native_initial::uses_native_initial_delivery(&session.command);
+    if native_initial {
+        if let Some(text) = initial_text.as_deref().filter(|text| !text.is_empty()) {
+            if let Err(error) = crate::omp_native_initial::stage_native_initial_prompt(
+                &session.command,
+                &session_id,
+                text,
+            ) {
+                log::warn!("session {session_id} native initial prompt staging failed: {error}");
+            }
+        }
+    }
     session_ops::spawn_session(session, &cwd, hook_port, initial_columns, initial_rows)?;
+    if native_initial {
+        return Ok(HostCreateOutcome {
+            session_id,
+            session: None,
+        });
+    }
     if let Some(initial_text) = initial_text.filter(|text| !text.is_empty()) {
         let mode = match initial_text_submit_mode {
             HostCreateSubmitMode::PasteOnly => session_ops::InitialTextSubmitMode::PasteOnly,
