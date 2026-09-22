@@ -7,11 +7,11 @@
 ## 2. Validation and delivery
 
 - [x] 2.1 Update affected DOX and vendor provenance; run formatter before final gate, typecheck, focused gate and the canonical workspace suite, then commit and capture the production build receipt.
-- [ ] 2.2 Main reviews source/security, integrates without touching existing WIP and updates the installed Comet atomically.
-- [ ] 2.3 Main observes OMP executing its initial task through installed launch_worker without a later task send.
-- [ ] 2.4 Main observes Claude executing its initial task through installed launch_worker without a later task send.
-- [ ] 2.5 Main observes Pi executing its initial task through installed launch_worker without a later task send.
-- [ ] 2.6 Main observes Codex executing its initial task through installed launch_worker without a later task send.
-- [ ] 2.7 Record honest permission/authentication interactions and limits, verify no replay, clean up only probe processes/data, and reconcile this checklist from observed results.
+- [x] 2.2 Main reviews source/security, integrates without touching existing WIP and updates the installed Comet atomically.
+- [x] 2.3 Main observes OMP executing its initial task through installed launch_worker without a later task send.
+- [x] 2.4 Main observes Claude executing its initial task through installed launch_worker without a later task send.
+- [x] 2.5 Main observes Pi executing its initial task through installed launch_worker without a later task send.
+- [x] 2.6 Main observes Codex executing its initial task through installed launch_worker without a later task send.
+- [x] 2.7 Record honest permission/authentication interactions and limits, verify no replay, clean up only probe processes/data, and reconcile this checklist from observed results.
 
 Final fingerprint-bound receipts and independent acceptance are recorded in the work ticket after this source checklist is frozen. Keeping that final state in the ticket avoids invalidating its own evidence by changing a source checkbox.
