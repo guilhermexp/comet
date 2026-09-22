@@ -58,9 +58,8 @@ use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX,
     DETAILS_SIDEBAR_MIN, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId, SidebarOrganization,
-    SidebarSort, TERMINAL_DEFAULT_HEIGHT, TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT, UiSettings,
-    badge_combo, jump_hints_visible, modifier_send_hint_visible, platform_combo,
-    sidebar_pin_profile_key,
+    SidebarSort, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
+    platform_combo, sidebar_pin_profile_key,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -115,6 +114,7 @@ pub struct JumpSession(pub usize);
 /// Restore a default focus only after an in-flight handoff has had a frame to
 /// claim the window. A synchronous focus-lost fallback can otherwise steal
 /// focus from controls that are mounting in response to the same input event.
+#[cfg(test)]
 pub(crate) fn restore_focus_if_empty_on_next_frame<T: 'static>(
     focus: FocusHandle,
     window: &mut Window,
@@ -221,7 +221,6 @@ const PANE_RESIZE_HITBOX_TOP: f32 = Theme::TITLEBAR_HEIGHT;
 /// Chrome layers that paint full-bleed at a window edge round their own
 /// backgrounds with it — see [`Shell::window_corner_radius`].
 pub(crate) const LINUX_WINDOW_CORNER_RADIUS: f32 = 10.0;
-const TERMINAL_RESIZE_HITBOX_HEIGHT: f32 = 10.0;
 
 fn stable_panel_content_width(target: f32, transition: Option<(f32, f32)>) -> f32 {
     transition.map(|(from, to)| from.max(to)).unwrap_or(target)
@@ -1221,7 +1220,6 @@ enum PaneResizeKind {
     Right,
     Files,
     Details,
-    Terminal,
 }
 
 /// Resolve one pointer sample while keeping the persisted width legal. The
@@ -1406,9 +1404,6 @@ impl Render for SurfaceTabTooltip {
         crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
     }
 }
-/// Drag marker for the terminal-panel height handle.
-struct TerminalResize;
-
 /// Invisible drag ghost — resize drags and contained pinned-session reorders
 /// render nothing at the cursor.
 struct DragGhost;
@@ -2069,10 +2064,6 @@ pub struct Shell {
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
-    /// Archived slim row under the pointer — swaps its time label for the
-    /// Unarchive affordance and restores the dimmed harness mark (t3code's
-    /// settled-row hover).
-    pub(super) archived_hover: Option<String>,
     /// The jump-hint overlay is visible while the held modifiers exactly
     /// match a jump shortcut. Window deactivation clears it.
     pub(super) jump_hints: bool,
@@ -2308,7 +2299,6 @@ pub struct Shell {
     /// width target ([`Self::right_target`] has no `Window`).
     viewport_width: f32,
     viewport_height: f32,
-    terminal_tween: Option<WidthTween>,
     /// Last observed `window.is_fullscreen()` (`None` before first paint) —
     /// flips key the traffic-light inset tween.
     fullscreen: Option<bool>,
@@ -2784,7 +2774,6 @@ impl Shell {
             pinned_open: true,
             sessions_open: true,
             archived_shown: 0,
-            archived_hover: None,
             jump_hints: false,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
@@ -2928,7 +2917,6 @@ impl Shell {
             right_pane_expanded: false,
             viewport_width: 1280.0,
             viewport_height: 880.0,
-            terminal_tween: None,
             fullscreen: None,
             titlebar_tween: None,
             titlebar_island: None,
@@ -3542,20 +3530,6 @@ impl Shell {
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
         cx.notify();
-    }
-
-    /// Closing the last surface tab closes the surface host; a docked
-    /// explorer keeps its own column.
-    fn collapse_surfaces_if_empty(&mut self, panel_key: &str, cx: &mut Context<Self>) {
-        if panel_key == self.panel_key(cx)
-            && self.right_tabs.get(panel_key).is_none_or(Vec::is_empty)
-        {
-            let from = self.right_visible_width(cx);
-            if self.panels.hide(panel_key) {
-                self.suspend_file_images(cx);
-                self.finish_right_transition(from, cx);
-            }
-        }
     }
 
     /// Show or hide the surface host portion of the right pane. A no-op when
@@ -5082,9 +5056,7 @@ impl Shell {
         match kind {
             PaneResizeKind::Sidebar => self.sidebar_resize_edge = None,
             PaneResizeKind::Right => self.right_resize_edge = None,
-            // The fork's terminal is a right-pane tab: no bottom-dock drag
-            // anchor to clear.
-            PaneResizeKind::Terminal | PaneResizeKind::Files | PaneResizeKind::Details => {}
+            PaneResizeKind::Files | PaneResizeKind::Details => {}
         }
     }
 
@@ -5646,11 +5618,6 @@ impl Shell {
                         },
                     ));
                     self.shortcuts_page = Some(page);
-                }
-                if let Some(page) = &self.shortcuts_page {
-                    page.update(cx, |page, _| {
-                        page.show_appshots(section == SettingsSection::Appshots)
-                    });
                 }
                 match &self.shortcuts_page {
                     Some(page) => {
@@ -14182,7 +14149,6 @@ mod tests {
     fn pane_resize_hitboxes_yield_the_titlebar_chrome() {
         assert_eq!(PANE_RESIZE_HITBOX_TOP, Theme::TITLEBAR_HEIGHT);
         assert_eq!(PANE_RESIZE_HITBOX_HALF_WIDTH * 2.0, 12.0);
-        assert_eq!(TERMINAL_RESIZE_HITBOX_HEIGHT, 10.0);
     }
 
     #[test]

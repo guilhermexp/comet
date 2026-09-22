@@ -826,7 +826,6 @@ impl Composer {
         path: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::attachments;
         let device = self
             .state
             .read(cx)
@@ -1984,7 +1983,7 @@ mod tests {
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
-    use gpui::{AppContext, ScrollHandle, TestAppContext, point};
+    use gpui::{ScrollHandle, TestAppContext, point};
 
     struct QueueScrollTestView {
         queue: ScrollHandle,

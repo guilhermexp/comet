@@ -1,29 +1,9 @@
 name: Windows tests
 
+# Fork: manual only. `crates/workers-unpeel` (fork-only) is Unix-only today
+# (std::os::unix / std::os::fd without cfg), so an automatic Windows build
+# would fail on every push. Re-enable push/pull_request once it is portable.
 on:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'apps/zeron/**'
-      - 'dist/windows/**'
-      - 'crates/**'
-      - 'scripts/test-windows-*.ps1'
-      - 'scripts/package-windows.ps1'
-      - '.github/workflows/windows.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'apps/zeron/**'
-      - 'dist/windows/**'
-      - 'crates/**'
-      - 'scripts/test-windows-*.ps1'
-      - 'scripts/package-windows.ps1'
-      - '.github/workflows/windows.yml'
   workflow_dispatch:
     inputs:
       native_gui:

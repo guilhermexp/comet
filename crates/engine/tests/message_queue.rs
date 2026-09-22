@@ -504,6 +504,69 @@ async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
     core.shutdown().await;
 }
 
+/// Fork contract: a Worker notification is an app-owned delivery to its
+/// parent chat. When Cancel freezes the queue, the user's rows keep waiting
+/// for an explicit send, but a held Worker notification still goes out as the
+/// next turn instead of sitting behind a pause nobody will lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frozen_queue_still_delivers_worker_notifications() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+
+    core.doc_host
+        .queue_message(CHAT, "user follow-up", Vec::new())
+        .expect("queue user row");
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Steer {
+                prompt: "worker finished".into(),
+                message_id: Some("worker-notify-message:worker-1:event-1".into()),
+            },
+        )
+        .expect("queue worker notification");
+    wait_for(
+        || queue_texts(&core) == vec!["user follow-up", "worker finished"],
+        "both rows to be held behind the running turn",
+    )
+    .await;
+
+    core.doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .expect("queue interrupt");
+    wait_for(
+        || {
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "worker finished")
+        },
+        "the worker notification to be delivered despite the frozen queue",
+    )
+    .await;
+    assert_eq!(queue_texts(&core), vec!["user follow-up"]);
+    assert!(
+        !prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "user follow-up"),
+        "Cancel must still freeze what the user typed"
+    );
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 /// A `Steer` command asks for the running turn directly — a client that decided
 /// for itself, and the path a question's follow-up prompt takes. It obeys the
 /// same rule as a typed message: a turn-boundary agent's mailbox is not read

@@ -35,6 +35,7 @@ pub fn faces(text: &str) -> Vec<(Range<usize>, Face)> {
 /// Highlight fenced code with its own grammar. Running the Markdown grammar
 /// over the whole draft colors fence bodies as strings, including identifiers.
 /// Keep prose and fence markers neutral, and retain exact source byte offsets.
+#[cfg(test)]
 pub fn syntax_spans(text: &str) -> Vec<zeron_syntax::HighlightSpan> {
     if text.len() > 128 * 1024 {
         return Vec::new();
@@ -72,6 +73,7 @@ pub fn syntax_spans(text: &str) -> Vec<zeron_syntax::HighlightSpan> {
     result
 }
 
+#[cfg(test)]
 fn highlight_code_body(
     source: &str,
     language: &str,

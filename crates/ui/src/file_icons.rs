@@ -13,7 +13,7 @@ use rust_embed::RustEmbed;
 use serde::Deserialize;
 use zeron_syntax::LanguageId;
 
-use crate::theme::{Appearance, Theme};
+use crate::theme::Appearance;
 
 const ASSET_PREFIX: &str = "file-icons/";
 
@@ -35,18 +35,6 @@ fn dark_icon_svg(svg: &str) -> String {
             .replace(&original.to_ascii_lowercase(), brighter);
     }
     svg
-}
-
-/// Neutral seat for a polychrome file icon. Callers choose where a well is
-/// appropriate; its counter-shade stays visible in both appearances without
-/// tinting the authored artwork. Frost needs more coverage because the
-/// backdrop beneath the translucent surface can vary.
-pub(crate) fn well_bg(theme: &Theme) -> gpui::Hsla {
-    let alpha = if theme.is_frost() { 0.32 } else { 0.16 };
-    match theme.appearance {
-        Appearance::Dark => crate::theme::grey(0).opacity(alpha),
-        Appearance::Light => crate::theme::grey(255).opacity(alpha),
-    }
 }
 
 #[derive(RustEmbed)]

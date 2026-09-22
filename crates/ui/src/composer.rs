@@ -943,6 +943,7 @@ fn escape_dismisses_completion(key: &str, completion_open: bool) -> bool {
     key == "escape" && completion_open
 }
 
+#[cfg(test)]
 fn wizard_escape_goes_back(key: &str, input_focused: bool, input_empty: bool) -> bool {
     key == "escape" && (!input_focused || input_empty)
 }

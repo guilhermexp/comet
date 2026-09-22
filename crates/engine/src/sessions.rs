@@ -3490,6 +3490,12 @@ async fn drive_run(
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
             }
+            // The composer's context indicator reads the session row, not the
+            // doc meta; missing fields keep the previous measurement (merge).
+            inner.set_context_usage(
+                &chat_id,
+                zeron_proto::ContextUsage::reported(*tokens, *window),
+            );
             continue;
         }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT

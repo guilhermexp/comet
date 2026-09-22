@@ -1034,7 +1034,7 @@ pub(super) mod pinned_session_tests {
         let (host, cx) = cx.add_window_view(|_, cx| {
             PinnedHost(cx.new(|cx| {
                 let state = cx.new(|_| AppState::new());
-                let mut shell = crate::shell::test_shell(
+                let shell = crate::shell::test_shell(
                     state,
                     EngineBootConfig {
                         data_dir: dir.path().into(),
@@ -1973,11 +1973,6 @@ fn promote_local_device_group<T>(
         let local = groups.remove(index);
         groups.insert(0, local);
     }
-}
-
-/// Shared quiet rule for sidebar groups and palette sections.
-pub(super) fn sidebar_separator(theme: &Theme) -> gpui::Div {
-    div().h(px(1.0)).bg(theme.border.opacity(0.6))
 }
 
 fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyElement) -> gpui::Div {

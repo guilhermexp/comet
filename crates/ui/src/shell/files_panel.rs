@@ -96,11 +96,6 @@ impl Shell {
         self.files_visible_width(cx)
     }
 
-    pub(super) fn surface_max_width(&self, cx: &App) -> f32 {
-        self.files_layout(self.files_visible_width(cx), cx)
-            .surface_max
-    }
-
     pub(super) fn right_visible_width(&self, cx: &App) -> f32 {
         let available =
             (self.viewport_width - self.sidebar_now() - self.files_visible_width(cx)).max(0.0);

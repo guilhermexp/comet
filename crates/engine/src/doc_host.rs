@@ -1504,13 +1504,6 @@ impl DocHost {
                 // commit lands in the client when connected, else in the
                 // pending buffer the join drains — nothing composed during
                 // (or before) the dial is lost to the room.
-                // A one-time full replay heals history stranded by older clients.
-                // Its durable marker is independent of the download cursor.
-                if !self.inner.store.chat_outbox_initialized(chat_id)? {
-                    let updates = crate::chat2_host::publication_updates(doc.doc())
-                        .map_err(EngineError::Other)?;
-                    self.inner.store.initialize_chat_outbox(chat_id, &updates)?;
-                }
                 let weak_push = Arc::downgrade(&handle);
                 let publication_store = self.inner.store.clone();
                 let publication_chat = chat_id.to_string();
@@ -1522,11 +1515,6 @@ impl DocHost {
                             // lock (verify pass: releasing it between the None
                             // check and the push let the join's store+drain
                             // slip between, orphaning the update forever).
-                            let batch_id = uuid::Uuid::new_v4().to_string();
-                            if let Err(err) = publication_store.enqueue_chat_update(&publication_chat, &batch_id, bytes) {
-                                handle.publication_failed.store(true, Ordering::Release);
-                                tracing::error!(chat = %publication_chat, %err, "chat2: durable outbox write failed");
-                            }
                             let client_guard = lock(&handle.chat2);
                             let batch_id = uuid::Uuid::new_v4().to_string();
                             if let Err(err) = publication_store.enqueue_chat_update(
@@ -3320,6 +3308,12 @@ impl DocHost {
         // unnecessary while it waited simply finds nothing to do.
         let _drain = handle.drain_lock.lock().await;
         if handle.queue_paused.load(Ordering::Acquire) {
+            // A paused queue (after Cancel/recovery) holds what the USER typed.
+            // Worker lifecycle notifications are app-owned deliveries to the
+            // parent chat; the fork always delivered them as the next turn, so
+            // they must not sit behind a pause nobody will lift.
+            self.drain_paused_worker_notifications(&sessions, handle)
+                .await;
             return;
         }
         loop {
@@ -3377,6 +3371,40 @@ impl DocHost {
                 handle.publish_queue();
                 return;
             }
+        }
+    }
+
+    /// While the queue is paused, release only Worker notifications (message
+    /// ids minted by `workers::model::parent_notification_rpc_params`), oldest
+    /// first, one turn at a time. User rows keep waiting for an explicit send.
+    async fn drain_paused_worker_notifications(
+        &self,
+        sessions: &SessionsEngine,
+        handle: &Arc<ChatDocHandle>,
+    ) {
+        if sessions.turn_in_flight(&handle.chat_id) {
+            return;
+        }
+        let Ok(queue) = handle.doc.read_queue() else {
+            return;
+        };
+        let Some(next) = queue
+            .into_iter()
+            .find(|item| is_worker_notification_id(&item.id) && item.delivery_gate.is_none())
+        else {
+            return;
+        };
+        let Ok(Some(item)) = handle.doc.take_queued(&next.id) else {
+            return;
+        };
+        handle.publish_queue();
+        if let Err(err) = self
+            .dispatch_queued(handle, &item, QueueSend::NextTurn)
+            .await
+        {
+            tracing::warn!(chat = %handle.chat_id, error = %err, "queued worker notification failed");
+            let _ = handle.doc.insert_queued(0, &item);
+            handle.publish_queue();
         }
     }
 
@@ -5028,6 +5056,14 @@ fn rewrite_attachment_reference(prompt: &str, source: &str, target: &str) -> Str
             &format!("image=\"{}\"", attribute(target)),
         )
         .replace(source, target)
+}
+
+/// Message ids of app-owned Worker parent notifications
+/// (`crates/ui/src/workers/model.rs::parent_notification_rpc_params`).
+const WORKER_NOTIFICATION_ID_PREFIX: &str = "worker-notify-message:";
+
+fn is_worker_notification_id(id: &str) -> bool {
+    id.starts_with(WORKER_NOTIFICATION_ID_PREFIX)
 }
 
 #[cfg(test)]

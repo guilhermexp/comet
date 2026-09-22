@@ -3695,6 +3695,79 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
     );
 }
 
+/// OpenCode/ACP report occupancy through the dedicated `ContextUsage` event
+/// (upstream v0.2.83), not `Usage`. The composer gauge reads the session row,
+/// so that event must reach it too, not only the chat doc's meta.
+#[tokio::test]
+async fn context_usage_event_reaches_the_session_row() {
+    struct ReportsContextEvent;
+
+    #[async_trait]
+    impl Harness for ReportsContextEvent {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Context event"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let script = vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-ctx".into(),
+                    assistant_message_id: format!("a-{}", request.prompt),
+                },
+                AgentEvent::ContextUsage {
+                    tokens: Some(42_000),
+                    window: Some(200_000),
+                },
+                AgentEvent::TextDelta { text: "ok".into() },
+                done(DoneStatus::Completed),
+            ];
+            Ok(futures::stream::iter(script.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ReportsContextEvent));
+    let watch = core.sessions.watch_sessions();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-context-event",
+        SessionCommandPayload::Run {
+            request: run_request("measure"),
+            message_id: "m-context-event".into(),
+        },
+    );
+    let expected = zeron_proto::ContextUsage::reported(Some(42_000), Some(200_000));
+    wait_for(
+        || watch.borrow().first().and_then(|s| s.context_usage) == Some(expected),
+        "the ContextUsage event to reach the session row",
+    )
+    .await;
+    core.shutdown().await;
+}
+
 /// Regression: turn 2 spawns a fresh runtime process that has not reported a
 /// context snapshot yet. The session row feeding the composer gauge must keep
 /// the last known measurement across the boundary — dropping it flipped the
