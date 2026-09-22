@@ -450,23 +450,28 @@ fn project_terminal_fallback(raw: &str, max_bytes: usize) -> String {
     truncate_tail(projected.trim(), max_bytes)
 }
 
-fn semantic_output(session_id: &str, raw: &str, max_bytes: usize) -> String {
-    let rows = unpeel_core::terminal_viewport::read_terminal_viewport_snapshot(
-        session_id.to_owned(),
-        220,
-        120,
-        Some(256 * 1024),
-        Some(0),
-        Some(120),
-    )
-    .ok()
-    .map(|snapshot| {
-        snapshot
-            .viewport_rows
-            .into_iter()
-            .map(|row| row.text)
-            .collect()
-    });
+/// Read terminal text for both controller tools and parent notifications.
+pub fn worker_output_text(session_id: &str, raw: &str, max_bytes: usize) -> String {
+    let rows =
+        unpeel_core::session_host::request_current_viewport_snapshot(session_id, 0, Some(120))
+            .or_else(|_| {
+                unpeel_core::terminal_viewport::replay_terminal_viewport_snapshot(
+                    session_id.to_owned(),
+                    220,
+                    120,
+                    Some(256 * 1024),
+                    Some(0),
+                    Some(120),
+                )
+            })
+            .ok()
+            .map(|snapshot| {
+                snapshot
+                    .viewport_rows
+                    .into_iter()
+                    .map(|row| row.text)
+                    .collect()
+            });
     choose_semantic_output(raw, rows, max_bytes)
 }
 
@@ -648,7 +653,7 @@ fn dispatch_action(
             let output = client
                 .read_output(&session.id, None, 0)
                 .map(|output| {
-                    semantic_output(
+                    worker_output_text(
                         &session.id,
                         &String::from_utf8_lossy(&output.data),
                         16 * 1024,
@@ -667,7 +672,7 @@ fn dispatch_action(
                 "offset": output.offset,
                 "next_offset": output.next_offset,
                 "truncated_upstream": output.truncated,
-                "text": semantic_output(
+                "text": worker_output_text(
                     &session.id,
                     &String::from_utf8_lossy(&output.data),
                     64 * 1024

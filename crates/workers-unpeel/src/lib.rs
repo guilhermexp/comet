@@ -18,6 +18,7 @@ pub mod worktree_config;
 
 pub use controller_mcp::{
     CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,
+    worker_output_text,
 };
 #[doc(hidden)]
 pub use hook_migration::remove_legacy_hook_root_at;

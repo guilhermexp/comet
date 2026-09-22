@@ -330,14 +330,14 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   carregava 9 espaços herdados da indentação do fonte. Teste checa indentação
   linha a linha, porque `contains("```\n…")` casa a cerca sem enxergar o que vem
   antes dela — foi assim que o teste antigo passou com o markdown quebrado.
-- **`\r` no output tail é retorno de carro, não "mais um controle".** Um TUI
-  repinta a status line dezenas de vezes e o journal guarda cada repaint;
-  `clean_output` tira o ANSI mas mantém o `\r`, então mapeá-lo para espaço junto
-  com os outros concatenava todas as versões numa linha só. Fica o último paint,
-  que é o que um terminal mostraria. Simplificação conhecida: o último segmento
-  vence inteiro, e um repaint mais curto que o anterior deixaria cauda visível
-  num terminal de verdade — status line redesenha do mesmo tamanho, então não
-  paga um emulador aqui.
+- **MCP e notificações usam `worker_output_text`, não repinturas ANSI como log.**
+  O texto vem do snapshot atual do Host, sem impor uma geometria fictícia.
+  PTY e emulador começam com os mesmos `initial_cols`/`initial_rows`; nascer
+  em 80×24 quando o processo usa 120×40 apaga respostas durante repinturas.
+  Host indisponível mantém o replay limitado anterior; a geometria histórica
+  não é exata sem um histórico de resize. O formatter continua sanitizando
+  campos, controles e cercas de Markdown, mas recebe o texto já interpretado.
+  Não é screenshot, OCR nem transcript estruturado do provider.
 - **O prompt de notificação é markdown, e a quebra de linha do output tail é
   conteúdo.** `build_worker_parent_notification_prompt` monta título + bullets +
   bloco de código cercado; `safe_prompt_field` continua achatando os campos de
@@ -474,6 +474,7 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 ## Verification
 
 Run all: `cargo test -p zeron-workers-unpeel` (part of the publish gate).
+Regressão de saída: `cargo test -p zeron-workers-unpeel --test controller_mcp worker_output_preserves_answer_when_repaints_depend_on_terminal_width` preserva a resposta literal após repinturas que dependem da largura real.
 Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 
 **O socket aceito do ingress de hook precisa voltar a bloquear.** O listener é

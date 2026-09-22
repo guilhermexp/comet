@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "c0f2712b7dc3b44ca8aa560d562272f3a3df64df"
+vendored_tree = "6804915f2a7d15031d82a1147a812203cbac93e9"
 vendored_from = "working-tree"
 local_modifications_count = 31
 local_deletions = ["apps/website"]
@@ -56,3 +56,7 @@ base_revision_resolves_upstream = false
 # Before exec, the managed wrapper removes only PATH entries resolving to
 # itself by file identity; configured upstream executable/argv remain intact.
 # The external-launcher regression runs in worker_initial_briefing.
+#
+# 2026-09-22 — session_host initializes the PTY and terminal viewport with the
+# same launch geometry. A fixed 80x24 viewport lost final answers emitted by a
+# 120x40 worker before desktop attach. Proven via the Comet adapter and real OMP.

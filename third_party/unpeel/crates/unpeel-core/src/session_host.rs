@@ -4644,11 +4644,13 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             updated_at: current_timestamp_ms(),
         })?;
 
+        let initial_cols = launch.initial_cols.filter(|cols| *cols >= 2).unwrap_or(80);
+        let initial_rows = launch.initial_rows.filter(|rows| *rows >= 2).unwrap_or(24);
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: launch.initial_rows.filter(|rows| *rows >= 2).unwrap_or(24),
-                cols: launch.initial_cols.filter(|cols| *cols >= 2).unwrap_or(80),
+                rows: initial_rows,
+                cols: initial_cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -4863,10 +4865,10 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             } else {
                 0
             }));
-        let mut viewport_state = TerminalViewportState::new(80, 24);
+        let mut viewport_state = TerminalViewportState::new(initial_cols, initial_rows);
         viewport_state.reset_at_output_offset(
-            80,
-            24,
+            initial_cols,
+            initial_rows,
             journal_start_offset,
             journal_start_offset > 0,
         );

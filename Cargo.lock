@@ -11838,6 +11838,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "libc",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

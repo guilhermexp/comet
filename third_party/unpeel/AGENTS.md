@@ -912,3 +912,11 @@ exist.
 ## Fork hook verification
 
 `runtimes/setup_conformance_tests.rs` executes every owned shell hook with explicit proxy variables and empty proxy exclusions. CaptureServer verifies direct loopback delivery and the persisted `last-hook-event.json` event and generation.
+
+## Comet worker output geometry
+
+The session Host initializes its PTY and `TerminalViewportState` from the same
+validated launch columns/rows, including resumed Hosts. A hard-coded 80×24
+emulator corrupts output from a 120×40 PTY before any desktop attach. Text-only
+controllers use `request_current_viewport_snapshot`; a virtual resized replay
+cannot substitute for the live grid when cursor movement depends on wrapping.

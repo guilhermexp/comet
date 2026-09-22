@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
-use std::sync::Mutex;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
     WorkerCompletionEvidence, WorkersSession, WorkersSessionCapabilities,
@@ -227,6 +227,76 @@ fn semantic_fallback_interprets_repaints_and_removes_controls() {
     assert!(!semantic.chars().any(char::is_control));
 }
 
+#[cfg(unix)]
+#[test]
+fn worker_output_preserves_answer_when_repaints_depend_on_terminal_width() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use unpeel_core::session_host::{SessionHostCommand, SessionHostResponse, socket_path};
+    use unpeel_core::terminal_viewport::TerminalViewportState;
+
+    let _lock = ENV_LOCK.lock();
+    let home = tempfile::Builder::new()
+        .prefix("out-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    let socket = socket_path("output-smoke");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // The footer wraps at the real width. Clearing its two rows must not erase
+    // the answer above it, as a replay at an invented wider width would.
+    let raw = "RESULTADO: 527\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x1b[2K\r\x1b[1A\x1b[2K\r";
+    let host = std::thread::spawn(move || {
+        let mut terminal = TerminalViewportState::new(20, 5);
+        terminal.feed(raw.as_bytes());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("viewport request did not arrive: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        let SessionHostCommand::ViewportSnapshot {
+            cols,
+            rows,
+            scroll_offset_rows,
+            viewport_rows,
+        } = serde_json::from_str(&request).unwrap()
+        else {
+            panic!("expected viewport request");
+        };
+        let snapshot = if cols == 0 && rows == 0 {
+            terminal.snapshot(scroll_offset_rows, viewport_rows)
+        } else {
+            terminal.snapshot_resized(cols, rows, scroll_offset_rows, viewport_rows)
+        };
+        let response = SessionHostResponse {
+            ok: true,
+            error: None,
+            viewport: Some(snapshot),
+            activity_token: None,
+        };
+        writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+    });
+    let text = zeron_workers_unpeel::worker_output_text("output-smoke", raw, 4096);
+    host.join().unwrap();
+    assert_eq!(text, "RESULTADO: 527");
+}
+
 #[test]
 fn known_startup_prompts_are_dismissed_before_submitting_the_brief() {
     assert_eq!(
@@ -369,7 +439,7 @@ impl Drop for UnpeelHomeGuard {
 
 #[test]
 fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let _lock = ENV_LOCK.lock();
     let home = TempDir::new()?;
     fs::write(
         home.path().join("app-state.json"),
@@ -413,7 +483,7 @@ fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error:
 #[test]
 fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
 -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let _lock = ENV_LOCK.lock();
     let home = TempDir::new()?;
     fs::write(
         home.path().join("app-state.json"),
@@ -471,7 +541,7 @@ fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
 #[test]
 fn add_project_registers_an_unlisted_checkout_and_is_idempotent()
 -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let _lock = ENV_LOCK.lock();
     let home = TempDir::new()?;
     fs::write(
         home.path().join("app-state.json"),
@@ -568,7 +638,7 @@ fn add_project_registers_an_unlisted_checkout_and_is_idempotent()
 
 #[test]
 fn controller_mcp_prepares_the_current_binary_as_session_host() {
-    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let _lock = ENV_LOCK.lock();
     let previous = std::env::var_os("UNPEEL_HOST_CMD");
     // SAFETY: this test binary serializes its environment mutations with ENV_LOCK.
     unsafe { std::env::remove_var("UNPEEL_HOST_CMD") };
@@ -590,7 +660,7 @@ fn controller_mcp_prepares_the_current_binary_as_session_host() {
 
 #[test]
 fn controller_authority_marker_is_consumed_before_workers_launch() {
-    let _lock = ENV_LOCK.lock().expect("environment test lock");
+    let _lock = ENV_LOCK.lock();
     let previous = std::env::var_os("COMET_WORKERS_CONTROLLER");
     // SAFETY: this test binary serializes its environment mutations with ENV_LOCK.
     unsafe { std::env::set_var("COMET_WORKERS_CONTROLLER", "1") };
@@ -609,7 +679,7 @@ fn controller_authority_marker_is_consumed_before_workers_launch() {
 
 #[test]
 fn controller_parent_chat_identity_is_consumed_before_worker_descendants_spawn() {
-    let _lock = ENV_LOCK.lock().expect("environment test lock");
+    let _lock = ENV_LOCK.lock();
     let previous = std::env::var_os("COMET_WORKERS_PARENT_CHAT_ID");
     // SAFETY: this test binary serializes its environment mutations with ENV_LOCK.
     unsafe { std::env::set_var("COMET_WORKERS_PARENT_CHAT_ID", " parent-chat-1 ") };
@@ -738,7 +808,7 @@ fn workers_serve_answers_ping_while_a_request_is_pending_and_drops_cancelled_req
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for SharedWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            self.0.lock().extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -773,7 +843,7 @@ fn workers_serve_answers_ping_while_a_request_is_pending_and_drops_cancelled_req
     )
     .expect("serve drains its input");
 
-    let written = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let written = String::from_utf8(output.lock().clone()).unwrap();
     let ids: Vec<serde_json::Value> = written
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["id"].clone())
