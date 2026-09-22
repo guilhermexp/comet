@@ -1135,16 +1135,11 @@ mod tests {
             state.tick(docked, false, now);
             let at = now + std::time::Duration::from_millis(100);
             state.observe_pane(docked, pane(docked), false, at);
-            // #453 snaps the layout reflow whenever motion is reduced; the
-            // frame is otherwise the settled one (upstream left this test
-            // asserting the pre-#453 frame).
-            assert_eq!(
-                state.tick(docked, true, at),
-                DockFrame {
-                    snap_reflow: true,
-                    ..DockFrame::settled(docked)
-                }
-            );
+            // Reduced motion snaps the reflow too (#453), so the settled frame
+            // carries the snap flag.
+            let mut settled = DockFrame::settled(docked);
+            settled.snap_reflow = true;
+            assert_eq!(state.tick(docked, true, at), settled);
             assert_eq!(state.opacity(), 1.0);
             assert_eq!(state.layout_width(400.0, true, at), 400.0);
         }
