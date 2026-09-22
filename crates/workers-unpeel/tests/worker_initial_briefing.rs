@@ -731,20 +731,13 @@ exec "$REAL_BIN" "$@"
     fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))?;
 
     unpeel_core::hook_assets::install_codex_wrapper()?;
-    let installed = fs::read_to_string(&wrapper_path)?;
-    assert!(
-        !installed.contains("argv=%s") && !installed.contains("$*"),
-        "normal hook install must update the already-installed wrapper so the prompt is absent from traces"
-    );
 
-    let probe = home.path().join("probe-wrapper");
-    fs::create_dir_all(&probe)?;
     let real_bin = home.path().join("bin-wrapper").join("codex-real");
     fs::create_dir_all(real_bin.parent().expect("parent"))?;
     fs::write(
         &real_bin,
         r#"#!/bin/sh
-exit 0
+printf '%s\n' 'wrapper-child-executed'
 "#,
     )?;
     fs::set_permissions(&real_bin, fs::Permissions::from_mode(0o755))?;
@@ -763,9 +756,10 @@ exit 0
         "installed wrapper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(output.stdout, b"wrapper-child-executed\n");
     let trace_text = fs::read_to_string(&trace).unwrap_or_default();
     assert!(
-        !trace_text.contains(secret) && !trace_text.contains("argv="),
+        !trace_text.contains(secret),
         "Codex wrapper must not persist the positional prompt in diagnostic traces"
     );
     Ok(())

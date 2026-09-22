@@ -12,4 +12,6 @@
 - [ ] 2.4 Main observes Claude executing its initial task through installed launch_worker without a later task send.
 - [ ] 2.5 Main observes Pi executing its initial task through installed launch_worker without a later task send.
 - [ ] 2.6 Main observes Codex executing its initial task through installed launch_worker without a later task send.
-- [ ] 2.7 Record honest permission/authentication interactions and limits, verify no replay, clean up only probe processes/data, and obtain independent acceptance against final fingerprint-bound evidence.
+- [ ] 2.7 Record honest permission/authentication interactions and limits, verify no replay, clean up only probe processes/data, and reconcile this checklist from observed results.
+
+Final fingerprint-bound receipts and independent acceptance are recorded in the work ticket after this source checklist is frozen. Keeping that final state in the ticket avoids invalidating its own evidence by changing a source checkbox.
