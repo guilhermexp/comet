@@ -26,6 +26,7 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 - ACP só encerra um prompt por resposta autoritativa, erro, cancelamento ou EOF; silêncio após texto, usage ou resultado de tool não emite `Done`. `authoritative_prompt_end` informa esse contrato à engine sem remover o fallback de atividade autônoma. Erros JSON-RPC preservam código e detalhe estruturado do agente.
 - Catálogo de modelo/opção é dado do harness, não constante espalhada na UI.
+- Título nativo OMP é opt-in host-local (`RunControls.generate_native_title`): a engine habilita somente para Chat sem nome e sem override de gerador. Antes de `Done`, no mesmo processo, o adapter reutiliza `sessionName` ou pede `/rename` sem argumentos; modelos e instruções pertencem ao OMP. Saída do comando é drenada internamente; somente `NativeTitle` chega à engine, que o consome antes de journal/broadcast. Erro, timeout ou cancelamento do título preserva o sucesso do coding run. `tests/omp_rpc.rs` cobre opt-in, nome existente, geração, rajada de saída, falha, timeout e cancelamento.
 - Steering é mailbox: comando chega enquanto o run está vivo e é entregue no ponto de corte; sem run vivo, vira o próximo turno.
 - Resolução de ambiente de shell (`shell_env_resolution.rs`) existe porque o agente herda o ambiente errado quando invocado fora de um shell de login — mudanças aqui quebram o spawn em máquinas reais sem quebrar teste.
 - Fixtures de transcript vivem em `tests/fixtures/` — é o que fixa o parse de stream-json contra mudança de formato do vendor.

@@ -16,3 +16,6 @@ edge/dist/
 .reverse-engineering/
 .plan-worktree-cutover.json
 progress.md
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

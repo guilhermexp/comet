@@ -1,9 +1,11 @@
-//! Chat auto-titling — after the first user+assistant exchange completes on an
-//! untitled chat, name it with the harness's cheapest model (port of zeron's
-//! `generateTitle` in `sessions.ts`).
+//! Chat auto-titling — use OMP's native session title, or generate a title
+//! through the configured isolated title harness for other runtimes.
 //!
-//! Flow (fire-and-forget from the run task; every failure is a silent skip with
-//! tracing — a title must never fail or delay a run):
+//! Applying the title is detached from the run task; failures are traced and
+//! never turn a successful coding response into a failed run:
+//! OMP supplies native title metadata at completion; it never enters the model
+//! selection below. Missing native titles use only the textual fallback.
+//! The isolated title-generation path for other runtimes:
 //! 1. skip when the chat already has a title (or has no workspace row);
 //! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
 //!    last listed model — zeron's `cheapestModel`);
@@ -60,7 +62,20 @@ impl TitleGenerator {
 
     /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
     /// task after a completed exchange; runs detached so it never delays anything.
-    pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
+    pub fn maybe_generate(
+        &self,
+        chat_id: &str,
+        harness: HarnessId,
+        prompt: &str,
+        cwd: &str,
+        native_title: Option<&str>,
+    ) {
+        if harness == HarnessId::Omp
+            && self.inner.registry.title_settings().harness.is_none()
+            && native_title.is_none()
+        {
+            return;
+        }
         if !self
             .inner
             .in_flight
@@ -74,8 +89,12 @@ impl TitleGenerator {
         let chat_id = chat_id.to_string();
         let prompt = prompt.to_string();
         let cwd = cwd.to_string();
+        let native_title = native_title.map(str::to_owned);
         tokio::spawn(async move {
-            if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
+            if let Err(err) = this
+                .generate(&chat_id, harness, &prompt, &cwd, native_title.as_deref())
+                .await
+            {
                 tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
             }
             this.inner
@@ -92,6 +111,7 @@ impl TitleGenerator {
         harness_id: HarnessId,
         prompt: &str,
         cwd: &str,
+        native_title: Option<&str>,
     ) -> Result<(), EngineError> {
         let chat = self
             .inner
@@ -102,7 +122,15 @@ impl TitleGenerator {
             return Ok(()); // already named
         }
 
-        let generated = self.run_title_model(chat_id, harness_id, prompt, cwd).await;
+        let generated = if harness_id == HarnessId::Omp
+            && self.inner.registry.title_settings().harness.is_none()
+        {
+            native_title
+                .map(clean_title)
+                .filter(|title| !title.is_empty())
+        } else {
+            self.run_title_model(chat_id, harness_id, prompt, cwd).await
+        };
         // Fallback so a chat is always named even if the model run produced nothing.
         let fallback: String = prompt
             .split_whitespace()
@@ -269,9 +297,9 @@ pub(crate) async fn cheapest_model_before(
 /// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
 /// listed model; `None` when the catalog is empty (harness picks its default).
 ///
-/// Curated catalogs (claude, codex) carry one row per tier, but the OMP harness
-/// forwards its runtime's RAW provider inventory — every historical model, in
-/// alphabetical order. There a plain first-match picked
+/// Curated catalogs (claude, codex) carry one row per tier. Raw provider
+/// inventories can include every historical model in alphabetical order.
+/// Before native OMP titles, a plain first-match picked
 /// `anthropic/claude-3-haiku-20240307`, retired at Anthropic, so every titling
 /// attempt 404'd and fell back to the prompt's first words. So the first
 /// small-tier row only decides the FAMILY (provider prefix + tier word) and the
@@ -380,6 +408,7 @@ async fn collect_text(
         steering: steer_rx,
         interrupt,
         chat_id: chat_id.to_string(),
+        generate_native_title: false,
     };
     let mut stream = harness.run_title(request, controls).await?;
     let mut text = String::new();
@@ -458,6 +487,94 @@ mod tests {
                 .to_string()
                 .contains("attempted to use a tool")
         );
+    }
+
+    #[tokio::test]
+    async fn omp_native_title_needs_no_model_or_title_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        // No harness is registered: using native metadata must never resolve
+        // another provider or query a model catalog.
+        let registry = Arc::new(HarnessRegistry::new());
+        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
+            .unwrap();
+        core.workspace
+            .create_chat("native", None, Some(&core.device_id), None, None)
+            .unwrap();
+        let generator = TitleGenerator::new(core.workspace.clone(), registry, core.repos.clone());
+        generator.maybe_generate("native", HarnessId::Omp, "Primeiro pedido", ".", None);
+        assert!(generator.inner.in_flight.lock().unwrap().is_empty());
+        generator
+            .generate(
+                "native",
+                HarnessId::Omp,
+                "Primeiro pedido",
+                ".",
+                Some("Título da CLI"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            core.workspace
+                .chat("native")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Título da CLI")
+        );
+        core.workspace.rename_chat("native", "Nome manual").unwrap();
+        generator
+            .generate(
+                "native",
+                HarnessId::Omp,
+                "Primeiro pedido",
+                ".",
+                Some("Outro título da CLI"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            core.workspace
+                .chat("native")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Nome manual")
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn omp_missing_native_title_uses_only_prompt_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
+            .unwrap();
+        core.workspace
+            .create_chat("native", None, Some(&core.device_id), None, None)
+            .unwrap();
+        let generator = TitleGenerator::new(core.workspace.clone(), registry, core.repos.clone());
+        generator
+            .generate(
+                "native",
+                HarnessId::Omp,
+                "Pedido original em português",
+                ".",
+                Some(""),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            core.workspace
+                .chat("native")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Pedido original em português")
+        );
+        core.shutdown().await;
     }
 
     struct RecordingTitleHarness(std::sync::Mutex<Vec<RunRequest>>);
@@ -650,8 +767,8 @@ mod tests {
 
     #[test]
     fn cheapest_picks_the_newest_row_of_the_small_tier_family() {
-        // The OMP harness forwards its runtime's raw inventory, alphabetically
-        // sorted: retired Haiku 3 sorts ahead of the current Haiku 4.5, and
+        // A raw inventory sorted alphabetically lists retired Haiku 3
+        // ahead of the current Haiku 4.5, and
         // picking it 404'd every titling attempt.
         let models = vec![
             model("anthropic/claude-3-5-sonnet-20241022", "Claude Sonnet 3.5"),

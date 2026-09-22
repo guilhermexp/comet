@@ -73,6 +73,7 @@ fn controls(
         steering: steer_rx,
         interrupt: token.clone(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     (controls, steer_tx, token)
 }
@@ -427,6 +428,7 @@ async fn approvals_round_trip_as_input_requests() {
         steering: steer_rx,
         interrupt: token.clone(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;

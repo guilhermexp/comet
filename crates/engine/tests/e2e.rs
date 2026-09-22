@@ -2,7 +2,8 @@
 //! journal + broadcast + folded doc entries, plus interrupt/recovery/idempotence
 //! and the RPC surface over the in-memory transport.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -92,6 +93,70 @@ struct ScriptedHarness {
     script: Vec<AgentEvent>,
     step_delay: Duration,
     hang_until_interrupt: bool,
+}
+
+/// OMP-shaped fixture whose normal run stream comes from the existing mock
+/// harness. The counters make an accidental fallback to catalog/title-model
+/// generation fail the test's assertions without requiring a real OMP process.
+struct NativeTitleHarness {
+    harness_id: HarnessId,
+    delegate: MockHarness,
+    model_calls: Arc<AtomicUsize>,
+    title_calls: Arc<AtomicUsize>,
+    control_flags: Arc<Mutex<Vec<bool>>>,
+}
+
+#[async_trait]
+impl Harness for NativeTitleHarness {
+    fn id(&self) -> HarnessId {
+        self.harness_id
+    }
+
+    fn display_name(&self) -> &str {
+        "Native title OMP fixture"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.model_calls.fetch_add(1, Ordering::SeqCst);
+        Err(HarnessError::Protocol(
+            "native title fixture must not query models".into(),
+        ))
+    }
+
+    async fn run_title(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.title_calls.fetch_add(1, Ordering::SeqCst);
+        Err(HarnessError::Protocol(
+            "native title fixture must not run title generation".into(),
+        ))
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.control_flags
+            .lock()
+            .unwrap()
+            .push(controls.generate_native_title);
+        self.delegate.run(request, controls).await
+    }
 }
 
 #[async_trait]
@@ -585,6 +650,308 @@ async fn queued_run_command_executes_end_to_end() {
         core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::Idle)
     );
+}
+
+#[tokio::test]
+async fn omp_native_title_is_host_local_and_skips_title_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_calls = Arc::new(AtomicUsize::new(0));
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let control_flags = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble_live(
+        dir.path(),
+        Arc::new(NativeTitleHarness {
+            harness_id: HarnessId::Omp,
+            delegate: MockHarness {
+                script: vec![
+                    AgentEvent::SessionStarted {
+                        harness: HarnessId::Omp,
+                        model: "omp-default".into(),
+                        tools: Vec::new(),
+                        cwd: "/tmp".into(),
+                        session_id: "omp-session".into(),
+                        assistant_message_id: "omp-assistant".into(),
+                    },
+                    AgentEvent::NativeTitle {
+                        title: "Native OMP title".into(),
+                    },
+                    done(DoneStatus::Completed),
+                ],
+            },
+            model_calls: Arc::clone(&model_calls),
+            title_calls: Arc::clone(&title_calls),
+            control_flags: Arc::clone(&control_flags),
+        }),
+    );
+    core.workspace
+        .create_chat(
+            CHAT,
+            None,
+            Some(&core.device_id),
+            Some(omp_chat_config()),
+            Some("/tmp".into()),
+        )
+        .expect("create untitled OMP chat");
+
+    // Subscribe before dispatch so the absence of NativeTitle is checked in
+    // both the durable replay and the live broadcast.
+    let (replayed, mut live) = core.sessions.subscribe(CHAT, 0).unwrap();
+    assert!(replayed.is_empty());
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-native-title",
+        SessionCommandPayload::Run {
+            request: run_request("inspect the repository"),
+            message_id: "msg-native-title".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            core.workspace
+                .chat(CHAT)
+                .ok()
+                .flatten()
+                .and_then(|chat| chat.title)
+                .as_deref()
+                == Some("Native OMP title")
+        },
+        "native OMP title",
+    )
+    .await;
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|session| session.status == SessionStatus::Idle)
+        },
+        "run to settle",
+    )
+    .await;
+
+    let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
+    assert_eq!(replay.len(), 2, "session start and Done only: {replay:#?}");
+    assert!(
+        replay
+            .iter()
+            .all(|event| !matches!(event.event, AgentEvent::NativeTitle { .. }))
+    );
+    assert!(matches!(
+        replay.first().map(|event| &event.event),
+        Some(AgentEvent::SessionStarted { .. })
+    ));
+    assert!(matches!(
+        replay.last().map(|event| &event.event),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+
+    let mut broadcast = Vec::new();
+    while let Ok(event) = live.try_recv() {
+        broadcast.push(event);
+    }
+    assert_eq!(
+        broadcast.len(),
+        2,
+        "session start and Done only: {broadcast:#?}"
+    );
+    assert!(
+        broadcast
+            .iter()
+            .all(|event| !matches!(event.event, AgentEvent::NativeTitle { .. }))
+    );
+
+    let transcript = entries(&core);
+    assert_eq!(
+        transcript.len(),
+        1,
+        "native metadata never creates a transcript row"
+    );
+    assert_eq!(transcript[0].role, MessageRole::User);
+    assert_eq!(
+        transcript[0].parts,
+        vec![MessagePart::Text {
+            id: "t0".into(),
+            text: "inspect the repository".into(),
+        }]
+    );
+    assert_eq!(
+        core.workspace.chat(CHAT).unwrap().unwrap().title.as_deref(),
+        Some("Native OMP title")
+    );
+    assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(title_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(&*control_flags.lock().unwrap(), &[true]);
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_title_control_is_scoped_to_untitled_omp_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_calls = Arc::new(AtomicUsize::new(0));
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let omp_flags = Arc::new(Mutex::new(Vec::new()));
+    let alternate_flags = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(NativeTitleHarness {
+        harness_id: HarnessId::Omp,
+        delegate: MockHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Omp,
+                    model: "omp-default".into(),
+                    tools: Vec::new(),
+                    cwd: "/tmp".into(),
+                    session_id: "omp-session".into(),
+                    assistant_message_id: "omp-assistant".into(),
+                },
+                AgentEvent::NativeTitle {
+                    title: "Native OMP title".into(),
+                },
+                done(DoneStatus::Completed),
+            ],
+        },
+        model_calls: Arc::clone(&model_calls),
+        title_calls: Arc::clone(&title_calls),
+        control_flags: Arc::clone(&omp_flags),
+    }));
+    registry.register(Arc::new(NativeTitleHarness {
+        harness_id: HarnessId::Mock,
+        delegate: MockHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: Vec::new(),
+                    cwd: "/tmp".into(),
+                    session_id: "mock-session".into(),
+                    assistant_message_id: "mock-assistant".into(),
+                },
+                done(DoneStatus::Completed),
+            ],
+        },
+        model_calls: Arc::clone(&model_calls),
+        title_calls: Arc::clone(&title_calls),
+        control_flags: Arc::clone(&alternate_flags),
+    }));
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Omp, None)
+        .expect("engine core assembles");
+
+    core.workspace
+        .create_chat(
+            "native-untitled",
+            None,
+            Some(&core.device_id),
+            Some(omp_chat_config()),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    core.workspace
+        .create_chat(
+            "native-named",
+            None,
+            Some(&core.device_id),
+            Some(omp_chat_config()),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    core.workspace
+        .rename_chat("native-named", "Already named")
+        .unwrap();
+    core.workspace
+        .create_chat(
+            "alternate-named",
+            None,
+            Some(&core.device_id),
+            Some(omp_chat_config()),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    core.workspace
+        .rename_chat("alternate-named", "Alternate already named")
+        .unwrap();
+
+    core.sessions
+        .dispatch(
+            "native-untitled",
+            HarnessId::Omp,
+            run_request("name this native run"),
+            Some("msg-native-untitled".into()),
+        )
+        .await
+        .unwrap();
+    core.sessions
+        .dispatch(
+            "native-named",
+            HarnessId::Omp,
+            run_request("leave this title alone"),
+            Some("msg-native-named".into()),
+        )
+        .await
+        .unwrap();
+    let mut alternate_request = run_request("use the explicit alternate harness");
+    alternate_request.harness = Some(HarnessId::Mock);
+    core.sessions
+        .dispatch(
+            "alternate-named",
+            HarnessId::Mock,
+            alternate_request,
+            Some("msg-alternate".into()),
+        )
+        .await
+        .unwrap();
+
+    wait_for(
+        || {
+            ["native-untitled", "native-named", "alternate-named"]
+                .into_iter()
+                .all(|chat_id| {
+                    core.sessions
+                        .session_status(chat_id)
+                        .is_some_and(|session| session.status == SessionStatus::Idle)
+                })
+        },
+        "all native title control fixtures to settle",
+    )
+    .await;
+
+    assert_eq!(&*omp_flags.lock().unwrap(), &[true, false]);
+    assert_eq!(&*alternate_flags.lock().unwrap(), &[false]);
+    assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(title_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        core.workspace
+            .chat("native-untitled")
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Native OMP title")
+    );
+    assert_eq!(
+        core.workspace
+            .chat("native-named")
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Already named")
+    );
+    assert_eq!(
+        core.workspace
+            .chat("alternate-named")
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Alternate already named")
+    );
+
+    core.shutdown().await;
 }
 
 #[tokio::test]

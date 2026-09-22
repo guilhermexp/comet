@@ -42,6 +42,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         steering,
         interrupt: CancellationToken::new(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     let request = RunRequest {
         prompt: "hi".into(),

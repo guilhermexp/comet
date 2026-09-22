@@ -1146,6 +1146,19 @@ impl SessionsEngine {
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
             chat_id: chat_id.to_string(),
+            generate_native_title: harness_id == HarnessId::Omp
+                && self.inner.titles.get().is_some()
+                && self.inner.registry.title_settings().harness.is_none()
+                && self
+                    .inner
+                    .workspace()
+                    .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
+                    .is_some_and(|chat| {
+                        !chat
+                            .title
+                            .as_deref()
+                            .is_some_and(|title| !title.trim().is_empty())
+                    }),
         };
 
         lock(&self.inner.runs).insert(
@@ -1167,13 +1180,11 @@ impl SessionsEngine {
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, &request.prompt);
 
-        // Name the chat NOW, off the first prompt — not after the first
-        // exchange completes ("called New session for a long time for no
-        // reason"; the titler only needs the prompt and skips titled chats;
-        // the Done-time call below stays as the retry for a failed
-        // generation).
+        // Isolated title generators can start from the first prompt. OMP's
+        // automatic path waits for native session metadata at completion.
+        // The Done-time call also supplies the textual fallback if needed.
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd, None);
         }
 
         tokio::spawn(drive_run(
@@ -2320,7 +2331,8 @@ fn trajectory_event_projects(event: &AgentEvent) -> bool {
         | AgentEvent::GeneratedImage { .. }
         | AgentEvent::ReasoningDelta { .. }
         | AgentEvent::AssistantMessageCompleted { .. }
-        | AgentEvent::ToolCallPreview { .. } => false,
+        | AgentEvent::ToolCallPreview { .. }
+        | AgentEvent::NativeTitle { .. } => false,
     }
 }
 
@@ -3113,6 +3125,14 @@ async fn drive_run(
             event
         };
 
+        // Native titles are host-local metadata, not transcript/journal events.
+        if let AgentEvent::NativeTitle { title } = &event {
+            if let Some(titles) = inner.titles.get() {
+                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd, Some(title));
+            }
+            continue;
+        }
+
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
         // into the subagent's own doc, and the parent keeps only the spawn
@@ -3636,7 +3656,7 @@ async fn drive_run(
             if *status == DoneStatus::Completed
                 && let Some(titles) = inner.titles.get()
             {
-                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
+                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd, Some(""));
             }
             // An accepted steer awaiting its boundary owns the continuation:
             // the previous Done is an internal handoff, not a completion ping.

@@ -12,6 +12,8 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 ## Local Contracts
 
+- `NativeTitle` é metadata consumida pela engine e não produz nenhuma part de transcript no fold.
+
 - Contexto parcial usa os mesmos campos opcionais `contextTokens`/`contextWindow`: Registry grava null e Workspace remove o campo não reportado. `RawSession` aceita tokens sem limite, limite sem tokens e zero real; restart não transforma ausência em zero.
 
 - `MessagePart::Image` é atômica e idempotente por id; fold encerra reasoning anterior e preserva ordem. Schema e salvage validam path/nome não vazios e MIME PNG/JPEG/WebP/GIF, nunca SVG. O gêmeo Edge preserva os mesmos campos.

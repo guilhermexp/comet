@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `AgentEvent::NativeTitle` transporta metadata local de título da CLI para a engine. É consumido antes de journal/broadcast; somente o título resultante do Chat sincroniza pelo contrato existente.
+
 - `ContextUsage` conserva `tokens`/`contextWindow` numéricos no fio; `tokensReported: false` é aditivo e distingue tokens ausentes de zero (ausência do flag mantém semântica legada). `reported_tokens`/`reported_window` e `merge` são a fonte compartilhada para snapshots parciais. Contexto do Chat é distinto de Managed Provider Usage e continua sincronizado nas rows de Session.
 
 - `GeneratedImage` transporta referência raster (`id`, `path`, `name`, `mimeType`). Paths emitidos pelo runtime são entrada privada da engine: antes de journal/sync ela importa para uploads do perfil. O evento não carrega bytes/base64.

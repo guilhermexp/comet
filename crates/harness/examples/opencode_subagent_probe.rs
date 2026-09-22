@@ -40,6 +40,7 @@ async fn main() {
         steering,
         interrupt: CancellationToken::new(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     // Optional second arg overrides the prompt (e.g. the mock rig's
     // "TWO subagents" variant exercising concurrent binding).

@@ -32,6 +32,7 @@ async fn main() {
         steering,
         interrupt: CancellationToken::new(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     let request = RunRequest {
         prompt: "Use spawn_subagent to launch ONE subagent of type general with description \

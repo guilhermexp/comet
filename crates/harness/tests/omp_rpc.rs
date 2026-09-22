@@ -27,6 +27,10 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp-rpc.sh")
 }
 
+fn title_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp-title-rpc.sh")
+}
+
 fn fake_workers_controller_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-workers-controller-mcp.sh")
 }
@@ -59,6 +63,40 @@ fn fake_harness(scenario: &str) -> OmpHarness {
         .with_env(fake_env(scenario))
         .with_workers_mcp_executable(fake_workers_controller_path())
         .with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+}
+
+fn title_harness(scenario: &str, temp: &tempfile::TempDir) -> OmpHarness {
+    let log = temp.path().join("omp-title.log");
+    let pid = temp.path().join("omp-title.pid");
+    let env = HashMap::from([
+        ("FAKE_OMP_TITLE_SCENARIO".to_owned(), scenario.to_owned()),
+        (
+            "FAKE_OMP_TITLE_LOG".to_owned(),
+            log.to_string_lossy().into_owned(),
+        ),
+        (
+            "FAKE_OMP_TITLE_PID_FILE".to_owned(),
+            pid.to_string_lossy().into_owned(),
+        ),
+    ]);
+    OmpHarness::new()
+        .with_executable(title_fixture_path())
+        .with_env(env)
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+        .with_prompt_timeout(Duration::from_secs(2))
+}
+
+fn native_title_request(cwd: &std::path::Path) -> RunRequest {
+    let mut request = request("ordinary coding prompt that must never be sent for a title");
+    request.cwd = cwd.to_string_lossy().into_owned();
+    request.resume = Some("/tmp/native-title-session.jsonl".into());
+    request.model = Some("provider/forbidden-model".into());
+    request.reasoning = Some(ReasoningLevel::Max);
+    request
+}
+
+fn title_fixture_log(temp: &tempfile::TempDir) -> String {
+    std::fs::read_to_string(temp.path().join("omp-title.log")).unwrap_or_default()
 }
 
 fn request(prompt: &str) -> RunRequest {
@@ -107,6 +145,7 @@ fn controls_with_answer(
         steering: steer_rx,
         interrupt: interrupt.clone(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     (controls, steer_tx, interrupt)
 }
@@ -128,6 +167,7 @@ fn controls_with_pending_answer() -> (
         steering: steer_rx,
         interrupt: interrupt.clone(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     (controls, steer_tx, interrupt)
 }
@@ -156,6 +196,7 @@ fn controls_declining() -> (
         steering: steer_rx,
         interrupt: interrupt.clone(),
         chat_id: String::new(),
+        generate_native_title: false,
     };
     (controls, steer_tx, interrupt)
 }
@@ -173,6 +214,205 @@ async fn collect_until_done(
         }
     }
     events
+}
+
+#[tokio::test]
+async fn omp_native_title_uses_existing_session_and_local_rename_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = title_harness("generate", &temp);
+    let (mut controls, _steer, _interrupt) = controls_with_answer("unused");
+    controls.generate_native_title = true;
+    let mut stream = harness
+        .run(native_title_request(temp.path()), controls)
+        .await
+        .unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::NativeTitle { title } if title == "Native OMP title"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta { text } if text.contains("title noise")
+    )));
+
+    let log = title_fixture_log(&temp);
+    assert!(log.contains("switch_session"), "{log}");
+    assert!(log.contains("get_state"), "{log}");
+    assert!(log.contains("\"message\":\"/rename\""), "{log}");
+    assert_eq!(
+        log.matches("\"type\":\"set_model\"").count(),
+        1,
+        "the coding run may select its requested model once; title generation must not select it again: {log}"
+    );
+    assert_eq!(
+        log.matches("\"type\":\"set_thinking_level\"").count(),
+        1,
+        "the coding run may set thinking once; title generation must not touch it: {log}"
+    );
+    assert!(!log.contains("get_available_models"), "{log}");
+    assert_eq!(log.matches("ordinary coding prompt").count(), 1, "{log}");
+    assert_eq!(log.matches("\"message\":\"/rename\"").count(), 1, "{log}");
+}
+
+#[tokio::test]
+async fn omp_native_title_keeps_existing_name_without_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = title_harness("existing", &temp);
+    let (mut controls, _steer, _interrupt) = controls_with_answer("unused");
+    controls.generate_native_title = true;
+    let mut stream = harness
+        .run(native_title_request(temp.path()), controls)
+        .await
+        .unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::NativeTitle { title } if title == "Existing OMP title"
+    )));
+    let log = title_fixture_log(&temp);
+    assert!(!log.contains("\"message\":\"/rename\""), "{log}");
+    assert_eq!(log.matches("ordinary coding prompt").count(), 1, "{log}");
+}
+
+#[tokio::test]
+async fn omp_native_title_drains_local_output_and_accepts_empty_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = title_harness("empty-burst", &temp);
+    let (mut controls, _steer, _interrupt) = controls_with_answer("unused");
+    controls.generate_native_title = true;
+    let mut stream = harness
+        .run(native_title_request(temp.path()), controls)
+        .await
+        .unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::NativeTitle { .. } | AgentEvent::TextDelta { .. }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn omp_native_title_failure_does_not_fail_coding_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = title_harness("rename-error", &temp);
+    let (mut controls, _steer, _interrupt) = controls_with_answer("unused");
+    controls.generate_native_title = true;
+    let mut stream = harness
+        .run(native_title_request(temp.path()), controls)
+        .await
+        .unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NativeTitle { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn omp_native_title_is_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = title_harness("generate", &temp);
+    let (controls, _steer, _interrupt) = controls_with_answer("unused");
+    let mut stream = harness
+        .run(native_title_request(temp.path()), controls)
+        .await
+        .unwrap();
+    let events = collect_until_done(&mut stream).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NativeTitle { .. }))
+    );
+    assert!(!title_fixture_log(&temp).contains("/rename"));
+}
+
+#[tokio::test]
+async fn omp_native_title_timeout_preserves_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = title_harness("rename-hang", &temp);
+    let (mut controls, _steer, _interrupt) = controls_with_answer("unused");
+    controls.generate_native_title = true;
+    let mut stream = harness
+        .run(native_title_request(temp.path()), controls)
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(3), collect_until_done(&mut stream))
+        .await
+        .unwrap();
+    assert!(title_fixture_log(&temp).contains("/rename"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NativeTitle { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn omp_native_title_can_be_cancelled_after_coding_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = title_harness("rename-hang", &temp)
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(30));
+    let (mut controls, _steer, interrupt) = controls_with_answer("unused");
+    controls.generate_native_title = true;
+    let mut stream = harness
+        .run(native_title_request(temp.path()), controls)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !title_fixture_log(&temp).contains("/rename") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        interrupt.cancel();
+        let events = collect_until_done(&mut stream).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::NativeTitle { .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ));
+    })
+    .await
+    .unwrap();
 }
 
 #[test]

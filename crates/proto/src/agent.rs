@@ -480,6 +480,11 @@ pub struct WorkflowTaskUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
+    /// Host-local native session metadata, consumed before journal/broadcast.
+    /// Only the resulting Chat title is synchronized by the engine.
+    NativeTitle {
+        title: String,
+    },
     #[serde(rename_all = "camelCase")]
     SessionStarted {
         harness: HarnessId,

@@ -872,6 +872,7 @@ async fn run_session(
         mut steering,
         interrupt,
         chat_id: _,
+        generate_native_title,
     } = controls;
     let request_input: Arc<RequestInputFn> = request_input.into();
     let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
@@ -900,7 +901,7 @@ async fn run_session(
     while !finished {
         tokio::select! {
             _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
-                finish_agent_end(&process, &event_tx, &mut session_id,
+                finish_agent_end(&process, &mut events, &interrupt, generate_native_title, &event_tx, &mut session_id,
                     AgentEndDisposition::Error("OMP compaction timed out before completion".into())).await;
                 finished = true;
             }
@@ -927,7 +928,7 @@ async fn run_session(
                                 // without agent_end. Publish their fresh usage before
                                 // Done so the Chat marker can show before → after.
                                 finish_agent_end(
-                                    &process,
+                                    &process, &mut events, &interrupt, generate_native_title,
                                     &event_tx,
                                     &mut session_id,
                                     AgentEndDisposition::Complete,
@@ -1089,7 +1090,7 @@ async fn run_session(
                 if compacting {
                     if let Some(disposition) = compaction_completion(&frame) {
                         finished = finish_agent_end(
-                            &process, &event_tx, &mut session_id, disposition,
+                            &process, &mut events, &interrupt, generate_native_title, &event_tx, &mut session_id, disposition,
                         ).await;
                         continue;
                     }
@@ -1225,7 +1226,7 @@ async fn run_session(
                             AgentEndDisposition::Continue => pending_agent_end = Some(frame),
                             disposition => {
                                 finished = finish_agent_end(
-                                    &process,
+                                    &process, &mut events, &interrupt, generate_native_title,
                                     &event_tx,
                                     &mut session_id,
                                     disposition,
@@ -1246,7 +1247,7 @@ async fn run_session(
                         {
                             let disposition = normalizer.classify_agent_end(&frame);
                             finished = finish_agent_end(
-                                &process,
+                                &process, &mut events, &interrupt, generate_native_title,
                                 &event_tx,
                                 &mut session_id,
                                 disposition,
@@ -1288,8 +1289,70 @@ fn compaction_completion(frame: &Value) -> Option<AgentEndDisposition> {
     }
 }
 
+/// OMP's local /rename command owns title models, instructions and fallback.
+/// Its command output is bookkeeping and never enters the Chat transcript.
+async fn native_title_before_shutdown(
+    process: &OmpProcess,
+    events: &mut mpsc::Receiver<Value>,
+    interrupt: &tokio_util::sync::CancellationToken,
+    state: &Value,
+) -> Option<String> {
+    let title_from_state = |state: &Value| {
+        state
+            .get("sessionName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+    };
+    if interrupt.is_cancelled() {
+        return None;
+    }
+    if let Some(title) = title_from_state(state) {
+        return Some(title);
+    }
+    if state
+        .get("messageCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0
+    {
+        return None;
+    }
+    let generation = async {
+        let response = process
+            .request(json!({ "type": "prompt", "message": "/rename" }))
+            .await
+            .ok()?;
+        if response.get("agentInvoked").and_then(Value::as_bool) != Some(false) {
+            return None;
+        }
+        let state = process.request(json!({ "type": "get_state" })).await.ok()?;
+        title_from_state(&state)
+    };
+    tokio::pin!(generation);
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            _ = interrupt.cancelled() => return None,
+            _ = &mut deadline => return None,
+            result = &mut generation => return result,
+            frame = events.recv() => {
+                // Drain concurrently: local commands may emit more frames than
+                // the bounded event channel before acknowledging the request.
+                frame?;
+            }
+        }
+    }
+}
+
 async fn finish_agent_end(
     process: &OmpProcess,
+    events: &mut mpsc::Receiver<Value>,
+    interrupt: &tokio_util::sync::CancellationToken,
+    generate_native_title: bool,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
     session_id: &mut String,
     disposition: AgentEndDisposition,
@@ -1311,6 +1374,13 @@ async fn finish_agent_end(
                 },
             )
             .await;
+        }
+        if generate_native_title && disposition == AgentEndDisposition::Complete {
+            if let Some(title) =
+                native_title_before_shutdown(process, events, interrupt, &state).await
+            {
+                let _ = emit(event_tx, AgentEvent::NativeTitle { title }).await;
+            }
         }
     }
     match disposition {

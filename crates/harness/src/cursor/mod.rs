@@ -460,6 +460,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         chat_id: _,
+        generate_native_title: _,
     } = controls;
 
     let mut assistant_message_id = new_message_id();
