@@ -1,19 +1,19 @@
 ## Why
 
-Two real OMP Worker launches opened a process but timed out delivering `initial_text`; the same worker executed the task after a separate `send_text`. The Comet controller waits for terminal readiness and mistakes retained MCP startup text for ongoing boot. Orchestrator.dev avoids this OMP failure by passing the initial prompt through the runtime's native startup interface.
+The owner requested initial task delivery when launching a worker, regardless of preset. The OMP-only implementation was explicitly rejected as a partial delivery. The configured catalog contains OMP, Claude, Pi and Codex. All four must receive initial_text through launch itself; proving only one runtime is not acceptance.
 
 ## What Changes
 
-- Deliver an OMP Worker's initial brief through its native startup path, without requiring viewport readiness or a second controller call.
-- Preserve the chosen preset, checkout, session ownership, parent task tracking and explicit delivery outcome. Do not add approval-bypass flags.
-- Prevent duplicate initial submission, unsafe shell interpolation and replay of the initial task on restart.
-- Retain the existing guarded interactive delivery path for other runtimes; no speculative provider sweep.
-- Prove the behavior with a focused regression and a real isolated controller/OMP launch, then update the installed Comet without interrupting unrelated sessions.
+- Generalize native initial-task delivery to all four configured runtimes and presets selecting those runtimes.
+- Use each CLI's supported startup input without changing interactive mode, model selection or permission flags.
+- Preserve the one-shot reservation, honest delivery receipt, parent task association, checkout and restart-without-replay behavior.
+- Keep task content out of persisted restart commands, shell history and diagnostic argv logs; preserve literal text and trailing newlines.
+- Prove every preset through the installed Comet MCP, without later task submission. Existing authentication/permission gates remain real and must not be bypassed to manufacture a passing probe.
 
 ## Capabilities
 
 ### New Capabilities
-- `worker-initial-briefing`: reliable native startup delivery and truthful launch outcomes for OMP Workers.
+- `worker-initial-briefing`: initial task delivery and truthful launch outcomes for OMP, Claude, Pi and Codex Workers.
 
 ### Modified Capabilities
 
@@ -21,4 +21,4 @@ None.
 
 ## Impact
 
-Comet's `crates/workers-unpeel` controller and tests; the vendored Unpeel launch/runtime boundary only where native startup transport requires it, with provenance and local DOX updates. Public `workers.launch_worker` arguments remain compatible. Orchestrator.dev is a read-only reference. Graft configuration repair, notification output, admin/cards work and other current Comet changes are out of scope.
+`crates/workers-unpeel`, the vendored Unpeel launch/runtime boundary and its four integration adapters, including the Codex wrapper's argument logging; local DOX, provenance and this existing OpenSpec change. The public launch API remains unchanged. Orchestrator.dev is a read-only reference. Preserve unrelated WIP and running sessions. New retry orchestration, Graft repairs and the pre-existing restart response-ID race are not part of this change.

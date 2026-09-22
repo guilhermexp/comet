@@ -1,6 +1,6 @@
-//! One-shot OMP startup input. The stored Session command never carries the
-//! task; a private file is consumed through OMP's `@file` argument only on the
-//! first spawn argv.
+//! One-shot native startup input. The stored Session command never carries the
+//! task; adapters declare file-argument or positional delivery, and this module
+//! stages a private file and attaches it only on the first spawn argv.
 
 use crate::integrations::shared;
 use crate::session_host;
@@ -14,10 +14,7 @@ pub const NATIVE_INITIAL_CLAIMED_FILE: &str = "native-initial-message.claimed";
 pub const NATIVE_INITIAL_ATTACHED_FILE: &str = "native-initial-message.attached";
 
 pub fn uses_native_initial_delivery(runtime_or_command: &str) -> bool {
-    matches!(
-        crate::integrations::command_head(runtime_or_command),
-        "omp" | "omp-cli"
-    )
+    crate::integrations::native_initial_input(runtime_or_command).is_some()
 }
 
 pub fn native_initial_message_path(session_id: &str) -> PathBuf {
@@ -101,29 +98,39 @@ pub fn stage_native_initial_prompt(
 }
 
 /// Compute the first-spawn argv. Must not ACK: `.attached` is written only
-/// after the real spawn/PTY submit succeeds. `@file` is added only when the
-/// pending reservation still has a body to attach.
+/// after the real spawn/PTY submit succeeds. Native arguments are added only
+/// when the pending reservation still has a body to attach.
 pub fn prepare_native_initial_argv(
     runtime_or_command: &str,
     command: &str,
     session_id: &str,
 ) -> Result<String, String> {
-    if !(uses_native_initial_delivery(runtime_or_command) || uses_native_initial_delivery(command))
-    {
+    let Some(input) = crate::integrations::native_initial_input(runtime_or_command)
+        .or_else(|| crate::integrations::native_initial_input(command))
+    else {
         return Ok(command.to_string());
-    }
+    };
     let directory = session_host::session_dir(session_id);
     let pending = directory.join(NATIVE_INITIAL_PENDING_FILE);
     let body = directory.join(NATIVE_INITIAL_MESSAGE_FILE);
     if !pending.is_file() || !body.is_file() {
         return Ok(command.to_string());
     }
-    let token = format!("@{}", body.display());
-    Ok(format!(
-        "{} {}",
-        command.trim(),
-        shared::shell_quote(&token)
-    ))
+    let attachment = match input {
+        crate::integrations::NativeInitialInput::FileArgument => {
+            shared::shell_quote(&format!("@{}", body.display()))
+        }
+        crate::integrations::NativeInitialInput::PositionalPrompt => {
+            let text = fs::read_to_string(&body).map_err(|error| {
+                format!(
+                    "Failed to read native initial prompt {}: {error}",
+                    body.display()
+                )
+            })?;
+            format!("-- {}", shared::shell_quote(&text))
+        }
+    };
+    Ok(format!("{} {}", command.trim(), attachment))
 }
 
 /// Claim a non-replayable reservation, run the Host's irreversible spawn/PTY
@@ -304,12 +311,34 @@ mod tests {
     }
 
     #[test]
-    fn other_runtimes_do_not_consume_omp_prompt_files() {
+    fn unsupported_runtimes_do_not_consume_native_prompt_files() {
         let _lock = ENV_LOCK.lock().expect("lock");
         let (_dir, previous) = isolated_home();
         stage_native_initial_prompt("omp", "s2", "secret").expect("stage");
-        let command = prepare_native_initial_argv("claude", "claude", "s2").expect("prepare");
-        assert_eq!(command, "claude");
+        let command =
+            prepare_native_initial_argv("prime-agent", "prime-agent", "s2").expect("prepare");
+        assert_eq!(command, "prime-agent");
+        restore_home(previous);
+    }
+
+    #[test]
+    fn positional_runtime_attaches_quoted_body_once() {
+        let _lock = ENV_LOCK.lock().expect("lock");
+        let (_dir, previous) = isolated_home();
+        let briefing = "--flag && true; echo $HOME\nunicodé ✓\n\n";
+        stage_native_initial_prompt("claude", "s3", briefing).expect("stage");
+        let first = prepare_native_initial_argv("claude", "claude --permission-mode plan", "s3")
+            .expect("prepare");
+        assert!(first.contains("-- "), "{first}");
+        assert!(first.contains(&shared::shell_quote(briefing)), "{first}");
+        assert!(!first.contains("--auto-approve"), "{first}");
+        assert!(!native_initial_prompt_attached("s3"));
+        submit_with_native_reservation("s3", || Ok(())).expect("submit");
+        assert!(native_initial_prompt_attached("s3"));
+        let second =
+            prepare_native_initial_argv("claude", "claude --permission-mode plan --continue", "s3")
+                .expect("prepare");
+        assert_eq!(second, "claude --permission-mode plan --continue");
         restore_home(previous);
     }
 }

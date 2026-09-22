@@ -847,19 +847,19 @@ pub fn native_initial_from_presets(
     preset_id: &str,
     presets: &[crate::WorkersPresetSetting],
 ) -> bool {
-    unpeel_core::omp_native_initial::resolve_enabled_preset_command(
+    unpeel_core::native_initial::resolve_enabled_preset_command(
         project_id,
         preset_id,
         presets
             .iter()
-            .map(|preset| unpeel_core::omp_native_initial::CatalogPreset {
+            .map(|preset| unpeel_core::native_initial::CatalogPreset {
                 id: &preset.id,
                 command: &preset.command,
                 enabled: preset.enabled,
                 project_id: preset.project_id.as_deref(),
             }),
     )
-    .is_some_and(unpeel_core::omp_native_initial::uses_native_initial_delivery)
+    .is_some_and(unpeel_core::native_initial::uses_native_initial_delivery)
 }
 
 fn launch_briefing_next_action(session_id: &str, native: bool) -> String {
@@ -881,11 +881,11 @@ fn confirm_native_initial_briefing(
 ) -> Result<(), String> {
     let deadline = Instant::now() + MANIFEST_WAIT;
     loop {
-        if unpeel_core::omp_native_initial::native_initial_prompt_attached(session_id) {
+        if unpeel_core::native_initial::native_initial_prompt_attached(session_id) {
             break;
         }
         if Instant::now() >= deadline {
-            if unpeel_core::omp_native_initial::native_initial_prompt_claimed(session_id) {
+            if unpeel_core::native_initial::native_initial_prompt_claimed(session_id) {
                 return Err(
                     "native initial submission receipt is unconfirmed; inspect the worker before acting".into(),
                 );
@@ -1374,7 +1374,7 @@ fn tool_definition() -> Value {
                 "status": { "type": "string", "description": "wait_for_status: the worker status to block on, as reported by list_workers and inspect_worker." },
                 "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: how long to block, chosen by you to fit the work (default 30, maximum 4h); expiration returns timed_out: true with a worker snapshot and a next hint as a normal read, not a failure. The wait is cancellable and does not block other actions." },
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
-                "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing delivered once at launch. OMP receives it through native startup; other runtimes wait until the agent prompt is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
+                "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing delivered once at launch. OMP, Claude, Pi and Codex receive it through native startup. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
                 "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },
                 "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." },
                 "expected_old_fingerprint": { "type": "string", "description": "recover_project_identity: required fingerprint reported as the old side of the diagnosed conflict." },

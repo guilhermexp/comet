@@ -32,6 +32,12 @@ pub struct BuiltinPresetDefinition {
     pub quick_launch: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeInitialInput {
+    FileArgument,
+    PositionalPrompt,
+}
+
 #[derive(Clone, Copy)]
 pub struct Integration {
     pub install_runtime_support: Option<fn() -> Result<(), String>>,
@@ -44,6 +50,7 @@ pub struct Integration {
     pub legacy_mcp_gate_kind: Option<LegacyMcpGateKind>,
     pub legacy_mcp_gate_granted: Option<LegacyMcpGateGranted>,
     pub read_session_telemetry: Option<crate::session_telemetry::ReadSessionTelemetry>,
+    pub native_initial_input: Option<NativeInitialInput>,
 }
 
 impl Integration {
@@ -62,6 +69,7 @@ impl Integration {
             legacy_mcp_gate_kind: None,
             legacy_mcp_gate_granted: None,
             read_session_telemetry: None,
+            native_initial_input: None,
         }
     }
 
@@ -128,6 +136,11 @@ impl Integration {
         self.read_session_telemetry = reader;
         self
     }
+
+    pub const fn with_native_initial_input(mut self, input: NativeInitialInput) -> Self {
+        self.native_initial_input = Some(input);
+        self
+    }
 }
 
 include!(concat!(
@@ -186,6 +199,11 @@ fn runtime_for_dispatch(
 fn integration_for_dispatch(runtime_or_command: &str) -> Option<&'static Integration> {
     let runtime = runtime_for_dispatch(runtime_or_command)?;
     integration_for_id(&runtime.legacy_slug)
+}
+
+pub fn native_initial_input(runtime_or_command: &str) -> Option<NativeInitialInput> {
+    integration_for_dispatch(runtime_or_command)
+        .and_then(|integration| integration.native_initial_input)
 }
 
 pub fn command_head(command: &str) -> &str {

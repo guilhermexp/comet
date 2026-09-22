@@ -41,9 +41,13 @@ base_revision_resolves_upstream = false
 # from the executable catalog; controller_api returns 409 with that reason,
 # reserving unknown-project 400 for IDs that were never registered.
 
-# 2026-09-21 — OMP native initial prompt: one-shot file + @file on first spawn
-# argv only (omp_native_initial). Prepare attaches only with a body. Host
-# claims `.pending` → `.claimed` immediately before spawn/PTY write via
+# 2026-09-21 — Native initial prompt for the four configured worker presets.
+# `omp_native_initial` renamed to `native_initial` (no alias). Adapters declare
+# FileArgument (OMP/Pi) or PositionalPrompt (Claude/Codex). Prepare attaches
+# only with a body (`@file` or `--` + quoted text; never `$(cat)`). Host claims
+# `.pending` → `.claimed` immediately before spawn/PTY write via
 # submit_with_native_reservation; ACK after success must not drop the child.
 # Native is PasteAndSubmit-only. Stored Session.command is unchanged; restart
-# does not replay. Does not bump local_modifications_count.
+# does not replay. Codex command-wrapper.sh no longer logs argv; normal hook
+# install overwrites a stale managed asset. Does not bump
+# local_modifications_count.

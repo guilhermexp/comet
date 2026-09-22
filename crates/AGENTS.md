@@ -16,11 +16,13 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 - `edition = "2024"` em todas.
 - Runtime async é **tokio** em todo lugar; a UI faz a ponte por `gpui_tokio` (`Tokio::spawn` vira `Task` do gpui). A UI nunca bloqueia na engine.
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
-- **OMP `launch_worker` briefing is native startup.** The Comet-owned controller
-  lives in `workers-unpeel`; prepare/ACK of the one-shot `@file` lives in
-  vendored `unpeel-core::omp_native_initial` (claim before spawn; ACK after
-  submit without abandoning the child). Regression
-  seam: `cargo test -p zeron-workers-unpeel --test worker_initial_briefing`.
+- **Configured worker presets receive `launch_worker` briefing at native
+  startup.** OMP, Claude, Pi and Codex all use `unpeel-core::native_initial`
+  (claim before spawn; ACK after submit without abandoning the child).
+  Adapters declare `FileArgument` (`@file`: OMP/Pi) or `PositionalPrompt`
+  (`--` + quoted body: Claude/Codex). Prime-agent and other integrations keep
+  interactive delivery. Regression seam:
+  `cargo test -p zeron-workers-unpeel --test worker_initial_briefing`.
 - Live Voice é lifecycle da `engine`; a `ui` só projeta e controla, e navegação de Chat nunca manda stop. Em `Working`/`AwaitingInput`, a elegibilidade exige suporte OMP a contexto operacional silencioso; em `Idle`, um handle OMP estacionado permanece elegível com Live básico.
 
 ## Work Guidance

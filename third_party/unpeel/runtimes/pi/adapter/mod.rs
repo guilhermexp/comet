@@ -39,7 +39,8 @@ pub(crate) const INTEGRATION: Integration =
     Integration::new(Some(setup::install_lifecycle_extension), None)
         .with_startup_command(prepare_startup_command)
         .with_resume_adapter(resume::ADAPTER)
-        .with_context_adapter(context::ADAPTER);
+        .with_context_adapter(context::ADAPTER)
+        .with_native_initial_input(super::NativeInitialInput::FileArgument);
 
 #[cfg(test)]
 mod tests {

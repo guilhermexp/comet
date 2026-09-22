@@ -571,13 +571,13 @@ fn resolve_host_create(
         // Prefer a project-scoped row if a legacy catalog happens to contain
         // the same id globally too. Either way, preset selection wins over an
         // explicit command in the wire request, matching shipped clients.
-        let command = crate::omp_native_initial::resolve_enabled_preset_command(
+        let command = crate::native_initial::resolve_enabled_preset_command(
             project_id.as_str(),
             &preset_id,
             context
                 .presets
                 .iter()
-                .map(|preset| crate::omp_native_initial::CatalogPreset {
+                .map(|preset| crate::native_initial::CatalogPreset {
                     id: &preset.id,
                     command: &preset.command,
                     enabled: preset.enabled,
@@ -648,10 +648,11 @@ fn create_session(
     Ok(body)
 }
 
-/// Native `@file` startup is only for OMP PasteAndSubmit. PasteOnly/Raw keep
-/// the Host PTY contracts inside [`execute_headless_session_create`].
+/// Native startup is for integrations that declare an initial-input capability
+/// and PasteAndSubmit. PasteOnly/Raw keep the Host PTY contracts inside
+/// [`execute_headless_session_create`].
 pub fn native_initial_startup_enabled(command: &str, mode: HostCreateSubmitMode) -> bool {
-    crate::omp_native_initial::uses_native_initial_delivery(command)
+    crate::native_initial::uses_native_initial_delivery(command)
         && matches!(mode, HostCreateSubmitMode::PasteAndSubmit)
 }
 
@@ -701,7 +702,7 @@ pub fn execute_headless_session_create(
     let native_initial = native_initial_startup_enabled(&session.command, initial_text_submit_mode);
     if native_initial {
         if let Some(text) = initial_text.as_deref().filter(|text| !text.is_empty()) {
-            if let Err(error) = crate::omp_native_initial::stage_native_initial_prompt(
+            if let Err(error) = crate::native_initial::stage_native_initial_prompt(
                 &session.command,
                 &session_id,
                 text,

@@ -55,7 +55,8 @@ pub(crate) const INTEGRATION: Integration =
         .with_startup_command(prepare_startup_command)
         .with_automatic_mcp_setup(has_automatic_mcp_setup)
         .with_resume_adapter(resume::ADAPTER)
-        .with_context_adapter(context::ADAPTER);
+        .with_context_adapter(context::ADAPTER)
+        .with_native_initial_input(super::NativeInitialInput::PositionalPrompt);
 
 #[cfg(test)]
 mod tests {

@@ -27,11 +27,12 @@ fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> Str
     startup_command(command)
 }
 
-pub(crate) const INTEGRATION: Integration =
+pub(crate) const fn family_integration() -> Integration {
     Integration::new(Some(setup::install_lifecycle_extension), None)
         .with_startup_command(prepare_startup_command)
         .with_resume_adapter(resume::ADAPTER)
-        .with_session_telemetry(SESSION_TELEMETRY_READER);
+        .with_session_telemetry(SESSION_TELEMETRY_READER)
+}
 
 #[cfg(test)]
 mod tests {

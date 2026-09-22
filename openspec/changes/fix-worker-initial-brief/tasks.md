@@ -1,15 +1,15 @@
-## 1. Behavioral regression
+## 1. Complete runtime coverage
 
-- [x] 1.1 Add the isolated `worker_initial_briefing` integration seam and capture a behavioral RED proving that native initial task delivery does not occur on the baseline; retain test, assertion and execution receipt.
+- [x] 1.1 Add formatted behavioral cases for all four runtimes to worker_initial_briefing; capture a behavioral RED with unchanged test bytes and exact failing source preserved.
+- [x] 1.2 Generalize native delivery through the existing integration descriptors; migrate every OMP-specific module reference, preserve reservation/ACK and parent semantics, and remove raw Codex argv trace logging through the normal hook update path.
+- [x] 1.3 Prove literal payloads, leading options, trailing newlines, original preset flags, missing-body/spawn/ACK failures, diagnostic privacy and restart without replay for each transport/runtime.
 
-## 2. Native startup delivery
+## 2. Validation and delivery
 
-- [x] 2.1 Implement OMP native initial input at the existing launch/runtime boundary; verify an optional MCP startup warning cannot prevent first-task execution and submission happens exactly once.
-- [x] 2.2 Preserve literal prompt content, preset options/approval behavior, checkout, parent task ownership and resume semantics; verify metacharacter/leading-option inputs, immediate completion, restart without replay and honest failures in isolated integration tests.
-- [x] 2.3 Preserve guarded interactive submission for other runtimes; verify existing controller startup/menu regression tests remain green.
-
-## 3. Delivery proof
-
-- [x] 3.1 Update local DOX/Test matrix and vendor provenance if touched; validate OpenSpec, format, focused gate, crate/workspace suite and capture the production build receipt with literal outcomes.
-- [x] 3.2 Exercise the compiled controller and real OMP with an isolated profile: one launch call, no later send, literal task result, correct checkout, then cleanup only probe processes. Record observed scope and limitations.
-- [x] 3.3 Main reviews the scoped diff and evidence, integrates without disturbing existing WIP, updates the installed Comet and verifies the fixed launch path without interrupting unrelated sessions.
+- [x] 2.1 Update affected DOX and vendor provenance; run formatter before final gate, typecheck, focused gate and the canonical workspace suite, then commit and capture the production build receipt.
+- [ ] 2.2 Main reviews source/security, integrates without touching existing WIP and updates the installed Comet atomically.
+- [ ] 2.3 Main observes OMP executing its initial task through installed launch_worker without a later task send.
+- [ ] 2.4 Main observes Claude executing its initial task through installed launch_worker without a later task send.
+- [ ] 2.5 Main observes Pi executing its initial task through installed launch_worker without a later task send.
+- [ ] 2.6 Main observes Codex executing its initial task through installed launch_worker without a later task send.
+- [ ] 2.7 Record honest permission/authentication interactions and limits, verify no replay, clean up only probe processes/data, and obtain independent acceptance against final fingerprint-bound evidence.

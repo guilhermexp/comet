@@ -1198,7 +1198,7 @@ fn resume_agent_in_place(
         browser_mcp_enabled,
         computer_mcp_enabled,
     );
-    let startup_command = crate::omp_native_initial::prepare_native_initial_argv(
+    let startup_command = crate::native_initial::prepare_native_initial_argv(
         expected_runtime_id,
         &startup_command,
         session_id,
@@ -1360,15 +1360,13 @@ fn resume_agent_in_place(
         }
         return Err(error);
     }
-    if let Err(error) =
-        crate::omp_native_initial::submit_with_native_reservation(session_id, || {
-            guard
-                .writer
-                .write_all(&payload)
-                .and_then(|_| guard.writer.flush())
-                .map_err(|error| format!("Failed to submit agent relaunch command: {error}"))
-        })
-    {
+    if let Err(error) = crate::native_initial::submit_with_native_reservation(session_id, || {
+        guard
+            .writer
+            .write_all(&payload)
+            .and_then(|_| guard.writer.flush())
+            .map_err(|error| format!("Failed to submit agent relaunch command: {error}"))
+    }) {
         clear_runtime_launch_pending(
             session_id,
             expected_generation,
@@ -4766,7 +4764,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                 launch.browser_mcp_enabled,
                 launch.computer_mcp_enabled,
             );
-            let startup_command = crate::omp_native_initial::prepare_native_initial_argv(
+            let startup_command = crate::native_initial::prepare_native_initial_argv(
                 runtime_id,
                 &startup_command,
                 &launch.session.id,
@@ -4797,7 +4795,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         }
 
         let child =
-            crate::omp_native_initial::submit_with_native_reservation(&launch.session.id, || {
+            crate::native_initial::submit_with_native_reservation(&launch.session.id, || {
                 pair.slave
                     .spawn_command(cmd)
                     .map_err(|e| format!("Failed to spawn command: {e}"))

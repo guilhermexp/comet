@@ -1,59 +1,79 @@
 ## Purpose
 
-Ensure an OMP Worker receives its assigned task during launch, without requiring the caller to repair prompt delivery after startup.
+Ensure Workers using every configured OMP, Claude, Pi or Codex preset receive their assigned task during launch, without a separate task-delivery action.
 
 ## ADDED Requirements
 
-### Requirement: Initial OMP task is delivered by launch
-The system SHALL deliver a supplied initial task to an OMP Worker through the runtime's native startup input, exactly once, without requiring a second caller action or terminal prompt recognition.
+### Requirement: Every configured runtime receives its task through launch
+The system SHALL deliver a supplied initial task to OMP, Claude, Pi and Codex Workers through their supported native startup input, exactly once, without terminal prompt recognition or a second task submission.
 
-#### Scenario: Nonfatal MCP startup warning
-- **WHEN** an OMP Worker starts with an initial task and emits an optional MCP connection warning before accepting work
-- **THEN** it receives and executes the task once, and launch reports successful briefing delivery without a separate send action
-- Test: integration — native startup execution despite optional MCP warning
+#### Scenario: OMP initial task
+- **WHEN** an OMP preset is launched with initial_text
+- **THEN** native startup receives the task and no later task send is needed
+- Test: integration — OMP native launch result
+
+#### Scenario: Claude initial task
+- **WHEN** a Claude preset is launched with initial_text
+- **THEN** its interactive CLI receives the task as a native initial prompt without later task typing
+- Test: integration — Claude native launch result
+
+#### Scenario: Pi initial task
+- **WHEN** a Pi preset is launched with initial_text
+- **THEN** native startup receives the task without waiting for viewport readiness
+- Test: integration — Pi native launch result
+
+#### Scenario: Codex initial task
+- **WHEN** a Codex preset is launched with initial_text
+- **THEN** its interactive CLI receives the task as a native initial prompt without later task typing
+- Test: integration — Codex native launch result
 
 #### Scenario: Literal task content
-- **WHEN** the initial task contains Unicode, quotes, newlines, shell metacharacters or text resembling command-line options or file references
-- **THEN** the Worker receives task text rather than executing it as shell commands, interpreting it as flags or loading unintended files
-- Test: integration — literal task bytes at the runtime boundary
+- **WHEN** initial_text contains Unicode, quotes, shell metacharacters, leading options or file-like text, and trailing newlines
+- **THEN** task content survives the runtime boundary literally, without shell evaluation, unintended argument parsing or newline truncation
+- Test: integration — literal native task content across input formats
+
+#### Scenario: Nonfatal startup warning
+- **WHEN** a supported runtime retains startup or optional MCP warning text
+- **THEN** that viewport text does not prevent native task submission or cause duplicate delivery
+- Test: integration — native task delivery despite startup text
 
 ### Requirement: Launch preserves authority and lifecycle
-The system MUST preserve the chosen preset's runtime options, checkout and approval behavior. Initial submission MUST remain associated with the correct parent task, and restarting the Worker MUST NOT replay its original initial task.
+The system MUST preserve the configured runtime options, checkout, model and approval behavior. Initial work MUST belong to the correct parent task. Restarting or resuming MUST NOT resubmit the initial task.
 
-#### Scenario: Preset and task identity survive native startup
-- **WHEN** a parent launches an OMP Worker using an existing configured preset and initial task
-- **THEN** the Worker uses that preset and exact checkout, does not acquire additional approval bypass, and its completion belongs to that initial task
-- Test: integration — preset authority, checkout and initial task episode
+#### Scenario: Preset configuration and parent ownership
+- **WHEN** a configured preset supplies runtime options or shares an id with a project-scoped preset
+- **THEN** the actual enabled project-scoped-then-global command is preserved and initial completion belongs to the correct parent episode
+- Test: integration — authoritative preset resolution and immediate completion
 
-#### Scenario: Restart does not repeat the first task
-- **WHEN** a Worker originally started with an initial task is restarted or resumed
-- **THEN** its initial task is not automatically submitted again
-- Test: integration — resume does not replay initial task
+#### Scenario: Restart without task replay
+- **WHEN** an OMP, Claude, Pi or Codex Worker with an initial task is restarted or resumed
+- **THEN** the native task is not submitted again and the stored resume command contains no initial task
+- Test: integration — one-shot restart for each runtime
 
-### Requirement: Failure and other runtime behavior remain explicit
-The system SHALL distinguish a created process from delivered work. A failed delivery MUST NOT report successful briefing submission, and a live Worker MUST retain an inspectable identifier. Non-OMP runtime delivery MUST retain its existing shell, boot and menu protections.
+#### Scenario: Existing permission and authentication gates
+- **WHEN** the selected CLI requires authentication or action approval
+- **THEN** the launcher preserves that gate and does not add bypass flags or claim model execution merely from submission
+- Test: integration — permission flags preserved and submission distinct from execution
 
-#### Scenario: Startup delivery fails
-- **WHEN** a process is created but native initial delivery fails
-- **THEN** the result identifies the Worker and reports the actual delivery failure without claiming successful submission
-- Test: integration — partial launch reports delivery failure and session identity
+### Requirement: Delivery failures and task privacy remain explicit
+The system SHALL distinguish process creation, initial task submission and task execution. Native startup failure MUST retain an inspectable worker identity and must not falsely acknowledge a missing task. Task bodies MUST NOT be persisted in restart commands, shell history or diagnostic argv logs.
 
-#### Scenario: Spawn fails before ACK
-- **WHEN** native argv is prepared but spawn or transport fails
-- **THEN** `.attached` is absent, `.pending` remains, and `briefing_submitted` is false
-- Test: integration — failed spawn does not report briefing_submitted
+#### Scenario: Native startup fails
+- **WHEN** preparation or spawn fails, or the task body is missing
+- **THEN** delivery is not falsely acknowledged; a known pre-submit failure remains retryable and any created worker stays inspectable
+- Test: integration — missing body and failed native spawn
 
-#### Scenario: Unauthorized submit modes keep PTY contracts
-- **WHEN** Host create uses PasteOnly or Raw with an OMP command
-- **THEN** native startup is not used and those submit-mode contracts remain
-- Test: integration — PasteOnly/Raw do not use native startup
+#### Scenario: Receipt failure after submission
+- **WHEN** submission succeeded but its ACK cannot be persisted
+- **THEN** the live Host remains alive, task material is not made replayable and guidance does not prescribe blind resubmission
+- Test: integration — post-submit ACK failure preserves result without replay
 
-#### Scenario: MCP native decision matches Host command resolution
-- **WHEN** a preset id is duplicated or carries a stale cli_id
-- **THEN** MCP uses the enabled project-scoped then global command Host will spawn
-- Test: integration — MCP native decision matches host command resolution
+#### Scenario: Diagnostic privacy
+- **WHEN** Codex or Claude receives native positional task text
+- **THEN** task text is absent from persisted command metadata, shell history and wrapper diagnostic logs
+- Test: integration — positional task is not persisted in wrapper traces or resume metadata
 
-#### Scenario: Interactive runtime is not ready
-- **WHEN** a runtime using interactive submission shows a shell, startup screen or blocking menu
-- **THEN** the initial brief is not typed into that surface
-- Test: integration — existing controller shell, boot and menu protections
+#### Scenario: Non-submitting modes and unsupported integrations
+- **WHEN** Host uses PasteOnly or Raw, or an integration lacks native startup capability
+- **THEN** its existing submission contract and interactive shell/menu protections remain unchanged
+- Test: integration — explicit modes and guarded fallback unchanged

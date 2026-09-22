@@ -2,11 +2,10 @@
 REAL_BIN="${UNPEEL_REAL_CODEX_BIN:-}"
 TRACE_FILE="${UNPEEL_HOOK_TRACE_FILE:-$HOME/.zeron/workers/hooks/trace.log}"
 mkdir -p "$(dirname "$TRACE_FILE")" >/dev/null 2>&1 || true
-printf '%s codex-wrapper-start session=%s port=%s argv=%s\n' \
+printf '%s codex-wrapper-start session=%s port=%s\n' \
   "$(date '+%Y-%m-%d %H:%M:%S')" \
   "${UNPEEL_SESSION_ID:-}" \
-  "${UNPEEL_APP_PORT:-}" \
-  "$*" >> "$TRACE_FILE" 2>/dev/null || true
+  "${UNPEEL_APP_PORT:-}" >> "$TRACE_FILE" 2>/dev/null || true
 if [ -z "$REAL_BIN" ]; then
   _unpeel_original_path="${UNPEEL_ORIGINAL_PATH:-$PATH}"
   REAL_BIN="$(PATH="$_unpeel_original_path" command -v codex 2>/dev/null || true)"
