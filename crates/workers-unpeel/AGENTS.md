@@ -82,8 +82,9 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   process in their `mcpServers` list (resolved by zeron-harness's
   `workers_mcp.rs` and rendered into each runtime's dialect); it is NOT
   Unpeel's worker-to-worker MCP host.
-- **OMP receives `initial_text` at native startup.** `launch_worker` stages a
-  private one-shot file. The Host prepares `@file` only when a body exists,
+- **OMP, Claude, Pi and Codex receive `initial_text` at native startup.**
+  `launch_worker` stages a private one-shot body. The Host prepares `@file`
+  for OMP/Pi or `--` plus the quoted body for Claude/Codex only when a body exists,
   then claims `.pending` → `.claimed` immediately before spawn/PTY submit.
   Successful submit never restores pending; ACK persists `.claimed` →
   `.attached` without `?` after the child is live. Missing body cannot ACK.
@@ -95,6 +96,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   unconfirmed `.claimed` is inspect-only, never WITHOUT/resend. Capture
   parent `registered_at_unix_ms` before spawn. Restart must not replay.
   `tests/worker_initial_briefing.rs` is the regression seam.
+  Codex's managed wrapper must reach upstream launchers without PATH recursion
+  or diagnostic argv copies. Unsupported integrations keep interactive delivery.
 - **Activity state machine is shared by include.** `activity_bridge.rs`
   includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
   nao forke a maquina de estados numa copia local; mude no proprio
@@ -463,17 +466,6 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 - New Workers capability: extend `LocalWorkersClient` + typed models here, then
   consume from `zeron-ui/src/workers/`.
-- **OMP launch briefing is native, not viewport-wait.** `launch_worker`
-  attaches sanitized `initial_text` onto the create request for OMP presets
-  whose resolved command is OMP and whose submit mode is PasteAndSubmit.
-  Prepare `@file` only with a real body, then claim `.pending` → `.claimed`
-  at the Host submit seam. A failed spawn restores `.pending` and
-  `briefing_submitted=false`. ACK failure after success keeps Host alive with
-  a consumed reservation.
-  Preset resolution matches Host (enabled project-scoped, then global, by
-  command). Capture parent `registered_at_unix_ms` before spawn so a fast Stop
-  still belongs to the episode. Restart must not replay. Interactive PTY
-  submit stays for other runtimes and for PasteOnly/Raw.
 - Changes that touch session lifecycle must preserve the durable-seed /
   runtime-generation semantics of the included activity state machine.
 - Platform-specific resource code goes in `resources/macos.rs` with the
@@ -536,13 +528,32 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 | `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
 | `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
-| `tests/worker_initial_briefing.rs` (11) — OMP native startup delivery, Host submit seam spawn failure, missing-body/ACK-failure no replay, HostCreateSubmitMode PasteOnly/Raw, restart without replay, other-runtime shell/boot/menu guards | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
+| `tests/worker_initial_briefing.rs` (13) — OMP/Claude/Pi/Codex native delivery, literal input, spawn and ACK failures, no replay, existing interactive guards, managed Codex wrapper privacy and upstream launcher composition | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
+
+### Native initial briefing scenarios
+
+All scenarios use `tests/worker_initial_briefing.rs`; real CLI execution is
+separately observed through the isolated Workers MCP launch/restart recipe.
+The shell asset also passes `bash -n third_party/unpeel/runtimes/codex/assets/hooks/command-wrapper.sh`.
+
+| OpenSpec scenario | Behavioral test |
+|---|---|
+| OMP / Claude / Pi / Codex initial task | `configured_runtimes_receive_the_literal_task_through_native_startup` |
+| Literal task content; nonfatal startup warning | `configured_runtimes_receive_the_literal_task_through_native_startup` |
+| Upstream Codex launcher resolves PATH again | `codex_wrapper_reaches_an_upstream_path_resolving_launcher` |
+| Preset configuration and parent ownership | `mcp_native_decision_matches_host_command_resolution`; `parent_task_episode_cutoff_survives_immediate_completion` |
+| Restart without task replay | `restart_does_not_replay_the_native_initial_task` |
+| Existing permission and authentication gates | `configured_runtimes_receive_the_literal_task_through_native_startup`; real preset matrix, without adding bypasses |
+| Native startup fails | `failed_spawn_does_not_report_briefing_submitted`; `missing_body_does_not_ack_a_surviving_pending`; `missing_native_delivery_is_not_reported_as_submitted` |
+| Receipt failure after submission | `ack_failure_after_submit_keeps_result_and_does_not_replay` |
+| Diagnostic privacy | `codex_wrapper_install_updates_an_existing_managed_asset_without_tracing_the_prompt`; `restart_does_not_replay_the_native_initial_task` |
+| Non-submitting modes and unsupported integrations | `paste_only_and_raw_keep_host_pty_contracts`; `interactive_runtimes_keep_shell_boot_and_menu_protections` |
 
 ## Child DOX Index
 

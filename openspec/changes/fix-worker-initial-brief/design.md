@@ -19,6 +19,7 @@ Non-goals: headless/print conversion, preset configuration edits, a second launc
 5. Positional input is necessarily visible to the local process-argv observer, as in the CLI's normal API. Do not duplicate it into persistent logs: remove raw argv logging in the Codex command wrapper and ensure the normal owned-hook reconciliation installs the corrected asset. Preserve non-content diagnostics. Do not claim that argv is secret.
 6. Keep the current 64 KiB/sanitization boundary and PasteOnly/Raw contracts. Unsupported integrations retain guarded interactive delivery; none of the four configured presets may fall back to viewport-based initial task delivery.
 7. The existing behavioral test file remains the gate. Add observable CLI/process cases for each runtime, literal/leading-option/trailing-newline inputs, no shell evaluation, no trace leakage, and no replay. Freeze formatted tests before capturing RED and preserve the exact failing source snapshot. Main performs the real four-preset installed-artifact matrix.
+8. The real Codex probe exposed managed-wrapper → upstream-launcher → managed-wrapper recursion. Before exec, remove PATH entries whose `codex` is the same file as the managed wrapper. Preserve remaining entries and order, including existing empty entries; when none remain, use `/dev/null` rather than accidentally enabling cwd lookup. Keep the resolved upstream executable and all preset arguments.
 
 ## Risks / Trade-offs
 

@@ -37,6 +37,11 @@ The system SHALL deliver a supplied initial task to OMP, Claude, Pi and Codex Wo
 - **THEN** that viewport text does not prevent native task submission or cause duplicate delivery
 - Test: integration — native task delivery despite startup text
 
+#### Scenario: Upstream Codex launcher resolves PATH again
+- **WHEN** the configured Codex executable is another launcher that searches PATH for codex
+- **THEN** execution reaches the external CLI without rediscovering the managed wrapper, while preserving the configured arguments
+- Test: integration — external Codex launcher does not recurse through the managed wrapper
+
 ### Requirement: Launch preserves authority and lifecycle
 The system MUST preserve the configured runtime options, checkout, model and approval behavior. Initial work MUST belong to the correct parent task. Restarting or resuming MUST NOT resubmit the initial task.
 

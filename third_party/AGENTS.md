@@ -123,8 +123,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   the Host alive if receipt persistence fails (reservation stays consumed).
   Native is PasteAndSubmit-only via `native_initial_startup_enabled`.
   The stored Session command never carries the task; restart must not replay.
-  The Codex command wrapper must not log argv. Prime-agent keeps interactive
-  delivery.
+  The Codex command wrapper must not log argv. Before exec it removes PATH
+  entries resolving to itself by file identity, so upstream launchers cannot
+  recurse through the managed wrapper. Prime-agent keeps interactive delivery.
 - **A extensão de lifecycle da família pi serve os três CLIs.** `pi`, `omp` e
   `prime-agent` recebem `--extension
   <unpeel_home>/hooks/pi-family-lifecycle-extension.js` e emitem `Start`/`Stop`

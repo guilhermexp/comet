@@ -764,3 +764,87 @@ printf '%s\n' 'wrapper-child-executed'
     );
     Ok(())
 }
+
+#[test]
+fn codex_wrapper_reaches_an_upstream_path_resolving_launcher()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = env_lock();
+    let home = IsolatedHome::new()?;
+    unpeel_core::hook_assets::install_codex_wrapper()?;
+    let wrapper_dir = unpeel_core::hook_assets::wrapper_bin_dir();
+    let upstream_dir = home.path().join("upstream");
+    let real_dir = home.path().join("real");
+    let cwd = home.path().join("cwd");
+    let wrapper_alias = home.path().join("wrapper alias");
+    std::os::unix::fs::symlink(&wrapper_dir, &wrapper_alias)?;
+    for (dir, script) in [
+        (
+            &upstream_dir,
+            r#"#!/bin/bash
+if [ "${TEST_UPSTREAM_ENTERED:-}" = 1 ]; then
+  echo 'upstream launcher rediscovered the managed wrapper' >&2
+  exit 97
+fi
+export TEST_UPSTREAM_ENTERED=1
+candidate="$(command -v codex)" || {
+  printf '%s\n' 'no-codex-candidate'
+  exit 0
+}
+exec "$candidate" "$@"
+"#,
+        ),
+        (
+            &real_dir,
+            "#!/bin/sh\nprintf '%s\\n' 'external-codex-executed'\n",
+        ),
+        (&cwd, "#!/bin/sh\nprintf '%s\\n' 'cwd-codex-executed'\n"),
+    ] {
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join("codex"), script)?;
+        fs::set_permissions(dir.join("codex"), fs::Permissions::from_mode(0o755))?;
+    }
+    for (case, paths, expected) in [
+        (
+            "upstream executable behind filesystem aliases",
+            vec![
+                wrapper_dir.clone(),
+                wrapper_alias.clone(),
+                real_dir.clone(),
+                "/bin".into(),
+            ],
+            "external-codex-executed\n",
+        ),
+        (
+            "removing every entry must not enable cwd lookup",
+            vec![wrapper_dir.clone(), wrapper_alias.clone()],
+            "no-codex-candidate\n",
+        ),
+        (
+            "explicit middle empty entry retains cwd priority",
+            vec![wrapper_dir.clone(), "".into(), real_dir],
+            "cwd-codex-executed\n",
+        ),
+        (
+            "explicit trailing empty entry retains cwd lookup",
+            vec![wrapper_dir.clone(), wrapper_alias, "".into()],
+            "cwd-codex-executed\n",
+        ),
+    ] {
+        let output = Command::new(wrapper_dir.join("codex"))
+            .args(["--", "literal startup task"])
+            .current_dir(&cwd)
+            .env("PATH", std::env::join_paths(paths)?)
+            .env("UNPEEL_REAL_CODEX_BIN", upstream_dir.join("codex"))
+            .env("UNPEEL_HOOK_TRACE_FILE", home.path().join("wrapper.trace"))
+            .env_remove("TEST_UPSTREAM_ENTERED")
+            .env_remove("BASH_ENV")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{case}: Codex must reach the external executable instead of recursing: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout)?, expected, "{case}");
+    }
+    Ok(())
+}

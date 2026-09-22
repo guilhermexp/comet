@@ -60,5 +60,23 @@ fi
 # interpreter absolutely: a PATH lookup there dies as an unattributable 127,
 # exactly like the hook path in notify-normalizer.sh.
 UNPEEL_NOTIFY_BASH="${BASH:-/bin/bash}"
+
+# An upstream launcher may resolve codex through PATH again. Remove this
+# wrapper by file identity so filesystem aliases cannot send that lookup back here.
+_unpeel_remaining_path="${PATH}:"
+_unpeel_child_path=""
+_unpeel_path_separator=""
+while [ -n "$_unpeel_remaining_path" ]; do
+  _unpeel_path_entry="${_unpeel_remaining_path%%:*}"
+  _unpeel_remaining_path="${_unpeel_remaining_path#*:}"
+  [ "${_unpeel_path_entry:-.}/codex" -ef "$0" ] && continue
+  _unpeel_child_path="${_unpeel_child_path}${_unpeel_path_separator}${_unpeel_path_entry}"
+  _unpeel_path_separator=":"
+done
+if [ -z "$_unpeel_path_separator" ]; then
+  _unpeel_child_path="/dev/null"
+fi
+export PATH="$_unpeel_child_path"
+
 exec "$REAL_BIN" "${UNPEEL_MCP_ARGS[@]}" \
   -c "notify=[\"$UNPEEL_NOTIFY_BASH\",\"$UNPEEL_CODEX_NOTIFY_PATH\"]" "$@"

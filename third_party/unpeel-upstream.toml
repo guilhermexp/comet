@@ -51,3 +51,8 @@ base_revision_resolves_upstream = false
 # does not replay. Codex command-wrapper.sh no longer logs argv; normal hook
 # install overwrites a stale managed asset. Does not bump
 # local_modifications_count.
+#
+# 2026-09-22 — Real Codex startup exposed upstream-launcher PATH recursion.
+# Before exec, the managed wrapper removes only PATH entries resolving to
+# itself by file identity; configured upstream executable/argv remain intact.
+# The external-launcher regression runs in worker_initial_briefing.
