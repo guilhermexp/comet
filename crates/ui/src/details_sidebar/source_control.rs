@@ -1,4 +1,4 @@
-use zeron_proto::{CheckoutStatusFile, GitFileStatus};
+use zeron_proto::{CheckoutStatusFile, GitStatusCode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceControlRow {
@@ -13,28 +13,28 @@ pub struct DiscardPrompt {
     pub message: String,
 }
 
-pub fn status_letter(status: GitFileStatus) -> char {
+pub fn status_letter(status: GitStatusCode) -> char {
     match status {
-        GitFileStatus::Unmodified => ' ',
-        GitFileStatus::Modified => 'M',
-        GitFileStatus::Added => 'A',
-        GitFileStatus::Deleted => 'D',
-        GitFileStatus::Renamed => 'R',
-        GitFileStatus::Copied => 'C',
-        GitFileStatus::Untracked => 'U',
-        GitFileStatus::Unmerged => '!',
+        GitStatusCode::Unmodified => ' ',
+        GitStatusCode::Modified => 'M',
+        GitStatusCode::Added => 'A',
+        GitStatusCode::Deleted => 'D',
+        GitStatusCode::Renamed => 'R',
+        GitStatusCode::Copied => 'C',
+        GitStatusCode::Untracked => 'U',
+        GitStatusCode::Unmerged => '!',
     }
 }
 
 pub fn is_staged(file: &CheckoutStatusFile) -> bool {
     !matches!(
         file.index,
-        GitFileStatus::Unmodified | GitFileStatus::Untracked
+        GitStatusCode::Unmodified | GitStatusCode::Untracked
     )
 }
 
 pub fn is_unstaged(file: &CheckoutStatusFile) -> bool {
-    file.worktree != GitFileStatus::Unmodified
+    file.worktree != GitStatusCode::Unmodified
 }
 
 pub fn staged_rows(files: &[CheckoutStatusFile]) -> Vec<SourceControlRow> {
@@ -82,7 +82,7 @@ pub fn sync_button_label(upstream: Option<&str>) -> &'static str {
 
 pub fn discard_prompt(paths: &[CheckoutStatusFile]) -> DiscardPrompt {
     let deletes_untracked = paths.iter().any(|file| {
-        file.index == GitFileStatus::Untracked || file.worktree == GitFileStatus::Untracked
+        file.index == GitStatusCode::Untracked || file.worktree == GitStatusCode::Untracked
     });
     let names: Vec<String> = paths.iter().map(|file| file.path.clone()).collect();
     let message = if names.len() == 1 {
@@ -112,7 +112,7 @@ pub fn discard_prompt(paths: &[CheckoutStatusFile]) -> DiscardPrompt {
 mod tests {
     use super::*;
 
-    fn file(path: &str, index: GitFileStatus, worktree: GitFileStatus) -> CheckoutStatusFile {
+    fn file(path: &str, index: GitStatusCode, worktree: GitStatusCode) -> CheckoutStatusFile {
         CheckoutStatusFile {
             path: path.into(),
             old_path: None,
@@ -125,8 +125,8 @@ mod tests {
     fn both_sections_get_a_letter_for_mm_files() {
         let files = [file(
             "a.rs",
-            GitFileStatus::Modified,
-            GitFileStatus::Modified,
+            GitStatusCode::Modified,
+            GitStatusCode::Modified,
         )];
         let staged = staged_rows(&files);
         let changes = changes_rows(&files);
@@ -139,20 +139,20 @@ mod tests {
     #[test]
     fn badge_counts_three_changed_files() {
         let files = [
-            file("a", GitFileStatus::Modified, GitFileStatus::Unmodified),
-            file("b", GitFileStatus::Unmodified, GitFileStatus::Modified),
-            file("c", GitFileStatus::Untracked, GitFileStatus::Untracked),
+            file("a", GitStatusCode::Modified, GitStatusCode::Unmodified),
+            file("b", GitStatusCode::Unmodified, GitStatusCode::Modified),
+            file("c", GitStatusCode::Untracked, GitStatusCode::Untracked),
         ];
         assert_eq!(change_badge(&files), 3);
     }
 
     #[test]
     fn commit_requires_message_and_staged_files() {
-        let staged = [file("a", GitFileStatus::Added, GitFileStatus::Unmodified)];
+        let staged = [file("a", GitStatusCode::Added, GitStatusCode::Unmodified)];
         let dirty = [file(
             "a",
-            GitFileStatus::Unmodified,
-            GitFileStatus::Modified,
+            GitStatusCode::Unmodified,
+            GitStatusCode::Modified,
         )];
         assert!(can_commit("ok", &staged));
         assert!(!can_commit("   ", &staged));
@@ -170,15 +170,15 @@ mod tests {
     fn untracked_discard_prompt_warns_it_deletes() {
         let prompt = discard_prompt(&[file(
             "scratch.txt",
-            GitFileStatus::Untracked,
-            GitFileStatus::Untracked,
+            GitStatusCode::Untracked,
+            GitStatusCode::Untracked,
         )]);
         assert!(prompt.message.contains("scratch.txt"));
         assert!(prompt.message.to_lowercase().contains("delete"));
         let tracked = discard_prompt(&[file(
             "a.rs",
-            GitFileStatus::Unmodified,
-            GitFileStatus::Modified,
+            GitStatusCode::Unmodified,
+            GitStatusCode::Modified,
         )]);
         assert!(tracked.message.contains("a.rs"));
         assert!(!tracked.message.to_lowercase().contains("delete"));
@@ -188,12 +188,12 @@ mod tests {
     fn untracked_letter_is_distinct_from_added_and_conflict() {
         let files = [file(
             "new.txt",
-            GitFileStatus::Untracked,
-            GitFileStatus::Untracked,
+            GitStatusCode::Untracked,
+            GitStatusCode::Untracked,
         )];
         assert_eq!(changes_rows(&files)[0].letter, 'U');
-        assert_eq!(status_letter(GitFileStatus::Unmerged), '!');
-        assert_eq!(status_letter(GitFileStatus::Added), 'A');
+        assert_eq!(status_letter(GitStatusCode::Unmerged), '!');
+        assert_eq!(status_letter(GitStatusCode::Added), 'A');
         assert!(staged_rows(&files).is_empty());
     }
 }

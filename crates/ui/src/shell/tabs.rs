@@ -92,7 +92,8 @@ impl Shell {
     }
 
     /// Open a session from the sidebar: select it, the main area follows.
-    pub(super) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.state
@@ -104,6 +105,7 @@ impl Shell {
     /// re-homes the canvas onto that project; under "All" the current pick
     /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
         if self.sidebar_mode == SidebarMode::Workers {
             self.workers_model.update(cx, |model, cx| {
                 let Some(project) = model.selected_project().cloned() else {
@@ -139,9 +141,17 @@ impl Shell {
                 .clone()
                 .filter(|id| state.space_row(id).is_some())
         };
+        let defaults = crate::settings::composer::ComposerDefaults::load(&self.data_dir);
         self.state.update(cx, |s, cx| {
             if target.is_some() {
                 s.select_space(target, cx);
+            } else if defaults.no_project {
+                // Opening an existing project session (including boot's last
+                // session) must not erase the saved new-session opt-out.
+                s.select_space(None, cx);
+                if let Some(device) = defaults.device {
+                    s.select_device(device, cx);
+                }
             }
             s.select_chat(None, cx);
         });
@@ -151,8 +161,13 @@ impl Shell {
     /// The unified titlebar in chat mode:
     /// `[new-session +] [harness icon + session title] … [utility controls]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
-    /// animated left inset, terminal and utility-panel controls).
-    pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// animated left inset, terminal and utility-panel controls, and the
+    /// project actions control).
+    pub(super) fn render_session_title_bar(
+        &mut self,
+        viewport_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
@@ -198,7 +213,7 @@ impl Shell {
         // The new-session `+` renders in the WINDOW-CONTROL CLUSTER whenever a
         // session is selected (`render_titlebar_cluster`) — this row budgets
         // one button slot so the title never sits under it.
-        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let sidebar_now = self.sidebar_now();
         let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
         let details_open = self.details_sidebar_open(cx);
         let details_now = if details_open {
@@ -260,6 +275,9 @@ impl Shell {
         // across the chat column - the capture button landed on top of the
         // conversation title. A content-sized cluster needs no geometry: the
         // row's own right padding already ends at the chat column's edge.
+        let row_gap = 8.0;
+        let files_open = self.files_panel_open(cx);
+        let files_now = self.files_visible_width(cx);
         let changes_trailing: Option<gpui::AnyElement> = if changes_active && !on_canvas {
             let capabilities = titlebar_capabilities(
                 SidebarMode::Orchestrator,
@@ -276,6 +294,9 @@ impl Shell {
                     .child(self.render_orchestrator_capture_button(&theme, cx))
                     .when(capabilities.trajectory, |el| {
                         el.child(self.render_orchestrator_trajectory_button(&theme, cx))
+                    })
+                    .when(!files_open, |el| {
+                        el.child(self.render_files_panel_toggle(&theme, cx))
                     })
                     .when(!details_open && self.details_context(cx).is_some(), |el| {
                         el.child(self.render_details_sidebar_button(
@@ -303,6 +324,9 @@ impl Shell {
                     .when(capabilities.trajectory, |el| {
                         el.child(self.render_orchestrator_trajectory_button(&theme, cx))
                     })
+                    .when(!on_canvas && !files_open, |el| {
+                        el.child(self.render_files_panel_toggle(&theme, cx))
+                    })
                     .when(!details_open && self.details_context(cx).is_some(), |el| {
                         el.child(self.render_details_sidebar_button(
                             "orchestrator-toggle-details-sidebar",
@@ -324,7 +348,7 @@ impl Shell {
             div()
                 .absolute()
                 .top_0()
-                .right(px(details_now))
+                .right(px(details_now + files_now))
                 .w(px(right_now))
                 .h(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
@@ -357,15 +381,53 @@ impl Shell {
                     cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
                 ))
         });
+        // The explorer slot (upstream's docked Files column) sits over the
+        // explorer column between the surface host and the Details sidebar,
+        // carrying its own toggle while the explorer is open; closed, the
+        // toggle rides in the trailing cluster above.
+        let files_header = (files_open && !on_canvas && files_now > 0.0).then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .right(px(details_now))
+                .w(px(files_now))
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_end()
+                .pr(px(10.0))
+                .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .overflow_hidden()
+                .occlude()
+                .child(self.render_files_panel_toggle(&theme, cx))
+        });
+        // Project actions (upstream #project-actions) take whatever the title
+        // row leaves between the title and the trailing cluster.
+        let trailing_budget = 4.0 * 28.0 + 3.0 * 6.0;
+        let available_titlebar_width = (self.viewport_width
+            - row_left
+            - self.titlebar_right_pad(Theme::SPACE_LG)
+            - details_now
+            - right_now
+            - files_now
+            - trailing_budget
+            - row_gap * 3.0)
+            .max(0.0);
+        let actions = (!takeover && !on_canvas)
+            .then(|| {
+                self.render_project_actions_control(available_titlebar_width, viewport_height, cx)
+            })
+            .flatten();
         let inner = div()
             .size_full()
             .flex()
             .items_center()
             .pt(px(Theme::TITLEBAR_TOP_PAD))
-            .gap(px(8.0))
+            .gap(px(row_gap))
             .pl(px(row_left))
             .pr(px(self.titlebar_right_pad(Theme::SPACE_LG)
                 + details_now
+                + files_now
                 + right_now))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
@@ -374,6 +436,7 @@ impl Shell {
                 el.child(
                     div()
                         .min_w_0()
+                        .overflow_hidden()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -405,7 +468,8 @@ impl Shell {
                         .when_some(target, |el, target| {
                             el.child(
                                 div()
-                                    .flex_none()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_size(px(12.0))
                                     .text_color(theme.text_muted.opacity(0.5))
                                     .child(target),
@@ -414,6 +478,7 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(actions)
             .children(changes_trailing)
             // Stable utility controls at the right edge of the conversation
             // titlebar; hidden on the new-session canvas because neither
@@ -460,9 +525,31 @@ impl Shell {
             .h(px(Theme::TITLEBAR_HEIGHT))
             .flex_none()
             .child(inner)
-            .children(panel_header);
+            .children(panel_header)
+            .children(files_header);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
+    }
+
+    /// Toggle for upstream's docked explorer column (`files_panel.rs`). It
+    /// rides the fork's trailing cluster while the explorer is closed and
+    /// the explorer slot over its column while open.
+    fn render_files_panel_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.files_panel_open(cx);
+        header_icon_button(
+            "toggle-files-panel",
+            icons::FILE_TREE,
+            open,
+            theme,
+            cx.listener(|this, _, window, cx| this.toggle_files_panel(window, cx)),
+        )
+        .role(gpui::Role::Button)
+        .aria_label(if open {
+            "Hide files panel"
+        } else {
+            "Show files panel"
+        })
+        .into_any_element()
     }
 }
 

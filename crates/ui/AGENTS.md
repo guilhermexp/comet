@@ -262,6 +262,9 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 - Completion sounds/banners consume new Session completion markers, never infer success from Idle. First observations, stale updates and pending sends update the baseline silently. AwaitingInput notifications remain independent; compaction uses the same completion evidence.
 
+- **Sync upstream v0.2.83** (`openspec/changes/sync-upstream-v0-2-83/`): Enter com run ativo continua fazendo steer; o painel de fila do upstream (`queue.rs`) coexiste (editar, Send now, Steer now) e não substitui o steering. O transcript prepara linhas em background (`TranscriptPreparation`), então `Row` precisa continuar `Send + Sync`; a largura da conversa é configurável (padrão 736) e vale para transcript e composer. `attachments::parse_user_message_images` já devolve o texto sem o contexto do appshot (o card é a apresentação). Fica de fora do upstream: fold compacto/`TOOL_FOLD`, restyle em árvore das tools, ícones Symbols, anel de contexto, terminal no rodapé.
+- **Testes de Shell usam `shell::test_shell`**, que monta `WorkersModel::detached` sob `cfg(test)` (sem poll do daemon real); os fixtures em `examples/` usam o modelo vivo. Métrica nativa de texto em teste passa por `file_preview::loader::PREVIEW_TEXT_SYSTEM` — uma segunda plataforma nativa concorrente aborta no HIToolbox (macOS 27).
+
 - **Projeto vazio não é seleção automática de Workers**: `apply_snapshot` nunca escolhe o primeiro registro como fallback. Ao desaparecer a última sessão do projeto selecionado, a seleção implícita é limpa (inclui archive/remove local e refresh de alteração externa). Projeto vazio selecionado explicitamente ou com launch pendente continua acessível; o ledger e os arquivos não são removidos.
 
 ## Work Guidance

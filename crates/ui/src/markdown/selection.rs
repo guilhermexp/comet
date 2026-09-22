@@ -49,6 +49,15 @@ fn state() -> &'static Mutex<Option<MdSelection>> {
     STATE.get_or_init(|| Mutex::new(None))
 }
 
+/// Selection state is process-global; tests that exercise its lifecycle must
+/// not race each other.
+#[cfg(test)]
+pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
 /// `(key, text)` pairs). Handles either direction; empty interior lines retain their newline.
@@ -63,6 +72,9 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
         let from = if ei == start.0 { start.1 } else { 0 };
         let to = if ei == end.0 { end.1 } else { text.len() };
         let (from, to) = (from.min(text.len()), to.min(text.len()));
+        // Keep empty elements strictly between the endpoints. Rendered code
+        // fences register one element per source line, so a blank line must
+        // contribute its newline when a selection crosses it.
         if from < to || (ei > start.0 && ei < end.0) {
             spans.push(Span {
                 key: (*key).to_string(),
@@ -107,6 +119,14 @@ pub fn drag_anchor(key: &str) -> Option<usize> {
     let guard = state().lock().unwrap();
     let sel = guard.as_ref()?;
     (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_ix)
+}
+
+pub(crate) fn anchor_key() -> Option<String> {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.anchor_key.clone())
 }
 
 /// Whether a markdown selection drag is currently in flight.
@@ -365,6 +385,14 @@ pub(crate) mod tests {
         assert_eq!(resolve_spans(&elems(), (2, 5), (0, 6)), spans);
     }
 
+    #[test]
+    fn spans_across_empty_elements_preserve_blank_lines() {
+        let elements = [("line-1", "first"), ("line-2", ""), ("line-3", "third")];
+        let spans = resolve_spans(&elements, (0, 0), (2, 5));
+        assert_eq!(spans.len(), 3);
+        assert_eq!(join_spans(&spans), "first\n\nthird");
+    }
+
     /// The drag tests below mutate the process-global selection state —
     /// serialize them, or the parallel test runner interleaves their
     /// begin/end_drag calls (long-standing flake).
@@ -417,7 +445,7 @@ pub(crate) mod tests {
 
     #[test]
     fn drag_lifecycle_and_copy_joins() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 6);
         assert_eq!(drag_anchor("p1"), Some(6));
         assert_eq!(drag_anchor("p2"), None);
@@ -437,7 +465,7 @@ pub(crate) mod tests {
 
     #[test]
     fn drag_survives_forward_virtualization() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 6);
         assert!(update_drag(&elems(), (2, 5)));
         let shifted = [("p2", "second"), ("p3", "third one"), ("p4", "fourth")];
@@ -455,7 +483,7 @@ pub(crate) mod tests {
 
     #[test]
     fn drag_survives_backward_virtualization() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p5", 4);
         let first = [("p3", "third"), ("p4", "fourth"), ("p5", "fifth")];
         assert!(update_drag(&first, (0, 2)));
@@ -467,7 +495,7 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_click_clears_on_release() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 3);
         assert_eq!(end_drag("p1"), None);
         assert_eq!(selected_text(), None);
@@ -475,7 +503,7 @@ pub(crate) mod tests {
 
     #[test]
     fn double_click_span() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin_with_span("p1", "hello world", 6..11);
         assert_eq!(wash_range("p1"), Some(6..11));
         assert_eq!(end_drag("p1").as_deref(), Some("world"));

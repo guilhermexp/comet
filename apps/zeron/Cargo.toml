@@ -45,6 +45,7 @@ zeron-rpc.workspace = true
 zeron-ui.workspace = true
 zeron-update.workspace = true
 zeron-workers-unpeel.workspace = true
+zeron-mcp.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
@@ -53,11 +54,19 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The custom allocator is macOS-only (see main.rs): glibc measured flat on the
+# same streaming/scroll workloads, so Linux keeps the system allocator.
 [target.'cfg(target_os = "macos")'.dependencies]
 mimalloc.workspace = true
 image = { workspace = true, optional = true }
 objc2 = { workspace = true, optional = true }
 objc2-app-kit = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
 tempfile.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.11"

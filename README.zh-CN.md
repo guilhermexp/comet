@@ -1,6 +1,6 @@
 # Zeron
 
-在本地管理你的编码 agent（Claude Code、Codex、Cursor、Grok、Hermes、Pi、OMP、Prime Agent 以及其他本地 CLI runtime），也可以打开多设备同步。
+在本地管理你的编码 agent（Claude Code、Codex、Cursor、Devin、Grok、Hermes、Pi、Antigravity、OMP、Prime Agent 以及其他本地 CLI runtime），也可以打开多设备同步。
 
 *[English](README.md) | 简体中文*
 
@@ -57,6 +57,6 @@ macOS 上用桌面版发行包，或者从源码构建 `zeron`，再运行 `zero
 
 ---
 
-想参与开发，或者好奇它怎么跑起来的？[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/comet)，也可以看 [ARCHITECTURE.md](ARCHITECTURE.md)。
+想参与开发，或者好奇它怎么跑起来的？[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/zeron)，也可以看 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 采用 [MIT License](LICENSE)。

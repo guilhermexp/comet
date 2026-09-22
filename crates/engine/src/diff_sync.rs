@@ -54,6 +54,8 @@ use crate::process::{
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::workspace_host::WorkspaceHost;
 
+mod git_status;
+
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_DIFF_SOURCE_BYTES: usize = 2 * 1024 * 1024;
@@ -94,6 +96,7 @@ pub struct DiffSidecar {
 /// One bounded atomic snapshot of a checkout's working tree.
 #[derive(Debug, Clone)]
 pub struct DiffSnapshot {
+    pub git_status: Option<(Vec<zeron_proto::GitFileStatus>, bool)>,
     pub branch: String,
     pub head_sha: Option<String>,
     pub patch: String,
@@ -168,6 +171,7 @@ struct DiffSyncInner {
     orphan_grace: Duration,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
     status_tx: watch::Sender<Vec<zeron_proto::CheckoutStatus>>,
+    statuses_tx: watch::Sender<Vec<zeron_proto::CheckoutGitStatus>>,
     /// chat_id → turn-start tree (see [`TurnSnapshot`]).
     turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
     /// The tasks hold `Weak` refs, but an in-flight iteration holds an
@@ -243,6 +247,7 @@ impl CheckoutDiffSync {
                 orphan_grace,
                 diffs_tx,
                 status_tx,
+                statuses_tx: watch::channel(Vec::new()).0,
                 turn_trees: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
                 supervisor: Mutex::new(None),
@@ -295,6 +300,11 @@ impl CheckoutDiffSync {
             inner: Arc::downgrade(&self.inner),
             checkout_id,
         })
+    }
+
+    /// Consumers filter this shared cache; subscribing never starts another Git scan.
+    pub fn watch_git_statuses(&self) -> watch::Receiver<Vec<zeron_proto::CheckoutGitStatus>> {
+        self.inner.statuses_tx.subscribe()
     }
 
     /// Regroup this device's chats by checkout identity, then (re)build watchers.
@@ -685,10 +695,14 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         Err(err) => {
             tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
                 "diff-sync: capture failed");
+            git_status::publish(inner, entry, Vec::new(), false);
             return;
         }
     };
 
+    if let Some((files, complete)) = &snapshot.git_status {
+        git_status::publish(inner, entry, files.clone(), *complete);
+    }
     if lock(&entry.checksum).as_deref() == Some(snapshot.checksum.as_str()) {
         return; // unchanged — publish nothing
     }
@@ -733,8 +747,8 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
             };
             let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
             // Fresh bearer per request — never the boot-time snapshot.
-            let Some(bearer) = edge.bearer().await else {
-                tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (signed out)");
+            let Ok(bearer) = edge.bearer().await else {
+                tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (token unavailable)");
                 continue;
             };
             let result = inner
@@ -796,6 +810,11 @@ fn publish_status_with(inner: &Arc<DiffSyncInner>, updated: Option<zeron_proto::
             }
         }
         statuses.sort_by(|a, b| a.checkout_id.cmp(&b.checkout_id));
+    });
+    inner.statuses_tx.send_if_modified(|statuses| {
+        let before = statuses.len();
+        statuses.retain(|status| live.contains(&status.checkout_id));
+        before != statuses.len()
     });
 }
 
@@ -911,17 +930,17 @@ fn split_z(value: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn git_xy(code: char) -> zeron_proto::GitFileStatus {
+fn git_xy(code: char) -> zeron_proto::GitStatusCode {
     match code {
-        ' ' => zeron_proto::GitFileStatus::Unmodified,
-        'M' | 'T' => zeron_proto::GitFileStatus::Modified,
-        'A' => zeron_proto::GitFileStatus::Added,
-        'D' => zeron_proto::GitFileStatus::Deleted,
-        'R' => zeron_proto::GitFileStatus::Renamed,
-        'C' => zeron_proto::GitFileStatus::Copied,
-        'U' => zeron_proto::GitFileStatus::Unmerged,
-        '?' => zeron_proto::GitFileStatus::Untracked,
-        _ => zeron_proto::GitFileStatus::Modified,
+        ' ' => zeron_proto::GitStatusCode::Unmodified,
+        'M' | 'T' => zeron_proto::GitStatusCode::Modified,
+        'A' => zeron_proto::GitStatusCode::Added,
+        'D' => zeron_proto::GitStatusCode::Deleted,
+        'R' => zeron_proto::GitStatusCode::Renamed,
+        'C' => zeron_proto::GitStatusCode::Copied,
+        'U' => zeron_proto::GitStatusCode::Unmerged,
+        '?' => zeron_proto::GitStatusCode::Untracked,
+        _ => zeron_proto::GitStatusCode::Modified,
     }
 }
 
@@ -1339,7 +1358,13 @@ pub async fn capture_diff_against(
     let status = capture_git(
         repos.runner(),
         root,
-        &["--no-optional-locks", "status", "--porcelain=v1", "-z"],
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
         2 * 1024 * 1024,
     )
     .await?;
@@ -1358,27 +1383,57 @@ pub async fn capture_diff_against(
     let mut untracked: Vec<String> = parse_porcelain_v1_z(&status.stdout)
         .into_iter()
         .filter(|file| {
-            file.index == zeron_proto::GitFileStatus::Untracked
-                || file.worktree == zeron_proto::GitFileStatus::Untracked
+            file.index == zeron_proto::GitStatusCode::Untracked
+                || file.worktree == zeron_proto::GitStatusCode::Untracked
         })
         .map(|file| file.path)
         .collect();
     untracked.sort();
 
+    // Status now enumerates new directories as individual paths. Keep content
+    // work bounded even when thousands of those files are binary or too large
+    // to fit in the patch; their Git statuses remain complete independently.
+    let mut untracked_budget = MAX_PATCH_BYTES;
     for path in untracked {
+        if untracked_budget == 0 {
+            truncated = true;
+            break;
+        }
         let full = root.join(&path);
         let binary;
         let mut additions = 0u32;
-        let size = tokio::fs::metadata(&full)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let Ok(metadata) = tokio::fs::symlink_metadata(&full).await else {
+            continue;
+        };
+        let size = metadata.len();
         if size > MAX_PATCH_BYTES as u64 {
             binary = true;
             truncated = true;
         } else {
-            match tokio::fs::read(&full).await {
+            let content = if metadata.file_type().is_symlink() {
+                // A Git symlink's content is its target path, never the target file.
+                tokio::fs::read_link(&full)
+                    .await
+                    .map(|path| path.to_string_lossy().into_owned().into_bytes())
+            } else {
+                async {
+                    use tokio::io::AsyncReadExt as _;
+                    let file = tokio::fs::File::open(&full).await?;
+                    let mut bytes = Vec::new();
+                    file.take(untracked_budget as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .await?;
+                    Ok::<_, std::io::Error>(bytes)
+                }
+                .await
+            };
+            match content {
                 Ok(bytes) => {
+                    if bytes.len() > untracked_budget {
+                        truncated = true;
+                        break;
+                    }
+                    untracked_budget = untracked_budget.saturating_sub(bytes.len().max(1));
                     binary = bytes.contains(&0);
                     if !binary {
                         let text = String::from_utf8_lossy(&bytes).to_string();
@@ -1427,6 +1482,7 @@ pub async fn capture_diff_against(
     let checksum = crate::repos::hex(&hasher.finalize());
 
     Ok(DiffSnapshot {
+        git_status: Some(git_status::parse(&status.stdout, status.truncated)),
         branch,
         head_sha: (!head.is_empty()).then_some(head),
         patch,
@@ -1524,6 +1580,7 @@ pub async fn capture_commit_diff(
     Ok(DiffSnapshot {
         branch,
         head_sha: Some(sha.to_string()),
+        git_status: None,
         patch,
         files,
         additions,
@@ -1564,6 +1621,11 @@ pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
     ));
     let run = |args: &[&str]| {
         let mut cmd = tokio::process::Command::new("git");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut().creation_flags(0x08000000);
+        }
         cmd.arg("-C").arg(root).args(args);
         cmd.env("GIT_INDEX_FILE", &index);
         cmd.stdin(std::process::Stdio::null());
@@ -1693,6 +1755,7 @@ pub async fn capture_turn_diff(
     Ok(DiffSnapshot {
         branch,
         head_sha: (!head.is_empty()).then_some(head),
+        git_status: None,
         patch,
         files,
         additions,
@@ -2049,29 +2112,29 @@ mod future_size_tests {
 #[cfg(test)]
 mod parse_porcelain_v1_z_tests {
     use super::parse_porcelain_v1_z;
-    use zeron_proto::GitFileStatus;
+    use zeron_proto::GitStatusCode;
 
     #[test]
     fn splits_staged_unstaged_untracked_and_rename() {
         let buf = b"MM both.txt\0A  added.txt\0?? untracked.txt\0R  new name.txt\0old name.txt\0 M path with space.txt\0??  nota.txt\0";
         let files = parse_porcelain_v1_z(buf);
         assert_eq!(files[0].path, "both.txt");
-        assert_eq!(files[0].index, GitFileStatus::Modified);
-        assert_eq!(files[0].worktree, GitFileStatus::Modified);
+        assert_eq!(files[0].index, GitStatusCode::Modified);
+        assert_eq!(files[0].worktree, GitStatusCode::Modified);
         assert_eq!(files[1].path, "added.txt");
-        assert_eq!(files[1].index, GitFileStatus::Added);
-        assert_eq!(files[1].worktree, GitFileStatus::Unmodified);
+        assert_eq!(files[1].index, GitStatusCode::Added);
+        assert_eq!(files[1].worktree, GitStatusCode::Unmodified);
         assert_eq!(files[2].path, "untracked.txt");
-        assert_eq!(files[2].index, GitFileStatus::Untracked);
-        assert_eq!(files[2].worktree, GitFileStatus::Untracked);
+        assert_eq!(files[2].index, GitStatusCode::Untracked);
+        assert_eq!(files[2].worktree, GitStatusCode::Untracked);
         assert_eq!(files[3].path, "new name.txt");
         assert_eq!(files[3].old_path.as_deref(), Some("old name.txt"));
-        assert_eq!(files[3].index, GitFileStatus::Renamed);
+        assert_eq!(files[3].index, GitStatusCode::Renamed);
         assert_eq!(files[4].path, "path with space.txt");
-        assert_eq!(files[4].index, GitFileStatus::Unmodified);
-        assert_eq!(files[4].worktree, GitFileStatus::Modified);
+        assert_eq!(files[4].index, GitStatusCode::Unmodified);
+        assert_eq!(files[4].worktree, GitStatusCode::Modified);
         assert_eq!(files[5].path, " nota.txt");
-        assert_eq!(files[5].index, GitFileStatus::Untracked);
+        assert_eq!(files[5].index, GitStatusCode::Untracked);
     }
 }
 

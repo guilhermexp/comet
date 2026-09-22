@@ -222,6 +222,22 @@ mod tests {
     }
 
     #[test]
+    fn binding_is_stable_and_children_are_independent() {
+        let mut children = Subagents::new("root".into());
+        children.bind("alpha", "spawn-alpha");
+        children.bind("beta", "spawn-beta");
+        children.bind("alpha", "later-activity");
+        assert_eq!(
+            children.route("alpha", vec![text("a")]),
+            vec![tag("spawn-alpha", text("a"))]
+        );
+        assert_eq!(
+            children.route("beta", vec![text("b")]),
+            vec![tag("spawn-beta", text("b"))]
+        );
+    }
+
+    #[test]
     fn root_and_missing_children_are_ignored() {
         let mut children = Subagents::new("root".into());
         assert!(children.bind("root", "spawn").is_empty());
@@ -365,5 +381,45 @@ mod tests {
                 if parent_tool_use_id == "spawn-alpha"
                     && matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "early")
         )));
+    }
+
+    #[test]
+    fn early_content_waits_for_the_spawn_and_drains_once_in_order() {
+        let mut children = Subagents::new("root".into());
+        assert!(
+            children
+                .route("alpha", vec![text("first"), text("second")])
+                .is_empty()
+        );
+        assert_eq!(
+            children.bind("alpha", "spawn"),
+            vec![tag("spawn", text("first")), tag("spawn", text("second"))]
+        );
+        assert!(children.bind("alpha", "spawn").is_empty());
+        assert_eq!(children.pending_bytes, 0);
+    }
+
+    #[test]
+    fn root_and_missing_ids_never_bind_or_buffer() {
+        let mut children = Subagents::new("root".into());
+        for child in ["root", ""] {
+            assert!(children.bind(child, "spawn").is_empty());
+            assert!(children.route(child, vec![text("noise")]).is_empty());
+        }
+        children.bind("alpha", "");
+        assert!(children.spawns.is_empty());
+        assert!(children.pending.is_empty());
+    }
+
+    #[test]
+    fn unbound_backlog_is_bounded_without_affecting_known_children() {
+        let mut children = Subagents::new("root".into());
+        children.route("unknown", vec![text(&"x".repeat(MAX_PENDING_BYTES))]);
+        assert!(children.pending.is_empty());
+        children.bind("alpha", "spawn");
+        assert_eq!(
+            children.route("alpha", vec![text("ok")]),
+            vec![tag("spawn", text("ok"))]
+        );
     }
 }

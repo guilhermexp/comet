@@ -24,7 +24,7 @@ use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
-use crate::settings::{self, SavePolicy};
+use crate::settings::{self, SavePolicy, widgets};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -186,6 +186,7 @@ impl LoginFlow {
 
 pub struct AccountsPage {
     state: Entity<AppState>,
+    scroll: widgets::PageScroll,
     /// Which device's logins are shown; `None` = this device (no passthrough).
     /// Retargeted by the page-header device switcher (zeron parity: the
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
@@ -215,6 +216,7 @@ impl AccountsPage {
         });
         let mut page = Self {
             state,
+            scroll: widgets::PageScroll::default(),
             target_device: None,
             device_menu: popover::Popup::default(),
             snapshot: Loadable::Idle,
@@ -270,6 +272,12 @@ impl AccountsPage {
             object.insert("targetDeviceId".into(), serde_json::json!(target));
         }
         value
+    }
+
+    fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll.set_list_hovered(*hovered) {
+            cx.notify();
+        }
     }
 
     /// The page-header device switcher (zeron device-switcher.tsx): a quiet
@@ -778,7 +786,6 @@ impl AccountsPage {
         now: DateTime<Utc>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::settings::widgets;
         let is_busy = self.busy_account.as_deref() == Some(account.id.as_str());
         let email: SharedString = account
             .email
@@ -961,7 +968,7 @@ impl AccountsPage {
         viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let theme = Theme::of(cx).clone();
+        let theme = Theme::of(cx).for_popup();
         let red_text = theme.danger_muted.opacity(0.9); // red-300
         let login = self.login.as_ref()?;
         let title = login.title();
@@ -1229,9 +1236,18 @@ impl AccountsPage {
     }
 }
 
+impl popover::ScrollRailHost for AccountsPage {
+    fn rail_bar(&mut self) -> &mut popover::MenuScrollbarState {
+        self.scroll.rail_bar()
+    }
+
+    fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
+        self.scroll.rail_scroll()
+    }
+}
+
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
@@ -1247,10 +1263,12 @@ impl Render for AccountsPage {
             HarnessId::Kimi => (crate::icons::WORKER_KIMI, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY, None),
             HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
+            HarnessId::Devin => (crate::icons::DEVIN_MARK, None),
             HarnessId::Grok => (crate::icons::GROK_MARK, None),
             HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
             HarnessId::Pi => (crate::icons::PI_MARK, None),
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
+            HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -1448,77 +1466,90 @@ impl Render for AccountsPage {
             }
         };
 
+        let scrollbar = popover::rail(self, "accounts-page-scrollbar", &theme, cx);
         div()
-            .id("accounts-page")
+            .id("accounts-page-host")
+            .relative()
             .size_full()
-            .overflow_y_scroll()
+            .on_hover(cx.listener(Self::on_scroll_hovered))
             .child(
-                widgets::page_column()
+                div()
+                    .id("accounts-page")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll.scroll)
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(widgets::page_header(&theme, "Accounts", account_count))
-                            .child(div().flex_1())
+                        widgets::page_column()
                             .child(
-                                // `text-[12.5px]` + leading 16px Refresh icon,
-                                // dimmed while a refresh is in flight (zeron
-                                // `disabled:opacity-50`).
-                                widgets::ghost_action(&theme)
-                                    .id("accounts-refresh")
-                                    .flex_none()
-                                    .text_size(px(12.5))
-                                    .hover(|s| widgets::ghost_hover(&theme, s))
-                                    .when(refreshing, |el| el.opacity(0.5))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.load(force_usage_for(LoadTrigger::Refresh), cx)
-                                    }))
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(widgets::page_header(&theme, "Accounts", account_count))
+                                    .child(div().flex_1())
                                     .child(
-                                        crate::icons::icon(crate::icons::REFRESH)
-                                            .size(px(16.0))
-                                            .text_color(theme.text_muted),
+                                        // `text-[12.5px]` + leading 16px Refresh icon,
+                                        // dimmed while a refresh is in flight (zeron
+                                        // `disabled:opacity-50`).
+                                        widgets::ghost_action(&theme)
+                                            .id("accounts-refresh")
+                                            .flex_none()
+                                            .text_size(px(12.5))
+                                            .hover(|s| widgets::ghost_hover(&theme, s))
+                                            .when(refreshing, |el| el.opacity(0.5))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.load(
+                                                    force_usage_for(LoadTrigger::Refresh),
+                                                    cx,
+                                                )
+                                            }))
+                                            .child(
+                                                crate::icons::icon(crate::icons::REFRESH)
+                                                    .size(px(16.0))
+                                                    .text_color(theme.text_muted),
+                                            )
+                                            .child(SharedString::from("Refresh")),
                                     )
-                                    .child(SharedString::from("Refresh")),
+                                    .child(self.render_device_switcher(&theme, cx)),
                             )
-                            .child(self.render_device_switcher(&theme, cx)),
-                    )
-                    .child(widgets::page_subtitle(
-                        &theme,
-                        "The Claude Code, Codex, and Cursor logins plus managed Kimi Code, \
-                         Grok, and Antigravity Usage on this device. Zeron keeps switchable \
-                         accounts backed up; authentication for Kimi, Grok, and Antigravity \
-                         remains owned by their CLIs.",
-                    ))
-                    .when_some(self.error.clone(), |el, message| {
-                        el.child(
-                            widgets::error_strip(&theme, message)
-                                .id("accounts-action-error")
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.error = None;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .children(sections)
-                    // Footer note (zeron: `mt-6 text-[12px] leading-relaxed
-                    // text-muted-foreground/60`).
-                    .child(
-                        div()
-                            .mt(px(24.0))
-                            .text_size(px(12.0))
-                            .line_height(px(19.0))
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(
-                                "Switching rewrites the CLI\u{2019}s stored login, so new \
-                                 agent sessions use the selected account immediately. On \
-                                 macOS, an already-running Claude Code can hold the previous \
-                                 login for up to ~30 seconds (Keychain cache).",
-                            )),
+                            .child(widgets::page_subtitle(
+                                &theme,
+                                "The Claude Code, Codex, and Cursor logins plus managed Kimi Code, \
+                                 Grok, and Antigravity Usage on this device. Zeron keeps \
+                                 switchable accounts backed up; authentication for Kimi, Grok, \
+                                 and Antigravity remains owned by their CLIs.",
+                            ))
+                            .when_some(self.error.clone(), |el, message| {
+                                el.child(
+                                    widgets::error_strip(&theme, message)
+                                        .id("accounts-action-error")
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.error = None;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .children(sections)
+                            // Footer note (zeron: `mt-6 text-[12px] leading-relaxed
+                            // text-muted-foreground/60`).
+                            .child(
+                                div()
+                                    .mt(px(24.0))
+                                    .text_size(px(12.0))
+                                    .line_height(px(19.0))
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(SharedString::from(
+                                        "Switching rewrites the CLI\u{2019}s stored login, so new \
+                                         agent sessions use the selected account immediately. On \
+                                         macOS, an already-running Claude Code can hold the previous \
+                                         login for up to ~30 seconds (Keychain cache).",
+                                    )),
+                            ),
                     ),
             )
+            .children(scrollbar)
             .when_some(dialog, |el, dialog| el.child(dialog))
     }
 }

@@ -45,7 +45,8 @@ enum AppshotContext {
     }
 
     /// Keep the original context separate from the ordinary attachment
-    /// trailer while a persisted user message is rendered.
+    /// trailer while a persisted user message is rendered, and byte-for-byte
+    /// during a text-only queue edit (the queue row owns its attachment list).
     static func suffix(_ text: String) -> String? {
         guard let range = text.range(of: marker) else { return nil }
         let suffix = String(text[range.lowerBound...])

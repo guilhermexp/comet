@@ -35,7 +35,7 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 
 ## Remotes e publicação
 
-- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/comet` (terceiro, MIT).
+- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/zeron` (terceiro, MIT; renomeado de `zeronsh/comet`). O upstream reassinou o histórico em set/2026: o último sync de ancestralidade é o merge de `d721f301` (v0.2.83) em `sync/upstream-v0.2.83`.
 - **Nunca pushar para o upstream.** Qualquer push vai pro fork.
 - `gh` resolve pro upstream por default: **sempre passar `-R guilhermexp/comet`** em `gh run list`, `gh release view`, etc.
 - `.github/workflows/{deploy,release}.yml` são herdados do upstream: `deploy` publica o Worker Cloudflare em push na `main` que toque `edge/`; `release` dispara em tag `v*` e publica no R2. **Não pushar tag `v*` no fork sem entender o efeito.**

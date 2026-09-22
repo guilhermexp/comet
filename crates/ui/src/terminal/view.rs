@@ -22,9 +22,11 @@ use super::emulator::{CellColor, CellSnapshot, Side};
 use super::panel::TerminalPanel;
 use crate::workers::terminal::WorkersTerminal;
 
-/// Terminal font metrics (mono).
+/// Default terminal font metrics; the rendered values come from the theme.
 pub const TERM_FONT_SIZE: f32 = 13.0;
 pub const TERM_LINE_HEIGHT: f32 = 18.0;
+/// Line height as a multiple of the font size, so a user-chosen size keeps the
+/// default's row rhythm.
 const TERM_LINE_HEIGHT_RATIO: f32 = TERM_LINE_HEIGHT / TERM_FONT_SIZE;
 /// Inner padding of the grid area.
 pub const TERM_PADDING: f32 = 12.0;

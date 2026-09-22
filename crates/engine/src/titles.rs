@@ -207,6 +207,12 @@ impl TitleGenerator {
                 [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Mock]
                     .into_iter()
                     .find(|id| enabled.contains(id))
+                    .or_else(|| {
+                        enabled
+                            .iter()
+                            .copied()
+                            .find(|id| zeron_harness::supports_titles(*id))
+                    })
             }
         })?;
         if !zeron_harness::supports_titles(harness_id)

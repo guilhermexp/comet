@@ -7,10 +7,10 @@ use std::{
 use super::model::{PreviewKind, classify_preview_kind};
 use crate::markdown::parser::BlockTree;
 use calamine::{Data, Range, Reader, open_workbook_auto};
-use comet_syntax::HighlightedDocument;
 use gpui::{
     Font, Image, ImageFormat, Pixels, SharedString, TextRun, TextSystem, WindowTextSystem, font, px,
 };
+use zeron_syntax::HighlightedDocument;
 
 const MAX_TEXT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 32 * 1024 * 1024;
@@ -192,7 +192,10 @@ pub fn find_widest_line_index_with_system(
     widest_ix
 }
 
-static PREVIEW_TEXT_SYSTEM: LazyLock<Arc<TextSystem>> = LazyLock::new(|| {
+/// The one headless native text system of the process. Creating a second
+/// native platform concurrently (e.g. from parallel tests) aborts inside
+/// HIToolbox on macOS, so every native-metrics caller shares this one.
+pub(crate) static PREVIEW_TEXT_SYSTEM: LazyLock<Arc<TextSystem>> = LazyLock::new(|| {
     let platform = gpui_platform::current_platform(true);
     let ts = Arc::new(TextSystem::new(platform.text_system()));
     let faces: Vec<std::borrow::Cow<'static, [u8]>> = crate::typography::GEIST_MONO
@@ -781,7 +784,7 @@ pub(crate) fn load_text_preview(
             };
             Ok(LoadedPreview::Code {
                 lines,
-                highlights: comet_syntax::highlight(comet_syntax::HighlightRequest {
+                highlights: zeron_syntax::highlight(zeron_syntax::HighlightRequest {
                     source: &source,
                     path: Some(path.as_ref()),
                     fence_tag: None,

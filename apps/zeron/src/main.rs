@@ -2,23 +2,33 @@
 //! local-only without credentials. `zeron login` and `zeron logout` select the
 //! profile used by the next engine start without mutating a live runtime.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(target_os = "linux")]
 mod appshot_cli;
 mod auth_cli;
 mod daemon;
+mod paths;
 mod update_cli;
 mod workers_cli;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "zeron", about = "Multi-device controller for coding agents")]
+#[command(
+    name = "zeron",
+    version,
+    about = "Multi-device controller for coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     /// Open a Zeron conversation URL.
     #[arg(value_name = "URL")]
     open_url: Option<String>,
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    wait_for_exit: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -35,8 +45,12 @@ enum Command {
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
     #[cfg(target_os = "linux")]
-    /// Trigger an Appshot in the running headed instance.
+    /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
     Appshot,
+    /// Serve the Zeron MCP (Model Context Protocol) server on stdin/stdout,
+    /// proxying to the running engine's IPC. Agents use it to create, read,
+    /// and message chats. Logs go to stderr; stdout is the protocol.
+    Mcp,
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -101,18 +115,28 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     }
 }
 
-/// Use mimalloc v2 on macOS to return transient streaming allocations.
-/// Other platforms retain their system allocator.
+/// mimalloc, macOS only: libmalloc never returns the streaming churn's
+/// high-water pages, so transient allocation became permanent RSS
+/// (docs/memory-plan.md §1). Pinned to mimalloc v2 in the workspace manifest —
+/// the crate's default v3 has the same pathology (churn retained as permanent
+/// RSS, ~6x glibc's growth on identical workloads, no idle recovery). Linux
+/// measured flat on glibc, so it keeps the system allocator.
 #[cfg(target_os = "macos")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    attach_parent_console();
     if zeron_workers_unpeel::run_session_host_mode_if_requested().map_err(anyhow::Error::msg)? {
         return Ok(());
     }
     zeron_workers_unpeel::configure_self_as_session_host_launcher().map_err(anyhow::Error::msg)?;
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Some(pid) = cli.wait_for_exit {
+        zeron_update::windows::wait_for_exit(pid)?;
+    }
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
     // loro's internal block-encode diagnostics log at info and flood
@@ -145,19 +169,32 @@ fn main() -> anyhow::Result<()> {
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        let console = tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout);
-        let registry = tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(console));
-        match log_file {
-            Some(file) => registry
+        // `zeron mcp` owns stdout for the protocol: a single log line on it
+        // would corrupt the JSON-RPC stream, so its diagnostics go to stderr.
+        if matches!(&cli.command, Some(Command::Mcp)) {
+            tracing_subscriber::registry()
+                .with(filter)
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
-                        .with_writer(std::sync::Arc::new(file)),
+                        .with_writer(std::io::stderr),
                 )
-                .init(),
-            None => registry.init(),
+                .init();
+        } else {
+            let console = tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout);
+            let registry = tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(console));
+            match log_file {
+                Some(file) => registry
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Arc::new(file)),
+                    )
+                    .init(),
+                None => registry.init(),
+            }
         }
     }
 
@@ -165,6 +202,18 @@ fn main() -> anyhow::Result<()> {
     // survive boot recovery joining every journaled chat, and Metal aborts
     // when MPSImage cannot open default.metallib (2026-09-11).
     zeron_engine::raise_nofile_limit();
+
+    if long_running {
+        // Finder launches have no visible stderr. Mirror the panic location
+        // and backtrace into the same rotating log as engine diagnostics.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(panic = %info,
+                backtrace = %std::backtrace::Backtrace::force_capture(),
+                "application panic");
+            default_hook(info);
+        }));
+    }
 
     match cli.command {
         Some(Command::Headless) => {
@@ -190,6 +239,10 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
         }
+        Some(Command::Mcp) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(zeron_mcp::run(zeron_mcp::McpConfig::from_env()))
+        }
         #[cfg(target_os = "linux")]
         Some(Command::Appshot) => appshot_cli::run(&engine_config_from_env().data_dir),
         Some(Command::Update { check }) => {
@@ -210,9 +263,7 @@ fn main() -> anyhow::Result<()> {
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
-                data_dir: std::env::var_os("ZERON_DATA_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(dirs_data_dir),
+                data_dir: paths::data_dir(),
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
@@ -229,6 +280,31 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+
+    // The GUI subsystem prevents Explorer from creating a console at startup.
+    // Reuse an existing parent's console for CLI output and cargo run, without
+    // allocating one. Attach before Clap so help and argument errors work too.
+    // Preserve redirected pipes/files: attaching may replace standard handles.
+    unsafe {
+        let saved = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .map(|id| (id, GetStdHandle(id)));
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            for (id, handle) in saved {
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    SetStdHandle(id, handle);
+                }
+            }
+        }
+    }
+}
+
 /// The env-resolved engine configuration shared by `headless`, `login`,
 /// `logout`, and `status` — one resolution so the CLI auth commands always
 /// operate on the exact session the daemon will load.
@@ -236,9 +312,7 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
     // Dev-mode bearer (no WorkOS): an explicit token enables sync.
     let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
     zeron_engine::EngineConfig {
-        data_dir: std::env::var_os("ZERON_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(dirs_data_dir),
+        data_dir: paths::data_dir(),
         edge_url: edge_url_from_env(),
         ipc_port: std::env::var("ZERON_IPC_PORT")
             .ok()
@@ -268,9 +342,11 @@ fn harness_from_value(selected: Option<&str>) -> zeron_engine::HarnessId {
         Some("claude-code") => zeron_engine::HarnessId::ClaudeCode,
         Some("codex") => zeron_engine::HarnessId::Codex,
         Some("cursor") => zeron_engine::HarnessId::Cursor,
+        Some("devin") => zeron_engine::HarnessId::Devin,
         Some("grok") => zeron_engine::HarnessId::Grok,
         Some("hermes") => zeron_engine::HarnessId::Hermes,
         Some("pi") => zeron_engine::HarnessId::Pi,
+        Some("antigravity") => zeron_engine::HarnessId::Antigravity,
         Some("omp") | None | Some("") => zeron_engine::HarnessId::Omp,
         Some(_) => zeron_engine::HarnessId::Omp,
     }
@@ -287,21 +363,8 @@ mod harness_default_tests {
         assert_eq!(harness_from_value(Some("")), HarnessId::Omp);
         assert_eq!(harness_from_value(Some("omp")), HarnessId::Omp);
         assert_eq!(harness_from_value(Some("codex")), HarnessId::Codex);
+        assert_eq!(harness_from_value(Some("devin")), HarnessId::Devin);
     }
-}
-
-fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
-    let dir = home.join(".zeron");
-    // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
-    // device identity, prefs) instead of starting fresh.
-    if !dir.exists() {
-        let old = home.join(".comet-native");
-        if old.exists() && std::fs::rename(&old, &dir).is_ok() {
-            eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
-        }
-    }
-    dir
 }
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
@@ -441,10 +504,7 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
 /// locked logs to `zeron-{mode}.{pid}.log` instead; the next lock-holding
 /// launch sweeps pid-suffixed files older than a week.
 fn open_log_file(mode: &str) -> Option<std::fs::File> {
-    let dir = std::env::var_os("ZERON_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(dirs_data_dir)
-        .join("logs");
+    let dir = paths::data_dir().join("logs");
     open_log_file_in(&dir, mode)
 }
 

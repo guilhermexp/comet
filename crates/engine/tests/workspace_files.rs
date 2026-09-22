@@ -139,3 +139,46 @@ async fn files_rpc_rejects_foreign_workspace_and_unregistered_checkout() {
     );
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_file_rpcs_preserve_plain_folder_search_support() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("plain-folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("notes.txt"), "plain\n").unwrap();
+    let core = EngineCore::assemble(
+        &temp.path().join("plain-data"),
+        Arc::new(HarnessRegistry::new()),
+        zeron_proto::HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    core.workspace
+        .create_space(
+            "space-plain",
+            &core.device_id,
+            folder.to_str().unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let legacy = client
+        .call(
+            "SearchFiles",
+            json!({"spaceId":"space-plain","query":"notes"}),
+        )
+        .await
+        .expect("legacy SearchFiles on plain folder");
+    assert_eq!(legacy[0]["path"], "notes.txt");
+    let listing = client
+        .call("ListWorkspaceDirectory", json!({"spaceId":"space-plain"}))
+        .await
+        .expect("workspace listing on plain folder");
+    assert!(
+        listing["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry["path"] == "notes.txt"))
+    );
+    core.shutdown().await;
+}

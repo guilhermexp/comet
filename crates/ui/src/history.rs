@@ -1556,14 +1556,14 @@ impl Render for GitHistoryFetchButton {
         let history = self.history.clone();
         div()
             .id("history-fetch-all")
-            .h(px(24.0))
+            .h(px(crate::surface_chrome::CONTROL_SIZE))
             .px(px(8.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
             .gap(px(6.0))
-            .rounded(px(6.0))
+            .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
             .bg(if fetching {
                 crate::theme::wash(0.05)
             } else {
@@ -1597,7 +1597,7 @@ impl Render for GitHistoryFetchButton {
                 .into_any_element()
             } else {
                 crate::icons::icon(crate::icons::CLOUD)
-                    .size(px(12.0))
+                    .size(px(crate::surface_chrome::ICON_SIZE))
                     .text_color(theme.text_muted.opacity(0.75))
                     .into_any_element()
             })
@@ -1628,12 +1628,12 @@ impl Render for GitHistoryViewButton {
 
         div()
             .id("history-view-trigger")
-            .size(px(24.0))
+            .size(px(crate::surface_chrome::CONTROL_SIZE))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
+            .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
             .cursor_pointer()
             .bg(if showing_tips {
                 theme.accent.opacity(0.12)
@@ -1686,12 +1686,12 @@ impl Render for GitHistorySearchControl {
             let control = cx.entity().downgrade();
             return div()
                 .id("history-search-trigger")
-                .size(px(24.0))
+                .size(px(crate::surface_chrome::CONTROL_SIZE))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(6.0))
+                .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
                 .cursor_pointer()
                 .bg(crate::motion::hover_blend(
                     "history-search-trigger",
@@ -1752,7 +1752,8 @@ impl Render for GitHistorySearchControl {
             .id("history-search-expanded")
             .h(px(22.0))
             .w(px(HISTORY_SEARCH_WIDTH))
-            .flex_none()
+            .min_w(px(80.0))
+            .flex_shrink(1.0)
             .overflow_hidden()
             .flex()
             .items_center()
@@ -3208,6 +3209,7 @@ impl GitHistory {
     }
 
     fn render_author_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &theme.for_popup();
         let show_name = configured_author_display(cx) == GitHistoryAuthorDisplay::Name;
         popover::popover_card(theme)
             .w(px(116.0))
@@ -3243,6 +3245,7 @@ impl GitHistory {
     }
 
     fn render_column_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &theme.for_popup();
         let columns = configured_columns(cx);
         let widths = configured_column_widths(cx);
         let order = configured_column_order(cx);
@@ -3832,10 +3835,18 @@ impl GitHistory {
                             )
                         })
                         .when(!has_avatar, |avatar| {
-                            avatar
-                                .text_size(px(9.0))
-                                .text_color(theme.text_faint)
-                                .child(initial)
+                            avatar.child(
+                                div()
+                                    .w_full()
+                                    .text_center()
+                                    .font_family(theme.font_sans.clone())
+                                    .text_size(px(9.0))
+                                    .line_height(px(18.0))
+                                    .relative()
+                                    .top(px(0.5))
+                                    .text_color(theme.text_faint)
+                                    .child(initial),
+                            )
                         })
                         .tooltip(move |_, cx| {
                             cx.new(|_| HistoryAuthorTooltip {
@@ -4615,7 +4626,7 @@ mod tests {
         let mut app = gpui::TestApp::new();
         app.update(|cx| {
             Theme::install(crate::theme::Appearance::Dark, cx);
-            crate::composer::init(cx);
+            crate::composer::init(cx, crate::settings::ComposerSendBehavior::default());
         });
         let mut window = app.open_window(HistorySearchFocusHarness::new);
         window.draw();
@@ -4675,7 +4686,7 @@ mod tests {
         let mut app = gpui::TestApp::new();
         app.update(|cx| {
             Theme::install(crate::theme::Appearance::Dark, cx);
-            crate::composer::init(cx);
+            crate::composer::init(cx, crate::settings::ComposerSendBehavior::default());
             init(
                 Default::default(),
                 Default::default(),

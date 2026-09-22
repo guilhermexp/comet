@@ -538,31 +538,46 @@ pub struct WorkersModel {
 
 impl WorkersModel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        Self::build(state, true, cx)
+    }
+
+    /// A model that never talks to the machine's Workers daemon: no poll, no
+    /// initial refresh. Shell unit tests use it so they stay hermetic.
+    #[cfg(test)]
+    pub(crate) fn detached(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        Self::build(state, false, cx)
+    }
+
+    fn build(state: Entity<AppState>, live: bool, cx: &mut Context<Self>) -> Self {
         let client = crate::workers::client::shared();
         let poll_client = client.clone();
-        let poll_task = cx.spawn(async move |this, cx| {
-            let mut observed_epoch = poll_client.activity_epoch();
-            let mut recovery_ticks = 0_u8;
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(125))
-                    .await;
-                recovery_ticks = recovery_ticks.wrapping_add(1);
-                let current_epoch = poll_client.activity_epoch();
-                let hook_changed = current_epoch != observed_epoch;
-                let recovery_due = recovery_ticks >= 8;
-                if !hook_changed && !recovery_due {
-                    continue;
+        let poll_task = if !live {
+            Task::ready(())
+        } else {
+            cx.spawn(async move |this, cx| {
+                let mut observed_epoch = poll_client.activity_epoch();
+                let mut recovery_ticks = 0_u8;
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(125))
+                        .await;
+                    recovery_ticks = recovery_ticks.wrapping_add(1);
+                    let current_epoch = poll_client.activity_epoch();
+                    let hook_changed = current_epoch != observed_epoch;
+                    let recovery_due = recovery_ticks >= 8;
+                    if !hook_changed && !recovery_due {
+                        continue;
+                    }
+                    observed_epoch = current_epoch;
+                    if recovery_due {
+                        recovery_ticks = 0;
+                    }
+                    if this.update(cx, |model, cx| model.refresh(cx)).is_err() {
+                        break;
+                    }
                 }
-                observed_epoch = current_epoch;
-                if recovery_due {
-                    recovery_ticks = 0;
-                }
-                if this.update(cx, |model, cx| model.refresh(cx)).is_err() {
-                    break;
-                }
-            }
-        });
+            })
+        };
         let mut model = Self {
             state,
             client,
@@ -618,7 +633,9 @@ impl WorkersModel {
             advisories_task: None,
             runtime_update_tasks: HashMap::new(),
         };
-        model.refresh(cx);
+        if live {
+            model.refresh(cx);
+        }
         model
     }
 
@@ -1706,6 +1723,7 @@ impl WorkersModel {
         crate::notify::post(
             "Workers notification",
             "Notifications from active CLI workers are enabled.",
+            None,
         );
         crate::sound::play(crate::sound::Sound::Done);
     }
@@ -2165,7 +2183,7 @@ impl WorkersModel {
                     && !session_is_observed
                     && (!notification_settings.background_only || !app_focused);
                 if delivery_allowed && notification_settings.desktop_notifications {
-                    crate::notify::post(title, body);
+                    crate::notify::post(title, body, None);
                 }
                 if delivery_allowed && notification_settings.sound_enabled {
                     crate::sound::play(sound);

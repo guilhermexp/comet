@@ -550,6 +550,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_peer_pairs_again_without_waiting_for_ice_failure() {
+        // The device that drops its peer (sleep, network roam, coordinator
+        // lease reset) must be served promptly by the other side, whose own
+        // peer object still looks healthy until ICE consent expires.
         let stop = CancellationToken::new();
         let (mut a, mut a_out) = Peers::new("a".into(), Arc::new(Echo), stop.clone());
         let (mut b, mut b_out) = Peers::new("b".into(), Arc::new(Echo), stop.clone());
@@ -567,16 +570,20 @@ mod tests {
                 let _ = peer_a.signal("b", message.signal).await;
             }
         });
-        let result = tokio::time::timeout(Duration::from_secs(25), async {
+        let result = tokio::time::timeout(Duration::from_secs(40), async {
             echo_round(&b, "a").await;
+            // Non-initiator drops: its connect request must replace a's peer.
             b.remove("a").await;
             tokio::time::timeout(Duration::from_secs(8), echo_round(&b, "a"))
                 .await
-                .expect("re-pair after requester dropped its peer stalled");
+                .expect("re-pair after the requester dropped its peer stalled");
+            // Initiator drops: it offers again and b replaces its peer.
             a.remove("b").await;
             tokio::time::timeout(Duration::from_secs(8), echo_round(&a, "b"))
                 .await
-                .expect("re-pair after initiator dropped its peer stalled");
+                .expect("re-pair after the initiator dropped its peer stalled");
+            // Both directions still work over the final pair.
+            echo_round(&b, "a").await;
         })
         .await;
         stop.cancel();

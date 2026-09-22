@@ -213,8 +213,15 @@ impl MacPlatform {
             Arc::new(gpui::NoopTextSystem::new())
         };
 
-        let keyboard_layout = MacKeyboardLayout::new();
-        let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
+        // Headless platforms (text shaping in tests/background loaders) never
+        // dispatch key events. TIS keyboard APIs abort off the main thread on
+        // macOS 27, so they are only queried for a real, headed app.
+        let keyboard_mapper = if headless {
+            Rc::new(MacKeyboardMapper::new(""))
+        } else {
+            let keyboard_layout = MacKeyboardLayout::new();
+            Rc::new(MacKeyboardMapper::new(keyboard_layout.id()))
+        };
 
         Self(Mutex::new(MacPlatformState {
             headless,

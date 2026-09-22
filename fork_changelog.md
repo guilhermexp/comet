@@ -9,6 +9,13 @@ Tracks local/private fork changes against upstream.
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
 
+## 2026-09-22 — Sync de ancestralidade com upstream v0.2.83 (`d721f301`)
+
+- Merge real de `zeronsh/zeron@d721f301` em `sync/upstream-v0.2.83`, base `87123b50` (v0.2.29) via graft temporário: o upstream reassinou o histórico (só GPG; árvores idênticas). 138 arquivos / 1.339 hunks resolvidos.
+- Entram: instaladores explícitos de agents, adapter ACP do Antigravity, OpenCode 2.x (agents, replies versionadas), catálogos por credencial, hardening de harness, referências ricas no composer, painel de fila, seções/pins da sidebar, explorer/editor de Files, zoom de imagem, edição de comentários de review, scroll horizontal no diff, Project Actions, geometria de janela, About, assinatura sonora, Linux CSD/browser, `zeron-mcp`, workflows de teste, outbox/residência/sem-projeto no iOS.
+- Mantidos: Run/Steer (fila coexiste; #284 rejeitado), Workers, OMP, Live Voice, trajectory, contas/uso, visual do fork (monocode, blur, Material, apresentação de tools), Files/Details, terminal no painel direito, `release.yml` e versão `0.2.18`. `cursor-sdk-update.yml` (cron que abre PR) não entra.
+- `comet-syntax` → `zeron-syntax`. Change: `openspec/changes/sync-upstream-v0-2-83/`.
+
 ## 2026-09-10 — Upstream P1–P9, com contratos do fork preservados
 
 - Integração seletiva da comparação até `a1adfde2` (v0.2.59): caches e renderer, composer/seleção/foco, recuperação causal, lifecycle ACP, Files remoto, previews de desenvolvimento, histórico Git e interações iOS.

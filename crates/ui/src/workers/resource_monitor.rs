@@ -485,6 +485,7 @@ fn post_resource_alert(
     crate::notify::post(
         "Worker resource warning",
         &format!("{title} · {project} has {severity}. Open Settings -> Resources for details."),
+        None,
     );
 }
 
@@ -508,6 +509,7 @@ fn post_pressure_alert(level: MemoryPressureLevel, snapshot: Option<&WorkersReso
         &format!(
             "{severity}. Comet released local caches without stopping any worker.{detail} Open Settings -> Resources for details."
         ),
+        None,
     );
 }
 

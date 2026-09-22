@@ -98,6 +98,7 @@ pub(super) fn fragment(flat: &FlatText, range: Range<usize>) -> FlatText {
         })
         .collect();
     FlatText {
+        original: None,
         text: flat.text[range].to_owned().into(),
         runs,
         links,

@@ -23,8 +23,8 @@
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
-//!   reads, checkout-scoped filesystem change stream, and jailed create/rename/
-//!   delete/move/copy mutations executed on the owning device.
+//!   reads, hash-guarded writes, checkout-scoped filesystem change stream, and
+//!   jailed create/rename/delete/move/copy mutations executed on the owning device.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -48,8 +48,9 @@
 //! forward can never loop. Streaming methods are proxied by re-subscribing remotely and
 //! piping items. To make another method device-addressable, nothing per-method is needed
 //! beyond `forwardable: true` (and `stream: true` if it streams) on its entry in
-//! `zeron_rpc::method::rpc_methods!`; handlers stay transport-agnostic. Currently
-//! routed: `ListHarnesses`, `ListModels`, `QueueCommand`, and `WatchDocMessages`.
+//! `zeron_rpc::method::rpc_methods!`; handlers stay transport-agnostic. This
+//! includes the workspace file surface, whose checkout always lives on the routed
+//! target device.
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -63,7 +64,10 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
-use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
+use zeron_proto::{
+    ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, ProjectActionDraft, Space, ToolCall,
+    WorkspaceScope,
+};
 use zeron_rpc::{
     LinkCache, RevealTrajectoryRawParams, RpcError, RpcReply, RpcService, TrajectoryCursor,
     TrajectoryRawField, TrajectoryRawRevealResult, TrajectoryTerminalReason,
@@ -76,6 +80,7 @@ use crate::auth::Auth;
 use crate::change_requests::CheckoutChangeRequests;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
+use crate::project_actions::ProjectActionsStore;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::run_journal::RunJournal;
@@ -110,6 +115,8 @@ struct ProbeLiveVoiceParams {
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +124,16 @@ struct ListModelsParams {
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
+}
+
+async fn update_harness_enabled(
+    registry: &HarnessRegistry,
+    harness: HarnessId,
+    enabled: bool,
+) -> Result<(), RpcError> {
+    registry
+        .set_enabled(harness, enabled)
+        .map_err(RpcError::Failed)
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +167,80 @@ struct RelayCommandParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct TakeProjectActionSetupParams {
+    chat_id: String,
+    command_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueMessageParams {
+    chat_id: String,
+    text: String,
+    #[serde(default)]
+    attachments: Vec<String>,
+    /// Keep this row visible during the current turn even when the harness
+    /// supports mid-turn steering.
+    #[serde(default)]
+    hold_for_turn_end: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedMessageParams {
+    chat_id: String,
+    id: String,
+    /// Present for UpdateQueuedMessage only; empty text deletes the row.
+    #[serde(default)]
+    text: String,
+    /// Present for MoveQueuedMessage only.
+    #[serde(default)]
+    to_index: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeginQueuedMessageEditParams {
+    chat_id: String,
+    id: String,
+    editor_device_id: String,
+    editor_instance_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenewQueuedMessageEditParams {
+    chat_id: String,
+    id: String,
+    lease_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum FinishQueuedMessageEditAction {
+    Commit,
+    Cancel,
+    Discard,
+    ReleaseUnchanged,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinishQueuedMessageEditParams {
+    chat_id: String,
+    id: String,
+    lease_id: String,
+    action: FinishQueuedMessageEditAction,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    expected_text_hash: Option<String>,
+    #[serde(default)]
+    attachments: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoPathParams {
     /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
@@ -178,6 +269,8 @@ struct CreateWorktreeParams {
     #[serde(alias = "repo")]
     repo_path: String,
     branch: String,
+    #[serde(default)]
+    space_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +280,38 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListProjectActionsParams {
+    space_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpsertProjectActionParams {
+    space_id: String,
+    #[serde(default)]
+    action_id: Option<String>,
+    action: ProjectActionDraft,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteProjectActionParams {
+    space_id: String,
+    action_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunProjectActionParams {
+    space_id: String,
+    chat_id: String,
+    action_id: String,
+    cols: u16,
+    rows: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -383,6 +508,10 @@ enum MutateParams {
         /// Cwd override (isolated-worktree path); default = the space's folder.
         #[serde(default)]
         cwd: Option<String>,
+        /// The chat whose agent is creating this one (Zeron MCP); recorded
+        /// on the row as `parentChatId` for orchestration trees.
+        #[serde(default)]
+        parent_chat_id: Option<String>,
     },
     /// Create a space (device + folder pair). Idempotent by id; a live
     /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
@@ -435,6 +564,11 @@ enum MutateParams {
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
     SetChatArchived { chat_id: String, archived: bool },
+    /// Change one pin without replacing another device's edits.
+    #[serde(rename_all = "camelCase")]
+    ChangeSidebarPin {
+        change: zeron_proto::SidebarPinChange,
+    },
     /// Full-config replace on the chat row (zeron `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -477,6 +611,7 @@ pub struct EngineRpc {
     repos: Repos,
     workspace_files: crate::WorkspaceFiles,
     terminals: Terminals,
+    project_actions: ProjectActionsStore,
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
     diff_sync: CheckoutDiffSync,
@@ -502,6 +637,7 @@ impl EngineRpc {
         repos: Repos,
         workspace_files: crate::WorkspaceFiles,
         terminals: Terminals,
+        project_actions: ProjectActionsStore,
         change_requests: CheckoutChangeRequests,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
@@ -511,6 +647,8 @@ impl EngineRpc {
         let engine_info = EngineInfo {
             device_id: doc_host.device_id().to_string(),
             workspace_scope,
+            cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
+            capabilities: zeron_proto::capabilities::current(),
         };
         Self {
             worker_projects: Default::default(),
@@ -521,6 +659,7 @@ impl EngineRpc {
             repos,
             workspace_files,
             terminals,
+            project_actions,
             previews: None,
             change_requests,
             diff_sync,
@@ -613,6 +752,20 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
     }
 
+    fn local_project_action_space(&self, space_id: &str) -> Result<Space, RpcError> {
+        let space = self
+            .workspace
+            .space(space_id)
+            .map_err(|err| RpcError::Failed(err.to_string()))?
+            .ok_or_else(|| RpcError::Failed("Project space not found".into()))?;
+        if space.device_id != self.doc_host.device_id() {
+            return Err(RpcError::Failed(
+                "Project space belongs to another device".into(),
+            ));
+        }
+        Ok(space)
+    }
+
     /// Resolve a mention-search root from synced workspace rows. A client may
     /// name an existing linked worktree for a new chat, but it is verified
     /// against the space repository before any filesystem walk begins.
@@ -627,6 +780,32 @@ impl EngineRpc {
             .await
             .map(|workspace| workspace.root)
             .map_err(Into::into)
+    }
+
+    /// Catalogs also serve projectless sessions, which have no workspace space.
+    /// Keep workspace validation for project targets and use only a known local
+    /// chat's persisted cwd (or home) for a projectless conversation.
+    async fn catalog_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
+        if p.space_id.is_none() && p.path.is_none() {
+            let Some(chat_id) = &p.chat_id else {
+                return Ok(home_dir());
+            };
+            let chat = self
+                .workspace
+                .chat(chat_id)
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .ok_or_else(|| RpcError::BadParams("chat not found".into()))?;
+            if chat.device_id != self.doc_host.device_id() {
+                return Err(RpcError::BadParams("chat belongs to another device".into()));
+            }
+            if chat.space_id.is_none() {
+                return Ok(chat
+                    .cwd
+                    .map(|cwd| std::path::PathBuf::from(crate::sessions::expand_home(&cwd)))
+                    .unwrap_or_else(home_dir));
+            }
+        }
+        self.file_search_root(p).await
     }
 
     /// Accept only a checkout already named by a local chat or contained in a
@@ -777,7 +956,10 @@ impl EngineRpc {
         if info.stream {
             // Streams are unbounded by design (a quiet WATCH_* is healthy);
             // only unary calls below get the reply deadline.
-            if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+            if matches!(
+                method,
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST | methods::WATCH_WORKSPACE_GIT_STATUS
+            ) {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
                     Err(err) => {
@@ -844,14 +1026,16 @@ impl EngineRpc {
                 config,
                 branch,
                 cwd,
+                parent_chat_id,
             } => {
                 self.workspace
-                    .create_chat(
+                    .create_chat_with_parent(
                         &chat_id,
                         space_id.as_deref(),
                         device_id.as_deref(),
                         config,
                         cwd,
+                        parent_chat_id,
                     )
                     .map_err(failed)?;
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
@@ -928,6 +1112,9 @@ impl EngineRpc {
                 .set_chat_archived(&chat_id, archived)
                 .map_err(failed)
                 .map(drop),
+            MutateParams::ChangeSidebarPin { change } => {
+                self.workspace.change_sidebar_pin(&change).map_err(failed)
+            }
             MutateParams::SetChatConfig { chat_id, config } => self
                 .workspace
                 .set_chat_config(&chat_id, &config)
@@ -983,6 +1170,84 @@ fn git_rpc_error(error: crate::EngineError) -> RpcError {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct Installations(
+    std::sync::Mutex<std::collections::HashMap<HarnessId, zeron_harness::CancellationToken>>,
+);
+
+struct Installing<'a> {
+    installs: &'a Installations,
+    harness: HarnessId,
+    cancel: zeron_harness::CancellationToken,
+}
+impl Drop for Installing<'_> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.installs
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.harness);
+    }
+}
+impl Installations {
+    fn begin(&self, harness: HarnessId) -> Result<Installing<'_>, RpcError> {
+        let mut installs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if installs.contains_key(&harness) {
+            return Err(RpcError::Failed("already installing".into()));
+        }
+        let cancel = zeron_harness::CancellationToken::new();
+        installs.insert(harness, cancel.clone());
+        Ok(Installing {
+            installs: self,
+            harness,
+            cancel,
+        })
+    }
+    fn cancel(&self, harness: HarnessId) {
+        if let Some(cancel) = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&harness)
+        {
+            cancel.cancel();
+        }
+    }
+}
+
+async fn run_requested_install(
+    harness: HarnessId,
+    cancel: zeron_harness::CancellationToken,
+) -> Result<(), zeron_harness::HarnessError> {
+    #[cfg(test)]
+    if let Ok(script) = std::env::var(format!("ZERON_INSTALLER_COMMAND_{harness:?}").to_uppercase())
+    {
+        return zeron_harness::install::install_with_command(harness, &script, cancel).await;
+    }
+    zeron_harness::install::install_harness(harness, cancel).await
+}
+
+async fn install_harness_with<F, Fut>(
+    registry: &HarnessRegistry,
+    harness: HarnessId,
+    install: F,
+) -> Result<Vec<crate::registry::HarnessDescriptor>, RpcError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), zeron_harness::HarnessError>>,
+{
+    if !zeron_harness::install::can_install(harness) {
+        return Err(RpcError::Failed(
+            "No supported installer or required tools available on this device".into(),
+        ));
+    }
+    install()
+        .await
+        .map_err(|error| RpcError::Failed(error.to_string()))?;
+    Ok(registry.descriptors())
+}
+
 /// A watch receiver as a stream: current value first, then every change.
 fn watch_stream<T>(rx: watch::Receiver<T>) -> BoxStream<'static, serde_json::Value>
 where
@@ -1005,29 +1270,73 @@ where
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
 fn doc_messages_stream(
-    rx: watch::Receiver<Vec<zeron_doc::SessionMessageEntry>>,
+    rx: watch::Receiver<crate::doc_host::TranscriptSnapshot>,
+    doc: std::sync::Arc<zeron_doc::SessionDoc>,
 ) -> BoxStream<'static, serde_json::Value> {
     use zeron_doc::transcript_delta::{TranscriptFrame, diff_transcript};
     futures::stream::unfold(
-        (rx, None::<Vec<zeron_doc::SessionMessageEntry>>),
-        |(mut rx, mut prev)| async move {
+        (
+            rx,
+            None::<crate::doc_host::TranscriptSnapshot>,
+            doc,
+            None,
+            zeron_doc::TranscriptBaseline::default(),
+        ),
+        |(mut rx, mut prev, doc, mut previous_usage, mut opening_baseline)| async move {
             loop {
                 if prev.is_some() {
                     rx.changed().await.ok()?;
                 }
-                let current: Vec<_> = rx.borrow_and_update().clone();
-                let frame = match prev.as_deref() {
-                    None => TranscriptFrame::reset(&current),
-                    Some(prev) => diff_transcript(prev, &current),
+                // Watchers retain the immutable published snapshot. Each
+                // connection used to deep-copy the entire transcript here.
+                let current = rx.borrow_and_update().clone();
+                let frame = match prev.as_ref() {
+                    None => TranscriptFrame::reset(&current.entries),
+                    Some(prev) => diff_transcript(&prev.entries, &current.entries),
+                };
+                let replay_baseline = match prev.as_ref() {
+                    None => {
+                        opening_baseline = zeron_doc::TranscriptBaseline::capture(&current.entries);
+                        Some(opening_baseline.clone())
+                    }
+                    Some(prev)
+                        if !std::sync::Arc::ptr_eq(
+                            &prev.replay_baseline,
+                            &current.replay_baseline,
+                        ) =>
+                    {
+                        // The tracker only observes changes after attach; its
+                        // baseline omits unchanged cached parts. Preserve this
+                        // subscription's opening cutoff without capturing live
+                        // appends or sharing another viewer's later cutoff.
+                        // Ordinary live updates never rebuild this metadata.
+                        let mut baseline = (*current.replay_baseline).clone();
+                        for (entry, parts) in &opening_baseline.entries {
+                            let merged = baseline.entries.entry(entry.clone()).or_default();
+                            for (part, &len) in parts {
+                                let cutoff = merged.entry(part.clone()).or_default();
+                                *cutoff = (*cutoff).max(len);
+                            }
+                        }
+                        Some(baseline)
+                    }
+                    _ => None,
                 };
                 prev = Some(current);
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
-                if frame.is_empty_delta() {
+                let usage = doc.context_usage().map(Into::into);
+                if frame.is_empty_delta() && usage == previous_usage && replay_baseline.is_none() {
                     continue;
                 }
-                let value = serde_json::to_value(&frame).ok()?;
-                return Some((value, (rx, prev)));
+                previous_usage = usage;
+                let value = serde_json::to_value(zeron_doc::TranscriptUpdate {
+                    frame,
+                    context_usage: usage,
+                    replay_baseline,
+                })
+                .ok()?;
+                return Some((value, (rx, prev, doc, previous_usage, opening_baseline)));
             }
         },
     )
@@ -1323,6 +1632,46 @@ fn reveal_unavailable(
     TrajectoryRawRevealResult::unavailable(field, reason, Some(client_message.into()))
 }
 
+/// First paint reads only the local tail; full history is deferred until the
+/// next stream poll. No network dependency or persisted truncation.
+async fn opening_doc_messages_stream(
+    host: crate::doc_host::DocHost,
+    chat_id: String,
+) -> Result<BoxStream<'static, serde_json::Value>, RpcError> {
+    let (handle, preview) = tokio::task::spawn_blocking(move || {
+        let handle = host.open(&chat_id)?;
+        let entries = handle.doc().read_opening_tail(128)?;
+        let mut preview = serde_json::to_value(zeron_doc::TranscriptUpdate {
+            frame: zeron_doc::TranscriptFrame::reset(&entries),
+            context_usage: handle.doc().context_usage().map(Into::into),
+            replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
+        })
+        .map_err(|e| crate::EngineError::Other(e.to_string()))?;
+        preview["historyPending"] = serde_json::Value::Bool(true);
+        Ok::<_, crate::EngineError>((handle, preview))
+    })
+    .await
+    .map_err(|e| RpcError::Failed(e.to_string()))?
+    .map_err(|e| RpcError::Failed(e.to_string()))?;
+    // Do not build the full mirror before yielding the preview.
+    // The next poll attaches normally and begins with a complete
+    // authoritative reset; subsequent frames use normal deltas.
+    let full = futures::stream::once(async move {
+        match tokio::task::spawn_blocking(move || (handle.watch_messages(), handle.doc_arc())).await
+        {
+            Ok((rx, doc)) => doc_messages_stream(rx, doc),
+            Err(error) => {
+                tracing::warn!(%error, "transcript opening failed");
+                futures::stream::empty().boxed()
+            }
+        }
+    })
+    .flatten();
+    Ok(futures::stream::once(async move { preview })
+        .chain(full)
+        .boxed())
+}
+
 /// Authentication-only RPC surface used while the headed app is waiting for a
 /// production WorkOS session. Keeping this independent from [`EngineRpc`] lets
 /// the UI show its sign-in and organization gates before identity-scoped Loro
@@ -1460,6 +1809,20 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::INSTALL_HARNESS => {
+                let p: ListModelsParams = parse_params(params)?;
+                let installing = self.registry.installs.begin(p.harness)?;
+                let descriptors = install_harness_with(&self.registry, p.harness, || {
+                    run_requested_install(p.harness, installing.cancel.clone())
+                })
+                .await?;
+                RpcReply::value(&descriptors)
+            }
+            methods::CANCEL_INSTALL => {
+                let p: ListModelsParams = parse_params(params)?;
+                self.registry.installs.cancel(p.harness);
+                RpcReply::value(&serde_json::json!({}))
+            }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
@@ -1470,9 +1833,7 @@ impl RpcService for EngineRpc {
             }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
-                self.registry
-                    .set_enabled(p.harness, p.enabled)
-                    .map_err(RpcError::Failed)?;
+                update_harness_enabled(&self.registry, p.harness, p.enabled).await?;
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
@@ -1483,26 +1844,69 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = harness
-                    .models()
+                let models = crate::model_catalogs::list(self.repos.data_dir(), harness, p.force)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
+            methods::LIST_SKILLS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    harness: HarnessId,
+                    #[serde(default)]
+                    chat_id: Option<String>,
+                    #[serde(default)]
+                    space_id: Option<String>,
+                    #[serde(default)]
+                    path: Option<String>,
+                }
+                let p: Params = parse_params(params)?;
+                let root = self
+                    .catalog_root(&FileSearchParams {
+                        query: String::new(),
+                        chat_id: p.chat_id,
+                        space_id: p.space_id,
+                        path: p.path,
+                    })
+                    .await?;
+                let harness = self
+                    .registry
+                    .resolve(p.harness)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let skills = harness
+                    .skills(&root)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&skills)
+            }
             methods::LIST_COMMANDS => {
-                // Same shape as ListModels: forces a lazy resolve, then the
-                // harness's own (cached) discovery — ACP agents advertise
-                // availableCommands, claude answers the initialize control
-                // request, codex lists skills; only harnesses whose wire has
-                // no listing (cursor, mock) fall through to the trait's
-                // empty default.
-                let p: ListModelsParams = parse_params(params)?;
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    harness: HarnessId,
+                    #[serde(default)]
+                    chat_id: Option<String>,
+                    #[serde(default)]
+                    space_id: Option<String>,
+                    #[serde(default)]
+                    path: Option<String>,
+                }
+                let p: Params = parse_params(params)?;
+                let root = self
+                    .catalog_root(&FileSearchParams {
+                        query: String::new(),
+                        chat_id: p.chat_id,
+                        space_id: p.space_id,
+                        path: p.path,
+                    })
+                    .await?;
                 let harness = self
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
-                    .commands()
+                    .commands_for(&root)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
@@ -1536,6 +1940,20 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
+            methods::TAKE_PROJECT_ACTION_SETUP => {
+                let p: TakeProjectActionSetupParams = parse_params(params)?;
+                let outcome = self
+                    .project_actions
+                    .take_setup_handoff(&p.command_id, &p.chat_id);
+                match outcome {
+                    Some(outcome) => RpcReply::value(&serde_json::json!({
+                        "ready": true,
+                        "setupAction": outcome.setup_action,
+                        "setupError": outcome.setup_error,
+                    })),
+                    None => RpcReply::value(&serde_json::json!({ "ready": false })),
+                }
+            }
             methods::RETRY_DELIVERY => {
                 let p: ChatParams = parse_params(params)?;
                 self.doc_host
@@ -1553,13 +1971,24 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "outcome": outcome }))
             }
             methods::WATCH_DOC_MESSAGES => {
+                // Opt-in: older viewports retain the full-reset contract.
+                let opening_tail = params
+                    .get("openingTail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let p: ChatParams = parse_params(params)?;
+                if opening_tail {
+                    return Ok(RpcReply::Stream(
+                        opening_doc_messages_stream(self.doc_host.clone(), p.chat_id).await?,
+                    ));
+                }
                 let handle = self
                     .doc_host
                     .open(&p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
+                    handle.doc_arc(),
                 )))
             }
             methods::PROBE_LIVE_VOICE => {
@@ -1607,7 +2036,149 @@ impl RpcService for EngineRpc {
             methods::WATCH_LIVE_VOICE => Ok(RpcReply::Stream(watch_stream(
                 self.sessions.watch_live_voice(),
             ))),
+            methods::WATCH_QUEUE => {
+                let p: ChatParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let rx = handle.watch_queue();
+                Ok(RpcReply::Stream(
+                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
+                        if !first {
+                            rx.changed().await.ok()?;
+                        }
+                        let items = rx.borrow_and_update().clone();
+                        let value = serde_json::json!({ "items": items });
+                        Some((value, (rx, false)))
+                    })
+                    .boxed(),
+                ))
+            }
+            methods::QUEUE_MESSAGE => {
+                let p: QueueMessageParams = parse_params(params)?;
+                let id = self
+                    .doc_host
+                    .queue_message_with_behavior(
+                        &p.chat_id,
+                        &p.text,
+                        p.attachments,
+                        p.hold_for_turn_end,
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "id": id }))
+            }
+            methods::UPDATE_QUEUED_MESSAGE => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let changed = self
+                    .doc_host
+                    .update_queued_message(&p.chat_id, &p.id, &p.text)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "changed": changed }))
+            }
+            methods::BEGIN_QUEUED_MESSAGE_EDIT => {
+                let p: BeginQueuedMessageEditParams = parse_params(params)?;
+                let outcome = self
+                    .doc_host
+                    .begin_queued_message_edit(
+                        &p.chat_id,
+                        &p.id,
+                        &p.editor_device_id,
+                        &p.editor_instance_id,
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(
+                    &serde_json::to_value(outcome).map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::RENEW_QUEUED_MESSAGE_EDIT => {
+                let p: RenewQueuedMessageEditParams = parse_params(params)?;
+                let outcome = self
+                    .doc_host
+                    .renew_queued_message_edit(&p.chat_id, &p.id, &p.lease_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(
+                    &serde_json::to_value(outcome).map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::FINISH_QUEUED_MESSAGE_EDIT => {
+                let p: FinishQueuedMessageEditParams = parse_params(params)?;
+                let action = match p.action {
+                    FinishQueuedMessageEditAction::Commit => {
+                        crate::doc_host::FinishQueueEditAction::Commit
+                    }
+                    FinishQueuedMessageEditAction::Cancel => {
+                        crate::doc_host::FinishQueueEditAction::Cancel
+                    }
+                    FinishQueuedMessageEditAction::Discard => {
+                        crate::doc_host::FinishQueueEditAction::Discard
+                    }
+                    FinishQueuedMessageEditAction::ReleaseUnchanged => {
+                        crate::doc_host::FinishQueueEditAction::ReleaseUnchanged
+                    }
+                };
+                let outcome = self
+                    .doc_host
+                    .finish_queued_message_edit_with_attachments(
+                        &p.chat_id,
+                        &p.id,
+                        &p.lease_id,
+                        action,
+                        p.text.as_deref(),
+                        p.expected_text_hash.as_deref(),
+                        p.attachments.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(
+                    &serde_json::to_value(outcome).map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::MOVE_QUEUED_MESSAGE => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let changed = self
+                    .doc_host
+                    .move_queued_message(&p.chat_id, &p.id, p.to_index)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "changed": changed }))
+            }
+            methods::REMOVE_QUEUED_MESSAGE => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let removed = self
+                    .doc_host
+                    .remove_queued_message(&p.chat_id, &p.id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::SEND_QUEUED_MESSAGE_NOW => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let sent = self
+                    .doc_host
+                    .send_queued_now(&p.chat_id, &p.id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "sent": sent }))
+            }
+            methods::STEER_QUEUED_MESSAGE_NOW => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let sent = self
+                    .doc_host
+                    .steer_queued_now(&p.chat_id, &p.id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "sent": sent }))
+            }
             methods::PROBE_SYNC => {
+                // Focus probes remain cheap. An explicit Retry may also allow
+                // one fresh, shared auth attempt before its cooldown expires.
+                if params.get("retry").and_then(serde_json::Value::as_bool) == Some(true)
+                    && let Some(auth) = &self.auth
+                {
+                    auth.retry_refresh();
+                }
                 self.workspace.probe();
                 self.doc_host.probe_open_chats();
                 self.doc_host.probe_edge_reachability();
@@ -1735,6 +2306,9 @@ impl RpcService for EngineRpc {
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }
+            methods::WATCH_SIDEBAR_PREFERENCES => Ok(RpcReply::Stream(watch_stream(
+                self.workspace.watch_sidebar_preferences(),
+            ))),
             methods::WATCH_DEVICES => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_devices(),
             ))),
@@ -1856,7 +2430,13 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
+                let sidebar_pins = matches!(&p, MutateParams::ChangeSidebarPin { .. });
                 self.mutate(p)?;
+                if sidebar_pins {
+                    return RpcReply::value(&serde_json::json!({
+                        "ok": true, "sidebarPreferences": self.workspace.sidebar_preferences_snapshot(),
+                    }));
+                }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
@@ -1895,6 +2475,39 @@ impl RpcService for EngineRpc {
                         })
                         .boxed(),
                 ))
+            }
+            methods::WATCH_WORKSPACE_GIT_STATUS => {
+                let request: zeron_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
+                let workspace = self.workspace_files.resolve_target(&request.target).await?;
+                let rx = self.diff_sync.watch_git_statuses();
+                // Only this authorized checkout crosses the connection. None means
+                // unavailable, including plain folders and initial/restarting engines.
+                let stream = futures::stream::unfold(
+                    (rx, workspace.checkout_id, None, false),
+                    |(mut rx, checkout_id, mut previous, mut emitted)| async move {
+                        loop {
+                            if emitted {
+                                rx.changed().await.ok()?;
+                            }
+                            let next = rx
+                                .borrow_and_update()
+                                .iter()
+                                .find(|s| s.checkout_id == checkout_id)
+                                .cloned();
+                            if !emitted || previous != next {
+                                emitted = true;
+                                previous = next.clone();
+                                let value =
+                                    serde_json::to_value(zeron_proto::WorkspaceGitStatusFrame {
+                                        status: next,
+                                    })
+                                    .ok()?;
+                                return Some((value, (rx, checkout_id, previous, emitted)));
+                            }
+                        }
+                    },
+                );
+                Ok(RpcReply::Stream(stream.boxed()))
             }
             methods::WATCH_CHECKOUT_CHANGE_REQUEST => {
                 let p: CheckoutChangeRequestParams = parse_params(params)?;
@@ -2363,6 +2976,17 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&matches)
             }
+            methods::READ_WORKSPACE_IMAGE => {
+                let request: zeron_proto::ReadWorkspaceImageRequest = parse_params(params)?;
+                let chunk = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.read_image(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("Workspace image read timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&chunk)
+            }
             methods::READ_WORKSPACE_FILE => {
                 let request: zeron_proto::ReadWorkspaceFileRequest = parse_params(params)?;
                 let file = tokio::time::timeout(
@@ -2373,6 +2997,17 @@ impl RpcService for EngineRpc {
                 .map_err(|_| RpcError::Failed("workspace file read timed out".into()))?
                 .map_err(RpcError::from)?;
                 RpcReply::value(&file)
+            }
+            methods::WRITE_WORKSPACE_FILE => {
+                let request: zeron_proto::WriteWorkspaceFileRequest = parse_params(params)?;
+                let outcome = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.write_file(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file write timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
             }
             methods::WATCH_WORKSPACE_FILES => {
                 let request: zeron_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
@@ -2445,12 +3080,73 @@ impl RpcService for EngineRpc {
             }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
+                let setup_space = match p.space_id.as_deref() {
+                    Some(space_id) => {
+                        let space = self.local_project_action_space(space_id)?;
+                        let space_root = std::fs::canonicalize(&space.path)
+                            .map_err(|_| RpcError::Failed("Project root is unavailable".into()))?;
+                        let repo_root = std::fs::canonicalize(&p.repo_path).map_err(|_| {
+                            RpcError::Failed("Worktree repository is unavailable".into())
+                        })?;
+                        if space_root != repo_root {
+                            return Err(RpcError::Failed(
+                                "Worktree repository does not match project space".into(),
+                            ));
+                        }
+                        Some((space, space_root))
+                    }
+                    None => None,
+                };
                 let worktree = self
                     .repos
                     .create_worktree(std::path::Path::new(&p.repo_path), &p.branch)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&worktree)
+                let mut outcome = CreateWorktreeOutcome {
+                    worktree,
+                    setup_action: None,
+                    setup_error: None,
+                };
+                if let Some((space, project_root)) = setup_space {
+                    match self
+                        .project_actions
+                        .setup_action(&space.id, std::path::Path::new(&space.path))
+                    {
+                        Ok(Some(action)) => {
+                            let worktree_root = std::fs::canonicalize(&outcome.worktree.path)
+                                .unwrap_or_else(|_| outcome.worktree.path.clone().into());
+                            match crate::project_actions::launch_project_setup_action(
+                                &self.terminals,
+                                &action,
+                                &project_root,
+                                &worktree_root,
+                                80,
+                                24,
+                            ) {
+                                Ok(run) => outcome.setup_action = Some(run),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        space_id = %space.id,
+                                        worktree = %outcome.worktree.path,
+                                        error = %err,
+                                        "failed to start project setup Action"
+                                    );
+                                    outcome.setup_error = Some(err.to_string());
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                space_id = %space.id,
+                                error = %err,
+                                "failed to resolve project setup Action"
+                            );
+                            outcome.setup_error = Some(err.to_string());
+                        }
+                    }
+                }
+                RpcReply::value(&outcome)
             }
             methods::DELETE_WORKTREE => {
                 let p: DeleteWorktreeParams = parse_params(params)?;
@@ -2462,6 +3158,96 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::LIST_PROJECT_ACTIONS => {
+                let p: ListProjectActionsParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let actions = self.project_actions.clone();
+                // Snapshots discover repository files; keep all filesystem work
+                // (including mutation persistence below) off the async worker.
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    actions.snapshot(&space.id, std::path::Path::new(&space.path))
+                })
+                .await
+                .map_err(|err| RpcError::Failed(err.to_string()))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::UPSERT_PROJECT_ACTION => {
+                let p: UpsertProjectActionParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let actions = self.project_actions.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    actions.upsert(
+                        &space.id,
+                        std::path::Path::new(&space.path),
+                        p.action_id.as_deref(),
+                        p.action,
+                    )
+                })
+                .await
+                .map_err(|err| RpcError::Failed(err.to_string()))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::DELETE_PROJECT_ACTION => {
+                let p: DeleteProjectActionParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let actions = self.project_actions.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    actions.delete(&space.id, std::path::Path::new(&space.path), &p.action_id)
+                })
+                .await
+                .map_err(|err| RpcError::Failed(err.to_string()))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::RUN_PROJECT_ACTION => {
+                let p: RunProjectActionParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("Project chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed(
+                        "Project chat belongs to another device".into(),
+                    ));
+                }
+                if chat.space_id.as_deref() != Some(space.id.as_str()) {
+                    return Err(RpcError::Failed(
+                        "Project chat belongs to another space".into(),
+                    ));
+                }
+                let cwd = chat
+                    .cwd
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| RpcError::Failed("Project chat has no checkout".into()))?;
+                let checkout = self
+                    .repos
+                    .workspace_checkout(std::path::Path::new(&space.path), &cwd)
+                    .await
+                    .ok_or_else(|| {
+                        RpcError::Failed("Project chat checkout is unavailable".into())
+                    })?;
+                let project_root = std::fs::canonicalize(&space.path)
+                    .map_err(|_| RpcError::Failed("Project root is unavailable".into()))?;
+                let action = self
+                    .project_actions
+                    .action(&space.id, std::path::Path::new(&space.path), &p.action_id)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("Project action not found".into()))?;
+                let run = crate::project_actions::launch_project_action(
+                    &self.terminals,
+                    &action,
+                    &project_root,
+                    &checkout,
+                    p.cols,
+                    p.rows,
+                )
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&run)
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
@@ -2839,8 +3625,385 @@ impl RpcService for EngineRpc {
 mod tests {
     use super::*;
 
+    // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
+    #[cfg(unix)]
+    async fn installer_rpc_fixture(mode: &str) {
+        use std::{os::unix::fs::PermissionsExt, sync::Arc};
+        if std::env::var_os("ZERON_INSTALL_FIXTURE_CHILD").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let script = match mode {
+                "success" => {
+                    "test -z \"$ZERON_INSTALL_FIXTURE_CHILD\" && test -z \"$CLAUDECODE\" && printf '#!/bin/sh\\necho 99.0.0\\n' > \"$CODEX_EXECUTABLE\" && /bin/chmod +x \"$CODEX_EXECUTABLE\""
+                }
+                "failure" => "echo 'fixture failure api_key=private' >&2; exit 7",
+                "missing" => "exit 0",
+                "cancel" => "echo ready > \"$READY_FILE\"; sleep 60",
+                "npm" => "npm install -g @openai/codex",
+                _ => unreachable!(),
+            };
+            let test = format!("rpc::tests::installer_rpc_{mode}");
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture", "--include-ignored"])
+                .env("ZERON_INSTALL_FIXTURE_CHILD", root.path())
+                .env("ZERON_INSTALLER_COMMAND_CODEX", script)
+                .env("ZERON_NO_LOGIN_SHELL", "1")
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("CODEX_EXECUTABLE", bin.join("codex"))
+                .env("CLAUDECODE", "nested-test")
+                .env("READY_FILE", root.path().join("ready"))
+                .env("npm_config_prefix", root.path())
+                .env("npm_config_cache", root.path().join("npm-cache"))
+                .env(
+                    "PATH",
+                    std::env::join_paths(
+                        std::iter::once(bin)
+                            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                    )
+                    .unwrap(),
+                )
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let root =
+            std::path::PathBuf::from(std::env::var_os("ZERON_INSTALL_FIXTURE_CHILD").unwrap());
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(zeron_harness::CodexHarness::new()));
+        let core = crate::EngineCore::assemble(
+            &root.join("engine"),
+            registry.clone(),
+            HarnessId::Codex,
+            None,
+        )
+        .unwrap();
+        let rpc = core.rpc_service();
+        let params = serde_json::json!({"harness": "codex"});
+        assert!(!registry.descriptors()[0].installed);
+        assert_eq!(registry.descriptors()[0].enabled, Some(false));
+        let result = if mode == "cancel" {
+            let rpc = rpc.clone();
+            let task = tokio::spawn(async move {
+                rpc.handle(
+                    methods::INSTALL_HARNESS,
+                    serde_json::json!({"harness": "codex"}),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !root.join("ready").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // A second service for the same device must share the in-flight guard.
+            let other = core.rpc_service();
+            assert!(
+                matches!(other.handle(methods::INSTALL_HARNESS, params.clone()).await, Err(RpcError::Failed(e)) if e == "already installing")
+            );
+            other.handle(methods::CANCEL_INSTALL, params).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            rpc.handle(methods::INSTALL_HARNESS, params).await
+        };
+        match mode {
+            "success" | "npm" => {
+                let RpcReply::Value(value) = result.unwrap() else {
+                    panic!("expected descriptors");
+                };
+                let list: Vec<crate::registry::HarnessDescriptor> =
+                    serde_json::from_value(value).unwrap();
+                assert!(list[0].installed);
+                assert_eq!(list[0].enabled, Some(true));
+                assert!(list[0].can_install);
+                let path = root.join("bin/codex");
+                assert!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111 != 0);
+                println!(
+                    "InstallHarness ({mode}): installed=false/enabled=false -> installed=true/enabled=true; {}",
+                    path.display()
+                );
+            }
+            "failure" => assert!(
+                matches!(result, Err(RpcError::Failed(e)) if e.contains("fixture failure") && e.contains("[REDACTED]") && !e.contains("private"))
+            ),
+            "missing" => assert!(
+                matches!(result, Err(RpcError::Failed(e)) if e.contains("installer finished but `codex` was not found on PATH"))
+            ),
+            "cancel" => {
+                assert!(matches!(result, Err(RpcError::Failed(e)) if e.contains("cancelled")));
+                assert!(registry.installs.begin(HarnessId::Codex).is_ok());
+            }
+            _ => unreachable!(),
+        }
+        assert!(is_forwardable(methods::CANCEL_INSTALL));
+        core.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_success() {
+        installer_rpc_fixture("success").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_failure() {
+        installer_rpc_fixture("failure").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_missing() {
+        installer_rpc_fixture("missing").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_cancel() {
+        installer_rpc_fixture("cancel").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "downloads the official npm package into an isolated temporary prefix"]
+    async fn installer_rpc_npm() {
+        installer_rpc_fixture("npm").await;
+    }
+
+    #[tokio::test]
+    async fn explicit_install_rpc_verifies_archive_and_refreshes_descriptors() {
+        use sha2::{Digest, Sha512};
+        use std::io::Write;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeron_harness::archive_install::{ArchivePin, ensure_installed, installed_entry};
+        if std::env::var_os("ZERON_INSTALL_RPC_TEST").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rpc::tests::explicit_install_rpc_verifies_archive_and_refreshes_descriptors",
+                    "--nocapture",
+                ])
+                .env("ZERON_INSTALL_RPC_TEST", "1")
+                .env("ZERON_ADAPTERS_DIR", root.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        if !zeron_harness::acp::can_install(HarnessId::Antigravity) {
+            return;
+        }
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("server", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let digest = Box::leak(format!("{:x}", Sha512::digest(&bytes)).into_boxed_str());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Box::leak(
+            format!("http://{}/archive.zip", listener.local_addr().unwrap()).into_boxed_str(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            let mut buf = [0; 4096];
+            while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0, "archive request closed before its headers");
+                headers.extend_from_slice(&buf[..count]);
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&bytes).await.unwrap();
+        });
+        let pin = ArchivePin {
+            name: "explicit-install-test",
+            version: "1",
+            url,
+            entry: "server",
+            sha512: digest,
+        };
+        let registry = HarnessRegistry::new();
+        let descriptor = serde_json::from_value(serde_json::json!({
+            "id": "antigravity", "name": "Antigravity", "supportsSteering": true,
+            "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": false
+        }))
+        .unwrap();
+        registry.register_lazy(
+            descriptor,
+            Box::new(move || installed_entry(&pin).is_some()),
+            Box::new(|| panic!("installation must not spawn the harness")),
+        );
+        assert!(!registry.descriptors()[0].installed);
+        let result = install_harness_with(&registry, HarnessId::Antigravity, || async {
+            ensure_installed(pin, "Test adapter").await.map(|_| ())
+        })
+        .await
+        .unwrap();
+        assert!(result[0].installed);
+        assert_eq!(result[0].enabled, Some(true));
+        assert!(result[0].can_install);
+        assert!(installed_entry(&pin).unwrap().is_file());
+        server.await.unwrap();
+        // The verified marker makes another explicit install idempotent, even
+        // after the archive server has stopped.
+        install_harness_with(&registry, HarnessId::Antigravity, || async {
+            ensure_installed(pin, "Test adapter").await.map(|_| ())
+        })
+        .await
+        .unwrap();
+        assert!(
+            install_harness_with(&registry, HarnessId::Mock, || async {
+                panic!("unsupported harness must not invoke an installer")
+            })
+            .await
+            .is_err()
+        );
+        assert!(is_forwardable(methods::INSTALL_HARNESS));
+        assert_eq!(
+            info(methods::INSTALL_HARNESS).unwrap().deadline,
+            std::time::Duration::from_secs(15 * 60)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_opening_tail_arrives_before_full_mirror_and_keeps_all_history() {
+        use crate::doc_host::{DocHost, DocHostConfig};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "viewer".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("whale").unwrap();
+        handle
+            .doc()
+            .push_message(&zeron_doc::SessionMessageEntry {
+                id: "turn".into(),
+                role: zeron_doc::MessageRole::Assistant,
+                parts: (0..500)
+                    .map(|i| zeron_doc::MessagePart::Text {
+                        id: format!("part-{i}"),
+                        text: "local text".into(),
+                    })
+                    .collect(),
+                created_at: 0,
+                device_id: "host".into(),
+                status: None,
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+        // Hold publication blocked: the opening must not await the full mirror.
+        let held = handle.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            held.import_transcript(|| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        locked_rx.recv().unwrap();
+        let opening = tokio::time::timeout(
+            Duration::from_secs(2),
+            opening_doc_messages_stream(host.clone(), "whale".into()),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        let mut stream = opening
+            .expect("first paint must not wait for publication")
+            .unwrap();
+        let preview = stream.next().await.unwrap();
+        assert_eq!(preview["historyPending"], true);
+        assert_eq!(preview["reset"][0]["parts"].as_array().unwrap().len(), 128);
+        assert_eq!(preview["reset"][0]["parts"][0]["id"], "part-372");
+        // Changes between preview and subscribe must appear in the full reset.
+        handle
+            .write_user_message("arrived", "new local message", 1)
+            .unwrap();
+        let full = stream.next().await.unwrap();
+        assert!(full.get("historyPending").is_none());
+        assert_eq!(full["reset"][0]["parts"].as_array().unwrap().len(), 500);
+        assert_eq!(full["reset"][1]["id"], "arrived");
+        handle
+            .write_user_message("live", "after attach", 2)
+            .unwrap();
+        let live = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut entries = Vec::new();
+        for value in [full, live] {
+            let update: zeron_doc::TranscriptUpdate = serde_json::from_value(value).unwrap();
+            zeron_doc::apply_transcript_frame(&mut entries, update.frame).unwrap();
+        }
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.last().unwrap().id, "live");
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn antigravity_disable_does_not_launch_the_server() {
+        let registry = HarnessRegistry::new();
+        let executable = std::env::current_exe().unwrap();
+        registry.register(std::sync::Arc::new(
+            zeron_harness::AcpHarness::grok().with_executable(executable.clone()),
+        ));
+        registry.register(std::sync::Arc::new(
+            zeron_harness::AcpHarness::antigravity().with_executable(executable),
+        ));
+        registry.set_enabled(HarnessId::Antigravity, true).unwrap();
+
+        update_harness_enabled(&registry, HarnessId::Antigravity, false)
+            .await
+            .unwrap();
+        assert!(!registry.enabled_set().contains(&HarnessId::Antigravity));
+    }
+
     /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
     /// `targetDeviceId`); the extra fields must be tolerated, `accountId` wins.
+    #[test]
+    fn list_models_force_is_optional_and_backward_compatible() {
+        let old: ListModelsParams =
+            serde_json::from_value(serde_json::json!({"harness":"codex"})).unwrap();
+        assert!(!old.force);
+        let forced: ListModelsParams =
+            serde_json::from_value(serde_json::json!({"harness":"codex","force":true})).unwrap();
+        assert!(forced.force);
+    }
+
     #[test]
     fn agent_account_params_accept_ui_shape() {
         let p: AgentAccountParams = parse_params(serde_json::json!({
@@ -2860,6 +4023,20 @@ mod tests {
         info(method)
             .unwrap_or_else(|| panic!("{method} missing from the rpc registry"))
             .forwardable
+    }
+
+    #[test]
+    fn sidebar_preferences_mutation_accepts_desktop_wire_shape() {
+        let p: MutateParams = parse_params(serde_json::json!({
+            "op": "changeSidebarPin",
+            "change": {"action":"move","sessionId":"chat-b","before":"chat-a","after":null},
+        }))
+        .expect("sidebar preferences params");
+        assert!(matches!(
+            p,
+            MutateParams::ChangeSidebarPin { change: zeron_proto::SidebarPinChange::Move { session_id, before, .. } }
+                if session_id == "chat-b" && before.as_deref() == Some("chat-a")
+        ));
     }
 
     #[test]
@@ -2887,6 +4064,24 @@ mod tests {
         assert!(!is_forwardable(methods::WATCH_LIVE_VOICE));
     }
 
+    #[test]
+    fn workspace_file_surface_is_forwardable() {
+        let stream = |m: &str| info(m).unwrap().stream;
+        assert!(is_forwardable(methods::LIST_WORKSPACE_DIRECTORY));
+        assert!(is_forwardable(methods::SEARCH_WORKSPACE_FILES));
+        assert!(is_forwardable(methods::READ_WORKSPACE_FILE));
+        assert!(is_forwardable(methods::READ_WORKSPACE_IMAGE));
+        assert!(is_forwardable(methods::WRITE_WORKSPACE_FILE));
+        assert!(is_forwardable(methods::WATCH_WORKSPACE_FILES));
+        assert!(is_forwardable(methods::WATCH_WORKSPACE_GIT_STATUS));
+        assert!(!stream(methods::LIST_WORKSPACE_DIRECTORY));
+        assert!(!stream(methods::SEARCH_WORKSPACE_FILES));
+        assert!(!stream(methods::READ_WORKSPACE_FILE));
+        assert!(!stream(methods::WRITE_WORKSPACE_FILE));
+        assert!(stream(methods::WATCH_WORKSPACE_FILES));
+        assert!(stream(methods::WATCH_WORKSPACE_GIT_STATUS));
+    }
+
     /// Every forwardable unary method gets a bounded reply deadline —
     /// interactive calls fail fast, network-bound git/update calls get the
     /// long leash, and nothing awaits forever (the "Sending…" wedge).
@@ -2894,6 +4089,9 @@ mod tests {
     fn relay_reply_deadlines_are_tiered_and_bounded() {
         use std::time::Duration;
         let deadline = |m: &str| info(m).unwrap().deadline;
+        for method in [methods::LIST_MODELS, methods::LIST_COMMANDS] {
+            assert_eq!(deadline(method), Duration::from_secs(100));
+        }
         assert_eq!(deadline(methods::CREATE_WORKTREE), Duration::from_secs(120));
         assert_eq!(deadline(methods::CLONE_REPO), Duration::from_secs(15 * 60));
         assert_eq!(deadline(methods::LIST_BRANCHES), Duration::from_secs(30));
@@ -4749,5 +5947,402 @@ mod tests {
             }
             other => panic!("expected typed store unavailable, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod context_usage_tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn replay_cutoff_travels_with_coalesced_backfill_and_live_content() {
+        use crate::doc_host::{DocHost, DocHostConfig};
+        use zeron_sync::chat_client::ChatDocSink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "viewer".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("replay-chat").unwrap();
+        let sink = crate::chat2_host::EngineChatSink::new(&handle.doc_arc(), store, "replay-chat")
+            .with_handle(Arc::downgrade(&handle));
+        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc());
+        let first: zeron_doc::TranscriptUpdate =
+            serde_json::from_value(stream.next().await.unwrap()).unwrap();
+        assert!(first.replay_baseline.unwrap().entries.is_empty());
+
+        let source = zeron_doc::SessionDoc::init("replay-chat").unwrap();
+        let append = |id: &str| {
+            source
+                .push_message(&zeron_doc::SessionMessageEntry {
+                    id: id.into(),
+                    role: zeron_doc::MessageRole::Assistant,
+                    parts: vec![zeron_doc::MessagePart::Text {
+                        id: "text".into(),
+                        text: id.into(),
+                    }],
+                    created_at: 0,
+                    device_id: "writer".into(),
+                    status: Some(zeron_doc::MessageStatus::Streaming),
+                    continuation_of: None,
+                    duration_ms: None,
+                })
+                .unwrap()
+        };
+        append("cached");
+        sink.apply_checkpoint(&source.export_snapshot().unwrap(), 0)
+            .unwrap();
+        let checkpoint: zeron_doc::TranscriptUpdate = serde_json::from_value(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            checkpoint
+                .replay_baseline
+                .unwrap()
+                .entries
+                .contains_key("cached")
+        );
+
+        let version = source.doc().oplog_vv();
+        append("away");
+        sink.apply_replay_row(
+            &source
+                .doc()
+                .export(loro::ExportMode::updates(&version))
+                .unwrap(),
+            1,
+        );
+        let version = source.doc().oplog_vv();
+        append("live");
+        sink.apply_row(
+            &source
+                .doc()
+                .export(loro::ExportMode::updates(&version))
+                .unwrap(),
+            2,
+        );
+        // Neither the doc worker nor the RPC consumer ran between these
+        // imports. They must not flatten their different presentation origins.
+        let update: zeron_doc::TranscriptUpdate = serde_json::from_value(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let cutoff = update.replay_baseline.unwrap();
+        assert!(cutoff.entries.contains_key("away"));
+        assert!(!cutoff.entries.contains_key("live"));
+        let mut entries = vec![];
+        zeron_doc::apply_transcript_frame(&mut entries, checkpoint.frame).unwrap();
+        zeron_doc::apply_transcript_frame(&mut entries, update.frame).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let version = source.doc().oplog_vv();
+        append("next-live");
+        sink.apply_row(
+            &source
+                .doc()
+                .export(loro::ExportMode::updates(&version))
+                .unwrap(),
+            3,
+        );
+        let update: zeron_doc::TranscriptUpdate = serde_json::from_value(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            update.replay_baseline.is_none(),
+            "live updates must not resend the history watermark"
+        );
+        let mut reopened = doc_messages_stream(handle.watch_messages(), handle.doc_arc());
+        let opening: zeron_doc::TranscriptUpdate =
+            serde_json::from_value(reopened.next().await.unwrap()).unwrap();
+        assert_eq!(
+            opening.replay_baseline.unwrap().entries.len(),
+            4,
+            "reopening includes all existing content as history"
+        );
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn replay_metadata_and_backfill_leave_interleaved_local_content_live() {
+        use crate::doc_host::{DocHost, DocHostConfig};
+        use zeron_sync::chat_client::ChatDocSink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("interleaved").unwrap();
+        let sink = crate::chat2_host::EngineChatSink::new(&handle.doc_arc(), store, "interleaved")
+            .with_handle(Arc::downgrade(&handle));
+        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc());
+        stream.next().await.unwrap();
+        let source = zeron_doc::SessionDoc::init("interleaved").unwrap();
+        sink.apply_checkpoint(&source.export_snapshot().unwrap(), 0)
+            .unwrap();
+        let entry = |id: &str| zeron_doc::SessionMessageEntry {
+            id: id.into(),
+            role: zeron_doc::MessageRole::Assistant,
+            parts: vec![zeron_doc::MessagePart::Text {
+                id: "text".into(),
+                text: id.into(),
+            }],
+            created_at: 0,
+            device_id: "host".into(),
+            status: Some(zeron_doc::MessageStatus::Streaming),
+            continuation_of: None,
+            duration_ms: None,
+        };
+        handle.doc().push_message(&entry("local-before")).unwrap();
+        source.update_context_usage(Some(10), Some(100)).unwrap();
+        sink.apply_replay_row(&source.export_snapshot().unwrap(), 1);
+        let update: zeron_doc::TranscriptUpdate = serde_json::from_value(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            update.replay_baseline.is_none(),
+            "metadata must not reset ongoing live animations"
+        );
+        let mut entries = vec![];
+        zeron_doc::apply_transcript_frame(&mut entries, update.frame).unwrap();
+        assert_eq!(entries[0].id, "local-before");
+        let version = source.doc().oplog_vv();
+        source.push_message(&entry("historical")).unwrap();
+        handle.doc().push_message(&entry("local-between")).unwrap();
+        sink.apply_replay_row(
+            &source
+                .doc()
+                .export(loro::ExportMode::updates(&version))
+                .unwrap(),
+            2,
+        );
+        handle.doc().push_message(&entry("local-after")).unwrap();
+        let update: zeron_doc::TranscriptUpdate = serde_json::from_value(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let baseline = update.replay_baseline.unwrap();
+        assert_eq!(baseline.entries.len(), 1);
+        assert!(baseline.entries.contains_key("historical"));
+        zeron_doc::apply_transcript_frame(&mut entries, update.frame).unwrap();
+        assert_eq!(entries.len(), 4);
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_each_watchers_opening_cutoff_without_consuming_live_text() {
+        use crate::doc_host::{DocHost, DocHostConfig};
+        use zeron_sync::chat_client::ChatDocSink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "viewer".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("cached-replay").unwrap();
+        let sink =
+            crate::chat2_host::EngineChatSink::new(&handle.doc_arc(), store, "cached-replay")
+                .with_handle(Arc::downgrade(&handle));
+        let source = zeron_doc::SessionDoc::init("cached-replay").unwrap();
+        let mut writer = zeron_doc::SegmentWriter::begin(&source, "reply", "host", 0).unwrap();
+        let text = |id: &str, value: &str| zeron_doc::MessagePart::Text {
+            id: id.into(),
+            text: value.into(),
+        };
+        let cached = text("body", "café histórico");
+        writer.sync(&[cached.clone()]).unwrap();
+        sink.apply_checkpoint(&source.export_snapshot().unwrap(), 0)
+            .unwrap();
+        // Cached content exists before the first watcher and never enters
+        // the changed-parts tracker. It may not have been painted yet.
+        let mut first = doc_messages_stream(handle.watch_messages(), handle.doc_arc());
+        let opening: zeron_doc::TranscriptUpdate =
+            serde_json::from_value(first.next().await.unwrap()).unwrap();
+        assert_eq!(
+            opening.replay_baseline.unwrap().entries["reply"]["body"],
+            "café histórico".len()
+        );
+
+        let live = text("body", "café histórico y nuevo");
+        writer.sync(&[live.clone()]).unwrap();
+        sink.apply_row(&source.export_snapshot().unwrap(), 1);
+        let update: zeron_doc::TranscriptUpdate = serde_json::from_value(
+            tokio::time::timeout(std::time::Duration::from_secs(2), first.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(update.replay_baseline.is_none());
+        // A later subscriber sees a longer historical prefix, but must not
+        // change the first subscriber's ongoing live animation.
+        let mut second = doc_messages_stream(handle.watch_messages(), handle.doc_arc());
+        let opening: zeron_doc::TranscriptUpdate =
+            serde_json::from_value(second.next().await.unwrap()).unwrap();
+        assert_eq!(
+            opening.replay_baseline.unwrap().entries["reply"]["body"],
+            "café histórico y nuevo".len()
+        );
+
+        let mut parts = vec![live];
+        for ix in 0..2 {
+            let id = format!("recovered-{ix}");
+            parts.push(text(&id, "otro bloque histórico"));
+            writer.sync(&parts).unwrap();
+            sink.apply_replay_row(&source.export_snapshot().unwrap(), 2 + ix);
+            for (stream, expected) in [
+                (&mut first, "café histórico".len()),
+                (&mut second, "café histórico y nuevo".len()),
+            ] {
+                let update: zeron_doc::TranscriptUpdate = serde_json::from_value(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                let baseline = update.replay_baseline.unwrap();
+                assert_eq!(
+                    baseline.entries["reply"].get("body"),
+                    Some(&expected),
+                    "replay must retain this watcher's opening cutoff, excluding later live bytes"
+                );
+                assert_eq!(
+                    baseline.entries["reply"][&id],
+                    "otro bloque histórico".len()
+                );
+                assert_eq!(baseline.entries["reply"].len(), 2 + ix as usize);
+            }
+        }
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn reopening_rearms_history_for_previously_live_text() {
+        use crate::doc_host::{DocHost, DocHostConfig};
+        use zeron_sync::chat_client::ChatDocSink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "viewer".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("reopen").unwrap();
+        let sink = crate::chat2_host::EngineChatSink::new(&handle.doc_arc(), store, "reopen")
+            .with_handle(Arc::downgrade(&handle));
+        let source = zeron_doc::SessionDoc::init("reopen").unwrap();
+        let mut writer = zeron_doc::SegmentWriter::begin(&source, "reply", "host", 0).unwrap();
+        let part = |text: &str| zeron_doc::MessagePart::Text {
+            id: "body".into(),
+            text: text.into(),
+        };
+        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc());
+        stream.next().await.unwrap();
+        writer.sync(&[part("live")]).unwrap();
+        sink.apply_row(&source.export_snapshot().unwrap(), 1);
+        let _: serde_json::Value =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+        drop(stream);
+        // No unwatched commit clears provenance before the new attach.
+        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc());
+        stream.next().await.unwrap();
+        writer.sync(&[part("live plus recovered")]).unwrap();
+        sink.apply_replay_row(&source.export_snapshot().unwrap(), 2);
+        let update: zeron_doc::TranscriptUpdate = serde_json::from_value(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            update.replay_baseline.unwrap().entries["reply"]["body"],
+            "live plus recovered".len()
+        );
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn context_only_commits_reach_remote_watch_and_reconnect() {
+        let host = zeron_doc::SessionDoc::init("context-chat").unwrap();
+        host.update_context_usage(Some(42000), Some(200000))
+            .unwrap();
+        // The viewing engine reads a replicated document, with no harness process.
+        let remote = Arc::new(zeron_doc::SessionDoc::from_doc(loro::LoroDoc::new()));
+        remote
+            .doc()
+            .import(&host.export_snapshot().unwrap())
+            .unwrap();
+        let (tx, rx) = watch::channel(crate::doc_host::TranscriptSnapshot::default());
+        let mut stream = doc_messages_stream(rx, remote.clone());
+        let first = stream.next().await.unwrap();
+        assert_eq!(first["contextUsage"]["tokens"], 42000);
+        assert!(first.get("reset").is_some());
+        let version = host.doc().oplog_vv();
+        host.update_context_usage(Some(0), None).unwrap();
+        remote
+            .doc()
+            .import(
+                &host
+                    .doc()
+                    .export(loro::ExportMode::updates(&version))
+                    .unwrap(),
+            )
+            .unwrap();
+        tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
+        let update = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update["contextUsage"]["tokens"], 0);
+        assert_eq!(update["contextUsage"]["contextWindow"], 200000);
+        let mut reconnect = doc_messages_stream(tx.subscribe(), remote.clone());
+        assert_eq!(
+            reconnect.next().await.unwrap()["contextUsage"],
+            update["contextUsage"]
+        );
+        remote.clear_context_usage().unwrap();
+        tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
+        assert!(stream.next().await.unwrap()["contextUsage"].is_null());
     }
 }

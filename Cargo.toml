@@ -14,6 +14,7 @@ members = [
     "crates/update",
     "crates/workers-unpeel",
     "crates/ui",
+    "crates/mcp",
     "apps/zeron",
 ]
 exclude = [
@@ -38,12 +39,13 @@ zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }
 zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
-comet-syntax = { path = "crates/syntax" }
+zeron-syntax = { path = "crates/syntax" }
 zeron-update = { path = "crates/update" }
 zeron-workers-unpeel = { path = "crates/workers-unpeel" }
 zeron-ui = { path = "crates/ui" }
 unpeel-core = { path = "third_party/unpeel/crates/unpeel-core" }
 zeron-theme = { path = "crates/theme" }
+zeron-mcp = { path = "crates/mcp" }
 
 # CRDT
 loro = "1.13"
@@ -85,6 +87,10 @@ gpui_platform = { path = "third_party/zui/crates/gpui_platform", features = [
     "runtime_shaders",
 ] }
 gpui_tokio = { path = "third_party/zui/crates/gpui_tokio" }
+# Upstream component primitives. Its own `gpui`/`gpui_macros` git deps are
+# redirected to the vendored tree by the `[patch]` below, so the workspace
+# keeps a single GPUI identity.
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "03cd9947a6aa07921cb284ad66c87fd6735e55b0" }
 
 # diffs
 similar = "2"
@@ -103,6 +109,9 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "0.4"
+# antigravity writes `settings.json` but reads it back with `hjson.load`, so a
+# user's comments and unquoted keys have to survive our read of the same file.
+deser-hjson = "2.2"
 plist = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -110,8 +119,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # misc
-# Keep mimalloc v2 on macOS; other platforms retain their system allocator.
-# The upstream retention benchmarks and rationale are in docs/memory-plan.md.
+# Global allocator on macOS only: libmalloc retains the churn high-water mark
+# as permanent RSS - measured as the top residency cause in
+# docs/memory-plan.md. Pinned to mimalloc v2: the crate's default (v3.3.2)
+# has the same watermark pathology itself - transient streaming/render churn
+# became permanent RSS (~6x glibc growth, daemon at 908MB for 7.3MB of docs,
+# no idle recovery). Linux stays on glibc, which measured flat on the same
+# workloads.
 mimalloc = { version = "0.1", features = ["v2"] }
 anyhow = "1"
 tempfile = "3"
@@ -121,12 +135,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 notify = "7"
 portable-pty = "0.8"
 alacritty_terminal = "0.26"
 pulldown-cmark = "0.12"
 rquickjs = "0.9"
 unicode-segmentation = "1"
+unicode-width = "0.2"
 fontdb = "0.23"
 ttf-parser = "0.25.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -186,3 +202,11 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# `gpui-base` (zeronsh/gpui-component) depends on zeronsh/zui by git; point
+# those crates at the vendored snapshot so only one GPUI is compiled.
+[patch."https://github.com/zeronsh/zui"]
+gpui = { path = "third_party/zui/crates/gpui" }
+gpui_macros = { path = "third_party/zui/crates/gpui_macros" }
+gpui_platform = { path = "third_party/zui/crates/gpui_platform" }
+gpui_tokio = { path = "third_party/zui/crates/gpui_tokio" }

@@ -6,12 +6,12 @@ use std::{
     sync::Arc,
 };
 
-use comet_syntax::HighlightedDocument;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, EventEmitter, Image, InteractiveElement, IntoElement,
     ListHorizontalSizingBehavior, ListState, ObjectFit, Render, SharedString, StyledText, Task,
     UniformListScrollHandle, Window, div, font, img, list, prelude::*, px, uniform_list,
 };
+use zeron_syntax::HighlightedDocument;
 
 use crate::{
     details_sidebar::files_view::material_icon_path,

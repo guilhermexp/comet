@@ -21,3 +21,9 @@ license = "Apache-2.0"
 #   no-mistakes(review): Drop unverifiable scale claim, simplify example call
 # 37123559dda41271fb4984992f79b644b3d681ba
 #   no-mistakes(document): document window_blur example in examples README
+
+# Local patch (sync/upstream-v0.2.83, 2026-09-22), not upstreamed:
+#   gpui_macos/src/platform.rs — a headless `MacPlatform` skips the TIS
+#   keyboard-layout query. On macOS 27 `TISCopyCurrentKeyboardLayoutInputSource`
+#   aborts (SIGABRT in HIToolbox) off the main thread, which killed the
+#   parallel zeron-ui test binary whenever a test shaped text natively.

@@ -241,6 +241,9 @@ struct TerminalTab {
     key: u64,
     title: SharedString,
     terminal_id: Option<String>,
+    /// The device the PTY was opened on, captured at open time so every later
+    /// RPC for this tab keeps addressing the same host.
+    target_device_id: Option<String>,
     emulator: Emulator,
     exited: Option<i32>,
     last_seq: u64,
@@ -276,6 +279,12 @@ pub struct TerminalPanel {
     /// through the changing clip, but do not feed transient widths into the
     /// emulator: alternate-screen rows truncate rather than reflow.
     resize_suspended: bool,
+    /// Whether this docked panel's bottom-left/right corners sit at the
+    /// WINDOW's corners — the shell sets these per frame so the panel's fill
+    /// can carry the CSD window's rounded corners (gpui cannot clip children
+    /// rounded; each full-bleed layer rounds itself).
+    window_corner_bl: bool,
+    window_corner_br: bool,
     tab_seq: u64,
     last_selected: Option<String>,
     /// Last reported grid placement; `None` until the first prepaint.
@@ -307,6 +316,8 @@ impl TerminalPanel {
             embedded: false,
             render_context: None,
             resize_suspended: false,
+            window_corner_bl: false,
+            window_corner_br: false,
             tab_seq: 0,
             last_selected: None,
             geometry: None,
@@ -341,6 +352,17 @@ impl TerminalPanel {
         self.resize_suspended = suspended;
     }
 
+    /// Shell hook: whether the panel's bottom corners sit at the window's
+    /// corners (Linux CSD floating window). Notifies only on change so the
+    /// per-frame shell call stays cheap.
+    pub fn set_window_corners(&mut self, bl: bool, br: bool, cx: &mut Context<Self>) {
+        if self.window_corner_bl != bl || self.window_corner_br != br {
+            self.window_corner_bl = bl;
+            self.window_corner_br = br;
+            cx.notify();
+        }
+    }
+
     /// Shell toggle hook. Opening lazily creates the first tab for the
     /// selected chat (drawer mode; embedded tabs are explicit); closing
     /// keeps every session alive (detach ≠ close).
@@ -366,8 +388,10 @@ impl TerminalPanel {
         }
     }
 
-    // ---- embedded (right-pane surface) API — the shell's tab strip drives
-    // ---- these; keys are stable across reorders/closes.
+    // ---- externally managed session API. The right-pane host drives the
+    // ---- keyed tab operations because its surface strip lives in Shell;
+    // ---- Project Actions reserve and attach tabs; keys are stable across
+    // ---- reorders/closes.
 
     /// `(key, title, exited)` for the selected chat's tabs, in tab order.
     pub fn tab_summaries(&self, cx: &App) -> Vec<(u64, SharedString, bool)> {
@@ -407,6 +431,83 @@ impl TerminalPanel {
         self.render_context = Some(context.clone());
         self.open_tab_in_context(context, Some(cwd), None, cx);
         Some(self.tab_seq)
+    }
+
+    /// Create a named placeholder tab without opening a PTY. Project Actions
+    /// use this before their host-side run RPC completes.
+    pub fn reserve_tab_for_chat(
+        &mut self,
+        chat: String,
+        title: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.tab_seq += 1;
+        let key = self.tab_seq;
+        let entry = self.chats.entry(chat).or_default();
+        entry.tabs.push(TerminalTab {
+            key,
+            title: title.into(),
+            terminal_id: None,
+            target_device_id: None,
+            emulator: Emulator::new(80, 24),
+            exited: None,
+            last_seq: 0,
+            coalescer: InputCoalescer::default(),
+            flush_task: None,
+            resize_task: None,
+            _run: None,
+        });
+        entry.active = entry.tabs.len() - 1;
+        cx.notify();
+        key
+    }
+
+    /// Attach and stream a PTY that was already opened by the owning engine.
+    pub fn attach_reserved_session(
+        &mut self,
+        chat: &str,
+        key: u64,
+        session: TerminalSession,
+        target_device_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.tab_mut(chat, key).is_none() {
+            return false;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return false;
+        };
+        let run = Self::spawn_session(
+            chat.to_string(),
+            key,
+            engine,
+            target_device_id,
+            None,
+            Some(session),
+            cx,
+        );
+        if let Some(tab) = self.tab_mut(chat, key) {
+            tab._run = Some(run);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Turn a placeholder into a visible failed tab without opening a PTY.
+    pub fn fail_reserved_tab(
+        &mut self,
+        chat: &str,
+        key: u64,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tab_mut(chat, key) {
+            tab.emulator
+                .feed(format!("\x1b[31mfailed to run action: {message}\x1b[0m\r\n").as_bytes());
+            tab.exited = Some(-1);
+            cx.notify();
+        }
     }
 
     /// Make `key` the rendered tab of the selected chat.
@@ -535,38 +636,27 @@ impl TerminalPanel {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.tab_seq += 1;
-        let key = self.tab_seq;
-        let entry = self.chats.entry(context.clone()).or_default();
-        let tab_no = entry.tabs.len() + 1;
-        entry.tabs.push(TerminalTab {
-            key,
-            title: format!("Terminal {tab_no}").into(),
-            terminal_id: None,
-            emulator: Emulator::new(80, 24),
-            exited: None,
-            last_seq: 0,
-            coalescer: InputCoalescer::default(),
-            flush_task: None,
-            resize_task: None,
-            _run: None,
-        });
-        entry.active = entry.tabs.len() - 1;
-
-        let run = Self::spawn_session(context.clone(), key, engine, target, cwd, cx);
+        let tab_no = self
+            .chats
+            .get(&context)
+            .map_or(1, |entry| entry.tabs.len() + 1);
+        let key = self.reserve_tab_for_chat(context.clone(), format!("Terminal {tab_no}"), cx);
+        let run = Self::spawn_session(context.clone(), key, engine, target, cwd, None, cx);
         if let Some(tab) = self.tab_mut(&context, key) {
             tab._run = Some(run);
         }
         cx.notify();
     }
 
-    /// OpenTerminal, then pump SubscribeTerminal with reconnect backoff.
+    /// OpenTerminal (unless the owning engine already opened the PTY), then
+    /// pump SubscribeTerminal with reconnect backoff.
     fn spawn_session(
         context: String,
         key: u64,
         engine: EngineHandle,
         target: Option<String>,
         cwd: Option<String>,
+        existing_session: Option<TerminalSession>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -579,17 +669,24 @@ impl TerminalPanel {
                 })
                 .unwrap_or((80, 24));
 
-            let terminal_context = match cwd {
-                Some(cwd) => serde_json::json!({ "cwd": cwd, "cols": cols, "rows": rows }),
-                None => serde_json::json!({ "chatId": context, "cols": cols, "rows": rows }),
+            let opened = match existing_session {
+                Some(session) => Ok(session),
+                None => {
+                    let terminal_context = match cwd {
+                        Some(cwd) => serde_json::json!({ "cwd": cwd, "cols": cols, "rows": rows }),
+                        None => {
+                            serde_json::json!({ "chatId": context, "cols": cols, "rows": rows })
+                        }
+                    };
+                    engine
+                        .client()
+                        .call_as::<TerminalSession>(
+                            methods::OPEN_TERMINAL,
+                            with_target(terminal_context, &target),
+                        )
+                        .await
+                }
             };
-            let opened = engine
-                .client()
-                .call_as::<TerminalSession>(
-                    methods::OPEN_TERMINAL,
-                    with_target(terminal_context, &target),
-                )
-                .await;
             let session = match opened {
                 Ok(session) => session,
                 Err(err) => {
@@ -612,6 +709,7 @@ impl TerminalPanel {
                 .update(cx, |panel, cx| {
                     if let Some(tab) = panel.tab_mut(&context, key) {
                         tab.terminal_id = Some(terminal_id.clone());
+                        tab.target_device_id = target.clone();
                         cx.notify();
                         true
                     } else {
@@ -712,10 +810,10 @@ impl TerminalPanel {
         event: TerminalEvent,
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
-        let target = self.chat_target(chat, cx);
         let Some(tab) = self.tab_mut(chat, key) else {
             return StreamDisposition::Stop;
         };
+        let target = tab.target_device_id.clone();
         match event {
             TerminalEvent::Data { seq, data } => {
                 tab.last_seq = seq;
@@ -793,10 +891,10 @@ impl TerminalPanel {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let target = self.chat_target(&chat, cx);
         let Some(tab) = self.tab_mut(&chat, key) else {
             return;
         };
+        let target = tab.target_device_id.clone();
         if tab.coalescer.is_empty() {
             return;
         }
@@ -880,6 +978,7 @@ impl TerminalPanel {
         let Some(chat) = self.selected_chat(cx) else {
             return;
         };
+        let engine = self.engine(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
             return;
         };
@@ -892,8 +991,7 @@ impl TerminalPanel {
         }
         tab.emulator.resize(cols, rows);
         let key = tab.key;
-        let engine = self.engine(cx);
-        let target = self.chat_target(&chat, cx);
+        let target = tab.target_device_id.clone();
         if let (Some(engine), Some(tab)) = (engine, self.tab_mut(&chat, key)) {
             let id = tab.terminal_id.clone();
             tab.resize_task = Some(cx.spawn(async move |this, cx| {
@@ -1329,7 +1427,6 @@ impl TerminalPanel {
 
     fn close_tab(&mut self, chat: &str, key: u64, cx: &mut Context<Self>) {
         let engine = self.engine(cx);
-        let target = self.chat_target(chat, cx);
         let Some(tabs) = self.chats.get_mut(chat) else {
             return;
         };
@@ -1337,6 +1434,7 @@ impl TerminalPanel {
             return;
         };
         let tab = tabs.tabs.remove(ix);
+        let target = tab.target_device_id.clone();
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
         if now_empty {
@@ -1370,10 +1468,18 @@ impl Render for TerminalPanel {
         // fill here stacked another shade on the pane (user report); the
         // drawer keeps its own tone.
         let panel_bg: Option<gpui::Hsla> = (!self.embedded).then(|| terminal_panel_bg(&theme));
+        // Docked at the window's bottom edge, the panel's own fill carries
+        // the CSD window's bottom corners when it sits at them (the shell
+        // decides per frame; embedded panels never do).
+        let corner_bl = self.window_corner_bl;
+        let corner_br = self.window_corner_br;
+        let corner = px(crate::shell::LINUX_WINDOW_CORNER_RADIUS);
         let Some(_chat) = self.selected_chat(cx) else {
             return div()
                 .size_full()
                 .when_some(panel_bg, |el, bg| el.bg(bg))
+                .when(corner_bl, |el| el.rounded_bl(corner))
+                .when(corner_br, |el| el.rounded_br(corner))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1393,6 +1499,8 @@ impl Render for TerminalPanel {
             .flex()
             .flex_col()
             .when_some(panel_bg, |el, bg| el.bg(bg))
+            .when(corner_bl, |el| el.rounded_bl(corner))
+            .when(corner_br, |el| el.rounded_br(corner))
             .child(
                 div()
                     .id("terminal-body")

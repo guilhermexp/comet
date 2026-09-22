@@ -21,8 +21,10 @@ use tokio_util::sync::CancellationToken;
 
 /// Discovery must not turn into HTTP traffic against the user's dev servers.
 /// A listening socket is probed until it answers HTTP once; that verdict then
-/// holds for the socket's lifetime because process enumeration proves the
-/// same process still owns the same port. Non-HTTP listeners use backoff.
+/// holds for the socket's lifetime, because the process enumeration each
+/// cycle already proves the same process still owns the same port. Sockets
+/// that did not answer HTTP (a server bound but not yet serving) are retried
+/// with a capped exponential backoff instead of on every cycle.
 #[derive(Default)]
 pub(crate) struct ProbeMemory {
     verdicts: HashMap<(u32, u64, SocketAddr), Verdict>,
@@ -38,6 +40,8 @@ enum Verdict {
 
 const NOT_HTTP_INITIAL_BACKOFF: Duration = Duration::from_secs(4);
 const NOT_HTTP_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// (servers already confirmed HTTP, listeners to probe this cycle)
 type Planned<T> = (Vec<(T, discovery::Listener)>, Vec<(T, discovery::Listener)>);
 
 fn probe_key(listener: &discovery::Listener) -> (u32, u64, SocketAddr) {
@@ -45,6 +49,9 @@ fn probe_key(listener: &discovery::Listener) -> (u32, u64, SocketAddr) {
 }
 
 impl ProbeMemory {
+    /// Splits this cycle's candidates into servers already known to speak
+    /// HTTP and listeners that need a probe now. Verdicts for sockets that
+    /// are no longer listed are forgotten so a reused port is probed afresh.
     pub(crate) fn plan<T>(
         &mut self,
         candidates: Vec<(T, discovery::Listener)>,
@@ -275,6 +282,7 @@ mod tests {
         let (known, probe) = memory.plan(vec![((), listener(7, 8081))], t0);
         assert!(known.is_empty());
         assert_eq!(probe.len(), 1);
+        // The original socket, once absent, is forgotten and re-probed on return.
         memory.record(&probe[0].1, true, t0);
         for cycle in 1..1_000u64 {
             let now = t0 + Duration::from_secs(2 * cycle);
@@ -297,6 +305,7 @@ mod tests {
         memory.record(&probe[0].1, false, t0 + Duration::from_secs(5));
         let (_, probe) = memory.plan(vec![((), listener(7, 8081))], t0 + Duration::from_secs(10));
         assert!(probe.is_empty(), "backoff doubled");
+        // A different process on the same port carries no verdict over.
         let (_, probe) = memory.plan(vec![((), listener(8, 8081))], t0 + Duration::from_secs(10));
         assert_eq!(probe.len(), 1);
         memory.record(&probe[0].1, true, t0);
@@ -315,6 +324,6 @@ mod tests {
             now += NOT_HTTP_MAX_BACKOFF;
         }
         let (_, probe) = memory.plan(vec![((), listener(7, 8081))], now);
-        assert_eq!(probe.len(), 1);
+        assert_eq!(probe.len(), 1, "still retried once per max backoff");
     }
 }

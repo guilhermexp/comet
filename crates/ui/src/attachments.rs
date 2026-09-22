@@ -21,8 +21,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::TryStreamExt as _;
 use gpui::{
-    AnyElement, BackgroundExecutor, Image, ImageFormat, ObjectFit, SharedString, Size,
-    StyledImage as _, div, img, prelude::*, px,
+    AnyElement, BackgroundExecutor, Image, ImageFormat, SharedString, Size, div, prelude::*, px,
 };
 
 use crate::state::EngineHandle;
@@ -99,6 +98,7 @@ mod neutral_attachment_wording_tests {
 /// An attachment ref parsed back out of a user message's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserImageAttachment {
+    pub appshot: Option<crate::appshots::AppshotPresentation>,
     pub id: String,
     pub path: String,
     pub name: String,
@@ -176,7 +176,8 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
             attachments: Vec::new(),
         };
     };
-    let body = content[..body_end].trim_end();
+    let body = crate::appshots::strip_context_for_display(content[..body_end].trim_end());
+    let presentations = crate::appshots::presentations(content);
     let attachments: Vec<UserImageAttachment> = content[refs_start..]
         .lines()
         .filter_map(|line| {
@@ -185,6 +186,7 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
         })
         .enumerate()
         .map(|(index, path)| UserImageAttachment {
+            appshot: presentations.get(&path).cloned(),
             id: format!("{index}:{path}"),
             name: name_from_path(&path),
             path,
@@ -880,7 +882,12 @@ pub async fn read_attachment_image(
     }
     let bytes = BASE64.decode(b64.as_bytes()).ok()?;
     let image = if let Some(expected) = expected_raster_mime {
-        if expected != mime {
+        if expected != mime
+            || !matches!(
+                mime.as_str(),
+                "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+            )
+        {
             return None;
         }
         let expected = expected.to_owned();
@@ -907,6 +914,26 @@ pub async fn read_attachment_image(
         },
         image,
     })
+}
+
+/// Decode with a fixed allocation budget and retain only a small queue image.
+/// Full resolution is fetched on explicit preview, never retained by queue rows.
+pub(crate) fn queue_thumbnail_image(source: &Image) -> Option<Arc<Image>> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(source.bytes.as_slice()))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let thumb = reader.decode().ok()?.thumbnail(160, 112);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    thumb.write_to(&mut bytes, image::ImageFormat::Png).ok()?;
+    Some(Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        bytes.into_inner(),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,22 +1282,69 @@ pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image
 pub struct PreviewImage {
     pub name: SharedString,
     pub image: Arc<Image>,
+    pub(crate) viewer: crate::image_viewer::ImageView,
 }
 
-/// The bare lightbox: dim scrim, the image at ≤85vh/90vw, the file name under
-/// it. Any click closes (the whole dialog is the close button, as in the
-/// original's `cursor-zoom-out` figure), and so does Escape — `focus` must be
-/// focused by the caller when the preview opens so the key reaches us.
+impl PreviewImage {
+    pub fn new(name: impl Into<SharedString>, image: Arc<Image>) -> Self {
+        Self {
+            name: name.into(),
+            image,
+            viewer: Default::default(),
+        }
+    }
+}
+
+/// Shared image viewer over a dim scrim. Escape and a click close it;
+/// dragging and zoom controls are consumed by the viewer.
 pub fn lightbox(
-    viewport: Size<gpui::Pixels>,
+    window: &mut gpui::Window,
     preview: &PreviewImage,
     focus: &gpui::FocusHandle,
     on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    cx: &mut gpui::App,
 ) -> AnyElement {
+    lightbox_with_size(window, preview, focus, None, on_close, cx)
+}
+
+/// Sanitized SVG variants retain their source's natural logical dimensions.
+pub(crate) fn lightbox_with_size(
+    window: &mut gpui::Window,
+    preview: &PreviewImage,
+    focus: &gpui::FocusHandle,
+    natural_size: Option<Size<gpui::Pixels>>,
+    on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    cx: &mut gpui::App,
+) -> AnyElement {
+    let viewport = window.viewport_size();
     let max_h = px(f32::from(viewport.height) * 0.85);
     let max_w = px(f32::from(viewport.width) * 0.9);
+    let natural_size = natural_size.or_else(|| {
+        preview
+            .image
+            .clone()
+            .use_render_image(window, cx)
+            .map(|image| {
+                let dimensions = image.size(0);
+                gpui::size(
+                    px(dimensions.width.0 as f32),
+                    px(dimensions.height.0 as f32),
+                )
+            })
+    });
+    let content = match natural_size {
+        Some(natural) => preview
+            .viewer
+            .render(preview.image.clone(), natural, None, window, cx),
+        None => div()
+            .text_color(ink(0.6))
+            .child("Loading image…")
+            .into_any_element(),
+    };
     let on_close = std::rc::Rc::new(on_close);
     let close_on_key = on_close.clone();
+    let press_state = preview.viewer.clone();
+    let click_state = preview.viewer.clone();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -1289,22 +1363,25 @@ pub fn lightbox(
                     .items_center()
                     .justify_center()
                     .gap(px(12.0))
-                    .cursor_pointer()
                     .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
                         if event.keystroke.key == "escape" {
                             cx.stop_propagation();
                             close_on_key(window, cx);
                         }
                     })
-                    .on_click(move |_, window, cx| on_close(window, cx))
-                    .child(
-                        img(preview.image.clone())
-                            .object_fit(ObjectFit::Contain)
-                            .max_h(max_h)
-                            .max_w(max_w)
-                            .rounded(px(6.0))
-                            .shadow_2xl(),
-                    )
+                    .capture_any_mouse_down(move |event, _, _| {
+                        if event.button == gpui::MouseButton::Left {
+                            press_state.begin_click();
+                        }
+                    })
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        if !click_state.dragged() {
+                            on_close(window, cx);
+                        }
+                    })
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .child(div().w(max_w).h(max_h).child(content))
                     .child(
                         div()
                             .max_w(max_w)
@@ -1322,6 +1399,48 @@ pub fn lightbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appshot_cards_follow_their_exact_image_reference() {
+        let shot = crate::appshots::tests::shot();
+        let paths = HashMap::from([(shot.screenshot.id.clone(), "/remote/a & b.png".to_string())]);
+        let body = crate::appshots::with_appshots("Look here", &[shot], &paths);
+        let message = with_attachments(
+            &body,
+            &["/remote/ordinary.png".into(), "/remote/a & b.png".into()],
+        );
+        let parsed = parse_user_message_images(&message);
+        assert_eq!(parsed.text, "Look here");
+        assert!(parsed.attachments[0].appshot.is_none());
+        let appshot = parsed.attachments[1].appshot.as_ref().unwrap();
+        assert_eq!(appshot.app_name, "Safari & Notes");
+        assert_eq!(appshot.title(), "A \"window\"");
+    }
+
+    #[test]
+    fn duplicate_or_invalid_appshot_metadata_stays_an_ordinary_attachment() {
+        let body = format!(
+            "Question\n\n{}\n<appshot app=\"One\" image=\"/a.png\">private text</appshot><appshot app=\"Two\" image=\"/a.png\">other text</appshot>",
+            crate::appshots::CONTEXT_MARKER
+        );
+        let parsed = parse_user_message_images(&with_attachments(&body, &["/a.png".into()]));
+        assert!(parsed.attachments[0].appshot.is_none());
+        assert_eq!(parsed.text, "Question");
+    }
+
+    #[test]
+    fn queue_images_have_a_small_retained_pixel_budget() {
+        let source = image::DynamicImage::new_rgba8(2400, 1600);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        source
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let source = Image::from_bytes(ImageFormat::Png, bytes.into_inner());
+        let thumbnail = queue_thumbnail_image(&source).unwrap();
+        let (width, height) = crate::appshots::png_dimensions(&thumbnail.bytes).unwrap();
+        assert!(width <= 160 && height <= 112);
+        assert!(thumbnail.bytes.len() < 160 * 112 * 4);
+    }
 
     #[test]
     fn with_attachments_round_trips_through_parse() {
@@ -1343,6 +1462,19 @@ mod tests {
         let parsed = parse_user_message_images(&content);
         assert_eq!(parsed.text, "");
         assert_eq!(parsed.attachments.len(), 1);
+    }
+
+    #[test]
+    fn appshot_context_is_hidden_but_image_remains() {
+        let body = format!(
+            "Fix the layout\n\n{}\n<appshot app=\"Safari\">secret AX text</appshot>",
+            crate::appshots::CONTEXT_MARKER
+        );
+        let content = with_attachments(&body, &["/a/appshot.png".to_string()]);
+        let parsed = parse_user_message_images(&content);
+        assert_eq!(parsed.text, "Fix the layout");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].path, "/a/appshot.png");
     }
 
     #[test]
@@ -1381,7 +1513,10 @@ mod tests {
         let parsed = parse_user_message_images(&content);
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].path, "/real.png");
-        assert!(parsed.text.contains("AX text"));
+        // Upstream v0.2.83 hides the observed appshot context from the parsed
+        // body (it is presented as the appshot card instead).
+        assert!(!parsed.text.contains("AX text"));
+        assert!(parsed.text.starts_with("Inspect"));
     }
 
     #[test]
@@ -1481,20 +1616,243 @@ mod tests {
     }
 }
 
-pub(crate) fn queue_thumbnail_image(source: &Image) -> Option<Arc<Image>> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(source.bytes.as_slice()))
-        .with_guessed_format()
-        .ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(128 * 1024 * 1024);
-    reader.limits(limits);
-    let thumb = reader.decode().ok()?.thumbnail(160, 112);
-    let mut bytes = std::io::Cursor::new(Vec::new());
-    thumb.write_to(&mut bytes, image::ImageFormat::Png).ok()?;
-    Some(Arc::new(Image::from_bytes(
-        ImageFormat::Png,
-        bytes.into_inner(),
-    )))
+#[cfg(test)]
+mod generated_image_tests {
+    use super::*;
+
+    #[test]
+    fn generated_image_cache_isolates_policy_aliases_and_load_claims() {
+        let owner = "policy-audit-owner";
+        let path = "/uploads/policy01-image.png";
+        let png = AttachmentKey::new(owner, path, Some("image/png"));
+        let gif = AttachmentKey::new(owner, path, Some("image/gif"));
+        let raw = Arc::new(Image::from_bytes(ImageFormat::Gif, b"GIF89a".to_vec()));
+        seed_attachment(owner, path, "image.gif", raw.clone());
+        seed_attachment_alias(owner, "policy01", "image.gif", raw.clone());
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Loading
+        ));
+        let alias = AttachmentKey::new(owner, "/another/policy01-image.png", Some("image/png"));
+        assert!(matches!(
+            attachment_snapshot_for(&alias),
+            AttachmentSnapshot::Loading
+        ));
+        assert!(begin_load_for(&png));
+        assert!(!begin_load_for(&png));
+        assert!(begin_load_for(&gif));
+        drop(AttachmentLoadGuard(png.clone()));
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot_for(&gif),
+            AttachmentSnapshot::Loading
+        ));
+        store_loaded_for(&gif, "image.gif".into(), raw);
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot_for(&gif),
+            AttachmentSnapshot::Loaded(_)
+        ));
+        let changed = AttachmentKey::new(owner, path, Some("image/jpeg"));
+        assert!(matches!(
+            attachment_snapshot_for(&changed),
+            AttachmentSnapshot::Loading
+        ));
+    }
+
+    #[test]
+    fn generated_image_history_is_evicted_with_decoded_memory_accounting() {
+        let mut cache = ImageCache::default();
+        // Cache accounting reads only IHDR. No large allocations are needed
+        // to exercise the production eviction policy across a long history.
+        for i in 0..100 {
+            let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            bytes.extend_from_slice(&2048_u32.to_be_bytes());
+            bytes.extend_from_slice(&2048_u32.to_be_bytes());
+            cache.insert_loaded(
+                AttachmentKey::new("bounded-history", &format!("/{i}.png"), Some("image/png")),
+                CachedAttachmentImage {
+                    name: "generated.png".into(),
+                    image: Arc::new(Image::from_bytes(ImageFormat::Png, bytes)),
+                },
+            );
+            assert!(cache.loaded_bytes <= IMAGE_CACHE_BUDGET_BYTES);
+            // The real render loop calls flush_evicted to release these CPU/GPU assets.
+            cache.pending_free.clear();
+        }
+        assert!(!cache.map.contains_key(&AttachmentKey::new(
+            "bounded-history",
+            "/0.png",
+            Some("image/png")
+        )));
+        assert!(cache.map.contains_key(&AttachmentKey::new(
+            "bounded-history",
+            "/99.png",
+            Some("image/png")
+        )));
+    }
+
+    #[test]
+    fn generated_image_decoder_checks_actual_type_and_downsamples() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(3072, 16)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = png.into_inner();
+        assert!(
+            crate::image_media::decode_generated_image(
+                bytes.clone(),
+                "image/jpeg",
+                MAX_ATTACHMENT_BYTES as usize
+            )
+            .is_err()
+        );
+        let decoded = crate::image_media::decode_generated_image(
+            bytes,
+            "image/png",
+            MAX_ATTACHMENT_BYTES as usize,
+        )
+        .unwrap();
+        assert_eq!(decoded.width, 2048.0);
+        assert!(decoded.bytes < IMAGE_CACHE_BUDGET_BYTES);
+        assert!(
+            crate::image_media::decode_generated_image(
+                b"GIF89a".to_vec(),
+                "image/gif",
+                MAX_ATTACHMENT_BYTES as usize
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_image_animation_retains_only_first_static_frame() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                        16,
+                        16,
+                        image::Rgba(color),
+                    )))
+                    .unwrap();
+            }
+        }
+        let decoded = crate::image_media::decode_generated_image(
+            bytes,
+            "image/gif",
+            MAX_ATTACHMENT_BYTES as usize,
+        )
+        .unwrap();
+        assert_eq!(
+            image::guess_format(&decoded.image.bytes).unwrap(),
+            image::ImageFormat::Png
+        );
+        let pixels = image::load_from_memory(&decoded.image.bytes)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    struct ImageRpc {
+        calls: Arc<Mutex<Vec<serde_json::Value>>>,
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for ImageRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            assert_eq!(method, methods::READ_ATTACHMENT_CHUNK);
+            self.calls.lock().unwrap().push(params);
+            zeron_rpc::RpcReply::value(
+                &serde_json::json!({"name":"generated.png", "mimeType":"image/png", "data":BASE64.encode(&self.bytes), "nextOffset": self.bytes.len(), "done":true}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_image_chunk_reader_targets_owner_and_bounds_decode() {
+        let executor = gpui_platform::background_executor();
+        for (width, target, expected, succeeds) in [
+            (64, Some("remote-owner"), "image/png", true),
+            (64, None, "image/png", true),
+            (4097, None, "image/png", false),
+            (64, None, "image/gif", false),
+        ] {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(width, 1)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            let calls = Arc::new(Mutex::new(vec![]));
+            let engine =
+                EngineHandle::from_test_client(zeron_rpc::memory_client(Arc::new(ImageRpc {
+                    calls: calls.clone(),
+                    bytes: png.into_inner(),
+                })));
+            let loaded = read_attachment_image(
+                &engine,
+                &executor,
+                target,
+                "/profile/uploads/image.png",
+                Some(expected),
+            )
+            .await;
+            assert_eq!(loaded.is_some(), succeeds);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["path"], "/profile/uploads/image.png");
+            assert_eq!(
+                calls[0].get("targetDeviceId").and_then(|v| v.as_str()),
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn generated_image_cancelled_load_releases_claim_without_losing_completed_images() {
+        let owner = "cancelled-generated-owner";
+        let path = "/fixture/cancelled-generated.png";
+        assert!(begin_load(owner, path));
+        drop(AttachmentLoadGuard(key(owner, path)));
+        assert!(matches!(
+            attachment_snapshot(owner, path),
+            AttachmentSnapshot::Error { .. }
+        ));
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new()));
+        store_loaded(owner, path, "generated.png".into(), image);
+        drop(AttachmentLoadGuard(key(owner, path)));
+        assert!(matches!(
+            attachment_snapshot(owner, path),
+            AttachmentSnapshot::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn generated_image_decode_accepts_attachment_byte_cap_but_rejects_excess() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut bytes = png.into_inner();
+        // Padding represents a large source with small dimensions; the intake
+        // cap is 24 MiB, independent of the workspace preview's 8 MiB cap.
+        bytes.resize(9 * 1024 * 1024, 0);
+        assert!(
+            crate::image_media::decode_raster_image(bytes.clone(), MAX_ATTACHMENT_BYTES as usize)
+                .is_ok()
+        );
+        assert!(crate::image_media::decode_raster_image(bytes, 8 * 1024 * 1024).is_err());
+    }
 }

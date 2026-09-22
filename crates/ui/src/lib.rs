@@ -22,16 +22,22 @@ mod capture;
 pub mod change_requests;
 pub mod changes;
 pub(crate) mod chat_export;
+mod comment_ui;
 pub mod comments;
 pub mod composer;
+mod composer_dock;
+mod composer_markdown;
 pub mod details_sidebar;
 pub mod edge_fade;
 pub mod file_change;
+pub mod file_icons;
 pub mod file_preview;
+pub mod files;
 pub mod frost;
 pub mod history;
 pub mod icons;
 pub(crate) mod image_media;
+pub(crate) mod image_viewer;
 pub mod inline_media;
 #[cfg(debug_assertions)]
 pub mod inspector;
@@ -42,15 +48,22 @@ pub mod markdown;
 pub mod markdown_decor;
 pub mod mermaid_preview;
 pub mod motion;
+mod new_thread_background_effects;
+mod new_thread_background_image;
+mod new_thread_background_mask;
+mod notice;
 pub mod notify;
 pub mod pickers;
 pub mod popover;
+pub mod project_actions;
 mod questions;
+pub mod queue;
 pub mod rail;
 pub mod settings;
 pub mod shell;
 pub mod sound;
 pub mod state;
+pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
@@ -63,6 +76,7 @@ mod turn_steps;
 pub mod typography;
 mod url_chips;
 pub mod workers;
+mod workspace_links;
 
 use std::path::PathBuf;
 
@@ -71,6 +85,16 @@ use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOp
 
 pub use state::EngineBootConfig;
 pub use zeron_proto::HarnessId;
+
+/// Whether a control whose primary action is click activation may also start
+/// a GPUI drag from the same hitbox. GPUI promotes pointer travel above 2 px
+/// to a drag. Normal Windows click jitter can cross that threshold, cancel the
+/// click, and leave the drag ghost following the pointer instead of activating
+/// the control. Drag-first controls (resize handles, scrollbars, queue rows)
+/// intentionally do not use this policy.
+pub(crate) const fn click_activation_drag_enabled() -> bool {
+    !cfg!(target_os = "windows")
+}
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/zeron`, not here).
@@ -123,6 +147,10 @@ impl gpui::Global for ReopenState {}
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
+    // Retain ownership for the whole application lifetime. The bridge's
+    // default runtime has only two workers, insufficient for a desktop engine.
+    let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
+    let runtime_handle = runtime.handle().clone();
     let app = gpui_platform::application().with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
@@ -150,8 +178,8 @@ pub fn run_app(config: UiConfig) {
         }
     });
     app.run(move |cx: &mut App| {
-        // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
-        gpui_tokio::init(cx);
+        gpui_tokio::init_from_handle(cx, runtime_handle);
+        gpui_base::init(cx);
         let data_dir = config.boot().data_dir.clone();
         let ui_settings = settings::UiSettings::load(&data_dir);
         settings::init(ui_settings.clone(), data_dir.clone(), cx);
@@ -183,7 +211,7 @@ pub fn run_app(config: UiConfig) {
             ui_settings.git_history_author_display,
             cx,
         );
-        composer::init(cx);
+        composer::init(cx, ui_settings.composer_send_behavior);
         terminal::panel::init(cx);
         app_menus::init(cx);
         #[cfg(debug_assertions)]
@@ -217,6 +245,19 @@ pub fn run_app(config: UiConfig) {
         cx.set_global(workers::menu_bar::WorkersMenuBarGlobal {
             controller: workers_menu_bar,
         });
+        // Banner clicks land on the notified chat. The AppKit delegate fires
+        // mid-event, so hop through a channel rather than updating inline.
+        let (click_tx, mut click_rx) = futures::channel::mpsc::unbounded::<String>();
+        notify::on_click(move |chat_id| {
+            let _ = click_tx.unbounded_send(chat_id);
+        });
+        let click_state = state.clone();
+        cx.spawn(async move |cx| {
+            while let Some(chat_id) = click_rx.next().await {
+                let _ = cx.update(|cx| open_notified_chat(chat_id, &click_state, cx));
+            }
+        })
+        .detach();
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
@@ -265,49 +306,190 @@ pub fn run_app(config: UiConfig) {
     });
 }
 
-/// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
-/// root view. Called at boot and again from `on_reopen` if the dock icon is
-/// clicked after ⌘W closed the window.
+/// A clicked banner: bring Zeron forward on that chat through the sidebar's
+/// own path (chat route + composer focus), reopening the main window first if
+/// ⌘W closed it.
+fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx: &mut App) {
+    cx.activate(true);
+    if cx.windows().is_empty()
+        && let Some(reopen) = cx.try_global::<ReopenState>()
+    {
+        let (state, boot, workers_model) = (
+            reopen.state.clone(),
+            reopen.boot.clone(),
+            reopen.workers_model.clone(),
+        );
+        open_main_window(state, boot, workers_model, cx);
+    }
+    let shell = cx
+        .windows()
+        .into_iter()
+        .find_map(|window| window.downcast::<shell::Shell>());
+    match shell {
+        Some(shell) => {
+            let _ = shell.update(cx, |shell, window, cx| {
+                window.activate_window();
+                shell.open_chat(chat_id, cx);
+            });
+        }
+        None => state.update(cx, |state, cx| state.select_chat(Some(chat_id), cx)),
+    }
+}
+
+fn restored_main_window_bounds(cx: &App) -> (Bounds<gpui::Pixels>, Option<gpui::DisplayId>) {
+    // Capture/demo runs need a deterministic narrow window, not the user's
+    // last saved geometry.
+    if capture::knob("ZERON_DEMO_NARROW").is_some() {
+        return (Bounds::centered(None, size(px(900.), px(600.)), cx), None);
+    }
+    let fallback = (Bounds::centered(None, size(px(1320.), px(880.)), cx), None);
+    let Some(saved) = settings::current(cx).window_geometry else {
+        return fallback;
+    };
+    let displays = cx.displays();
+    let primary = cx
+        .primary_display()
+        .and_then(|primary| {
+            displays
+                .iter()
+                .position(|display| display.id() == primary.id())
+        })
+        .unwrap_or(0);
+    let geometries: Vec<_> = displays
+        .iter()
+        .map(|display| {
+            let mut geometry = settings::WindowGeometry::from_bounds(display.visible_bounds());
+            geometry.display_uuid = display.uuid().ok();
+            geometry
+        })
+        .collect();
+    saved
+        .restore(&geometries, primary)
+        .map_or(fallback, |(index, geometry)| {
+            (geometry.bounds(), Some(displays[index].id()))
+        })
+}
+
+fn save_main_window_geometry(window: &gpui::Window, cx: &mut App) {
+    if window.is_fullscreen() {
+        return;
+    }
+    // macos infers maximization from screen-sized bounds, including ordinary
+    // windows; other desktop backends report a distinct maximized variant.
+    let WindowBounds::Windowed(bounds) = window.window_bounds() else {
+        return;
+    };
+    let mut geometry = settings::WindowGeometry::from_bounds(bounds);
+    geometry.display_uuid = window.display(cx).and_then(|display| display.uuid().ok());
+    if geometry.is_valid() {
+        settings::update(settings::SavePolicy::Debounced, cx, |settings| {
+            settings.window_geometry = Some(geometry);
+        });
+    }
+}
+
+fn observe_main_window_geometry<T: 'static>(window: &mut gpui::Window, cx: &gpui::Context<T>) {
+    cx.observe_window_bounds(window, |_, window, cx| {
+        save_main_window_geometry(window, cx);
+    })
+    .detach();
+}
+
+/// Open the main window (restored geometry, else 1320×880 centered; min
+/// 900×600) with [`shell::Shell`] as the root view. Called at boot and again
+/// from `on_reopen` if the dock icon is clicked after ⌘W closed the window.
 fn open_main_window(
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
     workers_model: gpui::Entity<workers::model::WorkersModel>,
     cx: &mut App,
 ) -> gpui::WindowHandle<shell::Shell> {
-    let window_size = if capture::knob("ZERON_DEMO_NARROW").is_some() {
-        size(px(900.), px(600.))
-    } else {
-        size(px(1320.), px(880.))
-    };
-    let bounds = Bounds::centered(None, window_size, cx);
+    let (bounds, display_id) = restored_main_window_bounds(cx);
     let shell_state = state.clone();
-    let window = cx
+    let handle = cx
         .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                display_id,
                 window_min_size: Some(size(px(900.), px(600.))),
+                // `kind` is deliberately left at its default `WindowKind::Normal`
+                // (gpui platform.rs WindowOptions::default), which on macOS maps
+                // to `NSNormalWindowLevel` (gpui_macos window.rs) — same as zed's
+                // main window. Nothing here raises the window level or touches
+                // presentation options; the "menu bar never appears" symptom came
+                // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
+                // from window kind/level, and `appears_transparent` only affects
+                // the titlebar, not the menu bar.
+                // macOS: frameless-inset chrome like the original Electron app
+                // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
+                // feature-inventory §1.1). The strip is custom-drawn. Windows
+                // still needs a native title for taskbar previews and Alt+Tab. On
+                // Linux/Windows `appears_transparent` hides the system titlebar
+                // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: None,
+                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
                     appears_transparent: true,
+                    // Native lights are 14px tall: top 14 → center 21, matching
+                    // the 38px titlebar row with 4px top-only content padding.
                     traffic_light_position: Some(gpui::point(px(14.), px(14.))),
                 }),
+                // Our own titlebar strip drags the window (WindowControlArea::
+                // Drag + start_window_move) — mark the content view app-owned
+                // so AppKit neither dead-zones the strip nor delays clicks.
                 app_owns_titlebar_drag: true,
+                // Linux: request client-side decorations — zeron draws its own
+                // unified titlebar and (under CSD) its own caption buttons
+                // (shell.rs `render_linux_caption_controls`). Leaving this unset
+                // requests SERVER decorations, which stacked a compositor
+                // titlebar on top of the app's chrome under sway/KDE, while
+                // compositors without SSD support (GNOME) went client-side
+                // anyway — frameless, and before the shell drew caption buttons,
+                // with no window controls at all. The compositor can still
+                // override via xdg-decoration negotiation; the shell re-resolves
+                // what to draw every frame.
                 window_decorations: cfg!(target_os = "linux")
                     .then_some(gpui::WindowDecorations::Client),
+                // Frosted shell (macOS): blur the desktop behind the window; the
+                // shell paints its frost surface translucent so the sidebar reads
+                // as glass (shell.rs root). Elsewhere blur support is compositor
+                // roulette — stay opaque.
+                // One source of truth with the re-apply loop in `appearance::apply`
+                // — if these two ever disagree, vibrancy dies on the first theme
+                // change and never comes back.
                 window_background: theme::Theme::of(cx).window_background_appearance(),
                 app_id: Some("zeron".into()),
                 ..Default::default()
             },
             move |window, cx| {
+                window.set_rem_size(px(typography::font_size(cx).pixels()));
+                // React to the user flipping macOS between light and dark. Detached:
+                // the subscription lives as long as the window does, and the window
+                // owns nothing that would drop it early.
                 appearance::observe_window(window, cx).detach();
                 window.set_background_blur_radius(
                     theme::Theme::of(cx).window_background_blur_radius(),
                 );
-                cx.new(|cx| shell::Shell::new(shell_state, boot, workers_model, cx))
+                let shell = cx.new(|cx| {
+                    observe_main_window_geometry(window, cx);
+                    shell::Shell::new(shell_state, boot, workers_model, cx)
+                });
+                save_main_window_geometry(window, cx);
+                let weak_shell = shell.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    let should_close = weak_shell
+                        .update(cx, |shell, cx| shell.prepare_window_close(cx))
+                        .unwrap_or(true);
+                    if should_close {
+                        save_main_window_geometry(window, cx);
+                        settings::flush(cx);
+                    }
+                    should_close
+                });
+                shell
             },
         )
         .expect("failed to open window");
-    let window_id = window.window_id();
+    let window_id = handle.window_id();
     cx.on_window_closed(move |cx, closed| {
         if closed == window_id {
             state.update(cx, |state, cx| {
@@ -318,8 +500,11 @@ fn open_main_window(
         }
     })
     .detach();
+    // Belt and braces: assert the blur once the window actually exists. The
+    // `WindowOptions` value is applied during creation, before the view is
+    // attached; re-pushing it here means a window is never left opaque.
     appearance::reapply_window_background(cx);
-    window
+    handle
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -334,6 +519,9 @@ fn start_appshot_service(activation_dir: PathBuf, cx: &mut App) {
                 continue;
             };
             let capture = capture.await;
+            // Coalesce presses made while capture was in flight. Delivery
+            // focuses Zeron; replaying old activations would capture the wrong
+            // app or show a misleading self-capture error after success.
             while matches!(shortcuts.next().now_or_never(), Some(Some(()))) {}
             cx.update(|cx| deliver_appshot(target, capture, cx));
         }
@@ -341,6 +529,10 @@ fn start_appshot_service(activation_dir: PathBuf, cx: &mut App) {
     .detach();
 }
 
+/// Check viewer focus on the UI thread before any native capture or portal
+/// request, and resolve the destination chat before awaiting native APIs.
+/// Portals do not identify the source window, so their backends cannot reject
+/// Zeron after the picker or capture has already started.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_appshot_capture(
     cx: &mut App,
@@ -366,35 +558,111 @@ fn start_appshot_capture(
     ))
 }
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod appshot_activation_tests {
+    use super::*;
+
+    struct ViewerWindow;
+
+    impl gpui::Render for ViewerWindow {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    #[gpui::test]
+    fn appshot_capture_skips_any_focused_viewer_window(cx: &mut gpui::TestAppContext) {
+        // The guard must cover every Zeron window, not only a Shell/chat root.
+        for _ in 0..2 {
+            let window = cx.add_window(|_, _| ViewerWindow);
+            window
+                .update(cx, |_, window, _| window.activate_window())
+                .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                assert!(cx.active_window().is_some());
+                assert!(start_appshot_capture(cx).is_none());
+            });
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn deliver_appshot(
     target: Option<String>,
     result: Result<appshots::CapturedAppshot, appshots::CaptureError>,
     cx: &mut App,
 ) {
-    let Some(handle) = cx
-        .window_stack()
-        .unwrap_or_else(|| cx.windows())
-        .into_iter()
-        .find_map(|handle| handle.downcast::<shell::Shell>())
-    else {
-        return;
-    };
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+
+    type Pending = VecDeque<(Option<String>, appshots::CapturedAppshot)>;
+
+    fn pending() -> &'static Mutex<Pending> {
+        static PENDING: OnceLock<Mutex<Pending>> = OnceLock::new();
+        PENDING.get_or_init(|| Mutex::new(VecDeque::new()))
+    }
+
     if matches!(
         result,
         Err(appshots::CaptureError::Cancelled | appshots::CaptureError::SelfCapture)
     ) {
         return;
     }
+    let mut captures = pending()
+        .lock()
+        .map(|mut queue| queue.drain(..).collect::<Pending>())
+        .unwrap_or_default();
+    let error = match result {
+        Ok(appshot) => {
+            captures.push_back((target.clone(), appshot));
+            None
+        }
+        Err(error) => Some(error),
+    };
+    let handle = cx
+        .window_stack()
+        .unwrap_or_else(|| cx.windows())
+        .into_iter()
+        .find_map(|handle| handle.downcast::<shell::Shell>())
+        .or_else(|| {
+            let reopen = cx.try_global::<ReopenState>()?;
+            Some(open_main_window(
+                reopen.state.clone(),
+                reopen.boot.clone(),
+                reopen.workers_model.clone(),
+                cx,
+            ))
+        });
+    let Some(handle) = handle else {
+        if !captures.is_empty() {
+            let count = captures.len();
+            if let Ok(mut queue) = pending().lock() {
+                queue.extend(captures);
+            }
+            tracing::warn!(
+                count,
+                "Appshot captured with no Zeron window; preserving it for the next delivery"
+            );
+        }
+        return;
+    };
+    let captured = !captures.is_empty();
     cx.activate(true);
     let _ = handle.update(cx, |shell, window, cx| {
         window.activate_window();
-        match result {
-            Ok(appshot) => shell.receive_appshot_for(target, appshot, window, cx),
-            Err(error) => shell.show_appshot_error(target, error.to_string(), window, cx),
+        for (target, appshot) in captures {
+            shell.receive_appshot_for(target, appshot, window, cx);
+        }
+        if let Some(error) = error {
+            shell.show_appshot_error(target, error.to_string(), window, cx);
         }
     });
-    appshots::foreground_after_capture();
+    if captured {
+        appshots::foreground_after_capture();
+    }
 }
-
-mod surface_chrome;

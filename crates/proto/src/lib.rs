@@ -6,8 +6,12 @@
 
 pub mod agent;
 pub mod entities;
+pub mod file_mentions;
+pub mod invocation;
 pub mod live_voice;
 pub mod motion;
+pub mod preview;
+pub mod sidebar_pins;
 pub mod trajectory;
 pub mod view;
 pub mod workspace;
@@ -15,6 +19,8 @@ pub mod workspace;
 pub use agent::*;
 pub use entities::*;
 pub use live_voice::*;
+pub use preview::*;
+pub use sidebar_pins::*;
 pub use trajectory::*;
 pub use workspace::*;
 
@@ -35,6 +41,3 @@ pub fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
         .ok()?;
     Some((major, minor, patch))
 }
-
-mod preview;
-pub use preview::*;

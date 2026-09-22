@@ -27,13 +27,13 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use crate::comments::DiffComment;
+use crate::comments::ReviewComment;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
     EngineInfo, HarnessId, LiveVoiceAvailability, LiveVoicePhase, LiveVoiceState, Session,
-    SessionStatus, Space, WorkspaceScope,
+    SessionStatus, SidebarPreferencesState, Space, WorkspaceScope,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -41,6 +41,50 @@ use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
 };
 use crate::live_voice::coalesce_caption;
+
+// Recently viewed transcripts stay renderable while a fresh watch opens. Move
+// ownership on navigation; never clone whale payloads or retain live watches.
+const TRANSCRIPT_CACHE_CAP: usize = 12;
+const TRANSCRIPT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+struct CachedTranscript {
+    prepared: Option<Arc<crate::transcript::PreparedTranscript>>,
+    chat_id: String,
+    entries: Vec<SessionMessageEntry>,
+    context_usage: Option<zeron_proto::ContextUsage>,
+    bytes: usize,
+}
+
+// A cancelled GPUI watch may own a whale's mirror between updates. Its
+// destructor must not free that entire object graph on the UI thread either.
+struct WatchPreparation {
+    worker: Option<crate::transcript::TranscriptPreparation>,
+    executor: gpui::BackgroundExecutor,
+}
+impl WatchPreparation {
+    fn new(executor: gpui::BackgroundExecutor) -> Self {
+        Self {
+            worker: Some(Default::default()),
+            executor,
+        }
+    }
+    fn prepare(
+        &mut self,
+        update: &zeron_doc::TranscriptUpdate,
+    ) -> Result<Arc<crate::transcript::PreparedTranscript>, TranscriptDesync> {
+        self.worker.as_mut().unwrap().prepare(update)
+    }
+}
+impl Drop for WatchPreparation {
+    fn drop(&mut self) {
+        let worker = self.worker.take();
+        self.executor
+            .spawn(async move {
+                drop(worker);
+            })
+            .detach();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -92,7 +136,7 @@ struct InProcessEngine {
     refresh_task: tokio::task::JoinHandle<()>,
     /// Serves this engine to other viewports over the IPC port. `None` when the
     /// port was already taken — the window still works over its own transport.
-    ipc_task: Option<tokio::task::JoinHandle<()>>,
+    ipc_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     client: RpcClient,
 }
 
@@ -108,8 +152,12 @@ impl EngineBackend for InProcessEngine {
         self.boot_task.abort();
         // Stop accepting first: a viewport must not connect midway through the
         // drain and queue work against stores that are closing.
-        if let Some(ipc) = &self.ipc_task {
+        let ipc_task = self.ipc_task.lock().await.take();
+        if let Some(ipc) = ipc_task {
             ipc.abort();
+            // `abort` only requests cancellation. Observe task completion so the
+            // listener is closed before bootstrap reports an assembly failure.
+            let _ = ipc.await;
         }
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
@@ -223,20 +271,8 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    #[cfg(test)]
-    pub(crate) fn from_test_client(client: RpcClient) -> Self {
-        Self {
-            inner: Arc::new(RemoteEngine {
-                client: Arc::new(client),
-                url: "memory:test".into(),
-                lifecycle_task: tokio::sync::Mutex::new(None),
-            }),
-            engine_info: EngineInfo {
-                device_id: "test".into(),
-                workspace_scope: WorkspaceScope::Local,
-            },
-            deferred_state: None,
-        }
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
@@ -380,7 +416,7 @@ impl EngineHandle {
                 runtime,
                 boot_task,
                 refresh_task,
-                ipc_task,
+                ipc_task: tokio::sync::Mutex::new(ipc_task),
                 client,
             }),
             engine_info,
@@ -464,6 +500,24 @@ impl EngineHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_client(client: RpcClient) -> Self {
+        Self {
+            inner: Arc::new(RemoteEngine {
+                client: Arc::new(client),
+                url: "memory://test".into(),
+                lifecycle_task: tokio::sync::Mutex::new(None),
+            }),
+            engine_info: EngineInfo {
+                device_id: "local".into(),
+                workspace_scope: WorkspaceScope::Local,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+            },
+            deferred_state: None,
+        }
+    }
+
     pub fn client(&self) -> &RpcClient {
         self.inner.client()
     }
@@ -505,6 +559,8 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
             Ok(EngineInfo {
                 device_id: legacy.device_id,
                 workspace_scope: WorkspaceScope::Synced,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
             })
         }
         Err(err) => Err(err),
@@ -628,17 +684,27 @@ pub struct AppState {
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
-    // Compare visible metadata while retaining fresh liveness leases.
+    // Last published device presentation. Heartbeats refresh the underlying
+    // timestamps without invalidating every view when no displayed value changed.
     device_presentation: Option<Vec<(Device, bool, String)>>,
+    // Presence ticks also retire stale remote session indicators. Remember
+    // their last published appearance even when the device rows stay online.
     session_presence_presentation: Vec<Indicator>,
     /// Live edge posture (WatchConnectivity): drives the connection pill,
     /// composer honesty ("will queue"), and the Queued send badges.
     pub connectivity: zeron_proto::Connectivity,
+    /// Whether this runtime's connectivity watch has delivered its first
+    /// frame. The default `Disabled` value is only a placeholder and must not
+    /// seed notification decisions before the watch is authoritative.
+    pub(crate) connectivity_observed: bool,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
+    /// Synced user/org sidebar pin state. Local workspaces deliberately ignore
+    /// this and continue reading their device-local settings entry.
+    pub sidebar_preferences: SidebarPreferencesState,
     session_presentation: Option<Vec<Session>>,
     /// The project the new-session canvas mints into. Healed by
     /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
@@ -669,11 +735,21 @@ pub struct AppState {
     deep_link_notice: Option<String>,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
-    /// The selected chat's opening `WatchDocMessages` reset has landed. An
+    /// The selected chat's pending-message queue — what was typed while the
+    /// agent was busy, in the order it will be sent. Device-agnostic: the
+    /// chat's doc holds them (every device sees the same queue).
+    pub queue: Vec<zeron_doc::QueuedMessage>,
+    pub context_usage: Option<zeron_proto::ContextUsage>,
+    /// The selected chat has a transcript from a `WatchDocMessages` reset
+    /// (including a retained reset from an earlier visit). An
     /// empty transcript is otherwise indistinguishable from the pre-replay
     /// gap after selection, where optimistic echoes may already be visible.
     pub transcript_replayed: bool,
-    /// Content revision; unrelated app notifications do not require row derivation.
+    transcript_baselines: HashMap<String, Arc<zeron_doc::TranscriptBaseline>>,
+    transcript_cache: std::collections::VecDeque<CachedTranscript>,
+    pub(crate) prepared_transcripts: HashMap<String, Arc<crate::transcript::PreparedTranscript>>,
+    /// Changes only when transcript/optimistic content changes. Presence,
+    /// catalogs and other app-state notifications need no row derivation.
     pub(crate) transcript_revision: u64,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
@@ -693,7 +769,11 @@ pub struct AppState {
     /// percent ring, present exactly while bytes are moving.
     transfers: HashMap<String, (u64, u64)>,
     /// Written by the changes pane, read by the composer.
-    diff_comments: HashMap<String, Vec<DiffComment>>,
+    review_comments: HashMap<String, Vec<ReviewComment>>,
+    /// File surfaces whose editor-backed comments currently cite a buffer
+    /// revision that has not reached disk yet. A chat remains blocked until
+    /// every surface waiting on a workspace write has finished or cancelled.
+    review_comment_flushes: HashMap<String, HashSet<u64>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -710,6 +790,7 @@ pub struct AppState {
     transcript_task: Option<Task<()>>,
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
+    queue_task: Option<Task<()>>,
     change_requests_visible: bool,
     /// Checkouts the Workers surface wants resolved, published by
     /// `WorkersModel` after each snapshot. A second SOURCE of targets, not a
@@ -730,6 +811,20 @@ pub struct AppState {
     sub_watch_tasks: HashMap<String, Task<()>>,
 }
 
+/// Text/reasoning growth changes the transcript without changing session
+/// status, tools, navigation, or composer state. Keep those frames local to
+/// the affected transcript instead of rebuilding every app-state observer.
+pub(crate) struct TranscriptTextChanged {
+    pub doc_id: String,
+}
+
+impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
+
+fn is_text_append(frame: &TranscriptFrame) -> bool {
+    matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
+        if upsert.is_empty() && remove.is_empty() && !append.is_empty())
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -746,9 +841,11 @@ impl AppState {
             device_presentation: None,
             session_presence_presentation: Vec::new(),
             connectivity: zeron_proto::Connectivity::default(),
+            connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
+            sidebar_preferences: SidebarPreferencesState::default(),
             session_presentation: None,
             selected_space: None,
             no_project: false,
@@ -756,14 +853,20 @@ impl AppState {
             selected_chat: None,
             transcript_stalls: std::collections::HashMap::new(),
             transcript: Vec::new(),
+            queue: Vec::new(),
+            context_usage: None,
             transcript_replayed: false,
+            transcript_baselines: HashMap::new(),
+            transcript_cache: Default::default(),
+            prepared_transcripts: HashMap::new(),
             transcript_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             compacting: HashMap::new(),
             upload_progress: None,
             transfers: HashMap::new(),
-            diff_comments: HashMap::new(),
+            review_comments: HashMap::new(),
+            review_comment_flushes: HashMap::new(),
             local_device_id: None,
             data_dir: None,
             live_voice: LiveVoiceState::default(),
@@ -778,6 +881,7 @@ impl AppState {
             change_request_tasks: HashMap::new(),
             workers_change_request_targets: HashSet::new(),
             workers_tool_catalog: WorkersToolCatalog::default(),
+            queue_task: None,
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
@@ -796,52 +900,127 @@ impl AppState {
         self.selected_chat.clone().unwrap_or_default()
     }
 
-    pub fn diff_comments(&self, key: &str) -> &[DiffComment] {
-        self.diff_comments
+    pub fn review_comments(&self, key: &str) -> &[ReviewComment] {
+        self.review_comments
             .get(key)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
 
-    pub fn add_diff_comment(&mut self, key: &str, comment: DiffComment) {
-        self.diff_comments
+    pub fn add_review_comment(&mut self, key: &str, comment: ReviewComment) {
+        self.review_comments
             .entry(key.to_string())
             .or_default()
             .push(comment);
     }
 
-    pub fn remove_diff_comment(&mut self, key: &str, id: &str) {
-        if let Some(list) = self.diff_comments.get_mut(key) {
+    pub fn remove_review_comment(&mut self, key: &str, id: &str) {
+        if let Some(list) = self.review_comments.get_mut(key) {
             list.retain(|c| c.id != id);
             if list.is_empty() {
-                self.diff_comments.remove(key);
+                self.review_comments.remove(key);
+                self.review_comment_flushes.remove(key);
             }
         }
     }
 
-    pub fn take_diff_comments(&mut self, key: &str) -> Vec<DiffComment> {
-        self.diff_comments.remove(key).unwrap_or_default()
+    /// Update only a staged comment's body. A stale editor must never recreate
+    /// a comment that has already been removed or sent to the agent.
+    pub fn update_review_comment_body(&mut self, key: &str, id: &str, body: String) {
+        if let Some(comment) = self
+            .review_comments
+            .get_mut(key)
+            .and_then(|comments| comments.iter_mut().find(|comment| comment.id == id))
+        {
+            comment.body = body;
+        }
     }
 
-    pub fn purge_diff_comments(&mut self, key: &str) {
-        self.diff_comments.remove(key);
+    pub fn update_review_comment_line(&mut self, key: &str, id: &str, line: u32) {
+        if let Some(comment) = self
+            .review_comments
+            .get_mut(key)
+            .and_then(|comments| comments.iter_mut().find(|comment| comment.id == id))
+        {
+            comment.line = line;
+        }
+    }
+
+    pub fn rename_review_comment_path(&mut self, key: &str, old_path: &str, new_path: &str) {
+        if let Some(comments) = self.review_comments.get_mut(key) {
+            for comment in comments
+                .iter_mut()
+                .filter(|comment| comment.is_file() && comment.path == old_path)
+            {
+                comment.path = new_path.to_string();
+            }
+        }
+    }
+
+    pub fn take_review_comments(&mut self, key: &str) -> Vec<ReviewComment> {
+        self.review_comment_flushes.remove(key);
+        self.review_comments.remove(key).unwrap_or_default()
+    }
+
+    pub fn purge_review_comments(&mut self, key: &str) {
+        self.review_comment_flushes.remove(key);
+        self.review_comments.remove(key);
+    }
+
+    pub fn begin_review_comment_flush(&mut self, key: &str, source: u64) {
+        self.review_comment_flushes
+            .entry(key.to_string())
+            .or_default()
+            .insert(source);
+    }
+
+    pub fn finish_review_comment_flush(&mut self, key: &str, source: u64) {
+        let remove_key = self
+            .review_comment_flushes
+            .get_mut(key)
+            .is_some_and(|sources| {
+                sources.remove(&source);
+                sources.is_empty()
+            });
+        if remove_key {
+            self.review_comment_flushes.remove(key);
+        }
+    }
+
+    pub fn review_comment_flush_pending(&self, key: &str) -> bool {
+        self.review_comment_flushes.contains_key(key)
     }
 
     // ---- reducers (pure) ----
+
+    pub(crate) fn apply_sidebar_preferences(&mut self, value: SidebarPreferencesState) -> bool {
+        if value.revision < self.sidebar_preferences.revision || value == self.sidebar_preferences {
+            return false;
+        }
+        self.sidebar_preferences = value;
+        true
+    }
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
         self.chats_synced = true;
+        self.transcript_cache
+            .retain(|cached| self.chats.iter().any(|c| c.id == cached.chat_id));
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
+            self.transcript_baselines.remove(selected);
+            self.prepared_transcripts.remove(selected);
             self.selected_chat = None;
             self.transcript.clear();
+            self.context_usage = None;
             self.transcript_revision = self.transcript_revision.wrapping_add(1);
             self.transcript_replayed = false;
             self.transcript_task = None;
+            self.queue.clear();
+            self.queue_task = None;
         }
     }
 
@@ -886,6 +1065,10 @@ impl AppState {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
         self.spaces_synced = true;
+        if self.no_project {
+            self.selected_space = None;
+            return;
+        }
         // Heal a vanished selection (project deleted elsewhere): fall back to
         // the first project; its chats died with it, so a matching chat
         // selection is healed by the accompanying chats frame (`apply_chats`).
@@ -916,6 +1099,7 @@ impl AppState {
 
     pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) {
         self.connectivity = connectivity;
+        self.connectivity_observed = true;
     }
 
     /// Record that this chat's transcript delivery is down, with the reason the
@@ -1044,6 +1228,28 @@ impl AppState {
             .is_some_and(|v| v >= min)
     }
 
+    /// Capability checks use the live EngineInfo for this device (including a
+    /// localhost daemon that may not match the UI binary) and synced device
+    /// rows for peers. Missing declarations are conservatively unsupported.
+    pub fn device_supports(&self, device_id: &str, capability: &str) -> bool {
+        if let Some(engine) = self.engine.as_ref()
+            && engine.engine_info().device_id == device_id
+        {
+            return engine.engine_info().supports(capability);
+        }
+        self.devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .is_some_and(|device| device.supports(capability))
+    }
+
+    pub fn chat_host_supports(&self, chat_id: &str, capability: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_some_and(|chat| self.device_supports(&chat.device_id, capability))
+    }
+
     /// First project on the composer's picked device (falling back through
     /// the local device, then any project at all — better a cross-device
     /// project than a surprise project-less canvas). Display order.
@@ -1080,6 +1286,9 @@ impl AppState {
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
+        if let Some(id) = &self.selected_chat {
+            self.prepared_transcripts.remove(id);
+        }
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         // Doc frames supersede optimistic echoes carrying the same id.
         if let Some(chat_id) = self.selected_chat.as_deref()
@@ -1098,6 +1307,10 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
+        if let Some(id) = &self.selected_chat {
+            self.prepared_transcripts.remove(id);
+        }
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
@@ -1111,6 +1324,86 @@ impl AppState {
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
         self.ack_pending_send_from_transcript();
+        Ok(())
+    }
+
+    /// Apply an incoming frame and invalidate only its affected presentation.
+    pub fn receive_transcript_frame(
+        &mut self,
+        frame: TranscriptFrame,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        let text_doc = self
+            .selected_chat
+            .as_ref()
+            .filter(|id| {
+                is_text_append(&frame)
+                    && !self.pending_sends.contains_key(*id)
+                    && self.pending_echoes().is_empty()
+            })
+            .cloned();
+        let result = self.apply_transcript_frame(frame);
+        if let Some(doc_id) = text_doc.filter(|_| result.is_ok()) {
+            cx.emit(TranscriptTextChanged { doc_id });
+        } else {
+            cx.notify();
+        }
+        result
+    }
+
+    pub(crate) fn transcript_baseline(
+        &self,
+        doc_id: &str,
+    ) -> Option<&Arc<zeron_doc::TranscriptBaseline>> {
+        self.transcript_baselines.get(doc_id)
+    }
+
+    pub fn receive_transcript_update(
+        &mut self,
+        update: zeron_doc::TranscriptUpdate,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        self.receive_transcript_frame(update.frame, cx)?;
+        if let (Some(doc_id), Some(baseline)) = (&self.selected_chat, update.replay_baseline) {
+            self.transcript_baselines
+                .insert(doc_id.clone(), Arc::new(baseline));
+        }
+        if self.context_usage != update.context_usage {
+            self.context_usage = update.context_usage;
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    /// The opt-in opening tail is provisional. Never replace a complete view
+    /// with it, and don't treat it as a full reset for caching/scroll anchors.
+    pub(crate) fn receive_opening_transcript_update(
+        &mut self,
+        update: zeron_doc::TranscriptUpdate,
+        history_pending: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        if history_pending && self.transcript_replayed {
+            return Ok(());
+        }
+        let old_prepared = self
+            .selected_chat
+            .as_ref()
+            .and_then(|id| self.prepared_transcripts.remove(id));
+        let old_entries = if matches!(&update.frame, TranscriptFrame::Reset { .. }) {
+            std::mem::take(&mut self.transcript)
+        } else {
+            Vec::new()
+        };
+        cx.background_executor()
+            .spawn(async move {
+                drop((old_prepared, old_entries));
+            })
+            .detach();
+        self.receive_transcript_update(update, cx)?;
+        if history_pending {
+            self.transcript_replayed = false;
+        }
         Ok(())
     }
 
@@ -1144,13 +1437,34 @@ impl AppState {
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(doc_id);
         self.sub_transcripts.remove(doc_id);
+        self.prepared_transcripts.remove(doc_id);
+        self.transcript_baselines.remove(doc_id);
     }
 
     /// Frozen-blob path: the finished subagent's uploaded transcript, no
     /// watch needed (and any in-flight watch is superseded).
     pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
+        self.prepared_transcripts.remove(&doc_id);
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(&doc_id);
+        self.transcript_baselines.insert(
+            doc_id.clone(),
+            Arc::new(zeron_doc::TranscriptBaseline::capture(&entries)),
+        );
+        self.sub_transcripts.insert(doc_id, entries);
+    }
+
+    pub(crate) fn set_prepared_subagent_snapshot(
+        &mut self,
+        doc_id: String,
+        entries: Vec<SessionMessageEntry>,
+        prepared: Arc<crate::transcript::PreparedTranscript>,
+    ) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.sub_watch_tasks.remove(&doc_id);
+        self.transcript_baselines
+            .insert(doc_id.clone(), prepared.navigation_baseline.clone());
+        self.prepared_transcripts.insert(doc_id.clone(), prepared);
         self.sub_transcripts.insert(doc_id, entries);
     }
 
@@ -1347,9 +1661,34 @@ impl AppState {
 
     // ---- queries ----
 
-    /// Non-archived chats in sidebar order.
+    /// Non-archived, top-level chats in sidebar order. Chats spawned by
+    /// another chat (`parent_chat_id`, the Zeron MCP's orchestration link)
+    /// are the parent's workers, not sessions the user started: they stay
+    /// reachable by id/deep link but never take a sidebar row or jump slot.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
-        self.chats.iter().filter(|c| !c.archived)
+        self.chats
+            .iter()
+            .filter(|c| !c.archived && c.parent_chat_id.is_none())
+    }
+
+    pub(crate) fn restore_composer_target(
+        &mut self,
+        defaults: &crate::settings::composer::ComposerDefaults,
+    ) {
+        if self.selected_chat.is_some() || self.no_project {
+            return;
+        }
+        if self.selected_device.is_none() {
+            self.selected_device = defaults.device.clone();
+        }
+        if self.selected_space.is_none() {
+            self.no_project = defaults.no_project;
+            self.selected_space = if defaults.no_project {
+                None
+            } else {
+                defaults.project.clone()
+            };
+        }
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
@@ -1385,9 +1724,7 @@ impl AppState {
                 .find(|s| s.device_id == device_id)
                 .map(|s| s.id.clone());
             self.no_project = first.is_none();
-            if first.is_some() {
-                self.selected_space = first;
-            }
+            self.selected_space = first;
         }
         self.selected_device = Some(device_id);
         cx.notify();
@@ -1699,6 +2036,7 @@ impl AppState {
         self.spaces.clear();
         self.chats.clear();
         self.sessions.clear();
+        self.sidebar_preferences = SidebarPreferencesState::default();
         self.session_presentation = None;
         self.selected_space = None;
         self.no_project = false;
@@ -1708,6 +2046,10 @@ impl AppState {
         self.chats_synced = false;
         self.spaces_synced = false;
         self.transcript.clear();
+        self.transcript_baselines.clear();
+        self.transcript_cache.clear();
+        self.prepared_transcripts.clear();
+        self.context_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.echoes.clear();
@@ -1757,11 +2099,15 @@ impl AppState {
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        // The attachment notification precedes the first connectivity frame.
+        // Make that bootstrap gap explicit so the shell resets its alert
+        // baseline instead of comparing the new runtime with the old one.
+        self.connectivity_observed = false;
         let engine_info = handle.engine_info();
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
-        let mut watch_tasks = Vec::with_capacity(8);
+        let mut watch_tasks = Vec::with_capacity(10);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
         }
@@ -1773,6 +2119,12 @@ impl AppState {
                 AppState::apply_sessions,
             ),
             spawn_chats_watch(cx, handle.clone()),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_SIDEBAR_PREFERENCES,
+                AppState::apply_sidebar_preferences,
+            ),
             spawn_watch(
                 cx,
                 handle.clone(),
@@ -1825,7 +2177,14 @@ impl AppState {
         self.refresh_live_voice_availability(true, cx);
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            if handle
+                .engine_info()
+                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+            {
+                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+            }
         }
         cx.notify();
     }
@@ -1942,12 +2301,94 @@ impl AppState {
             }
             return;
         }
+        // Take the destination before trimming: switching to the oldest warm
+        // transcript must not evict the very entry we are about to display.
+        let cached = self
+            .transcript_cache
+            .iter()
+            .position(|cached| Some(&cached.chat_id) == chat_id.as_ref())
+            .and_then(|index| self.transcript_cache.remove(index));
+        if let Some(previous) = &self.selected_chat {
+            let old_baseline = self.transcript_baselines.remove(previous);
+            cx.background_executor()
+                .spawn(async move {
+                    drop(old_baseline);
+                })
+                .detach();
+            let prepared = self.prepared_transcripts.remove(previous);
+            if self.transcript_replayed {
+                let entries = std::mem::take(&mut self.transcript);
+                let bytes = prepared.as_ref().map_or_else(
+                    || {
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                std::mem::size_of::<SessionMessageEntry>()
+                                    + entry.id.len()
+                                    + entry
+                                        .parts
+                                        .iter()
+                                        .map(|part| {
+                                            std::mem::size_of::<zeron_doc::MessagePart>()
+                                                + part.byte_len()
+                                        })
+                                        .sum::<usize>()
+                            })
+                            .sum()
+                    },
+                    |p| p.bytes,
+                );
+                self.transcript_cache.push_back(CachedTranscript {
+                    prepared,
+                    chat_id: previous.clone(),
+                    entries,
+                    context_usage: self.context_usage,
+                    bytes,
+                });
+                while self.transcript_cache.len() > TRANSCRIPT_CACHE_CAP
+                    || self
+                        .transcript_cache
+                        .iter()
+                        .map(|cached| cached.bytes)
+                        .sum::<usize>()
+                        > TRANSCRIPT_CACHE_BYTES
+                {
+                    let evicted = self.transcript_cache.pop_front();
+                    cx.background_executor()
+                        .spawn(async move {
+                            drop(evicted);
+                        })
+                        .detach();
+                }
+            }
+        }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
         self.transcript.clear();
+        self.context_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
+        if let Some(cached) = cached {
+            self.transcript_baselines.insert(
+                cached.chat_id.clone(),
+                cached
+                    .prepared
+                    .as_ref()
+                    .map(|p| p.navigation_baseline.clone())
+                    .unwrap_or_else(|| {
+                        Arc::new(zeron_doc::TranscriptBaseline::capture(&cached.entries))
+                    }),
+            );
+            if let Some(prepared) = cached.prepared {
+                self.prepared_transcripts.insert(cached.chat_id, prepared);
+            }
+            self.transcript = cached.entries;
+            self.context_usage = cached.context_usage;
+            self.transcript_replayed = true;
+        }
         self.transcript_task = None;
+        self.queue.clear();
+        self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) keeps the current project pick.
@@ -1958,6 +2399,7 @@ impl AppState {
                         self.no_project = false;
                     }
                     None => {
+                        self.selected_space = None;
                         self.no_project = true;
                         self.selected_device = Some(chat.device_id.clone());
                     }
@@ -1966,10 +2408,35 @@ impl AppState {
             self.mark_chat_seen(id, cx);
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            if handle
+                .engine_info()
+                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+            {
+                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+            }
         }
         self.refresh_live_voice_availability(true, cx);
         cx.notify();
+    }
+
+    /// Replace the selected chat's queue subscription without clearing its
+    /// current projection. This is used after an optimistic mutation fails:
+    /// the authoritative opening frame repairs the local list even though the
+    /// document itself did not change and therefore emitted no new frame.
+    pub(crate) fn refresh_selected_queue(&mut self, cx: &mut Context<Self>) {
+        self.queue_task = None;
+        let (Some(chat_id), Some(handle)) = (self.selected_chat.clone(), self.engine.clone())
+        else {
+            return;
+        };
+        if handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+        {
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        }
     }
 
     /// Select a project; the caller (shell) decides which chat to land on.
@@ -1983,15 +2450,16 @@ impl AppState {
                     self.selected_device = Some(device);
                 }
             }
-            None => self.no_project = true,
+            None => {
+                self.selected_device = self.effective_device_id();
+                self.no_project = true;
+            }
         }
         if self.selected_space == space_id && space_id.is_some() {
             cx.notify();
             return;
         }
-        if space_id.is_some() {
-            self.selected_space = space_id;
-        }
+        self.selected_space = space_id;
         cx.notify();
     }
 
@@ -2326,7 +2794,7 @@ fn spawn_transcript_watch(
         const STALL_THRESHOLD: u32 = 3;
         let mut consecutive_failures: u32 = 0;
         'resubscribe: loop {
-            let params = serde_json::json!({ "chatId": chat_id });
+            let params = serde_json::json!({ "chatId": chat_id, "openingTail": true });
             let mut rx = match handle
                 .client()
                 .subscribe(methods::WATCH_DOC_MESSAGES, params)
@@ -2367,8 +2835,22 @@ fn spawn_transcript_watch(
                     continue 'resubscribe;
                 }
             };
+            let mut preparation = WatchPreparation::new(cx.background_executor().clone());
             while let Some(value) = rx.recv().await {
-                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                let history_pending = value
+                    .get("historyPending")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let decoded = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let update: zeron_doc::TranscriptUpdate =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        let prepared = preparation.prepare(&update).map_err(|e| e.to_string())?;
+                        Ok::<_, String>((update, prepared, preparation))
+                    })
+                    .await;
+                let (update, prepared, next_preparation) = match decoded {
                     Ok(frame) => frame,
                     Err(err) => {
                         // Schema skew (a newer peer's entry shape arriving
@@ -2380,15 +2862,22 @@ fn spawn_transcript_watch(
                         continue 'resubscribe;
                     }
                 };
+                preparation = next_preparation;
                 let mut desync = false;
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        if let Err(err) = state.apply_transcript_frame(frame) {
+                        if history_pending && state.transcript_replayed {
+                            return;
+                        }
+                        if let Err(err) =
+                            state.receive_opening_transcript_update(update, history_pending, cx)
+                        {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
                             desync = true;
+                        } else {
+                            state.prepared_transcripts.insert(chat_id.clone(), prepared);
                         }
-                        cx.notify();
                     }
                 });
                 if alive.is_err() {
@@ -2409,10 +2898,69 @@ fn spawn_transcript_watch(
     })
 }
 
+/// The selected chat's pending-message queue, straight off its doc. Whole-list
+/// frames (the queue is a handful of rows at most), retried like the transcript
+/// watch — a queue that silently stopped updating would show messages the host
+/// has already sent.
+fn spawn_queue_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+) -> Task<()> {
+    #[derive(serde::Deserialize)]
+    struct QueueFrame {
+        #[serde(default)]
+        items: Vec<zeron_doc::QueuedMessage>,
+    }
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_QUEUE, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::debug!(%chat_id, error = %err, "queue watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let frame: QueueFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed queue frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    // Guard against a stale pump racing a newer selection.
+                    if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                        state.queue = frame.items;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
 /// [`spawn_transcript_watch`]'s shape, writing into `sub_transcripts[doc_id]`
-/// instead of the selected chat's transcript. The apply guard is PER KEY:
-/// the map still holding the key (unwatch/snapshot both remove it), never
-/// `selected_chat` — a subagent tab outlives chat switches.
+/// instead of the selected chat's transcript. The apply guard is per key so a
+/// subagent tab can outlive chat switches.
 fn spawn_subagent_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -2437,8 +2985,18 @@ fn spawn_subagent_watch(
                     continue 'resubscribe;
                 }
             };
+            let mut preparation = WatchPreparation::new(cx.background_executor().clone());
             while let Some(value) = rx.recv().await {
-                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                let decoded = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let update: zeron_doc::TranscriptUpdate =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        let prepared = preparation.prepare(&update).map_err(|e| e.to_string())?;
+                        Ok::<_, String>((update, prepared, preparation))
+                    })
+                    .await;
+                let (update, prepared, next_preparation) = match decoded {
                     Ok(frame) => frame,
                     Err(err) => {
                         tracing::warn!(error = %err, "malformed subagent frame; resubscribing");
@@ -2446,16 +3004,33 @@ fn spawn_subagent_watch(
                         continue 'resubscribe;
                     }
                 };
+                preparation = next_preparation;
                 let mut desync = false;
                 let alive = this.update(cx, |state, cx| {
                     // A stale pump racing a snapshot/unwatch finds no key.
                     if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                        let frame = update.frame;
+                        let text_only = is_text_append(&frame);
                         state.transcript_revision = state.transcript_revision.wrapping_add(1);
                         if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
                             tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
                             desync = true;
                         }
-                        cx.notify();
+                        if !desync {
+                            state.prepared_transcripts.insert(doc_id.clone(), prepared);
+                        }
+                        if !desync && let Some(baseline) = update.replay_baseline {
+                            state
+                                .transcript_baselines
+                                .insert(doc_id.clone(), Arc::new(baseline));
+                        }
+                        if text_only && !desync {
+                            cx.emit(TranscriptTextChanged {
+                                doc_id: doc_id.clone(),
+                            });
+                        } else {
+                            cx.notify();
+                        }
                     }
                 });
                 if alive.is_err() {
@@ -2478,6 +3053,7 @@ fn spawn_subagent_watch(
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+    use gpui::AppContext;
     use zeron_engine::{EngineCore, default_registry};
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `zeron_proto::view`.
@@ -2677,6 +3253,8 @@ mod tests {
                 engine_info: EngineInfo {
                     device_id: "owner-device".into(),
                     workspace_scope: WorkspaceScope::Local,
+                    cursor_sdk_version: None,
+                    capabilities: zeron_proto::capabilities::current(),
                 },
                 state: state_rx,
             }),
@@ -3014,6 +3592,7 @@ mod tests {
             created_at: base + TimeDelta::minutes(created_min),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -3065,6 +3644,163 @@ mod tests {
             duration_ms: None,
             continuation_of: None,
         }
+    }
+
+    #[gpui::test]
+    fn opening_tail_is_visible_but_never_replaces_or_caches_complete_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            let update = |id: &str| zeron_doc::TranscriptUpdate {
+                frame: TranscriptFrame::reset(&[user_entry(id)]),
+                context_usage: None,
+                replay_baseline: None,
+            };
+            state.select_chat(Some("whale".into()), cx);
+            state
+                .receive_opening_transcript_update(update("tail"), true, cx)
+                .unwrap();
+            assert_eq!(state.transcript[0].id, "tail");
+            assert!(
+                !state.transcript_replayed,
+                "scroll-anchor fallback must await full history"
+            );
+            state.select_chat(None, cx);
+            assert!(
+                state.transcript_cache.is_empty(),
+                "a preview is not a complete cached copy"
+            );
+            state.select_chat(Some("whale".into()), cx);
+            state
+                .receive_opening_transcript_update(update("full"), false, cx)
+                .unwrap();
+            state
+                .receive_opening_transcript_update(update("tail"), true, cx)
+                .unwrap();
+            assert_eq!(
+                state.transcript[0].id, "full",
+                "reconnect must preserve the full view"
+            );
+            state.select_chat(None, cx);
+            state.select_chat(Some("whale".into()), cx);
+            state
+                .receive_opening_transcript_update(update("tail"), true, cx)
+                .unwrap();
+            assert_eq!(
+                state.transcript[0].id, "full",
+                "revisit must preserve the cache"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn whale_transcript_revisit_is_synchronous_and_fresh_reset_wins(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("whale".into()), cx);
+            let entries: Vec<_> = (0..2000)
+                .map(|i| {
+                    let mut entry = user_entry(&format!("message-{i}"));
+                    entry.parts.push(zeron_doc::MessagePart::Text {
+                        id: "text".into(),
+                        text: "x".repeat(2048),
+                    });
+                    entry
+                })
+                .collect();
+            state.apply_transcript(entries);
+            let allocation = state.transcript.as_ptr();
+            for _ in 0..10 {
+                state.select_chat(Some("other".into()), cx);
+                assert!(
+                    state.transcript.is_empty(),
+                    "never show another chat's rows"
+                );
+                state.select_chat(Some("whale".into()), cx);
+                assert_eq!(
+                    state.transcript.len(),
+                    2000,
+                    "revisit must render before any RPC frame"
+                );
+                assert_eq!(
+                    state.transcript.as_ptr(),
+                    allocation,
+                    "move whale payloads, don't copy them"
+                );
+                assert!(state.transcript_replayed);
+                assert!(
+                    state
+                        .transcript_baseline("whale")
+                        .unwrap()
+                        .covers(&state.transcript[0])
+                );
+            }
+            state
+                .apply_transcript_frame(TranscriptFrame::reset(&[user_entry(
+                    "new-authoritative-row",
+                )]))
+                .unwrap();
+            assert_eq!(state.transcript.len(), 1);
+            assert_eq!(state.transcript[0].id, "new-authoritative-row");
+            state.select_chat(None, cx);
+            state.select_chat(Some("whale".into()), cx);
+            assert_eq!(state.transcript[0].id, "new-authoritative-row");
+            // An authoritative empty reset must still be honored.
+            state
+                .apply_transcript_frame(TranscriptFrame::reset(&[]))
+                .unwrap();
+            assert!(state.transcript.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn transcript_revisit_cache_is_bounded_and_account_scoped(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            for i in 0..20 {
+                state.select_chat(Some(format!("chat-{i}")), cx);
+                state.apply_transcript(vec![user_entry("row")]);
+            }
+            state.select_chat(None, cx);
+            assert_eq!(state.transcript_cache.len(), TRANSCRIPT_CACHE_CAP);
+            state.select_chat(Some("chat-0".into()), cx);
+            assert!(state.transcript.is_empty(), "oldest entry was evicted");
+            state.apply_chats(vec![chat("chat-19", 0, None)]);
+            assert_eq!(
+                state.transcript_cache.len(),
+                1,
+                "deleted chats leave no cached rows"
+            );
+            state.prepare_runtime_replacement(cx);
+            state.select_chat(Some("chat-19".into()), cx);
+            assert!(
+                state.transcript.is_empty(),
+                "account replacement must clear cached content"
+            );
+            assert!(state.transcript_cache.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn transcript_cache_rejects_oversize_and_unloaded_entries(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("loading".into()), cx);
+            state.select_chat(Some("oversize".into()), cx);
+            assert!(state.transcript_cache.is_empty());
+            let mut entry = user_entry("large");
+            entry.parts.push(zeron_doc::MessagePart::Text {
+                id: "text".into(),
+                text: "x".repeat(TRANSCRIPT_CACHE_BYTES + 1),
+            });
+            state.apply_transcript(vec![entry]);
+            state.select_chat(None, cx);
+            assert!(
+                state.transcript_cache.is_empty(),
+                "byte budget applies even to one whale"
+            );
+        });
     }
 
     #[test]
@@ -3122,6 +3858,8 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: None,
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
         }
     }
 
@@ -3537,6 +4275,65 @@ mod tests {
     }
 
     #[test]
+    fn projectless_preference_survives_restart_and_space_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let defaults = crate::settings::composer::ComposerDefaults {
+            device: Some("remote".into()),
+            // Older versions kept a stale project alongside the opt-out.
+            project: Some("old-project".into()),
+            no_project: true,
+            ..Default::default()
+        };
+        defaults.save(dir.path()).unwrap();
+        let mut state = AppState::new();
+        state.restore_composer_target(&crate::settings::composer::ComposerDefaults::load(
+            dir.path(),
+        ));
+        for spaces in [
+            vec![],
+            vec![space("s1", "remote", "/a", 1)],
+            vec![],
+            vec![space("s2", "other", "/b", 2)],
+        ] {
+            state.apply_spaces(spaces);
+            assert!(state.no_project);
+            assert!(state.selected_space.is_none());
+            assert!(state.selected_space_row().is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+        }
+    }
+
+    #[gpui::test]
+    fn projectless_selection_clears_project_and_survives_device_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.apply_spaces(vec![
+                space("s1", "dev", "/a", 1),
+                space("s2", "remote", "/b", 2),
+            ]);
+            state.select_space(Some("s1".into()), cx);
+            state.select_space(None, cx);
+            assert!(state.selected_space.is_none());
+            state.select_device("remote".into(), cx);
+            assert!(state.no_project);
+            assert!(state.selected_space.is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+            state.select_space(Some("s2".into()), cx);
+            assert!(!state.no_project);
+            assert_eq!(state.selected_space_row().unwrap().id, "s2");
+            state.selected_device = Some("dev".into());
+            state.select_space(None, cx);
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+            state.select_space(Some("s2".into()), cx);
+            state.select_device("empty-device".into(), cx);
+            assert!(state.selected_space.is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("empty-device"));
+        });
+    }
+
+    #[test]
     fn chats_in_space_filters_and_orders() {
         let mut state = AppState::new();
         state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
@@ -3652,6 +4449,61 @@ mod tests {
         state.apply_chats(vec![archived, chat("b", 1, None)]);
         let visible: Vec<&str> = state.visible_chats().map(|c| c.id.as_str()).collect();
         assert_eq!(visible, ["b"]);
+    }
+
+    #[test]
+    fn visible_chats_hide_spawned_children() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        let mut child = chat("child", 0, Some(1));
+        child.parent_chat_id = Some("parent".into());
+        state.apply_chats(vec![child, chat("parent", 1, Some(2))]);
+        let visible: Vec<&str> = state.visible_chats().map(|c| c.id.as_str()).collect();
+        assert_eq!(visible, ["parent"]);
+        // The sidebar list and jump slots follow the same rule.
+        let rows: Vec<&str> = state
+            .sidebar_chats(now, None)
+            .into_iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(rows, ["parent"]);
+        // The child row itself is still addressable (deep links, tabs).
+        assert!(state.chats.iter().any(|c| c.id == "child"));
+    }
+
+    #[test]
+    fn jump_slots_count_the_rows_the_sidebar_draws() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        let mut in_space = chat("a", 0, Some(3));
+        in_space.space_id = Some("s1".into());
+        let mut other_space = chat("b", 1, Some(2));
+        other_space.space_id = Some("s2".into());
+        let mut archived = chat("gone", 2, Some(1));
+        archived.space_id = Some("s1".into());
+        archived.archived = true;
+        state.apply_spaces(vec![
+            space("s1", "d1", "/tmp/s1", 0),
+            space("s2", "d1", "/tmp/s2", 1),
+        ]);
+        state.apply_chats(vec![in_space, other_space, archived]);
+
+        // The archived row is not in the active list, so no slot reaches it.
+        let order: Vec<&str> = state
+            .sidebar_chats(now, None)
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(order.len(), 2);
+        assert!(!order.contains(&"gone"));
+
+        // A project filter renumbers: the visible rows only.
+        let filtered: Vec<&str> = state
+            .sidebar_chats(now, Some("s2"))
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(filtered, ["b"]);
     }
 
     #[test]
@@ -3863,6 +4715,8 @@ mod tests {
         assert_eq!(project_label(Some("/home/w/dev/zeron")), "zeron");
         assert_eq!(project_label(Some("/home/w/dev/zeron/")), "zeron");
         assert_eq!(project_label(None), "No project");
+        assert_eq!(project_label(Some("~")), "No project");
+        assert_eq!(project_label(Some("~/")), "No project");
         assert_eq!(project_label(Some("   ")), "No project");
         assert_eq!(project_label(Some("/")), "/");
     }
@@ -3958,6 +4812,45 @@ mod tests {
     }
 
     #[test]
+    fn review_comment_body_updates_are_scoped_and_keep_current_metadata() {
+        let mut state = AppState::new();
+        let original = ReviewComment::file("a.rs", 2, "Original");
+        state.add_review_comment("chat-1", original.clone());
+        state.add_review_comment("chat-2", original.clone());
+        state.begin_review_comment_flush("chat-1", 1);
+        state.update_review_comment_line("chat-1", &original.id, 9);
+        state.rename_review_comment_path("chat-1", "a.rs", "renamed.rs");
+        state.update_review_comment_body("chat-1", &original.id, "Revised".into());
+        let mut expected = original.clone();
+        expected.path = "renamed.rs".into();
+        expected.line = 9;
+        expected.body = "Revised".into();
+        assert_eq!(state.review_comments("chat-1"), &[expected]);
+        assert_eq!(state.review_comments("chat-2"), &[original.clone()]);
+        assert!(state.review_comment_flush_pending("chat-1"));
+        state.remove_review_comment("chat-1", &original.id);
+        state.update_review_comment_body("chat-1", &original.id, "Stale".into());
+        state.update_review_comment_body("missing-chat", &original.id, "Stale".into());
+        assert!(state.review_comments("chat-1").is_empty());
+        assert!(state.review_comments("missing-chat").is_empty());
+    }
+
+    #[test]
+    fn review_comment_flush_waits_for_every_file_surface() {
+        let mut state = AppState::new();
+
+        state.begin_review_comment_flush("chat-1", 1);
+        state.begin_review_comment_flush("chat-1", 2);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 1);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 2);
+        assert!(!state.review_comment_flush_pending("chat-1"));
+    }
+
+    #[test]
     fn version_triple_parses_and_gates_device_features() {
         assert_eq!(version_triple("0.2.12"), Some((0, 2, 12)));
         assert_eq!(version_triple("0.2.12-beta.1"), Some((0, 2, 12)));
@@ -3977,6 +4870,8 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: Some("0.2.12".into()),
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
         }];
         assert!(s.device_version_at_least("d1", (0, 2, 12)));
         assert!(!s.device_version_at_least("d1", (0, 2, 13)));
@@ -3985,6 +4880,36 @@ mod tests {
             !s.device_version_at_least("d1", (0, 2, 12)),
             "unstamped version conservatively fails the gate"
         );
+    }
+
+    #[test]
+    fn explicit_capabilities_distinguish_same_version_builds() {
+        let mut state = AppState::default();
+        state.devices = vec![
+            Device {
+                id: "personal".into(),
+                name: "personal".into(),
+                platform: "macos".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: Some("0.2.31".into()),
+                cursor_sdk_version: None,
+                capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+            },
+            Device {
+                id: "upstream".into(),
+                name: "upstream".into(),
+                platform: "macos".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: Some("0.2.31".into()),
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+            },
+        ];
+
+        assert!(state.device_supports("personal", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
+        assert!(!state.device_supports("upstream", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
     }
 
     #[test]
@@ -4005,6 +4930,8 @@ mod tests {
             last_seen_at: Some(now),
             created_at: None,
             version: None,
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
         }];
         s.connectivity.state = ConnectivityState::Connected;
         s.connectivity.chats = vec![ChatConnectivity {
@@ -4058,5 +4985,30 @@ mod tests {
         assert!(!s.send_queued("c-remote", now));
         // …but the explicit undelivered flag still tells the truth.
         assert!(s.send_undelivered("c-remote", now));
+    }
+}
+
+#[cfg(feature = "appshots-fixture")]
+impl AppState {
+    /// Keep fixture documents deterministic while using the real attachment RPC.
+    pub fn fixture_attachment_engine(&mut self, engine: EngineHandle) {
+        self.engine = Some(engine);
+    }
+}
+
+#[cfg(feature = "project-palette-fixture")]
+impl AppState {
+    /// Seed provider metadata for the isolated native sidebar review fixture.
+    pub fn fixture_sidebar_change_request(
+        &mut self,
+        snapshot: zeron_proto::CheckoutChangeRequestStatus,
+    ) {
+        let key = crate::change_requests::ChangeRequestWatchKey {
+            device_id: snapshot.device_id.clone(),
+            cwd: snapshot.cwd.clone(),
+            branch: snapshot.branch.clone(),
+            checkout_id: Some(snapshot.checkout_id.clone()),
+        };
+        self.change_requests.store(key, snapshot);
     }
 }

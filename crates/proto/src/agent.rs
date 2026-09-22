@@ -9,9 +9,14 @@ pub enum HarnessId {
     Codex,
     /// Kimi Code managed account/Usage identity; not a runnable harness.
     Kimi,
-    /// Antigravity managed account/Usage identity; not a runnable harness.
+    /// Antigravity managed account/Usage identity. Upstream also drives
+    /// Google's agent over ACP (`agy_acp_server`, installed from its pinned
+    /// release archive); runnability is decided by the engine/harness
+    /// registry, never by this identity alone.
     Antigravity,
     Cursor,
+    /// Cognition's Devin agent, driven over ACP (`devin acp`).
+    Devin,
     /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
     /// Nous Research's Hermes Agent, driven over ACP (`hermes acp`).
@@ -149,6 +154,10 @@ pub struct WorktreeSpec {
     pub repo_path: String,
     /// Base ref the fresh `zeron/<name>` branch is created off.
     pub base: String,
+    /// Owning project used to resolve host-local setup Actions. Optional for
+    /// wire compatibility with clients that only request worktree creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -383,6 +392,11 @@ impl ContextUsage {
         (self.context_window > 0).then_some(self.context_window)
     }
 
+    /// Occupied fraction of the window when both sides were reported.
+    pub fn fraction(self) -> Option<f64> {
+        Some(self.reported_tokens()? as f64 / self.reported_window()? as f64)
+    }
+
     /// Updates are snapshots of independently reported fields, never cumulative totals.
     pub fn merge(self, previous: Option<Self>) -> Self {
         Self::reported(
@@ -542,6 +556,15 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         execution: Option<ToolExecutionMeta>,
     },
+    /// Latest context occupancy, independent of cumulative billing usage.
+    /// Missing fields preserve the previous measurement; zero tokens is valid.
+    /// The engine folds it into the same session-row `context_usage` snapshot
+    /// that `Usage { context_usage }` feeds.
+    #[serde(rename_all = "camelCase")]
+    ContextUsage {
+        tokens: Option<u64>,
+        window: Option<u64>,
+    },
     /// Turn usage plus an optional current-context snapshot. The event itself
     /// stays out of transcripts; the engine mirrors only `context_usage` onto
     /// the live session row for the composer gauge.
@@ -578,6 +601,8 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answers: Option<Vec<UserInputAnswer>>,
     },
+    /// A confirmed new assignment. When tagged as Subagent, this reopens the
+    /// same child transcript even if the provider does not echo the user text.
     #[serde(rename_all = "camelCase")]
     Steered {
         assistant_message_id: Option<String>,
@@ -877,11 +902,13 @@ mod tests {
             worktree: Some(WorktreeSpec {
                 repo_path: "/repos/comet".into(),
                 base: "main".into(),
+                space_id: Some("space-1".into()),
             }),
             ..req
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
+        assert_eq!(json["worktree"]["spaceId"], "space-1");
         let round: RunRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round.worktree, req.worktree);
     }
