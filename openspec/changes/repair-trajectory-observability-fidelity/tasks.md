@@ -1,129 +1,144 @@
 # Execution Contract
 
-Source plan: `docs/plans/2026-09-06-0304-fix-trajectory-observability-fidelity-plan.md`. R1–R14 and U1–U8 retain their plan meanings. `specs/chat-trajectory-preview/spec.md` is the behavioral acceptance contract; `design.md` owns implementation decisions.
+Current plan: `docs/superpowers/plans/2026-09-22-trajectory-repair.md` (T01–T16, R1–R22). `specs/chat-trajectory-preview/spec.md` owns behavior; `design.md` owns decisions. The 2026-09-06 plan is historical context, not a second queue. Existing R1–R14 are preserved; the 2026-09-22 audit adds R15–R22.
 
-This change is authored and validated only. No unchecked implementation task is evidence of work already performed. Commands and regression names below are execution targets, not recorded results. User authorization to author this change does not authorize starting workers, committing, publishing or restarting the hosting Comet process.
+This is a planning revision. All implementation checkboxes remain unchecked. Test names, commands and performance targets below are future verification requirements, not executed results. The current user request does not start implementation, commit, publication or restart of the hosting process.
 
-## Phase Map
+## Execution and Review Rules
 
-| Phase | Plan unit | Section | Dependencies | Boundary | Acceptance evidence |
-|---|---|---|---|---|---|
-| P0 | Preflight | 1 | — | Real checkout/runtime and sanitized characterization | Source capability evidence; baseline and ownership map |
-| P1 | U1 | 2 | P0 | Shared operation projection, indexed query, inspector | Correlation regression and selection/reveal-source evidence |
-| P2 | U2 | 3 | P1 | Internal envelope, consumed boundaries, folds | Runtime-to-group fixture and folding evidence |
-| P3 | U3 | 4 | P1 | Instants/intervals, mixed timing | Timing regression and native geometry |
-| P4 | U4 | 5 | P2 | Usage/context fidelity | Final-message replay and context evidence |
-| P5 | U5 | 6 | P2 | Consent, private source, local access/retention | Privacy isolation and fail-open evidence |
-| P6 | U6 | 7 | P1, P2, P5 | Original source and schema snapshots | Actual runtime fidelity and native Reveal |
-| P7 | U7 | 8 | P3, P4, P6 | Historical enrichment and convergence | Temporary-profile crash/reopen/replay evidence |
-| P8 | U8 | 9 | P1–P7 | Integrated acceptance and scoped contract closure | R1–R14 itemized conformance, native evidence and final review |
+- Follow Context → Specification → TDD → Delegation → Implementation → Proof → Review → Validation → Acceptance → Publication → Documentation. Each task includes its own red/green or native before/after check; broader integrated checks belong to section 16.
+- The plan's dependency table controls ordering. T03/T04 and T09/T10 may proceed independently only with disjoint file ownership; shared proto/harness/sessions/inspector changes have one integration owner per batch. Map callers before changing exported symbols. Do not absorb unrelated work or share Cargo targets between checkouts.
+- Use the existing project's worker/ticket workflow when implementation is authorized. Review each delivery independently against Spec, correctness and Reality; security review is mandatory for preview repair and complete-source boundaries. A green build or worker terminal status is insufficient evidence.
+- Filtered tests must execute at least one matching test. Native-only GPUI scenarios require actual typing/clicking/scrolling in an isolated identified executable/profile, not just calls to pure model methods. Record exact commands, counts, exit statuses and native observations without user secrets.
+- Publication gates remain not yet due until publication is authorized. Never push upstream. Never restart the app hosting active work as a side effect of validation.
 
-Parallel eligibility does not grant shared-file ownership. `proto/trajectory.rs`, `engine/sessions.rs`, `harness/omp/normalize.rs` and `ui/trajectory/inspector.rs` have one integration owner per batch. Independent worktrees must be based on the actual accepted integration state, not an unrelated clean HEAD. The concurrent OMP runtime-parity plan is adjacent ownership, not extra scope.
+## 1. T01 — Baseline and source characterization
 
-## Review Contract
+- [ ] 1.1 Resolve actual checkout/HEAD, unrelated edits, active ownership, applicable DOX and installed OMP executable/version. Map affected stream/RPC/projection callers through graft/LSP and confirm current source if stale. Verify by recording concrete baseline, caller map and native profile/launch method without changing the hosting process.
+- [ ] 1.2 Establish actual consumed-input/model/tool/usage/schema frames in an isolated OMP run; extract only necessary metadata, never dump systemPrompt or credentials. Files: `crates/harness/tests/omp_rpc.rs`, `tests/fixtures/`. Verify supported capabilities and record exact missing capability for any blocked delivery; no fabricated source fallback.
+- [ ] 1.3 Add minimal sanitized source-shaped fixtures for separated call/result, repeated updates, reverse concurrent results, missing hierarchy, end-only/mixed timing and context-only usage. Files: harness fixtures and co-located tests; new `crates/engine/tests/trajectory_fidelity.rs` when crossing layers. Verify each fixture reaches a real consumer boundary and reproduces an audited fault; native search/scroll baseline is also recorded.
 
-- **Spec owner:** orchestrator, with read-only phase review where supported; milestone is every phase before ACCEPT. Evidence maps each phase requirement/must_have to behavior and reviewed worker tests. Incomplete scenarios return REVISE on the same durable ticket.
-- **Standards & Security owner:** orchestrator and security reviewer for P5/P6; design/privacy review before those phases are accepted. Publication gates remain `not yet due` during local-only work, never falsely `passed`. Before any authorized push/merge, resolve and run the repository's live security and automated-review gates on the final diff.
-- **Reality owner:** orchestrator; milestone is each UI-bearing delivery before reporting it complete, then P8 integrated native smoke. Evidence includes executable/profile identity, exercised scenario and observed output/screenshots. A static capture fixture alone does not prove actual runtime capture.
-- Every implementation worker uses a durable Work Ticket and verified completion signature. Terminal completion and green tests are insufficient for ACCEPT. No worker touches the hosting app lifecycle without explicit authorization.
+## 2. T02 — Legacy sanitization and existing-preview repair
 
-## 1. Preflight and characterization
+- [ ] 2.1 Add the failing `trajectory_legacy_preview_redacts_before_reveal` test from plan T02 for text and reasoning, plus an old persisted-row fixture. Files: `crates/engine/src/trajectory_store.rs`, `crates/engine/tests/trajectory_fidelity.rs`. Verify sentinel leakage reproduces before the fix, while recovery source bytes remain unchanged.
+- [ ] 2.2 Use the existing sanitizer's preview in both legacy coalescers and protect ordinary reader/watch output for already-persisted rows before backfill. Files: store/rpc. Verify new import and first snapshot/watch from an old store contain no sentinel without requiring repair completion or Reveal.
+- [ ] 2.3 Add versioned bounded ordered-writer repair of existing preview text with monotonic rev, independent of cutover/import markers. Verify interruption/retry/idempotence, concurrent native capture, unchanged IDs/references/journal bytes, direct persisted rows after completion and update delivery to an earlier subscriber; privacy review accepts the complete read/write path.
 
-**must_haves:** the worker edits the intended checkout with unrelated work preserved; source capabilities are known for the installed OMP version; reproduction fixtures model the observed faults without importing user secrets.
+## 3. T03 — Editable search and technical identifiers
 
-- [ ] 1.1 Resolve actual checkout/worktree state, active owners, native instructions and task runner. Record the baseline and shared-file ownership with the concurrent OMP parity work; enumerate internal stream/RPC/record callers through LSP references before changing exported contracts. files: affected domains listed in the phase map, no edits required for discovery. verify: concrete baseline and caller/owner map, not inferred worker status.
-- [ ] 1.2 Establish installed OMP version and actual turn/message/tool/usage/schema frames using an isolated local run under the repo's canonical launch method. Extract only necessary metadata from get_state; do not dump systemPrompt or credentials. If required capabilities are absent, stop the affected phase with the exact missing source and request authorization for any runtime adaptation. files: `crates/harness/tests/omp_rpc.rs`, `crates/harness/tests/fixtures/`. verify: supported-version frame evidence and sanitized fixtures; no edits to the read-only reference checkout.
-- [ ] 1.3 Build minimal deterministic fixtures matching the audited separated call/result, repeated todo IDs, absent hierarchy, end-only timing and context-only usage shapes. Reuse the existing audit as the symptom baseline; do not rerun production queries merely to reconfirm it. files: `crates/harness/tests/fixtures/`, co-located trajectory tests and new `crates/engine/tests/trajectory_fidelity.rs` where integration is necessary. verify: each fixture exercises a consumer-visible contract; no invented all-fields-filled inspector record substitutes for capture.
+- [ ] 3.1 Add failing `trajectory_search_finds_call_identity` and identifier/text cases in `crates/ui/src/trajectory/model.rs`; reproduce the non-editable field natively. Verify call/parent/run/turn/step/record IDs, case-insensitive sanitized text and clear semantics; raw revealed content is excluded from search.
+- [ ] 3.2 Replace the decorative search field with the existing picker-style native input owned/subscribed by `TrajectoryView`, connected to Search/ClearSearch. Files: `view.rs`, `toolbar.rs`. Verify actual typing, paste, text selection and clearing update both input/model, preserve live query/focus and never submit a Chat message.
+- [ ] 3.3 Validate input lifecycle on Chat/surface switches and close; verify no stale subscription or clear-event feedback loop. Run focused model/toolbar tests and native normal/narrow interaction; evidence must include editing the displayed control.
 
-## 2. Correlated operation and paged inspector
+## 4. T04 — Scrollable detail and readable action context
 
-**must_haves:** call and result resolve one scoped operation across pages; selected event identity remains stable; no result is fabricated and no unrelated operation is joined. Covers R1–R3/R13.
+- [ ] 4.1 Reproduce clipped long content with the existing native fixture surface: 200 numbered lines, long identifiers and 599/600 px widths. Files: `crates/ui/src/capture.rs` only as needed, trajectory inspector/view. Verify inability to reach the last line before the fix and retain a repeatable native exercise.
+- [ ] 4.2 Give the tab body bounded vertical scroll while header/tabs remain accessible; reset detail position on selection change and preserve it on same-record live update. Files: inspector/view. Verify last-line access in every applicable tab, revealed data, low-height panel and narrow return; selection change still clears Reveal.
+- [ ] 4.3 Prioritize sanitized action/target/outcome in ledger/Summary while preserving complete IDs as accessible metadata and 26 px rows. Files: model/ledger/inspector. Verify pure label/summary tests and native light/dark presentation, missing-data honesty and distinction between available run terminal outcome and subordinate errors.
 
-- [ ] 2.1 Add the failing `trajectory_operation_contract` behavior reproduction using separated start/result events and selection on the start. Include success/error, reversed concurrent completion, result-only, late completion and Done without a result. files: `crates/ui/src/trajectory/model.rs`, `crates/proto/src/trajectory.rs`. verify: `cargo test -p zeron-ui trajectory_operation_contract` fails on the characterized contract before the fix and passes after it.
-- [ ] 2.2 Implement shared scope-aware operation derivation and explicit identity ambiguity. Repeated metadata updates/replay retain authoritative outcome and original start; preserve event ordering/IDs and avoid per-render payload copying or quadratic joining. files: `crates/proto/src/trajectory.rs`, `crates/ui/src/trajectory/model.rs`. verify: co-located behavior regressions for same call ID across run/Chat/parent scope and authoritative todo updates.
-- [ ] 2.3 Add indexed, authorized, bounded local `GetTrajectoryOperation` for a persisted selected Record ID, returning sanitized operation data, source references, snapshot revision and completeness/continuation. Preserve ownership/forwarding limits and distinguish unloaded data from absent result. files: `crates/rpc/src/{lib.rs,method.rs}`, `crates/engine/src/{trajectory_store.rs,rpc.rs}`, co-located tests. verify: cross-page operation resolves without full-Chat loading; foreign IDs rejected; concurrent newer revision wins over stale response.
-- [ ] 2.4 Connect inspector tabs and summary to the operation while preserving the selected event. Bind Payload/Result Reveal to their own source references, update live without reselection and keep pending response invalidation intact. Include call-ID search and named tool completion labels. files: `crates/ui/src/trajectory/{model.rs,inspector.rs,view.rs,ledger.rs}`. verify: focused UI model tests plus native selection-before-completion and historical reopen; no response crosses selection/profile/delete boundaries.
+## 5. T05 — Shared scoped operation projection
 
-## 3. Observed hierarchy and independent folds
+- [ ] 5.1 Add failing `trajectory_operation_contract` cases in `crates/proto/src/trajectory.rs`: success/error, reverse concurrency, result-only, late result, Done without result, repeated metadata, cross-run/Chat/parent IDs and ambiguous same-scope collision. Verify expectations fail on isolated-event interpretation before implementation.
+- [ ] 5.2 Implement one pure operation derivation with authoritative outcome, separate payload/result source identities, completeness and original start preservation. Keep event IDs/order intact; avoid quadratic joining or payload copying per render. Verify all operation cases, replay idempotence and deterministic ambiguity reporting.
+- [ ] 5.3 Freeze additive operation/scope/source contracts for downstream consumers; map callers and test serde old/new/unknown fields. Verify `cargo test -p zeron-proto trajectory_operation_contract` executes cases and unchanged normalized event/transcript contracts remain compatible.
 
-**must_haves:** model response boundaries become Steps under consumed-input Turns; absent boundaries remain unknown; Calls folding preserves text/reasoning. Covers R2–R4/R13.
+## 6. T06 — Indexed query and correlated Inspector
 
-- [ ] 3.1 Add failing `trajectory_hierarchy_contract` using a consumed input, two model responses/tools and a later consumed input. Include steering ACK before consumption and replay. files: `crates/harness/tests/omp_rpc.rs`, `crates/ui/src/trajectory/model.rs`. verify: `cargo test -p zeron-ui trajectory_hierarchy_contract` and harness fixture reproduction defend observed group/fold behavior, not field forwarding.
-- [ ] 3.2 Introduce the internal harness→engine envelope and extract metadata before AgentEvent fan-out. Migrate every internal stream consumer; source metadata absent on other harnesses remains valid. Do not add raw bytes to recovery/public AgentEvent. files: `crates/harness/src/lib.rs`, `crates/harness/src/omp/{mod.rs,normalize.rs}`, `crates/proto/src/trajectory.rs`, `crates/engine/src/sessions.rs`, references-resolved consumers. verify: existing harness/transcript/recovery contracts remain valid; diagnostic-only boundaries do not duplicate transcript content.
-- [ ] 3.3 Capture stable consumed-input/model/parent boundaries in order and persist metadata for new records. Replay does not renumber groups; unknown groups are clearly labeled. files: `crates/engine/src/{sessions.rs,trajectory_store.rs}`, `crates/proto/src/trajectory.rs`, `crates/ui/src/trajectory/model.rs`. verify: normalizer→capture→group fixture covers interleaved scopes and late boundaries.
-- [ ] 3.4 Separate Calls from Step folding and preserve interleaved model records, Turn settings, manual overrides, selected descendants and chronological order. files: `crates/ui/src/trajectory/{model.rs,ledger.rs}`. verify: the original fold reproduction passes and native Calls toggle leaves model content visible.
+- [ ] 6.1 Add failing `trajectory_operation_lookup` with call/result in different pages separated by 20,000 events, late completion during lookup and selection/profile invalidation. Files: engine store/rpc and integration test. Verify no whole-Chat scan/load is required and missing pages are not interpreted as absent results.
+- [ ] 6.2 Implement indexed local-only `GetTrajectoryOperation` for a persisted Chat/Record ID, consistent snapshot revision and bounded continuation. Files: RPC lib/method, engine store/rpc. Verify ownership, forged IDs, omitted targetDeviceId, remote forwarding rejection and explicit unsupported behavior with an older daemon.
+- [ ] 6.3 Connect Inspector and live invalidation to the shared operation while preserving the selected event. Files: UI model/view/inspector. Verify sources differ correctly for Payload/Result Reveal, newer rev defeats stale responses, selection-before-completion updates without reclick and reopened call/result inspections agree.
+- [ ] 6.4 Run RPC round-trip/local-only, `trajectory_operation_lookup` and UI `trajectory_operation_contract`; verify native cross-page operation and delayed-response selection cases. No raw source is fetched merely by selecting an operation.
 
-## 4. Recorded instants and intervals
+## 7. T07 — Observed hierarchy and internal envelope
 
-**must_haves:** end-only observations remain usable; missing legacy timing does not invalidate measured runs; execution and observation duration are distinctly labeled. Covers R5/R13.
+- [ ] 7.1 Add failing `trajectory_hierarchy_contract` from consumed input, two model responses, steering ACK then consumption and interleaved parent scopes. Files: OMP RPC fixtures, sessions/proto/UI tests. Verify expected Turns/Steps, no transcript duplication and replay-stable boundaries.
+- [ ] 7.2 Add internal harness→engine metadata envelope before public AgentEvent fan-out and migrate every resolved stream consumer. Files: harness lib/OMP, sessions/proto and mapped callers. Verify other harnesses accept absent metadata, raw bodies do not enter public/recovery events and metadata-only ordering is deterministic.
+- [ ] 7.3 Capture stable observed turn/step/full-parent identities, coalescers per scope and honest unknown groups. Files: sessions/store/proto/UI model. Verify ACK does not open a Turn, model response maps to Step, nested scope isolation and native unknown/observed grouping; run OMP, trajectory_capture and hierarchy tests.
 
-- [ ] 4.1 Add failing `trajectory_recorded_contract` with start-only, end-only, final message and a separate legacy sequence-only run. Include reversed clock and overlapping operations. files: `crates/ui/src/trajectory/timeline.rs`. verify: `cargo test -p zeron-ui trajectory_recorded_contract` fails on the old global fallback and passes on mixed honest geometry.
-- [ ] 4.2 Capture timing provenance and available monotonic elapsed measurements; derive tool intervals from correlated source without claiming transport interval equals execution duration. Handle invalid/overflowing measurements locally. files: `crates/proto/src/trajectory.rs`, `crates/engine/src/{sessions.rs,trajectory_store.rs}`. verify: measured zero versus absent duration, execution-versus-host difference and local invalid timing cases.
-- [ ] 4.3 Render measured instants/intervals and explicitly sequence-only segments with stable selection/range/hit-testing. Update Timing and toolbar labels without losing lane/error semantics. files: `crates/ui/src/trajectory/{timeline.rs,inspector.rs,toolbar.rs}`. verify: focused model/layout tests and native mixed-timing smoke at normal/narrow widths.
+## 8. T08 — Calls folding, selection and timeline dimming
 
-## 5. Honest consumption and context
+- [ ] 8.1 Add failing `trajectory_navigation_contract` for interleaved reasoning/tool/text/tool, independent Turn/Call overrides, selected hidden child and query+fold. Files: model/timeline/ledger. Verify old step-wide fold and visible-row-only dimming fail the new behavior cases.
+- [ ] 8.2 Separate tool folding from Step content and open only the required ancestor path on explicit selection; preserve unrelated overrides, event identity and global order with concurrent results. Files: model/view/ledger. Verify selected hidden record becomes a visible selected row and model content survives Calls folding.
+- [ ] 8.3 Derive dimming from query/range over all loaded records, independent of folded rows. Files: model/timeline. Verify the same match set before/after folds, then native search→fold→timeline click→clear with offscreen records at both widths.
 
-**must_haves:** occupancy 109686/272000 survives; missing consumption is not zero; duplicate final frames/resume do not inflate totals. Covers R6/R12/R13.
+## 9. T09 — Honest recorded timing
 
-- [ ] 5.1 Add failing `trajectory_usage_fidelity` through adapter/capture/store/reopen with context-only usage and synthetic old zeros. files: `crates/harness/tests/omp_rpc.rs`, `crates/engine/src/{sessions.rs,trajectory_store.rs}`. verify: `cargo test -p zeron-engine trajectory_usage_fidelity` fails on lost context/fake consumption and passes after correction.
-- [ ] 5.2 Extract authoritative final-message usage once per scoped message and context snapshots separately. Preserve optionality/provenance and cache/total source semantics; never add cumulative session values as run deltas or duplicate subordinate usage. files: `crates/harness/src/omp/{mod.rs,normalize.rs,protocol.rs}`, `crates/proto/src/trajectory.rs`, `crates/engine/src/{sessions.rs,trajectory_store.rs}`. verify: replay, duplicate message_end/turn_end, resume, reported zero, missing/cache fields and compaction snapshots.
-- [ ] 5.3 Display consumption/context/partiality at their correct model/step/run scope, not on unrelated tools; preserve Chat's last-known indicator. files: `crates/ui/src/trajectory/inspector.rs`. verify: native context-only and measured-consumption scenarios match actual runtime frames.
+- [ ] 9.1 Add failing `trajectory_recorded_contract` for start-only/end-only observations, final message, overlapping operations and a separate sequence-only legacy run. Files: timeline/proto tests. Verify invalid or regressing local timing does not discard valid timing elsewhere.
+- [ ] 9.2 Preserve first capture start through finalization, record timing provenance and available monotonic elapsed; derive correlated host intervals separately from runtime execution duration. Files: sessions/store/proto. Verify missing versus measured-zero duration, overflow and differing runtime/host values.
+- [ ] 9.3 Render measured instants/intervals plus explicitly sequence-only segments; label effective/mixed mode and preserve range/selection/hit-testing. Files: timeline/inspector/toolbar. Verify timing regression tests and native Sequence/Recorded on the same mixed history with overlap/end-of-axis selection.
 
-## 6. Opt-in private source and authorized Reveal
+## 10. T10 — Consumption and context fidelity
 
-**must_haves:** consent is next-run/Chat/profile-scoped; raw bodies have no public fan-out; source retention is bounded; revocation/deletion works; failure never interrupts the run. Covers R8–R11/R14. Security-sensitive worker ownership is mandatory.
+- [ ] 10.1 Add failing `trajectory_usage_fidelity` through adapter/capture/store/reopen: context 109686/272000 with unknown consumption, literal old OMP zeros, measured zero and duplicate final-message usage. Verify absent and zero differ and known context survives.
+- [ ] 10.2 Extract final-message usage once per scoped identity separately from context snapshots, with source/availability/cache semantics. Files: OMP mod/normalize/protocol, proto, sessions/store. Verify message_end/turn_end replay, resume, cumulative totals, subordinate duplication and compaction/model-change snapshots.
+- [ ] 10.3 Display consumption/context at the model/Step/run scope, retain partiality and keep Chat's last-known indicator. Files: inspector and affected mapped consumers. Verify no tokens inherited by unrelated tools, run focused usage/OMP tests and compare native output with actual supported runtime frames.
 
-- [ ] 6.1 Define additive consent, diagnostic-source reference, fidelity/availability and local-control contracts. Implement engine-owned arm/disarm/revoke policy consumed once at matching run start and cleared on restart/profile/deletion. files: `crates/proto/src/trajectory.rs`, `crates/rpc/src/{lib.rs,method.rs}`, `crates/engine/src/{sessions.rs,rpc.rs}`. verify: next-run scope, other Chat, subsequent run, active revocation and queued-write policy behavior.
-- [ ] 6.2 Implement isolated profile-local `trajectory_diagnostics.rs` with owner-only permissions, safe source paths, opaque references, bounded writer/readers, typed degradation and no AgentEvent/journal/raw-watch contamination. files: new `crates/engine/src/trajectory_diagnostics.rs`, `crates/engine/src/{lib.rs,profile.rs,sessions.rs,trajectory_store.rs}`. verify: sensitive sentinel introduced only in pre-normalization diagnostic fields is absent from public/normalized paths, permissions/escape checks, queue/writer/disk failure keep execution live.
-- [ ] 6.3 Implement 7-day expiry, 128 MiB profile budget, 1 MiB field limit, fidelity/original-size metadata, oldest-first eviction and explicit delete-diagnostics. Integrate all Chat deletion paths and archive semantics using serialized bounded retention. files: `crates/engine/src/{trajectory_diagnostics.rs,workspace_host.rs,rpc.rs}`, co-located tests. verify: TTL/budget/truncation, archive, local/sync/Space deletion, concurrent reader and retention failure do not erase semantic/journal data.
-- [ ] 6.4 Extend local Reveal to the new source under exact ownership/attached-reference/version/field checks and lifecycle invalidation; preserve explicitly labeled journal-backed normalized legacy reads. Reject forwarding, forged references and cross-profile calls. files: `crates/engine/src/rpc.rs`, `crates/rpc/src/{lib.rs,method.rs}`, `crates/rpc/tests/device_room.rs`. verify: `cargo test -p zeron-engine trajectory_reveal` plus new diagnostic access tests; source deletion while reading and omitted target device cannot leak.
-- [ ] 6.5 Add explicit next-run consent control, visible scope/limits/active state, disarm/revoke and delete-diagnostics affordance inside Trajectory. Keep sanitized previews default and Reveal explicit; invalidate pending/revealed content on all existing lifecycle boundaries. files: `crates/ui/src/trajectory/{toolbar.rs,model.rs,view.rs,inspector.rs}`. verify: native off→armed→capturing→off and revoke/delete flows, view close/reopen and transient Reveal error/retry.
-- [ ] 6.6 Review the privacy boundary and worker tests before accepting the phase; keep complete producers disabled until source and Reveal satisfy the contract. files: phase P5 diff and test evidence. verify: itemized no-leak/ownership/retention/fail-open findings with no unresolved blocking issue; publish gates are not falsely marked passed.
+## 11. T11 — Consent and local diagnostic contracts
 
-## 7. Runtime schemas and original source extraction
+- [ ] 11.1 Add `trajectory_diagnostic_consent` behavior cases before implementation: Off→Armed→Capturing→Off, Chat/profile scope, next-run consumption, another Chat, restart, view close, disarm and active revocation. Files: engine sessions/rpc tests. Verify each state/transition and that revocation cannot be bypassed by queued writes.
+- [ ] 11.2 Implement additive source/fidelity/availability contracts and engine-owned local control policy. Files: proto, RPC lib/method, sessions/rpc. Verify old journal references still decode, forged/foreign/forwarded controls fail and an older daemon reports unsupported; complete source producers stay disabled until T12 passes.
+- [ ] 11.3 Add visible scope/limits/off/armed/capturing/revoke/delete controls in Trajectory. Files: toolbar/model/view. Verify native next-run scope with two Chats and restart/profile clearing; opening the view neither arms capture nor reveals content.
 
-**must_haves:** schema has observed provenance; opted-in source preserves received fields before normalization; unsupported/truncated source is not advertised as complete. Covers R7–R11.
+## 12. T12 — Private source, retention and authorized Reveal
 
-- [ ] 7.1 Extract bounded get_state.dumpTools snapshots after host-tool registration and on catalog-changing boundaries, deduplicated by content with source/time precision. Never retain systemPrompt or claim a stale snapshot is execution-exact. files: `crates/harness/src/omp/{mod.rs,protocol.rs,process.rs}`, `crates/proto/src/trajectory.rs`, `crates/engine/src/{sessions.rs,trajectory_store.rs}`. verify: two actual/sanitized runtime catalog snapshots, schema absence and sensitive examples preserve fidelity/preview boundaries.
-- [ ] 7.2 Capture original received args and result objects from execution boundaries under active consent before normalization. Enforce revocation without unnecessary raw cloning; retain text/details/diff/image/reference structure within declared limits, without reading arbitrary artifact paths. files: `crates/harness/src/omp/{normalize.rs,mod.rs}`, `crates/engine/src/{sessions.rs,trajectory_diagnostics.rs}`, `crates/harness/tests/omp_rpc.rs`. verify: command/cwd/env/timeout and multiform result survive opted-in Reveal; consent off/revoked retains no complete source.
-- [ ] 7.3 Bind schema/payload/result inspector presentation to source fidelity, provenance and explicit unavailability; remove normalized-type-as-schema claims and complete-source claims on legacy data. files: `crates/ui/src/trajectory/{inspector.rs,view.rs}`, `crates/proto/src/trajectory.rs`, `crates/engine/src/rpc.rs`. verify: native complete/legacy/sanitized/truncated/expired/unsupported cases and stale Reveal response isolation.
-- [ ] 7.4 Re-review the integrated producer-to-source privacy path, including logs, Voice, watch, export and journal behavior. files: P5/P6 integration diff and focused tests. verify: actual runtime fidelity evidence and no-leak sentinel checks; missing runtime capability blocks this phase rather than accepting static schema fallback.
+- [ ] 12.1 Add and implement `trajectory_diagnostics` source tests for owner-only filesystem access, safe opaque reference paths, bounded queue/writer/readers and typed failure. Files: new engine trajectory_diagnostics.rs plus lib/profile/sessions. Verify queue/disk/writer failure exposes diagnostic gaps while normalized execution/journal continue.
+- [ ] 12.2 Implement and test seven-day expiry, 128 MiB/profile oldest-first eviction, 1 MiB/field cap and original-size/fidelity metadata with injected clock/limits. Files: diagnostics/workspace_host/rpc. Verify serial retention, archive semantics, explicit diagnostic deletion and local/sync/Space Chat deletion preserve appropriate semantic/recovery data.
+- [ ] 12.3 Extend exact persisted-reference/version/field/ownership checks to diagnostic Reveal outside the async hot path; recheck lifecycle before returning. Files: engine rpc, RPC lib/method/tests/device_room, UI view/inspector. Verify cross-profile/forged/remote denial, transient retry and pending/revealed invalidation on source expiry/deletion, selection, close, Chat or profile change.
+- [ ] 12.4 Run diagnostic and `trajectory_reveal`/relay tests plus native off/armed/capturing/revoke/delete/Reveal flows. Independent privacy review must accept no-leak/authorization/retention/fail-open evidence before enabling complete source producers.
 
-## 8. Non-destructive historical enrichment
+## 13. T13 — Runtime schema and original received data
 
-**must_haves:** old calls correlate and recoverable context survives; enrichment is idempotent/restartable and revision-safe; journals and native newer fields remain intact. Covers R12–R14.
+- [ ] 13.1 Add `trajectory_source_fidelity` fixtures: catalog A→B, args with command/cwd/env/timeout, structured multiform result, sensitive examples and missing capability. Files: OMP RPC fixtures and engine tests. Verify expected historical source, sanitized defaults and explicit absence before producer implementation.
+- [ ] 13.2 Extract only necessary get_state.dumpTools schema after host-tool registration and catalog changes, deduplicated with observation provenance; omit systemPrompt. Files: OMP mod/protocol/process, proto, sessions/store. Verify actual installed-runtime snapshots, precision and unsupported capability without static-schema substitution.
+- [ ] 13.3 Capture original received args/result before normalization only under active policy; enforce no unnecessary raw clone/queue when off/revoked and bounded preservation of text/details/diff/image metadata/reference. Files: OMP normalize/mod, sessions/diagnostics. Verify opt-in field fidelity without following artifact paths or collecting inherited environment/credentials.
+- [ ] 13.4 Present source/fidelity/availability in schema/payload/result and re-review the integrated privacy boundary. Files: inspector/view/proto/rpc. Verify real runtime Reveal and a diagnostic-only sentinel absent from public AgentEvent, recovery additions, SQLite/watch, sync/export, Voice and logs; unsupported source leaves the affected fidelity acceptance pending.
 
-- [ ] 8.1 Add `trajectory_fidelity` integration reproduction with a temporary old-format profile and separate call/result/context records. Include existing native coverage, legacy marker and a subscriber at an earlier revision. files: new `crates/engine/tests/trajectory_fidelity.rs`. verify: `cargo test -p zeron-engine --test trajectory_fidelity` fails on the pre-enrichment contract and becomes the green acceptance signal.
-- [ ] 8.2 Add versioned lazy bounded enrichment markers/patches without resetting imports, deleting stores or changing source events. Preserve scoped correlation and only recover facts still in local source; treat source-proven synthetic zeros specifically, not all zeros. files: `crates/engine/src/{trajectory_store.rs,run_journal.rs}`, `crates/proto/src/trajectory.rs`. verify: idempotent rerun, missing/corrupt/oversized journal and partial recovery with existing history preserved.
-- [ ] 8.3 Integrate revision-safe enrichment delivery and reopen/crash behavior. Protect newer native information, full watermark semantics and existing recovery behavior. files: `crates/engine/src/{trajectory_store.rs,rpc.rs}`, `crates/engine/tests/{trajectory_fidelity.rs,restart_resume.rs}`. verify: integration reproduction passes; `cargo test -p zeron-engine trajectory_watch` and restart/resume contract remain green; journal source bytes are unchanged in the temporary fixture.
+## 14. T14 — Non-destructive history enrichment
 
-## 9. Integrated acceptance and contract closure
+- [ ] 14.1 Add failing `trajectory_fidelity` integration with old-format store, separate sources, known context, proven synthetic zeros, legacy import marker, newer native data and subscriber at old rev. Verify the expected before/after facts and recovery byte equality.
+- [ ] 14.2 Implement versioned lazy bounded enrichment independent of legacy-import and sanitization-repair markers, preserving identity/order and newer fields. Files: store/run_journal/proto. Verify idempotence, interrupted resume, missing/corrupt/oversized sources and no destructive rebuild; unrecoverable schemas/args/measurements stay absent.
+- [ ] 14.3 Deliver patches through ordered writer/rev and test concurrent native writes, reconnect and reopen. Files: store/rpc, trajectory_fidelity.rs/restart_resume.rs. Verify `cargo test -p zeron-engine --test trajectory_fidelity`, `--test restart_resume` and `trajectory_watch`; no duplicate rows or journal rewrite.
 
-**must_haves:** actual source→adapter→store→watch→projection→inspector behavior is observed; all R1–R14 have evidence; no runtime parity/retention/security gap is hidden by a green build.
+## 15. T15 — Quiet live navigation and measured scale
 
-- [ ] 9.1 Consolidate consumer-visible integration coverage and replace misleading all-fields-filled fixtures where they bypass the broken boundary. Keep regression tests that defend plausible behavior faults; do not add source-text/default assertions merely for coverage. files: `crates/engine/tests/trajectory_fidelity.rs`, `crates/harness/tests/omp_rpc.rs`, co-located `crates/ui/src/trajectory/{model.rs,inspector.rs,timeline.rs,view.rs}` tests. verify: separated source-event shape exercises the integrated path; duplicate replay/revisions converge.
-- [ ] 9.2 Resolve and run the repo's canonical focused suites, then integrated formatting/build/workspace gates once after concurrent mutations settle. Inspect native instructions and live command help before gates; a filtered command matching zero tests is not evidence. files: final affected code/tests. verify: executed commands and exits recorded, including focused bug signals and complete integration/build results; no hidden pipe failure.
-- [ ] 9.3 Launch the canonical isolated native GPUI verification surface with executable/profile provenance. Exercise live selection before completion, history/restart/reconnect, cross-page call/result, parallel tools/error/subagent, folds/scroll/range, mixed timing, usage, schema and complete-source off/on/revoke/delete. files: existing fixture surface `crates/ui/src/capture.rs` only where needed; no hosting-app restart. verify: normal/narrow widths, light/dark, real runtime chain and screenshot/output evidence per changed behavior.
-- [ ] 9.4 Run final independent Spec, Standards/privacy and Reality review on the integrated diff and fill the conformance table below from actual evidence. Return any unmet requirement to the same durable ticket as REVISE. files: final diff and evidence records. verify: no inferred pass from terminal status, build-only result or static demo; publication gates stay not yet due unless publication is separately authorized.
-- [ ] 9.5 After smoke proves behavior, update only affected DOX/Test Coverage Matrix and current architecture/design/functional/changelog contracts; remove throwaway probes. Do not mark unchecked implementation tasks complete or archive on planning validation alone. files: affected domain instructions, `ARCHITECTURE.md`, `DESIGN.md`, `FUNCTIONAL-BASELINE.html`, `fork_changelog.md`, this change's tasks/evidence. verify: documented fidelity/limits match native evidence; unrelated checkout work is untouched.
+- [ ] 15.1 Reproduce quiet-stream scrollback; add `trajectory_live_navigation` cases for explicit return, user movement versus pending jump, selection offscreen and stream faster than frame rate. Files: view/ledger/model/toolbar. Verify actual position-based behavior across wheel/trackpad/drag/keyboard and no implicit rearm.
+- [ ] 15.2 Keep explicit live-edge return available without a new watch item; retain the watch-side pre-catch-up guard, pending-jump distinction and two-row tolerance. Verify native scrollback with zero incoming events and selection during a pending live jump; pending counts exclude revisions of existing rows.
+- [ ] 15.3 Benchmark synthetic 20,373-event/12-run history with 10 deltas/s for 60 seconds on an identified optimized build/reference machine. Files: existing capture fixture and affected projection/render functions. Verify p95 input/selection feedback below 100 ms and no UI stall above 250 ms; record baseline and final measurements, not inferred performance.
+- [ ] 15.4 Optimize only measured projection/render bottlenecks with revision/query/fold invalidation and bounded/density-aware timeline painting if needed. Preserve virtualized ledger, deterministic event hit mapping, search/errors/selection and indexed operation lookup. Verify pure geometry/projection regressions and repeat the same native benchmark when changes are necessary.
+
+## 16. T16 — Integrated proof, review, acceptance and documentation
+
+- [ ] 16.1 Consolidate source-shaped adapter→capture→store→watch→projection/inspector integration, including failure, concurrency, pages, stale response, replay and reopen. Files: trajectory_fidelity.rs, omp_rpc.rs, co-located UI tests. Verify plausible behavior faults fail before fixes; perfect synthetic inspector records alone are insufficient.
+- [ ] 16.2 After focused suites pass and concurrent mutations settle, run `cargo fmt --all -- --check`, `cargo build`, `cargo test --workspace` and canonical `scripts/e2e-smoke.sh` after reading its DOX. Verify exact commands/exits/test counts; resolve affected failures and report external blockers without declaring passed checks.
+- [ ] 16.3 Execute all T16 native scenarios from the plan with actual supported OMP source plus isolated synthetic UI/scale fixtures, in light/dark, 599/600 px and low-height layouts. Verify editable search, folds/hidden selection, detail last line, quiet follow, timing/usage/schema/consent/Reveal and lifecycle using identified binary/profile; no hosting-app restart.
+- [ ] 16.4 Complete independent Spec, correctness/regression, privacy and Reality reviews of the integrated diff. Verify all R1–R22 have concrete test/native evidence in the ledger below; return blockers to their delivery instead of marking tasks complete on worker status alone.
+- [ ] 16.5 Update affected DOX/Test Coverage Matrix and current CONTEXT/architecture/design/functional/changelog/streaming-guide contracts only where behavior changed. Validate OpenSpec; archive only after implementation acceptance. Verify docs reflect actual native evidence, unrelated work is untouched and publication remains separately gated to the fork.
 
 ## Conformance Ledger
 
-A future ACCEPT requires every row to carry actual evidence and the reviewed tests that defend it. Pending rows below are deliberately not implementation claims.
+Pending entries are deliberate implementation gaps. Fill evidence only from executed tests and native observations.
 
-| Requirement | Main phase | Acceptance focus | Evidence |
+| Requirement | Deliveries | Acceptance focus | Evidence |
 |---|---|---|---|
-| R1 | P1 | Start/result share outcome and sources; event identity retained | pending |
-| R2 | P1/P2 | Scoped IDs, repeats, replay, cross-page operation | pending |
-| R3 | P1 | Missing result versus success/error/late completion | pending |
-| R4 | P2 | Consumed Turns, model Steps, independent Calls folds | pending |
-| R5 | P3 | Instants/intervals, mixed legacy and timing provenance | pending |
-| R6 | P4 | Context versus consumption, measured zero, dedup/cache | pending |
-| R7 | P6 | Observed schema, snapshot precision and unavailable source | pending |
-| R8 | P5/P6 | Opted-in original arguments/results, sanitized default | pending |
-| R9 | P5 | Next-run Chat/profile consent and restart clearing | pending |
-| R10 | P5/P6 | No diagnostic body in public/normalized/sync/export paths | pending |
-| R11 | P5/P6 | Source limits/errors/ownership and late-response invalidation | pending |
-| R12 | P7 | Recoverable history only, no journal rewrite/reset | pending |
-| R13 | P1/P7/P8 | Live/reopen/revision/page convergence, selection/scroll | pending |
-| R14 | P5/P7 | Bounded fail-open capture and semantic retention | pending |
+| R1 | T05/T06 | Complete operation, selected event retained | pending |
+| R2 | T05/T06/T07 | Scope, concurrency, updates, pages and replay | pending |
+| R3 | T05/T06 | Missing result, error, result-only, late result | pending |
+| R4 | T07/T08 | Consumed Turns, model Steps, independent tool folds | pending |
+| R5 | T09 | Instants/intervals, mixed legacy, provenance | pending |
+| R6 | T10 | Context/consumption/zero/cache/dedup | pending |
+| R7 | T13 | Observed schema and historical precision | pending |
+| R8 | T12/T13 | Opted-in original received args/results | pending |
+| R9 | T11/T12 | Next-run Chat/profile consent and clearing | pending |
+| R10 | T12/T13 | No diagnostic raw in public/normalized channels | pending |
+| R11 | T06/T12/T13 | Authorized references, bounds, lifecycle invalidation | pending |
+| R12 | T14 | Recoverable history without reset/journal rewrite | pending |
+| R13 | T06/T14/T16 | Live/reopen/rev/pages, stable selection/scroll | pending |
+| R14 | T12/T14 | Bounded fail-open capture and retention | pending |
+| R15 | T03 | Native editable search, IDs and clear | pending |
+| R16 | T08 | Hidden selection reveal and fold-independent dimming | pending |
+| R17 | T04 | Reachable long Inspector content and narrow return | pending |
+| R18 | T02/T14 | Legacy import/read/backfill sanitization | pending |
+| R19 | T04/T06 | Useful sanitized action summary with full metadata | pending |
+| R20 | T15 | Explicit return on quiet stream, no implicit rearm | pending |
+| R21 | T15 | Measured large-history responsiveness and identity | pending |
+| R22 | T16 | Native interaction and actual runtime chain evidence | pending |

@@ -1,6 +1,6 @@
 ## Context
 
-See `proposal.md` for motivation. The correction plan is `docs/plans/2026-09-06-0304-fix-trajectory-observability-fidelity-plan.md`; R/U/KTD references below resolve there.
+See `proposal.md` for motivation. The current execution plan is `docs/superpowers/plans/2026-09-22-trajectory-repair.md` (T01–T16, R1–R22). Historical U/KTD references below resolve to `docs/plans/2026-09-06-0304-fix-trajectory-observability-fidelity-plan.md`; they explain earlier decisions, not a second execution queue.
 
 Current capture emits separate start/result records; UI selection reads one record. `source_seq/sub_seq` is event position, while `rev` is the update cursor. The existing bounded writer, independent readers, legacy cutover and local Reveal authorization are load-bearing constraints. The OMP normalizer discards fields before journal capture. The local OMP source exposes turn/message/tool events and `get_state.dumpTools`, but source and installed executable versions have diverged.
 
@@ -8,7 +8,7 @@ Privacy boundary: ADR 0004 owns the sanitized read model; ADR 0005 requires expl
 
 ## Goals / Non-Goals
 
-**Goals:** One shared operation projection for all readers; observable boundaries and provenance; loss-aware diagnostics; replay-safe enrichment; protected bounded source retention; stable selection across live updates and pages.
+**Goals:** One shared operation projection for all readers; observable boundaries and provenance; loss-aware diagnostics; replay-safe enrichment; protected bounded source retention; functional search/scroll/folds; sanitized legacy reads and repairs; stable selection across live updates and pages.
 
 **Non-Goals:** Replacing recovery, broad event-journal refactoring, synchronized/raw export, global environment capture, provider HTTP interception, Worker trajectories, new billing telemetry or new runtime dependencies. This change does not implement the concurrent OMP chat-runtime-parity plan.
 
@@ -74,6 +74,28 @@ Operation correlation applies over existing event rows without rewriting them. A
 
 Alternative rejected: delete/rebuild Trajectory at boot or rewrite journals. Missing old schemas/arguments remain not captured; old timing absent from source stays sequence-only. Covers U7/KTD12.
 
+### D9. Immediate safe legacy reads and durable preview repair
+
+The legacy text/reasoning coalescers currently discard the sanitized preview and persist truncated original text. Use the existing sanitizer result for new imports. Protect reader output before serving any old rows, while a separate versioned repair processes already-persisted previews in bounded ordered-writer batches. Sanitize existing preview text without reading or rewriting recovery source; preserve IDs, references and other metadata. Advance rev for actual persisted changes so a prior subscriber receives the correction. Resume/repeat must be idempotent and must not reset legacy cutover/import markers.
+
+Alternative rejected: only fix future imports, or wait for background backfill before protecting watch. Those leave existing history unsafe during migration. Reader defense remains a defense-in-depth boundary after repair; serialization/search/default rendering must never promote Raw Reveal data into a preview. Covers T02/R18.
+
+### D10. Native controls and one presentation state
+
+Use the existing editable input used by pickers, with the entity/subscription owned by TrajectoryView. Toolbar renders the input; edit and clear update one query without feedback loops, focus stealing or Chat submission. Match sanitized metadata plus record/run/turn/step/call/parent identifiers. Dimming is computed over all loaded records independently of visible ledger rows. Selection expands only its required ancestors and scrolls to the existing semantic row, preserving unrelated overrides and the global fold policy.
+
+Inspector header and tabs remain fixed while the tab body owns vertical scrolling. Selection change resets detail scroll and Reveal; an update of the same selected event preserves the reader's position. Summary/ledger prioritize sanitized action, target and outcome, with complete technical metadata still reachable. Maintain 26 px ledger rows, the 600 px layout breakpoint and existing theme/accessibility patterns. A run's terminal outcome and the presence of recovered tool errors should be identified separately when the sources distinguish them.
+
+Alternative rejected: custom text editing or synthetic model-only tests for interaction. Reuse native input/scroll components and prove typing, clearing, reaching the last line and narrow return in GPUI. Covers T03/T04/T08 and R15–R17/R19.
+
+### D11. Live navigation and measured scale
+
+Keep an explicit live-edge return action available even when no watch event arrives after the user scrolls away. Any added offset observer uses the same pending-programmatic-jump distinction; retain the watch-side pre-catch-up guard, two-row tolerance and explicit-only rearm. Scrollback or explicit historical selection must not be undone by a queued live jump.
+
+Measure a synthetic 20,373-record/12-run history, not the user's private data. The execution plan sets a reference-machine interaction target of p95 below 100 ms and no UI stall over 250 ms during 10 deltas/s for 60 seconds; these are proposed acceptance targets, not audited performance claims. Cache/invalidate projections by records revision/query/fold instead of rebuilding unchanged data each render. Retain ledger virtualization; if painting needs density aggregation, preserve deterministic mapping to records, errors, matches and selection. One operation lookup remains indexed and bounded, never a whole-Chat load.
+
+Alternative rejected: assume that a virtualized ledger also bounds timeline/projection cost, or add a new analytics framework before measuring the existing implementation. Covers T15/R20/R21. T16/R22 requires native evidence for all repaired interactions and real runtime-to-inspector fidelity.
+
 ## Risks / Trade-offs
 
 - Installed OMP capability differs from reference source → U2/U4/U6 must inspect frames of the actual executable in an isolated run. Lack of schema/usage/boundary source blocks the affected fidelity acceptance; no invented endpoint or silent fallback. Any upstream runtime adaptation needs explicit authorization, not edits to the read-only reference checkout.
@@ -86,9 +108,9 @@ Alternative rejected: delete/rebuild Trajectory at boot or rewrite journals. Mis
 ## Migration Plan
 
 1. Before code edits, resolve actual checkout/baseline and native instructions, inspect active overlapping work, and validate installed runtime capabilities without restarting the hosting app. Create sanitized fixtures matching the source shape.
-2. Land shared projection/local operation lookup, then diagnostic envelope/boundaries. All optional wire fields decode old records. New local RPC unavailable on an older daemon is reported as unsupported, not authoritative empty data.
+2. Fix legacy sanitization/read protection first; land editable search and scroll independently, then shared projection/local operation lookup and diagnostic envelope/boundaries. All optional wire fields decode old records. New local RPC unavailable on an older daemon is reported as unsupported, not authoritative empty data.
 3. Integrate timing/usage. Integrate storage/control/Reveal with capture disabled until the privacy path passes; only then attach complete source producers and schema extraction.
 4. Apply additive storage migrations and lazy bounded enrichment. Preserve native write coverage, journal bytes, legacy imports and rev semantics. Exercise reopen/crash/replay in a temporary profile.
-5. Observe native GPUI and complete itemized conformance R1–R14. Update only affected current contracts/DOX/inventories; archive is a separate authorized completion step.
+5. Complete selection/fold/dimming/live navigation and measured-scale verification. Observe native GPUI and complete itemized conformance R1–R22. Update only affected current contracts/DOX/inventories; archive only after implementation and acceptance, never on planning validation.
 
 Rollback: disarm complete capture and prevent new writes before reverting code. Preserve semantic/journal data; do not downgrade schema destructively or reset a store. If the prior binary cannot read a new additive schema/source version, use a previously saved isolated verification profile to validate rollback and keep production data intact pending a compatible reader. Old code must never interpret unknown raw references as journal paths. Publication and any hosting-process restart remain separately authorized operations.

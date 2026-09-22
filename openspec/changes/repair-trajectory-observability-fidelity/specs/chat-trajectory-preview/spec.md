@@ -107,7 +107,7 @@ Test: integration
 
 ### Requirement: Duration, Turns, Calls, and Search controls
 
-The toolbar MUST provide Duration, Turns, Calls, and Search controls. Duration MUST switch between equal-width sequence geometry and recorded geometry for observed instants and intervals without presenting missing timing as measured data. Turns MUST fold turns independently from Calls folding tool calls under assistant steps. Calls folding MUST preserve interleaved model text and reasoning. Search and range focus MUST de-emphasize nonmatching records without removing chronological context. A sequence-only segment MUST NOT remove measured geometry from other segments or runs. Runtime execution duration and host-observed interval MUST be distinguished.
+The toolbar MUST provide working native Duration, Turns, Calls, and editable Search controls. Search MUST accept typing and paste and support explicit clearing, with available technical identifiers as well as sanitized text searchable. Duration MUST switch between equal-width sequence geometry and recorded geometry for observed instants and intervals without presenting missing timing as measured data. Turns MUST fold turns independently from Calls folding tool calls under assistant steps. Calls folding MUST preserve interleaved model text and reasoning. Search and range focus MUST de-emphasize nonmatching records without removing chronological context. A sequence-only segment MUST NOT remove measured geometry from other segments or runs. Runtime execution duration and host-observed interval MUST be distinguished.
 
 #### Scenario: Independent folding
 Test: unit
@@ -156,6 +156,27 @@ Test: unit
 - **THEN** only the affected timing is marked unavailable or invalid
 - **AND** other measured intervals and event selection remain usable without fabricated negative durations
 
+#### Scenario: Edit search in the native surface
+Test: none
+Reason: GPUI render/input has no automated headless harness in the owning DOX matrix; native typing, paste and clear evidence is mandatory in T03/T16, in addition to unit-tested query transitions.
+- **WHEN** the user focuses the search control and types or pastes a query
+- **THEN** the visible query is editable and immediately drives matching
+- **AND** clearing it resets both the input and matching state without losing chronological context
+- **AND** keyboard input does not submit a Chat message
+
+#### Scenario: Search by technical identity
+Test: unit
+- **WHEN** a query matches an available call, parent, run, turn, step or record identifier
+- **THEN** the corresponding records match alongside ordinary sanitized text matches
+- **AND** raw revealed content is not added to searchable default data
+
+#### Scenario: Search remains coherent through folding
+Test: unit
+- **GIVEN** a query distinguishes matching and nonmatching events
+- **WHEN** their ledger ancestors are folded or unfolded
+- **THEN** the same events remain matched or de-emphasized in the timeline
+- **AND** selection remains visually distinguishable from a search match
+
 ### Requirement: Hierarchical virtualized ledger
 
 The ledger MUST organize records as run, turn, step, and event in chronological order using observed boundaries and explicit unknown groups. Large trajectories MUST use stable semantic identities and preserve scroll anchoring during historical prepend, live append, folding, search, and selection. Selecting a tool whose related events are outside the loaded window SHALL resolve its operation without requiring all Chat history to be loaded. Selecting a hidden child SHALL make the required ancestor path visible without resetting unrelated fold preferences.
@@ -194,9 +215,23 @@ Test: unit
 - **THEN** the required ancestor path becomes visible
 - **AND** unrelated fold overrides, event identity and chronological context are preserved
 
+#### Scenario: Explicit return on a quiet stream
+Test: none
+Reason: Scroll/input rendering is native-only per the UI DOX; T15 also unit-tests the position and pending-jump decisions.
+- **GIVEN** the user scrolls away from the end and no new event arrives
+- **WHEN** the user wants to return to live following
+- **THEN** an explicit return action is accessible without waiting for a new event
+- **AND** merely scrolling back to the end does not automatically rearm following
+
+#### Scenario: Historical navigation wins over a pending live jump
+Test: unit
+- **WHEN** the user navigates to an older event while an automatic live-edge jump is pending
+- **THEN** the historical selection and viewport are preserved
+- **AND** automatic following resumes only by explicit user action
+
 ### Requirement: Internal synchronized inspector
 
-Selecting a timeline span or ledger row MUST synchronize timeline selection, ledger selection, and inspector content. The inspector MUST remain inside Trajectory rather than using the global Details sidebar, and MUST expose Summary, Payload, Result, Schema, and Timing views when corresponding data exists for the selected event or its correlated operation. The selected event identity and chronology MUST remain visible while related operation fields are resolved from their actual source events. Live completion SHALL update the selected call inspector without requiring reselection.
+Selecting a timeline span or ledger row MUST synchronize timeline selection, ledger selection, and inspector content. The inspector MUST remain inside Trajectory rather than using the global Details sidebar, and MUST expose Summary, Payload, Result, Schema, and Timing views when corresponding data exists for the selected event or its correlated operation. The selected event identity and chronology MUST remain visible while related operation fields are resolved from their actual source events. Live completion SHALL update the selected call inspector without requiring reselection. Detail content MUST remain scrollable to its end at supported widths, with header, tabs and narrow return accessible. Sanitized action, target and outcome SHALL precede technical identifiers when known, while complete identifiers remain accessible.
 
 #### Scenario: Inspect a tool result
 Test: unit
@@ -225,9 +260,33 @@ Test: integration
 - **THEN** both selections expose the same operation outcome and available input/output
 - **AND** each selection preserves its own event identity and chronological position
 
+#### Scenario: Read long detail content
+Test: none
+Reason: GPUI scroll reachability and responsive rendering require native evidence under the owning DOX; T04/T16 exercise each applicable tab at normal and narrow widths.
+- **GIVEN** Summary, Payload, Result, Schema or Timing contains more content than the panel height
+- **WHEN** the user scrolls within the detail body
+- **THEN** the last retained line is reachable and the header and tab controls remain accessible
+- **AND** long identifiers do not make content inaccessible
+- **AND** narrow detail retains a working return path
+
+#### Scenario: Detail position follows selection identity
+Test: unit
+- **WHEN** the selected record changes
+- **THEN** its detail position starts at the beginning and the previous Raw Reveal is cleared
+- **WHEN** the same selected record receives a live update
+- **THEN** the reader's detail position is preserved
+
+#### Scenario: Action context precedes technical metadata
+Test: unit
+- **WHEN** a tool event has a sanitized action name, target and authoritative outcome
+- **THEN** its ledger label and inspector summary identify those facts without requiring a raw reveal
+- **AND** full record and correlation identifiers remain accessible as technical metadata
+- **AND** missing targets or outcomes are not fabricated
+- **AND** available run terminal outcome is distinguishable from the fact that a subordinate tool encountered an error
+
 ### Requirement: Safe-by-default raw reveal
 
-Payload and Result MUST show sanitized representations by default. The user MAY explicitly reveal one raw local field only on the device that captured the event. Raw reveal MUST be temporary presentation state and MUST NOT change synchronized state, export, or the stored sanitized representation. Consent to capture complete source MUST NOT automatically reveal it. Reveal SHALL validate local ownership and the exact persisted source reference and field. Legacy normalized source and complete original source SHALL be identified distinctly, with explicit fidelity and availability. Late responses MUST NOT restore data after selection, view, profile, Chat or source invalidation.
+Payload and Result MUST show sanitized representations by default. The user MAY explicitly reveal one raw local field only on the device that captured the event. Raw reveal MUST be temporary presentation state and MUST NOT change synchronized state, export, or the stored sanitized representation. Consent to capture complete source MUST NOT automatically reveal it. Reveal SHALL validate local ownership and the exact persisted source reference and field. Legacy normalized source and complete original source SHALL be identified distinctly, with explicit fidelity and availability. Late responses MUST NOT restore data after selection, view, profile, Chat or source invalidation. Legacy imports and previously persisted previews MUST satisfy the same default sanitization boundary before any ordinary read or watch response; truncation alone is not sanitization. Repair MUST preserve event identities and recovery sources.
 
 #### Scenario: Reveal and clear a sensitive value
 Test: integration
@@ -268,6 +327,23 @@ Test: integration
 - **THEN** the inspector distinguishes the source fidelity or unavailability reason
 - **AND** no empty successful value is substituted
 - **AND** a transient failure permits an explicit retry without crossing selection or ownership boundaries
+
+#### Scenario: Legacy text and reasoning are safe before reveal
+Test: unit
+- **GIVEN** a legacy text or reasoning source contains a recognizable secret within its preview window
+- **WHEN** the source is imported and read through the default Trajectory view
+- **THEN** the secret is redacted from the persisted preview and default result
+- **AND** truncation alone is not treated as sanitization
+- **AND** the recovery source is unchanged
+
+#### Scenario: Previously persisted unsafe preview is repaired
+Test: integration
+- **GIVEN** an older store already contains an unredacted legacy preview
+- **WHEN** the upgraded reader serves history before background repair has completed
+- **THEN** the default response is sanitized immediately
+- **AND** bounded restartable repair replaces the unsafe persisted preview without changing event identity or recovery source
+- **AND** subscribers receive the persisted correction through a newer revision
+- **AND** repeating or interrupting repair does not duplicate events or reset legacy imports
 
 ### Requirement: Missing data remains unavailable
 
@@ -450,6 +526,7 @@ Test: integration
 Test: integration
 - **WHEN** retained source reaches seven days of age
 - **THEN** the source is expired and cannot be newly revealed
+- **AND** pending or currently revealed presentation of that source is invalidated
 - **AND** semantic records remain inspectable with source expiry identified
 
 #### Scenario: Explicit diagnostic deletion and Chat deletion
@@ -499,3 +576,24 @@ Test: integration
 - **WHEN** the runtime delivers an already-truncated result or external artifact reference
 - **THEN** the inspector identifies that representation as the original received source with its limitations
 - **AND** it does not claim the underlying unlimited stdout or artifact bytes were captured
+
+
+### Requirement: Responsive large-history navigation
+
+Trajectory SHALL keep search, selection, folding, detail scrolling and live updates usable with a history of at least twenty thousand events. Large-history presentation MUST preserve event identity, chronology, selected-event visibility, error indication and search matches. Any density aggregation SHALL retain a deterministic path to its represented events. Inspecting one operation MUST remain bounded independently of total Chat history.
+
+#### Scenario: Inspect a large history during live capture
+Test: none
+Reason: Native interaction latency and frame stalls require the measured GPUI exercise in T15/T16; unit tests separately cover geometry, mapping and projection correctness.
+- **GIVEN** a synthetic local history of 20,373 records across twelve runs
+- **WHEN** live events continue while the user searches, selects, folds and reads older details
+- **THEN** interactions remain responsive under the execution plan's recorded reference-machine budget
+- **AND** the selected event, user scroll position and chronological order are preserved
+- **AND** no raw production data is needed for the performance fixture
+
+#### Scenario: Dense timeline preserves navigation identity
+Test: unit
+- **WHEN** more events occupy a timeline region than can be painted separately
+- **THEN** a density representation preserves deterministic navigation to its represented events
+- **AND** error, match and selection states remain discoverable
+- **AND** changing density does not change event IDs or fabricate timing

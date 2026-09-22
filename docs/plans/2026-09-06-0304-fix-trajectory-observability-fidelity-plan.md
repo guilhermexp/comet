@@ -7,6 +7,8 @@ origin: docs/brainstorms/2026-09-01-comet-chat-trajectory-preview-requirements.m
 
 # fix: Trajectory observability fidelity
 
+> **Plano histórico.** A receita de execução vigente é [Trajectory Repair Implementation Plan, 2026-09-22](../superpowers/plans/2026-09-22-trajectory-repair.md), que incorpora este diagnóstico e os novos achados de interface e sanitização. A fila única de implementação fica em `openspec/changes/repair-trajectory-observability-fidelity/tasks.md`; os IDs R1–R14 deste documento permanecem como referência histórica.
+
 ## Summary
 
 Corrigir a fidelidade da Trajectory de ponta a ponta: operação correlacionada, hierarquia real, tempos utilizáveis, métricas honestas, schema observado e captura completa opt-in. Recuperar do histórico somente fatos ainda disponíveis. O plano não autoriza implementação, commit, reinício do app ou publicação.

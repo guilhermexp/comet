@@ -1,6 +1,6 @@
 ## Why
 
-The audited OMP Trajectory contains completed results for all 34 unique tools, while their 38 call records still appear Running; it also loses observed hierarchy, usable timing and context occupancy. Static schema descriptions and normalized-only raw arguments prevent the inspector from answering what actually ran.
+The 2026-09-22 audit confirmed the same fidelity failures on the user's current Chat: a snapshot contained 20,373 records with no turn/step identity, and 81 call records with matching results still appeared Running. The search field is not editable, long inspector content is clipped, and legacy import can persist unredacted preview text, so the feature needs functional UI repair as well as trustworthy operation, timing, usage and source data.
 
 ## What Changes
 
@@ -12,6 +12,10 @@ The audited OMP Trajectory contains completed results for all 34 unique tools, w
 - Add explicit next-run complete diagnostic capture for one Chat/profile, with a separate bounded local source and authorized ephemeral Reveal. Semantic sanitized capture remains always on.
 - Enrich recoverable history idempotently without resetting Trajectory or rewriting recovery journals; unavailable historical schemas/arguments remain unavailable.
 - Require end-to-end adapter/store/watch/projection coverage and native GPUI evidence, not only fabricated inspector fixtures.
+- Wire a real search input, technical-ID matching and consistent dimming across folded groups; make timeline selection reveal its required ledger path.
+- Make inspector content scrollable, put sanitized action/target/outcome before technical metadata, and preserve fixed-height ledger rows.
+- Correct legacy preview sanitization at import and read boundaries, and repair already-persisted previews without altering recovery journals.
+- Keep explicit live-edge return available on a quiet stream and verify responsiveness with a synthetic 20,373-event history.
 
 ## Capabilities
 
@@ -21,7 +25,7 @@ None; diagnostic capture belongs to the existing Trajectory capability.
 
 ### Modified Capabilities
 
-- `chat-trajectory-preview`: Correlated operation inspection, observed hierarchy/timing/usage/schema fidelity, opt-in complete source capture, bounded private retention and non-destructive historical enrichment.
+- `chat-trajectory-preview`: Correlated operation inspection, observed hierarchy/timing/usage/schema fidelity, functional search/folds/scroll/navigation, safe legacy previews, opt-in complete source capture, bounded private retention and non-destructive historical enrichment.
 
 ## Impact
 
@@ -32,4 +36,4 @@ None; diagnostic capture belongs to the existing Trajectory capability.
 - `crates/ui/src/trajectory`: Coherent inspector, folds, timing, usage/schema display, explicit opt-in and ephemeral Reveal.
 - No new dependency, synchronized document schema, Worker trajectory, provider billing/usage integration, raw export, or recovery-journal expansion is planned. Existing normalized transcript and journal behavior remains unchanged.
 
-Planning source: `docs/plans/2026-09-06-0304-fix-trajectory-observability-fidelity-plan.md` (R1–R14, U1–U8). Privacy decision: `docs/adr/0005-complete-trajectory-capture-is-opt-in.md`, complementing ADR 0004. This proposal does not authorize implementation, commit, publication or restart of the hosting Comet process.
+Current execution plan: `docs/superpowers/plans/2026-09-22-trajectory-repair.md` (T01–T16, R1–R22). The 2026-09-06 plan is historical context; its R1–R14 retain their meaning. Privacy decision: `docs/adr/0005-complete-trajectory-capture-is-opt-in.md`, complementing ADR 0004. This revision plans the repairs requested by the user; it does not record implementation, commit, publication or restart of the hosting Comet process.
