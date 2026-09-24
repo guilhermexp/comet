@@ -27,5 +27,5 @@
 ## 6. Docs and integration
 
 - [x] 6.1 Update the affected DOX (`crates/harness/AGENTS.md`, `crates/engine/AGENTS.md`, `crates/rpc/AGENTS.md`, new crate AGENTS.md if the repo convention requires it) and `CONTEXT.md` terms for agent-created chats; verify a DOX pass
-- [ ] 6.2 Full gate `cargo test --workspace`, `cargo build`, `cargo fmt --all --check` green
+- [x] 6.2 Full gate `cargo test --workspace`, `cargo build`, `cargo fmt --all --check` green
 - [ ] 6.3 Reality: in an isolated dev app (`scripts/dev-demo.sh` or the project's native recipe), from an orchestrator chat ask the agent to create a chat; observe the child in the sidebar, its first run answering the prompt with the parent's model, the caller not switching view, and the child's tool list without `sessions`; save evidence under `.tmp/verify/`
