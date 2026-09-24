@@ -5,10 +5,10 @@
 
 ## 2. Engine
 
-- [ ] 2.1 Persist `origin_chat_id` through `workspace_host` create/upsert and the registry doc; verify with a `workspace_host` test
-- [ ] 2.2 Implement the `SpawnChat` handler: parent config copy (row config), space resolution (default parent space / projectless device, explicit space, unknown space → error without creating), origin stamp, queue `Run`; verify with engine integration tests for inheritance after `setChatConfig`, space defaults and unknown space
-- [ ] 2.3 Stamp `RunRequest.sessions` in `dispatch_inner`, revive and `request_from_chat_row` (grant only with the workers grant + no origin + bound IPC endpoint; overwrite client values); keep secondary runs without it; verify with engine tests for human chat, child chat (first and later runs), forged payload, no endpoint and secondary builders
-- [ ] 2.4 Engine e2e with the mock harness: `SpawnChat` → `WatchChats` emits the child with origin → first run completes with the prompt as the user message; verify `cargo test -p zeron-engine --test e2e`
+- [x] 2.1 Persist `origin_chat_id` through `workspace_host` create/upsert and the registry doc; verify with a `workspace_host` test
+- [x] 2.2 Implement the `SpawnChat` handler: parent config copy (row config), space resolution (default parent space / projectless device, explicit space, unknown space → error without creating), origin stamp, queue `Run`; verify with engine integration tests for inheritance after `setChatConfig`, space defaults and unknown space
+- [x] 2.3 Stamp `RunRequest.sessions` in `dispatch_inner`, revive and `request_from_chat_row` (grant only with the workers grant + no origin + bound IPC endpoint; overwrite client values); keep secondary runs without it; verify with engine tests for human chat, child chat (first and later runs), forged payload, no endpoint and secondary builders
+- [x] 2.4 Engine e2e with the mock harness: `SpawnChat` → `WatchChats` emits the child with origin → first run completes with the prompt as the user message; verify `cargo test -p zeron-engine --test e2e`
 
 ## 3. comet-sessions server
 

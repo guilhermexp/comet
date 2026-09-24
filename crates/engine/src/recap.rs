@@ -526,6 +526,7 @@ mod tests {
         assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
         assert!(!request.auto_approve);
         assert!(!request.enable_workers_mcp);
+        assert!(request.sessions.is_none());
         assert!(request.resume.is_none());
     }
 

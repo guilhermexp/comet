@@ -678,6 +678,7 @@ mod tests {
             assert_eq!(request.model.as_deref(), Some("chosen-title-model"));
             assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
             assert!(!request.auto_approve);
+            assert!(request.sessions.is_none());
             assert!(request.resume.is_none());
             assert_ne!(std::path::Path::new(&request.cwd), dir.path());
             assert!(

@@ -476,6 +476,12 @@ impl EngineCore {
         zeron_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
     }
 
+    /// Remember the IPC endpoint this process bound. `comet-sessions` is
+    /// granted only after this call; a lost bind leaves the tool off.
+    pub fn note_local_ipc(&self, endpoint: &str) {
+        self.sessions.note_local_ipc(endpoint);
+    }
+
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
         let mut rpc = EngineRpc::new(
             self.sessions.clone(),
@@ -940,6 +946,9 @@ impl Engine {
             stop_tx,
         });
         let server = serve_ipc(config.ipc_port, service).await?;
+        runtime
+            .core()
+            .note_local_ipc(&format!("ws://127.0.0.1:{}", config.ipc_port));
 
         tokio::select! {
             result = shutdown_signal() => result?,

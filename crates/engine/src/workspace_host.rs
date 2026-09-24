@@ -913,7 +913,7 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
     ) -> Result<(), EngineError> {
-        self.create_chat_with_parent(chat_id, space_id, device_id, config, cwd, None)
+        self.insert_chat(chat_id, space_id, device_id, config, cwd, None, None)
     }
 
     /// [`create_chat`](Self::create_chat) recording the creating chat
@@ -926,6 +926,42 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
         parent_chat_id: Option<String>,
+    ) -> Result<(), EngineError> {
+        self.insert_chat(chat_id, space_id, device_id, config, cwd, parent_chat_id, None)
+    }
+
+    /// Same upsert as [`Self::create_chat`], with the parent chat recorded as
+    /// origin (`originChatId`) — the `sessions` tool's link.
+    pub fn create_child_chat(
+        &self,
+        chat_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
+        config: Option<ChatConfig>,
+        cwd: Option<String>,
+        origin_chat_id: &str,
+    ) -> Result<(), EngineError> {
+        self.insert_chat(
+            chat_id,
+            space_id,
+            device_id,
+            config,
+            cwd,
+            None,
+            Some(origin_chat_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_chat(
+        &self,
+        chat_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
+        config: Option<ChatConfig>,
+        cwd: Option<String>,
+        parent_chat_id: Option<String>,
+        origin_chat_id: Option<&str>,
     ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
@@ -974,6 +1010,7 @@ impl WorkspaceHost {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
+                origin_chat_id: origin_chat_id.map(str::to_owned),
             })
         })?;
         Ok(())
@@ -2861,5 +2898,47 @@ mod tests {
             .last_applied
             .clone();
         assert_eq!(last_applied, Some(current_set));
+    }
+
+    #[tokio::test]
+    async fn create_child_chat_persists_origin_on_the_same_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = super::WorkspaceHost::open(
+            store,
+            super::WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Host A".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.create_chat("parent", None, Some("dev-a"), None, None)
+            .unwrap();
+        host.create_child_chat("child", None, Some("dev-a"), None, Some("/tmp/child".into()), "parent")
+            .unwrap();
+        let child = host.chat("child").unwrap().unwrap();
+        assert_eq!(child.origin_chat_id.as_deref(), Some("parent"));
+        assert!(host.chat("parent").unwrap().unwrap().origin_chat_id.is_none());
+        host.flush();
+        let reopened = super::WorkspaceHost::open(
+            std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap()),
+            super::WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Host A".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.chat("child").unwrap().unwrap().origin_chat_id.as_deref(),
+            Some("parent")
+        );
     }
 }

@@ -1016,6 +1016,100 @@ impl EngineRpc {
         }
     }
 
+    fn spawn_chat(
+        &self,
+        params: zeron_proto::SpawnChatParams,
+    ) -> Result<zeron_proto::SpawnChatResult, RpcError> {
+        let prompt = params.prompt.trim();
+        if prompt.is_empty() {
+            return Err(RpcError::Failed("prompt is required".into()));
+        }
+        let prompt = prompt.to_owned();
+        let parent = self
+            .workspace
+            .chat(&params.parent_chat_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+            .ok_or_else(|| RpcError::Failed(format!("no such chat: {}", params.parent_chat_id)))?;
+        let (space_id, device_id, cwd) = if let Some(requested) = params
+            .space_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let space = self
+                .workspace
+                .space(requested)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .ok_or_else(|| RpcError::Failed(format!("no such space: {requested}")))?;
+            (Some(space.id), space.device_id, space.path)
+        } else if let Some(parent_space) = parent.space_id.clone() {
+            let space = self
+                .workspace
+                .space(&parent_space)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            match space {
+                Some(space) => (Some(space.id), space.device_id, space.path),
+                None => (
+                    Some(parent_space),
+                    parent.device_id.clone(),
+                    parent.cwd.clone().unwrap_or_else(|| "~".into()),
+                ),
+            }
+        } else {
+            (
+                None,
+                parent.device_id.clone(),
+                parent.cwd.clone().unwrap_or_else(|| "~".into()),
+            )
+        };
+        let chat_id = crate::new_id();
+        self.workspace
+            .create_child_chat(
+                &chat_id,
+                space_id.as_deref(),
+                Some(&device_id),
+                parent.config.clone(),
+                Some(cwd.clone()),
+                &parent.id,
+            )
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        let config = parent.config.as_ref();
+        let request = zeron_proto::RunRequest {
+            prompt,
+            harness: config.map(|config| config.harness),
+            model: config.and_then(|config| config.model.clone()),
+            reasoning: config.and_then(|config| config.reasoning),
+            model_options: config
+                .map(|config| config.model_options.clone())
+                .unwrap_or_default(),
+            cwd,
+            sandbox: config
+                .map(|config| config.sandbox)
+                .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
+            auto_approve: false,
+            enable_workers_mcp: true,
+            workers_parent_chat_id: None,
+            sessions: None,
+            attachments: Vec::new(),
+            resume: None,
+            worktree: None,
+        };
+        self.doc_host
+            .queue_command(
+                &chat_id,
+                SessionCommandPayload::Run {
+                    request,
+                    message_id: crate::new_id(),
+                },
+            )
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        Ok(zeron_proto::SpawnChatResult {
+            chat_id,
+            space_id,
+            device_id,
+        })
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -2427,6 +2521,10 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true, "version": version }))
+            }
+            methods::SPAWN_CHAT => {
+                let params: zeron_proto::SpawnChatParams = parse_params(params)?;
+                RpcReply::value(&self.spawn_chat(params)?)
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;

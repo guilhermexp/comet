@@ -4448,3 +4448,97 @@ async fn real_image_generation_profile_smoke() {
     );
     core.sessions.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.note_local_ipc("ws://127.0.0.1:43111");
+    core.workspace
+        .create_space(
+            "space-e2e",
+            &core.device_id,
+            "/tmp/e2e-space",
+            Some("E2E".into()),
+            false,
+        )
+        .unwrap();
+    core.workspace
+        .create_chat(
+            "parent-e2e",
+            Some("space-e2e"),
+            Some(&core.device_id),
+            Some(ChatConfig {
+                harness: HarnessId::Mock,
+                model: Some("parent-model".into()),
+                reasoning: Some(ReasoningLevel::High),
+                model_options: Default::default(),
+                sandbox: SandboxLevel::ReadOnly,
+            }),
+            None,
+        )
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let mut chats = client
+        .subscribe(zeron_rpc::methods::WATCH_CHATS, serde_json::Value::Null)
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), chats.recv()).await;
+    let created = client
+        .call(
+            zeron_rpc::methods::SPAWN_CHAT,
+            serde_json::json!({
+                "parentChatId": "parent-e2e",
+                "prompt": "e2e child prompt",
+            }),
+        )
+        .await
+        .unwrap();
+    let child_id = created["chatId"].as_str().unwrap().to_owned();
+    let mut saw_origin = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(200), chats.recv()).await
+        {
+            let rows: Vec<zeron_proto::Chat> = serde_json::from_value(frame).unwrap_or_default();
+            if rows.iter().any(|chat| {
+                chat.id == child_id && chat.origin_chat_id.as_deref() == Some("parent-e2e")
+            }) {
+                saw_origin = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_origin, "WatchChats emits the child with origin");
+    wait_for(
+        || {
+            let entries = core
+                .doc_host
+                .open(&child_id)
+                .ok()
+                .and_then(|handle| handle.doc().read_entries().ok())
+                .unwrap_or_default();
+            let prompt_landed = entries.iter().any(|entry| {
+                entry.role == MessageRole::User
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Text { text, .. } if text == "e2e child prompt")
+                    })
+            });
+            let finished = entries.iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            });
+            prompt_landed && finished
+        },
+        "child first run",
+    )
+    .await;
+    let child = core.workspace.chat(&child_id).unwrap().unwrap();
+    assert_eq!(child.config.as_ref().and_then(|config| config.model.as_deref()), Some("parent-model"));
+    core.shutdown().await;
+}

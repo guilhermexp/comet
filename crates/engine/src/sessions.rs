@@ -261,6 +261,9 @@ struct Inner {
     trajectory_tool_names: Mutex<HashMap<String, HashMap<String, String>>>,
     tombstoned_chats: Mutex<BoundedTombstones>,
     restart_gate: Mutex<Option<zeron_update::RestartGate>>,
+    /// Bound local IPC endpoint (`ws://127.0.0.1:<port>`). Empty when this
+    /// process lost the bind, so `comet-sessions` is not pointed at another engine.
+    local_ipc: Mutex<Option<String>>,
     #[cfg(test)]
     admission_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
@@ -270,6 +273,28 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Engine authority for `comet-sessions`. Client values are discarded.
+pub(crate) fn stamp_sessions(
+    request: &mut RunRequest,
+    chat_id: &str,
+    origin_chat_id: Option<&str>,
+    endpoint: Option<&str>,
+    engine_id: &str,
+) {
+    let origin = origin_chat_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let endpoint = endpoint.map(str::trim).filter(|value| !value.is_empty());
+    request.sessions = match (request.enable_workers_mcp, origin, endpoint) {
+        (true, None, Some(endpoint)) => Some(zeron_proto::SessionsGrant {
+            parent_chat_id: chat_id.to_owned(),
+            endpoint: endpoint.to_owned(),
+            engine_id: engine_id.to_owned(),
+        }),
+        _ => None,
+    };
 }
 
 fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String {
@@ -331,10 +356,39 @@ impl SessionsEngine {
                 trajectory_tool_names: Mutex::new(HashMap::new()),
                 tombstoned_chats: Mutex::new(BoundedTombstones::new(4096)),
                 restart_gate: Mutex::new(None),
+                local_ipc: Mutex::new(None),
                 #[cfg(test)]
                 admission_hook: Mutex::new(None),
             }),
         }
+    }
+
+    /// Record the endpoint this process actually bound. Dispatch refuses to
+    /// grant `sessions` until this is set.
+    pub fn note_local_ipc(&self, endpoint: &str) {
+        let endpoint = endpoint.trim();
+        if endpoint.is_empty() {
+            return;
+        }
+        *lock(&self.inner.local_ipc) = Some(endpoint.to_owned());
+    }
+
+    /// Overwrite any client-supplied grant. `sessions` exists only on an
+    /// orchestrator run (workers grant) of a chat with no origin, and only
+    /// while this engine has a bound IPC endpoint.
+    pub(crate) fn stamp_sessions_grant(&self, chat_id: &str, request: &mut RunRequest) {
+        let origin = self
+            .inner
+            .doc_host()
+            .and_then(|host| host.chat_origin(chat_id));
+        let endpoint = lock(&self.inner.local_ipc).clone();
+        stamp_sessions(
+            request,
+            chat_id,
+            origin.as_deref(),
+            endpoint.as_deref(),
+            &self.inner.device_id,
+        );
     }
 
     pub fn set_trajectory_store(&self, store: Arc<TrajectoryStore>) {
@@ -1039,6 +1093,7 @@ impl SessionsEngine {
         // cross-harness delivery before recording or routing the user turn.
         zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
             .map_err(EngineError::Other)?;
+        self.stamp_sessions_grant(chat_id, &mut request);
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -1501,6 +1556,7 @@ impl SessionsEngine {
                 request.prompt = prompt_text;
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
+                sessions.stamp_sessions_grant(&chat_id, &mut request);
                 let harness_id = host.harness_for_request(&chat_id, &request);
                 match host
                     .dispatch_with_source_context(

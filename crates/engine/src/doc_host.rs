@@ -4918,7 +4918,7 @@ impl DocHost {
             }
         };
         let config = chat.config;
-        Some(zeron_proto::RunRequest {
+        let mut request = zeron_proto::RunRequest {
             prompt: prompt.to_string(),
             harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),
@@ -4939,7 +4939,20 @@ impl DocHost {
             attachments: Vec::new(),
             resume: None,
             worktree: None,
-        })
+        };
+        if let Some(sessions) = self.sessions() {
+            sessions.stamp_sessions_grant(chat_id, &mut request);
+        }
+        Some(request)
+    }
+
+    /// Origin recorded when `sessions` opened this chat. `None` for composer chats.
+    pub(crate) fn chat_origin(&self, chat_id: &str) -> Option<String> {
+        self.workspace()?
+            .chat(chat_id)
+            .ok()
+            .flatten()?
+            .origin_chat_id
     }
 
     fn persist_snapshot(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
