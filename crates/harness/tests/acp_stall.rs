@@ -58,6 +58,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         auto_approve: true,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,

@@ -1488,6 +1488,7 @@ impl SessionsEngine {
                             auto_approve: false,
                             enable_workers_mcp: true,
                             workers_parent_chat_id: Some(chat_id.clone()),
+                            sessions: None,
                             attachments: Vec::new(),
                             resume: None,
                             worktree: None,
@@ -4644,6 +4645,7 @@ mod tests {
             worktree: None,
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
+            sessions: None,
         }
     }
 

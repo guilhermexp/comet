@@ -1545,6 +1545,7 @@ mod tests {
             auto_approve: true,
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
+            sessions: None,
             resume: None,
             attachments: Vec::new(),
             worktree: None,

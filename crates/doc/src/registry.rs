@@ -915,6 +915,7 @@ impl RegistryDoc {
                 chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
             ),
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+            ("originChatId", opt_str(chat.origin_chat_id.as_deref())),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())

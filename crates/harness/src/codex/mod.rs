@@ -1896,6 +1896,7 @@ mod tests {
             auto_approve: false,
             enable_workers_mcp: enabled,
             workers_parent_chat_id: Some("parent-chat".into()),
+            sessions: None,
             resume: None,
             attachments: Vec::new(),
             worktree: None,

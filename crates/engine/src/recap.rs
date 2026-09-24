@@ -411,6 +411,7 @@ pub async fn run_recap_model(
                 auto_approve: false,
                 enable_workers_mcp: false,
                 workers_parent_chat_id: None,
+                sessions: None,
                 attachments: Vec::new(),
                 resume: None,
                 worktree: None,

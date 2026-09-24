@@ -4935,6 +4935,7 @@ impl DocHost {
             auto_approve: false,
             enable_workers_mcp: true,
             workers_parent_chat_id: Some(chat_id.to_owned()),
+            sessions: None,
             attachments: Vec::new(),
             resume: None,
             worktree: None,

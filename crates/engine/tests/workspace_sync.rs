@@ -155,6 +155,7 @@ fn run_request(prompt: &str) -> RunRequest {
         auto_approve: true,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,

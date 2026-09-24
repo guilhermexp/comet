@@ -285,6 +285,7 @@ impl WorkspaceDoc {
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
         set_opt_str(&row, "parentChatId", chat.parent_chat_id.as_deref())?;
+        set_opt_str(&row, "originChatId", chat.origin_chat_id.as_deref())?;
         self.doc.commit();
         Ok(())
     }
@@ -735,6 +736,7 @@ pub(crate) struct RawChat {
     room_gen: Option<u32>,
     #[serde(default)]
     parent_chat_id: Option<String>,
+    origin_chat_id: Option<String>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -776,6 +778,7 @@ impl From<RawChat> for Chat {
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
+            origin_chat_id: raw.origin_chat_id,
         }
     }
 }
@@ -902,6 +905,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            origin_chat_id: None,
         }
     }
 

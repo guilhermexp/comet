@@ -124,6 +124,10 @@ pub struct RunRequest {
     /// engine stamps this field; UI and remote callers do not choose it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workers_parent_chat_id: Option<String>,
+    /// Engine-stamped grant for the `comet-sessions` MCP. Clients cannot
+    /// choose it: dispatch overwrites whatever arrived on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<SessionsGrant>,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -162,6 +166,16 @@ pub struct WorktreeSpec {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Authority the engine stamps onto an orchestrator run so `comet-sessions`
+/// can open native chats only on that engine, and only for that parent chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsGrant {
+    pub parent_chat_id: String,
+    pub endpoint: String,
+    pub engine_id: String,
 }
 
 /// The session-scoped singleton id for the live plan/todo chip. ACP plan
@@ -846,6 +860,7 @@ mod tests {
         assert!(req.attachments.is_empty());
         assert!(!req.enable_workers_mcp);
         assert_eq!(req.workers_parent_chat_id, None);
+        assert!(req.sessions.is_none());
         // …and an empty list serializes away (old readers never see it).
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("attachments").is_none());
@@ -886,6 +901,27 @@ mod tests {
             serde_json::to_value(request).unwrap()["workersParentChatId"],
             "chat-parent-1"
         );
+    }
+
+    #[test]
+    fn run_request_sessions_grant_defaults_and_round_trips() {
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.sessions.is_none());
+        let grant = SessionsGrant {
+            parent_chat_id: "parent".into(),
+            endpoint: "ws://127.0.0.1:9".into(),
+            engine_id: "engine-1".into(),
+        };
+        let req = RunRequest {
+            sessions: Some(grant.clone()),
+            ..req
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["sessions"]["parentChatId"], "parent");
+        assert_eq!(value["sessions"]["engineId"], "engine-1");
+        let round: RunRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round.sessions, Some(grant));
     }
 
     #[test]

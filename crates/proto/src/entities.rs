@@ -230,6 +230,10 @@ pub struct Chat {
     /// human started; a dangling id (parent deleted) is tolerated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
+    /// Parent chat when this row was opened by the `sessions` tool. Absent on
+    /// human-created chats and on rows written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_chat_id: Option<String>,
 }
 
 impl Chat {

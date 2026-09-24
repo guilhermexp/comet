@@ -119,6 +119,7 @@ fn run_payload(message_id: &str, repo_path: &str, space_id: Option<&str>) -> Ses
             auto_approve: true,
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
+            sessions: None,
             attachments: Vec::new(),
             resume: None,
             worktree: Some(WorktreeSpec {

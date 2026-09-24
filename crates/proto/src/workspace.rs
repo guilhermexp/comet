@@ -61,6 +61,26 @@ impl EngineInfo {
     }
 }
 
+/// `SpawnChat` request: open a child native chat and queue its first run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnChatParams {
+    pub parent_chat_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+}
+
+/// `SpawnChat` reply. `space_id` is absent when the child is projectless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnChatResult {
+    pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    pub device_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +101,33 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn spawn_chat_params_round_trip_and_default_space() {
+        let bare: SpawnChatParams = serde_json::from_value(serde_json::json!({
+            "parentChatId": "parent",
+            "prompt": "do the thing",
+        }))
+        .unwrap();
+        assert_eq!(bare.space_id, None);
+        let full = SpawnChatParams {
+            parent_chat_id: "parent".into(),
+            prompt: "do the thing".into(),
+            space_id: Some("space-1".into()),
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["spaceId"], "space-1");
+        assert_eq!(serde_json::from_value::<SpawnChatParams>(value).unwrap(), full);
+        let result = SpawnChatResult {
+            chat_id: "child".into(),
+            space_id: None,
+            device_id: "device-1".into(),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(value.get("spaceId").is_none());
+        assert_eq!(value["chatId"], "child");
+        assert_eq!(serde_json::from_value::<SpawnChatResult>(value).unwrap(), result);
+    }
+
     fn engine_info_uses_camel_case_fields() {
         let info = EngineInfo {
             device_id: "device-1".into(),

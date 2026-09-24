@@ -9158,6 +9158,7 @@ impl Composer {
                             auto_approve: false,
                             enable_workers_mcp: true,
                             workers_parent_chat_id: None,
+                            sessions: None,
                             resume: None,
                             attachments: attachment_paths,
                             worktree: run_worktree,

@@ -189,6 +189,10 @@ rpc_methods! {
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     MUTATE / Mutate = "Mutate" { params: serde_json::Value, reply: serde_json::Value },
+    /// Create a child native chat from a parent row and queue its first run.
+    /// Params `{parentChatId, prompt, spaceId?}`; reply `{chatId, spaceId?, deviceId}`.
+    /// Local IPC only: the caller is the engine-stamped sessions server.
+    SPAWN_CHAT / SpawnChat = "SpawnChat" { params: zeron_proto::SpawnChatParams, reply: zeron_proto::SpawnChatResult, local_only: true },
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     LOCAL_DEVICE / LocalDevice = "LocalDevice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },

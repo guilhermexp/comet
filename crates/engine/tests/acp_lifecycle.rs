@@ -63,6 +63,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
                 auto_approve: true,
                 enable_workers_mcp: false,
                 workers_parent_chat_id: None,
+                sessions: None,
                 attachments: Vec::new(),
                 worktree: None,
                 resume: None,
