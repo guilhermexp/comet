@@ -718,6 +718,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 parent_chat_id: None,
                 space_id: Some("space-legacy".into()),
                 last_seen_at: Some(now),
+                origin_chat_id: None,
             })
             .unwrap();
         legacy

@@ -4946,13 +4946,20 @@ impl DocHost {
         Some(request)
     }
 
-    /// Origin recorded when `sessions` opened this chat. `None` for composer chats.
-    pub(crate) fn chat_origin(&self, chat_id: &str) -> Option<String> {
-        self.workspace()?
-            .chat(chat_id)
-            .ok()
-            .flatten()?
-            .origin_chat_id
+    /// Lineage read from the chat row. A missing workspace, a missing row or
+    /// a read error is `Unknown`, never `Root`: the grant fails closed.
+    pub(crate) fn chat_origin(&self, chat_id: &str) -> crate::sessions::ChatOrigin {
+        use crate::sessions::ChatOrigin;
+        let Some(workspace) = self.workspace() else {
+            return ChatOrigin::Unknown;
+        };
+        match workspace.chat(chat_id) {
+            Ok(Some(chat)) => match chat.origin_chat_id {
+                None => ChatOrigin::Root,
+                Some(_) => ChatOrigin::Spawned,
+            },
+            Ok(None) | Err(_) => ChatOrigin::Unknown,
+        }
     }
 
     fn persist_snapshot(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
@@ -5561,6 +5568,38 @@ mod abandoned_recovery_tests {
             .save_snapshot("other", &other.export_snapshot().unwrap())
             .unwrap();
         assert_eq!(host.peek_needs_abandoned_recovery("other"), false);
+    }
+
+    #[tokio::test]
+    async fn chat_origin_is_unknown_unless_the_row_was_read() {
+        use crate::sessions::ChatOrigin;
+        let (dir, host) = host_with_store();
+        assert_eq!(host.chat_origin("any"), ChatOrigin::Unknown, "no workspace");
+
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store"));
+        let workspace = crate::workspace_host::WorkspaceHost::open(
+            store,
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Host A".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .expect("workspace");
+        workspace
+            .create_chat("root", None, Some("dev-a"), None, None)
+            .unwrap();
+        workspace
+            .create_child_chat("child", None, Some("dev-a"), None, None, "root")
+            .unwrap();
+        host.set_workspace(workspace);
+
+        assert_eq!(host.chat_origin("missing"), ChatOrigin::Unknown, "no row");
+        assert_eq!(host.chat_origin("root"), ChatOrigin::Root);
+        assert_eq!(host.chat_origin("child"), ChatOrigin::Spawned);
     }
 }
 

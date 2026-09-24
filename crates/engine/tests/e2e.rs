@@ -4503,7 +4503,8 @@ async fn spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt() {
     let mut saw_origin = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(200), chats.recv()).await
+        if let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(200), chats.recv()).await
         {
             let rows: Vec<zeron_proto::Chat> = serde_json::from_value(frame).unwrap_or_default();
             if rows.iter().any(|chat| {
@@ -4539,6 +4540,12 @@ async fn spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt() {
     )
     .await;
     let child = core.workspace.chat(&child_id).unwrap().unwrap();
-    assert_eq!(child.config.as_ref().and_then(|config| config.model.as_deref()), Some("parent-model"));
+    assert_eq!(
+        child
+            .config
+            .as_ref()
+            .and_then(|config| config.model.as_deref()),
+        Some("parent-model")
+    );
     core.shutdown().await;
 }

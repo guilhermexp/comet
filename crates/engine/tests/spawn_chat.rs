@@ -14,8 +14,8 @@ use zeron_doc::{
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
-    SandboxLevel, SessionsGrant, SteeringMode,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    SessionsGrant, SteeringMode,
 };
 
 type RequestLog = Arc<Mutex<Vec<(String, RunRequest)>>>;
@@ -290,9 +290,10 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
             tokio::time::timeout(Duration::from_millis(200), chats.recv()).await
         {
             let rows: Vec<zeron_proto::Chat> = serde_json::from_value(frame).unwrap_or_default();
-            if rows.iter().any(|chat| {
-                chat.id == child_id && chat.origin_chat_id.as_deref() == Some("parent")
-            }) {
+            if rows
+                .iter()
+                .any(|chat| chat.id == child_id && chat.origin_chat_id.as_deref() == Some("parent"))
+            {
                 saw_origin = true;
                 break;
             }
@@ -307,7 +308,10 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
     wait_for(|| assistant_complete(&core, &child_id), "child first run").await;
     assert_eq!(user_text(&core, &child_id), vec!["child prompt".to_owned()]);
     let first = &requests_for(&log, &child_id)[0];
-    assert!(first.sessions.is_none(), "child first run has no sessions grant");
+    assert!(
+        first.sessions.is_none(),
+        "child first run has no sessions grant"
+    );
     assert!(first.enable_workers_mcp);
     assert_eq!(
         first.workers_parent_chat_id.as_deref(),
@@ -340,7 +344,10 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
     )
     .await;
     let later = &requests_for(&log, &child_id)[1];
-    assert!(later.sessions.is_none(), "forged sessions grant is overwritten");
+    assert!(
+        later.sessions.is_none(),
+        "forged sessions grant is overwritten"
+    );
     assert_eq!(
         later.workers_parent_chat_id.as_deref(),
         Some(child_id.as_str())

@@ -275,20 +275,28 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Lineage of a chat as far as the engine could read its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatOrigin {
+    /// Row read, no `origin_chat_id`: a human-opened chat.
+    Root,
+    /// Row read, opened by `sessions`.
+    Spawned,
+    /// No doc host, no row or a read error.
+    Unknown,
+}
+
 /// Engine authority for `comet-sessions`. Client values are discarded.
 pub(crate) fn stamp_sessions(
     request: &mut RunRequest,
     chat_id: &str,
-    origin_chat_id: Option<&str>,
+    origin: ChatOrigin,
     endpoint: Option<&str>,
     engine_id: &str,
 ) {
-    let origin = origin_chat_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
     let endpoint = endpoint.map(str::trim).filter(|value| !value.is_empty());
     request.sessions = match (request.enable_workers_mcp, origin, endpoint) {
-        (true, None, Some(endpoint)) => Some(zeron_proto::SessionsGrant {
+        (true, ChatOrigin::Root, Some(endpoint)) => Some(zeron_proto::SessionsGrant {
             parent_chat_id: chat_id.to_owned(),
             endpoint: endpoint.to_owned(),
             engine_id: engine_id.to_owned(),
@@ -374,18 +382,18 @@ impl SessionsEngine {
     }
 
     /// Overwrite any client-supplied grant. `sessions` exists only on an
-    /// orchestrator run (workers grant) of a chat with no origin, and only
+    /// orchestrator run (workers grant) of a chat whose row reads as root, and only
     /// while this engine has a bound IPC endpoint.
     pub(crate) fn stamp_sessions_grant(&self, chat_id: &str, request: &mut RunRequest) {
         let origin = self
             .inner
             .doc_host()
-            .and_then(|host| host.chat_origin(chat_id));
+            .map_or(ChatOrigin::Unknown, |host| host.chat_origin(chat_id));
         let endpoint = lock(&self.inner.local_ipc).clone();
         stamp_sessions(
             request,
             chat_id,
-            origin.as_deref(),
+            origin,
             endpoint.as_deref(),
             &self.inner.device_id,
         );
@@ -5870,5 +5878,48 @@ mod tests {
 
         // Release stream barrier so run completes cleanly:
         let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn sessions_grant_requires_a_root_row_and_fails_closed_otherwise() {
+        use super::{ChatOrigin, stamp_sessions};
+        let forged = zeron_proto::SessionsGrant {
+            parent_chat_id: "forged".into(),
+            endpoint: "ws://127.0.0.1:1".into(),
+            engine_id: "forged-engine".into(),
+        };
+        let orchestrator = || RunRequest {
+            enable_workers_mcp: true,
+            sessions: Some(forged.clone()),
+            ..request()
+        };
+
+        let mut root = orchestrator();
+        stamp_sessions(
+            &mut root,
+            "chat",
+            ChatOrigin::Root,
+            Some("ws://127.0.0.1:9"),
+            "engine",
+        );
+        let grant = root.sessions.expect("root row with endpoint is granted");
+        assert_eq!(grant.parent_chat_id, "chat");
+        assert_eq!(grant.endpoint, "ws://127.0.0.1:9");
+        assert_eq!(grant.engine_id, "engine");
+
+        for origin in [ChatOrigin::Spawned, ChatOrigin::Unknown] {
+            let mut denied = orchestrator();
+            stamp_sessions(
+                &mut denied,
+                "chat",
+                origin,
+                Some("ws://127.0.0.1:9"),
+                "engine",
+            );
+            assert!(
+                denied.sessions.is_none(),
+                "{origin:?} never receives sessions"
+            );
+        }
     }
 }
