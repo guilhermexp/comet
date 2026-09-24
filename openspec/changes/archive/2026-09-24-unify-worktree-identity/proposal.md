@@ -78,20 +78,26 @@ question:
 
 ### Modified Capabilities
 
-- `workers-project-identity`: one verdict per project, and every caller that
-  acts on a worktree — launch, remove, rename, badge — reads it.
+- `workers-repository-identity`: one verdict per project, and the launch path
+  reads it.
 
-The capability is not in `openspec/specs/` yet, and three live changes write to
-it: `distinguish-worktrees-from-groups` (which declares it New),
-`adopt-external-worktrees`, and this one. Whichever archives first creates the
-spec, so this delta is split to say what it adds and what it replaces:
+Drafted against a `workers-project-identity` capability that never reached
+`openspec/specs/`. `stabilize-workers-project-identity` archived first
+(2026-09-18) as `workers-repository-identity` and took over two of this
+change's three ADDED requirements, so the delta was reconciled on 2026-09-23:
 
-- ADDED — launch, removal ownership and the pull-request badge. No other change
-  states them.
+- ADDED — launch only. Removal ownership is now stated by
+  `workers-repository-identity` ("Actions respect checkout availability and
+  ownership"): an adopted checkout is ARCHIVED, never de-registered by a
+  remove, and physical deletion needs an app-owned linked worktree. The
+  pull-request badge is stated by `workers-sidebar-context` ("Consistent
+  checkout context"), which also extends it to ordinary checkouts — the
+  "only a worktree has a pull request" gate this proposal describes above is
+  no longer the shipped behavior.
 - MODIFIED `A worktree never projects as a group` — the group predicate from
   `distinguish-worktrees-from-groups`, restated as one verdict computed before
-  the object is built, and extended to the removal, menu and confirmation
-  routing that reads it.
+  the object is built, and extended to the menu and confirmation routing that
+  reads it.
 - MODIFIED `A linked worktree is recognised from its checkout` — disk detection
   from `adopt-external-worktrees`, whose unqualified "report the checked-out
   branch as the project's worktree branch" is the clause a detached HEAD breaks.
@@ -99,7 +105,7 @@ spec, so this delta is split to say what it adds and what it replaces:
 
 Archive order is therefore `distinguish-worktrees-from-groups` →
 `adopt-external-worktrees` → this change. `openspec validate --strict` already
-refuses the MODIFIED delta while the spec is absent, so the order enforces
+refuses a MODIFIED requirement the spec does not hold yet, so the order enforces
 itself.
 
 ## Impact
@@ -126,9 +132,9 @@ itself.
 
 ## Integration follow-up — 2026-09-18
 
-[`stabilize-workers-project-identity`](../stabilize-workers-project-identity/proposal.md)
+[`stabilize-workers-project-identity`](../2026-09-18-stabilize-workers-project-identity/proposal.md)
 extends the Workers/Projects path with durable repository membership, explicit
 checkout ownership/availability and history-preserving lifecycle actions. Its
-[verification report](../../../docs/verification/2026-09-18-workers-project-identity.md)
+[verification report](../../../../docs/verification/2026-09-18-workers-project-identity.md)
 records the integrated evidence. This cross-reference does not mark this
 change's independent tasks or engine-specific checks complete.

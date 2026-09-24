@@ -22,10 +22,19 @@
 - [x] 2.4 Probe against the real `~/.unpeel/app-state.json`: 9 of 47 projects
       project as worktrees with their branch, 4 of them nested under the
       registered repository they are a checkout of.
-- [ ] 2.5 Visual check on `scripts/dev-demo.sh`: `jk-wt-correios` and
+- [x] 2.5 Visual check on `scripts/dev-demo.sh`: `jk-wt-correios` and
       `jk-wt-assets` nest under `JK Distribuição` with their branch names.
 
 ## 3. Closeout
 
 - [x] 3.1 Record disk detection in `crates/workers-unpeel/AGENTS.md`.
-- [ ] 3.2 Archive once 2.5 is confirmed.
+- [x] 3.2 Archive once 2.5 is confirmed.
+
+## Closeout note
+
+Closed 2026-09-24 on the user's go-ahead, without a dedicated visual pass.
+Suites green: `unpeel-core` (668), `zeron-workers-unpeel`, `zeron-ui` (1416),
+`cargo fmt --all --check`.
+Partial evidence: a Settings ▸ Projects screenshot on 2026-09-23 showed the
+live JK Distribuição worktrees grouped under it with their branch names
+(`jk-wt-correios`/`jk-wt-assets` no longer exist on disk).

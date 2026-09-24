@@ -38,7 +38,7 @@ falls out of the path the projection has already read.
 
 ### Modified Capabilities
 
-- `workers-project-identity`: a worktree is recognised by its checkout, not
+- `workers-repository-identity`: a worktree is recognised by its checkout, not
   only by its registration.
 
 ## Impact
@@ -55,9 +55,9 @@ falls out of the path the projection has already read.
 
 ## Integration follow-up — 2026-09-18
 
-[`stabilize-workers-project-identity`](../stabilize-workers-project-identity/proposal.md)
+[`stabilize-workers-project-identity`](../2026-09-18-stabilize-workers-project-identity/proposal.md)
 extends the Workers/Projects path with durable repository membership, explicit
 checkout ownership/availability and history-preserving lifecycle actions. Its
-[verification report](../../../docs/verification/2026-09-18-workers-project-identity.md)
+[verification report](../../../../docs/verification/2026-09-18-workers-project-identity.md)
 records the integrated evidence. This cross-reference does not mark this
 change's independent tasks or engine-specific checks complete.

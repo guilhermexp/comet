@@ -19,4 +19,4 @@
 ## 3. Closeout
 
 - [x] 3.1 Record the rule in `crates/engine/AGENTS.md`.
-- [ ] 3.2 Archive once verified.
+- [x] 3.2 Archive once verified.

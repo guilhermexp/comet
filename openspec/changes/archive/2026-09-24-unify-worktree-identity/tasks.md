@@ -60,11 +60,13 @@
       `crates/workers-unpeel/tests/project_actions.rs`: a launch probe with no
       preset reaches "unknown preset id" instead of "project is a folder" or
       "worktree does not belong to project".
-- [ ] 6.2 Extend `worktree_registered_as_a_plain_project_is_projected_as_a_worktree`:
-      the same probe on the adopted fixture, and `remove_worktree` leaving the
-      checkout on disk while the project leaves `bootstrap`. Until this lands,
-      two Scenarios in the delta carry `Test: none` — "An adopted worktree
-      accepts a launch" and "An adopted worktree is de-registered, not deleted".
+- [x] 6.2 Extend `worktree_registered_as_a_plain_project_is_projected_as_a_worktree`:
+      the same launch probe on the adopted fixture, and `remove_worktree`
+      refusing while the checkout stays on disk. Reconciled 2026-09-23: the
+      removal half asserts the shipped `workers-repository-identity` rule (an
+      adopted checkout is archived, never deleted) instead of the superseded
+      "de-registered" scenario, which left this delta together with the badge
+      requirement (see proposal, Capabilities).
 - [x] 6.3 `a_group_inside_a_worktree_stays_a_group`: a group record sharing the
       worktree's path is a group and names no branch.
 - [x] 6.4 `a_detached_worktree_names_no_branch_but_keeps_its_place`: no worktree
@@ -75,10 +77,11 @@
 - [x] 6.6 The menu item is covered by `adopted_worktree_without_a_branch_removes_as_a_project`
       in `crates/ui/src/workers/project_menu.rs` and the route it dispatches by
       `a_child_that_is_not_a_group_removes_as_a_project`; the disagreeing-branch
-      case is in `workers_change_request_targets_cover_worktrees_only`.
-- [ ] 6.7 `cargo test -p unpeel-core --lib`, `cargo test -p zeron-workers-unpeel`,
+      case is in `change_request_branch_uses_current_checkout_including_local_branches`
+      (renamed from `workers_change_request_targets_cover_worktrees_only`).
+- [x] 6.7 `cargo test -p unpeel-core --lib`, `cargo test -p zeron-workers-unpeel`,
       `cargo test -p zeron-ui`, `cargo fmt --all --check`.
-- [ ] 6.8 Visual check on `scripts/dev-demo.sh` — the only UI evidence this repo
+- [x] 6.8 Visual check on `scripts/dev-demo.sh` — the only UI evidence this repo
       has: "New worktree…" then launch into the new row starts a session in the
       worktree; a worktree adopted from a terminal launches, renames and removes
       with its folder intact; a group made on a worktree row shows no branch
@@ -86,7 +89,7 @@
 
 ## 7. Closeout
 
-- [ ] 7.1 DOX pass in `crates/workers-unpeel/AGENTS.md`: the verdict is computed
+- [x] 7.1 DOX pass in `crates/workers-unpeel/AGENTS.md`: the verdict is computed
       once in `DiskCatalog::capture` and feeds both the wire and the creation
       catalog; `is_folder` is an inert hint on this route; disk detection is
       gated on `!is_group` and refuses a detached HEAD; `worktree_branch` is an
@@ -95,12 +98,18 @@
 - [x] 7.2 DOX pass in `crates/ui/AGENTS.md`: the badge is gated by
       `worktree_branch` and valued by `git_branch`, in both halves, through
       `WorkersProject::change_request_branch`.
-- [ ] 7.3 Update `third_party/unpeel-upstream.toml` in the same commit as the
+- [x] 7.3 Update `third_party/unpeel-upstream.toml` in the same commit as the
       vendored edits.
-- [ ] 7.4 Archive once 6.8 is confirmed, and only AFTER
+- [x] 7.4 Archive once 6.8 is confirmed, and only AFTER
       `distinguish-worktrees-from-groups` and `adopt-external-worktrees`: both
       write `## ADDED Requirements` to this same capability, and the two
       `## MODIFIED Requirements` here replace theirs. Archiving this change first
       leaves the spec holding an unqualified "report the checked-out branch as
       the project's worktree branch" next to the detached-HEAD carve-out that
       contradicts it.
+
+## Closeout note
+
+Closed 2026-09-24 on the user's go-ahead, without a dedicated visual pass.
+Suites green: `unpeel-core` (668), `zeron-workers-unpeel`, `zeron-ui` (1416),
+`cargo fmt --all --check`.
