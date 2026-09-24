@@ -94,11 +94,13 @@ pub fn matches_query(row: &ProjectRow, query: &str) -> bool {
 /// O novo nome, ou `None` quando não há o que salvar. Vazio e inalterado voltam
 /// `None` — é o que faz o campo reverter em vez de gravar lixo. Pura.
 pub fn resolve_rename(input: &str, current: &str) -> Option<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() || trimmed == current {
+    // The field is the multiline composer input, so Shift+Enter can put a
+    // newline in the middle of a name; a project name is one line.
+    let collapsed = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() || collapsed == current {
         return None;
     }
-    Some(trimmed.to_owned())
+    Some(collapsed)
 }
 
 fn commands_from_editor(text: &str) -> Vec<String> {
@@ -1165,13 +1167,16 @@ impl ProjectsPage {
                         filesystem_available,
                         cx,
                     ))
-                    .child(widgets::page_header(theme, "Config", None))
+                    .when_some(self.render_association(theme, &row, cx), |el, card| {
+                        el.child(section_header(theme, "Association")).child(card)
+                    })
+                    .child(section_header(theme, "Config"))
                     .child(self.render_config(theme, &detail, filesystem_available, cx))
-                    .child(widgets::page_header(theme, "Worktree", None))
+                    .child(section_header(theme, "Worktree"))
                     .child(self.render_worktree(theme, &row, &detail, runnable, cx))
-                    .child(widgets::page_header(theme, "Auto Doc", None))
+                    .child(section_header(theme, "Auto Doc"))
                     .child(self.render_auto_doc(theme, &row, &detail, runnable, cx))
-                    .child(widgets::page_header(theme, "Danger Zone", None))
+                    .child(section_header(theme, "Danger Zone"))
                     .child(self.render_danger(theme, &row, cx)),
             )
             .into_any_element()
@@ -1184,21 +1189,22 @@ impl ProjectsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.selected.as_deref();
+        let home = dirs_home();
+        let count = group.checkouts.len();
         let rows: Vec<AnyElement> = group
             .checkouts
             .iter()
             .map(|checkout| {
                 let path = checkout.path.clone();
                 let is_selected = selected == Some(checkout.path.as_str());
-                let branch = checkout
-                    .display_branch()
-                    .map(|branch| format!(" · {branch}"))
-                    .unwrap_or_default();
+                let primary = checkout.checkout_kind == Some(project_ledger::CheckoutKind::Primary);
+                // Available is the norm and says nothing: only the exceptions
+                // earn a pill.
                 let status = match checkout.checkout_availability {
-                    Some(project_ledger::CheckoutAvailability::Available) => "Available",
-                    Some(project_ledger::CheckoutAvailability::Missing) => "Unavailable",
-                    Some(project_ledger::CheckoutAvailability::ProbeFailed) => "Probe failed",
-                    None => "Status unknown",
+                    Some(project_ledger::CheckoutAvailability::Available) => None,
+                    Some(project_ledger::CheckoutAvailability::Missing) => Some("Unavailable"),
+                    Some(project_ledger::CheckoutAvailability::ProbeFailed) => Some("Probe failed"),
+                    None => Some("Unknown"),
                 };
                 div()
                     .id(SharedString::from(format!(
@@ -1208,53 +1214,88 @@ impl ProjectsPage {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .py(px(6.0))
-                    .rounded(px(6.0))
+                    .gap(px(10.0))
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(8.0))
                     .cursor_pointer()
                     .when(is_selected, |el| el.bg(crate::theme::glass_selected_bg()))
-                    .hover(|s| s.bg(theme.glass_hover()))
+                    .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
                     .on_click(cx.listener(move |page, _, _, cx| page.select(path.clone(), cx)))
                     .child(
-                        crate::icons::icon(
-                            if checkout.checkout_kind == Some(project_ledger::CheckoutKind::Primary)
-                            {
-                                crate::icons::FOLDER
-                            } else {
-                                crate::icons::GIT_BRANCH
-                            },
-                        )
+                        crate::icons::icon(if primary {
+                            crate::icons::FOLDER
+                        } else {
+                            crate::icons::GIT_BRANCH
+                        })
                         .size(px(14.0))
-                        .text_color(theme.text_muted),
+                        .flex_none()
+                        .text_color(if is_selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        }),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_col()
+                            .gap(px(1.0))
                             .min_w_0()
                             .flex_1()
                             .child(
                                 div()
-                                    .truncate()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(format!(
-                                        "{}{}",
-                                        checkout.name, branch
-                                    ))),
+                                    .flex()
+                                    .flex_row()
+                                    .items_baseline()
+                                    .gap(px(6.0))
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .max_w(px(220.0))
+                                            .truncate()
+                                            .text_size(px(12.5))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(SharedString::from(checkout.name.clone())),
+                                    )
+                                    .when_some(checkout.display_branch(), |el, branch| {
+                                        el.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(11.5))
+                                                .text_color(theme.text_muted)
+                                                .child(SharedString::from(branch.to_string())),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
                                     .truncate()
                                     .text_size(px(11.0))
-                                    .text_color(theme.text_muted.opacity(0.65))
-                                    .child(SharedString::from(format!(
-                                        "{status} · {}",
-                                        checkout.path
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(SharedString::from(display_path(
+                                        &checkout.path,
+                                        home.as_deref(),
                                     ))),
                             ),
                     )
+                    .when(primary, |el| el.child(widgets::badge(theme, "Main")))
+                    .when_some(status, |el, status| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded_full()
+                                .bg(theme.warning.opacity(0.12))
+                                .text_size(px(10.5))
+                                .text_color(theme.warning_muted)
+                                .child(SharedString::from(status)),
+                        )
+                    })
                     .into_any_element()
             })
             .collect();
@@ -1267,15 +1308,22 @@ impl ProjectsPage {
                         "Checkouts",
                         "Select the exact checkout used for settings and worker actions",
                     ))
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .w(px(420.0))
-                            .gap(px(2.0))
-                            .children(rows),
-                    ),
+                    .child(widgets::badge(theme, count.to_string())),
+            )
+            .child(
+                // A repository with many worktrees scrolls inside the card
+                // instead of pushing the rest of the page down.
+                div()
+                    .id("project-checkout-list")
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .max_h(px(CHECKOUT_LIST_MAX_HEIGHT))
+                    .overflow_y_scroll()
+                    .p(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(rows),
             )
             .into_any_element()
     }
@@ -1296,10 +1344,9 @@ impl ProjectsPage {
                 widgets::card_row(theme, true)
                     .child(label_block(theme, "Name", "Display name for this project"))
                     .child(
-                        div()
+                        field_frame(self.name_input.clone().into_any_element())
                             .flex_none()
-                            .w(px(280.0))
-                            .child(self.name_input.clone()),
+                            .w(px(280.0)),
                     ),
             )
             .child(
@@ -1534,22 +1581,27 @@ impl ProjectsPage {
                             .child(SharedString::from(current.to_string())),
                     )
                     .when(available, |el| {
-                        el.child(action_button(
-                            theme,
-                            "Use .comet",
-                            cx.listener(|page, _, _, cx| {
-                                page.select_config_target(ConfigTarget::Comet, cx)
-                            }),
-                        ))
-                        .when(detail.cursor_available, |el| {
+                        el.when(self.config_target != ConfigTarget::Comet, |el| {
                             el.child(action_button(
                                 theme,
-                                "Use .cursor",
+                                "Use .comet",
                                 cx.listener(|page, _, _, cx| {
-                                    page.select_config_target(ConfigTarget::Cursor, cx)
+                                    page.select_config_target(ConfigTarget::Comet, cx)
                                 }),
                             ))
                         })
+                        .when(
+                            detail.cursor_available && self.config_target != ConfigTarget::Cursor,
+                            |el| {
+                                el.child(action_button(
+                                    theme,
+                                    "Use .cursor",
+                                    cx.listener(|page, _, _, cx| {
+                                        page.select_config_target(ConfigTarget::Cursor, cx)
+                                    }),
+                                ))
+                            },
+                        )
                         .child(action_button(
                             theme,
                             "Save config",
@@ -1577,10 +1629,11 @@ impl ProjectsPage {
         let project_id = row.project_id.clone();
         let mut card = widgets::section_card(theme).child(
             widgets::card_row(theme, true)
-                .child(label_block(
+                .child(label_block_wrapped(
                     theme,
                     "Setup Commands",
-                    "Run after worktree creation. $ROOT_WORKTREE_PATH points at the main checkout.",
+                    "Run after worktree creation. $ROOT_WORKTREE_PATH points at the main \
+                     checkout. Shift+Enter adds a line; Enter saves.",
                 ))
                 .when(runnable, |el| {
                     el.child(action_button(
@@ -1638,7 +1691,7 @@ impl ProjectsPage {
         widgets::section_card(theme)
             .child(
                 widgets::card_row(theme, true)
-                    .child(label_block(
+                    .child(label_block_wrapped(
                         theme,
                         "Run Auto Doc",
                         if runnable {
@@ -1661,152 +1714,91 @@ impl ProjectsPage {
             .into_any_element()
     }
 
-    fn render_danger(
+    /// Resolving which repository a checkout belongs to. Not destructive, so
+    /// it lives above Danger Zone; `None` when there is nothing to resolve.
+    fn render_association(
         &mut self,
         theme: &Theme,
         row: &ProjectRow,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let path = row.path.clone();
-        let name = row.name.clone();
-        let recorded_icon = row.icon_path.clone();
-        let confirming = self.confirm_forget;
-        let checkout_id = row.checkout_id.clone();
-        let repository_id = row.repository_id.clone();
-        let repositories = self.repositories.clone();
-        let identity_known = row.checkout_kind.is_some();
-        // A registered checkout may only be forgotten after it has been
-        // archived. Archiving keeps its project/session identity while making
-        // the presentation metadata inactive, so an archived live row is
-        // intentionally eligible here.
-        let can_forget = !row.is_live() || row.archived;
-        let can_restore =
-            row.archived && row.is_available() && identity_known && checkout_id.is_some();
-        widgets::section_card(theme)
-            .child(
-                widgets::card_row(theme, true)
-                    .child(label_block(
-                        theme,
-                        "Forget Project",
-                        if confirming {
-                            "This clears only the metadata. Files on disk and sessions are untouched."
-                        } else {
-                            "Remove this project's recorded metadata. Files on disk are kept."
-                        },
-                    ))
-                    .when(!confirming && can_forget, |el| {
-                        el.child(action_button(
+    ) -> Option<AnyElement> {
+        let checkout_id = row.checkout_id.clone()?;
+        // The principal checkout IS the repository's identity: undoing it
+        // strips the repository of its primary and leaves every sibling
+        // worktree without an executable checkout.
+        if row.checkout_kind? == project_ledger::CheckoutKind::Primary {
+            return None;
+        }
+        if row.is_pending() {
+            let body: AnyElement = if self.repositories.is_empty() {
+                quiet(theme, "No repository identity is available yet")
+            } else {
+                let links = self
+                    .repositories
+                    .iter()
+                    .map(|repository| {
+                        let repository_id = repository.id.clone();
+                        let checkout_id = checkout_id.clone();
+                        let label = format!(
+                            "Link to {}",
+                            repository.name.as_deref().unwrap_or(repository.id.as_str())
+                        );
+                        action_button(
                             theme,
-                            "Forget",
-                            cx.listener(|page, _, _, cx| {
-                                page.confirm_forget = true;
-                                cx.notify();
-                            }),
-                        ))
-                    })
-                    .when(!confirming && !can_forget, |el| {
-                        el.child(quiet(
-                            theme,
-                            "Archive the active checkout before forgetting metadata",
-                        ))
-                    })
-                    .when(!confirming && can_restore, |el| {
-                        let id = checkout_id.clone().expect("restore checkout id");
-                        el.child(action_button(
-                            theme,
-                            "Restore checkout",
+                            &label,
                             cx.listener(move |page, _, _, cx| {
-                                let id = id.clone();
-                                page.run_action(
-                                    cx,
-                                    move |client| {
-                                        client.restore_checkout(&id).map_err(|e| e.to_string())
-                                    },
-                                    "Checkout restored",
-                                );
-                            }),
-                        ))
-                    })
-                    .when(
-                        !confirming && !row.archived && identity_known && checkout_id.is_some(),
-                        |el| {
-                        let id = checkout_id.clone().expect("archive checkout id");
-                        el.child(action_button(
-                            theme,
-                            "Archive checkout",
-                            cx.listener(move |page, _, _, cx| {
-                                let id = id.clone();
-                                page.run_action(
-                                    cx,
-                                    move |client| {
-                                        client.archive_checkout(&id).map_err(|e| e.to_string())
-                                    },
-                                    "Checkout archived",
-                                );
-                            }),
-                        ))
-                    })
-                    .when(
-                        !confirming && row.is_pending() && identity_known && checkout_id.is_some(),
-                        |el| {
-                        let checkout_id = checkout_id.clone().expect("pending checkout id");
-                        if repositories.is_empty() {
-                            return el.child(quiet(
-                                theme,
-                                "Association pending — no repository identity is available yet",
-                            ));
-                        }
-                        let links = repositories
-                            .iter()
-                            .map(|repository| {
-                                let repository_id = repository.id.clone();
                                 let checkout_id = checkout_id.clone();
-                                let label = format!(
-                                    "Link to {}",
-                                    repository
-                                        .name
-                                        .as_deref()
-                                        .unwrap_or(repository.id.as_str())
+                                let repository_id = repository_id.clone();
+                                page.run_action(
+                                    cx,
+                                    move |client| {
+                                        client
+                                            .associate_checkout(&checkout_id, &repository_id)
+                                            .map_err(|e| e.to_string())
+                                    },
+                                    "Checkout associated",
                                 );
-                                action_button(
-                                    theme,
-                                    &label,
-                                    cx.listener(move |page, _, _, cx| {
-                                        let checkout_id = checkout_id.clone();
-                                        let repository_id = repository_id.clone();
-                                        page.run_action(
-                                            cx,
-                                            move |client| {
-                                                client
-                                                    .associate_checkout(
-                                                        &checkout_id,
-                                                        &repository_id,
-                                                    )
-                                                    .map_err(|e| e.to_string())
-                                            },
-                                            "Checkout associated",
-                                        );
-                                    }),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(6.0))
-                                .children(links),
+                            }),
                         )
                     })
-                    .when(
-                        !confirming
-                            && row.association == project_ledger::AssociationState::Known
-                            && identity_known
-                            && repository_id.is_some()
-                            && checkout_id.is_some(),
-                        |el| {
-                            let checkout_id = checkout_id.clone().expect("known checkout id");
-                            el.child(action_button(
+                    .collect::<Vec<_>>();
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(6.0))
+                    .children(links)
+                    .into_any_element()
+            };
+            // Stacked: one button per known repository does not fit beside a
+            // label, and the choice is the user's — nothing here is guessed.
+            return Some(
+                widgets::section_card(theme)
+                    .child(
+                        stacked_row(theme, true)
+                            .child(label_block_wrapped(
+                                theme,
+                                "Repository association",
+                                "No Git evidence ties this checkout to a repository. \
+                                 Pick the one it belongs to; you can undo it later.",
+                            ))
+                            .child(body),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if row.association == project_ledger::AssociationState::Known && row.repository_id.is_some()
+        {
+            return Some(
+                widgets::section_card(theme)
+                    .child(
+                        widgets::card_row(theme, true)
+                            .child(label_block(
+                                theme,
+                                "Repository association",
+                                "Associated with its repository",
+                            ))
+                            .child(action_button(
                                 theme,
                                 "Undo association",
                                 cx.listener(move |page, _, _, cx| {
@@ -1821,9 +1813,100 @@ impl ProjectsPage {
                                         "Checkout association removed",
                                     );
                                 }),
-                            ))
-                        },
+                            )),
                     )
+                    .into_any_element(),
+            );
+        }
+        None
+    }
+
+    fn render_danger(
+        &mut self,
+        theme: &Theme,
+        row: &ProjectRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = row.path.clone();
+        let name = row.name.clone();
+        let recorded_icon = row.icon_path.clone();
+        let confirming = self.confirm_forget;
+        let checkout_id = row
+            .checkout_id
+            .clone()
+            .filter(|_| row.checkout_kind.is_some());
+        // A registered checkout may only be forgotten after it has been
+        // archived. Archiving keeps its project/session identity while making
+        // the presentation metadata inactive, so an archived live row is
+        // intentionally eligible here.
+        let can_forget = !row.is_live() || row.archived;
+        let can_archive = !row.archived && checkout_id.is_some();
+        let can_restore = row.archived && row.is_available() && checkout_id.is_some();
+        let checkout_row = (can_archive || can_restore).then(|| {
+            let id = checkout_id.clone().expect("checkout id");
+            let (label, description, verb, notice) = if can_restore {
+                (
+                    "Restore checkout",
+                    "Bring this checkout back into the active working set",
+                    "Restore",
+                    "Checkout restored",
+                )
+            } else {
+                (
+                    "Archive checkout",
+                    "Leave the working set; files and sessions are kept",
+                    "Archive",
+                    "Checkout archived",
+                )
+            };
+            widgets::card_row(theme, true)
+                .child(label_block(theme, label, description))
+                .child(action_button(
+                    theme,
+                    verb,
+                    cx.listener(move |page, _, _, cx| {
+                        let id = id.clone();
+                        page.run_action(
+                            cx,
+                            move |client| {
+                                if can_restore {
+                                    client.restore_checkout(&id)
+                                } else {
+                                    client.archive_checkout(&id)
+                                }
+                                .map_err(|e| e.to_string())
+                            },
+                            notice,
+                        );
+                    }),
+                ))
+        });
+        let has_checkout_row = checkout_row.is_some();
+        widgets::section_card(theme)
+            .children(checkout_row)
+            .child(
+                widgets::card_row(theme, !has_checkout_row)
+                    .child(label_block(
+                        theme,
+                        "Forget project",
+                        if confirming {
+                            "This clears only the metadata. Files on disk and sessions are untouched."
+                        } else if can_forget {
+                            "Remove this project's recorded metadata. Files on disk are kept."
+                        } else {
+                            "Archive the checkout first; forgetting only clears metadata."
+                        },
+                    ))
+                    .when(!confirming && can_forget, |el| {
+                        el.child(action_button(
+                            theme,
+                            "Forget",
+                            cx.listener(|page, _, _, cx| {
+                                page.confirm_forget = true;
+                                cx.notify();
+                            }),
+                        ))
+                    })
                     .when(confirming, |el| {
                         el.child(action_button(
                             theme,
@@ -1833,7 +1916,7 @@ impl ProjectsPage {
                                 cx.notify();
                             }),
                         ))
-                        .child(action_button(
+                        .child(danger_button(
                             theme,
                             &format!("Forget \"{name}\""),
                             cx.listener(move |page, _, _, cx| {
@@ -1901,6 +1984,30 @@ pub fn auto_doc_prompt(added: Option<&AnchorCommit>, opened: Option<&AnchorCommi
 }
 
 /// Rótulo + descrição à esquerda de uma linha de card.
+/// Tallest the checkout list grows before it scrolls: five rows.
+const CHECKOUT_LIST_MAX_HEIGHT: f32 = 236.0;
+
+/// A section title below the first. `section_card` already puts 24px between
+/// a title and its card; nothing separated a card from the next title.
+fn section_header(theme: &Theme, title: &str) -> gpui::Div {
+    widgets::page_header(theme, title, None).mt(px(40.0))
+}
+
+/// The settings text-field chrome ([`popover::dialog_field`]) at row density:
+/// a bare `ComposerInput` in a card row reads as floating text, not a field.
+fn field_frame(input: AnyElement) -> gpui::Div {
+    crate::popover::dialog_field(input)
+        .py(px(6.0))
+        .text_size(px(13.0))
+}
+
+/// A path for display, with the home directory folded to `~`.
+fn display_path(path: &str, home: Option<&Path>) -> String {
+    home.and_then(|home| Path::new(path).strip_prefix(home).ok())
+        .map(|rest| format!("~/{}", rest.display()))
+        .unwrap_or_else(|| path.to_owned())
+}
+
 fn label_block(theme: &Theme, label: &str, description: &str) -> AnyElement {
     div()
         .flex_1()
@@ -1924,6 +2031,40 @@ fn label_block(theme: &Theme, label: &str, description: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// [`label_block`] whose description wraps instead of truncating: for copy
+/// that explains something and is useless cut in half.
+fn label_block_wrapped(theme: &Theme, label: &str, description: &str) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_size(px(13.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(description.to_string())),
+        )
+        .into_any_element()
+}
+
+/// A card row that stacks its content under the label instead of beside it.
+fn stacked_row(theme: &Theme, first: bool) -> gpui::Div {
+    widgets::card_row(theme, first)
+        .flex_col()
+        .items_start()
+        .gap(px(10.0))
+}
+
 fn config_editor_row(
     theme: &Theme,
     label: &str,
@@ -1931,8 +2072,12 @@ fn config_editor_row(
     input: Entity<ComposerInput>,
 ) -> gpui::Div {
     widgets::card_row(theme, false)
-        .child(label_block(theme, label, description))
-        .child(div().flex_none().w(px(360.0)).child(input))
+        .child(label_block_wrapped(theme, label, description))
+        .child(
+            field_frame(input.into_any_element())
+                .flex_none()
+                .w(px(360.0)),
+        )
 }
 
 /// Valor à direita, com a linha cinza do commit âncora embaixo quando existe.
@@ -1986,6 +2131,31 @@ fn action_button(
         .into_any_element()
 }
 
+/// The confirming half of a destructive action: same shape as
+/// [`action_button`], in the danger tone so it cannot pass for "Cancel".
+fn danger_button(
+    theme: &Theme,
+    label: &str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(SharedString::from(format!("danger-{label}")))
+        .flex_none()
+        .px(px(10.0))
+        .py(px(5.0))
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(theme.danger.opacity(0.4))
+        .bg(theme.danger.opacity(0.1))
+        .text_size(px(12.0))
+        .text_color(theme.danger)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.danger.opacity(0.18)))
+        .on_click(on_click)
+        .child(SharedString::from(label.to_string()))
+        .into_any_element()
+}
+
 fn quiet(theme: &Theme, copy: &str) -> AnyElement {
     div()
         .px(px(8.0))
@@ -2027,6 +2197,18 @@ mod tests {
             remote_url: remote.map(str::to_owned),
             branch: None,
         }
+    }
+
+    #[test]
+    fn display_path_folds_home_and_leaves_other_paths_alone() {
+        let home = Path::new("/Users/me");
+        assert_eq!(
+            display_path("/Users/me/Projetos/jk/.worktrees/a", Some(home)),
+            "~/Projetos/jk/.worktrees/a"
+        );
+        // A sibling that only shares the prefix string is not under home.
+        assert_eq!(display_path("/Users/meta/x", Some(home)), "/Users/meta/x");
+        assert_eq!(display_path("/tmp/x", None), "/tmp/x");
     }
 
     #[test]
@@ -2133,6 +2315,11 @@ mod tests {
         assert_eq!(
             resolve_rename(" novo nome ", "comet"),
             Some("novo nome".to_owned())
+        );
+        assert_eq!(
+            resolve_rename("novo\n  nome", "comet"),
+            Some("novo nome".to_owned()),
+            "a newline typed with Shift+Enter never reaches the registry"
         );
     }
 
