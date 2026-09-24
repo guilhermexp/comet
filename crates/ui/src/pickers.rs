@@ -559,6 +559,27 @@ pub struct RepoTarget {
     pub branch: Option<String>,
 }
 
+/// Why a live Chat's Ref cannot change right now, or `None` when it can.
+/// `indicator` is `AppState::indicator_for(chat_id, now)` — the caller injects
+/// `now`, so the verdict is a pure function of the run state. A checkout moved
+/// under a running agent swaps files it already read: silent, no error.
+pub(crate) fn live_ref_switch_blocked(
+    indicator: zeron_proto::view::Indicator,
+) -> Option<&'static str> {
+    (indicator == zeron_proto::view::Indicator::Working)
+        .then_some("Cannot switch branches while the agent is working")
+}
+
+/// Badge on a Ref row that already has a worktree. In a live Chat picking it
+/// is a Retarget, and resume is cwd-scoped: the row says so before the click.
+fn worktree_row_badge(live_chat: bool) -> &'static str {
+    if live_chat {
+        "worktree · new conversation"
+    } else {
+        "worktree"
+    }
+}
+
 pub(crate) struct ReturnComposerFocus;
 impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
 
@@ -1515,18 +1536,40 @@ impl Pickers {
 
     // ---- selections ----
 
+    /// The live Chat a Ref pick applies to: the on-screen target's Chat when a
+    /// target is mounted (a target without one is a bare repo, not the
+    /// selected Chat), else the selected Chat. `None` is the draft.
+    fn live_ref_chat(&self, cx: &App) -> Option<String> {
+        match &self.active_repo_target {
+            Some(target) => target.chat_id.clone(),
+            None => self
+                .state
+                .read(cx)
+                .selected_chat_row()
+                .map(|chat| chat.id.clone()),
+        }
+    }
+
+    /// [`live_ref_switch_blocked`] for the live Chat, if any, at this instant.
+    fn live_ref_block(&self, cx: &App) -> Option<&'static str> {
+        let chat_id = self.live_ref_chat(cx)?;
+        let indicator = self
+            .state
+            .read(cx)
+            .indicator_for(&chat_id, chrono::Utc::now());
+        live_ref_switch_blocked(indicator)
+    }
+
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
+        // Defense behind the disabled trigger and inert rows: a run can start
+        // while the popover is already open.
+        if let Some(reason) = self.live_ref_block(cx) {
+            self.switch_error = Some(reason.into());
+            cx.notify();
+            return;
+        }
         if let Some(target) = self.active_repo_target.clone() {
             if let Some(chat_id) = &target.chat_id {
-                let now = chrono::Utc::now();
-                if self.state.read(cx).indicator_for(chat_id, now)
-                    == zeron_proto::view::Indicator::Working
-                {
-                    self.switch_error =
-                        Some("Cannot switch branches while the agent is working".into());
-                    cx.notify();
-                    return;
-                }
                 if let Some(worktree_path) = &row.worktree_path {
                     self.switch_live_worktree(chat_id, worktree_path, &row.name, cx);
                 } else {
@@ -1539,15 +1582,6 @@ impl Pickers {
         }
 
         if let Some(chat) = self.state.read(cx).selected_chat_row().cloned() {
-            let now = chrono::Utc::now();
-            if self.state.read(cx).indicator_for(&chat.id, now)
-                == zeron_proto::view::Indicator::Working
-            {
-                self.switch_error =
-                    Some("Cannot switch branches while the agent is working".into());
-                cx.notify();
-                return;
-            }
             if let Some(worktree_path) = &row.worktree_path {
                 self.switch_live_worktree(&chat.id, worktree_path, &row.name, cx);
             } else {
@@ -3577,6 +3611,8 @@ impl Pickers {
                     .and_then(|c| c.branch.clone())
             });
         let switching = self.switching.clone();
+        let live_chat = self.live_ref_chat(cx).is_some();
+        let blocked = self.live_ref_block(cx);
         let scrollbar = popover::rail(self, "branch-scrollbar", &theme, cx);
         let body: AnyElement = match &self.refs {
             Loadable::Loading | Loadable::Idle => {
@@ -3623,10 +3659,14 @@ impl Pickers {
                                         format!("branch-row-{ix}"),
                                     )
                                     .id(("branch-row", ix))
-                                    .when(switching.is_some(), |el| el.opacity(0.55))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.pick_ref(row.clone(), cx);
-                                    }))
+                                    .when(switching.is_some() || blocked.is_some(), |el| {
+                                        el.opacity(0.55)
+                                    })
+                                    .when(blocked.is_none(), |el| {
+                                        el.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.pick_ref(row.clone(), cx);
+                                        }))
+                                    })
                                     .child(
                                         crate::icons::icon(crate::icons::GIT_BRANCH)
                                             .size(px(13.0))
@@ -3684,7 +3724,9 @@ impl Pickers {
                                                 .rounded(px(3.0))
                                                 .bg(theme.ink(0.08))
                                                 .text_color(theme.text_muted.opacity(0.6))
-                                                .child(SharedString::from("worktree")),
+                                                .child(SharedString::from(worktree_row_badge(
+                                                    live_chat,
+                                                ))),
                                         )
                                     })
                                     .when(is_current, |el| {
@@ -3707,6 +3749,23 @@ impl Pickers {
             .flex_col()
             .child(self.search_box(&theme))
             .child(body);
+        // A run started while the popover was open: say why the rows are inert
+        // instead of letting a click fail. The pick's own error band below
+        // stays for git failures.
+        if let Some(reason) = blocked
+            && self.switch_error.as_deref() != Some(reason)
+        {
+            popover = popover.child(
+                popover::menu_section().child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(reason)),
+                ),
+            );
+        }
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
         // git's own message, under a hairline.
         if let Some(error) = &self.switch_error {
@@ -3770,6 +3829,9 @@ impl Pickers {
         if !disabled {
             self.ensure_refs(false, cx);
         }
+        // A live Chat that is Working cannot move: the trigger goes inert. Refs
+        // still load above, so the list is ready the moment the run settles.
+        let disabled = disabled || self.live_ref_block(cx).is_some();
 
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
@@ -5599,6 +5661,30 @@ mod tests {
             [ComposerFooterControl::Model]
         );
     }
+    #[test]
+    fn live_ref_switch_is_blocked_only_while_working() {
+        use zeron_proto::view::Indicator;
+        assert_eq!(
+            live_ref_switch_blocked(Indicator::Working),
+            Some("Cannot switch branches while the agent is working")
+        );
+        // The run settles: the control accepts a Ref again. Waiting on input
+        // or errored is not an agent mid-read of the old checkout.
+        for settled in [
+            Indicator::None,
+            Indicator::AwaitingInput,
+            Indicator::Errored,
+        ] {
+            assert_eq!(live_ref_switch_blocked(settled), None, "{settled:?}");
+        }
+    }
+
+    #[test]
+    fn worktree_row_declares_the_retarget_cost_only_in_a_live_chat() {
+        assert_eq!(worktree_row_badge(true), "worktree · new conversation");
+        assert_eq!(worktree_row_badge(false), "worktree");
+    }
+
     #[test]
     fn branch_ref_metadata_classification() {
         let local_ref = RepoRef {

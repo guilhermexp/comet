@@ -210,6 +210,27 @@ fn worktree_registered_as_a_plain_project_is_projected_as_a_worktree()
     assert_eq!(project.worktree_branch.as_deref(), Some("feature/sidebar"));
     assert_eq!(project.parent_project_id.as_deref(), Some("root"));
     assert!(!project.is_group);
+
+    // The branch came from disk, not the registry, and the launch payload
+    // echoes what the sidebar read — the catalog has to agree with it.
+    let client = LocalWorkersClient::new();
+    let message = launch_error(
+        &client,
+        WorkersLaunchRequest::preset("checkout", "no-such-preset")
+            .with_worktree(&project.path, "feature/sidebar"),
+    );
+    assert!(
+        !message.contains("worktree does not belong to project"),
+        "{message}"
+    );
+    assert!(!message.contains("project is a folder"), "{message}");
+    assert!(message.contains("unknown preset id"), "{message}");
+
+    // The app did not create this checkout, so it is archived, never deleted.
+    client
+        .remove_worktree("checkout", false)
+        .expect_err("an adopted checkout is not app-owned");
+    assert!(checkout.exists(), "the adopted checkout stays on disk");
     Ok(())
 }
 

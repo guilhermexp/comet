@@ -52,14 +52,13 @@ already keys off `is_group` and needs no edit.
 
 ## Capabilities
 
-### New Capabilities
-
-- `workers-project-identity`: how a Workers project reaches the UI as a group,
-  a worktree, or a plain checkout.
-
 ### Modified Capabilities
 
-None.
+- `workers-repository-identity`: how a Workers project reaches the UI as a group,
+  a worktree, or a plain checkout. Originally drafted as a new capability,
+  `workers-project-identity`; retargeted on 2026-09-23 to the capability that
+  `stabilize-workers-project-identity` archived first, so the tree keeps one
+  identity spec instead of two.
 
 ## Impact
 
@@ -72,9 +71,9 @@ None.
 
 ## Integration follow-up — 2026-09-18
 
-[`stabilize-workers-project-identity`](../stabilize-workers-project-identity/proposal.md)
+[`stabilize-workers-project-identity`](../2026-09-18-stabilize-workers-project-identity/proposal.md)
 extends the Workers/Projects path with durable repository membership, explicit
 checkout ownership/availability and history-preserving lifecycle actions. Its
-[verification report](../../../docs/verification/2026-09-18-workers-project-identity.md)
+[verification report](../../../../docs/verification/2026-09-18-workers-project-identity.md)
 records the integrated evidence. This cross-reference does not mark this
 change's independent tasks or engine-specific checks complete.

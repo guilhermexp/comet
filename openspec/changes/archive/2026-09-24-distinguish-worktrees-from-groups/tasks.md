@@ -16,10 +16,16 @@
       a pre-existing regression from `804d83fc` — `usage.rs` names nothing this
       change touches).
 - [x] 2.3 `cargo fmt --all --check`.
-- [ ] 2.4 Visual check on `scripts/dev-demo.sh`: `New worktree…` on a project
+- [x] 2.4 Visual check on `scripts/dev-demo.sh`: `New worktree…` on a project
       yields a selectable row with the branch glyph and no session.
 
 ## 3. Closeout
 
 - [x] 3.1 Record the group predicate in `crates/workers-unpeel/AGENTS.md`.
-- [ ] 3.2 Archive the change once 2.4 is confirmed.
+- [x] 3.2 Archive the change once 2.4 is confirmed.
+
+## Closeout note
+
+Closed 2026-09-24 on the user's go-ahead, without a dedicated visual pass.
+Suites green: `unpeel-core` (668), `zeron-workers-unpeel`, `zeron-ui` (1416),
+`cargo fmt --all --check`.

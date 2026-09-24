@@ -9,7 +9,7 @@ launchable, and a member of the project ledger.
 
 #### Scenario: A registered worktree is not a group
 
-Test: `worktree_lifecycle_registers_and_removes_the_child_project`
+Test: `worktree_lifecycle_removes_checkout_but_retains_child_history`
 
 - **WHEN** a worktree is created through `create_worktree` and read back from
   `bootstrap`

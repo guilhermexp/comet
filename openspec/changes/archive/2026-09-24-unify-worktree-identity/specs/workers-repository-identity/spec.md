@@ -18,10 +18,7 @@ Test: `launching_into_a_created_worktree_is_not_rejected_as_a_folder`
 
 #### Scenario: An adopted worktree accepts a launch
 
-Test: none — no test in the tree launches into a worktree whose identity came
-from disk. Task 6.2 adds that probe to
-`worktree_registered_as_a_plain_project_is_projected_as_a_worktree`, which today
-asserts the projection only.
+Test: `worktree_registered_as_a_plain_project_is_projected_as_a_worktree`
 
 - **WHEN** a session is launched into a worktree whose identity came from disk,
   with the path and branch the sidebar read from the snapshot
@@ -35,49 +32,6 @@ Test: `a_failed_launch_keeps_the_worktree_it_just_created`
 - **THEN** the error is reported
 - **AND** the checkout stays on disk, as it already does for a failed setup
 
-### Requirement: Removing a worktree deletes only a checkout the app created
-
-Removal SHALL accept any worktree, however its identity was established, and
-SHALL delete the checkout from disk only when the registry records the app as
-its creator AND the path lies under the managed worktree root. Otherwise the
-project is de-registered with its sessions and the folder is left alone. The
-ownership predicate SHALL be one function, shared by the caller that asks and
-the routine that refuses.
-
-#### Scenario: An adopted worktree is de-registered, not deleted
-
-Test: none — no test removes a worktree the app did not create. Task 6.2 adds
-that half to `worktree_registered_as_a_plain_project_is_projected_as_a_worktree`;
-the neighbouring `a_group_inside_a_worktree_stays_a_group` only proves that
-removing a GROUP leaves its parent's checkout alone.
-
-- **WHEN** a worktree the app did not create is removed
-- **THEN** the project and its sessions leave the registry
-- **AND** the checkout still exists on disk
-
-#### Scenario: A worktree the app created is still deleted
-
-Test: `worktree_lifecycle_registers_and_removes_the_child_project`
-
-- **WHEN** a worktree created by `create_worktree` is removed
-- **THEN** its checkout is deleted, as before
-
-### Requirement: The pull-request badge follows the checkout
-
-The branch a Workers project offers to change-request lookup SHALL be gated by
-the registry's worktree branch — only a worktree has a pull request — and
-valued by the branch on disk, so switching branches inside the checkout moves
-the badge. Both halves of the pair, the subscription target and the read, SHALL
-ask the same accessor.
-
-#### Scenario: A switched worktree names the branch on disk
-
-Test: `workers_change_request_targets_cover_worktrees_only`
-
-- **WHEN** a worktree's registered branch and its checked-out branch disagree
-- **THEN** the change-request target names the checked-out branch
-- **AND** a project with no worktree branch, or a blank one, offers no target
-
 ## MODIFIED Requirements
 
 ### Requirement: A worktree never projects as a group
@@ -88,12 +42,13 @@ SHALL NOT apply disk detection to a record that is a group. Values already
 present in the registry SHALL still win: detection only fills what is absent. A
 worktree therefore SHALL reach the UI as a project that owns a checkout:
 selectable, launchable, and a member of the project ledger. The group verdict,
-not the presence of a parent, SHALL decide which removal a caller dispatches,
-which verb the project menu offers, and which confirmation the sidebar draws.
+not the presence of a parent, SHALL decide whether the project menu offers
+removing a group or acting on a checkout, and which confirmation the sidebar
+draws.
 
 #### Scenario: A registered worktree is not a group
 
-Test: `worktree_lifecycle_registers_and_removes_the_child_project`
+Test: `worktree_lifecycle_removes_checkout_but_retains_child_history`
 
 - **WHEN** a worktree is created through `create_worktree` and read back from
   `bootstrap`
@@ -117,7 +72,7 @@ Test: `a_group_inside_a_worktree_stays_a_group`
 - **AND** it names no worktree branch, so no removal route can reach the
   parent's checkout
 
-#### Scenario: A child that is not a group removes as a project
+#### Scenario: A child that is not a group is not removed as a group
 
 Test: `adopted_worktree_without_a_branch_removes_as_a_project` in
 `crates/ui/src/workers/project_menu.rs`, and
@@ -126,7 +81,8 @@ dispatches.
 
 - **WHEN** the menu is built for a child project that carries no worktree
   branch and is not a group
-- **THEN** the removal item removes a project, not a group
+- **THEN** the menu offers the checkout action — archive, since the app did
+  not create it — and never "Remove group"
 
 #### Scenario: An adopted worktree can be renamed
 
