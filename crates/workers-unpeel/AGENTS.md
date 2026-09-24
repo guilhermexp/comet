@@ -98,6 +98,11 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `tests/worker_initial_briefing.rs` is the regression seam.
   Codex's managed wrapper must reach upstream launchers without PATH recursion
   or diagnostic argv copies. Unsupported integrations keep interactive delivery.
+- **Worker titles are set at create, not by the PTY scanner.** Native startup
+  bypasses the Host prompt auto-title, so `launch_worker` `title` travels as the
+  Host create `title` (label + `custom_title`, survives restart). Without it the
+  Host titles from the first `initial_text` line (`created_session_label` in
+  `controller_api.rs`); only PTY-delivered briefings still use the scanner.
 - **Activity state machine is shared by include.** `activity_bridge.rs`
   includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
   nao forke a maquina de estados numa copia local; mude no proprio

@@ -38,6 +38,7 @@ const MAX_CREATE_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_CREATE_PATH_BYTES: usize = 16 * 1024;
 const MAX_CREATE_BRANCH_BYTES: usize = 4 * 1024;
 const MAX_CREATE_INITIAL_TEXT_BYTES: usize = 256 * 1024;
+const MAX_CREATE_TITLE_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -175,6 +176,8 @@ pub struct ResolvedHostCreate {
     pub cwd: String,
     pub worktree_path: Option<String>,
     pub worktree_branch: Option<String>,
+    /// Controller-chosen Session title; final once set (`custom_title`).
+    pub title: Option<String>,
     pub initial_text: Option<String>,
     pub initial_text_submit_mode: HostCreateSubmitMode,
     pub initial_columns: u16,
@@ -304,6 +307,8 @@ struct HostCreateWireRequest {
     worktree_path: Option<String>,
     #[serde(default)]
     worktree_branch: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     initial_text: Option<String>,
     #[serde(default)]
@@ -475,6 +480,19 @@ fn validate_host_create_value(
     Ok(())
 }
 
+/// Whitespace-collapsed Controller title. Control characters are rejected,
+/// not stripped: a title is display text, never terminal input.
+fn create_title(value: &str) -> Result<String, ControllerApiError> {
+    let title = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty()
+        || title.len() > MAX_CREATE_TITLE_BYTES
+        || title.chars().any(char::is_control)
+    {
+        return Err(ControllerApiError::new(400, "invalid title"));
+    }
+    Ok(title)
+}
+
 fn principal_can_create_session(principal: &ControllerPrincipal) -> bool {
     // Keep this match exhaustive. When scoped Link/Room principals are added,
     // the compiler must force an explicit authorization decision here instead
@@ -521,6 +539,7 @@ fn resolve_host_create(
     {
         return Err(ControllerApiError::new(400, "initial text too large"));
     }
+    let title = request.title.as_deref().map(create_title).transpose()?;
 
     let project = context
         .projects
@@ -604,6 +623,7 @@ fn resolve_host_create(
             .unwrap_or_else(|| project.path.clone()),
         worktree_path: project.worktree_path.clone(),
         worktree_branch: project.worktree_branch.clone(),
+        title,
         initial_text: request.initial_text,
         initial_text_submit_mode: request.initial_text_submit_mode,
         initial_columns: request
@@ -656,6 +676,32 @@ pub fn native_initial_startup_enabled(command: &str, mode: HostCreateSubmitMode)
         && matches!(mode, HostCreateSubmitMode::PasteAndSubmit)
 }
 
+/// Label and `custom_title` for a new Session. An explicit Controller title is
+/// final. Native startup never crosses the Host PTY, so the prompt auto-title
+/// that PTY delivery triggers is applied here from the briefing's first line,
+/// with the same normalization and the same unsettled-to-settled semantics.
+fn created_session_label(
+    command: &str,
+    title: Option<String>,
+    native_initial_text: Option<&str>,
+) -> (String, bool) {
+    if let Some(title) = title {
+        return (title, true);
+    }
+    if let Some(label) = native_initial_text
+        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+        .and_then(crate::session_host::normalize_prompt_title)
+    {
+        return (label, false);
+    }
+    let label = if command.is_empty() {
+        "Terminal"
+    } else {
+        command
+    };
+    (label.to_owned(), false)
+}
+
 /// Standard TUI/headless create effect. Adapters wrap this in a
 /// [`HostCreateExecutor`] so they can capture their hook-listener port while
 /// router tests substitute a side-effect-free callback.
@@ -669,6 +715,7 @@ pub fn execute_headless_session_create(
         cwd,
         worktree_path,
         worktree_branch,
+        title,
         initial_text,
         initial_text_submit_mode,
         initial_columns,
@@ -680,15 +727,17 @@ pub fn execute_headless_session_create(
     // matching the shipped native Host instead of turning a live Session into
     // an opaque create failure.
     let session_id = uuid::Uuid::new_v4().to_string().to_lowercase();
+    let native_initial = native_initial_startup_enabled(&command, initial_text_submit_mode);
+    let (label, custom_title) = created_session_label(
+        &command,
+        title,
+        initial_text.as_deref().filter(|_| native_initial),
+    );
     let session = SessionInfo {
         id: session_id.clone(),
         project_id,
-        label: if command.is_empty() {
-            "Terminal".into()
-        } else {
-            command.clone()
-        },
-        custom_title: false,
+        label,
+        custom_title,
         command,
         created_at: current_timestamp_ms(),
         tag_id: None,
@@ -699,7 +748,6 @@ pub fn execute_headless_session_create(
         role: None,
         task: None,
     };
-    let native_initial = native_initial_startup_enabled(&session.command, initial_text_submit_mode);
     if native_initial {
         if let Some(text) = initial_text.as_deref().filter(|text| !text.is_empty()) {
             if let Err(error) = crate::native_initial::stage_native_initial_prompt(
@@ -2434,6 +2482,7 @@ mod tests {
             "projectID": " project-1 ",
             "presetID": "preset-1",
             "command": "controller-command-must-not-win",
+            "title": "  WT-1\n  review   parser ",
             "initialText": "héllo\n\u{1b}[A",
             "initialColumns": 224,
             "initialRows": 48,
@@ -2453,6 +2502,7 @@ mod tests {
                 cwd: "/host/project".into(),
                 worktree_path: None,
                 worktree_branch: None,
+                title: Some("WT-1 review parser".into()),
                 initial_text: Some("héllo\n\u{1b}[A".into()),
                 initial_text_submit_mode: HostCreateSubmitMode::PasteAndSubmit,
                 initial_columns: 224,
@@ -2494,6 +2544,7 @@ mod tests {
                 cwd: "/host/worktrees/feature".into(),
                 worktree_path: Some("/host/worktrees/feature".into()),
                 worktree_branch: Some("feature/remote".into()),
+                title: None,
                 initial_text: Some("raw bytes\r".into()),
                 initial_text_submit_mode: HostCreateSubmitMode::Raw,
                 initial_columns: SESSION_CREATE_INITIAL_COLUMNS,
@@ -2551,6 +2602,13 @@ mod tests {
                 "command": "codex",
                 "initialTextSubmitMode": "futureMode",
             }),
+            json!({ "projectID": "project-1", "command": "codex", "title": " \n " }),
+            json!({ "projectID": "project-1", "command": "codex", "title": "\u{1b}[31mred" }),
+            json!({
+                "projectID": "project-1",
+                "command": "codex",
+                "title": "x".repeat(MAX_CREATE_TITLE_BYTES + 1),
+            }),
         ];
 
         for body in bodies {
@@ -2560,6 +2618,34 @@ mod tests {
             assert_eq!(response.status, 400, "{}", request.body);
         }
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn created_session_label_prefers_explicit_title_then_native_briefing_line() {
+        assert_eq!(
+            created_session_label("claude", Some("WT-1 parser".into()), Some("brief")),
+            ("WT-1 parser".into(), true),
+        );
+        // Native startup bypasses the PTY auto-title: the briefing's first
+        // real line titles the Session, still unsettled-by-user.
+        assert_eq!(
+            created_session_label("claude", None, Some("\n\n  ticket: WT-2  fix\nbody")),
+            ("ticket: WT-2 fix".into(), false),
+        );
+        // A slash-command first line never titles (normalize_prompt_title).
+        assert_eq!(
+            created_session_label("omp", None, Some("/resume\nreal task")),
+            ("omp".into(), false),
+        );
+        // PTY delivery leaves titling to the Host prompt scanner.
+        assert_eq!(
+            created_session_label("codex", None, None),
+            ("codex".into(), false)
+        );
+        assert_eq!(
+            created_session_label("", None, None),
+            ("Terminal".into(), false)
+        );
     }
 
     #[test]
