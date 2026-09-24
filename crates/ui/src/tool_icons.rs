@@ -315,6 +315,11 @@ fn semantic_tool_icon(name: &str, input: Option<&Value>) -> ToolIconDescriptor {
     }
     if lower == "hub" {
         let op = value_string(input, &["op"]).to_ascii_lowercase();
+        // Waiting on jobs is a pause, not configuration: the same clock the
+        // Workers `wait_for_status` row wears, never the generic gear.
+        if op == "wait" {
+            return ToolIconDescriptor::Solar(crate::icons::CLOCK_CIRCLE);
+        }
         return material(match op.as_str() {
             "start" | "stop" | "restart" | "ps" | "logs" => "console",
             "send" | "inbox" => "prompt",
@@ -377,6 +382,23 @@ mod tests {
 
     fn material(name: &str) -> ToolIconDescriptor {
         ToolIconDescriptor::Material(format!("file-icons/{name}.svg").into())
+    }
+
+    #[test]
+    fn hub_wait_wears_the_workers_wait_clock() {
+        let wait = ToolCall::Unknown {
+            name: "hub".into(),
+            input: Some(serde_json::json!({ "op": "wait", "ids": ["j1", "j2"] })),
+        };
+        assert!(matches!(
+            tool_icon_descriptor(&wait),
+            ToolIconDescriptor::Solar(path) if path == crate::icons::CLOCK_CIRCLE
+        ));
+        assert_eq!(
+            super::workers_action_icon("wait_for_status"),
+            crate::icons::CLOCK_CIRCLE,
+            "both waits read the same"
+        );
     }
 
     #[test]

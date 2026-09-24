@@ -222,7 +222,10 @@ pub static MAINTAINED_RUNTIMES: &[RuntimeMaintenanceDefinition] = &[
         homebrew: None,
         native_update: Some(NativeUpdateDefinition {
             executable: "pi",
-            args: &["update", "--extensions"],
+            // `pi update` alone updates pi only; `--extensions` updates only
+            // the installed packages and leaves pi behind (the advisory then
+            // never clears). `--all` is pi plus its packages.
+            args: &["update", "--all"],
             strategy: NativeUpdateStrategy::Always,
         }),
         probe_args: &["--version"],
@@ -1030,7 +1033,7 @@ mod tests {
         assert!(adv_behind.can_update);
         assert_eq!(
             adv_behind.update_command.as_deref(),
-            Some("pi update --extensions")
+            Some("pi update --all")
         );
 
         let adv_current = build_advisory(

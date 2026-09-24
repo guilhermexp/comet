@@ -181,6 +181,24 @@ pub const USER_MESSAGE_CARD_PAD_Y: f32 = 8.0;
 pub const USER_MESSAGE_CARD_RADIUS: f32 = 12.0;
 pub const USER_MESSAGE_FADE_HEIGHT: f32 = 40.0;
 
+/// Long pasted prompts travel farther, so their fold takes longer (upstream
+/// `user_resize_duration_ms`): close to the RESIZE timing for ordinary
+/// messages, scaling to an 850ms ceiling for very large content.
+pub fn user_resize_duration_ms(height_delta: f32) -> u64 {
+    (220.0 + height_delta.max(0.0) * 0.32).min(850.0).round() as u64
+}
+
+/// Short folds keep the decisive ease-out; large ones ease in-out so
+/// thousands of pixels do not vanish in the first frames.
+pub fn user_resize_spec(height_delta: f32) -> motion::MotionSpec {
+    let curve = if height_delta > 500.0 {
+        motion::EASE_IN_OUT
+    } else {
+        motion::EASE_OUT
+    };
+    motion::MotionSpec::new(user_resize_duration_ms(height_delta), curve)
+}
+
 fn user_message_overflows(content_height: f32) -> bool {
     content_height > USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0
 }
@@ -830,6 +848,9 @@ pub enum RowKind {
         rows: Arc<Vec<Row>>,
         summary: SharedString,
         duration_ms: Option<u64>,
+        /// Compact mode folds a turn that is still streaming: the header
+        /// reads "Working" with the title shimmer instead of a settled count.
+        active: bool,
     },
     TaskSnapshot {
         items: Arc<Vec<TaskSnapshotItem>>,
@@ -1002,6 +1023,43 @@ fn file_open_target(
     // ele nao se perdem, e dois `report.md` de diretorios diferentes seguem
     // sendo duas abas.
     Some((context_key.to_string(), root, expanded.into_owned()))
+}
+
+/// Skill roots a `skill://` read can point at, project first (the harness
+/// resolves the checkout's skills ahead of the user's), then the home dirs.
+/// Mirrors the OMP/Claude/Codex/Pi dirs in `zeron-harness::skills`.
+const SKILL_ROOTS: [&str; 5] = [
+    ".agents/skills",
+    ".claude/skills",
+    ".codex/skills",
+    ".pi/skills",
+    ".omp/agent/skills",
+];
+
+/// The on-disk file behind `skill://name[/sub/path]`: `name/SKILL.md` (or the
+/// named sub-file) under the first skill root that has it. `None` for other
+/// URIs, traversal attempts, or a skill this machine does not have.
+fn resolve_skill_uri(
+    uri: &str,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("skill://")?.trim_matches('/');
+    let (name, sub) = rest.split_once('/').unwrap_or((rest, "SKILL.md"));
+    let safe = |part: &str| {
+        !part.is_empty()
+            && std::path::Path::new(part)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+    };
+    if !safe(name) || !safe(sub) {
+        return None;
+    }
+    cwd.into_iter()
+        .chain(home)
+        .flat_map(|base| SKILL_ROOTS.iter().map(move |root| base.join(root)))
+        .map(|root| root.join(name).join(sub))
+        .find(|path| path.is_file())
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -1800,6 +1858,15 @@ fn rows_for_entry_with_todo_history(
                                 .then_some(id.as_str())
                             })
                             .max_by_key(|id| id.len())
+                            .or_else(|| {
+                                // A nested subagent's `task` call lives in
+                                // ITS doc, not this entry; the OMP synthetic
+                                // `parent--child` id still proves the batch.
+                                tool_id
+                                    .split_once("--")
+                                    .map(|(parent, _)| parent)
+                                    .filter(|parent| !parent.is_empty())
+                            })
                             .map(SharedString::from)
                     })
                     .flatten();
@@ -2160,6 +2227,7 @@ fn rows_for_entry_with_todo_history(
             rows: Arc::new(children),
             summary: plan.summary.into(),
             duration_ms: entry.duration_ms,
+            active: false,
         },
         entry_id: entry_id.clone(),
         timestamp: None,
@@ -2169,6 +2237,190 @@ fn rows_for_entry_with_todo_history(
     std::iter::once(steps)
         .chain(remaining.drain(..).map(|projected| projected.row))
         .collect()
+}
+
+/// Top-level rows plus the children a `TurnSteps` fold nests (compact mode
+/// nests live rows there), for state keyed by row id.
+fn flat_rows(rows: &[Row]) -> impl Iterator<Item = &Row> {
+    rows.iter().flat_map(|row| {
+        let children: &[Row] = match &row.kind {
+            RowKind::TurnSteps { rows, .. } => rows,
+            _ => &[],
+        };
+        std::iter::once(row).chain(children.iter())
+    })
+}
+
+/// The tools a row reveals: its group's calls, or a file-change card's one.
+fn revealable_tools(row: &Row) -> Option<Vec<&ToolItem>> {
+    match &row.kind {
+        RowKind::ToolGroup { tools, .. } => Some(tools.iter().collect()),
+        RowKind::FileChange { tool, .. } => Some(vec![tool]),
+        _ => None,
+    }
+}
+
+/// Next reveal epochs for every tool row in `rows` (compact `TurnSteps`
+/// children included). Known calls keep their epoch; history gets `None`;
+/// a call first seen live starts now, staggered within its arrival batch.
+fn classify_tool_reveals(
+    previous: &HashMap<SharedString, HashMap<SharedString, Option<Instant>>>,
+    rows: &[Row],
+    history: bool,
+    now: Instant,
+) -> HashMap<SharedString, HashMap<SharedString, Option<Instant>>> {
+    let mut next = HashMap::new();
+    let mut visit = |row: &Row| {
+        let Some(tools) = revealable_tools(row) else {
+            return;
+        };
+        let known = previous.get(&row.id);
+        let first_delay = if known.is_none() {
+            TOOL_FIRST_ROW_DELAY_MS
+        } else {
+            0
+        };
+        let mut arrival_ix = 0u64;
+        let starts = tools
+            .into_iter()
+            .map(|tool| {
+                let start = if history {
+                    None
+                } else if let Some(start) = known.and_then(|known| known.get(&tool.id)) {
+                    *start
+                } else {
+                    let start =
+                        now + Duration::from_millis(first_delay + arrival_ix * TOOL_ROW_STAGGER_MS);
+                    arrival_ix += 1;
+                    Some(start)
+                };
+                (tool.id.clone(), start)
+            })
+            .collect();
+        next.insert(row.id.clone(), starts);
+    };
+    for row in rows {
+        match &row.kind {
+            RowKind::TurnSteps { rows: children, .. } => children.iter().for_each(&mut visit),
+            _ => visit(row),
+        }
+    }
+    next
+}
+
+/// Compact mode (Settings → Appearance, upstream `transcript_compact_mode`):
+/// an assistant turn's work — thinking, tool calls, file edits, task lists,
+/// narration — folds into ONE `TurnSteps` row, live turns included. A live
+/// turn folds everything (its text is narration until the turn settles); a
+/// settled turn keeps its trailing reply visible. Questions, errors, generated
+/// images and notices never fold, so a blocking prompt or a failure surfaces.
+///
+/// A post-pass over the ordinary rows rather than a second projection: the
+/// fold reuses the settled `#steps` id, so settling a live compact turn is an
+/// in-place version change, not a row swap.
+fn compact_entry_rows(entry: &SessionMessageEntry, rows: Vec<Row>) -> Vec<Row> {
+    if entry.role != MessageRole::Assistant {
+        return rows;
+    }
+    let streaming = entry.status == Some(MessageStatus::Streaming);
+    let mut flat = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.kind {
+            RowKind::TurnSteps { rows: children, .. } => flat.extend(children.iter().cloned()),
+            _ => flat.push(row),
+        }
+    }
+    let is_work = |row: &Row| {
+        matches!(
+            row.kind,
+            RowKind::Reasoning { .. }
+                | RowKind::ToolGroup { .. }
+                | RowKind::FileChange { .. }
+                | RowKind::TaskSnapshot { .. }
+        )
+    };
+    let stays_out = |row: &Row| {
+        matches!(
+            row.kind,
+            RowKind::Question { .. }
+                | RowKind::ErrorChip { .. }
+                | RowKind::GeneratedImage { .. }
+                | RowKind::Notice { .. }
+        )
+    };
+    let fold_end = if streaming {
+        if !flat.iter().any(|row| !stays_out(row)) {
+            return flat;
+        }
+        flat.len()
+    } else {
+        // A reply-only turn has no work to fold.
+        let Some(last_work) = flat.iter().rposition(is_work) else {
+            return flat;
+        };
+        last_work + 1
+    };
+    let turn_start = flat.first().is_some_and(|row| row.turn_start);
+    let mut reply = flat.split_off(fold_end);
+    let mut children = Vec::with_capacity(flat.len());
+    let mut outside = Vec::new();
+    for row in flat {
+        if stays_out(&row) {
+            outside.push(row);
+        } else {
+            children.push(row);
+        }
+    }
+    if children.is_empty() {
+        outside.append(&mut reply);
+        return outside;
+    }
+    // The hover timestamp/copy strip rides the entry's last row; when that
+    // row folded (a settled turn ending on a tool), move it to the fold.
+    let (timestamp, copy_text) = if reply.is_empty() && outside.is_empty() {
+        children
+            .last_mut()
+            .map(|row| (row.timestamp.take(), row.copy_text.take()))
+            .unwrap_or_default()
+    } else {
+        (None, None)
+    };
+    if !streaming {
+        for child in &mut children {
+            settle_turn_steps_child(child);
+        }
+    }
+    for child in &mut children {
+        child.turn_start = false;
+    }
+    let summary = if streaming {
+        "Working".to_owned()
+    } else {
+        let breakdown = crate::turn_steps::activity_breakdown(&entry.parts);
+        if breakdown.is_empty() {
+            let steps = children.len();
+            format!("{steps} {}", if steps == 1 { "step" } else { "steps" })
+        } else {
+            breakdown
+        }
+    };
+    let duration_ms = entry.duration_ms.filter(|_| !streaming);
+    let version = turn_steps_version(&summary, duration_ms, &children) ^ (streaming as u64) << 61;
+    let steps = Row {
+        id: format!("{}#steps", entry.id).into(),
+        version,
+        turn_start,
+        kind: RowKind::TurnSteps {
+            rows: Arc::new(children),
+            summary: summary.into(),
+            duration_ms,
+            active: streaming,
+        },
+        entry_id: entry.id.clone().into(),
+        timestamp,
+        copy_text,
+    };
+    std::iter::once(steps).chain(outside).chain(reply).collect()
 }
 
 /// `ZERON_FRAME_STATS=1` logs live-row render-cost percentiles (p50/p95 µs
@@ -2579,7 +2831,9 @@ fn stream_copy(call: &ToolCall, label: &str, detail: &str) -> (String, String) {
                 .unwrap_or("");
             ("Skill".into(), zeron_proto::view::single_line(skill))
         }
-        ToolCall::Unknown { name, .. } if name == "hub" => (String::new(), detail.to_owned()),
+        ToolCall::Unknown { name, input } if name == "hub" => {
+            hub_stream_copy(input.as_ref(), label == "Running hub")
+        }
         ToolCall::Mcp { .. } => (String::new(), detail.to_owned()),
         ToolCall::Unknown { .. } if matches!(label, "Ran tool" | "Running tool") => {
             (String::new(), detail.to_owned())
@@ -2613,6 +2867,58 @@ fn stream_copy(call: &ToolCall, label: &str, detail: &str) -> (String, String) {
     }
 }
 
+/// OMP `hub` rows read like every other call — verb, then object ("Waited
+/// for 2 jobs", "Stopped report-qa") — instead of the raw op ("wait 2 jobs").
+fn hub_stream_copy(input: Option<&serde_json::Value>, running: bool) -> (String, String) {
+    let op = input
+        .and_then(|input| input.get("op"))
+        .and_then(serde_json::Value::as_str);
+    let target = input
+        .and_then(|input| {
+            ["name", "to", "from", "application"]
+                .into_iter()
+                .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|target| !target.is_empty());
+    let jobs = input
+        .and_then(|input| input.get("ids"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len);
+    let verb = |live: &str, done: &str| if running { live } else { done }.to_owned();
+    let object = target.map(str::to_owned).unwrap_or_default();
+    match op {
+        Some("wait") => {
+            let object = match (target, jobs) {
+                (Some(target), _) => format!("for {target}"),
+                (None, Some(1)) => "for 1 job".to_owned(),
+                (None, Some(n)) => format!("for {n} jobs"),
+                (None, None) => String::new(),
+            };
+            (verb("Waiting", "Waited"), object)
+        }
+        Some("send") => (
+            verb("Sending", "Sent"),
+            target
+                .map(|target| format!("→ {target}"))
+                .unwrap_or_default(),
+        ),
+        Some("start") => (verb("Starting", "Started"), object),
+        Some("stop") => (verb("Stopping", "Stopped"), object),
+        Some("restart") => (verb("Restarting", "Restarted"), object),
+        Some("logs") => (verb("Reading logs", "Read logs"), object),
+        Some("inspect") => (verb("Inspecting", "Inspected"), object),
+        Some(other) => (
+            verb("Running hub", "Ran hub"),
+            match target {
+                Some(target) => format!("{other} {target}"),
+                None => other.to_owned(),
+            },
+        ),
+        None => (verb("Running hub", "Ran hub"), String::new()),
+    }
+}
+
 fn stream_event_row(theme: &Theme) -> gpui::Div {
     div()
         .group("stream-event-header")
@@ -2627,6 +2933,195 @@ fn stream_event_row(theme: &Theme) -> gpui::Div {
         .font_weight(gpui::FontWeight::NORMAL)
         .text_size(px(render::MD_TEXT_SIZE))
         .line_height(px(render::MD_LINE_HEIGHT))
+}
+
+/// Slow light sweep across a live title (upstream #329 recipe): the active
+/// summary stays legible while still reading as "working".
+const TOOL_TITLE_SHIMMER: motion::MotionSpec = motion::MotionSpec::new(3_400, motion::EASE);
+const TOOL_TITLE_SHIMMER_HALF_WIDTH: f32 = 0.36;
+const TOOL_TITLE_SHIMMER_STRIP_WIDTH: f32 = 2.0;
+/// A live tool row fades and lifts in instead of popping (upstream #329).
+const TOOL_ROW_REVEAL: motion::MotionSpec = motion::MotionSpec::new(360, motion::EASE_OUT_EXPO);
+const TOOL_ROW_REVEAL_LIFT: f32 = 6.0;
+const TOOL_FIRST_ROW_DELAY_MS: u64 = 90;
+const TOOL_ROW_STAGGER_MS: u64 = 65;
+
+fn tool_row_reveal_progress(start: Option<Instant>, now: Instant, reduce_motion: bool) -> f32 {
+    let Some(start) = start.filter(|_| !reduce_motion) else {
+        return 1.0;
+    };
+    // A staggered start in the future holds the row fully veiled.
+    let elapsed = now.checked_duration_since(start).unwrap_or_default();
+    let raw = elapsed.as_secs_f32() / TOOL_ROW_REVEAL.total().as_secs_f32();
+    TOOL_ROW_REVEAL.curve.eval(raw.clamp(0.0, 1.0))
+}
+
+/// The Thought body's left border sits at the icon slot's center; the tool
+/// rail reuses that x so thinking and calls read as one guide.
+const TOOL_RAIL_X: f32 = STREAM_ICON / 2.0;
+/// Air between the rail and the icon it meets.
+const TOOL_RAIL_ICON_GAP: f32 = 3.0;
+/// A Read row shows its path chip in the icon slot.
+const READ_CHIP_HEIGHT: f32 = 24.0;
+
+/// Draw the rail segments that join this row's icon to its neighbours':
+/// `up` from the row top to above the icon, `down` from below the icon to
+/// the row bottom (through an open payload and its margin).
+fn with_tool_rail(
+    row: AnyElement,
+    up: bool,
+    down: bool,
+    icon_half: f32,
+    theme: &Theme,
+) -> AnyElement {
+    if !up && !down {
+        return row;
+    }
+    let center = CHIP_HEIGHT / 2.0;
+    let segment = || {
+        div()
+            .absolute()
+            .left(px(TOOL_RAIL_X))
+            .w(px(1.0))
+            .bg(theme.border)
+    };
+    div()
+        .relative()
+        .w_full()
+        .flex_none()
+        .child(row)
+        .when(up, |el| {
+            el.child(
+                segment()
+                    .top_0()
+                    .h(px((center - icon_half - TOOL_RAIL_ICON_GAP).max(0.0))),
+            )
+        })
+        .when(down, |el| {
+            el.child(
+                segment()
+                    .top(px(center + icon_half + TOOL_RAIL_ICON_GAP))
+                    .bottom_0(),
+            )
+        })
+        .into_any_element()
+}
+
+/// Wrap one tool row in its entrance: fade, a short lift, and (for fixed
+/// one-line rows) height growth so later rows slide instead of jumping.
+fn reveal_tool_row(row: AnyElement, progress: f32, grow_height: Option<f32>) -> AnyElement {
+    if progress >= 1.0 {
+        return row;
+    }
+    div()
+        .w_full()
+        .flex_none()
+        .relative()
+        .opacity(progress)
+        .top(px((1.0 - progress) * TOOL_ROW_REVEAL_LIFT))
+        .when_some(grow_height, |el, height| {
+            el.h(px(height * progress)).overflow_hidden()
+        })
+        .child(row)
+        .into_any_element()
+}
+
+/// A 300%-wide repeating highlight moving from 200% to -100% of the title:
+/// sampled by x so narrow paint clips reproduce the continuous gradient.
+fn tool_title_shimmer_amount(x: f32, phase: f32) -> f32 {
+    let primary_center = -2.5 + phase.clamp(0.0, 1.0) * 6.0;
+    (-2..=2)
+        .map(|copy| primary_center + copy as f32 * 3.0)
+        .map(|center| (1.0 - (x - center).abs() / TOOL_TITLE_SHIMMER_HALF_WIDTH).clamp(0.0, 1.0))
+        .fold(0.0, f32::max)
+}
+
+/// Current sweep phase for a live title, or `None` under reduced motion.
+/// Renews the shared pulse lease, so frames run only while it is painted.
+fn tool_title_shimmer_phase(view: gpui::EntityId, cx: &mut gpui::App) -> Option<f32> {
+    if cx.reduce_motion() {
+        return None;
+    }
+    Some(motion::pulse_delta(&TOOL_TITLE_SHIMMER, view, cx))
+}
+
+/// A stream-row title with an optional shimmer. The title stays ONE shaped
+/// run (per-glyph runs break kerning and make the sweep hop); the overlay
+/// repaints the same line through narrow moving clips, the native form of
+/// CSS `background-clip: text`.
+fn shimmer_title(text: SharedString, phase: Option<f32>, theme: &Theme) -> AnyElement {
+    let Some(phase) = phase else {
+        return text.into_any_element();
+    };
+    let overlay_text = text.clone();
+    let overlay_font = gpui::font(theme.font_sans.clone());
+    let base = theme.text_muted;
+    let peak = theme.text;
+    let run = move |color| TextRun {
+        len: overlay_text.len(),
+        font: overlay_font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shape_text = text.clone();
+    let overlay = canvas(
+        move |bounds, window, _| {
+            let shape = |color| {
+                window.text_system().shape_line(
+                    shape_text.clone(),
+                    px(render::MD_TEXT_SIZE),
+                    &[run(color)],
+                    None,
+                )
+            };
+            let text_width = f32::from(shape(peak).width()).min(f32::from(bounds.size.width));
+            let strip_count = (text_width / TOOL_TITLE_SHIMMER_STRIP_WIDTH).ceil() as usize;
+            let mut strips = Vec::with_capacity(strip_count);
+            for ix in 0..strip_count {
+                let left = ix as f32 * TOOL_TITLE_SHIMMER_STRIP_WIDTH;
+                let right = ((ix + 1) as f32 * TOOL_TITLE_SHIMMER_STRIP_WIDTH).min(text_width);
+                let x = (left + right) * 0.5 / text_width.max(1.0);
+                let amount = tool_title_shimmer_amount(x, phase);
+                if amount <= 0.001 {
+                    continue;
+                }
+                strips.push((left, right, shape(motion::mix(base, peak, amount))));
+            }
+            strips
+        },
+        move |bounds, strips, window, cx| {
+            for (left, right, line) in strips {
+                let mask = gpui::ContentMask {
+                    bounds: Bounds {
+                        origin: gpui::point(bounds.origin.x + px(left), bounds.origin.y),
+                        size: gpui::size(px(right - left), bounds.size.height),
+                    },
+                };
+                window.with_content_mask(Some(mask), |window| {
+                    let _ = line.paint(
+                        bounds.origin,
+                        px(render::MD_LINE_HEIGHT),
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                });
+            }
+        },
+    )
+    .absolute()
+    .inset_0();
+    div()
+        .relative()
+        .min_w_0()
+        .h(px(render::MD_LINE_HEIGHT))
+        .overflow_hidden()
+        .child(text)
+        .child(overlay)
+        .into_any_element()
 }
 
 /// Detail content shares the label's left edge; no separate timeline spine.
@@ -3813,6 +4308,18 @@ pub struct Transcript {
     attachment_preview_return_focus: Option<gpui::FocusHandle>,
     /// Shaped-content overflow for each user card, reported after prepaint.
     user_message_overflow: HashMap<SharedString, bool>,
+    /// Natural (unclipped) card height per overflowing user card, from the
+    /// same prepaint probe. The inline Show more tween travels to it.
+    user_message_heights: HashMap<SharedString, f32>,
+    /// Inline expand/collapse for clipped user cards (upstream `user_folds`).
+    user_folds: HashMap<SharedString, FoldState>,
+    /// Entrance epochs for live tool rows, keyed by tool-group row id then
+    /// tool id. `None` = present when this transcript attached (history) or
+    /// already revealed, so replay and virtualized remounts stay still.
+    tool_reveals: HashMap<SharedString, HashMap<SharedString, Option<Instant>>>,
+    /// Compact transcript mode (Settings → Appearance): every turn's work
+    /// folds into one `TurnSteps` row, live turns included.
+    compact_mode: bool,
     /// Full text opened from a clipped user-message card.
     user_message_preview: Option<UserMessagePreview>,
     /// Focused while the full-message overlay is open so Escape reaches it.
@@ -4163,6 +4670,10 @@ impl Transcript {
             attachment_preview_focus: cx.focus_handle(),
             attachment_preview_return_focus: None,
             user_message_overflow: HashMap::new(),
+            user_message_heights: HashMap::new(),
+            user_folds: HashMap::new(),
+            tool_reveals: HashMap::new(),
+            compact_mode: crate::settings::transcript_compact_mode(cx),
             user_message_preview: None,
             user_message_preview_focus: cx.focus_handle(),
             mermaid_preview: None,
@@ -5209,6 +5720,9 @@ impl Transcript {
             self.validated_mermaid.clear();
             self.media_clock = 0;
             self.user_message_overflow.clear();
+            self.user_message_heights.clear();
+            self.user_folds.clear();
+            self.tool_reveals.clear();
             self.user_message_preview = None;
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
@@ -5271,13 +5785,18 @@ impl Transcript {
                 if is_superseded_notice(entries, ix) {
                     continue;
                 }
-                if let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id)) {
-                    new_rows.extend(rows.iter().cloned());
+                let entry_rows = if let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id)) {
                     if let Some(next) = last_todo_snapshot(entry) {
                         todo_history = next.to_vec();
                     }
+                    rows.as_ref().clone()
                 } else {
-                    new_rows.extend(self.rows_for(entry, false, &mut todo_history));
+                    self.rows_for(entry, false, &mut todo_history)
+                };
+                if self.compact_mode {
+                    new_rows.extend(compact_entry_rows(entry, entry_rows));
+                } else {
+                    new_rows.extend(entry_rows);
                 }
             }
             if self.doc_override.is_none() {
@@ -5299,7 +5818,7 @@ impl Transcript {
             .collect();
         self.sticky_turn.retain_user_ids(&live_sticky_user_ids);
         self.reasoning_started.retain(|id, _| {
-            new_rows.iter().any(|row| {
+            flat_rows(&new_rows).any(|row| {
                 row.id == *id && matches!(&row.kind, RowKind::Reasoning { active: true, .. })
             })
         });
@@ -5359,8 +5878,7 @@ impl Transcript {
             // parsed trees instead of parsing the whole transcript twice;
             // only an entry mixing historical and live parts needs a prefix.
             historical_rows.extend(
-                new_rows
-                    .iter()
+                flat_rows(&new_rows)
                     .filter(|row| {
                         fully_historical.contains(&row.entry_id)
                             && matches!(row.kind, RowKind::LiveMarkdown { .. })
@@ -5381,6 +5899,18 @@ impl Transcript {
             self.last_replay_baseline = Some(baseline.clone());
         }
 
+        // Live tool rows fade and lift in (upstream #329). Only calls that
+        // ARRIVE after the replay baseline animate: the first populated frame
+        // after an attach, or a fresh replay baseline, is history — a chat
+        // switch must never replay a whole task log's entrances.
+        let tools_are_history = (self.veil_attach_pending && !entries_empty) || baseline_changed;
+        self.tool_reveals = classify_tool_reveals(
+            &self.tool_reveals,
+            &new_rows,
+            tools_are_history,
+            Instant::now(),
+        );
+
         // Text already streamed before this (re)attach is the veil BASELINE:
         // its rows' veils seed instead of fading (render creates them from
         // this set), so only post-switch appends animate. Captured from the
@@ -5391,8 +5921,7 @@ impl Transcript {
             && (!entries_empty || replay.authoritative_empty() || baseline_changed)
         {
             self.veil_attach_pending = false;
-            self.veil_baseline = new_rows
-                .iter()
+            self.veil_baseline = flat_rows(&new_rows)
                 .filter(|r| baseline.is_none() && matches!(r.kind, RowKind::LiveMarkdown { .. }))
                 .map(|r| r.id.clone())
                 .collect();
@@ -5401,8 +5930,9 @@ impl Transcript {
         // Veils live exactly as long as their live row — drop them on the
         // live→complete flip (any mid-fade chunk snaps to full, matching the
         // row's version splice).
-        let active_markdown: HashSet<&SharedString> = new_rows
-            .iter()
+        // Compact mode nests the live tail inside `TurnSteps`; its veils must
+        // survive each commit like top-level ones, or the text re-fades.
+        let active_markdown: HashSet<&SharedString> = flat_rows(&new_rows)
             .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
             .map(|row| &row.id)
             .collect();
@@ -6019,6 +6549,78 @@ impl Transcript {
             .ok();
         });
         self.attachment_retries.insert(key, task);
+    }
+
+    /// Inline Show more / Show less for a clipped user card (upstream
+    /// `toggle_user_fold`). The fold owns the viewport like explicit
+    /// navigation: the sent-turn hold and the bottom pin let go so growth
+    /// reveals the prompt instead of being chased by the spring. The runway
+    /// itself stays (only leaving the chat clears it).
+    fn toggle_user_fold(&mut self, row_id: SharedString, natural_h: f32) {
+        self.discard_pending_viewport();
+        self.release_own_turn_hold();
+        self.pinned = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.spring_settled_at = None;
+        self.spring_kick = false;
+        self.scroll_anim = None;
+        self.invalidate_sticky_users_after_row(&row_id);
+        let entry = self.user_folds.entry(row_id).or_default();
+        let currently_open = entry.open.unwrap_or(false);
+        entry.from = if currently_open {
+            natural_h
+        } else {
+            USER_MESSAGE_CARD_MAX_HEIGHT
+        };
+        entry.open = Some(!currently_open);
+        entry.epoch += 1;
+        entry.toggled_at = Some(Instant::now());
+    }
+
+    fn render_user_expander(
+        &mut self,
+        row_id: &SharedString,
+        expanded: bool,
+        natural_h: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let toggle_key = row_id.clone();
+        let glyph = if expanded {
+            crate::icons::ALT_ARROW_UP
+        } else {
+            crate::icons::ALT_ARROW_DOWN
+        };
+        let label = if expanded { "Show less" } else { "Show more" };
+        let button = div()
+            .id(SharedString::from(format!("{row_id}-expander")))
+            .group("user-message-toggle")
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .text_size(px(12.0))
+            .line_height(px(18.0))
+            .text_color(theme.text_muted)
+            .cursor_pointer()
+            .hover(|s| s.text_color(theme.text))
+            .child(label)
+            .child(
+                crate::icons::icon(glyph)
+                    .size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .group_hover("user-message-toggle", |s| s.text_color(theme.text)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_user_fold(toggle_key.clone(), natural_h);
+                cx.notify();
+            }));
+        div()
+            .mt(px(6.0))
+            .flex()
+            .justify_end()
+            .child(button)
+            .into_any_element()
     }
 
     fn render_generated_image(
@@ -7174,6 +7776,29 @@ impl Transcript {
                         .get(&row.id)
                         .copied()
                         .unwrap_or(false);
+                    // The sticky clone keeps the clipped card and its
+                    // full-message dialog; the list row expands inline.
+                    let inline_fold = !row.id.ends_with("#sticky");
+                    let fold = self.user_folds.get(&row.id).copied().unwrap_or_default();
+                    let expanded = inline_fold && overflow && fold.open == Some(true);
+                    let natural_h = self
+                        .user_message_heights
+                        .get(&row.id)
+                        .copied()
+                        .unwrap_or(USER_MESSAGE_CARD_MAX_HEIGHT)
+                        .max(USER_MESSAGE_CARD_MAX_HEIGHT);
+                    let card_max_h = if expanded {
+                        natural_h
+                    } else {
+                        USER_MESSAGE_CARD_MAX_HEIGHT
+                    };
+                    let fold_spec = user_resize_spec((card_max_h - fold.from).abs());
+                    let fold_animating = inline_fold
+                        && fold.epoch > 0
+                        && !cx.reduce_motion()
+                        && fold
+                            .toggled_at
+                            .is_some_and(|at| at.elapsed() < fold_spec.total());
                     let overflow_key = row.id.clone();
                     let weak = cx.weak_entity();
                     let preview = UserMessagePreview {
@@ -7184,7 +7809,7 @@ impl Transcript {
                         .relative()
                         .min_w_0()
                         .w_full()
-                        .max_h(px(USER_MESSAGE_CARD_MAX_HEIGHT))
+                        .max_h(px(card_max_h))
                         .overflow_hidden()
                         .rounded(px(USER_MESSAGE_CARD_RADIUS))
                         .border_1()
@@ -7203,49 +7828,83 @@ impl Transcript {
                                 .map(|bounds| f32::from(bounds.size.height))
                                 .unwrap_or(0.0);
                             let next = user_message_overflows(measured);
+                            // Card chrome around the text: padding + border.
+                            let natural = measured + USER_MESSAGE_CARD_PAD_Y * 2.0 + 2.0;
                             weak.update(cx, |this, cx| {
-                                if this
+                                let height_changed = next
+                                    && this
+                                        .user_message_heights
+                                        .insert(overflow_key.clone(), natural)
+                                        .is_none_or(|old| (old - natural).abs() > 0.5);
+                                let overflow_changed = this
                                     .user_message_overflow
                                     .insert(overflow_key.clone(), next)
-                                    != Some(next)
-                                {
+                                    != Some(next);
+                                if overflow_changed || height_changed {
                                     cx.notify();
                                 }
                             })
                             .ok();
                         })
                         .id(SharedString::from(format!("{}#user-card", row.id)));
-                    if overflow {
-                        let weak = cx.weak_entity();
-                        let fade_bg = user_message_card_background(&theme);
+                    if overflow && inline_fold {
+                        let toggle_key = row.id.clone();
                         let hover_border = theme.accent.opacity(0.40);
                         card = card
                             .cursor_pointer()
                             .hover(move |style| style.border_color(hover_border))
-                            .on_click(move |_, window, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.attachment_preview = None;
-                                    this.user_message_preview = Some(preview.clone());
-                                    window.focus(&this.user_message_preview_focus, cx);
-                                    cx.notify();
-                                })
-                                .ok();
-                            })
-                            .child(
-                                div()
-                                    .absolute()
-                                    .bottom_0()
-                                    .left_0()
-                                    .right_0()
-                                    .h(px(USER_MESSAGE_FADE_HEIGHT))
-                                    .bg(gpui::linear_gradient(
-                                        0.0,
-                                        gpui::linear_color_stop(fade_bg, 0.0),
-                                        gpui::linear_color_stop(fade_bg.opacity(0.0), 1.0),
-                                    )),
-                            );
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_user_fold(toggle_key.clone(), natural_h);
+                                cx.notify();
+                            }));
                     }
-                    column = column.child(card);
+                    if overflow && !expanded {
+                        let weak = cx.weak_entity();
+                        let fade_bg = user_message_card_background(&theme);
+                        let hover_border = theme.accent.opacity(0.40);
+                        if !inline_fold {
+                            card = card
+                                .cursor_pointer()
+                                .hover(move |style| style.border_color(hover_border))
+                                .on_click(move |_, window, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        this.attachment_preview = None;
+                                        this.user_message_preview = Some(preview.clone());
+                                        window.focus(&this.user_message_preview_focus, cx);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                });
+                        }
+                        card = card.child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(USER_MESSAGE_FADE_HEIGHT))
+                                .bg(gpui::linear_gradient(
+                                    0.0,
+                                    gpui::linear_color_stop(fade_bg, 0.0),
+                                    gpui::linear_color_stop(fade_bg.opacity(0.0), 1.0),
+                                )),
+                        );
+                    }
+                    if fold_animating {
+                        let from = fold.from;
+                        column = column.child(card.with_animation(
+                            SharedString::from(format!("{}-user-fold{}", row.id, fold.epoch)),
+                            fold_spec.animation(),
+                            move |el, t| el.max_h(px(motion::lerp(from, card_max_h, t))),
+                        ));
+                    } else {
+                        column = column.child(card);
+                    }
+                    if overflow && inline_fold {
+                        column = column.child(
+                            self.render_user_expander(&row.id, expanded, natural_h, &theme, cx),
+                        );
+                    }
                 } else if let Some(summary) = user_message_attachment_summary(&attachments) {
                     column = column.child(
                         div()
@@ -7476,13 +8135,25 @@ impl Transcript {
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
             RowKind::FileChange { tool, auto_open } => {
-                self.render_file_change(&row.id, tool, *auto_open, &theme, cx)
+                let reveal = self.tool_reveal_progress(&row.id, std::slice::from_ref(tool), cx)[0];
+                let card = self.render_file_change(&row.id, tool, *auto_open, &theme, cx);
+                reveal_tool_row(card, reveal, None)
             }
             RowKind::TurnSteps {
                 rows,
                 summary,
                 duration_ms,
-            } => self.render_turn_steps(&row.id, rows, summary, *duration_ms, window, theme, cx),
+                active,
+            } => self.render_turn_steps(
+                &row.id,
+                rows,
+                summary,
+                *duration_ms,
+                *active,
+                window,
+                theme,
+                cx,
+            ),
             RowKind::TaskSnapshot {
                 items,
                 created,
@@ -8153,11 +8824,15 @@ impl Transcript {
         rows: &Arc<Vec<Row>>,
         summary: &SharedString,
         duration_ms: Option<u64>,
+        active: bool,
         window: &mut Window,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = turn_steps_is_open(&self.turn_steps_open, row_id.as_ref());
+        let shimmer = active
+            .then(|| tool_title_shimmer_phase(cx.entity_id(), cx))
+            .flatten();
         let toggle_id = row_id.clone();
         let mut header = stream_event_row(theme)
             .id(SharedString::from(format!("{row_id}-hdr")))
@@ -8189,8 +8864,29 @@ impl Transcript {
                     .min_w_0()
                     .flex_shrink(1.0)
                     .truncate()
-                    .child(SharedString::from(format!("Activity · {summary}"))),
+                    .child(shimmer_title(
+                        SharedString::from(format!("Activity · {summary}")),
+                        shimmer,
+                        theme,
+                    )),
             );
+        if active {
+            header = header.child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(crate::loaders::mini_mono_spinner(
+                        "turn-steps-working",
+                        2.0,
+                        theme.text_muted,
+                        cx.entity_id(),
+                        cx,
+                    )),
+            );
+        }
         if let Some(duration) = turn_steps_duration_label(duration_ms) {
             header = header.child(
                 div()
@@ -8317,7 +9013,33 @@ impl Transcript {
             }
             _ => expanded.into_owned(),
         };
-        let open_file = if path.contains("://") && !path.starts_with("file://") {
+        // A skill read names a URI, not a file, so its recorded result is only
+        // the one-line summary. On the host that ran it, open the real file.
+        let local_skill = path
+            .starts_with("skill://")
+            .then(|| {
+                let state = self.state.read(cx);
+                let chat = state.selected_chat_row()?;
+                let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
+                local.then(|| chat.cwd.clone()).flatten()
+            })
+            .flatten()
+            .and_then(|cwd| {
+                resolve_skill_uri(
+                    path,
+                    Some(std::path::Path::new(&cwd)),
+                    std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .as_deref(),
+                )
+            });
+        let target = local_skill
+            .as_ref()
+            .map(|file| file.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let open_file = if local_skill.is_some() {
+            self.open_file_link(cx)
+        } else if path.contains("://") && !path.starts_with("file://") {
             let chat = self.state.read(cx).selected_chat_row()?.clone();
             let uri = path.clone();
             let tool_id = tool.id.to_string();
@@ -8361,7 +9083,6 @@ impl Transcript {
         } else {
             self.open_file_link(cx)
         };
-        let target = path.clone();
         let theme_text_hover = theme.text.opacity(0.10);
         let hover_color = crate::markdown::inline_chips::file_hover_color(theme);
         Some(
@@ -9161,6 +9882,33 @@ impl Transcript {
         row.child(summary).into_any_element()
     }
 
+    /// Entrance progress per call of one tool row, renewing the frame lease
+    /// while any is still revealing.
+    fn tool_reveal_progress(
+        &self,
+        row_id: &SharedString,
+        tools: &[ToolItem],
+        cx: &mut Context<Self>,
+    ) -> Vec<f32> {
+        let reduce_motion = cx.reduce_motion();
+        let now = Instant::now();
+        let starts = self.tool_reveals.get(row_id);
+        let progress: Vec<f32> = tools
+            .iter()
+            .map(|tool| {
+                let start = starts
+                    .and_then(|starts| starts.get(&tool.id))
+                    .copied()
+                    .flatten();
+                tool_row_reveal_progress(start, now, reduce_motion)
+            })
+            .collect();
+        if progress.iter().any(|p| *p < 1.0) {
+            motion::pulse_lease(cx.entity_id(), cx);
+        }
+        progress
+    }
+
     fn render_tool_group(
         &mut self,
         row_id: &SharedString,
@@ -9428,13 +10176,11 @@ impl Transcript {
                 })
                 .collect()
         };
-        let chips = div()
-            .when(collapses, |column| column.pl(px(STREAM_ICON + 8.0)))
-            .pt(px(CHIPS_TOP_PAD))
-            .flex()
-            .flex_col()
-            .gap(px(CHIP_GAP))
-            .children(tools.iter().enumerate().map(|(ix, tool)| {
+        let reveals = self.tool_reveal_progress(row_id, tools, cx);
+        let rendered_chips: Vec<AnyElement> = tools
+            .iter()
+            .enumerate()
+            .map(|(ix, tool)| {
                 // Spawn chips are LINKS, not accordions: the click opens the
                 // subagent's transcript as a right-pane tab (the shell hosts
                 // the surface — the chip only announces which doc it indexes).
@@ -9641,6 +10387,35 @@ impl Transcript {
                     .when(open, |row| row.mb(px(8.0)))
                     .child(card)
                     .into_any_element()
+            })
+            .collect();
+        let chips = div()
+            .when(collapses, |column| column.pl(px(STREAM_ICON + 8.0)))
+            .pt(px(CHIPS_TOP_PAD))
+            .flex()
+            .flex_col()
+            .gap(px(CHIP_GAP))
+            .children(rendered_chips.into_iter().enumerate().map(|(ix, chip)| {
+                // Consecutive calls share the guide rail the Thought body
+                // draws, at the same x. Spawn cards and framed command cards
+                // carry their own chrome there, so they break the rail.
+                let railed = |ix: usize| {
+                    let tool = &tools[ix];
+                    !is_spawn_link(tool)
+                        && !(matches!(tool.call, ToolCall::Exec { .. }) && detail_opens[ix])
+                };
+                let up = ix > 0 && railed(ix - 1) && railed(ix);
+                let down = ix + 1 < tools.len() && railed(ix) && railed(ix + 1);
+                let icon_half = if matches!(tools[ix].call, ToolCall::ReadFile { .. }) {
+                    READ_CHIP_HEIGHT / 2.0
+                } else {
+                    STREAM_ICON / 2.0
+                };
+                let chip = with_tool_rail(chip, up, down, icon_half, theme);
+                // Closed one-line rows also grow into place; an open payload
+                // has no analytic height, so it only fades and lifts.
+                let grows = !detail_opens[ix] && !is_spawn_link(&tools[ix]);
+                reveal_tool_row(chip, reveals[ix], grows.then_some(CHIP_HEIGHT))
             }));
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
@@ -10295,6 +11070,10 @@ fn chip_header_row(
         .map(crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path);
     let standalone_name = label.is_empty();
     let is_read = read_file.is_some();
+    // The running call's verb carries the live sweep; settled rows are still.
+    let label_shimmer = (header_state == ToolHeaderState::Pending && !running && !failed)
+        .then(|| tool_title_shimmer_phase(view, cx))
+        .flatten();
     stream_event_row(theme)
         .when(!is_read, |row| {
             row.child(
@@ -10325,7 +11104,11 @@ fn chip_header_row(
                     .flex()
                     .items_center()
                     .text_color(tint)
-                    .child(SharedString::from(label)),
+                    .child(shimmer_title(
+                        SharedString::from(label),
+                        label_shimmer,
+                        theme,
+                    )),
             )
         })
         .child(read_file.unwrap_or_else(|| {
@@ -11033,6 +11816,13 @@ impl Render for Transcript {
             .borrow_mut()
             .retain_rows(&self.rendered_rows);
         self.rendered_rows.clear();
+        let compact_mode = crate::settings::transcript_compact_mode(cx);
+        if self.compact_mode != compact_mode {
+            self.compact_mode = compact_mode;
+            // The row split differs by mode; rebuild every row.
+            self.last_source = None;
+            self.sync(cx);
+        }
         let content_width = crate::settings::transcript_width(cx);
         if self.content_width != content_width {
             self.content_width = content_width;
@@ -13516,6 +14306,293 @@ mod tests {
         }
     }
 
+    fn compact(entry: &SessionMessageEntry) -> Vec<Row> {
+        compact_entry_rows(entry, rows_for_entry(entry, false, &mut parse))
+    }
+
+    fn reasoning(id: &str, text: &str) -> MessagePart {
+        MessagePart::Reasoning {
+            id: id.into(),
+            text: text.into(),
+            completed: true,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn compact_mode_folds_a_settled_turn_and_keeps_the_reply() {
+        let entry = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                reasoning("r0", "thinking about it"),
+                tool_part("t1", "ls"),
+                text_part("n1", "checking the layout now"),
+                tool_part("t2", "pwd"),
+                text_part("r1", "All done."),
+            ],
+        );
+        let rows = compact(&entry);
+        assert_eq!(rows.len(), 2, "one fold + the reply");
+        let RowKind::TurnSteps {
+            rows: children,
+            active,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("work folds into TurnSteps");
+        };
+        assert!(!active);
+        assert_eq!(
+            rows[0].id.as_ref(),
+            "a1#steps",
+            "same id as the settled fold"
+        );
+        assert!(rows[0].turn_start);
+        assert!(
+            children
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::Reasoning { .. }))
+        );
+        assert!(
+            children
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::Markdown { .. })),
+            "narration folds with the work"
+        );
+        assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
+        assert!(
+            rows[1].timestamp.is_some(),
+            "the reply keeps the hover strip"
+        );
+    }
+
+    #[test]
+    fn compact_mode_folds_everything_while_streaming() {
+        let parts = vec![
+            reasoning("r0", "thinking"),
+            tool_part("t1", "ls"),
+            text_part("r1", "streaming the answer"),
+        ];
+        let rows = compact(&assistant("a1", MessageStatus::Streaming, parts.clone()));
+        assert_eq!(rows.len(), 1, "the live text tail folds too");
+        let RowKind::TurnSteps {
+            summary, active, ..
+        } = &rows[0].kind
+        else {
+            panic!("live work folds into TurnSteps");
+        };
+        assert!(*active);
+        assert_eq!(summary.as_ref(), "Working");
+
+        let done = compact(&assistant("a1", MessageStatus::Complete, parts));
+        assert_eq!(done.len(), 2, "settling surfaces the reply");
+        assert_eq!(
+            done[0].id, rows[0].id,
+            "settle is an in-place version change"
+        );
+        assert_ne!(done[0].version, rows[0].version);
+    }
+
+    #[test]
+    fn compact_mode_leaves_reply_only_turns_and_keeps_errors_visible() {
+        let reply_only = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![text_part("t0", "just an answer")],
+        );
+        let rows = compact(&reply_only);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].kind, RowKind::Markdown { .. }));
+
+        let with_error = assistant(
+            "a2",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t0", "ls"),
+                MessagePart::Error {
+                    id: "e1".into(),
+                    message: "boom".into(),
+                },
+                tool_part("t1", "pwd"),
+                text_part("r0", "the answer"),
+            ],
+        );
+        let rows = compact(&with_error);
+        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.kind, RowKind::ErrorChip { .. })),
+            "a failure never hides inside the fold"
+        );
+        assert!(matches!(
+            rows.last().unwrap().kind,
+            RowKind::Markdown { .. }
+        ));
+
+        let ends_on_tool = assistant("a3", MessageStatus::Complete, vec![tool_part("t0", "ls")]);
+        let rows = compact(&ends_on_tool);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].timestamp.is_some(),
+            "a folded last row hands its timestamp to the fold"
+        );
+    }
+
+    #[test]
+    fn tool_reveals_animate_only_live_arrivals() {
+        let t0 = Instant::now();
+        let first = rows_for_entry(
+            &assistant("a1", MessageStatus::Streaming, vec![tool_part("t1", "ls")]),
+            false,
+            &mut parse,
+        );
+        let history = classify_tool_reveals(&HashMap::new(), &first, true, t0);
+        assert!(
+            history
+                .values()
+                .flat_map(|m| m.values())
+                .all(Option::is_none),
+            "replayed calls never animate"
+        );
+
+        let second = rows_for_entry(
+            &assistant(
+                "a1",
+                MessageStatus::Streaming,
+                vec![tool_part("t1", "ls"), tool_part("t2", "pwd")],
+            ),
+            false,
+            &mut parse,
+        );
+        let live = classify_tool_reveals(&history, &second, false, t0);
+        let starts: Vec<_> = live.values().flat_map(|m| m.iter()).collect();
+        assert!(
+            starts
+                .iter()
+                .any(|(id, start)| id.as_ref() == "t1" && start.is_none()),
+            "a known call keeps its epoch"
+        );
+        assert!(
+            starts
+                .iter()
+                .any(|(id, start)| id.as_ref() == "t2" && start.is_some()),
+            "a new live call reveals"
+        );
+        let again = classify_tool_reveals(&live, &second, false, t0 + Duration::from_secs(5));
+        assert_eq!(live, again, "a later sync never restarts a reveal");
+    }
+
+    #[test]
+    fn tool_row_reveal_honors_delay_and_reduced_motion() {
+        let t0 = Instant::now();
+        assert_eq!(tool_row_reveal_progress(None, t0, false), 1.0);
+        let future = t0 + Duration::from_millis(90);
+        assert_eq!(tool_row_reveal_progress(Some(future), t0, false), 0.0);
+        assert_eq!(tool_row_reveal_progress(Some(future), t0, true), 1.0);
+        let mid = tool_row_reveal_progress(Some(t0), t0 + Duration::from_millis(120), false);
+        assert!(mid > 0.0 && mid < 1.0, "{mid}");
+        assert_eq!(
+            tool_row_reveal_progress(Some(t0), t0 + TOOL_ROW_REVEAL.total(), false),
+            1.0
+        );
+    }
+
+    #[test]
+    fn tool_title_shimmer_sweeps_without_a_loop_seam() {
+        // The pattern repeats every three title widths, so phase 0 and 1 match.
+        for x in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let a = tool_title_shimmer_amount(x, 0.0);
+            let b = tool_title_shimmer_amount(x, 1.0);
+            assert!((a - b).abs() < 1e-4, "x={x}: {a} vs {b}");
+        }
+        assert!((0..=10).any(|i| tool_title_shimmer_amount(0.5, i as f32 / 10.0) > 0.9));
+    }
+
+    #[test]
+    fn user_resize_duration_scales_with_distance_and_stays_bounded() {
+        assert_eq!(user_resize_duration_ms(0.0), 220);
+        assert!(user_resize_duration_ms(400.0) > user_resize_duration_ms(100.0));
+        assert_eq!(user_resize_duration_ms(10_000.0), 850);
+        assert_eq!(user_resize_spec(100.0).curve, motion::EASE_OUT);
+        assert_eq!(user_resize_spec(900.0).curve, motion::EASE_IN_OUT);
+    }
+
+    #[test]
+    fn hub_rows_read_verb_then_object_like_other_calls() {
+        let copy = |input: serde_json::Value, resolved: bool| {
+            let call = ToolCall::Unknown {
+                name: "hub".into(),
+                input: Some(input),
+            };
+            let presentation = tool_presentation(&call, resolved, false);
+            stream_copy(&call, presentation.label, &presentation.detail)
+        };
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            copy(serde_json::json!({"op":"wait", "ids":["j1","j2"]}), true),
+            pair("Waited", "for 2 jobs")
+        );
+        assert_eq!(
+            copy(serde_json::json!({"op":"wait", "ids":["j1"]}), false),
+            pair("Waiting", "for 1 job")
+        );
+        assert_eq!(
+            copy(serde_json::json!({"op":"wait"}), true),
+            pair("Waited", "")
+        );
+        assert_eq!(
+            copy(serde_json::json!({"op":"stop", "name":"report-qa"}), true),
+            pair("Stopped", "report-qa")
+        );
+        assert_eq!(
+            copy(serde_json::json!({"op":"send", "to":"scout"}), true),
+            pair("Sent", "→ scout")
+        );
+        assert_eq!(
+            copy(serde_json::json!({"op":"poke"}), true),
+            pair("Ran hub", "poke")
+        );
+        let bare = ToolCall::Unknown {
+            name: "hub".into(),
+            input: None,
+        };
+        let presentation = tool_presentation(&bare, true, false);
+        assert_eq!(
+            stream_copy(&bare, presentation.label, &presentation.detail),
+            pair("Ran hub", "")
+        );
+    }
+
+    #[test]
+    fn skill_uris_resolve_to_the_project_skill_file_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let project_skill = project.join(".agents/skills/openspec-propose");
+        let home_skill = home.join(".claude/skills/openspec-propose");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::create_dir_all(home_skill.join("references")).unwrap();
+        std::fs::write(project_skill.join("SKILL.md"), "---").unwrap();
+        std::fs::write(home_skill.join("SKILL.md"), "---").unwrap();
+        std::fs::write(home_skill.join("references/guide.md"), "#").unwrap();
+
+        let resolve = |uri| resolve_skill_uri(uri, Some(&project), Some(&home));
+        assert_eq!(
+            resolve("skill://openspec-propose"),
+            Some(project_skill.join("SKILL.md"))
+        );
+        assert_eq!(
+            resolve("skill://openspec-propose/references/guide.md"),
+            Some(home_skill.join("references/guide.md")),
+            "a sub-file falls through to the root that has it"
+        );
+        assert_eq!(resolve("skill://missing"), None);
+        assert_eq!(resolve("skill://../etc/passwd"), None);
+        assert_eq!(resolve("skill://openspec-propose/../../x"), None);
+        assert_eq!(resolve("https://example.com"), None);
+    }
+
     #[test]
     fn todo_snapshot_renders_outside_the_generic_tool_group() {
         let entry = assistant(
@@ -14149,6 +15226,39 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn nested_task_children_batch_by_their_synthetic_parent_prefix() {
+        // A subagent that spawned scouts recorded its `task` call in ITS own
+        // doc; the parent entry only sees the `call--child` spawns.
+        let entry = assistant(
+            "nested",
+            MessageStatus::Complete,
+            vec![
+                agent_part("call_230094--Audit.ReconAuth", "One"),
+                agent_part("call_230094--Audit.ReconStack", "Two"),
+                agent_part("call_230094--Audit.ReconDeploy", "Three"),
+                agent_part("call_777--Other", "Four"),
+                agent_part("plain", "Unlinked"),
+                text_part("after", "after"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let batches: Vec<(Option<&str>, usize)> = rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                RowKind::ToolGroup { tools, .. } if tools.iter().all(is_agent_tool) => {
+                    Some((tools[0].subagent_batch.as_deref(), tools.len()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            batches,
+            vec![(Some("call_230094"), 3), (Some("call_777"), 1), (None, 1)],
+            "one inline batch per parent call; unlinked spawns stay apart"
+        );
     }
 
     #[test]
@@ -15486,19 +16596,6 @@ mod tests {
                 "review",
             ),
             ("Skill", None, "Skill", ""),
-            (
-                "hub",
-                Some(serde_json::json!({"op":"wait", "ids":["job-1","job-2"]})),
-                "",
-                "wait 2 jobs",
-            ),
-            (
-                "hub",
-                Some(serde_json::json!({"op":"stop", "name":"report-qa"})),
-                "",
-                "stop report-qa",
-            ),
-            ("hub", None, "", "hub"),
         ];
         for resolved in [false, true] {
             for (name, input, label, detail) in &cases {
