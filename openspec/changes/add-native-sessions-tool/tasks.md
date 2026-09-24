@@ -1,7 +1,7 @@
 ## 1. Protocol
 
-- [ ] 1.1 Add `Chat.origin_chat_id` (serde default) and `RunRequest.sessions: Option<SessionsGrant>` in `crates/proto`; verify old JSON rows and requests deserialize with `None` (proto unit test)
-- [ ] 1.2 Add RPC method `SpawnChat` (params `parentChatId`, `prompt`, optional `spaceId`; result `chatId` + space/device) to `zeron_proto`/`zeron_rpc` methods; verify serde round-trip test
+- [x] 1.1 Add `Chat.origin_chat_id` (serde default) and `RunRequest.sessions: Option<SessionsGrant>` in `crates/proto`; verify old JSON rows and requests deserialize with `None` (proto unit test)
+- [x] 1.2 Add RPC method `SpawnChat` (params `parentChatId`, `prompt`, optional `spaceId`; result `chatId` + space/device) to `zeron_proto`/`zeron_rpc` methods; verify serde round-trip test
 
 ## 2. Engine
 

@@ -101,7 +101,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn spawn_chat_params_round_trip_and_default_space() {
         let bare: SpawnChatParams = serde_json::from_value(serde_json::json!({
             "parentChatId": "parent",
@@ -128,6 +127,7 @@ mod tests {
         assert_eq!(serde_json::from_value::<SpawnChatResult>(value).unwrap(), result);
     }
 
+    #[test]
     fn engine_info_uses_camel_case_fields() {
         let info = EngineInfo {
             device_id: "device-1".into(),

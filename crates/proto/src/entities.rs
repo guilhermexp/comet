@@ -1470,6 +1470,18 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn old_chat_row_deserializes_without_origin() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-1",
+            "deviceId": "device-1",
+            "archived": false,
+            "createdAt": "2026-08-21T12:00:00Z"
+        }))
+        .unwrap();
+        assert!(chat.origin_chat_id.is_none());
+    }
+
+    #[test]
     fn session_context_is_additive_and_round_trips() {
         let old: Session = serde_json::from_value(serde_json::json!({
             "chatId": "chat-1",
