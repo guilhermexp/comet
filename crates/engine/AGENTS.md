@@ -12,6 +12,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
+- `SpawnChat` (IPC local) abre um Chat filho com a config da row do pai, `origin_chat_id` no mesmo upsert e o primeiro `Run`. `RunRequest.sessions` só existe em run de orquestrador sem origem e com IPC realmente bound (`note_local_ipc` depois de `serve_ipc`); dispatch, revive e `request_from_chat_row` sobrescrevem valor de cliente. Runs de título, commit, recap e live voice ficam sem o grant. Cobertura: `tests/spawn_chat.rs`, `tests/e2e.rs::spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt`.
+
 - Atualizações de contexto mesclam campos reportados individualmente (`ContextUsage::merge`) antes de publicar WatchSessions e persistir. Tokens zero substituem a medição anterior; limite isolado não apaga tokens. Usage intermediário de contexto não muda status nem exige outro turno.
 
 - Login Codex reutiliza o resolvedor de executável do harness (`CODEX_EXECUTABLE` e PATH) e compõe o PATH do filho com o diretório resolvido; não assume que o daemon herdou o PATH do shell interativo. Cobertura: `tests/codex_login_resolver.rs`.
@@ -122,6 +124,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/process.rs` (teto de saída, kill, spawn) | unit | `cargo test -p zeron-engine process::` |
 | `src/diff_sync.rs` (`DiffMode::parse`, teto de frame) | unit | `cargo test -p zeron-engine diff_sync` |
 | `src/repos.rs` + `src/diff_sync.rs` + `src/rpc.rs` + `tests/source_control_ops.rs` + `tests/source_control_hardening.rs` (autorização do cwd, pathspec literal, porcelain XY, discard atômico) | unit / integration — FakeGit + checkout temporário | `cargo test -p zeron-engine repos` · `cargo test -p zeron-engine diff_sync` · `cargo test -p zeron-engine --test source_control_ops` · `cargo test -p zeron-engine --test source_control_hardening` |
+| `tests/spawn_chat.rs` + `tests/e2e.rs` (`SpawnChat`) | integration / e2e | `cargo test -p zeron-engine --test spawn_chat` · `cargo test -p zeron-engine --test e2e spawn_chat_watch` |
 | `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p zeron-engine` |
 | `tests/{auth,device_routing,run_controls_chat_id,m5_*,m5c_*}.rs` | integration | `cargo test -p zeron-engine` |
 | `tests/acp_lifecycle.rs` | integration — prompt ACP lento, steering e atividade autônoma | `cargo test -p zeron-engine --test acp_lifecycle` |

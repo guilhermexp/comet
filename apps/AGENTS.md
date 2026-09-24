@@ -22,6 +22,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 - Bind da porta é best-effort: porta ocupada não impede a janela de abrir, só perde a capacidade de hospedar peers.
 - **Modo headless**: só engine; imprime URL de sign-in no TTY (fluxo de paste-code), serve IPC em localhost e hospeda o próprio DeviceRoom.
 - Subcomandos vivem em arquivos separados (`auth_cli.rs`, `update_cli.rs`, `daemon.rs`) — `main.rs` só despacha.
+- `zeron __sessions_mcp__` é interceptado em `main` antes do parse de CLI e do host de workers, e delega para `zeron-sessions-mcp`. Argumento extra recusa com usage. Não é subcomando clap.
 - O allocator customizado do binário é mimalloc v2 apenas no macOS; Linux e demais plataformas mantêm o allocator de sistema.
 - No iOS, `NativeTranscriptTable` preserva identidade/posição de células e aplica keyboard inset com a animação nativa. `SessionStore.lastSubmittedMessageId` distingue envio local de entradas remotas; folding de mensagem vive no store quente. `ComposerEditorController` confirma IME antes do envio e aplica o draft resultante imediatamente. Disclosure de tools é local à célula, sem reconfigurar todo o transcript.
 - Imagens geradas no transcript carregam apenas `path/name/mimeType` no ChatDoc. O iOS valida os quatro MIME raster suportados, tenta o device dono antes do host e decodifica uma única frame com limite de bytes e dimensões antes de medir/renderizar; cache genérico e cache com MIME esperado são chaves distintas.

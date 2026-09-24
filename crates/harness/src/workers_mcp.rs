@@ -1,5 +1,5 @@
-//! The Comet-owned Workers controller MCP server, resolved once and rendered
-//! in each runtime's own config dialect. One resolver, three renderers.
+//! Comet MCP servers (`comet-workers`, `comet-sessions`), resolved together
+//! and rendered in each runtime's own config dialect.
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -63,7 +63,10 @@ pub(crate) fn resolve_sessions_for(
         args: vec![SESSIONS_MCP_ARG.to_owned()],
         env: vec![
             ("COMET_SESSIONS_CONTROLLER".into(), "1".into()),
-            ("COMET_SESSIONS_PARENT_CHAT_ID".into(), grant.parent_chat_id.clone()),
+            (
+                "COMET_SESSIONS_PARENT_CHAT_ID".into(),
+                grant.parent_chat_id.clone(),
+            ),
             ("COMET_SESSIONS_ENDPOINT".into(), grant.endpoint.clone()),
             ("COMET_SESSIONS_ENGINE_ID".into(), grant.engine_id.clone()),
         ],
@@ -182,9 +185,11 @@ impl WorkersMcpServer {
                 self.name, self.timeout_secs
             ),
         ];
-        overrides.extend(self.env.iter().map(|(name, value)| {
-            format!("mcp_servers.{}.env.{name}={}", self.name, quote(value))
-        }));
+        overrides.extend(
+            self.env.iter().map(|(name, value)| {
+                format!("mcp_servers.{}.env.{name}={}", self.name, quote(value))
+            }),
+        );
         overrides
     }
 }
@@ -283,9 +288,20 @@ mod tests {
             claude["mcpServers"]["comet-sessions"]["env"]["COMET_SESSIONS_ENGINE_ID"],
             "engine-1"
         );
-        let codex: Vec<_> = servers.iter().flat_map(|server| server.codex_overrides()).collect();
-        assert!(codex.iter().any(|line| line.contains("mcp_servers.comet-sessions.")));
-        assert!(codex.iter().any(|line| line.contains("mcp_servers.comet-workers.tool_timeout_sec=")));
+        let codex: Vec<_> = servers
+            .iter()
+            .flat_map(|server| server.codex_overrides())
+            .collect();
+        assert!(
+            codex
+                .iter()
+                .any(|line| line.contains("mcp_servers.comet-sessions."))
+        );
+        assert!(
+            codex
+                .iter()
+                .any(|line| line.contains("mcp_servers.comet-workers.tool_timeout_sec="))
+        );
         let acp: Vec<_> = servers.iter().map(|server| server.acp_value()).collect();
         assert_eq!(acp.len(), 2);
     }
@@ -304,5 +320,4 @@ mod tests {
         assert!(servers_for(Path::new("/opt/zeron"), &request(false, false), false).is_empty());
         assert!(claude_config_json(&[]).is_none());
     }
-
 }
