@@ -55,6 +55,7 @@ async fn check_persistence(
     let request = RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         prompt: format!("scenario:{scenario}"),
         harness: None,
         model: None,

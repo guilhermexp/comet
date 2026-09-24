@@ -12,7 +12,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
-- `SpawnChat` (IPC local) abre um Chat filho com a config da row do pai, `origin_chat_id` no mesmo upsert e o primeiro `Run`. `RunRequest.sessions` só existe em run de orquestrador sem origem e com IPC realmente bound (`note_local_ipc` depois de `serve_ipc`); dispatch, revive e `request_from_chat_row` sobrescrevem valor de cliente. Runs de título, commit, recap e live voice ficam sem o grant. Cobertura: `tests/spawn_chat.rs`, `tests/e2e.rs::spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt`.
+- `SpawnChat` (IPC local) abre um Chat filho com a config da row do pai, `origin_chat_id` no mesmo upsert e o primeiro `Run`. `RunRequest.sessions` só existe em run de orquestrador sem origem (`origin_chat_id` e `parent_chat_id` vazios: filho do Zeron MCP também fica sem o grant) e com IPC realmente bound (`note_local_ipc` depois de `serve_ipc`); dispatch, revive e `request_from_chat_row` sobrescrevem valor de cliente. Runs de título, commit, recap e live voice ficam sem o grant. Cobertura: `tests/spawn_chat.rs`, `tests/e2e.rs::spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt`.
 
 - Atualizações de contexto mesclam campos reportados individualmente (`ContextUsage::merge`) antes de publicar WatchSessions e persistir. Tokens zero substituem a medição anterior; limite isolado não apaga tokens. Usage intermediário de contexto não muda status nem exige outro turno.
 

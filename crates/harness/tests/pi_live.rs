@@ -32,6 +32,7 @@ async fn real_pi_mock_lifecycle() {
         let request = RunRequest {
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
+            sessions: None,
             prompt: match scenario {
                 "boundary" => "slow-model",
                 "interrupt" | "mid-kill" => "slow-tool",

@@ -44,6 +44,7 @@ async fn main() {
     let request = RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         prompt,
         harness: None,
         model,

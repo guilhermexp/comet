@@ -927,7 +927,15 @@ impl WorkspaceHost {
         cwd: Option<String>,
         parent_chat_id: Option<String>,
     ) -> Result<(), EngineError> {
-        self.insert_chat(chat_id, space_id, device_id, config, cwd, parent_chat_id, None)
+        self.insert_chat(
+            chat_id,
+            space_id,
+            device_id,
+            config,
+            cwd,
+            parent_chat_id,
+            None,
+        )
     }
 
     /// Same upsert as [`Self::create_chat`], with the parent chat recorded as

@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let request = RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         prompt: "Reply with exactly: Devin model discovery verified. Do not use tools.".into(),
         harness: None,
         model: Some(model.clone()),

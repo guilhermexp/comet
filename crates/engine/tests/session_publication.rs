@@ -257,6 +257,7 @@ async fn turn(core: &EngineCore, cwd: &std::path::Path, live: bool, second: bool
                 auto_approve: true,
                 enable_workers_mcp: false,
                 workers_parent_chat_id: None,
+                sessions: None,
                 attachments: vec![],
                 worktree: None,
                 resume: None,

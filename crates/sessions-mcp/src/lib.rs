@@ -395,6 +395,8 @@ mod tests {
             Ok(EngineInfo {
                 device_id: self.engine_id.clone(),
                 workspace_scope: WorkspaceScope::Local,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
             })
         }
         fn spaces(&self) -> Result<Vec<Space>, String> {

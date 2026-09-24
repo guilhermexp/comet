@@ -4946,18 +4946,20 @@ impl DocHost {
         Some(request)
     }
 
-    /// Lineage read from the chat row. A missing workspace, a missing row or
-    /// a read error is `Unknown`, never `Root`: the grant fails closed.
+    /// Lineage read from the chat row. Either agent-created link — `sessions`
+    /// (`origin_chat_id`) or the Zeron MCP (`parent_chat_id`) — is `Spawned`.
+    /// A missing workspace, a missing row or a read error is `Unknown`, never
+    /// `Root`: the grant fails closed.
     pub(crate) fn chat_origin(&self, chat_id: &str) -> crate::sessions::ChatOrigin {
         use crate::sessions::ChatOrigin;
         let Some(workspace) = self.workspace() else {
             return ChatOrigin::Unknown;
         };
         match workspace.chat(chat_id) {
-            Ok(Some(chat)) => match chat.origin_chat_id {
-                None => ChatOrigin::Root,
-                Some(_) => ChatOrigin::Spawned,
-            },
+            Ok(Some(chat)) if chat.origin_chat_id.is_none() && chat.parent_chat_id.is_none() => {
+                ChatOrigin::Root
+            }
+            Ok(Some(_)) => ChatOrigin::Spawned,
             Ok(None) | Err(_) => ChatOrigin::Unknown,
         }
     }
@@ -5595,11 +5597,26 @@ mod abandoned_recovery_tests {
         workspace
             .create_child_chat("child", None, Some("dev-a"), None, None, "root")
             .unwrap();
+        workspace
+            .create_chat_with_parent(
+                "mcp-child",
+                None,
+                Some("dev-a"),
+                None,
+                None,
+                Some("root".into()),
+            )
+            .unwrap();
         host.set_workspace(workspace);
 
         assert_eq!(host.chat_origin("missing"), ChatOrigin::Unknown, "no row");
         assert_eq!(host.chat_origin("root"), ChatOrigin::Root);
         assert_eq!(host.chat_origin("child"), ChatOrigin::Spawned);
+        assert_eq!(
+            host.chat_origin("mcp-child"),
+            ChatOrigin::Spawned,
+            "a zeron-mcp child is agent-created too"
+        );
     }
 }
 
