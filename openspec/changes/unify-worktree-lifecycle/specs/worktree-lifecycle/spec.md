@@ -1,7 +1,8 @@
 ## Purpose
 
 Dar ao comet um único ciclo de vida de worktree — onde nasce, como se nomeia, quais raízes são do app,
-o setup que sempre roda e o que é "em uso" — igual para Chats e Workers.
+o setup e os hooks do worktrunk que rodam, quando a branch sai junto e o que é "em uso" — igual para
+Chats e Workers.
 
 ## ADDED Requirements
 
@@ -101,3 +102,111 @@ Test: unit — mesmo predicado sem Worker vivo nem Chat `Working`.
 
 - **WHEN** nenhum Worker vive no checkout e nenhum Chat está `Working` nele
 - **THEN** o predicado de uso não bloqueia a remoção
+
+### Requirement: Os hooks de worktree do worktrunk rodam no app
+
+Quando o repositório tem `.config/wt.toml` com hooks aprovados, o app SHALL rodar `pre-start` depois de
+criar um worktree (para Chat ou Worker) e antes de devolvê-lo, e `post-start` em segundo plano em
+seguida; e SHALL rodar `pre-remove` antes de remover um checkout gerenciado e `post-remove` em segundo
+plano depois. Os três formatos do worktrunk SHALL ser aceitos: string, tabela (comandos concorrentes)
+e lista de tabelas (etapas em ordem). As variáveis de template SHALL ser renderizadas e escapadas para
+shell. Um hook que use variável ou filtro desconhecido SHALL NOT rodar, e o erro SHALL nomear o token.
+`pre-remove` que falha SHALL abortar a remoção com o checkout intacto. `pre-start` que falha SHALL NOT
+desfazer o worktree e SHALL chegar a quem pediu a criação. A saída de `post-*` SHALL ficar num log por
+checkout. O app SHALL NOT exigir o binário `wt` instalado.
+
+#### Scenario: pre-start e post-start rodam na criação
+Test: unit — repositório temporário com `wt.toml` aprovado cujos hooks gravam marcadores com `{{ branch }}`.
+
+- **WHEN** o app cria um worktree nesse repositório
+- **THEN** o marcador do `pre-start` existe quando a criação retorna, com o nome da branch
+- **AND** o marcador do `post-start` aparece depois, e sua saída está no log do checkout
+
+#### Scenario: Pipeline roda em ordem
+Test: unit — `[[pre-start]]` com duas etapas, a segunda lendo o arquivo gravado pela primeira.
+
+- **WHEN** o hook é um pipeline de duas etapas
+- **THEN** a segunda etapa só roda depois que a primeira terminou com sucesso
+
+#### Scenario: pre-remove que falha preserva o checkout
+Test: unit — `pre-remove = "exit 1"` aprovado.
+
+- **WHEN** a remoção de um checkout gerenciado e limpo é pedida
+- **THEN** ela é recusada com o comando que falhou
+- **AND** o checkout e a branch continuam no disco
+
+#### Scenario: Variável desconhecida não roda
+Test: unit — `pre-start = "echo {{ nao_existe }}"`.
+
+- **WHEN** o hook é renderizado
+- **THEN** ele não roda e o erro nomeia `nao_existe`
+
+### Requirement: Hooks vindos do repositório só rodam depois de aprovados
+
+Os comandos de `.config/wt.toml` SHALL rodar apenas quando o usuário aprovou aquele conjunto de
+comandos para aquele repositório. Qualquer mudança num comando SHALL exigir nova aprovação. Sem
+aprovação, a criação do worktree SHALL seguir sem esses hooks e SHALL informar que estão aguardando
+aprovação; a remoção SHALL seguir pulando `pre-remove` e `post-remove`, com aviso. Settings ▸ Projects
+SHALL mostrar os comandos lidos e permitir aprovar. O setup de `.comet/worktree.json` SHALL NOT exigir
+aprovação.
+
+#### Scenario: Hook não aprovado não roda
+Test: unit — `wt.toml` sem registro de aprovação.
+
+- **WHEN** o app cria um worktree
+- **THEN** nenhum comando do `wt.toml` roda
+- **AND** o resultado diz que os hooks aguardam aprovação
+
+#### Scenario: Comando alterado volta a pedir aprovação
+Test: unit — aprovar, alterar um comando do `wt.toml`, criar de novo.
+
+- **WHEN** um comando aprovado muda no arquivo
+- **THEN** o conjunto deixa de estar aprovado e não roda até nova aprovação
+
+### Requirement: Caches ignorados são clonados quando o projeto pede
+
+Quando o checkout principal tem `.worktreeinclude`, o app SHALL copiar para cada worktree que cria os
+arquivos que são ignorados pelo Git **e** casam com os padrões desse arquivo, a partir do checkout
+principal, antes do setup e dos hooks. A cópia SHALL usar reflink quando o sistema de arquivos suporta,
+e cópia comum quando não. Arquivos já existentes no destino SHALL NOT ser sobrescritos. Arquivos
+rastreados, metadados de controle de versão e worktrees aninhados SHALL NOT ser copiados. Sem
+`.worktreeinclude`, nada SHALL ser copiado.
+
+#### Scenario: target/ ignorado e incluído é clonado
+Test: unit — principal com `target/x` ignorado, `.env` ignorado, `.worktreeinclude` contendo `target/`.
+
+- **WHEN** o app cria um worktree
+- **THEN** `target/x` existe no worktree novo
+- **AND** `.env` não existe no worktree novo
+
+#### Scenario: Sem `.worktreeinclude` nada é copiado
+Test: unit — mesmo repositório sem o arquivo.
+
+- **WHEN** o app cria um worktree
+- **THEN** nenhum arquivo ignorado do principal aparece no worktree novo
+
+### Requirement: A branch sai junto com o checkout só quando já foi integrada
+
+Depois de remover um checkout gerenciado, pelo Chat ou pelos Workers, o app SHALL apagar a branch local
+desse checkout somente quando ela não é a branch padrão, não está em outro worktree e está integrada à
+branch padrão local (mesmo commit, ancestral, diff sem mudanças, árvores iguais, ou merge que não
+acrescenta nada). Uma branch com trabalho não integrado SHALL permanecer. Branches remotas SHALL NOT ser
+tocadas. Falha ao apagar a branch SHALL NOT desfazer a remoção do checkout e SHALL virar aviso.
+
+#### Scenario: Branch sem trabalho próprio sai
+Test: unit — worktree criado da padrão, sem commits, removido.
+
+- **WHEN** o checkout é removido
+- **THEN** a branch local dele não existe mais
+
+#### Scenario: Branch com commit não integrado fica
+Test: unit — worktree com um commit que a padrão não tem, removido.
+
+- **WHEN** o checkout é removido
+- **THEN** a branch local continua existindo e apontando para o commit
+
+#### Scenario: Branch squash-mergeada por árvore igual sai
+Test: unit — padrão recebe o mesmo conteúdo por outro commit.
+
+- **WHEN** o checkout é removido
+- **THEN** a branch é reconhecida como integrada e apagada
