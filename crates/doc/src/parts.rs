@@ -966,6 +966,7 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
 const HUB_INPUT_KEEP: [&str; 5] = ["op", "name", "to", "from", "application"];
 const SKILL_INPUT_KEEP: [&str; 3] = ["skill", "path", "name"];
 const EVAL_INPUT_KEEP: [&str; 2] = ["language", "title"];
+const SESSIONS_INPUT_KEEP: [&str; 3] = ["action", "space_id", "chat_id"];
 const WORKERS_INPUT_KEEP: [&str; 6] = [
     "action",
     "session_id",
@@ -997,6 +998,7 @@ fn chip_badge(call: &ToolCall) -> Option<serde_json::Value> {
         "eval" => &EVAL_INPUT_KEEP,
         kind if kind.eq_ignore_ascii_case("skill") => &SKILL_INPUT_KEEP,
         "workers" => &WORKERS_INPUT_KEEP,
+        "sessions" => &SESSIONS_INPUT_KEEP,
         _ => return None,
     };
     let mut kept = keep_short_strings(input, keys);
@@ -1739,6 +1741,30 @@ mod tests {
             );
             assert_eq!(sanitize_tool_call(&clean), clean);
         }
+    }
+
+    #[test]
+    fn sanitize_sessions_create_drops_the_prompt() {
+        let call = ToolCall::Mcp {
+            server: "comet-sessions".into(),
+            tool: "sessions".into(),
+            input: Some(serde_json::json!({
+                "action": "create",
+                "prompt": "private prompt",
+                "space_id": "space-1",
+                "chat_id": "child-1",
+                "model": "secret-model"
+            })),
+        };
+        let clean = sanitize_tool_call(&call);
+        let ToolCall::Mcp { input, .. } = &clean else {
+            panic!("MCP call");
+        };
+        assert_eq!(
+            input.as_ref().unwrap(),
+            &serde_json::json!({"action":"create", "space_id":"space-1", "chat_id":"child-1"})
+        );
+        assert_eq!(sanitize_tool_call(&clean), clean);
     }
 
     #[test]
