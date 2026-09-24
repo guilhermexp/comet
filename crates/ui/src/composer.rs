@@ -9892,38 +9892,6 @@ impl Composer {
             ContextIndicatorLevel::Warning => theme.warning.opacity(0.9),
             ContextIndicatorLevel::Critical => theme.danger.opacity(0.9),
         };
-        // While the command runs the ring has nothing true to show (the usage
-        // it plots is the pre-compaction one), so the slot says what is
-        // happening instead.
-        if self
-            .state
-            .read(cx)
-            .selected_chat
-            .as_deref()
-            .is_some_and(|chat_id| self.state.read(cx).is_compacting(chat_id))
-        {
-            return div()
-                .id("composer-compacting")
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .pl(px(4.0))
-                .child(crate::loaders::mini_mono_spinner(
-                    "composer-compacting-spinner",
-                    3.0,
-                    theme.text_muted.opacity(0.82),
-                    cx.entity_id(),
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(theme.text_muted)
-                        .child("Compacting…"),
-                )
-                .into_any_element();
-        }
         let tooltip_state = self.state.clone();
         let composer = cx.entity().downgrade();
         // The ring IS the /compact affordance: one click runs the command on

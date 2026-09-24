@@ -3975,8 +3975,25 @@ struct StickyTurnGroup {
 fn sticky_turn_rows(rows: &[Row]) -> Vec<usize> {
     rows.iter()
         .enumerate()
-        .filter_map(|(ix, row)| matches!(row.kind, RowKind::User { .. }).then_some(ix))
+        .filter_map(|(ix, row)| match &row.kind {
+            // A `/compact` row is a status line, not a prompt to pin.
+            RowKind::User { text, .. } if is_compact_command(text) => None,
+            RowKind::User { .. } => Some(ix),
+            _ => None,
+        })
         .collect()
+}
+
+/// A sent `/compact` (with or without instructions after it).
+fn is_compact_command(text: &str) -> bool {
+    let text = text.trim();
+    text == "/compact" || text.starts_with("/compact ")
+}
+
+/// The transcript marker the shell writes when a compaction finishes
+/// (`shell::compaction_marker`; older docs carry the Portuguese form).
+fn is_compaction_marker(text: &str) -> bool {
+    text.starts_with("Context compacted") || text.starts_with("Contexto compactado")
 }
 
 fn sticky_turn_group(user_rows: &[usize], reading_row_ix: usize) -> Option<StickyTurnGroup> {
@@ -6551,6 +6568,51 @@ impl Transcript {
         self.attachment_retries.insert(key, task);
     }
 
+    /// A sent `/compact` renders as the compaction's own status line instead
+    /// of a prompt card: a spinner while the command runs, then nothing once
+    /// the "Context compacted · a → b" marker lands below it. A compaction
+    /// that ended without a marker (swept or failed) leaves a quiet notice.
+    fn render_compact_command(
+        &mut self,
+        row_id: &SharedString,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ix = self.rows.iter().position(|row| &row.id == row_id);
+        let following = ix.map_or(&[][..], |ix| &self.rows[ix + 1..]);
+        let latest = !following
+            .iter()
+            .any(|row| matches!(&row.kind, RowKind::User { text, .. } if is_compact_command(text)));
+        let compacting = ix.is_some()
+            && latest
+            && self
+                .chat_id
+                .as_deref()
+                .is_some_and(|chat_id| self.state.read(cx).is_compacting(chat_id));
+        if compacting {
+            return notice_divider_with(
+                crate::loaders::mini_mono_spinner(
+                    "transcript-compacting-spinner",
+                    2.0,
+                    theme.text_muted,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element(),
+                "Compacting conversation…".into(),
+                theme,
+            );
+        }
+        let marked = following
+            .iter()
+            .take_while(|row| !matches!(row.kind, RowKind::User { .. }))
+            .any(|row| matches!(&row.kind, RowKind::Notice { text } if is_compaction_marker(text)));
+        if marked {
+            return div().into_any_element();
+        }
+        notice_divider("/compact".into(), theme)
+    }
+
     /// Inline Show more / Show less for a clipped user card (upstream
     /// `toggle_user_fold`). The fold owns the viewport like explicit
     /// navigation: the sent-turn hold and the bottom pin let go so growth
@@ -7722,6 +7784,9 @@ impl Transcript {
                 name,
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
+            RowKind::User { text, .. } if is_compact_command(text) => {
+                self.render_compact_command(&row.id, &theme, cx)
+            }
             RowKind::User {
                 text,
                 mentions,
@@ -10746,6 +10811,19 @@ fn user_message_dialog(
 /// made zeronsh/comet#95 undiagnosable from the screenshot.
 /// The between-turns marker: hairline · glyph · muted label · hairline.
 fn notice_divider(text: SharedString, theme: &Theme) -> AnyElement {
+    notice_divider_with(
+        crate::icons::icon(crate::icons::INFO_CIRCLE)
+            .size(px(13.0))
+            .text_color(theme.text_muted)
+            .into_any_element(),
+        text,
+        theme,
+    )
+}
+
+/// A centered line between hairlines with a leading glyph (the info icon for
+/// notices, a spinner for an in-flight compaction).
+fn notice_divider_with(leading: AnyElement, text: SharedString, theme: &Theme) -> AnyElement {
     let rule = || div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6));
     div()
         .py(px(10.0))
@@ -10762,11 +10840,7 @@ fn notice_divider(text: SharedString, theme: &Theme) -> AnyElement {
                 .gap(px(6.0))
                 .text_size(px(12.0))
                 .text_color(theme.text_muted)
-                .child(
-                    crate::icons::icon(crate::icons::INFO_CIRCLE)
-                        .size(px(13.0))
-                        .text_color(theme.text_muted),
-                )
+                .child(leading)
                 .child(text),
         )
         .child(rule())
@@ -14591,6 +14665,39 @@ mod tests {
         assert_eq!(resolve("skill://../etc/passwd"), None);
         assert_eq!(resolve("skill://openspec-propose/../../x"), None);
         assert_eq!(resolve("https://example.com"), None);
+    }
+
+    #[test]
+    fn compact_commands_are_status_lines_not_sticky_prompts() {
+        assert!(is_compact_command("/compact"));
+        assert!(is_compact_command("  /compact focus on the API  "));
+        assert!(!is_compact_command("/compactify"));
+        assert!(!is_compact_command("please /compact"));
+        assert!(is_compaction_marker("Context compacted · 16k → 59k"));
+        assert!(is_compaction_marker("Contexto compactado."));
+        let user = |id: &str, text: &str| Row {
+            id: id.into(),
+            version: 0,
+            turn_start: true,
+            kind: RowKind::User {
+                text: text.to_owned().into(),
+                mentions: Arc::default(),
+                url_chips: Arc::default(),
+                attachments: Arc::default(),
+                appshot_presentations: Arc::default(),
+                badges: Arc::default(),
+                pending: false,
+            },
+            entry_id: id.into(),
+            timestamp: None,
+            copy_text: None,
+        };
+        let rows = vec![
+            user("u1", "hello"),
+            user("u2", "/compact"),
+            user("u3", "next"),
+        ];
+        assert_eq!(sticky_turn_rows(&rows), vec![0, 2]);
     }
 
     #[test]
