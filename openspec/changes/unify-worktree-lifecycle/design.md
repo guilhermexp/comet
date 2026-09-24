@@ -1,227 +1,182 @@
 ## Context
 
-A motivação e o quadro dos dois caminhos estão em `proposal.md` (Why). O que molda o desenho:
+Ver `proposal.md` para a motivação. `engine` já depende de `zeron-workers-unpeel`; a fronteira
+Workers não pode depender da engine. O serviço Git comum fica em `crates/workers-unpeel`, e a
+engine o chama fora do executor async, com timeout. O registro Workers é local (`app-state.json`)
+e os Chats vivem no doc sincronizado: unificar o ciclo não unifica esses registros.
 
-- **Camadas:** `engine` já depende de `zeron-workers-unpeel` (`rpc.rs` usa `registered_projects`). O
-  contrário não pode existir. Então o dono comum só pode morar em `crates/workers-unpeel` (ou abaixo).
-- **`crates/workers-unpeel` é síncrono:** Git passa por `git_command::run_git` / `run_git_mutation`,
-  com deadline. A engine é tokio e não pode bloquear (`openspec/project.md`: trabalho síncrono vai para
-  `spawn_blocking` com timeout).
-- **O vendor fica intocado:** `unpeel_core::worktrees::{create, remove, is_managed}` fixam a raiz
-  `~/.unpeel/worktrees`. Nenhum consumidor do comet depende de o vendor criar ali além da nossa própria
-  chamada em `create_worktree_at`.
-- **A raiz legada do Chat já é a canônica:** o layout antigo do Chat
-  (`~/.zeron/worktrees/<repoName>/<nome>`) mora sob o mesmo diretório escolhido como canônico. "Sob a
-  raiz" cobre os dois layouts sem regra extra.
-- **`SetChatCwd` é uma `Mutate`** aplicada ao doc do workspace pelo engine local (`rpc.rs`), não um
-  comando encaminhado ao host do Chat.
-- **Remoção do lado Workers já é a política mais rígida** (`checkout_lifecycle::validate_removal` +
-  `remove_owned_checkout`). Ela vira a política única.
+Hoje `checkout_lifecycle::validate_removal` recebe `owned` de um registro Workers, além de testar
+raiz, Git e árvore limpa. A engine não dispõe dessa prova; estar sob uma raiz conhecida não a
+substitui. O `CheckoutActionLock` já serializa algumas ações Workers, mas todas as entradas de
+criação, launch e remoção precisam participar para a checagem de atividade valer.
 
 ## Goals / Non-Goals
 
-**Goals:**
-- Um módulo dono de: raízes gerenciadas, criação (layout + setup), predicado "em uso" e remoção.
-- Engine e fronteira Workers chamam só esse módulo para criar e remover worktree.
-- Nenhuma pasta existente é movida; nada é reescrito no registro.
+**Goals:** um serviço para criação, preparo, atividade e remoção; prova de posse para ambos os
+chamadores; criação isolada pelo controller MCP; suporte declarado aos quatro hooks de início e
+remoção do `.config/wt.toml`.
 
-**Non-Goals:**
-- Unificar o *registro* (Workers `app-state.json` vs Chat no CRDT). Continua cada lado com o seu.
-- Mudar nomes: Chat segue `zeron/<adj-noun>` + rename por título (`rename_worktree_branch`), Worker
-  segue a branch do usuário.
-- Encaminhar `SetChatCwd` ao host do Chat.
-- Depender do binário `wt`: o ciclo é nativo; o `wt` instalado continua funcionando por fora.
-- Status estilo `wt list`, fluxo `wt merge`, isolamento de Worker por launch, hooks de
-  switch/commit/merge e config de usuário do `wt` — change seguinte (`worktree-status-and-merge`).
+**Non-Goals:** mover worktrees existentes, unificar registros de Chat e Workers, implementar o
+binário `wt`, seus hooks de usuário, `wt merge`, deleção automática de branch, cópia automática de
+ignorados ou `worktree-path` configurável.
 
 ## Decisions
 
-### D1. O serviço estende `checkout_lifecycle.rs`
+### D1. Raiz comum e prova de posse separada
 
-`checkout_lifecycle.rs` já é dono de "archive/restore e remoção guardada; coordenação de
-launch/restart/remoção" e tem o `CheckoutActionLock` entre processos. Criação e raízes entram ali, em
-vez de num módulo novo (regra DOX: estender em vez de criar helper paralelo). Superfície pública,
-síncrona:
+Worktrees novos usam `ZERON_WORKTREES_DIR` não vazio ou `~/.zeron/worktrees`, em
+`<slug>-<fnv1a:08x>/<nome>`, com hash do caminho canônico do repositório. A localização serve
+apenas como limite adicional de segurança. A autorização de remoção exige ainda prova durável de
+que o Comet criou **aquele** checkout do **mesmo** repositório Git: caminho canônico, identidade do
+Git common dir e identificador administrativo do worktree. A branch observada é metadado, não
+critério de posse, pois o Chat a renomeia pelo título e o usuário pode trocá-la. Antes de
+`git worktree add`, o serviço grava um journal `PendingCreate` com identidade do repo, caminho
+reservado e ID da operação. Depois do add, grava `CreatedObserved` com a identidade Git observada
+e finaliza `Owned`, antes de qualquer setup. Só `CreatedObserved` permite reconciliação automática
+após nova verificação Git. Se essa gravação também falhar, o checkout fica no disco sem posse
+presumida e exige recuperação explícita; nenhum rollback usa `--force`.
 
-- `worktrees_root() -> PathBuf` — `ZERON_WORKTREES_DIR` não vazio, senão `~/.zeron/worktrees`.
-- `managed_roots() -> [PathBuf; 2]` — canônica + `unpeel_core::app_paths::worktrees_root()`.
-- `is_managed(path) -> bool` — caminho canônico sob alguma raiz; symlink resolvido antes (mesma regra
-  já testada em `symlink_cannot_make_an_external_checkout_managed`).
-- `create_worktree(repo, WorktreeName, base) -> CreatedWorktree` — `git worktree add` + setup; devolve
-  path, branch e o resultado do setup (`SetupOutcome`).
-- `checkout_in_use(path, busy_chat_cwds: &[PathBuf], workers: &WorkersBootstrap) -> Option<Reason>`.
-- `remove_managed_checkout(path, repo, InUse) -> Result<()>` — o miolo de hoje de
-  `remove_owned_checkout` sem a parte de registro Workers, que continua na fronteira.
+O índice local de posse fica em arquivo próprio sob `~/.zeron` (path injetável nos testes), com
+escrita atômica e protegido pelo `CheckoutActionLock`. Ele não entra no CRDT. A prova registrada
+inclui a identidade Git observada; uma troca de pasta ou de Git common dir invalida a autorização
+até recuperação explícita.
 
-*Alternativa rejeitada:* colocar o serviço na engine e fazer Workers chamarem a engine. Inverte a
-camada (`workers-unpeel` não pode depender de `engine`) e o caminho Workers roda na UI sem engine.
+Para Workers legados, o `CheckoutOwnership::AppManaged` e a evidência Git já guardados no registro
+podem ser migrados para a prova comum após revalidação. Para Chat legado sem proveniência durável,
+raiz e branch `zeron/*` não bastam: o checkout continua utilizável, mas a remoção pelo app é recusada
+com orientação de recuperação explícita. Worktrees externos, mesmo dentro de uma raiz conhecida,
+continuam `External`. `DeleteWorktree` primeiro resolve o alvo contra `git worktree list` do repo
+pedido; só depois usa a prova comum. Esta regra vale para chamadas locais e forwardable.
 
-### D2. Layout: `<slug>-<fnv1a:08x>/<nome>` sob a raiz canônica
+Alternativa rejeitada: inferir posse do prefixo do caminho. Qualquer ferramenta pode criar um
+worktree dentro da raiz, e um symlink pode confundir um teste textual.
 
-Mesmo esquema do Unpeel (`slug` do basename + FNV-1a do toplevel canônico), aplicado à raiz nova.
-Resolve a colisão de basename do layout antigo do Chat. Reutiliza `unpeel_core::worktrees::slug`
-(público). O hash é recalculado no comet — é uma função de 8 linhas, e `fnv1a` é privada no vendor;
-exportá-la seria patch de vendor só por isso.
+### D2. Um fluxo de criação com associação antes do preparo
 
-*Alternativa rejeitada:* manter `<repoName>/<nome>`. Dois clones chamados `comet` dividiriam o
-diretório e o gerador de nome só evita colisão de pasta, não de origem.
+`checkout_lifecycle` ganha a operação comum. Chat fornece seu nome `zeron/<adj-noun>`; Worker fornece
+a branch escolhida. O serviço preserva a seleção de base/fetch best-effort usada pelo caminho
+Workers. Ordem: lock → escolher caminho e verificar colisão → gravar `PendingCreate` →
+`git worktree add` → gravar `CreatedObserved` → finalizar `Owned`, associação do chamador e
+estado `Preparing` → liberar
+lock → setup `.comet`/`.cursor` → hooks
+aprovados → encerrar `Preparing` sob lock → resultado. A remoção trata `Preparing` como ocupado;
+um setup de até cinco minutos não precisa manter o lock global durante toda sua execução.
+Um checkout já registrado é reutilizado, com a mesma prova, sem rodar `post-start` duas vezes.
+Se o caminho já contém um worktree que outra ferramenta criou, o serviço pode associá-lo como
+`External`, sem criar journal `Owned` nem executar hooks `*-start` ou setup de criação sobre ele.
 
-### D3. Workers deixam de chamar o `create` do vendor
+Setup ou `pre-start` com erro **não** desfaz o checkout. O Chat grava o `cwd` antes de reportar erro,
+mostra o comando e não inicia o harness; o Worker registra o projeto e não lança o preset. O
+próximo envio/launch pedido pelo usuário tenta o preparo novamente no mesmo checkout; não cria
+outro. `post-start` só começa após os passos bloqueantes concluírem. Isso mantém o worktree
+recuperável e preserva a semântica
+bloqueante de `pre-start`.
 
-`create_worktree_at` troca `unpeel_core::worktrees::create` por `checkout_lifecycle::create_worktree`,
-preservando o que o vendor fazia e o comet depende: fetch best-effort, base padrão
-(`origin/HEAD` → `origin/main|master` → `main|master`) e *adotar* a pasta quando já existe um worktree
-registrado nela. A detecção de adoção (`known_before`) e o rollback só-do-que-criou continuam na
-fronteira, como hoje. `WorkersWorktreeResult` não muda de forma.
+Alternativa rejeitada: deixar o Chat executar depois de setup falho. O agente receberia um checkout
+que o usuário configurou como dependente daquele preparo.
 
-### D4. A engine delega, em `spawn_blocking`, com deadline
+### D3. Estado local de execução é consultado pelo serviço
 
-`Repos::create_worktree` e `Repos::delete_worktree` passam a chamar o serviço dentro de
-`disposable_worker`/`spawn_blocking`, com o mesmo teto que já protegem o fallback de hoje. A engine
-continua fazendo a resolução de alvo que tem hoje (`resolve_checkout` contra o porcelain) — é a
-autorização por repositório de um RPC `forwardable` — e só então chama a remoção do serviço com o
-caminho resolvido. O caminho "pasta já sumiu → `worktree prune`" continua na engine, porque não há
-checkout para validar.
+Uma fonte device-local de atividade, mantida pela engine host, registra o caminho canônico dos
+Chats `Working` e o identificador do run. O início do run e a remoção usam o mesmo
+`CheckoutActionLock`: o run registra atividade antes de começar a escrever; a remoção mantém o lock
+até `git worktree remove` terminar. A engine encerra a marca ao assentar; se morrer, a fonte usa
+lease/heartbeat com reconciliação contra a instância do host antes de autorizar exclusão. Expirar
+o heartbeat, sozinho, **não** prova que o run morreu: se o host ou o estado real não puderem ser
+consultados, a remoção falha fechada. Estado indisponível ou ambíguo nunca vira checkout livre.
 
-O nome do Chat continua sendo gerado na engine (`ADJECTIVES`/`NOUNS`, colisão contra pasta e branch)
-e entra no serviço como nome explícito.
+`Preparing` e `StartingWorker` também são estados ocupados. O controller marca `StartingWorker`
+antes de liberar o lock para spawn e só o encerra quando o Worker consta como vivo ou o launch
+falha. Assim não existe janela entre preparo e registro do processo na qual uma remoção possa
+apagar o checkout.
 
-### D5. "Em uso": Workers do serviço, Chats do chamador
+O serviço soma esse estado aos Workers vivos do `LocalWorkersClient`; UI, controller MCP e RPC não
+podem fornecer uma lista opcional de Chats que permita contornar a verificação. Retarget local usa a
+mesma consulta de Workers. Um Chat hospedado em outro device continua com a limitação descrita em
+`chat-checkout-control`: sua `Mutate::SetChatCwd` não é encaminhada ao host nesta change.
 
-O serviço sabe consultar Workers vivos (`LocalWorkersClient::bootstrap`, `session.is_live()`, com o
-mesmo casamento por caminho canônico de `remove_owned_checkout`). Ele **não** sabe de Chats: isso é
-estado da engine/UI. Por isso a metade Chat entra como parâmetro — a lista de `cwd` canônicos de Chats
-hospedados neste device com `effective_indicator == Working` (regra já compartilhada em
-`zeron_proto::view`):
+Alternativa rejeitada: a UI passar `busy_chat_cwds` para `remove_worktree`. O controller MCP e um
+chamador direto não passam pela UI.
 
-- **Engine (`DeleteWorktree`):** monta a lista a partir do workspace doc + `Sessions::session_status`.
-- **UI (remoção pelo lado Workers):** monta a partir de `AppState` (`indicator_for`), filtrando Chats
-  cujo host é o device local.
+### D4. Remoção segura, branch preservada
 
-*Alternativa rejeitada:* o serviço ler o doc do workspace. Puxaria `zeron-doc`/`loro` para dentro de
-`workers-unpeel`, que é exatamente o que o AGENTS.md dela evita (`owner`/`repo` não são derivados ali
-pelo mesmo motivo).
+Sob o lock: resolver o worktree do repositório pedido; confirmar prova de posse; conferir atividade;
+confirmar checkout linkado e HEAD retido; carregar/aprovar/renderizar `pre-remove`; executá-lo;
+encerrar processos `post-start` iniciados pelo Comet; **revalidar** identidade, atividade e
+limpeza; então `git worktree remove` sem `--force`. O hook
+pode limpar caches ignorados antes da verificação de limpeza, mas qualquer untracked/ignored que
+restar bloqueia. Não há `remove_dir_all` como fallback. Um worktree já ausente pode ter o registro
+Git podado depois de verificar sua identidade; nenhuma pasta é apagada nesse caminho.
 
-### D6. Setup do Chat: roda antes do run; falha não aborta o run
+A branch local fica sempre. Isso evita decisões de integração baseadas em heurística nesta primeira
+entrega e torna o resultado igual para Chat e Workers. A regra de `wt remove` (incluindo seus seis
+critérios e a preferência por upstream à frente) será especificada junto do futuro status/merge.
 
-`materialize_worktree` chama o serviço, que roda o setup. Se o setup falha, o worktree fica (mesma
-regra dos Workers), o `cwd` do Chat aponta para ele e o run **segue**, com a falha registrada como
-erro visível no transcript antes da primeira resposta do harness.
+Alternativa rejeitada: portar cinco dos seis critérios do `wt` agora. Seria uma política diferente
+com o mesmo nome, e um erro pode apagar o último nome de uma branch útil.
 
-*Por que seguir e não abortar:* abortar deixaria um worktree criado sem Chat apontando para ele; o
-próximo envio criaria outro (a reutilização em `materialize_worktree` depende de `chat.cwd` já ser o
-worktree). Um `bun install` quebrado num worktree que o agente consegue consertar é melhor que
-worktrees órfãos. No lado Workers a regra continua a de hoje (`create_worktree_and_launch` recusa o
-launch), porque ali o registro do projeto já guarda o checkout e o usuário relança à mão.
+### D5. Hooks de projeto do Worktrunk: subconjunto explícito
 
-### D7. `DeleteWorktree` perde `--force` e o fallback recursivo; a branch segue a regra do `wt`
+O Comet lê `.config/wt.toml` do checkout de origem selecionado para criação e do checkout removido
+para remoção. Suporta `pre-start`, `post-start`, `pre-remove`, `post-remove` como string, tabela de
+comandos concorrentes ou array de tabelas em sequência. Aceita só as variáveis `branch`,
+`worktree_path`, `worktree_name`, `repo`, `repo_path`, `primary_worktree_path`, `commit`,
+`short_commit`, `base`, `default_branch`, `hook_type`, `cwd` e o filtro `sanitize`. A expansão
+recebe escaping próprio para o contexto shell; cada formato e token é validado **antes** de rodar
+qualquer comando de um hook. Filtros/funções/condicionais não suportados, inclusive `hash_port` e
+`vars.*`, produzem erro nomeando o token. Isso é compatibilidade parcial, não interpretação geral
+de Jinja. Comandos shell que chamam `wt` continuam dependendo do binário externo.
 
-Consequência direta de "uma política, a mais rígida" para o checkout. Para a branch, a regra deixa de
-ser "`zeron/*` sempre com `-D`" (engine) ou "nunca" (Workers) e passa a ser a do `wt remove` (D10),
-igual nos dois lados. O teste de integração em `m5_repos_diffs_terminals.rs` que hoje prova "worktree
-removido e branch `zeron/…` apagada" passa a cobrir os dois casos: branch sem commits próprios é
-apagada; branch com commit não integrado fica. O `WORKTREE_REMOVE_TIMEOUT` continua valendo para o
-`git worktree remove`.
+`pre-*` executa com timeout e aborta a operação em erro. `post-*` roda após sucesso em processo
+separado, com log por checkout. `post-remove` executa no checkout principal, pois o alvo já saiu.
+Comandos de `post-start` iniciados pelo Comet têm processo rastreado para encerramento na remoção;
+processos de outras ferramentas não são terminados implicitamente.
 
-### D8. Retarget: checagem no handler de `SetChatCwd`, só quando o Chat é local
+A aprovação é local e vinculada à identidade do repositório e ao texto de cada comando; mudança
+requer nova aprovação. Settings ▸ Projects mostra a origem e o comando. `pre-start` ou `pre-remove`
+pendente bloqueia run/launch ou remoção; `post-*` pendente é pulado com aviso. Há opção explícita
+"remover sem hooks" que pula ambos os hooks de remoção, com confirmação e auditoria, sem pular as
+checagens de posse/atividade/limpeza. O setup `.comet` segue o contrato de confiança já existente.
+Cada execução usa o snapshot de comandos cujo hash foi aprovado: reler o arquivo depois da
+aprovação nunca troca silenciosamente o comando a executar. Aprovar em Settings exibe o texto
+exato desse snapshot.
 
-O handler da `Mutate::SetChatCwd` em `rpc.rs` consulta o serviço (`checkout_in_use` só com a metade
-Workers) **quando o host do Chat é o device local**; senão aplica sem checar (limitação registrada na
-spec `chat-checkout-control`). O erro volta pelo caminho que `switch_live_worktree` já trata e cai no
-`switch_error` do popover — nenhuma UI nova.
+Alternativa rejeitada: anunciar que todos os templates do `wt` funcionam. O formato TOML não
+implica suporte a todo o motor Jinja nem ao estado `vars.*` do Worktrunk.
 
-### D9. Hooks do `wt.toml`: ordem, bloqueio e formatos
+### D6. Isolamento no controller MCP
 
-Um módulo novo `worktrunk.rs` em `crates/workers-unpeel` lê `.config/wt.toml` **do checkout
-principal** (o arquivo do worktree novo é o mesmo commit, mas o principal pode ter mudança local ainda
-não commitada que o usuário quer testar — é o que o `wt` também faz ao rodar do repo). Aceita os três
-formatos do `wt`: string (um comando), tabela (comandos nomeados, concorrentes) e array de tabelas
-(pipeline: etapas em ordem, concorrência dentro de cada etapa). Chave desconhecida é ignorada — o
-arquivo é do `wt` e tem coisas que o comet não usa.
+`launch_worker` aceita opcionalmente `new_worktree: { branch, base_ref? }`, mutuamente exclusivo com
+`worktree_path`/`worktree_branch`. O controller valida preset, projeto Git e branch antes de criar;
+usa o fluxo comum de criação/registro/preparo e só então lança o preset no caminho retornado. A
+operação retorna ID do projeto, caminho, branch e ID do Worker. Falha de preparo ou launch deixa o
+checkout registrado e informa como reutilizá-lo; nunca o remove automaticamente. O briefing do
+orquestrador orienta usar `new_worktree` para fatias independentes. Lançamento no checkout atual
+continua possível quando explicitamente desejado ou quando o projeto não é Git.
 
-Ordem na criação: `git worktree add` → `copy-ignored` (D11) → setup `.comet/worktree.json` → `pre-start`
-→ devolve ao chamador → `post-start` em segundo plano. Ordem na remoção: validação (D7) → `pre-remove`
-(com os arquivos ainda no disco) → `git worktree remove` → branch (D10) → `post-remove` em segundo plano.
-
-- `pre-start` que falha segue a regra do setup (D6): o checkout fica e a falha chega ao chamador.
-  Difere do `wt`, que aborta; aqui abortar deixaria worktree órfão pelo mesmo motivo do D6.
-- `pre-remove` que falha **aborta** a remoção, como no `wt` — nada foi apagado ainda.
-- `post-*` roda desanexado, com saída em `<raiz>/.logs/<slug>/<nome>/<hook>.log`, sem teto de 5 min
-  (é o lugar de dev server/watcher), mas com process group próprio para ser encerrado na remoção.
-- Variáveis: `branch`, `worktree_path`, `worktree_name`, `repo`, `repo_path`, `primary_worktree_path`,
-  `commit`, `short_commit`, `base`, `default_branch`, `hook_type`, `cwd`; filtros `sanitize` e
-  `hash_port`. Tudo escapado para shell. Variável ou filtro que o comet não conhece faz o hook **não
-  rodar**, com erro que nomeia o token — render parcial rodaria comando errado.
-
-*Alternativa rejeitada:* chamar `wt hook <tipo>` quando o `wt` está no PATH. Duas implementações com
-comportamento diferente conforme a máquina, e o Chat criado por outro device dependeria do PATH do host.
-
-### D10. Branch na remoção: apagada só se integrada
-
-Depois do `git worktree remove`, a branch do checkout é apagada **somente** se: não é a branch padrão,
-não está em outro worktree, e está integrada à branch padrão local por uma das verificações do `wt`
-(mesmo commit; ancestral; `git diff <padrão>...<branch>` vazio; árvores iguais; `git merge-tree
---write-tree` produz a árvore da padrão). A verificação por patch-id de squash fica de fora (é a mais
-cara e a única heurística). Apaga com `git branch -d` quando ancestral, `-D` nos demais casos já
-provados integrados. Branch remota nunca é tocada. Falha ao apagar a branch não desfaz a remoção:
-vira aviso.
-
-Com isso "HEAD preservado" (validação) e "branch apagada" não conflitam: só se apaga o que já está
-contido na padrão.
-
-### D11. `copy-ignored`: opt-in por `.worktreeinclude`, reflink
-
-Só roda quando o repositório tem `.worktreeinclude` na raiz do checkout principal — o mesmo arquivo que
-o `wt --require-include` e o Claude Code desktop usam. Copia os arquivos que são ignorados pelo Git
-(`git ls-files --others --ignored --exclude-standard --directory`) **e** casam com o
-`.worktreeinclude`, do principal para o novo, pulando o que já existe e as exclusões fixas do `wt`
-(metadados de VCS, worktrees aninhados, a própria raiz de worktrees). Cópia por `clonefile` no macOS e
-`FICLONE` no Linux (crate `reflink-copy`), caindo para cópia comum. Roda antes do setup para que
-`bun install`/`cargo build` já encontrem os caches.
-
-*Alternativa rejeitada:* copiar todos os ignorados sem opt-in. Num repo sem `.worktreeinclude` isso
-clonaria `.env` de produção e caches arbitrários em todo worktree de Chat sem o usuário ter pedido.
-
-### D12. Aprovação dos hooks do `wt.toml`
-
-Comandos do `wt.toml` rodam só se aprovados. A aprovação fica em `~/.zeron/worktree-approvals.json`,
-chave = caminho canônico do repositório, valor = hash (SHA-256) do conjunto de comandos por tipo de
-hook. Mudou um comando → hash muda → volta a pedir. Settings ▸ Projects mostra os comandos lidos e o
-botão Aprovar; a engine lê o mesmo arquivo (mesmo device). Sem aprovação: o worktree é criado, os hooks
-do `wt.toml` não rodam e o chamador recebe "hooks do worktrunk aguardando aprovação". `pre-remove` não
-aprovado **não** bloqueia a remoção — só é pulado com aviso, senão um projeto novo não conseguiria
-remover nada.
-
-O `.comet/worktree.json` segue sem aprovação, como hoje: é configurado pelo próprio usuário na tela do
-app. A diferença é de origem: o `wt.toml` chega pelo repositório, escrito para outra ferramenta.
+Alternativa rejeitada: shell out para `wt switch -x`. Isso introduz dependência de runtime, outro
+layout de pastas e regras de posse distintas conforme a máquina.
 
 ## Risks / Trade-offs
 
-- **[`DeleteWorktree` passa a recusar o que antes apagava]** → Nenhuma UI deste repo chama o RPC; o
-  erro diz o que preservar. Registrado como BREAKING no proposal.
-- **[Setup roda na engine, inclusive disparado por outro device]** → Um Chat hospedado aqui e dirigido
-  de outro device roda o setup do repositório local, que é arquivo versionado do próprio repo — o
-  mesmo nível de confiança do agente que vai rodar ali. Timeout e limpeza do process group já existem
-  no executor.
-- **[Setup de até 5 min atrasa o primeiro run de um Chat em worktree novo]** → Aceito; é o mesmo teto
-  dos Workers e só acontece na criação.
-- **[Retarget em Chat de outro device não checa Workers]** → Explícito na spec; encaminhar a `Mutate`
-  ao host é uma change à parte.
-- **[Testes de Workers escreviam em `~/.unpeel/worktrees`]** (AGENTS.md: "Teste que cria worktree limpa
-  o que criou") → Com o override valendo para Workers, os testes passam a usar tempdir via
-  `ZERON_WORKTREES_DIR`.
-- **[Hook `post-start` que nunca termina]** → É o uso esperado (dev server). Process group próprio,
-  log em arquivo, e encerrado quando o checkout é removido.
-- **[`hash_port` diferente do `wt`]** → O filtro precisa reproduzir o algoritmo do `wt` para que a
-  porta seja a mesma dentro e fora do app; se não for possível confirmar o algoritmo, o filtro fica de
-  fora e o hook que o usa não roda (regra de token desconhecido do D9).
-- **[Reflink indisponível (ext4, volume de rede)]** → Cai para cópia comum; um `target/` grande pode
-  demorar. Opt-in por `.worktreeinclude` limita o estrago a quem pediu.
-- **[Duas raízes gerenciadas para sempre]** → Custo de uma comparação a mais; a raiz Unpeel só deixa de
-  ser necessária quando não houver mais worktree lá, e isso não é decidido aqui.
+- **Legados de Chat sem prova não são removíveis pelo app** → fail closed com mensagem de recuperação;
+  nenhum diretório é movido ou assumido como próprio por nome/prefixo.
+- **Setup pode gerar arquivos ignorados** → `pre-remove` pode limpá-los antes da verificação final;
+  sem hook, o usuário preserva ou limpa os arquivos explicitamente antes de remover.
+- **Lease de Chat não pode dar falso livre** → início do run e remoção compartilham lock; leitura
+  indisponível bloqueia remoção; testes exercitam início concorrente e crash.
+- **Hooks de projeto podem conter recursos do `wt` ausentes** → inspeção em Settings, erro por token
+  e diagnóstico antes de qualquer execução parcial.
+- **Sem cópia automática de caches** → build inicial ainda pode ser lento. Uma change posterior deve
+  definir opt-in, manifesto de proveniência e limpeza segura antes de copiar dados ignorados.
 
 ## Migration Plan
 
-Sem migração de dados: worktrees existentes ficam onde estão e seguem gerenciados. Rollback é reverter
-a change — os worktrees criados na raiz nova continuam worktrees Git normais, e o comet antigo os vê
-como externos (arquiváveis, não apagáveis), que é o lado seguro.
+1. Introduzir prova de posse e a fonte de atividade com testes de concorrência, mantendo os dois
+   chamadores existentes.
+2. Conectar Workers e engine ao serviço; migrar somente evidência Workers comprovada e deixar
+   legados de Chat de origem incerta em estado não removível.
+3. Conectar hooks e aprovação, depois `launch_worker.new_worktree`; validar cada etapa pelos testes
+   da spec e pelos fluxos visuais reais.
+4. Se a implantação precisar de rollback, preservar os registros de posse/atividade novos; versões
+   antigas simplesmente não os leem. Não mover nem limpar worktrees durante rollback.
