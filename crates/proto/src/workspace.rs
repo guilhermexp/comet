@@ -115,7 +115,10 @@ mod tests {
         };
         let value = serde_json::to_value(&full).unwrap();
         assert_eq!(value["spaceId"], "space-1");
-        assert_eq!(serde_json::from_value::<SpawnChatParams>(value).unwrap(), full);
+        assert_eq!(
+            serde_json::from_value::<SpawnChatParams>(value).unwrap(),
+            full
+        );
         let result = SpawnChatResult {
             chat_id: "child".into(),
             space_id: None,
@@ -124,7 +127,10 @@ mod tests {
         let value = serde_json::to_value(&result).unwrap();
         assert!(value.get("spaceId").is_none());
         assert_eq!(value["chatId"], "child");
-        assert_eq!(serde_json::from_value::<SpawnChatResult>(value).unwrap(), result);
+        assert_eq!(
+            serde_json::from_value::<SpawnChatResult>(value).unwrap(),
+            result
+        );
     }
 
     #[test]

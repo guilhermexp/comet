@@ -101,7 +101,10 @@ where
         let request = match serde_json::from_str::<Value>(&line) {
             Ok(request) => request,
             Err(_) => {
-                write_message(&mut writer, &error_response(Value::Null, -32700, "Parse error"))?;
+                write_message(
+                    &mut writer,
+                    &error_response(Value::Null, -32700, "Parse error"),
+                )?;
                 continue;
             }
         };
@@ -203,10 +206,11 @@ pub fn dispatch_action(
             }))
         }
         "create" => {
-            if arguments
-                .as_object()
-                .is_some_and(|object| OVERRIDE_FIELDS.iter().any(|field| object.contains_key(*field)))
-            {
+            if arguments.as_object().is_some_and(|object| {
+                OVERRIDE_FIELDS
+                    .iter()
+                    .any(|field| object.contains_key(*field))
+            }) {
                 return Err(
                     "create does not accept harness, model, reasoning, or sandbox overrides".into(),
                 );
@@ -224,11 +228,7 @@ pub fn dispatch_action(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
-            let created = engine.spawn(
-                &authority.parent_chat_id,
-                prompt,
-                space_id.as_deref(),
-            )?;
+            let created = engine.spawn(&authority.parent_chat_id, prompt, space_id.as_deref())?;
             Ok(json!({
                 "chatId": created.chat_id,
                 "spaceId": created.space_id,
@@ -279,19 +279,25 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 }
 
 fn tool_error(id: Value, message: &str) -> Value {
-    result_response(id, json!({
-        "content": [{ "type": "text", "text": message }],
-        "isError": true
-    }))
+    result_response(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true
+        }),
+    )
 }
 
 fn tool_success(id: Value, value: Value) -> Value {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    result_response(id, json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": value,
-        "isError": false
-    }))
+    result_response(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": value,
+            "isError": false
+        }),
+    )
 }
 
 struct RpcEngine {

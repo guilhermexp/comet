@@ -2918,11 +2918,24 @@ mod tests {
         .unwrap();
         host.create_chat("parent", None, Some("dev-a"), None, None)
             .unwrap();
-        host.create_child_chat("child", None, Some("dev-a"), None, Some("/tmp/child".into()), "parent")
-            .unwrap();
+        host.create_child_chat(
+            "child",
+            None,
+            Some("dev-a"),
+            None,
+            Some("/tmp/child".into()),
+            "parent",
+        )
+        .unwrap();
         let child = host.chat("child").unwrap().unwrap();
         assert_eq!(child.origin_chat_id.as_deref(), Some("parent"));
-        assert!(host.chat("parent").unwrap().unwrap().origin_chat_id.is_none());
+        assert!(
+            host.chat("parent")
+                .unwrap()
+                .unwrap()
+                .origin_chat_id
+                .is_none()
+        );
         host.flush();
         let reopened = super::WorkspaceHost::open(
             std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap()),
@@ -2937,7 +2950,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            reopened.chat("child").unwrap().unwrap().origin_chat_id.as_deref(),
+            reopened
+                .chat("child")
+                .unwrap()
+                .unwrap()
+                .origin_chat_id
+                .as_deref(),
             Some("parent")
         );
     }

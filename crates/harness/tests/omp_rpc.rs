@@ -19,8 +19,8 @@ use zeron_harness::{
     LiveVoiceEvent, LiveVoiceRequest, OmpHarness, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole, ReasoningLevel, RunRequest, SessionsGrant,
-    SandboxLevel, ToolCall, ToolDiff, UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole, ReasoningLevel, RunRequest,
+    SandboxLevel, SessionsGrant, ToolCall, ToolDiff, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
