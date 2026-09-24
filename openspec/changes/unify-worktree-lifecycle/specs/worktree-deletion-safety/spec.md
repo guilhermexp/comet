@@ -11,9 +11,12 @@ Once resolved, deletion SHALL follow the app's single removal policy: the
 checkout SHALL be managed by the app (under the canonical or a legacy worktree
 root), SHALL NOT be in use by a Worker or a `Working` Chat, SHALL have no
 uncommitted, untracked or ignored files, and its HEAD SHALL be retained by a
-branch or tag. Removal SHALL NOT force, SHALL NOT fall back to deleting the
-directory recursively, and SHALL NOT delete the checkout's branch. A worktree
-whose directory is already gone SHALL still have its registration pruned.
+branch or tag, and an approved `pre-remove` hook, when present, SHALL succeed.
+Removal SHALL NOT force and SHALL NOT fall back to deleting the directory
+recursively. The checkout's branch SHALL be deleted only when it is already
+integrated into the default branch; a branch carrying unintegrated work SHALL
+stay. A worktree whose directory is already gone SHALL still have its
+registration pruned.
 
 #### Scenario: An unrelated directory is refused
 
@@ -35,9 +38,17 @@ Test: `delete_worktree_refuses_paths_that_are_not_linked_worktrees`
 
 Test: `crates/engine/tests/m5_repos_diffs_terminals.rs` DeleteWorktree coverage, updated
 
-- **WHEN** deletion names a clean worktree the app created, whose HEAD is on its branch
+- **WHEN** deletion names a clean worktree the app created, whose branch has a commit the default branch lacks
 - **THEN** the checkout is removed
 - **AND** its branch, `zeron/…` included, still exists
+
+#### Scenario: An integrated branch leaves with its checkout
+
+Test: integration — DeleteWorktree over a clean worktree with no commits of its own.
+
+- **WHEN** deletion names a clean worktree the app created whose branch adds nothing to the default branch
+- **THEN** the checkout is removed
+- **AND** its branch no longer exists
 
 #### Scenario: Local changes block deletion
 

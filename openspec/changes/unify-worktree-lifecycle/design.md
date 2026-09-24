@@ -30,7 +30,9 @@ A motivação e o quadro dos dois caminhos estão em `proposal.md` (Why). O que 
 - Mudar nomes: Chat segue `zeron/<adj-noun>` + rename por título (`rename_worktree_branch`), Worker
   segue a branch do usuário.
 - Encaminhar `SetChatCwd` ao host do Chat.
-- Qualquer coisa do worktrunk.
+- Depender do binário `wt`: o ciclo é nativo; o `wt` instalado continua funcionando por fora.
+- Status estilo `wt list`, fluxo `wt merge`, isolamento de Worker por launch, hooks de
+  switch/commit/merge e config de usuário do `wt` — change seguinte (`worktree-status-and-merge`).
 
 ## Decisions
 
@@ -112,11 +114,13 @@ worktree). Um `bun install` quebrado num worktree que o agente consegue conserta
 worktrees órfãos. No lado Workers a regra continua a de hoje (`create_worktree_and_launch` recusa o
 launch), porque ali o registro do projeto já guarda o checkout e o usuário relança à mão.
 
-### D7. `DeleteWorktree` perde `--force`, o fallback recursivo e a deleção de branch
+### D7. `DeleteWorktree` perde `--force` e o fallback recursivo; a branch segue a regra do `wt`
 
-Consequência direta de "uma política, a mais rígida". O teste de integração em
-`m5_repos_diffs_terminals.rs` que hoje prova "worktree removido e branch `zeron/…` apagada" passa a
-provar "removido e branch preservada". O `WORKTREE_REMOVE_TIMEOUT` continua valendo para o
+Consequência direta de "uma política, a mais rígida" para o checkout. Para a branch, a regra deixa de
+ser "`zeron/*` sempre com `-D`" (engine) ou "nunca" (Workers) e passa a ser a do `wt remove` (D10),
+igual nos dois lados. O teste de integração em `m5_repos_diffs_terminals.rs` que hoje prova "worktree
+removido e branch `zeron/…` apagada" passa a cobrir os dois casos: branch sem commits próprios é
+apagada; branch com commit não integrado fica. O `WORKTREE_REMOVE_TIMEOUT` continua valendo para o
 `git worktree remove`.
 
 ### D8. Retarget: checagem no handler de `SetChatCwd`, só quando o Chat é local
@@ -125,6 +129,71 @@ O handler da `Mutate::SetChatCwd` em `rpc.rs` consulta o serviço (`checkout_in_
 Workers) **quando o host do Chat é o device local**; senão aplica sem checar (limitação registrada na
 spec `chat-checkout-control`). O erro volta pelo caminho que `switch_live_worktree` já trata e cai no
 `switch_error` do popover — nenhuma UI nova.
+
+### D9. Hooks do `wt.toml`: ordem, bloqueio e formatos
+
+Um módulo novo `worktrunk.rs` em `crates/workers-unpeel` lê `.config/wt.toml` **do checkout
+principal** (o arquivo do worktree novo é o mesmo commit, mas o principal pode ter mudança local ainda
+não commitada que o usuário quer testar — é o que o `wt` também faz ao rodar do repo). Aceita os três
+formatos do `wt`: string (um comando), tabela (comandos nomeados, concorrentes) e array de tabelas
+(pipeline: etapas em ordem, concorrência dentro de cada etapa). Chave desconhecida é ignorada — o
+arquivo é do `wt` e tem coisas que o comet não usa.
+
+Ordem na criação: `git worktree add` → `copy-ignored` (D11) → setup `.comet/worktree.json` → `pre-start`
+→ devolve ao chamador → `post-start` em segundo plano. Ordem na remoção: validação (D7) → `pre-remove`
+(com os arquivos ainda no disco) → `git worktree remove` → branch (D10) → `post-remove` em segundo plano.
+
+- `pre-start` que falha segue a regra do setup (D6): o checkout fica e a falha chega ao chamador.
+  Difere do `wt`, que aborta; aqui abortar deixaria worktree órfão pelo mesmo motivo do D6.
+- `pre-remove` que falha **aborta** a remoção, como no `wt` — nada foi apagado ainda.
+- `post-*` roda desanexado, com saída em `<raiz>/.logs/<slug>/<nome>/<hook>.log`, sem teto de 5 min
+  (é o lugar de dev server/watcher), mas com process group próprio para ser encerrado na remoção.
+- Variáveis: `branch`, `worktree_path`, `worktree_name`, `repo`, `repo_path`, `primary_worktree_path`,
+  `commit`, `short_commit`, `base`, `default_branch`, `hook_type`, `cwd`; filtros `sanitize` e
+  `hash_port`. Tudo escapado para shell. Variável ou filtro que o comet não conhece faz o hook **não
+  rodar**, com erro que nomeia o token — render parcial rodaria comando errado.
+
+*Alternativa rejeitada:* chamar `wt hook <tipo>` quando o `wt` está no PATH. Duas implementações com
+comportamento diferente conforme a máquina, e o Chat criado por outro device dependeria do PATH do host.
+
+### D10. Branch na remoção: apagada só se integrada
+
+Depois do `git worktree remove`, a branch do checkout é apagada **somente** se: não é a branch padrão,
+não está em outro worktree, e está integrada à branch padrão local por uma das verificações do `wt`
+(mesmo commit; ancestral; `git diff <padrão>...<branch>` vazio; árvores iguais; `git merge-tree
+--write-tree` produz a árvore da padrão). A verificação por patch-id de squash fica de fora (é a mais
+cara e a única heurística). Apaga com `git branch -d` quando ancestral, `-D` nos demais casos já
+provados integrados. Branch remota nunca é tocada. Falha ao apagar a branch não desfaz a remoção:
+vira aviso.
+
+Com isso "HEAD preservado" (validação) e "branch apagada" não conflitam: só se apaga o que já está
+contido na padrão.
+
+### D11. `copy-ignored`: opt-in por `.worktreeinclude`, reflink
+
+Só roda quando o repositório tem `.worktreeinclude` na raiz do checkout principal — o mesmo arquivo que
+o `wt --require-include` e o Claude Code desktop usam. Copia os arquivos que são ignorados pelo Git
+(`git ls-files --others --ignored --exclude-standard --directory`) **e** casam com o
+`.worktreeinclude`, do principal para o novo, pulando o que já existe e as exclusões fixas do `wt`
+(metadados de VCS, worktrees aninhados, a própria raiz de worktrees). Cópia por `clonefile` no macOS e
+`FICLONE` no Linux (crate `reflink-copy`), caindo para cópia comum. Roda antes do setup para que
+`bun install`/`cargo build` já encontrem os caches.
+
+*Alternativa rejeitada:* copiar todos os ignorados sem opt-in. Num repo sem `.worktreeinclude` isso
+clonaria `.env` de produção e caches arbitrários em todo worktree de Chat sem o usuário ter pedido.
+
+### D12. Aprovação dos hooks do `wt.toml`
+
+Comandos do `wt.toml` rodam só se aprovados. A aprovação fica em `~/.zeron/worktree-approvals.json`,
+chave = caminho canônico do repositório, valor = hash (SHA-256) do conjunto de comandos por tipo de
+hook. Mudou um comando → hash muda → volta a pedir. Settings ▸ Projects mostra os comandos lidos e o
+botão Aprovar; a engine lê o mesmo arquivo (mesmo device). Sem aprovação: o worktree é criado, os hooks
+do `wt.toml` não rodam e o chamador recebe "hooks do worktrunk aguardando aprovação". `pre-remove` não
+aprovado **não** bloqueia a remoção — só é pulado com aviso, senão um projeto novo não conseguiria
+remover nada.
+
+O `.comet/worktree.json` segue sem aprovação, como hoje: é configurado pelo próprio usuário na tela do
+app. A diferença é de origem: o `wt.toml` chega pelo repositório, escrito para outra ferramenta.
 
 ## Risks / Trade-offs
 
@@ -141,6 +210,13 @@ spec `chat-checkout-control`). O erro volta pelo caminho que `switch_live_worktr
 - **[Testes de Workers escreviam em `~/.unpeel/worktrees`]** (AGENTS.md: "Teste que cria worktree limpa
   o que criou") → Com o override valendo para Workers, os testes passam a usar tempdir via
   `ZERON_WORKTREES_DIR`.
+- **[Hook `post-start` que nunca termina]** → É o uso esperado (dev server). Process group próprio,
+  log em arquivo, e encerrado quando o checkout é removido.
+- **[`hash_port` diferente do `wt`]** → O filtro precisa reproduzir o algoritmo do `wt` para que a
+  porta seja a mesma dentro e fora do app; se não for possível confirmar o algoritmo, o filtro fica de
+  fora e o hook que o usa não roda (regra de token desconhecido do D9).
+- **[Reflink indisponível (ext4, volume de rede)]** → Cai para cópia comum; um `target/` grande pode
+  demorar. Opt-in por `.worktreeinclude` limita o estrago a quem pediu.
 - **[Duas raízes gerenciadas para sempre]** → Custo de uma comparação a mais; a raiz Unpeel só deixa de
   ser necessária quando não houver mais worktree lá, e isso não é decidido aqui.
 
