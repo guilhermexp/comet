@@ -154,13 +154,16 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         if !self.files.contains_key(&key) {
+            let changes = self.source_control_pane.clone();
             let files = cx.new(|cx| {
-                FilesSurface::new_explorer(
+                let mut files = FilesSurface::new_explorer(
                     self.state.clone(),
                     self.active_chat.clone(),
                     self.settings.files_show_all,
                     cx,
-                )
+                );
+                files.set_changes_view(changes, |pane, cx| pane.change_count(cx), cx);
+                files
             });
             let owner = key.clone();
             let sub = cx.subscribe_in(

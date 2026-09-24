@@ -2132,6 +2132,9 @@ pub struct Shell {
     right_tab_scroll: gpui::ScrollHandle,
     /// Independent rightmost Details / Files column (Orchestrator.dev parity).
     details_sidebar: Entity<DetailsSidebar>,
+    /// The Details sidebar's Changes panel, mounted as the Files explorer's
+    /// Changes tab (same source-control state, rendered in both places).
+    source_control_pane: Entity<crate::details_sidebar::view::SourceControlPane>,
     _details_sub: Subscription,
     file_preview: Entity<FilePreview>,
     _file_preview_sub: Subscription,
@@ -2566,6 +2569,10 @@ impl Shell {
             let composer = composer.clone();
             move |cx| DetailsSidebar::new(state, workers_model, preferences, pickers, composer, cx)
         });
+        let source_control_pane = cx.new({
+            let details_sidebar = details_sidebar.clone();
+            move |cx| crate::details_sidebar::view::SourceControlPane::new(details_sidebar, cx)
+        });
         let file_preview = cx.new(|_| FilePreview::new());
         let details_sub = cx.subscribe(
             &details_sidebar,
@@ -2812,6 +2819,7 @@ impl Shell {
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
             details_sidebar,
+            source_control_pane,
             _details_sub: details_sub,
             file_preview,
             _file_preview_sub: file_preview_sub,

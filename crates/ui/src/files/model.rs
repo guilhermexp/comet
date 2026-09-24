@@ -315,6 +315,22 @@ impl FileTreeModel {
         true
     }
 
+    /// Close every directory but the root. Selection inside a closed
+    /// directory climbs to its top-level ancestor so it stays visible.
+    pub fn collapse_all(&mut self) -> bool {
+        if self.expanded.len() <= 1 {
+            return false;
+        }
+        self.expanded.retain(String::is_empty);
+        if let Some(selected) = self.selected.clone()
+            && let Some((top, _)) = selected.split_once('/')
+        {
+            self.selected = Some(top.to_string());
+        }
+        self.rebuild_visible_rows();
+        true
+    }
+
     pub fn expand(&mut self, path: &str) -> bool {
         if self
             .nodes
@@ -814,6 +830,38 @@ mod tests {
                 .map(|row| row.path.as_str())
                 .collect::<Vec<_>>(),
             ["src", "a.rs", "z.rs", "link"]
+        );
+    }
+
+    #[test]
+    fn collapse_all_keeps_only_the_root_open() {
+        let mut tree = FileTreeModel::new();
+        assert!(!tree.collapse_all(), "nothing to collapse");
+        let generation = tree.generation();
+        tree.begin_load("", None, generation);
+        tree.apply_page(
+            page("", vec![entry("src", WorkspaceEntryKind::Directory)], None),
+            generation,
+        );
+        tree.expand("src");
+        tree.begin_load("src", None, generation);
+        tree.apply_page(
+            page(
+                "src",
+                vec![entry("src/lib.rs", WorkspaceEntryKind::File)],
+                None,
+            ),
+            generation,
+        );
+        tree.select("src/lib.rs");
+        assert!(tree.collapse_all());
+        assert!(tree.expanded_directories().is_empty());
+        assert!(tree.is_expanded(""));
+        assert!(tree.visible_rows.iter().all(|row| row.path != "src/lib.rs"));
+        assert_eq!(
+            tree.selected(),
+            Some("src"),
+            "selection climbs to a visible row"
         );
     }
 

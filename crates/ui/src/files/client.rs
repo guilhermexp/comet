@@ -249,6 +249,23 @@ impl WorkspaceFilesClient {
         self.call(methods::WRITE_WORKSPACE_FILE, &request).await
     }
 
+    /// New empty file or directory under `parent_path` (fork RPC shared
+    /// with the Details tree; forwardable, so remote chats work too).
+    pub async fn create_entry(
+        &self,
+        parent_path: String,
+        name: String,
+        kind: zeron_proto::WorkspaceEntryKind,
+    ) -> Result<zeron_proto::WorkspaceEntryMutation, FilesClientError> {
+        let request = zeron_proto::CreateWorkspaceEntryRequest {
+            target: self.context.target.clone(),
+            parent_path,
+            name,
+            kind,
+        };
+        self.call(methods::CREATE_WORKSPACE_ENTRY, &request).await
+    }
+
     pub async fn watch(&self) -> Result<mpsc::Receiver<serde_json::Value>, FilesClientError> {
         let request = WatchWorkspaceFilesRequest {
             target: self.context.target.clone(),

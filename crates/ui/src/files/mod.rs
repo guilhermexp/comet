@@ -171,6 +171,30 @@ impl FilesPresentation {
 
 impl EventEmitter<FilesEvent> for FilesSurface {}
 
+/// Explorer presentation's top tabs: the file tree, or the source-control
+/// Changes panel the shell hands in (fork: one panel for tree + git).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ExplorerTab {
+    #[default]
+    Explorer,
+    Changes,
+}
+
+/// An in-flight New File / New Folder: the name row under the toolbar.
+struct PendingCreate {
+    parent: String,
+    kind: zeron_proto::WorkspaceEntryKind,
+    error: Option<SharedString>,
+    busy: bool,
+}
+
+/// A mounted Changes panel plus how to read its badge count.
+struct ChangesSlot {
+    view: gpui::AnyView,
+    count: std::rc::Rc<dyn Fn(&gpui::App) -> usize>,
+    _observe: Subscription,
+}
+
 struct EditorContextMenu {
     editor: Entity<editor::FileEditorState>,
     position: Point<Pixels>,
@@ -208,6 +232,18 @@ pub struct FilesSurface {
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
+    explorer_tab: ExplorerTab,
+    changes: Option<ChangesSlot>,
+    /// The search field shows only on demand (toolbar magnifier), or while
+    /// a query is active; the resting toolbar is icons only.
+    search_open: bool,
+    search_focus_pending: bool,
+    create: Option<PendingCreate>,
+    create_input: Entity<ComposerInput>,
+    create_focus_pending: bool,
+    /// The project-name row folds the whole tree away.
+    root_collapsed: bool,
+    _create_events: Subscription,
     _observe: Subscription,
     _search_events: Subscription,
 }
@@ -217,18 +253,33 @@ impl Render for FilesSurface {
         if std::mem::take(&mut self.search_restore_tree_focus) {
             self.tree_focus.focus(window, cx);
         }
+        if std::mem::take(&mut self.search_focus_pending) {
+            use gpui::Focusable;
+            self.search.focus_handle(cx).focus(window, cx);
+        }
+        if std::mem::take(&mut self.create_focus_pending) {
+            use gpui::Focusable;
+            self.create_input.focus_handle(cx).focus(window, cx);
+        }
         let theme = crate::theme::Theme::of(cx).clone();
         let is_editor = self.presentation.is_editor();
         // Both presentations carry a secondary header of the same height
         // directly under the titlebar: the editor's breadcrumb toolbar, or the
         // explorer's search + visibility toolbar.
+        let tabs =
+            (!is_editor && self.changes.is_some()).then(|| self.render_explorer_tabs(&theme, cx));
+        let on_changes = !is_editor && self.explorer_tab == ExplorerTab::Changes;
         let header = if is_editor {
             self.render_editor_header(&theme, cx)
+        } else if on_changes {
+            None
         } else {
             Some(self.render_explorer_header(&theme, cx))
         };
         let body = if is_editor {
             self.render_preview(window, cx)
+        } else if let Some(changes) = self.changes.as_ref().filter(|_| on_changes) {
+            changes.view.clone().into_any_element()
         } else {
             self.render_explorer(&theme, cx).into_any_element()
         };
@@ -245,6 +296,7 @@ impl Render for FilesSurface {
             .flex()
             .bg(crate::theme::ink(0.0))
             .flex_col()
+            .children(tabs)
             .children(header)
             .child(div().flex_1().min_h_0().w_full().child(body))
             .children(editor_context_menu)
@@ -252,6 +304,107 @@ impl Render for FilesSurface {
 }
 
 impl FilesSurface {
+    /// Mount the shell's source-control panel as the explorer's Changes tab.
+    /// `count` feeds the tab badge; the surface re-renders when `view` does.
+    pub fn set_changes_view<V: Render>(
+        &mut self,
+        view: Entity<V>,
+        count: impl Fn(&V, &gpui::App) -> usize + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let _observe = cx.observe(&view, |_, _, cx| cx.notify());
+        let counted = view.clone();
+        self.changes = Some(ChangesSlot {
+            view: view.into(),
+            count: std::rc::Rc::new(move |cx| count(counted.read(cx), cx)),
+            _observe,
+        });
+        cx.notify();
+    }
+
+    fn set_explorer_tab(&mut self, tab: ExplorerTab, cx: &mut Context<Self>) {
+        if self.explorer_tab != tab {
+            self.explorer_tab = tab;
+            cx.notify();
+        }
+    }
+
+    /// Explorer | Changes segmented control, the Details sidebar's pill
+    /// recipe so both panes' tab strips read as one family.
+    fn render_explorer_tabs(
+        &mut self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let active_tab = self.explorer_tab;
+        let badge = self
+            .changes
+            .as_ref()
+            .map(|changes| (changes.count)(cx))
+            .unwrap_or(0);
+        let pill = |id: &'static str, label: &'static str, tab: ExplorerTab| {
+            let active = active_tab == tab;
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .h(px(crate::surface_chrome::CONTROL_SIZE))
+                .flex_1()
+                .px(px(12.0))
+                .rounded(px(7.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .bg(if active {
+                    theme.bg.opacity(0.6)
+                } else {
+                    gpui::transparent_black()
+                })
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(if active { theme.text } else { theme.text_muted })
+                .child(label)
+        };
+        let changes = pill("files-tab-changes", "Changes", ExplorerTab::Changes)
+            .on_click(cx.listener(|this, _, _, cx| this.set_explorer_tab(ExplorerTab::Changes, cx)))
+            .when(badge > 0, |pill| {
+                pill.child(
+                    div()
+                        .px(px(6.0))
+                        .rounded(px(8.0))
+                        .bg(crate::theme::ink(0.08))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(format!("{badge}")),
+                )
+            });
+        div()
+            .h(px(crate::surface_chrome::HEADER_HEIGHT))
+            .flex_none()
+            .px(px(crate::surface_chrome::EDGE_INSET))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .w_full()
+                    .p(px(2.0))
+                    .rounded(px(9.0))
+                    .bg(crate::theme::ink(0.03))
+                    .flex()
+                    .items_center()
+                    .child(
+                        pill("files-tab-explorer", "Explorer", ExplorerTab::Explorer).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.set_explorer_tab(ExplorerTab::Explorer, cx)
+                            }),
+                        ),
+                    )
+                    .child(changes),
+            )
+            .into_any_element()
+    }
+
     fn render_explorer(
         &mut self,
         theme: &crate::theme::Theme,
@@ -364,7 +517,137 @@ impl FilesSurface {
                         ),
                 )
             })
-            .child(content)
+            .children(self.render_root_row(theme, cx))
+            .children(self.render_create_row(theme, cx))
+            .when(!self.root_collapsed, |element| element.child(content))
+    }
+
+    /// The checkout's name as a quiet uppercase section row; clicking it
+    /// folds the whole tree away (the Explorer layout of editors).
+    fn render_root_row(
+        &mut self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.search_state.query.is_empty() {
+            return None;
+        }
+        let cwd = self.request_context.as_ref()?.cwd.clone();
+        let name = std::path::Path::new(cwd.trim_end_matches('/'))
+            .file_name()
+            .map(|name| name.to_string_lossy().to_uppercase())
+            .unwrap_or_else(|| cwd.to_uppercase());
+        let collapsed = self.root_collapsed;
+        Some(
+            div()
+                .id("files-root-row")
+                .debug_selector(|| "files-root-row".into())
+                .h(px(tree::TREE_ROW_HEIGHT))
+                .flex_none()
+                .px(px(crate::surface_chrome::EDGE_INSET))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::wash(0.05)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.root_collapsed = !this.root_collapsed;
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(if collapsed {
+                        crate::icons::ALT_ARROW_RIGHT
+                    } else {
+                        crate::icons::ALT_ARROW_DOWN
+                    })
+                    .size(px(11.0))
+                    .text_color(theme.text_faint),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(10.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text_muted)
+                        .child(name),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The name field of an in-flight New File / New Folder.
+    fn render_create_row(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let create = self.create.as_ref()?;
+        let is_directory = create.kind == zeron_proto::WorkspaceEntryKind::Directory;
+        let location = if create.parent.is_empty() {
+            "root".to_string()
+        } else {
+            format!("{}/", create.parent)
+        };
+        Some(
+            div()
+                .flex_none()
+                .px(px(crate::surface_chrome::EDGE_INSET))
+                .py(px(4.0))
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    crate::surface_chrome::input()
+                        .id("files-create-input")
+                        .debug_selector(|| "files-create-input".into())
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "escape" {
+                                this.cancel_create(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .when(create.error.is_some(), |field| {
+                            field.border_1().border_color(theme.danger)
+                        })
+                        .child(
+                            crate::icons::icon(if is_directory {
+                                crate::icons::FOLDER_WITH_FILES
+                            } else {
+                                crate::icons::DOCUMENT_ADD
+                            })
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_faint),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child(self.create_input.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(if create.error.is_some() {
+                            theme.danger
+                        } else {
+                            theme.text_faint
+                        })
+                        .truncate()
+                        .child(match &create.error {
+                            Some(error) => error.clone(),
+                            None => format!(
+                                "New {} in {location} — Enter to create, Esc to cancel",
+                                if is_directory { "folder" } else { "file" }
+                            )
+                            .into(),
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A persistent explorer: opening a path always delegates to the shell.
@@ -456,6 +739,25 @@ impl FilesSurface {
                 .with_accessibility_role(gpui::Role::SearchInput)
                 .with_text_metrics(11.0, 16.0)
         });
+        let create_input = cx.new(|cx| {
+            ComposerInput::new("Name", cx)
+                .with_single_line()
+                .with_text_metrics(11.5, 16.0)
+        });
+        let create_events =
+            cx.subscribe(&create_input, |this: &mut Self, _, event, cx| match event {
+                ComposerInputEvent::Submitted | ComposerInputEvent::ModifiedSubmitted => {
+                    this.confirm_create(cx)
+                }
+                ComposerInputEvent::MentionDismiss => this.cancel_create(cx),
+                ComposerInputEvent::Edited => {
+                    if let Some(create) = this.create.as_mut() {
+                        create.error = None;
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            });
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => this.on_search_edited(cx),
             ComposerInputEvent::Submitted
@@ -533,6 +835,15 @@ impl FilesSurface {
             loads: HashMap::new(),
             error: None,
             started: false,
+            explorer_tab: ExplorerTab::default(),
+            changes: None,
+            search_open: false,
+            search_focus_pending: false,
+            create: None,
+            create_input,
+            create_focus_pending: false,
+            root_collapsed: false,
+            _create_events: create_events,
             _observe: observe,
             _search_events: search_events,
         };
@@ -999,13 +1310,249 @@ impl FilesSurface {
     /// to the tree.
     fn close_search(&mut self, cx: &mut Context<Self>) {
         self.clear_search(cx);
+        self.search_open = false;
         self.search_restore_tree_focus = true;
         cx.notify();
     }
 
-    /// The explorer's secondary header: the same toolbar band the editor
-    /// carries directly under the titlebar (search field + visibility eye).
+    fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.explorer_tab = ExplorerTab::Explorer;
+        self.search_open = true;
+        self.search_focus_pending = true;
+        cx.notify();
+    }
+
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.root_collapsed = false;
+        if self.tree.collapse_all() {
+            self.sync_tree_list();
+        }
+        cx.notify();
+    }
+
+    /// New File / New Folder: under the selected directory, beside the
+    /// selected file, or at the root (the Details tree's rule).
+    fn begin_create(&mut self, kind: zeron_proto::WorkspaceEntryKind, cx: &mut Context<Self>) {
+        let selected = self.tree.selected().map(str::to_owned);
+        let selected_is_dir = selected
+            .as_deref()
+            .and_then(|path| self.tree.node(path))
+            .is_some_and(|node| node.entry.kind == zeron_proto::WorkspaceEntryKind::Directory);
+        let parent = crate::details_sidebar::file_actions::create_parent_path(
+            selected.as_deref(),
+            selected_is_dir,
+        );
+        if !parent.is_empty() && self.tree.expand(&parent) {
+            self.sync_tree_list();
+            if !self.tree.is_directory_loaded(&parent) {
+                self.load_directory(parent.clone(), None, cx);
+            }
+        }
+        self.explorer_tab = ExplorerTab::Explorer;
+        self.root_collapsed = false;
+        self.create = Some(PendingCreate {
+            parent,
+            kind,
+            error: None,
+            busy: false,
+        });
+        self.create_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.create_focus_pending = true;
+        cx.notify();
+    }
+
+    fn cancel_create(&mut self, cx: &mut Context<Self>) {
+        if self.create.take().is_some() {
+            self.search_restore_tree_focus = true;
+            cx.notify();
+        }
+    }
+
+    fn confirm_create(&mut self, cx: &mut Context<Self>) {
+        let Some(create) = self.create.as_ref().filter(|create| !create.busy) else {
+            return;
+        };
+        let name = self.create_input.read(cx).text().trim().to_string();
+        let parent = create.parent.clone();
+        let kind = create.kind;
+        let siblings: Vec<&str> = self
+            .tree
+            .node(&parent)
+            .map(|node| {
+                node.children
+                    .iter()
+                    .filter_map(|child| self.tree.node(child))
+                    .map(|child| child.entry.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Err(error) =
+            crate::details_sidebar::file_actions::validate_create_name(&name, &siblings)
+        {
+            if let Some(create) = self.create.as_mut() {
+                create.error = Some(error.into());
+            }
+            cx.notify();
+            return;
+        }
+        let (Some(context), Some(engine)) = (
+            self.request_context.clone(),
+            self.state.read(cx).engine().cloned(),
+        ) else {
+            if let Some(create) = self.create.as_mut() {
+                create.error = Some("Workspace service is unavailable.".into());
+            }
+            cx.notify();
+            return;
+        };
+        if let Some(create) = self.create.as_mut() {
+            create.busy = true;
+        }
+        let client = WorkspaceFilesClient::new(engine, context);
+        cx.spawn(async move |this, cx| {
+            let result = client.create_entry(parent.clone(), name, kind).await;
+            let _ = this.update(cx, |surface, cx| match result {
+                Ok(created) => {
+                    surface.create = None;
+                    surface.tree.invalidate_directory(&parent);
+                    let intent = if created.is_directory {
+                        search::RevealIntent::ActivateDirectory
+                    } else {
+                        search::RevealIntent::OpenFile
+                    };
+                    surface.reveal_path(created.path, intent, cx);
+                    cx.notify();
+                }
+                Err(error) => {
+                    if let Some(create) = surface.create.as_mut() {
+                        create.busy = false;
+                        create.error = Some(error.to_string().into());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The explorer's secondary header, the same band the editor carries:
+    /// resting, a row of actions (New File, New Folder, Collapse, Search,
+    /// hidden files, Changes); searching, the search field + eye.
     fn render_explorer_header(
+        &mut self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if self.search_open || !self.search_state.query.is_empty() {
+            return self.render_search_header(theme, cx);
+        }
+        let include_ignored = self.tree.include_ignored();
+        let badge = self
+            .changes
+            .as_ref()
+            .map(|changes| (changes.count)(cx))
+            .unwrap_or(0);
+        let icon = |path: &'static str, active: bool| {
+            crate::icons::icon(path)
+                .size(px(crate::surface_chrome::ICON_SIZE))
+                .text_color(if active { theme.text } else { theme.text_muted })
+        };
+        let mut row = toolbar(theme)
+            .id("files-explorer-header")
+            .debug_selector(|| "files-explorer-header".into())
+            .justify_around()
+            .child(
+                toolbar_button("files-new-file", "New File")
+                    .debug_selector(|| "files-new-file".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.begin_create(zeron_proto::WorkspaceEntryKind::File, cx)
+                    }))
+                    .child(icon(crate::icons::DOCUMENT_ADD, false)),
+            )
+            .child(
+                toolbar_button("files-new-folder", "New Folder")
+                    .debug_selector(|| "files-new-folder".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.begin_create(zeron_proto::WorkspaceEntryKind::Directory, cx)
+                    }))
+                    .child(icon(crate::icons::FOLDER_WITH_FILES, false)),
+            )
+            .child(
+                toolbar_button("files-collapse-all", "Collapse Folders")
+                    .debug_selector(|| "files-collapse-all".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx)))
+                    .child(icon(crate::icons::FOLD_VERTICAL, false)),
+            )
+            .child(
+                toolbar_button("files-search-toggle", "Search Files")
+                    .debug_selector(|| "files-search-toggle".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.open_search(cx)))
+                    .child(icon(crate::icons::MAGNIFER, false)),
+            )
+            .child(
+                toolbar_button(
+                    "files-toggle-ignored",
+                    if include_ignored {
+                        "Hide hidden and ignored files"
+                    } else {
+                        "Show all files (even hidden)"
+                    },
+                )
+                .debug_selector(|| "files-toggle-ignored".into())
+                .when(include_ignored, |element| {
+                    element.bg(crate::theme::wash(0.1))
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_ignored(cx);
+                }))
+                .child(icon(
+                    if include_ignored {
+                        crate::icons::EYE
+                    } else {
+                        crate::icons::EYE_CLOSED
+                    },
+                    include_ignored,
+                )),
+            );
+        if self.changes.is_some() {
+            row =
+                row.child(
+                    toolbar_button("files-open-changes", "Source Control")
+                        .debug_selector(|| "files-open-changes".into())
+                        .relative()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_explorer_tab(ExplorerTab::Changes, cx)
+                        }))
+                        .child(icon(crate::icons::PULL_REQUEST, false))
+                        .when(badge > 0, |button| {
+                            button.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-4.0))
+                                    .right(px(-5.0))
+                                    .min_w(px(14.0))
+                                    .h(px(14.0))
+                                    .px(px(3.0))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(gpui::rgb(0x387dcc))
+                                    .text_size(px(9.0))
+                                    .text_color(gpui::rgb(0xffffff))
+                                    .child(format!("{badge}")),
+                            )
+                        }),
+                );
+        }
+        row.into_any_element()
+    }
+
+    /// Search mode of the explorer header: field + visibility eye.
+    fn render_search_header(
         &mut self,
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
@@ -1115,6 +1662,14 @@ mod explorer_tests {
         // The explorer header is the same band as the editor header.
         let header = cx.debug_bounds("files-explorer-header").unwrap();
         assert_eq!(header.size.height, px(crate::surface_chrome::HEADER_HEIGHT));
+        assert!(
+            cx.debug_bounds("files-search").is_none(),
+            "the resting toolbar is icons only"
+        );
+        let toggle = cx.debug_bounds("files-search-toggle").unwrap().center();
+        cx.simulate_click(toggle, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let header = cx.debug_bounds("files-explorer-header").unwrap();
         let bounds = cx.debug_bounds("files-search").unwrap();
         assert!(bounds.top() >= header.top() && bounds.bottom() <= header.bottom());
         // Click the field padding, not just the input's text hitbox.
@@ -1145,6 +1700,99 @@ mod explorer_tests {
         cx.update(|window, cx| {
             assert!(files.read(cx).tree_focus.is_focused(window));
         });
+        assert!(
+            cx.debug_bounds("files-new-file").is_some(),
+            "closing search restores the action row"
+        );
+    }
+
+    #[gpui::test]
+    fn new_entry_row_validates_and_cancels(cx: &mut TestAppContext) {
+        use gpui::Modifiers;
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let (files, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            FilesSurface::new_explorer(state, "chat".into(), false, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let new_folder = cx.debug_bounds("files-new-folder").unwrap().center();
+        cx.simulate_click(new_folder, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("files-create-input").is_some());
+        files.read_with(cx, |files, _| {
+            let create = files.create.as_ref().unwrap();
+            assert_eq!(create.kind, zeron_proto::WorkspaceEntryKind::Directory);
+            assert_eq!(create.parent, "", "no selection creates at the root");
+        });
+        // An empty name never reaches the RPC.
+        files.update(cx, |files, cx| files.confirm_create(cx));
+        files.read_with(cx, |files, _| {
+            let create = files.create.as_ref().unwrap();
+            assert!(create.error.is_some());
+            assert!(!create.busy);
+        });
+        files.update(cx, |files, cx| files.cancel_create(cx));
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("files-create-input").is_none());
+    }
+
+    struct StubChanges(usize);
+
+    impl Render for StubChanges {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().debug_selector(|| "stub-changes".into()).size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn explorer_hosts_the_changes_panel_as_a_second_tab(cx: &mut TestAppContext) {
+        use gpui::Modifiers;
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let (files, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            FilesSurface::new_explorer(state, "chat".into(), false, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            cx.debug_bounds("files-tab-changes").is_none(),
+            "no Changes tab until the shell mounts a panel"
+        );
+
+        let stub = cx.update(|_, cx| cx.new(|_| StubChanges(3)));
+        files.update(cx, |files, cx| {
+            files.set_changes_view(stub.clone(), |stub, _| stub.0, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("files-explorer-header").is_some());
+        assert!(cx.debug_bounds("stub-changes").is_none());
+        files.read_with(cx, |files, cx| {
+            assert_eq!((files.changes.as_ref().unwrap().count)(cx), 3);
+        });
+
+        let changes = cx.debug_bounds("files-tab-changes").unwrap().center();
+        cx.simulate_click(changes, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("stub-changes").is_some());
+        assert!(
+            cx.debug_bounds("files-explorer-header").is_none(),
+            "the search toolbar belongs to the tree tab"
+        );
+
+        let explorer = cx.debug_bounds("files-tab-explorer").unwrap().center();
+        cx.simulate_click(explorer, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("files-explorer-header").is_some());
+        assert!(cx.debug_bounds("stub-changes").is_none());
     }
 
     #[gpui::test]
