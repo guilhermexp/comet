@@ -1,7 +1,15 @@
 #!/bin/sh
 set -eu
 
-[ "${COMET_WORKERS_CONTROLLER:-}" = "1" ] || exit 12
+if [ "${1:-}" = "__sessions_mcp__" ]; then
+  [ "${COMET_SESSIONS_CONTROLLER:-}" = "1" ] || exit 12
+  tool=sessions
+  label="sessions help"
+else
+  [ "${COMET_WORKERS_CONTROLLER:-}" = "1" ] || exit 12
+  tool=workers
+  label="worker help"
+fi
 emit() { printf '%s\n' "$1"; }
 rid() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'; }
 
@@ -11,7 +19,7 @@ while IFS= read -r line; do
       emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake-workers\",\"version\":\"1\"}}}"
       ;;
     *'"method":"tools/list"'*)
-      emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"tools\":[{\"name\":\"workers\",\"description\":\"Coordinate test workers\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"action\"],\"properties\":{\"action\":{\"type\":\"string\"}}}}]}}"
+      emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"tools\":[{\"name\":\"$tool\",\"description\":\"Coordinate test workers\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"action\"],\"properties\":{\"action\":{\"type\":\"string\"}}}}]}}"
       ;;
     *'"method":"tools/call"'*)
       case "$line" in
@@ -27,7 +35,7 @@ while IFS= read -r line; do
           dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\000' x
           printf '"}],"isError":false}}\n'
           ;;
-        *) emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"worker help\"}],\"isError\":false}}" ;;
+        *) emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"$label\"}],\"isError\":false}}" ;;
       esac
       ;;
   esac

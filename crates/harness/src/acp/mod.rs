@@ -52,12 +52,6 @@ use zeron_proto::{
     RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-fn workers_mcp_servers(enabled: bool, parent_chat_id: Option<&str>) -> Vec<Value> {
-    crate::workers_mcp::resolve(enabled, parent_chat_id)
-        .map(|server| vec![server.acp_value()])
-        .unwrap_or_default()
-}
-
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::process::{Command, Stdio};
 use crate::scratch::ScratchDir;
@@ -67,6 +61,13 @@ use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_ch
 use normalize::{UpdateNormalizer, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
+
+fn workers_mcp_servers(request: &RunRequest) -> Vec<Value> {
+    crate::workers_mcp::servers_for_request(request)
+        .iter()
+        .map(|server| server.acp_value())
+        .collect()
+}
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2908,10 +2909,7 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let mcp_servers = workers_mcp_servers(
-            request.enable_workers_mcp,
-            request.workers_parent_chat_id.as_deref(),
-        );
+        let mcp_servers = workers_mcp_servers(&request);
         let session_params = json!({ "cwd": request.cwd, "mcpServers": mcp_servers });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();

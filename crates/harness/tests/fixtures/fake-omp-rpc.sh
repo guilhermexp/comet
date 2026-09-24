@@ -206,7 +206,13 @@ while IFS= read -r line; do
       ;;
     set_host_tools)
       if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_tools 56; fi
-      respond "$line" '{"toolNames":["workers"]}'
+      if [ "$scenario" = "mixed-host-tools" ]; then
+        has "$line" '"name":"workers"' || exit 60
+        has "$line" '"name":"sessions"' || exit 61
+        respond "$line" '{"toolNames":["workers","sessions"]}'
+      else
+        respond "$line" '{"toolNames":["workers"]}'
+      fi
       ;;
     set_model)
       if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_model 57; fi
@@ -398,6 +404,21 @@ while IFS= read -r line; do
         else
           fail_stage timeout 28
         fi
+      elif [ "$scenario" = "mixed-host-tools" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"host_tool_call","id":"host-sessions","toolCallId":"sessions-1","toolName":"sessions","arguments":{"action":"help"}}'
+        read -r host_result
+        has "$host_result" '"type":"host_tool_result"' || fail_stage mixed 70
+        has "$host_result" '"id":"host-sessions"' || fail_stage mixed 70
+        has "$host_result" '"isError":false' || fail_stage mixed 70
+        has "$host_result" 'sessions help' || fail_stage mixed 71
+        emit '{"type":"host_tool_call","id":"host-workers","toolCallId":"workers-1","toolName":"workers","arguments":{"action":"help"}}'
+        read -r host_result
+        has "$host_result" '"id":"host-workers"' || fail_stage mixed 72
+        has "$host_result" '"isError":false' || fail_stage mixed 72
+        has "$host_result" 'worker help' || fail_stage mixed 73
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after both tools"}}'
+        emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "workers-cancel" ]; then
         emit '{"type":"host_tool_call","id":"host-hang","toolCallId":"workers-hang","toolName":"workers","arguments":{"action":"hang"}}'
         emit '{"type":"host_tool_cancel","id":"cancel-host","targetId":"host-hang"}'

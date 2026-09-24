@@ -434,10 +434,15 @@ impl Harness for OmpHarness {
             }
         }
 
-        let workers = if workers_expected {
-            let executable = self.workers_executable().ok_or_else(|| {
+        let executable = if workers_expected || request.sessions.is_some() {
+            Some(self.workers_executable().ok_or_else(|| {
                 HarnessError::Protocol("Workers controller executable is unavailable".into())
-            })?;
+            })?)
+        } else {
+            None
+        };
+        let workers = if workers_expected {
+            let executable = executable.clone().expect("checked");
             WorkersBridge::start(WorkersBridgeOptions {
                 enabled: true,
                 executable,
@@ -448,11 +453,24 @@ impl Harness for OmpHarness {
         } else {
             None
         };
-        if let Some(workers) = &workers {
+        let sessions = if let Some(grant) = &request.sessions {
+            let executable = executable.clone().expect("checked");
+            WorkersBridge::start_sessions(&executable, grant)
+                .await?
+                .map(Arc::new)
+        } else {
+            None
+        };
+        let host_tools: Vec<_> = workers
+            .iter()
+            .chain(sessions.iter())
+            .map(|bridge| bridge.definition().clone())
+            .collect();
+        if !host_tools.is_empty() {
             process
                 .request(json!({
                     "type": "set_host_tools",
-                    "tools": [workers.definition().clone()]
+                    "tools": host_tools
                 }))
                 .await?;
         }
@@ -519,6 +537,7 @@ impl Harness for OmpHarness {
             event_tx,
             controls,
             workers,
+            sessions,
             request.cwd,
             model,
             session_id,
@@ -861,6 +880,7 @@ async fn run_session(
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     workers: Option<Arc<WorkersBridge>>,
+    sessions: Option<Arc<WorkersBridge>>,
     cwd: String,
     model: String,
     mut session_id: String,
@@ -1119,7 +1139,11 @@ async fn run_session(
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
                         let tool = frame.get("toolName").and_then(Value::as_str).unwrap_or_default();
                         let arguments = frame.get("arguments").cloned().unwrap_or(Value::Null);
-                        match &workers {
+                        let bridge = match tool {
+                            "sessions" => sessions.as_ref(),
+                            _ => workers.as_ref(),
+                        };
+                        match bridge {
                             Some(workers) => match workers.begin_call(id, tool, arguments) {
                                 Ok(receiver) => {
                                     delivering.insert(id.to_owned());
@@ -1158,9 +1182,13 @@ async fn run_session(
                     }
                     Some("host_tool_cancel") => {
                         if let Some(target_id) = frame.get("targetId").and_then(Value::as_str)
-                            && let Some(workers) = &workers
                         {
-                            workers.cancel_call(target_id);
+                            if let Some(workers) = &workers {
+                                workers.cancel_call(target_id);
+                            }
+                            if let Some(sessions) = &sessions {
+                                sessions.cancel_call(target_id);
+                            }
                         }
                     }
                     Some("extension_ui_request") => {
@@ -1265,6 +1293,9 @@ async fn run_session(
 
     if let Some(workers) = workers {
         let _ = workers.shutdown().await;
+    }
+    if let Some(sessions) = sessions {
+        let _ = sessions.shutdown().await;
     }
     let _ = process.shutdown().await;
 }

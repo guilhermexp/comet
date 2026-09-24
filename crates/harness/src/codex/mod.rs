@@ -102,12 +102,10 @@ pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessErr
 }
 
 fn codex_workers_mcp_overrides(request: &RunRequest) -> Vec<String> {
-    crate::workers_mcp::resolve(
-        request.enable_workers_mcp,
-        request.workers_parent_chat_id.as_deref(),
-    )
-    .map(|server| server.codex_overrides())
-    .unwrap_or_default()
+    crate::workers_mcp::servers_for_request(request)
+        .iter()
+        .flat_map(|server| server.codex_overrides())
+        .collect()
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a

@@ -85,11 +85,7 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 }
 
 fn claude_workers_mcp_config(request: &RunRequest) -> Option<String> {
-    crate::workers_mcp::resolve(
-        request.enable_workers_mcp,
-        request.workers_parent_chat_id.as_deref(),
-    )
-    .map(|server| server.claude_config_json())
+    crate::workers_mcp::claude_config_json(&crate::workers_mcp::servers_for_request(request))
 }
 
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
