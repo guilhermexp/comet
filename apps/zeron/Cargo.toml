@@ -46,6 +46,7 @@ zeron-ui.workspace = true
 zeron-update.workspace = true
 zeron-workers-unpeel.workspace = true
 zeron-mcp.workspace = true
+zeron-sessions-mcp.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

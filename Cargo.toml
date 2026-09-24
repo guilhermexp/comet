@@ -13,6 +13,7 @@ members = [
     "crates/rpc",
     "crates/update",
     "crates/workers-unpeel",
+    "crates/sessions-mcp",
     "crates/ui",
     "crates/mcp",
     "apps/zeron",
@@ -42,6 +43,7 @@ zeron-rpc = { path = "crates/rpc" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-update = { path = "crates/update" }
 zeron-workers-unpeel = { path = "crates/workers-unpeel" }
+zeron-sessions-mcp = { path = "crates/sessions-mcp" }
 zeron-ui = { path = "crates/ui" }
 unpeel-core = { path = "third_party/unpeel/crates/unpeel-core" }
 zeron-theme = { path = "crates/theme" }
