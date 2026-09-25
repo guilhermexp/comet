@@ -25,7 +25,7 @@ ignorados ou `worktree-path` configurável.
 ### D1. Raiz comum e prova de posse separada
 
 Worktrees novos usam `ZERON_WORKTREES_DIR` não vazio ou `~/.zeron/worktrees`, em
-`<slug>-<fnv1a:08x>/<nome>`, com hash do caminho canônico do repositório. A localização serve
+`<slug>-<fnv1a:016x>/<nome>`, com hash do caminho canônico do repositório. A localização serve
 apenas como limite adicional de segurança. A autorização de remoção exige ainda prova durável de
 que o Comet criou **aquele** checkout do **mesmo** repositório Git: caminho canônico, identidade do
 Git common dir e identificador administrativo do worktree. A branch observada é metadado, não
@@ -90,13 +90,13 @@ antes de liberar o lock para spawn e só o encerra quando o Worker consta como v
 falha. Assim não existe janela entre preparo e registro do processo na qual uma remoção possa
 apagar o checkout.
 
-O serviço soma esse estado aos Workers vivos do `LocalWorkersClient`; UI, controller MCP e RPC não
-podem fornecer uma lista opcional de Chats que permita contornar a verificação. Retarget local usa a
+O serviço soma esse estado aos Workers vivos do `LocalWorkersClient`; UI, cliente Workers direto e
+RPC não podem fornecer uma lista opcional de Chats que permita contornar a verificação. Retarget local usa a
 mesma consulta de Workers. Um Chat hospedado em outro device continua com a limitação descrita em
 `chat-checkout-control`: sua `Mutate::SetChatCwd` não é encaminhada ao host nesta change.
 
-Alternativa rejeitada: a UI passar `busy_chat_cwds` para `remove_worktree`. O controller MCP e um
-chamador direto não passam pela UI.
+Alternativa rejeitada: a UI passar `busy_chat_cwds` para `remove_worktree`. Um chamador direto do
+cliente Workers e o RPC da engine não passam pela UI.
 
 ### D4. Remoção segura, branch preservada
 

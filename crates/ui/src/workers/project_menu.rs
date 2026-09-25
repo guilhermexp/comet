@@ -30,6 +30,7 @@ pub enum WorkersProjectMenuItem {
     ArchiveCheckout,
     RestoreCheckout,
     RemoveWorktree,
+    RemoveWorktreeWithoutHooks,
     RemoveGroup,
     RemoveProject,
 }
@@ -132,7 +133,10 @@ pub fn project_menu_items(
         // never share a dispatch path because archive retains sessions/files.
         items.push(WorkersProjectMenuItem::ArchiveCheckout);
         if is_managed_worktree {
-            items.push(WorkersProjectMenuItem::RemoveWorktree);
+            items.extend([
+                WorkersProjectMenuItem::RemoveWorktree,
+                WorkersProjectMenuItem::RemoveWorktreeWithoutHooks,
+            ]);
         }
     } else {
         items.push(WorkersProjectMenuItem::RemoveProject);
@@ -144,7 +148,7 @@ pub fn project_menu_items(
 mod tests {
     use super::{WorkersProjectMenuItem as Item, project_menu_items};
     use zeron_workers_unpeel::{
-        CheckoutAvailability, CheckoutKind, WorkersProject, WorkersSession,
+        CheckoutAvailability, CheckoutKind, CheckoutOwnership, WorkersProject, WorkersSession,
         WorkersSessionCapabilities, WorkersSessionSort,
     };
 
@@ -241,6 +245,24 @@ mod tests {
                 Item::ArchiveCheckout,
             ]
         );
+    }
+
+    #[test]
+    fn managed_worktree_exposes_hook_override_as_a_separate_removal_action() {
+        let mut managed = project(Some("root"), Some("feature/sidebar"));
+        managed.checkout_kind = Some(CheckoutKind::Linked);
+        managed.checkout_ownership = Some(CheckoutOwnership::AppManaged);
+        managed.checkout_availability = Some(CheckoutAvailability::Available);
+
+        let items = project_menu_items(&managed, &[]);
+        assert!(items.contains(&Item::RemoveWorktree));
+        assert!(items.contains(&Item::RemoveWorktreeWithoutHooks));
+
+        let mut external = managed;
+        external.checkout_ownership = Some(CheckoutOwnership::External);
+        let external_items = project_menu_items(&external, &[]);
+        assert!(!external_items.contains(&Item::RemoveWorktree));
+        assert!(!external_items.contains(&Item::RemoveWorktreeWithoutHooks));
     }
 
     /// An adopted worktree on a detached HEAD: a child with a parent projected

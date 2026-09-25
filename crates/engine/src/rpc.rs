@@ -58,6 +58,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
@@ -1246,6 +1247,51 @@ impl EngineRpc {
                     .map(drop)
             }
         }
+    }
+
+    /// Ref retarget is a local checkout action. Keep the legacy behavior for
+    /// Chats hosted on another device, but refuse to point a local Chat at a
+    /// linked worktree while a Workers process is using it.
+    async fn guard_chat_cwd_retarget(&self, chat_id: &str, cwd: &str) -> Result<(), RpcError> {
+        let Some(chat) = self
+            .workspace
+            .chat(chat_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        if chat.device_id != self.doc_host.device_id() {
+            return Ok(());
+        }
+
+        let target = cwd.to_owned();
+        let busy = tokio::task::spawn_blocking(move || {
+            let path = Path::new(&target);
+            // SetChatCwd also handles ordinary checkouts. This guard is only
+            // for Ref rows with their own linked-worktree checkout.
+            if crate::workspace_host::linked_worktree_root(path).is_none() {
+                return Ok(false);
+            }
+            zeron_workers_unpeel::LocalWorkersClient::new().checkout_is_busy(path)
+        })
+        .await
+        .map_err(|error| {
+            RpcError::Failed(format!(
+                "Could not verify Workers activity in the selected checkout: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            RpcError::Failed(format!(
+                "Could not verify Workers activity in the selected checkout: {error}"
+            ))
+        })?;
+
+        if busy {
+            return Err(RpcError::Failed(
+                "A Worker is working in this checkout; stop it before switching this Chat to the worktree".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2528,6 +2574,9 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
+                if let MutateParams::SetChatCwd { chat_id, cwd } = &p {
+                    self.guard_chat_cwd_retarget(chat_id, cwd).await?;
+                }
                 let sidebar_pins = matches!(&p, MutateParams::ChangeSidebarPin { .. });
                 self.mutate(p)?;
                 if sidebar_pins {
@@ -3195,17 +3244,19 @@ impl RpcService for EngineRpc {
                     }
                     None => None,
                 };
-                let worktree = self
+                let creation = self
                     .repos
-                    .create_worktree(std::path::Path::new(&p.repo_path), &p.branch)
+                    .create_worktree_with_setup(std::path::Path::new(&p.repo_path), &p.branch)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let mut outcome = CreateWorktreeOutcome {
-                    worktree,
+                    worktree: creation.worktree,
                     setup_action: None,
-                    setup_error: None,
+                    setup_error: creation.setup_error,
                 };
-                if let Some((space, project_root)) = setup_space {
+                if outcome.setup_error.is_none()
+                    && let Some((space, project_root)) = setup_space
+                {
                     match self
                         .project_actions
                         .setup_action(&space.id, std::path::Path::new(&space.path))
@@ -4190,7 +4241,14 @@ mod tests {
         for method in [methods::LIST_MODELS, methods::LIST_COMMANDS] {
             assert_eq!(deadline(method), Duration::from_secs(100));
         }
-        assert_eq!(deadline(methods::CREATE_WORKTREE), Duration::from_secs(120));
+        assert_eq!(
+            deadline(methods::CREATE_WORKTREE),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            deadline(methods::DELETE_WORKTREE),
+            Duration::from_secs(1800)
+        );
         assert_eq!(deadline(methods::CLONE_REPO), Duration::from_secs(15 * 60));
         assert_eq!(deadline(methods::LIST_BRANCHES), Duration::from_secs(30));
         assert_eq!(deadline(methods::QUEUE_COMMAND), Duration::from_secs(30));

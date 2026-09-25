@@ -23,7 +23,10 @@ internal host modes (`__session_host__` et al.).
 | `workspace_trust.rs` | Workspace trust decisions |
 | `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
 | `project_ledger.rs` | Historical project metadata, grouped Settings catalog and persistent Forget suppression |
-| `checkout_lifecycle.rs` | Archive/restore and guarded physical worktree removal; launch/restart/removal coordination |
+| `checkout_lifecycle.rs` | Shared Chat/Workers worktree creation, guarded physical removal, stale registration pruning, archive/restore and action coordination |
+| `worktree_ownership.rs` | Canonical worktree root and durable Git identity/ownership journal; path prefix and branch name never grant deletion rights |
+| `checkout_activity.rs` | Device-local reservations for Chat runs, preparation and Worker starts; an expired lease stays busy until reconciled |
+| `worktrunk_hooks.rs`, `worktrunk_lifecycle.rs`, `worktrunk_approvals.rs` | Supported `.config/wt.toml` start/remove hooks, bounded execution, per-command local approvals and background logs |
 | `git_command.rs` | Bounded Git subprocesses and pipe collection, separate read/mutation deadlines |
 | `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()` (every runtime attempted, failures accumulated instead of aborting the loop), then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
@@ -31,7 +34,8 @@ internal host modes (`__session_host__` et al.).
 | `tests/` | Integration tests per surface |
 
 Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`) only.
-Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
+Consumed by: zeron-engine (ciclo de vida de worktree e atividade local),
+zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
 
@@ -198,26 +202,26 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   a Session. **Falha de LAUNCH também não desfaz** — o rollback que chamava
   `remove_worktree(force)` no braço de erro saiu: o checkout já existe e já está
   registrado, e apagá-lo à força por causa de um preset inválido joga fora
-  trabalho do usuário. O único rollback que sobrou é o do registro que falhou,
-  onde o worktree ainda não é projeto de ninguém.
-- **`worktree_branch` no registro é POSSE, não identidade.** Identidade quem
-  responde é a projeção (bullet acima): worktree adotado é worktree e o registro
-  nunca ouviu falar dele. Por isso `remove_worktree` não recusa mais quem não
-  tem o campo — ele apaga do disco só quando o registro tem `worktree_branch`
-  (o app criou este checkout) **e** `worktrees::is_managed(path)`; qualquer
-  outra coisa é apenas desregistrada, com a pasta intacta. `is_managed` é o
-  predicado extraído de `worktrees::remove`, para quem PERGUNTA antes e quem
-  RECUSA depois fazerem a mesma pergunta — e é ele que impede um grupo (que
-  herda o path do pai) de derrubar o checkout do pai junto com o rótulo.
+  trabalho do usuário. Falha de registro também conserva checkout e branch
+  para diagnóstico; nenhum erro posterior ao Git autoriza rollback forçado.
+- **Posse exige journal e identidade Git.** `worktree_branch` e localização
+  ajudam a apresentar um checkout, mas não autorizam exclusão. Criação grava
+  `PendingCreate` antes do Git, `CreatedObserved` após observar o checkout e
+  `Owned` antes do preparo; remoção/prune encerram a prova como `Retired`, e
+  um add que falha sem deixar checkout nem registro Git vira `Aborted`. Um
+  worktree externo dentro da raiz canônica, até
+  via symlink, continua externo. Registros Workers legados `AppManaged` só
+  migram com evidência Git compatível; Chat legado sem essa prova não migra
+  automaticamente. `remove_worktree` consulta o journal de novo sob
+  `CheckoutActionLock` antes da remoção física.
 - **Hook ingress não morre por sinal de filho.** O accept loop trata
   `WouldBlock` e `Interrupted` como transitórios; setup/Worker encerrando
   processos no mesmo host não pode fechar o endpoint e devolver BrokenPipe ao
   próximo hook.
-- **Teste que cria worktree limpa o que criou.** `unpeel_core::worktrees::create`
-  escreve em `~/.unpeel/worktrees/`, que o state path injetado NAO redireciona.
-  O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o ramo deixa o
-  diretorio do repo vazio para tras e a contagem cresce a cada rodada (cresceu,
-  16 vezes, antes do `Drop` do fixture cobrir o pai).
+- **Teste de worktree usa estado e raiz privados.** Injetar
+  `ZERON_WORKTREES_DIR`, `ZERON_WORKTREE_OWNERSHIP_FILE` e `UNPEEL_HOME` no
+  fixture; restaurar o ambiente no `Drop`. O serviço comum escreve novos
+  checkouts em `~/.zeron/worktrees` por padrão, sem chamar o create do vendor.
 - **A família pi retoma por id, e `--continue` só sob diretório pinado.** `omp`
   e `prime-agent` compartilham a receita de resume em
   `third_party/unpeel/runtimes/_shared/pi-family/adapter/resume.rs`: aceitam
@@ -456,13 +460,33 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 ## Work Guidance
 
-- **Checkout lifecycle:** `checkout_lifecycle` separates archive/restore from
-  physical removal. Archive preserves session manifests/output and files;
-  removal accepts only an explicitly app-owned linked Git worktree under the
-  managed root, rejects active Workers and local/ignored data, and keeps the
-  branch and history. Never restore the legacy recursive-delete/force fallback.
-  `checkout-actions.lock` serializes launch/restart/removal separately from the
-  JSON lock. Interrupted mutation remains blocked until explicit clean restore.
+- **Checkout lifecycle:** Chat e Workers usam o mesmo serviço. A raiz canônica
+  organiza checkouts novos, mas não prova posse. Archive preserva manifests,
+  output e arquivos; remoção física exige `Owned` no journal, identidade Git
+  compatível, nenhuma atividade local e árvore limpa (inclusive ignorados),
+  depois de `pre-remove`. Branch e histórico permanecem. Nunca restaurar
+  `--force` nem fallback recursivo. `checkout-actions.lock` serializa criação,
+  início de run/Worker, Retarget e remoção; reservas locais de atividade
+  permanecem bloqueantes após perda de heartbeat até reconciliação. Ao iniciar
+  um Chat em `cwd` ainda ausente, a reserva examina o ancestral existente mais
+  próximo: prende um worktree linkado que contenha o futuro diretório e não
+  impede o run em uma pasta comum ainda não criada.
+- **Preparo e hooks:** `.comet/worktree.json`/`.cursor/worktrees.json` e os
+  hooks suportados de `.config/wt.toml` rodam após criação; falha mantém o
+  checkout e o próximo pedido retenta no mesmo caminho antes de executar o
+  agente. Aprovação local é por comando e identidade do repositório; mudança
+  de texto torna o comando pendente. `pre-*` bloqueia, `post-*` roda em segundo
+  plano com log. O renderer de templates suporta um subconjunto lexical de
+  shell: rejeita comandos com expansões aninhadas, here-doc, aspas ANSI ou
+  continuação de linha por backslash antes da execução, em vez de inserir
+  valores sem escape. Remoção sem hooks exige
+  ação explícita, mas não pula posse, atividade ou limpeza.
+- **Chat com nome gerado cria exclusivamente.** `PendingChatCheckout` mantém a
+  reserva `Preparing` enquanto a engine persiste `cwd`/branch. A API
+  `create_new_checkout_for_chat_unprepared` verifica branch e path sob
+  `CheckoutActionLock` e sinaliza `CheckoutNameTaken` para o Chat escolher
+  outro nome. A API de destino explícito continua podendo reutilizar o
+  worktree; não usar essa adoção na alocação automática.
 - **Bounded Git commands:** use `git_command` for identity/lifecycle probes;
   read and mutation deadlines differ. Kill the process group on deadline and
   bound pipe collection too, because a descendant can retain stdout after Git
@@ -531,15 +555,16 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (criação/preparo Chat e Workers), `src/checkout_lifecycle.rs`, `src/checkout_activity.rs`, `src/worktree_ownership.rs`, `src/worktrunk_{hooks,lifecycle,approvals}.rs`, `src/worktree_config.rs` (setup e retries) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/hook_migration.rs`, `src/activity_bridge.rs`, `src/resources.rs`, `src/session_event_journal.rs`, `src/project_ledger.rs`, `src/project_git.rs` | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
-| `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/controller_mcp.rs` — Comet-owned MCP surface, including `launch_worker.new_worktree` validation and recoverable launch failures | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/worker_initial_briefing.rs` (13) — OMP/Claude/Pi/Codex native delivery, literal input, spawn and ACK failures, no replay, existing interactive guards, managed Codex wrapper privacy and upstream launcher composition | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
-| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
+| `tests/project_actions.rs` (ownership, external/legacy checkouts, dirty removal and hook bypass), `tests/local_actions.rs`, `tests/session_actions.rs`, `tests/local_bootstrap.rs`, `tests/dev_demo_fixture.rs` — client actions over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
 
 ### Native initial briefing scenarios

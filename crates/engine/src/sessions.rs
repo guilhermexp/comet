@@ -159,6 +159,8 @@ fn apply_run_error_to_session(session: &mut Session, status: SessionStatus, erro
 
 struct RunHandle {
     run_id: String,
+    /// Prevent physical removal until this run has actually left the host.
+    _checkout_activity: Option<zeron_workers_unpeel::CheckoutActivityReservation>,
     steerable: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
@@ -1204,6 +1206,18 @@ impl SessionsEngine {
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
 
         let run_id = new_id();
+        let activity_reservation = {
+            let cwd = std::path::PathBuf::from(&request.cwd);
+            let operation_id = run_id.clone();
+            tokio::task::spawn_blocking(move || {
+                zeron_workers_unpeel::reserve_chat_run(&operation_id, &cwd)
+            })
+            .await
+            .map_err(|error| {
+                EngineError::Other(format!("Checkout activity worker failed: {error}"))
+            })?
+            .map_err(|error| EngineError::Other(error.to_string()))?
+        };
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -1260,6 +1274,7 @@ impl SessionsEngine {
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
+                _checkout_activity: activity_reservation,
                 steerable: harness.supports_steering(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,

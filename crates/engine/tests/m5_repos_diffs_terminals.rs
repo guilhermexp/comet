@@ -164,9 +164,9 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert!(PathBuf::from(&worktree.path).join("a.txt").exists());
     assert!(worktree.checkout_id.is_some());
     assert!(
-        worktree
-            .path
-            .starts_with(&*tmp.path().join("data").to_string_lossy())
+        Path::new(&worktree.path).starts_with(
+            std::fs::canonicalize(tmp.path().join("data")).expect("canonical data dir")
+        )
     );
     let branches = repos
         .branches(&repo_dir)
@@ -209,7 +209,7 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("wt identity");
     assert_ne!(main_identity.id, wt_identity.id);
 
-    // Delete: dir removed, zeron branch removed, refs pruned.
+    // Delete removes the owned, clean checkout and keeps its branch.
     repos
         .delete_worktree(&repo_dir, Path::new(&worktree.path))
         .await
@@ -220,8 +220,96 @@ async fn repos_round_trip_add_branches_worktrees() {
         .await
         .expect("branches after delete");
     assert!(
-        !branches.contains(&worktree.branch),
-        "zeron branch deleted: {branches:?}"
+        branches.contains(&worktree.branch),
+        "checkout removal preserves the branch: {branches:?}"
+    );
+
+    // A commit that is not in main keeps its branch when the checkout is
+    // removed, preserving the only ref to that work.
+    let unmerged = repos
+        .create_worktree(&repo_dir, "main")
+        .await
+        .expect("unmerged worktree");
+    let unmerged_path = PathBuf::from(&unmerged.path);
+    std::fs::write(unmerged_path.join("feature.txt"), "unmerged work\n")
+        .expect("write feature file");
+    git(&unmerged_path, &["add", "."]).await;
+    git(&unmerged_path, &["commit", "-m", "unmerged feature"]).await;
+    repos
+        .delete_worktree(&repo_dir, &unmerged_path)
+        .await
+        .expect("delete unmerged checkout");
+    assert!(!unmerged_path.exists());
+    assert!(
+        repos
+            .branches(&repo_dir)
+            .await
+            .expect("branches after unmerged delete")
+            .contains(&unmerged.branch),
+        "branch keeps the unmerged commit"
+    );
+
+    // A dirty checkout cannot be physically removed.
+    let dirty = repos
+        .create_worktree(&repo_dir, "main")
+        .await
+        .expect("dirty worktree");
+    let dirty_path = PathBuf::from(&dirty.path);
+    std::fs::write(dirty_path.join("untracked.txt"), "keep me\n").expect("write untracked file");
+    assert!(
+        repos.delete_worktree(&repo_dir, &dirty_path).await.is_err(),
+        "dirty checkouts are refused"
+    );
+    assert!(dirty_path.join("untracked.txt").exists());
+
+    // The managed root is a location policy, not proof of ownership. An
+    // external Git worktree created inside it remains undeletable.
+    let external_path = tmp.path().join("data/worktrees/external");
+    let external_path_arg = external_path.to_string_lossy().into_owned();
+    git(
+        &repo_dir,
+        &["worktree", "add", "-b", "external", &external_path_arg],
+    )
+    .await;
+    assert!(
+        repos
+            .delete_worktree(&repo_dir, &external_path)
+            .await
+            .is_err(),
+        "an external worktree under the managed root lacks journal ownership"
+    );
+    assert!(external_path.join("a.txt").exists());
+    assert!(
+        git_stdout(&repo_dir, &["show-ref", "--verify", "refs/heads/external"])
+            .await
+            .contains("refs/heads/external")
+    );
+
+    // A previously owned checkout whose leaf has been removed can have its
+    // stale Git registration pruned; the branch is preserved.
+    let stale = repos
+        .create_worktree(&repo_dir, "main")
+        .await
+        .expect("stale worktree");
+    let stale_path = PathBuf::from(&stale.path);
+    std::fs::remove_dir_all(&stale_path).expect("remove checkout leaf");
+    repos
+        .delete_worktree(&repo_dir, &stale_path)
+        .await
+        .expect("prune stale registration");
+    let listed_worktrees = git_stdout(&repo_dir, &["worktree", "list", "--porcelain"]).await;
+    assert!(!listed_worktrees.contains(&stale_path.to_string_lossy().to_string()));
+    assert!(
+        git_stdout(
+            &repo_dir,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", stale.branch)
+            ]
+        )
+        .await
+        .contains(&stale.branch)
     );
 
     // CreateRepo: sanitized name, initialized on main.
@@ -1847,7 +1935,7 @@ async fn rpc_dispatch_for_m5_methods() {
             ProjectActionDraft {
                 name: "Setup".into(),
                 command: concat!(
-                    "sleep 2; ",
+                    "sleep 6; ",
                     "printf 'ROOT=%s\\nWT=%s\\nCWD=%s\\n' ",
                     "\"$ZERON_PROJECT_ROOT\" \"$ZERON_WORKTREE_PATH\" \"$PWD\" ",
                     "| tee .zeron-setup-env"
@@ -1933,10 +2021,7 @@ async fn rpc_dispatch_for_m5_methods() {
         )
         .await
         .expect("CreateWorktree with setup");
-    assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "CreateWorktree waited for the setup command"
-    );
+    let create_elapsed = started.elapsed();
     assert!(outcome.setup_error.is_none());
     let setup = outcome.setup_action.expect("setup terminal");
     let mut setup_rx = core
@@ -1959,6 +2044,10 @@ async fn rpc_dispatch_for_m5_methods() {
     core.terminals
         .close(&setup.terminal.id)
         .expect("close setup terminal");
+    // The setup Action created this untracked fixture file. The shared
+    // removal policy now requires the checkout to be clean.
+    std::fs::remove_file(canonical_worktree.join(".zeron-setup-env"))
+        .expect("remove setup fixture before deleting worktree");
     client
         .call(
             methods::DELETE_WORKTREE,
@@ -2095,4 +2184,8 @@ async fn rpc_dispatch_for_m5_methods() {
     );
 
     core.shutdown().await;
+    assert!(
+        create_elapsed < Duration::from_secs(4),
+        "CreateWorktree waited for the setup command ({create_elapsed:?})"
+    );
 }

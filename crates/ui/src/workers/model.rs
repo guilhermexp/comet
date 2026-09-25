@@ -187,6 +187,13 @@ pub fn worktree_setup_failure_message(result: &WorkersWorktreeResult) -> Option<
     ))
 }
 
+pub fn worktree_hook_warning_message(result: &WorkersWorktreeResult) -> Option<String> {
+    let warning = result.hook_warning.as_deref()?;
+    Some(format!(
+        "Worktree created, but a Worktrunk post-start hook needs attention: {warning}"
+    ))
+}
+
 pub fn sessions_for_project<'a>(
     sessions: &'a [WorkersSession],
     project_id: &str,
@@ -494,6 +501,8 @@ pub struct WorkersModel {
     pub expanded_project_ids: HashSet<String>,
     pub loading: bool,
     pub error: Option<String>,
+    /// Advisory from a post-start hook after a worktree was successfully created.
+    pub action_notice: Option<String>,
     post_refresh_error: Option<String>,
     pub archive_project_id: Option<String>,
     pub archived_sessions: Vec<WorkersSession>,
@@ -506,6 +515,7 @@ pub struct WorkersModel {
     pub settings_error: Option<String>,
     pub confirming_remove_session_id: Option<String>,
     pub confirming_remove_project: Option<WorkersProject>,
+    pub confirming_remove_project_without_hooks: Option<WorkersProject>,
     pub gallery_pulse_session_id: Option<String>,
     confirming_remove_archived: bool,
     initialized_expansion: bool,
@@ -589,6 +599,7 @@ impl WorkersModel {
             expanded_project_ids: HashSet::new(),
             loading: true,
             error: None,
+            action_notice: None,
             post_refresh_error: None,
             archive_project_id: None,
             archived_sessions: Vec::new(),
@@ -604,6 +615,7 @@ impl WorkersModel {
             settings_error: None,
             confirming_remove_session_id: None,
             confirming_remove_project: None,
+            confirming_remove_project_without_hooks: None,
             gallery_pulse_session_id: None,
             confirming_remove_archived: false,
             initialized_expansion: false,
@@ -1440,6 +1452,7 @@ impl WorkersModel {
         name: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.action_notice = None;
         let parent_id = project_id.clone();
         self.run_action(
             move |client| {
@@ -1455,6 +1468,7 @@ impl WorkersModel {
                 model.selected_project_id = Some(worktree.project_id.clone());
                 model.selected_session_id = None;
                 model.launcher_project_id = None;
+                model.action_notice = worktree_hook_warning_message(&worktree);
                 if let Some(error) = worktree_setup_failure_message(&worktree) {
                     model.error = Some(error.clone());
                     model.post_refresh_error = Some(error);
@@ -1472,6 +1486,7 @@ impl WorkersModel {
         preset_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.action_notice = None;
         let parent_id = project_id.clone();
         self.run_action(
             move |client| {
@@ -1490,6 +1505,11 @@ impl WorkersModel {
                 )
             },
             move |model, result| {
+                model.action_notice = result.hook_warning.as_ref().map(|warning| {
+                    format!(
+                        "Worktree created, but a Worktrunk post-start hook needs attention: {warning}"
+                    )
+                });
                 model.expanded_project_ids.insert(parent_id);
                 model.expanded_project_ids.insert(result.project_id.clone());
                 model.selected_project_id = Some(result.project_id);
@@ -1590,26 +1610,61 @@ impl WorkersModel {
                 }
             },
             move |model, ()| {
-                model.expanded_project_ids.remove(&selected_id);
-                if model.selected_project_id.as_deref() == Some(&selected_id) {
-                    model.selected_project_id = None;
-                    model.selected_session_id = None;
-                }
-                if model.launcher_project_id.as_deref() == Some(&selected_id) {
-                    model.launcher_project_id = None;
-                }
+                model.clear_removed_project_selection(&selected_id);
             },
             cx,
         );
     }
 
+    pub fn remove_project_without_hooks(
+        &mut self,
+        project: WorkersProject,
+        cx: &mut Context<Self>,
+    ) {
+        if is_presentation_container(&project) || !checkout_can_be_removed(&project) {
+            return;
+        }
+        let selected_id = project.id.clone();
+        self.run_action(
+            move |client| client.remove_worktree_without_hooks(&project.id),
+            move |model, ()| model.clear_removed_project_selection(&selected_id),
+            cx,
+        );
+    }
+
+    fn clear_removed_project_selection(&mut self, project_id: &str) {
+        self.expanded_project_ids.remove(project_id);
+        if self.selected_project_id.as_deref() == Some(project_id) {
+            self.selected_project_id = None;
+            self.selected_session_id = None;
+        }
+        if self.launcher_project_id.as_deref() == Some(project_id) {
+            self.launcher_project_id = None;
+        }
+    }
+
     pub fn request_remove_project(&mut self, project: WorkersProject, cx: &mut Context<Self>) {
+        self.confirming_remove_project_without_hooks = None;
         self.confirming_remove_project = Some(project);
+        cx.notify();
+    }
+
+    pub fn request_remove_project_without_hooks(
+        &mut self,
+        project: WorkersProject,
+        cx: &mut Context<Self>,
+    ) {
+        if !checkout_can_be_removed(&project) {
+            return;
+        }
+        self.confirming_remove_project = None;
+        self.confirming_remove_project_without_hooks = Some(project);
         cx.notify();
     }
 
     pub fn cancel_remove_project(&mut self, cx: &mut Context<Self>) {
         self.confirming_remove_project = None;
+        self.confirming_remove_project_without_hooks = None;
         cx.notify();
     }
 
@@ -1622,6 +1677,19 @@ impl WorkersModel {
             return;
         };
         self.remove_project(project, cx);
+    }
+
+    pub fn confirm_remove_project_without_hooks(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.confirming_remove_project_without_hooks.take() else {
+            return;
+        };
+        self.remove_project_without_hooks(project, cx);
+    }
+
+    pub fn dismiss_action_notice(&mut self, cx: &mut Context<Self>) {
+        if self.action_notice.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub fn reveal_project(&mut self, path: String, cx: &mut Context<Self>) {
@@ -2395,7 +2463,7 @@ mod tests {
         parent_notification_rpc_params, reconcile_selection, reconcile_selection_with_pending,
         replacement_selection, resolve_session_target, selection_after_filter,
         selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
-        toggle_expanded, worktree_setup_failure_message,
+        toggle_expanded, worktree_hook_warning_message, worktree_setup_failure_message,
     };
 
     #[test]
@@ -2934,12 +3002,33 @@ mod tests {
             branch: "change/fix".into(),
             setup_failed_command: Some("bun install".into()),
             setup_failed_reason: Some("exit status: 1".into()),
+            hook_warning: None,
             setup_commands_run: 0,
         };
 
         assert_eq!(
             worktree_setup_failure_message(&result).as_deref(),
             Some("Worktree created, but setup failed at `bun install`: exit status: 1")
+        );
+    }
+
+    #[test]
+    fn worktree_hook_warning_is_exposed_as_advisory_after_creation() {
+        let result = WorkersWorktreeResult {
+            project_id: "worktree-1".into(),
+            path: "/tmp/worktree-1".into(),
+            branch: "change/fix".into(),
+            setup_failed_command: None,
+            setup_failed_reason: None,
+            hook_warning: Some("post-start approval is pending".into()),
+            setup_commands_run: 1,
+        };
+
+        assert_eq!(
+            worktree_hook_warning_message(&result).as_deref(),
+            Some(
+                "Worktree created, but a Worktrunk post-start hook needs attention: post-start approval is pending"
+            )
         );
     }
 

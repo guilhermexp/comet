@@ -1,6 +1,7 @@
 //! Typed Comet adapter for the pinned Unpeel local worker runtime.
 
 mod activity_bridge;
+mod checkout_activity;
 mod checkout_lifecycle;
 mod controller_mcp;
 mod git_command;
@@ -15,7 +16,12 @@ pub mod resources;
 mod session_event_journal;
 pub mod workspace_trust;
 pub mod worktree_config;
+pub mod worktree_ownership;
+mod worktrunk_approvals;
+mod worktrunk_hooks;
+mod worktrunk_lifecycle;
 
+pub use checkout_activity::{ActivityKind, CheckoutActivityReservation, reserve_chat_run};
 pub use controller_mcp::{
     CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,
     worker_output_text,
@@ -47,6 +53,313 @@ pub use project_identity::{
     RepositoryIdentity,
 };
 pub use project_ledger::{LedgerProject, LiveProject, ProjectRow};
+pub use worktrunk_approvals::{WorkersWorktrunkHookCommand, WorkersWorktrunkHooksSnapshot};
+
+/// Result of preparing one Chat checkout. The path is returned even when a
+/// setup command fails, so the Chat can retain and retry that same checkout.
+pub struct ChatWorktreeCreation {
+    pub path: PathBuf,
+    pub branch: String,
+    pub setup_failed_command: Option<String>,
+    pub setup_failed_reason: Option<String>,
+    pub hook_warning: Option<String>,
+}
+
+/// A Chat checkout created but not yet prepared. The preparation reservation
+/// remains alive while the engine records its cwd, preventing removal in the
+/// gap between Git creation and setup.
+pub struct PendingChatCheckout {
+    pub path: PathBuf,
+    pub branch: String,
+    repository: PathBuf,
+    base_ref: Option<String>,
+    journal: worktree_ownership::OwnershipJournal,
+    preparing: Option<CheckoutActivityReservation>,
+}
+
+impl PendingChatCheckout {
+    /// Finish setup and the approved start hooks after the caller has persisted
+    /// the Chat's checkout identity. The reservation is consumed on every path.
+    pub fn finish(self) -> Result<ChatWorktreeCreation, WorkersError> {
+        let Self {
+            path,
+            branch,
+            repository,
+            base_ref,
+            journal,
+            preparing,
+        } = self;
+        let pending = preparing.is_some();
+        finish_chat_preparation(
+            &repository,
+            &path,
+            &branch,
+            base_ref.as_deref(),
+            journal,
+            pending,
+            preparing,
+        )
+    }
+}
+
+pub fn create_checkout_for_chat(
+    repository: &Path,
+    branch: &str,
+    base_ref: Option<&str>,
+    root: &Path,
+    journal_path: &Path,
+) -> Result<ChatWorktreeCreation, WorkersError> {
+    create_checkout_for_chat_unprepared(repository, branch, base_ref, root, journal_path)?.finish()
+}
+
+/// Create or reuse the Chat's checkout without running setup or start hooks.
+/// The caller must persist the returned path/branch before calling finish.
+/// A pending preparation reservation is held by the returned value throughout
+/// that persistence window.
+pub fn create_checkout_for_chat_unprepared(
+    repository: &Path,
+    branch: &str,
+    base_ref: Option<&str>,
+    root: &Path,
+    journal_path: &Path,
+) -> Result<PendingChatCheckout, WorkersError> {
+    create_chat_checkout_unprepared(repository, branch, base_ref, root, journal_path, false)
+}
+
+/// Create a newly-named Chat checkout without adopting an existing branch or
+/// destination. This is for generated names: callers may retry with another
+/// name only when `CheckoutNameTaken` is returned.
+pub fn create_new_checkout_for_chat_unprepared(
+    repository: &Path,
+    branch: &str,
+    base_ref: Option<&str>,
+    root: &Path,
+    journal_path: &Path,
+) -> Result<PendingChatCheckout, WorkersError> {
+    create_chat_checkout_unprepared(repository, branch, base_ref, root, journal_path, true)
+}
+
+fn create_chat_checkout_unprepared(
+    repository: &Path,
+    branch: &str,
+    base_ref: Option<&str>,
+    root: &Path,
+    journal_path: &Path,
+    require_new: bool,
+) -> Result<PendingChatCheckout, WorkersError> {
+    let root = std::fs::canonicalize(root)
+        .or_else(|_| {
+            std::fs::create_dir_all(root)?;
+            std::fs::canonicalize(root)
+        })
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    let journal = worktree_ownership::OwnershipJournal::at(journal_path.to_owned(), root.clone());
+    let branch = branch.trim();
+    let name = branch.strip_prefix("zeron/").unwrap_or(branch);
+    let action = checkout_lifecycle::lock_checkout_actions()?;
+    if require_new {
+        git_command::run_git(repository, &["check-ref-format", "--branch", branch])
+            .map_err(WorkersError::State)?;
+        let repo_root = git_command::run_git(repository, &["rev-parse", "--show-toplevel"])
+            .map_err(WorkersError::State)?;
+        let repo_root = std::fs::canonicalize(repo_root.trim())
+            .map_err(|error| WorkersError::State(error.to_string()))?;
+        let target = worktree_ownership::worktree_path(&root, &repo_root, name)
+            .map_err(|error| WorkersError::State(error.to_string()))?;
+        let branch_ref = format!("refs/heads/{branch}");
+        let refs = git_command::run_git(
+            &repo_root,
+            &["for-each-ref", "--format=%(refname)", &branch_ref],
+        )
+        .map_err(WorkersError::State)?;
+        let branch_exists = refs.lines().any(|line| line.trim() == branch_ref);
+        let target_exists = match std::fs::symlink_metadata(&target) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(WorkersError::State(format!(
+                    "cannot inspect Chat checkout destination {}: {error}",
+                    target.display()
+                )));
+            }
+        };
+        if branch_exists || target_exists {
+            return Err(WorkersError::CheckoutNameTaken {
+                branch: branch.to_owned(),
+                path: target,
+            });
+        }
+    }
+    let created = checkout_lifecycle::create_checkout_under_lock(
+        &action, repository, name, branch, base_ref, &root, &journal,
+    )?;
+    let pending = journal
+        .preparation_pending(repository, &created.path)
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    let preparing = if pending {
+        if let Some(active) =
+            checkout_activity::busy_at(&checkout_activity::activity_file(), &created.path)
+                .map_err(WorkersError::State)?
+        {
+            return Err(WorkersError::State(format!(
+                "Checkout preparation is already pending while activity {:?} uses it; retry after that activity settles. path={}",
+                active.kind,
+                created.path.display()
+            )));
+        }
+        Some(checkout_activity::reserve_operation_under_lock(
+            &format!("chat-prepare-{}", uuid::Uuid::new_v4()),
+            &created.path,
+            checkout_activity::ActivityKind::Preparing,
+        )?)
+    } else {
+        None
+    };
+    drop(action);
+    Ok(PendingChatCheckout {
+        path: created.path,
+        branch: created.branch,
+        repository: repository.to_owned(),
+        base_ref: base_ref.map(str::to_owned),
+        journal,
+        preparing,
+    })
+}
+
+/// Retry a previously failed Chat preparation in its existing checkout. An
+/// external checkout or a successfully prepared one is a no-op.
+pub fn prepare_checkout_for_chat(
+    repository: &Path,
+    checkout: &Path,
+    root: &Path,
+    journal_path: &Path,
+) -> Result<ChatWorktreeCreation, WorkersError> {
+    let journal =
+        worktree_ownership::OwnershipJournal::at(journal_path.to_owned(), root.to_owned());
+    let action = checkout_lifecycle::lock_checkout_actions()?;
+    let checkout =
+        std::fs::canonicalize(checkout).map_err(|error| WorkersError::State(error.to_string()))?;
+    let pending = journal
+        .preparation_pending(repository, &checkout)
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    let branch_result =
+        git_command::run_git(&checkout, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let branch = if pending {
+        branch_result.map_err(WorkersError::State)?
+    } else {
+        branch_result.unwrap_or_default()
+    };
+    let branch = branch.trim().to_owned();
+    let preparing = if pending {
+        if let Some(active) =
+            checkout_activity::busy_at(&checkout_activity::activity_file(), &checkout)
+                .map_err(WorkersError::State)?
+        {
+            return Err(WorkersError::State(format!(
+                "Checkout preparation is already pending while activity {:?} uses it; retry after that activity settles. path={}",
+                active.kind,
+                checkout.display()
+            )));
+        }
+        Some(checkout_activity::reserve_operation_under_lock(
+            &format!("chat-prepare-{}", uuid::Uuid::new_v4()),
+            &checkout,
+            checkout_activity::ActivityKind::Preparing,
+        )?)
+    } else {
+        None
+    };
+    drop(action);
+    finish_chat_preparation(
+        repository, &checkout, &branch, None, journal, pending, preparing,
+    )
+}
+
+fn finish_chat_preparation(
+    repository: &Path,
+    checkout: &Path,
+    branch: &str,
+    base_ref: Option<&str>,
+    journal: worktree_ownership::OwnershipJournal,
+    pending: bool,
+    preparing: Option<CheckoutActivityReservation>,
+) -> Result<ChatWorktreeCreation, WorkersError> {
+    let mut setup = if pending {
+        worktree_config::run_setup_for_project(checkout, repository)
+    } else {
+        worktree_config::SetupOutcome::default()
+    };
+    let mut hook_warning = None;
+    let mut post_start = None;
+    if pending && setup.succeeded() {
+        let hooks = worktrunk_lifecycle::run_start_hooks(
+            &unpeel_core::app_paths::app_state_path(),
+            repository,
+            checkout,
+            branch,
+            base_ref,
+        );
+        if let Some(failure) = hooks.failure {
+            setup.failed = Some("pre-start".into());
+            setup.failed_reason = Some(failure);
+        }
+        hook_warning = hooks.warning;
+        post_start = hooks.post_start;
+    }
+    if pending && setup.succeeded() {
+        let _action = checkout_lifecycle::lock_checkout_actions()?;
+        journal
+            .mark_prepared(repository, checkout)
+            .map_err(|error| WorkersError::State(error.to_string()))?;
+    }
+    if let Some(hook) = post_start {
+        if let Err(error) = worktrunk_lifecycle::spawn_post_start(hook, checkout) {
+            hook_warning = Some(error);
+        }
+    }
+    drop(preparing);
+    Ok(ChatWorktreeCreation {
+        path: checkout.to_owned(),
+        branch: branch.to_owned(),
+        setup_failed_command: setup.failed,
+        setup_failed_reason: setup.failed_reason,
+        hook_warning,
+    })
+}
+
+/// Remove an app-owned Chat checkout after the same ownership, activity, hook
+/// and cleanliness checks used for a Worker checkout. The branch remains.
+pub fn remove_checkout_for_chat(
+    repository: &Path,
+    checkout: &Path,
+    root: &Path,
+    journal_path: &Path,
+) -> Result<(), WorkersError> {
+    let action = checkout_lifecycle::lock_checkout_actions()?;
+    let journal =
+        worktree_ownership::OwnershipJournal::at(journal_path.to_owned(), root.to_owned());
+    checkout_lifecycle::remove_checkout_under_lock(
+        &action,
+        &LocalWorkersClient::new(),
+        repository,
+        checkout,
+        &journal,
+        &unpeel_core::app_paths::app_state_path(),
+        false,
+    )
+}
+
+pub fn prune_missing_checkout_for_chat(
+    repository: &Path,
+    checkout: &Path,
+    root: &Path,
+    journal_path: &Path,
+) -> Result<(), WorkersError> {
+    let action = checkout_lifecycle::lock_checkout_actions()?;
+    let journal =
+        worktree_ownership::OwnershipJournal::at(journal_path.to_owned(), root.to_owned());
+    checkout_lifecycle::prune_missing_checkout_under_lock(&action, repository, checkout, &journal)
+}
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -475,6 +788,9 @@ pub struct WorkersWorktreeResult {
     /// qualquer forma — quem chamou decide se avisa.
     pub setup_failed_command: Option<String>,
     pub setup_failed_reason: Option<String>,
+    /// Advisory from a post hook. A pending/failed post hook does not roll
+    /// back an otherwise prepared checkout.
+    pub hook_warning: Option<String>,
     pub setup_commands_run: usize,
 }
 
@@ -491,12 +807,124 @@ fn ensure_setup_succeeded(worktree: &WorkersWorktreeResult) -> Result<(), Worker
     )))
 }
 
+/// A worktree whose blocking preparation failed stays on disk for recovery,
+/// but a direct launch must not bypass that failure by going straight to the
+/// Host. The ownership journal is authoritative for Comet-created checkouts;
+/// the app-state flag covers the narrow recovery window where the journal was
+/// cleared but persisting the completed setup result was interrupted.
+fn reject_pending_checkout_preparation(
+    launch: &WorkersLaunchRequest,
+    bootstrap: &WorkersBootstrap,
+) -> Result<(), WorkersError> {
+    let Some(project) = bootstrap
+        .projects
+        .iter()
+        .find(|project| project.id == launch.project_id)
+    else {
+        return Ok(());
+    };
+    if project.is_group {
+        return Ok(());
+    }
+
+    let state = unpeel_core::app_state::load_for_edit().map_err(WorkersError::State)?;
+    let raw_project = state
+        .get("projects")
+        .and_then(Value::as_array)
+        .and_then(|projects| projects.iter().find(|record| record["id"] == project.id));
+    let state_pending = raw_project
+        .and_then(|record| record.get("comet_setup_pending"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let checkout = Path::new(&project.path);
+    let journal_pending = if project.owns_worktree_checkout() {
+        let repository = project.repository_path.as_deref().ok_or_else(|| {
+            WorkersError::State(format!(
+                "Cannot verify preparation state for app-managed checkout; recoverable checkout project_id={} path={}",
+                project.id, project.path
+            ))
+        })?;
+        worktree_ownership::OwnershipJournal::for_current_user()
+            .and_then(|journal| journal.preparation_pending(Path::new(repository), checkout))
+            .map_err(|error| {
+                WorkersError::State(format!(
+                    "Cannot verify preparation state for app-managed checkout: {error}; recoverable checkout project_id={} path={}",
+                    project.id, project.path
+                ))
+            })?
+    } else {
+        false
+    };
+
+    if state_pending || journal_pending {
+        return Err(WorkersError::State(format!(
+            "Checkout preparation is pending; retry worktree creation for the same branch before launching. recoverable checkout project_id={} path={}",
+            project.id, project.path
+        )));
+    }
+    Ok(())
+}
+
+/// Keep the removal guard live across the detached Host's startup window. The
+/// launch RPC returns after the Host process was spawned, before that process
+/// necessarily wrote the manifest that bootstrap uses to expose a live Worker.
+/// Once the exact Session/checkout pair appears on disk, every later bootstrap
+/// can see it and the temporary reservation can be released.
+///
+/// Deliberately has no timeout: a missing manifest is not proof that the Host
+/// is dead, so releasing by elapsed time could let removal race a late start.
+/// If the Host exits without publishing a matching manifest, recovery is
+/// explicit because the checkout activity lease remains busy.
+fn release_starting_worker_after_manifest(
+    reservation: CheckoutActivityReservation,
+    session_id: String,
+    project_id: String,
+    checkout: PathBuf,
+) {
+    let retained = Arc::new(Mutex::new(Some(reservation)));
+    let worker_retained = Arc::clone(&retained);
+    let thread = std::thread::Builder::new()
+        .name("worker-start-confirmation".into())
+        .spawn(move || {
+            loop {
+                if let Some(manifest) = unpeel_core::session_host::load_manifest(&session_id) {
+                    let same_checkout = std::fs::canonicalize(&manifest.cwd).ok()
+                        == std::fs::canonicalize(&checkout).ok();
+                    if manifest.session.project_id == project_id && same_checkout {
+                        let mut held = worker_retained
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        drop(held.take());
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+    if let Err(error) = thread {
+        // spawn consumes and drops its closure on failure. Preserve the
+        // reservation explicitly; dropping it here would make the checkout
+        // removable even though the detached Host may still start.
+        if let Some(reservation) = retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            std::mem::forget(reservation);
+        }
+        unpeel_core::hook_assets::append_trace_log_line(&format!(
+            "Could not start Worker launch confirmation monitor: {error}; checkout activity remains blocked and requires explicit recovery"
+        ));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkersWorktreeLaunchResult {
     pub project_id: String,
     pub session_id: String,
     pub path: String,
     pub branch: String,
+    pub hook_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1146,6 +1574,8 @@ pub enum WorkersError {
     Protocol(String),
     #[error("Unpeel state operation failed: {0}")]
     State(String),
+    #[error("Chat checkout name is already taken: branch `{branch}`, path {}", .path.display())]
+    CheckoutNameTaken { branch: String, path: PathBuf },
     #[error("Invalid project directory {path}: {message}")]
     InvalidProject { path: String, message: String },
 }
@@ -1652,7 +2082,7 @@ impl LocalWorkersClient {
     }
 
     pub fn launch_session(&self, launch: &WorkersLaunchRequest) -> Result<String, WorkersError> {
-        let _checkout_action = checkout_lifecycle::lock_checkout_actions()?;
+        let checkout_action = checkout_lifecycle::lock_checkout_actions()?;
         // A pi-family launch resolves `--extension` under the legacy hook
         // root at spawn time; a missing asset means the session never emits
         // lifecycle events and stays visually idle forever. Best-effort:
@@ -1663,11 +2093,32 @@ impl LocalWorkersClient {
             ));
         }
         let bootstrap = self.bootstrap()?;
+        reject_pending_checkout_preparation(launch, &bootstrap)?;
         let launch = workspace_trust::prepare_launch_workspace_trust(
             launch,
             &bootstrap.projects,
             &bootstrap.presets,
         )?;
+        let starting_worker = bootstrap
+            .projects
+            .iter()
+            .find(|project| project.id == launch.project_id && project.owns_worktree_checkout())
+            .map(|project| {
+                let reservation = checkout_activity::reserve_operation_under_lock(
+                    &format!("start-worker-{}", uuid::Uuid::new_v4()),
+                    Path::new(&project.path),
+                    checkout_activity::ActivityKind::StartingWorker,
+                )?;
+                Ok::<_, WorkersError>((
+                    reservation,
+                    project.id.clone(),
+                    PathBuf::from(&project.path),
+                ))
+            })
+            .transpose()?;
+        // The durable StartingWorker reservation now protects the checkout
+        // while the controller spawns its detached Host process.
+        drop(checkout_action);
         let mut launch_body = launch.wire_body();
         if let (Some(body), Some((columns, rows))) =
             (launch_body.as_object_mut(), self.remembered_grid())
@@ -1677,6 +2128,14 @@ impl LocalWorkersClient {
         }
         let body = self.request("POST", "/mobile/sessions", Vec::new(), launch_body)?;
         let wire: CreatedSessionWire = serde_json::from_value(body)?;
+        if let Some((reservation, project_id, checkout)) = starting_worker {
+            release_starting_worker_after_manifest(
+                reservation,
+                wire.session_id.clone(),
+                project_id,
+                checkout,
+            );
+        }
         Ok(wire.session_id)
     }
 
@@ -2057,6 +2516,41 @@ impl LocalWorkersClient {
         Self::create_worktree_at(&unpeel_core::app_paths::app_state_path(), request)
     }
 
+    /// Inspect the exact project commands the user would approve in Settings.
+    pub fn worktrunk_hook_status(
+        &self,
+        project_id: &str,
+    ) -> Result<WorkersWorktrunkHooksSnapshot, WorkersError> {
+        worktrunk_approvals::status_at(&unpeel_core::app_paths::app_state_path(), project_id)
+            .map_err(WorkersError::State)
+    }
+
+    /// Device-local, fail-closed checkout activity query for Chat retarget and
+    /// physical removal. The caller must not hold the checkout action lock.
+    pub fn checkout_is_busy(&self, path: &Path) -> Result<bool, WorkersError> {
+        checkout_lifecycle::checkout_is_busy(self, path)
+    }
+
+    /// Approve only the command text that is still present on disk.
+    pub fn approve_worktrunk_hook(
+        &self,
+        project_id: &str,
+        hook_type: &str,
+        command_name: Option<&str>,
+        expected_command: &str,
+    ) -> Result<(), WorkersError> {
+        worktrunk_approvals::approve_at(
+            &unpeel_core::app_paths::app_state_path(),
+            project_id,
+            hook_type,
+            command_name,
+            expected_command,
+        )
+        .map_err(WorkersError::State)?;
+        unpeel_core::app_state::announce_app_state_changed();
+        Ok(())
+    }
+
     /// `create_worktree` contra um arquivo de estado explicito.
     ///
     /// Existe para que o teste possa provar a coisa que nenhum teste de
@@ -2068,10 +2562,41 @@ impl LocalWorkersClient {
         state_path: &Path,
         request: WorkersCreateWorktreeRequest,
     ) -> Result<WorkersWorktreeResult, WorkersError> {
+        Self::create_worktree_at_inner(state_path, request, false).map(|(result, _)| result)
+    }
+
+    fn create_worktree_at_inner(
+        state_path: &Path,
+        request: WorkersCreateWorktreeRequest,
+        hold_for_launch: bool,
+    ) -> Result<(WorkersWorktreeResult, Option<CheckoutActivityReservation>), WorkersError> {
         let branch = request.branch.trim();
         if branch.is_empty() {
             return Err(WorkersError::State("worktree branch is required".into()));
         }
+        let production = state_path == unpeel_core::app_paths::app_state_path();
+        let (root, journal) = if production {
+            (
+                worktree_ownership::canonical_root()
+                    .map_err(|error| WorkersError::State(error.to_string()))?,
+                worktree_ownership::OwnershipJournal::for_current_user()
+                    .map_err(|error| WorkersError::State(error.to_string()))?,
+            )
+        } else {
+            let home = state_path.parent().ok_or_else(|| {
+                WorkersError::State("isolated app state has no parent directory".into())
+            })?;
+            let root = home.join("worktrees");
+            let journal = worktree_ownership::OwnershipJournal::at(
+                home.join("worktree-ownership.json"),
+                root.clone(),
+            );
+            (root, journal)
+        };
+        // Serialize the state snapshot with checkout creation and registration.
+        // Otherwise two same-branch requests can both observe no project row
+        // and mint distinct IDs for the one Git worktree.
+        let action = checkout_lifecycle::lock_checkout_actions()?;
         let state =
             unpeel_core::app_state::load_for_edit_at(state_path).map_err(WorkersError::State)?;
         let projects = state
@@ -2087,24 +2612,42 @@ impl LocalWorkersClient {
         let parent_path = parent
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| WorkersError::State("parent project path is missing".into()))?;
-        // `worktrees::create` ADOPTS a checkout that is already there instead
-        // of failing (`worktrees.rs`, "Already there? Adopt it rather than
-        // failing"), and the `Worktree` it hands back carries no mark of who
-        // made it — `managed` only says "lives under the worktrees root".
-        // Asking git BEFORE is the only way to tell the two apart, and the
-        // rollback below force-removes, which on an adopted checkout would
-        // take the user's uncommitted work with it.
-        let known_before: Vec<String> = unpeel_core::worktrees::list(parent_path)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|worktree| worktree.path)
-            .collect();
-        let worktree =
-            unpeel_core::worktrees::create(parent_path, branch, request.base_ref.as_deref())
-                .map_err(WorkersError::State)?;
-        let adopted = known_before.contains(&worktree.path);
-        let project_id = format!("comet-worktree-{}", uuid::Uuid::new_v4().simple());
+            .ok_or_else(|| WorkersError::State("parent project path is missing".into()))?
+            .to_owned();
+        let worktree = checkout_lifecycle::create_checkout_under_lock(
+            &action,
+            Path::new(&parent_path),
+            branch,
+            branch,
+            request.base_ref.as_deref(),
+            &root,
+            &journal,
+        )?;
+        let path = worktree.path.to_string_lossy().into_owned();
+        let owned = journal
+            .verify_owned(Path::new(&parent_path), &worktree.path)
+            .map_err(|error| WorkersError::State(error.to_string()))?;
+        let existing = projects.iter().find(|project| {
+            project
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .as_deref()
+                == Some(worktree.path.as_path())
+        });
+        let project_id = existing
+            .and_then(|project| project.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("comet-worktree-{}", uuid::Uuid::new_v4().simple()));
+        let state_preparation_pending = existing
+            .and_then(|project| project.get("comet_setup_pending"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let journal_preparation_pending = owned
+            && journal
+                .preparation_pending(Path::new(&parent_path), &worktree.path)
+                .map_err(|error| WorkersError::State(error.to_string()))?;
+        let setup_pending = owned && (state_preparation_pending || journal_preparation_pending);
         let display_name = request
             .name
             .as_deref()
@@ -2112,67 +2655,142 @@ impl LocalWorkersClient {
             .filter(|name| !name.is_empty())
             .unwrap_or(branch)
             .to_owned();
-        let path = worktree.path.clone();
-        let mut identity_observation = project_identity::probe_checkout(Path::new(&path));
-        identity_observation.ownership = Some(if adopted {
-            project_identity::CheckoutOwnership::External
-        } else {
+        let mut identity_observation = project_identity::probe_checkout(&worktree.path);
+        identity_observation.ownership = Some(if owned {
             project_identity::CheckoutOwnership::AppManaged
+        } else {
+            project_identity::CheckoutOwnership::External
         });
-        let register = unpeel_core::app_state::edit_at(state_path, |state| {
-            let projects = state
-                .get_mut("projects")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| "projects must be an array".to_string())?;
-            projects.push(json!({
-                "id": project_id,
-                "name": display_name,
-                "path": path,
-                "workspace_id": "personal",
-                "sort_order": projects.len() as u32,
-                "parent_project_id": request.project_id,
-                "is_folder": true,
-                "worktree_branch": branch,
-            }));
-            record_in_ledger(state, &project_id, &path, &display_name).and_then(|_| {
-                project_identity::register_observation_in_state(
-                    state,
-                    &project_id,
-                    identity_observation.clone(),
-                )
-                .map(|_| ())
+        let register = if existing.is_some() {
+            Ok(())
+        } else {
+            unpeel_core::app_state::edit_at(state_path, |state| {
+                let projects = state
+                    .get_mut("projects")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| "projects must be an array".to_string())?;
+                projects.push(json!({
+                    "id": project_id,
+                    "name": display_name,
+                    "path": path,
+                    "workspace_id": "personal",
+                    "sort_order": projects.len() as u32,
+                    "parent_project_id": request.project_id,
+                    "is_folder": true,
+                    "worktree_branch": branch,
+                    "comet_setup_pending": setup_pending,
+                }));
+                record_in_ledger(state, &project_id, &path, &display_name).and_then(|_| {
+                    project_identity::register_observation_in_state(
+                        state,
+                        &project_id,
+                        identity_observation.clone(),
+                    )
+                    .map(|_| ())
+                })
             })
-        });
+        };
         if let Err(error) = register {
-            // Only undo what THIS call created. An adopted checkout predates
-            // us: it may hold months of uncommitted work, and rolling back a
-            // failed registration is no licence to delete it.
-            if !adopted {
-                let _ = unpeel_core::worktrees::remove(&worktree.path, true);
-            }
-            return Err(WorkersError::State(error));
+            // Registration can fail after Git has created a checkout. Keep it
+            // for diagnosis and recovery; a forced rollback can destroy files
+            // written by setup, another process, or a user in the meantime.
+            return Err(WorkersError::State(format!(
+                "Worktree {path} was created but project registration failed: {error}; checkout and branch were preserved"
+            )));
         }
-        if state_path == unpeel_core::app_paths::app_state_path() {
+        let preparing = if setup_pending {
+            if let Some(active) =
+                checkout_activity::busy_at(&checkout_activity::activity_file(), &worktree.path)
+                    .map_err(WorkersError::State)?
+            {
+                return Err(WorkersError::State(format!(
+                    "Checkout preparation is pending and activity {:?} is already using it; retry after that activity settles. recoverable checkout project_id={} path={}",
+                    active.kind, project_id, path
+                )));
+            }
+            Some(checkout_activity::reserve_operation_under_lock(
+                &format!("prepare-{}", uuid::Uuid::new_v4()),
+                &worktree.path,
+                checkout_activity::ActivityKind::Preparing,
+            )?)
+        } else {
+            None
+        };
+        let starting_worker = if hold_for_launch {
+            Some(checkout_activity::reserve_operation_under_lock(
+                &format!("start-worker-{}", uuid::Uuid::new_v4()),
+                &worktree.path,
+                checkout_activity::ActivityKind::StartingWorker,
+            )?)
+        } else {
+            None
+        };
+        drop(action);
+        if production && existing.is_none() {
             unpeel_core::app_state::announce_app_state_changed();
         }
-        // O setup do projeto roda AQUI, depois do registro: um worktree que
-        // existe mas nao foi registrado nao e um worktree, e o setup que
-        // falhasse antes disso deixaria a arvore orfa. Falha de setup NAO
-        // desfaz o worktree — o usuario prefere um checkout criado com um
-        // `bun install` quebrado a nenhum checkout, e o comando que quebrou
-        // vem nomeado no resultado.
-        let setup = worktree_config::run_setup_for_project(
-            Path::new(&worktree.path),
-            Path::new(parent_path),
-        );
-        Ok(WorkersWorktreeResult {
-            project_id,
-            path: worktree.path,
-            branch: branch.to_owned(),
-            setup_failed_command: setup.failed,
-            setup_failed_reason: setup.failed_reason,
-            setup_commands_run: setup.commands_run,
-        })
+        let mut setup = if setup_pending {
+            worktree_config::run_setup_for_project(&worktree.path, Path::new(&parent_path))
+        } else {
+            worktree_config::SetupOutcome::default()
+        };
+        let mut hook_warning = None;
+        let mut post_start = None;
+        if setup_pending && setup.succeeded() {
+            let hooks = worktrunk_lifecycle::run_start_hooks(
+                state_path,
+                Path::new(&parent_path),
+                &worktree.path,
+                branch,
+                request.base_ref.as_deref(),
+            );
+            if let Some(failure) = hooks.failure {
+                setup.failed = Some("pre-start".into());
+                setup.failed_reason = Some(failure);
+            }
+            hook_warning = hooks.warning;
+            post_start = hooks.post_start;
+        }
+        if setup_pending && setup.succeeded() {
+            let _finish = checkout_lifecycle::lock_checkout_actions()?;
+            journal
+                .mark_prepared(Path::new(&parent_path), &worktree.path)
+                .map_err(|error| WorkersError::State(error.to_string()))?;
+        }
+        if let Some(hook) = post_start {
+            if let Err(error) = worktrunk_lifecycle::spawn_post_start(hook, &worktree.path) {
+                hook_warning = Some(error);
+            }
+        }
+        if setup_pending {
+            unpeel_core::app_state::edit_at(state_path, |state| {
+                let project = state
+                    .get_mut("projects")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|projects| {
+                        projects
+                            .iter_mut()
+                            .find(|project| project["id"] == project_id)
+                    })
+                    .ok_or_else(|| "checkout registration disappeared during setup".to_owned())?;
+                project["comet_setup_pending"] = json!(!setup.succeeded());
+                Ok(())
+            })
+            .map_err(WorkersError::State)?;
+        }
+        drop(preparing);
+        Ok((
+            WorkersWorktreeResult {
+                project_id,
+                path,
+                branch: branch.to_owned(),
+                setup_failed_command: setup.failed,
+                setup_failed_reason: setup.failed_reason,
+                hook_warning,
+                setup_commands_run: setup.commands_run,
+            },
+            starting_worker,
+        ))
     }
 
     pub fn create_worktree_and_launch(
@@ -2180,23 +2798,38 @@ impl LocalWorkersClient {
         request: WorkersCreateWorktreeRequest,
         mut launch: WorkersLaunchRequest,
     ) -> Result<WorkersWorktreeLaunchResult, WorkersError> {
-        let worktree = self.create_worktree(request)?;
-        ensure_setup_succeeded(&worktree)?;
+        let (worktree, starting_worker) = Self::create_worktree_at_inner(
+            &unpeel_core::app_paths::app_state_path(),
+            request,
+            true,
+        )?;
+        if let Err(error) = ensure_setup_succeeded(&worktree) {
+            return Err(WorkersError::State(format!(
+                "{error}; recoverable checkout project_id={} path={}",
+                worktree.project_id, worktree.path
+            )));
+        }
         launch.project_id = worktree.project_id.clone();
         launch.worktree_path = Some(worktree.path.clone());
         launch.worktree_branch = Some(worktree.branch.clone());
-        match self.launch_session(&launch) {
+        let launched = self.launch_session(&launch);
+        drop(starting_worker);
+        match launched {
             Ok(session_id) => Ok(WorkersWorktreeLaunchResult {
                 project_id: worktree.project_id,
                 session_id,
                 path: worktree.path,
                 branch: worktree.branch,
+                hook_warning: worktree.hook_warning,
             }),
             // Falha de launch NAO desfaz o worktree, pela mesma razao que
             // falha de setup nao desfaz (ver `create_worktree` acima): o
             // checkout ja existe, ja foi registrado, e apaga-lo com `force`
             // por causa de um preset invalido perde trabalho do usuario.
-            Err(error) => Err(error),
+            Err(error) => Err(WorkersError::State(format!(
+                "{error}; recoverable checkout project_id={} path={}",
+                worktree.project_id, worktree.path
+            ))),
         }
     }
 
@@ -2299,7 +2932,13 @@ impl LocalWorkersClient {
     }
 
     pub fn remove_worktree(&self, project_id: &str, _force: bool) -> Result<(), WorkersError> {
-        checkout_lifecycle::remove_owned_checkout(self, project_id)
+        checkout_lifecycle::remove_owned_checkout(self, project_id, false)
+    }
+
+    /// Explicit operator override for project hooks only. Ownership, activity,
+    /// Git identity and clean-tree checks are identical to normal removal.
+    pub fn remove_worktree_without_hooks(&self, project_id: &str) -> Result<(), WorkersError> {
+        checkout_lifecycle::remove_owned_checkout(self, project_id, true)
     }
 
     pub fn remove_group(&self, project_id: &str) -> Result<(), WorkersError> {
@@ -4204,10 +4843,8 @@ mod worktree_setup_wiring_tests {
 
     struct Fixture {
         dir: PathBuf,
-        /// `unpeel_core::worktrees::create` escreve em `~/.unpeel/worktrees/`,
-        /// que o state path injetado NAO redireciona. Sem guardar o que foi
-        /// criado, rodar a suite suja a maquina do usuario — e sujou, 16 vezes,
-        /// antes disto existir.
+        /// Guarde os caminhos criados para removê-los no `Drop`, inclusive
+        /// quando a asserção falhar durante o teste.
         created: std::cell::RefCell<Vec<PathBuf>>,
     }
 
@@ -4284,12 +4921,17 @@ mod worktree_setup_wiring_tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            for path in self.created.borrow().iter() {
-                let _ = unpeel_core::worktrees::remove(path.to_str().unwrap_or_default(), true);
+            let mut created = self.created.borrow().clone();
+            created.sort();
+            created.dedup();
+            for path in &created {
+                let _ = Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(path)
+                    .current_dir(self.repo())
+                    .status();
                 let _ = std::fs::remove_dir_all(path);
-                // O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o
-                // ramo deixa o diretorio do repo vazio para tras, e a contagem
-                // em `~/.unpeel/worktrees/` cresce a cada rodada da suite.
+                // O diretório do repositório fica vazio depois da remoção.
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::remove_dir(parent);
                 }
@@ -4326,6 +4968,257 @@ mod worktree_setup_wiring_tests {
             std::fs::read_to_string(worktree.join("raiz.txt")).unwrap(),
             fixture.repo().to_str().unwrap(),
             "ROOT_WORKTREE_PATH tem que apontar para o checkout principal"
+        );
+    }
+
+    #[test]
+    fn pending_worktrunk_hook_retries_on_the_same_checkout_after_approval() {
+        let fixture = Fixture::new(None);
+        let config = fixture.repo().join(".config/wt.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "pre-start = \"printf ready > hook-ready.txt\"\n").unwrap();
+
+        let first = fixture.create().unwrap();
+        assert_eq!(first.setup_failed_command.as_deref(), Some("pre-start"));
+        assert!(
+            first
+                .setup_failed_reason
+                .as_deref()
+                .unwrap()
+                .contains("pending approval")
+        );
+        assert!(!Path::new(&first.path).join("hook-ready.txt").exists());
+        worktrunk_approvals::approve_at(
+            &fixture.state(),
+            "comet-parent",
+            "pre-start",
+            None,
+            "printf ready > hook-ready.txt",
+        )
+        .unwrap();
+        let second = fixture.create().unwrap();
+        assert_eq!(second.path, first.path);
+        assert!(second.setup_failed_command.is_none(), "{second:?}");
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&second.path).join("hook-ready.txt")).unwrap(),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn chat_preparation_retries_in_the_same_checkout_and_runs_once_after_success() {
+        let fixture = Fixture::new(Some(
+            r#"{"setup-worktree":"test -f \"$ROOT_WORKTREE_PATH/allow\" && printf x >> prepared.txt"}"#,
+        ));
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let created =
+            create_checkout_for_chat(&fixture.repo(), "zeron/blue-river", None, &root, &journal)
+                .unwrap();
+        assert!(created.setup_failed_command.is_some());
+        assert!(!created.path.join("prepared.txt").exists());
+        std::fs::write(fixture.repo().join("allow"), "ok").unwrap();
+        let retried =
+            prepare_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal).unwrap();
+        assert_eq!(retried.path, created.path);
+        assert!(retried.setup_failed_command.is_none());
+        assert_eq!(
+            std::fs::read_to_string(created.path.join("prepared.txt")).unwrap(),
+            "x"
+        );
+        prepare_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(created.path.join("prepared.txt")).unwrap(),
+            "x"
+        );
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&created.path)
+            .current_dir(fixture.repo())
+            .status();
+    }
+
+    #[test]
+    fn pending_chat_preparation_reservation_blocks_a_second_retry() {
+        let fixture = Fixture::new(Some(
+            r#"{"setup-worktree":"test -f \"$ROOT_WORKTREE_PATH/allow\" && printf x >> prepared.txt"}"#,
+        ));
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let created = create_checkout_for_chat(
+            &fixture.repo(),
+            "zeron/retry-reservation",
+            None,
+            &root,
+            &journal,
+        )
+        .unwrap();
+        fixture.created.borrow_mut().push(created.path.clone());
+        assert!(created.setup_failed_command.is_some());
+        std::fs::write(fixture.repo().join("allow"), "ok").unwrap();
+
+        // Model the interleaving after the first retry reserves Preparing but
+        // before its setup finishes. This directly exercises the durable guard
+        // without depending on OS thread scheduling under the parallel suite.
+        let first_retry = checkout_activity::reserve_operation(
+            "test-chat-retry-in-progress",
+            &created.path,
+            checkout_activity::ActivityKind::Preparing,
+        )
+        .unwrap();
+        let second_error =
+            match prepare_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal) {
+                Ok(_) => panic!("a second retry must not run while preparation is active"),
+                Err(error) => error,
+            };
+        assert!(
+            second_error.to_string().contains("already pending"),
+            "{second_error}"
+        );
+        assert!(
+            second_error
+                .to_string()
+                .contains(&created.path.to_string_lossy().to_string()),
+            "{second_error}"
+        );
+        assert!(
+            !created.path.join("prepared.txt").exists(),
+            "the rejected retry must not execute setup"
+        );
+        drop(first_retry);
+    }
+
+    #[test]
+    fn new_chat_checkout_refuses_existing_branch_or_destination() {
+        let fixture = Fixture::new(None);
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let branch = "zeron/taken-branch";
+        assert!(
+            Command::new("git")
+                .args(["branch", branch])
+                .current_dir(fixture.repo())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let branch_collision =
+            create_new_checkout_for_chat_unprepared(&fixture.repo(), branch, None, &root, &journal)
+                .err()
+                .expect("an existing branch must be reported as a collision");
+        assert!(matches!(
+            branch_collision,
+            WorkersError::CheckoutNameTaken { branch: ref found, .. } if found == branch
+        ));
+        if let WorkersError::CheckoutNameTaken { path, .. } = branch_collision {
+            assert!(
+                !path.exists(),
+                "branch collision must not create a checkout"
+            );
+        }
+
+        let branch = "zeron/taken-path";
+        let target =
+            worktree_ownership::worktree_path(&root, &fixture.repo(), "taken-path").unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "existing").unwrap();
+        let path_collision =
+            create_new_checkout_for_chat_unprepared(&fixture.repo(), branch, None, &root, &journal)
+                .err()
+                .expect("an occupied destination must be reported as a collision");
+        assert!(matches!(
+            path_collision,
+            WorkersError::CheckoutNameTaken {
+                branch: ref found,
+                ref path,
+            }
+                if found == branch && path == &target
+        ));
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "existing",
+            "a collision must not adopt or change the existing directory"
+        );
+    }
+
+    #[test]
+    fn unprepared_chat_checkout_holds_removal_guard_until_finish() {
+        let fixture = Fixture::new(Some(
+            r#"{"setup-worktree":"printf ready > chat-ready.txt"}"#,
+        ));
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let pending = create_checkout_for_chat_unprepared(
+            &fixture.repo(),
+            "zeron/persist-before-setup",
+            None,
+            &root,
+            &journal,
+        )
+        .unwrap();
+        fixture.created.borrow_mut().push(pending.path.clone());
+        assert_eq!(pending.branch, "zeron/persist-before-setup");
+        assert!(!pending.path.join("chat-ready.txt").exists());
+
+        let duplicate = create_checkout_for_chat_unprepared(
+            &fixture.repo(),
+            "zeron/persist-before-setup",
+            None,
+            &root,
+            &journal,
+        );
+        let duplicate = match duplicate {
+            Ok(_) => panic!("a second request must not run setup concurrently"),
+            Err(error) => error,
+        };
+        assert!(
+            duplicate.to_string().contains("already pending"),
+            "{duplicate}"
+        );
+        assert!(
+            duplicate
+                .to_string()
+                .contains(&pending.path.to_string_lossy().to_string())
+        );
+
+        let remove = remove_checkout_for_chat(&fixture.repo(), &pending.path, &root, &journal)
+            .expect_err("removal must be blocked while cwd persistence/setup is pending");
+        assert!(
+            remove.to_string().contains("Stop active Chats and Workers"),
+            "{remove}"
+        );
+        assert!(pending.path.is_dir());
+
+        let created = pending
+            .finish()
+            .expect("setup completes after cwd is persisted");
+        assert!(created.setup_failed_command.is_none());
+        assert_eq!(
+            std::fs::read_to_string(created.path.join("chat-ready.txt")).unwrap(),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn missing_owned_chat_checkout_prunes_only_git_registration() {
+        let fixture = Fixture::new(None);
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let created =
+            create_checkout_for_chat(&fixture.repo(), "zeron/missing-leaf", None, &root, &journal)
+                .unwrap();
+        std::fs::remove_dir_all(&created.path).unwrap();
+        prune_missing_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal).unwrap();
+        let branch = Command::new("git")
+            .args(["show-ref", "--verify", "refs/heads/zeron/missing-leaf"])
+            .current_dir(fixture.repo())
+            .status()
+            .unwrap();
+        assert!(branch.success(), "pruning must preserve the branch");
+        assert!(
+            prune_missing_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal)
+                .is_err()
         );
     }
 

@@ -1059,6 +1059,13 @@ async fn target_device_id_routes_over_the_relay() {
         )
         .await
         .expect("close remote setup terminal");
+    // The Action deliberately wrote these untracked files. The shared
+    // lifecycle refuses dirty worktrees, including over the relay, so clean
+    // only the fixture's own output before exercising successful deletion.
+    for marker in ["action-marker", "setup-marker"] {
+        std::fs::remove_file(setup_worktree.join(marker))
+            .expect("remove remote setup fixture marker");
+    }
     client
         .call(
             methods::DELETE_WORKTREE,

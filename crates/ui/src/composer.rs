@@ -10032,7 +10032,7 @@ impl Composer {
                                 "repoPath": repo_path,
                                 "branch": base,
                             }),
-                            Duration::from_secs(150),
+                            Duration::from_secs(1800),
                         )
                         .await?;
                         if let (Some(repo_path), Some(path)) = (
