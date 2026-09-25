@@ -22,8 +22,9 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
                                           └─ Workspace registry room ────┘
 ```
 
-- **Engine = backend** (was `@zeron/backend`): runs agents, owns auth, terminals, repos/worktrees,
-  diff sync, doc hosting. Pure Rust daemon, fully functional headless.
+- **Engine = backend** (was `@zeron/backend`): runs agents, owns auth, terminals, repository RPCs,
+  diff sync and doc hosting. Worktree creation, preparation and removal delegate to the shared
+  device-local service in `crates/workers-unpeel`. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC
   whether the engine is in-process or a separate daemon. Organized around **spaces** —
   (device, folder) pairs, local or synced according to the active profile. The sidebar is the
@@ -255,7 +256,9 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
   permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
   `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches zeron, avoids libgit2 edge
-  cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
+  cases); new Chat and Worker worktrees share `~/.zeron/worktrees/<repo-slug>-<hash>/`, with
+  device-local proof of app ownership and activity guards in `workers-unpeel`; fs watchers
+  (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff
   sidecar.
 - **Agent accounts**: credential-slot swap (macOS keeps both a Keychain item and a credentials

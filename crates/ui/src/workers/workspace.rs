@@ -1248,6 +1248,83 @@ impl WorkersSidebar {
                 )
                 .into_any_element();
         }
+        if self
+            .model
+            .read(cx)
+            .confirming_remove_project_without_hooks
+            .as_ref()
+            .is_some_and(|candidate| candidate.id == project.id)
+        {
+            return div()
+                .id(("workers-project-remove-without-hooks-confirm", index))
+                .w_full()
+                .px(px(9.0))
+                .py(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .rounded(px(9.0))
+                .bg(crate::theme::ink(0.10))
+                .text_size(px(SIDEBAR_LABEL_SIZE))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child("Remove worktree without hooks?")
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(theme.warning)
+                        .child("Configured pre-remove and post-remove hooks will not run. Ownership, activity, Git identity, and clean-tree checks still apply."),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .child(div().flex_1().min_w(px(4.0)))
+                        .child(
+                            div()
+                                .id(("workers-project-remove-without-hooks-cancel", index))
+                                .h(px(22.0))
+                                .px(px(8.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .bg(crate::theme::ink(0.06))
+                                .hover(|el| el.bg(crate::theme::ink(0.10)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.model
+                                        .update(cx, |model, cx| model.cancel_remove_project(cx));
+                                }))
+                                .child("Cancel"),
+                        )
+                        .child(
+                            div()
+                                .id(("workers-project-remove-without-hooks-confirm-button", index))
+                                .h(px(22.0))
+                                .px(px(8.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(theme.danger)
+                                .bg(theme.danger.opacity(0.15))
+                                .hover(|el| el.bg(theme.danger.opacity(0.25)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.model.update(cx, |model, cx| {
+                                        model.confirm_remove_project_without_hooks(cx)
+                                    });
+                                }))
+                                .child("Remove, skip hooks"),
+                        ),
+                )
+                .into_any_element();
+        }
         let new_session_project = project.clone();
         let new_session_presets = presets.clone();
         let select_project_id = project.id.clone();
@@ -3202,6 +3279,7 @@ impl WorkersContent {
                 ProjectMenuItem::ArchiveCheckout => "Archive checkout",
                 ProjectMenuItem::RestoreCheckout => "Restore checkout",
                 ProjectMenuItem::RemoveWorktree => "Remove worktree",
+                ProjectMenuItem::RemoveWorktreeWithoutHooks => "Remove worktree without hooks…",
                 ProjectMenuItem::RemoveGroup => "Remove group",
                 ProjectMenuItem::RemoveProject => "Remove project",
             };
@@ -3218,12 +3296,14 @@ impl WorkersContent {
                 ProjectMenuItem::RestoreCheckout => icons::ARCHIVE_UP_MINIMALISTIC,
                 ProjectMenuItem::RevealInFinder | ProjectMenuItem::OpenInEditor => icons::FOLDER,
                 ProjectMenuItem::RemoveWorktree
+                | ProjectMenuItem::RemoveWorktreeWithoutHooks
                 | ProjectMenuItem::RemoveGroup
                 | ProjectMenuItem::RemoveProject => icons::TRASH_BIN_MINIMALISTIC,
             };
             let destructive = matches!(
                 item,
                 ProjectMenuItem::RemoveWorktree
+                    | ProjectMenuItem::RemoveWorktreeWithoutHooks
                     | ProjectMenuItem::RemoveGroup
                     | ProjectMenuItem::RemoveProject
             );
@@ -3304,6 +3384,11 @@ impl WorkersContent {
                         | ProjectMenuItem::RemoveProject => this.model.update(cx, |model, cx| {
                             model.request_remove_project(menu_project.clone(), cx)
                         }),
+                        ProjectMenuItem::RemoveWorktreeWithoutHooks => {
+                            this.model.update(cx, |model, cx| {
+                                model.request_remove_project_without_hooks(menu_project.clone(), cx)
+                            })
+                        }
                         ProjectMenuItem::NewSession | ProjectMenuItem::FolderColor => {}
                     }
                 }))
@@ -4641,6 +4726,7 @@ impl Render for WorkersContent {
         let (
             loading,
             error,
+            action_notice,
             snapshot,
             busy,
             selected_session,
@@ -4657,6 +4743,7 @@ impl Render for WorkersContent {
             (
                 model.loading,
                 model.error.clone(),
+                model.action_notice.clone(),
                 model.snapshot.clone(),
                 model.action_in_flight(),
                 model.selected_session().cloned(),
@@ -4817,6 +4904,37 @@ impl Render for WorkersContent {
                     )
                 },
             )
+            .when_some(action_notice, |el, notice| {
+                el.child(
+                    div()
+                        .id("workers-worktree-hook-warning")
+                        .mx(px(12.0))
+                        .mt(px(8.0))
+                        .p(px(9.0))
+                        .flex()
+                        .items_start()
+                        .gap(px(8.0))
+                        .rounded(px(8.0))
+                        .bg(theme.warning.opacity(0.08))
+                        .text_size(px(10.5))
+                        .text_color(theme.warning)
+                        .child(icon(icons::INFO_CIRCLE).size(px(13.0)))
+                        .child(div().flex_1().min_w_0().child(notice))
+                        .child(
+                            div()
+                                .id("workers-worktree-hook-warning-dismiss")
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.model
+                                        .update(cx, |model, cx| model.dismiss_action_notice(cx));
+                                }))
+                                .child("Dismiss"),
+                        ),
+                )
+            })
             .child(workers_content_outlet().child(content));
 
         div()

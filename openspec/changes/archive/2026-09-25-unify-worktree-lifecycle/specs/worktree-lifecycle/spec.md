@@ -90,11 +90,11 @@ estado device-local consultado pelo serviço, sem depender de uma lista opcional
 Se a atividade local não puder ser verificada com segurança, a remoção SHALL ser recusada; expiração
 de heartbeat sozinha SHALL NOT provar que a execução acabou.
 
-#### Scenario: Chat ativo bloqueia controller e UI
-Test: integration — `project_actions` e `controller_mcp` com Chat `Working` no checkout.
+#### Scenario: Chat ativo bloqueia remoção Workers
+Test: integration — `project_actions` com Chat `Working` no checkout; UI chama o mesmo cliente.
 
-- **WHEN** a UI ou o controller pede remoção enquanto esse Chat trabalha
-- **THEN** ambos recusam a operação e a pasta permanece
+- **WHEN** o cliente Workers pede remoção enquanto esse Chat trabalha
+- **THEN** a operação é recusada e a pasta permanece
 
 #### Scenario: Worker vivo bloqueia DeleteWorktree
 Test: integration — `DeleteWorktree` com Worker vivo no mesmo checkout.
@@ -122,7 +122,10 @@ string, tabela concorrente ou pipeline ordenado. O subconjunto de templates supo
 `branch`, `worktree_path`, `worktree_name`, `repo`, `repo_path`, `primary_worktree_path`, `commit`,
 `short_commit`, `base`, `default_branch`, `hook_type`, `cwd` e `sanitize`. Um token ou sintaxe fora
 desse conjunto SHALL produzir erro que o identifique antes de executar qualquer comando daquele
-hook. Um `pre-*` aprovado SHALL bloquear a operação e sua falha SHALL abortar run/launch ou
+hook. Para evitar interpolação sem escape, comandos com template e continuação de linha por
+backslash,
+here-doc, expansão shell aninhada ou aspas ANSI SHALL ser recusados antes de executar qualquer etapa.
+Um `pre-*` aprovado SHALL bloquear a operação e sua falha SHALL abortar run/launch ou
 remoção, preservando o checkout. `post-*` aprovado SHALL rodar em segundo plano, com log. O ciclo
 nativo SHALL funcionar sem binário `wt`; um hook que invoca `wt` depende dele.
 

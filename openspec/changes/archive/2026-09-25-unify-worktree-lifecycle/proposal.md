@@ -33,7 +33,7 @@ binário `wt` nem exige sua instalação para o ciclo nativo.
   mudanças locais, sem `--force` e sem fallback recursivo. A branch local é preservada em todos os
   casos nesta change. O serviço conserva o histórico do projeto Workers.
 - O estado de execução local de Chats e Workers é consultado pelo serviço em **todas** as entradas
-  de remoção, inclusive controller MCP e RPC, sob a mesma coordenação de criação/launch/remoção.
+  de remoção, inclusive cliente Workers e RPC, sob a mesma coordenação de criação/launch/remoção.
   Retarget local para um checkout com Worker vivo é recusado.
 - O Comet lê os hooks de projeto `pre-start`, `post-start`, `pre-remove` e `post-remove` de
   `.config/wt.toml`: formatos string, tabela e pipeline, com um subconjunto explícito de templates.
@@ -53,7 +53,9 @@ binário `wt` nem exige sua instalação para o ciclo nativo.
   hooks de usuário de `~/.config/worktrunk/config.toml`.
 - O parser aceita os três **formatos** de hook, mas só as variáveis e filtros listados na spec.
   Jinja condicionais, `vars.*`, funções, aliases e demais filtros do `wt` não são compatíveis nesta
-  etapa. Um hook que os use é recusado com o token identificado.
+  etapa. Comandos com templates em here-doc, expansão shell aninhada, aspas ANSI ou continuação
+  de linha por backslash também são recusados antes de executar. Um hook que use sintaxe fora do
+  subconjunto é recusado com o token identificado.
 - Hooks são comandos shell como no `wt`; um comando que invoca `wt` precisa que esse binário esteja
   instalado. O ciclo nativo do Comet e os hooks sem essa chamada não precisam dele.
 - `.worktreeinclude` e `wt step copy-ignored` **não** acionam cópia automática no Comet nesta

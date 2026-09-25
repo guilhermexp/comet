@@ -246,8 +246,8 @@ rpc_methods! {
     DELETE_WORKSPACE_ENTRY / DeleteWorkspaceEntry = "DeleteWorkspaceEntry" { params: zeron_proto::DeleteWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true },
     MOVE_WORKSPACE_ENTRY / MoveWorkspaceEntry = "MoveWorkspaceEntry" { params: zeron_proto::MoveWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true, deadline_secs: 60 },
     COPY_WORKSPACE_ENTRY / CopyWorkspaceEntry = "CopyWorkspaceEntry" { params: zeron_proto::CopyWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true, deadline_secs: 60 },
-    CREATE_WORKTREE / CreateWorktree = "CreateWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 120 },
-    DELETE_WORKTREE / DeleteWorktree = "DeleteWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    CREATE_WORKTREE / CreateWorktree = "CreateWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 1800 },
+    DELETE_WORKTREE / DeleteWorktree = "DeleteWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 1800 },
     // Terminals (ControlRpc, relay-forwardable — a terminal lives on the chat's
     // host device; SubscribeTerminal streams).
     OPEN_TERMINAL / OpenTerminal = "OpenTerminal" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },

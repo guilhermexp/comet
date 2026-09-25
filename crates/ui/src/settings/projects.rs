@@ -24,7 +24,9 @@ use std::sync::Arc;
 use zeron_workers_unpeel::project_git::{self, ProjectGitStatus, Visibility};
 use zeron_workers_unpeel::project_ledger;
 use zeron_workers_unpeel::worktree_config::{self, ConfigTarget, WorktreeConfig};
-use zeron_workers_unpeel::{AnchorCommit, LocalWorkersClient, ProjectRow, RepositoryIdentity};
+use zeron_workers_unpeel::{
+    AnchorCommit, LocalWorkersClient, ProjectRow, RepositoryIdentity, WorkersWorktrunkHooksSnapshot,
+};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::settings::widgets;
@@ -345,6 +347,42 @@ struct Detail {
     config: WorktreeConfig,
     config_target: ConfigTarget,
     cursor_available: bool,
+    worktrunk_hooks: Option<WorkersWorktrunkHooksSnapshot>,
+    worktrunk_hook_source_exists: bool,
+    worktrunk_hooks_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktrunkHookPresentation {
+    label: String,
+    status: &'static str,
+    needs_approval: bool,
+    command: String,
+}
+
+fn project_worktrunk_hook_command(
+    command: &zeron_workers_unpeel::WorkersWorktrunkHookCommand,
+) -> WorktrunkHookPresentation {
+    let label = command
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("{} · {name}", command.hook_type))
+        .unwrap_or_else(|| command.hook_type.clone());
+    WorktrunkHookPresentation {
+        label,
+        status: if command.approved {
+            "Approved"
+        } else {
+            "Approval required"
+        },
+        needs_approval: !command.approved,
+        command: command.command.clone(),
+    }
+}
+
+fn should_show_worktrunk_hooks(source_exists: bool, command_count: usize, has_error: bool) -> bool {
+    source_exists || command_count > 0 || has_error
 }
 
 pub struct ProjectsPage {
@@ -532,6 +570,8 @@ impl ProjectsPage {
         let opened = row.last_opened_at_unix_ms;
         let selected_path = row.path.clone();
         let detail_path = selected_path.clone();
+        let project_id = row.project_id.clone();
+        let client = self.client.clone();
         self.detail_task = Some(cx.spawn(async move |this, cx| {
             let resolved = cx
                 .background_executor()
@@ -541,6 +581,17 @@ impl ProjectsPage {
                     let git = project_git::status(&folder);
                     let detected = worktree_config::detect(&folder);
                     let available = worktree_config::available_targets(&folder);
+                    let (worktrunk_hooks, worktrunk_hook_source_exists, worktrunk_hooks_error) =
+                        match project_id.as_deref() {
+                            Some(project_id) => match client.worktrunk_hook_status(project_id) {
+                                Ok(snapshot) => {
+                                    let source_exists = Path::new(&snapshot.source_path).is_file();
+                                    (Some(snapshot), source_exists, None)
+                                }
+                                Err(error) => (None, false, Some(error.to_string())),
+                            },
+                            None => (None, false, None),
+                        };
                     Detail {
                         added_commit: project_git::commit_at(&folder, added),
                         opened_commit: project_git::commit_at(&folder, opened),
@@ -558,6 +609,9 @@ impl ProjectsPage {
                             .unwrap_or(false),
                         folder_exists: exists,
                         git,
+                        worktrunk_hooks,
+                        worktrunk_hook_source_exists,
+                        worktrunk_hooks_error,
                     }
                 })
                 .await;
@@ -1174,6 +1228,13 @@ impl ProjectsPage {
                     .child(self.render_config(theme, &detail, filesystem_available, cx))
                     .child(section_header(theme, "Worktree"))
                     .child(self.render_worktree(theme, &row, &detail, runnable, cx))
+                    .when_some(
+                        self.render_worktrunk_hooks(theme, &row, &detail, cx),
+                        |el, card| {
+                            el.child(section_header(theme, "Worktrunk Hooks"))
+                                .child(card)
+                        },
+                    )
                     .child(section_header(theme, "Auto Doc"))
                     .child(self.render_auto_doc(theme, &row, &detail, runnable, cx))
                     .child(section_header(theme, "Danger Zone"))
@@ -1677,6 +1738,157 @@ impl ProjectsPage {
         card.into_any_element()
     }
 
+    fn render_worktrunk_hooks(
+        &mut self,
+        theme: &Theme,
+        row: &ProjectRow,
+        detail: &Detail,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if let Some(error) = detail.worktrunk_hooks_error.as_deref() {
+            return Some(
+                widgets::section_card(theme)
+                    .child(
+                        stacked_row(theme, true)
+                            .child(label_block_wrapped(
+                                theme,
+                                "Could not inspect hooks",
+                                "The project hook file could not be read or parsed.",
+                            ))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_size(px(12.0))
+                                    .line_height(px(17.0))
+                                    .text_color(theme.danger)
+                                    .child(SharedString::from(error.to_owned())),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let hooks = detail.worktrunk_hooks.as_ref()?;
+        if !should_show_worktrunk_hooks(
+            detail.worktrunk_hook_source_exists,
+            hooks.commands.len(),
+            false,
+        ) {
+            return None;
+        }
+
+        let mut card = widgets::section_card(theme).child(
+            stacked_row(theme, true)
+                .child(label_block_wrapped(
+                    theme,
+                    "Source file",
+                    "Pending pre-hooks block; pending post-hooks are skipped with a warning.",
+                ))
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(12.0))
+                        .line_height(px(17.0))
+                        .font_family(theme.font_mono.clone())
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(hooks.source_path.clone())),
+                ),
+        );
+
+        if hooks.commands.is_empty() {
+            card = card.child(quiet(
+                theme,
+                "No supported lifecycle hooks are configured in this file.",
+            ));
+            return Some(card.into_any_element());
+        }
+
+        let project_id = row.project_id.clone();
+        for (index, command) in hooks.commands.iter().enumerate() {
+            let presentation = project_worktrunk_hook_command(command);
+            let needs_approval = presentation.needs_approval;
+            let mut command_row = stacked_row(theme, false).child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(presentation.label.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.5))
+                            .text_color(if needs_approval {
+                                theme.warning
+                            } else {
+                                theme.success
+                            })
+                            .child(SharedString::from(presentation.status)),
+                    ),
+            );
+            command_row = command_row.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(6.0))
+                    .bg(ink(0.04))
+                    .text_size(px(11.5))
+                    .line_height(px(16.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_color(theme.text)
+                    .child(SharedString::from(presentation.command)),
+            );
+
+            if needs_approval {
+                if let Some(project_id) = project_id.clone() {
+                    let hook_type = command.hook_type.clone();
+                    let command_name = command.name.clone();
+                    let expected_command = command.command.clone();
+                    command_row = command_row.child(action_button_with_id(
+                        theme,
+                        format!("worktrunk-hook-approve-{index}"),
+                        "Approve",
+                        cx.listener(move |page, _, _, cx| {
+                            let project_id = project_id.clone();
+                            let hook_type = hook_type.clone();
+                            let command_name = command_name.clone();
+                            let expected_command = expected_command.clone();
+                            page.run_action(
+                                cx,
+                                move |client| {
+                                    client
+                                        .approve_worktrunk_hook(
+                                            &project_id,
+                                            &hook_type,
+                                            command_name.as_deref(),
+                                            &expected_command,
+                                        )
+                                        .map_err(|error| error.to_string())
+                                },
+                                "Worktrunk hook approved",
+                            );
+                        }),
+                    ));
+                }
+            }
+            card = card.child(command_row);
+        }
+
+        Some(card.into_any_element())
+    }
+
     fn render_auto_doc(
         &mut self,
         theme: &Theme,
@@ -2114,8 +2326,17 @@ fn action_button(
     label: &str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
+    action_button_with_id(theme, format!("action-{label}"), label, on_click)
+}
+
+fn action_button_with_id(
+    theme: &Theme,
+    id: String,
+    label: &str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
     div()
-        .id(SharedString::from(format!("action-{label}")))
+        .id(SharedString::from(id))
         .flex_none()
         .px(px(10.0))
         .py(px(5.0))
@@ -2209,6 +2430,40 @@ mod tests {
         // A sibling that only shares the prefix string is not under home.
         assert_eq!(display_path("/Users/meta/x", Some(home)), "/Users/meta/x");
         assert_eq!(display_path("/tmp/x", None), "/tmp/x");
+    }
+
+    #[test]
+    fn worktrunk_hook_projection_preserves_command_text_and_approval_state() {
+        let pending =
+            project_worktrunk_hook_command(&zeron_workers_unpeel::WorkersWorktrunkHookCommand {
+                hook_type: "pre-start".to_owned(),
+                name: Some("install".to_owned()),
+                command: "bun  install\n  --frozen-lockfile".to_owned(),
+                approved: false,
+            });
+        assert_eq!(pending.label, "pre-start · install");
+        assert_eq!(pending.status, "Approval required");
+        assert!(pending.needs_approval);
+        assert_eq!(pending.command, "bun  install\n  --frozen-lockfile");
+        let approved =
+            project_worktrunk_hook_command(&zeron_workers_unpeel::WorkersWorktrunkHookCommand {
+                hook_type: "post-start".to_owned(),
+                name: None,
+                command: "npm run dev".to_owned(),
+                approved: true,
+            });
+        assert_eq!(approved.label, "post-start");
+        assert_eq!(approved.status, "Approved");
+        assert!(!approved.needs_approval);
+        assert_eq!(approved.command, "npm run dev");
+    }
+
+    #[test]
+    fn empty_missing_worktrunk_hook_source_does_not_render_a_section() {
+        assert!(!should_show_worktrunk_hooks(false, 0, false));
+        assert!(should_show_worktrunk_hooks(true, 0, false));
+        assert!(should_show_worktrunk_hooks(false, 1, false));
+        assert!(should_show_worktrunk_hooks(false, 0, true));
     }
 
     #[test]

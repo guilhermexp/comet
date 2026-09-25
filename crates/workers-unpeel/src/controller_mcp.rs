@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -12,9 +13,185 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::{
-    InitialTextSubmitMode, LocalWorkersClient, SessionAction, WorkersLaunchRequest, WorkersSession,
-    WorkersSessionCommand,
+    InitialTextSubmitMode, LocalWorkersClient, SessionAction, WorkersCreateWorktreeRequest,
+    WorkersLaunchRequest, WorkersProject, WorkersSession, WorkersSessionCommand,
+    WorkersWorktreeLaunchResult,
 };
+
+#[cfg(test)]
+mod launch_plan_tests {
+    use super::*;
+
+    #[test]
+    fn launch_plan_preserves_new_worktree_options_and_briefing() {
+        let plan = parse_launch_plan(json!({
+            "project_id": "repo",
+            "preset_id": "claude",
+            "new_worktree": {
+                "branch": "feature/parser-fix",
+                "base_ref": "origin/main"
+            },
+            "initial_text": "Implement the parser slice"
+        }))
+        .expect("valid isolated launch parses");
+
+        assert_eq!(plan.launch.project_id, "repo");
+        assert_eq!(plan.launch.preset_id.as_deref(), Some("claude"));
+        assert_eq!(plan.launch.worktree_path, None);
+        assert_eq!(plan.launch.worktree_branch, None);
+        assert_eq!(
+            plan.new_worktree,
+            Some(ControllerNewWorktree {
+                branch: "feature/parser-fix".into(),
+                base_ref: Some("origin/main".into())
+            })
+        );
+        assert_eq!(plan.briefing.as_deref(), Some("Implement the parser slice"));
+
+        let default_base = parse_launch_plan(json!({
+            "project_id": "repo",
+            "preset_id": "claude",
+            "new_worktree": { "branch": "feature/default-base" }
+        }))
+        .expect("omitted base ref parses");
+        assert_eq!(default_base.new_worktree.unwrap().base_ref, None);
+    }
+
+    #[test]
+    fn launch_plan_rejects_malformed_or_conflicting_new_worktree_options() {
+        let base = json!({ "project_id": "repo", "preset_id": "claude" });
+        let mut args = base.clone();
+        args["new_worktree"] = json!("feature/x");
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("must be an object")
+        );
+
+        let mut args = base.clone();
+        args["new_worktree"] = json!({ "base_ref": "origin/main" });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("'branch' is required")
+        );
+
+        let mut args = base.clone();
+        args["new_worktree"] = json!({ "branch": "   " });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("'branch' is required")
+        );
+
+        let mut args = base.clone();
+        args["new_worktree"] = json!({ "branch": "feature//bad" });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("valid Git branch")
+        );
+
+        let mut args = base.clone();
+        args["new_worktree"] = json!({ "branch": "feature/good", "base_ref": " " });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("base_ref cannot be empty")
+        );
+
+        let mut args = base.clone();
+        args["new_worktree"] = json!({ "branch": "feature/good", "base_ref": 7 });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("base_ref must be a string")
+        );
+
+        let mut args = base.clone();
+        args["new_worktree"] = json!({ "branch": "feature/good", "unexpected": true });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("unknown field 'unexpected'")
+        );
+
+        let mut args = base.clone();
+        args["new_worktree"] = json!({ "branch": "feature/good", "base_ref": "--help" });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("cannot start with '-'")
+        );
+
+        let mut args = base;
+        args["worktree_path"] = json!("/tmp/existing");
+        args["worktree_branch"] = json!("feature/existing");
+        args["new_worktree"] = json!({ "branch": "feature/new" });
+        assert!(
+            parse_launch_plan(args)
+                .unwrap_err()
+                .contains("mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn legacy_launch_parser_fails_closed_when_new_worktree_needs_its_own_plan() {
+        let error = parse_launch_briefing(json!({
+            "project_id": "repo",
+            "preset_id": "claude",
+            "new_worktree": { "branch": "feature/new" }
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("new_worktree"));
+        assert!(error.contains("launch plan"));
+    }
+
+    #[test]
+    fn new_worktree_launch_requires_a_git_project_before_creation() {
+        let non_git = tempfile::tempdir().unwrap();
+        let error = validate_git_checkout(non_git.path()).unwrap_err();
+        assert!(error.contains("new_worktree requires a Git checkout"));
+
+        let git_repo = tempfile::tempdir().unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(git_repo.path())
+            .status()
+            .expect("git init starts");
+        assert!(initialized.success(), "git init succeeds");
+        validate_git_checkout(git_repo.path()).expect("a Git checkout is accepted");
+    }
+
+    #[test]
+    fn controller_worktree_launch_response_preserves_hook_warning() {
+        let mut response = json!({ "launched": true });
+        add_worktree_launch_result(
+            &mut response,
+            WorkersWorktreeLaunchResult {
+                project_id: "checkout-1".into(),
+                session_id: "session-1".into(),
+                path: "/tmp/repo-wt".into(),
+                branch: "feature/hooks".into(),
+                hook_warning: Some("post-start is pending approval".into()),
+            },
+        );
+
+        assert_eq!(response["project_id"], "checkout-1");
+        assert_eq!(response["path"], "/tmp/repo-wt");
+        assert_eq!(response["hook_warning"], "post-start is pending approval");
+    }
+}
+
+fn add_worktree_launch_result(response: &mut Value, result: WorkersWorktreeLaunchResult) {
+    response["project_id"] = result.project_id.into();
+    response["path"] = result.path.into();
+    response["branch"] = result.branch.into();
+    if let Some(warning) = result.hook_warning {
+        response["hook_warning"] = warning.into();
+    }
+}
 
 pub const CONTROLLER_MCP_ARG: &str = "__workers_mcp__";
 /// Ceiling for one `wait_for_status` call. The orchestrator owns the actual
@@ -27,6 +204,26 @@ pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
 /// receives `[worker-task-notification]` when the worker finishes. Short repeated
 /// waits are polling and burn a full model turn each.
 pub const WAIT_TIMED_OUT_NEXT: &str = "Worker still running. Either call wait_for_status again with a timeout_seconds sized to the remaining work (up to limits.wait_seconds), or end your turn: a [worker-task-notification] arrives in this chat when the worker finishes. Do not poll with short waits.";
+
+/// Requested creation details for an isolated Worker checkout. This is kept
+/// separate from `WorkersLaunchRequest`: that wire request can name only an
+/// already-registered checkout, while this value must be consumed by the
+/// common create-and-launch lifecycle before a session is spawned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerNewWorktree {
+    pub branch: String,
+    pub base_ref: Option<String>,
+}
+
+/// Parsed controller launch intent. The caller validates `launch`'s project
+/// and enabled preset before creating `new_worktree`, then passes the briefing
+/// only after the resulting checkout is registered and prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerLaunchPlan {
+    pub launch: WorkersLaunchRequest,
+    pub new_worktree: Option<ControllerNewWorktree>,
+    pub briefing: Option<String>,
+}
 
 pub fn clamp_wait_for_status_timeout(timeout_seconds: Option<u64>) -> u64 {
     timeout_seconds
@@ -247,6 +444,16 @@ pub fn parse_launch(arguments: Value) -> Result<WorkersLaunchRequest, String> {
 pub fn parse_launch_briefing(
     arguments: Value,
 ) -> Result<(WorkersLaunchRequest, Option<String>), String> {
+    let plan = parse_launch_plan(arguments)?;
+    if plan.new_worktree.is_some() {
+        return Err(
+            "launch_worker.new_worktree must be handled through the controller launch plan".into(),
+        );
+    }
+    Ok((plan.launch, plan.briefing))
+}
+
+pub fn parse_launch_plan(arguments: Value) -> Result<ControllerLaunchPlan, String> {
     let project_id = required_string(&arguments, "project_id")?;
     // Preset is the only launch mode on this surface. A raw command would let
     // the caller pick a binary, model or reasoning flag the user never enabled
@@ -259,6 +466,14 @@ pub fn parse_launch_briefing(
     }
     let preset_id = required_string(&arguments, "preset_id")?;
     let mut request = WorkersLaunchRequest::preset(project_id, preset_id);
+    let new_worktree = parse_new_worktree(&arguments)?;
+    if new_worktree.is_some()
+        && (arguments.get("worktree_path").is_some() || arguments.get("worktree_branch").is_some())
+    {
+        return Err(
+            "new_worktree is mutually exclusive with worktree_path and worktree_branch".into(),
+        );
+    }
     match (
         optional_string(&arguments, "worktree_path"),
         optional_string(&arguments, "worktree_branch"),
@@ -286,7 +501,59 @@ pub fn parse_launch_briefing(
     } else {
         None
     };
-    Ok((request, briefing))
+    Ok(ControllerLaunchPlan {
+        launch: request,
+        new_worktree,
+        briefing,
+    })
+}
+
+fn parse_new_worktree(arguments: &Value) -> Result<Option<ControllerNewWorktree>, String> {
+    let Some(value) = arguments.get("new_worktree") else {
+        return Ok(None);
+    };
+    let Some(fields) = value.as_object() else {
+        return Err("new_worktree must be an object with branch and optional base_ref".into());
+    };
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "branch" | "base_ref"))
+    {
+        return Err(format!("new_worktree has unknown field '{unknown}'"));
+    }
+
+    let branch = required_string(value, "branch")?;
+    validate_git_branch(&branch)?;
+    let base_ref = match value.get("base_ref") {
+        None => None,
+        Some(Value::String(base_ref)) if !base_ref.trim().is_empty() => {
+            if base_ref.starts_with('-') {
+                return Err("new_worktree.base_ref cannot start with '-'".into());
+            }
+            if base_ref.chars().any(char::is_control) {
+                return Err("new_worktree.base_ref cannot contain control characters".into());
+            }
+            Some(base_ref.clone())
+        }
+        Some(Value::String(_)) => {
+            return Err("new_worktree.base_ref cannot be empty".into());
+        }
+        Some(_) => return Err("new_worktree.base_ref must be a string".into()),
+    };
+
+    Ok(Some(ControllerNewWorktree { branch, base_ref }))
+}
+
+fn validate_git_branch(branch: &str) -> Result<(), String> {
+    let result = Command::new("git")
+        .args(["check-ref-format", "--branch"])
+        .arg(branch)
+        .output()
+        .map_err(|error| format!("could not validate new_worktree.branch with Git: {error}"))?;
+    if !result.status.success() {
+        return Err("new_worktree.branch is not a valid Git branch name".into());
+    }
+    Ok(())
 }
 
 pub fn encode_keys(keys: &[String]) -> Result<String, String> {
@@ -492,7 +759,12 @@ fn dispatch_action(
     match action.as_str() {
         "help" => Ok(json!({
             "actions": ACTIONS,
-            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
+            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker. For each independent slice, launch a separate Worker with new_worktree={branch, base_ref?}; leave worktree_path/worktree_branch unset. Omit all worktree selectors only when sharing the project checkout is intentional, or use the existing worktree_path/worktree_branch pair to target a known checkout. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
+            "launch_worker": {
+                "independent_slice": "Pass new_worktree with a unique branch and optional base_ref so each Worker receives its own checkout.",
+                "project_checkout": "Omit all worktree fields only when running in the project checkout is an explicit choice.",
+                "existing_worktree": "Use worktree_path and worktree_branch together to target an existing checkout; this pair is exclusive with new_worktree."
+            },
             "keys": ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "ctrl-c", "text:<literal>"],
             "limits": { "wait_seconds": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
         })),
@@ -585,8 +857,13 @@ fn dispatch_action(
             }))
         }
         "launch_worker" => {
-            let (mut request, briefing) = parse_launch_briefing(arguments.clone())?;
-            validate_launch_target(client, &request)?;
+            let plan = parse_launch_plan(arguments.clone())?;
+            let project = validate_launch_target(client, &plan.launch)?;
+            if plan.new_worktree.is_some() {
+                validate_git_checkout(std::path::Path::new(&project.path))?;
+            }
+            let mut request = plan.launch;
+            let briefing = plan.briefing;
             // Capture before spawning: a fast-failing CLI can exit before
             // `launch_session` returns its id. The id is unique, so this earlier
             // cutoff cannot adopt history from another worker.
@@ -603,19 +880,46 @@ fn dispatch_action(
                         request.with_initial_text(text, InitialTextSubmitMode::PasteAndSubmit);
                 }
             }
-            let session_id = client
-                .launch_session(&request)
-                .map_err(|error| error.to_string())?;
+            let worktree_launch = if let Some(worktree) = plan.new_worktree {
+                Some(
+                    client
+                        .create_worktree_and_launch(
+                            WorkersCreateWorktreeRequest {
+                                project_id: request.project_id.clone(),
+                                branch: worktree.branch,
+                                name: None,
+                                base_ref: worktree.base_ref,
+                            },
+                            request.clone(),
+                        )
+                        // Keep lifecycle details verbatim: a launch failure can
+                        // leave a registered checkout that the caller must recover.
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
+            let session_id = if let Some(result) = &worktree_launch {
+                result.session_id.clone()
+            } else {
+                client
+                    .launch_session(&request)
+                    .map_err(|error| error.to_string())?
+            };
             if let Some(parent_chat_id) = parent_chat_id {
                 crate::register_worker_parent(
                     &session_id,
                     parent_chat_id,
                     registered_at_unix_ms,
                 )
-                .map_err(|error| {
-                    format!(
+                .map_err(|error| match &worktree_launch {
+                    Some(result) => format!(
+                        "Worker {} was created, but its parent chat binding could not be persisted: {error}. Recoverable checkout: project {} at {} (branch {}).",
+                        result.session_id, result.project_id, result.path, result.branch
+                    ),
+                    None => format!(
                         "Worker {session_id} was created, but its parent chat binding could not be persisted: {error}"
-                    )
+                    ),
                 })?;
             }
             // The worker exists from here on: returning Err would orphan a
@@ -643,6 +947,9 @@ fn dispatch_action(
                 "launched": true,
                 "briefing_submitted": briefing.is_some() && briefing_error.is_none()
             });
+            if let Some(result) = worktree_launch {
+                add_worktree_launch_result(&mut response, result);
+            }
             if let Some(error) = briefing_error {
                 response["briefing_error"] = error.into();
                 response["next_action"] = json!(launch_briefing_next_action(&session_id, native));
@@ -1186,18 +1493,14 @@ pub fn replacement_session_id(before: &[String], after: &[String]) -> Option<Str
 fn validate_launch_target(
     client: &LocalWorkersClient,
     request: &WorkersLaunchRequest,
-) -> Result<(), String> {
+) -> Result<WorkersProject, String> {
     let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
-    if !bootstrap
+    let project = bootstrap
         .projects
         .iter()
-        .any(|project| project.id == request.project_id && !project.is_group)
-    {
-        return Err(format!(
-            "Unknown runnable project '{}'.",
-            request.project_id
-        ));
-    }
+        .find(|project| project.id == request.project_id && !project.is_group)
+        .cloned()
+        .ok_or_else(|| format!("Unknown runnable project '{}'.", request.project_id))?;
     // Fail closed: a launch without an *enabled* preset is refused instead of
     // silently running whatever command it carries. Disabling a preset in
     // Settings is what makes it unspawnable here.
@@ -1211,6 +1514,16 @@ fn validate_launch_target(
     {
         return Err(format!("Unknown or disabled preset '{preset_id}'."));
     }
+    Ok(project)
+}
+
+fn validate_git_checkout(path: &std::path::Path) -> Result<(), String> {
+    crate::git_command::run_git(path, &["rev-parse", "--show-toplevel"]).map_err(|error| {
+        format!(
+            "launch_worker.new_worktree requires a Git checkout at '{}': {error}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1369,7 +1682,11 @@ fn tool_definition() -> Value {
         `restart_worker` brings it back with its conversation under a new \
         `session_id`. \
         Launch one worker per independent slice: N calls for N slices is the normal \
-        shape of parallel delegation. `action=help` returns the live per-action \
+        shape of parallel delegation. Pass `new_worktree: {branch, base_ref?}` on each \
+        launch so independent Workers receive separate checkouts. Omit worktree fields \
+        only when sharing the project checkout is intentional; use the existing \
+        `worktree_path`/`worktree_branch` pair only to target a known checkout. \
+        `action=help` returns the live per-action \
         contract and limits.",
         "inputSchema": {
             "type": "object",
@@ -1388,8 +1705,18 @@ fn tool_definition() -> Value {
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
                 "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing delivered once at launch. OMP, Claude, Pi and Codex receive it through native startup. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
                 "title": { "type": "string", "description": "launch_worker: the worker's display name in the Workers list, final for the session and kept across restart — name the ticket or task (e.g. `WT-20260924-fix-parser`), at most 256 bytes. Omitted: the first line of `initial_text`." },
-                "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },
-                "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." },
+                "worktree_path": { "type": "string", "description": "launch_worker: required together with worktree_branch to run in an existing git worktree instead of the project checkout. Mutually exclusive with new_worktree." },
+                "worktree_branch": { "type": "string", "description": "launch_worker: required together with worktree_path; the branch that existing checkout is on. Mutually exclusive with new_worktree." },
+                "new_worktree": {
+                    "type": "object",
+                    "required": ["branch"],
+                    "properties": {
+                        "branch": { "type": "string", "description": "New Git branch for this Worker. Must be a valid branch name; use a distinct branch for each independent slice." },
+                        "base_ref": { "type": "string", "description": "Optional Git ref or revision to create the branch from. Defaults to the common lifecycle's default base." }
+                    },
+                    "additionalProperties": false,
+                    "description": "Create a new isolated checkout before launch. Mutually exclusive with worktree_path/worktree_branch."
+                },
                 "expected_old_fingerprint": { "type": "string", "description": "recover_project_identity: required fingerprint reported as the old side of the diagnosed conflict." },
                 "expected_current_fingerprint": { "type": "string", "description": "recover_project_identity: required fingerprint freshly observed for the current checkout and repository." }
             },

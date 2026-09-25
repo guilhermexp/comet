@@ -221,7 +221,8 @@ impl SetupOutcome {
     }
 }
 
-/// Roda um comando com teto de tempo, matando o processo se ele estourar.
+/// Roda um comando com o tempo restante do orçamento de setup, matando o
+/// processo se ele estourar.
 ///
 /// `Command::output()` bloqueia para sempre, e um comando de setup travado
 /// seguraria a criacao do worktree indefinidamente — sem sinal na tela e sem
@@ -366,8 +367,8 @@ pub fn run_setup(worktree_path: &Path, main_path: &Path, config: &WorktreeConfig
     run_setup_with_timeout(worktree_path, main_path, config, COMMAND_TIMEOUT)
 }
 
-/// `run_setup` com teto explicito — existe para o teste do timeout poder usar
-/// milissegundos em vez de esperar os cinco minutos de producao.
+/// `run_setup` com teto total explícito. Um projeto pode listar vários
+/// comandos; o orçamento não recomeça para cada linha.
 fn run_setup_with_timeout(
     worktree_path: &Path,
     main_path: &Path,
@@ -379,12 +380,19 @@ fn run_setup_with_timeout(
     if commands.is_empty() {
         return outcome;
     }
+    let deadline = std::time::Instant::now() + timeout;
     for command in commands {
         if command.trim().is_empty() {
             continue;
         }
         outcome.output.push(format!("$ {command}"));
-        match run_one(worktree_path, main_path, command, timeout) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let result = if remaining.is_zero() {
+            Err(format!("setup timed out after {timeout:?}"))
+        } else {
+            run_one(worktree_path, main_path, command, remaining)
+        };
+        match result {
             Ok(()) => outcome.commands_run += 1,
             Err(reason) => {
                 outcome.output.push(reason.clone());
@@ -560,6 +568,32 @@ mod tests {
             main.path().display().to_string(),
             "ROOT_WORKTREE_PATH tem que chegar no comando"
         );
+    }
+
+    #[test]
+    fn multiple_setup_commands_share_one_timeout_budget() {
+        let main = Dir::new();
+        let worktree = Dir::new();
+        let config = WorktreeConfig {
+            shared: vec![
+                "sleep 0.5; touch first.txt".to_owned(),
+                "sleep 0.5; touch second.txt".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let outcome = run_setup_with_timeout(
+            worktree.path(),
+            main.path(),
+            &config,
+            Duration::from_millis(800),
+        );
+        assert_eq!(outcome.commands_run, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.failed.as_deref(),
+            Some("sleep 0.5; touch second.txt")
+        );
+        assert!(worktree.path().join("first.txt").exists());
+        assert!(!worktree.path().join("second.txt").exists());
     }
 
     #[test]

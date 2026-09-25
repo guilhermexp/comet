@@ -243,7 +243,21 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   do render e reset/forget só podem remover filho direto do diretório app-owned.
 - **Falha de setup e sucesso parcial visível.** O worktree criado continua
   selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
-  ao refresh seguinte e nenhum Worker é lançado automaticamente nele.
+  ao refresh seguinte e nenhum Worker é lançado automaticamente nele. Aviso de
+  `post-start` tanto da criação quanto da criação seguida de launch fica em
+  `WorkersModel.action_notice`, separado dos erros de refresh e dispensável
+  pela faixa advisory da surface Workers.
+- **Settings → Projects expõe os hooks Worktrunk por comando.** Mostra o texto
+  exato lido de `.config/wt.toml`, o estado aprovado/pendente e só oferece
+  Approve para comandos pendentes; o clique passa a identidade do repo e o
+  texto esperado para o cliente revalidar. Arquivo ausente não cria card vazio;
+  erro de leitura/parse aparece no próprio card.
+- **Remoção de worktree sem hooks é um override explícito e separado.** Só o
+  menu de checkout app-managed mostra `Remove worktree without hooks…`, com
+  confirmação que nomeia os hooks ignorados e mantém visíveis as checagens de
+  posse, atividade, identidade Git e árvore limpa. O dispatch chama
+  `remove_worktree_without_hooks`; não reutilizar `Archive checkout` nem o
+  caminho normal de remoção.
 - **Settings → Accounts renderiza provedores na ordem fixa Claude, Codex, Kimi,
   Antigravity, Cursor, Grok.** Contas gerenciadas (Kimi Code, Antigravity, Grok)
   chegam da engine `active: true, switchable: false`; a linha não expõe Add
@@ -325,7 +339,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/shell/{spaces,tabs}.rs` (ordem visual e atalhos de Chat) | unit | `cargo test -p zeron-ui shell::spaces::tests && cargo test -p zeron-ui shell::tabs::cycle_tests` |
 | `src/mermaid_preview.rs` (fit, slack de pan, fatores de gesto) | unit — matemática pura; a lightbox em si é visual | `cargo test -p zeron-ui --lib mermaid_preview` · `ZERON_MOCK_MEDIA=1 scripts/dev-demo.sh` |
 | `src/settings/accounts.rs` (ordem de provedores, ausência de add em managed, thresholds e format_reset; toggle de Usage é visual) | unit | `cargo test -p zeron-ui accounts` |
-| `src/settings/projects.rs` (filtro, git remoto, editor/config e decisões de ícone) | unit; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
+| `src/settings/projects.rs` (filtro, git remoto, editor/config, hooks Worktrunk: texto, estado de aprovação e visibilidade do card) | unit nas projeções; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/usage.rs` (remaining, tom semanal, gate do badge de reset, pace, membership por hidden-id, placeholder por provider, warning por harness) | unit — derivações puras sobre um `now` injetado | `cargo test -p zeron-ui usage` |
 | `src/details_sidebar/worked_projects.rs` (Worked Projects, Leaf Root, expansão de home, primeiro contato) | unit | `cargo test -p zeron-ui worked_projects` |
 | `src/details_sidebar/{chat_workers,widgets}.rs` (projeção, formatação e disclosure de telemetria de Worker) | unit + visual gpui | `cargo test -p zeron-ui details_sidebar` · `scripts/dev-demo.sh` |
@@ -336,9 +350,10 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/terminal/emulator.rs` (ANSI, seleção e retenção opt-in da tela alternativa) | unit — controle dividido entre chunks, tela principal e tela viva preservadas | `cargo test -p zeron-ui --lib terminal::emulator` |
 | `src/shell.rs` (divisores, orçamento responsivo e preservação da coluna vizinha) | unit — geometria pura; arraste nativo é visual | `cargo test -p zeron-ui --lib shell::tests` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
-| `src/workers/workspace.rs` (ordem por atividade da sidebar, subtree de projeto, cap de rows com a selecionada garantida, ramo de `session_sort`) | unit (projeções puras); render gpui é visual | `cargo test -p zeron-ui workers::workspace` |
+| `src/workers/workspace.rs` (ordem por atividade da sidebar, subtree de projeto, cap de rows com a selecionada garantida, ramo de `session_sort`, confirmação de remoção sem hooks e faixa advisory) | unit (projeções puras); render gpui é visual | `cargo test -p zeron-ui workers::workspace` |
+| `src/workers/project_menu.rs` (elegibilidade de remoção comum e override sem hooks por posse/availability) | unit | `cargo test -p zeron-ui workers::project_menu` |
 | `src/details_sidebar/widgets.rs` (foco de aba do widget Workers: ganho, esvaziamento, baseline, lista ausente) | unit — derivações puras sobre contagens e conjuntos injetados | `cargo test -p zeron-ui details_sidebar::widgets` |
-| `src/workers/model.rs` (fila de ações, reconciliação de seleção, projeto vazio sem fallback implícito, vizinho após arquivar) | unit (fila e projeções puras); o despacho em si roda em `cx.spawn` e é visual | `cargo test -p zeron-ui workers::model` |
+| `src/workers/model.rs` (fila de ações, reconciliação de seleção, aviso de `post-start`, projeto vazio sem fallback implícito, vizinho após arquivar) | unit (fila e projeções puras); o despacho em si roda em `cx.spawn` e é visual | `cargo test -p zeron-ui workers::model` |
 | `src/change_requests.rs` (alvos de PR locais/worktree e matching por checkout) | unit; badge confirmado depende do provider e render gpui é visual | `cargo test -p zeron-ui change_requests` |
 | `src/workers/presentation.rs` (matriz do indicador, idade relativa, comparador de atividade, branch atual do checkout) | unit — derivações puras | `cargo test -p zeron-ui workers::presentation` |
 | `src/workers/terminal.rs` (primeira publicação da grade, replay, resize serializado, protocolo de mouse, purga de terminais retidos, limpeza de erro de resize) | unit nas partes puras e projeção da grade com TestAppContext; paint, resize e input são visuais | `cargo test -p zeron-ui workers::terminal` |

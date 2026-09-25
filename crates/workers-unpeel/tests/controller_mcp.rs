@@ -2,6 +2,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
+use std::process::Command;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
     WorkerCompletionEvidence, WorkersSession, WorkersSessionCapabilities,
@@ -114,6 +115,67 @@ fn the_workers_schema_documents_every_action_and_names_the_other_substance() {
             "action {action} is named in no description, so a caller cannot build the call without a help round-trip"
         );
     }
+
+    let new_worktree = &properties["new_worktree"];
+    assert_eq!(new_worktree["type"], "object");
+    assert_eq!(new_worktree["additionalProperties"], false);
+    assert_eq!(new_worktree["required"][0], "branch");
+    assert_eq!(new_worktree["properties"]["branch"]["type"], "string");
+    assert_eq!(new_worktree["properties"]["base_ref"]["type"], "string");
+    assert!(
+        new_worktree["description"]
+            .as_str()
+            .unwrap()
+            .contains("Mutually exclusive with worktree_path/worktree_branch")
+    );
+    assert!(description.contains("new_worktree: {branch, base_ref?}"));
+    assert!(description.contains("sharing the project checkout is intentional"));
+}
+
+#[test]
+fn controller_help_explains_isolated_and_explicit_shared_checkout_launches() {
+    let response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": { "action": "help" }
+        }
+    }))
+    .expect("help action responds");
+    let help = &response["result"]["structuredContent"];
+
+    assert!(
+        help["workflow"]
+            .as_str()
+            .unwrap()
+            .contains("each independent slice")
+    );
+    assert!(
+        help["workflow"]
+            .as_str()
+            .unwrap()
+            .contains("new_worktree={branch, base_ref?}")
+    );
+    assert!(
+        help["workflow"]
+            .as_str()
+            .unwrap()
+            .contains("sharing the project checkout is intentional")
+    );
+    assert!(
+        help["launch_worker"]["independent_slice"]
+            .as_str()
+            .unwrap()
+            .contains("unique branch")
+    );
+    assert!(
+        help["launch_worker"]["project_checkout"]
+            .as_str()
+            .unwrap()
+            .contains("explicit choice")
+    );
 }
 
 #[test]
@@ -436,13 +498,26 @@ fn self_repainting_status_lines_do_not_restart_the_stability_window() {
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-struct UnpeelHomeGuard(Option<OsString>);
+struct UnpeelHomeGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl UnpeelHomeGuard {
     fn set(path: &std::path::Path) -> Self {
-        let previous = std::env::var_os("UNPEEL_HOME");
+        let values = [
+            ("UNPEEL_HOME", path.to_path_buf()),
+            ("ZERON_WORKTREES_DIR", path.join("worktrees")),
+            (
+                "ZERON_WORKTREE_OWNERSHIP_FILE",
+                path.join("worktree-ownership.json"),
+            ),
+        ];
+        let previous = values
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
         // SAFETY: every mutation in this test binary holds ENV_LOCK.
-        unsafe { std::env::set_var("UNPEEL_HOME", path) };
+        for (key, value) in values {
+            unsafe { std::env::set_var(key, value) };
+        }
         Self(previous)
     }
 }
@@ -451,9 +526,37 @@ impl Drop for UnpeelHomeGuard {
     fn drop(&mut self) {
         // SAFETY: the guard is dropped while the test still holds ENV_LOCK.
         unsafe {
-            match self.0.take() {
-                Some(previous) => std::env::set_var("UNPEEL_HOME", previous),
-                None => std::env::remove_var("UNPEEL_HOME"),
+            for (key, previous) in self.0.drain(..) {
+                match previous {
+                    Some(previous) => std::env::set_var(key, previous),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+struct EnvironmentVariableGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvironmentVariableGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: every mutation in this test binary holds ENV_LOCK.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvironmentVariableGuard {
+    fn drop(&mut self) {
+        // SAFETY: the caller still holds ENV_LOCK when this guard is dropped.
+        unsafe {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
             }
         }
     }
@@ -496,6 +599,318 @@ fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error:
         response["result"]["structuredContent"]["projects"][0]["id"],
         "project-1"
     );
+    Ok(())
+}
+
+/// Launch preparation is deliberately made to fail after each checkout is
+/// created. The controller must return its stable project id and path so the
+/// caller can recover both isolated worktrees; no Worker process is started.
+#[test]
+fn controller_new_worktree_launch_failure_returns_recoverable_distinct_checkouts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new()?;
+    let _home = UnpeelHomeGuard::set(home.path());
+
+    let repo = home.path().join("repo");
+    fs::create_dir_all(&repo)?;
+    let git = |args: &[&str]| -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new("git").args(args).current_dir(&repo).status()?;
+        if !status.success() {
+            return Err(format!("git {args:?} failed with {status}").into());
+        }
+        Ok(())
+    };
+    git(&["init", "--quiet", "--initial-branch=main"])?;
+    git(&["config", "user.email", "controller@example.test"])?;
+    git(&["config", "user.name", "Controller Test"])?;
+    fs::write(repo.join("README.md"), "controller fixture\n")?;
+    git(&["add", "README.md"])?;
+    git(&["commit", "--quiet", "-m", "fixture"])?;
+
+    let state_path = home.path().join("app-state.json");
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&json!({
+            "projects": [{
+                "id": "root",
+                "name": "Root",
+                "path": repo,
+                "workspace_id": "personal",
+                "sort_order": 0,
+                "is_folder": false
+            }],
+            "presets": [{
+                "id": "claude",
+                "label": "Claude",
+                "command": "claude",
+                "enabled": true,
+                "quick_launch": false
+            }],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))?,
+    )?;
+
+    // Trust is checked after checkout creation and before contacting the
+    // controller API. A regular file cannot serve as the config directory.
+    let blocked_trust_parent = home.path().join("claude-config-is-a-file");
+    fs::write(&blocked_trust_parent, "not a directory")?;
+    let _trust =
+        EnvironmentVariableGuard::set("CLAUDE_CONFIG_DIR", blocked_trust_parent.as_os_str());
+
+    let call = |branch: &str, request_id: u64| {
+        controller_mcp_handle_request(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "workers",
+                "arguments": {
+                    "action": "launch_worker",
+                    "project_id": "root",
+                    "preset_id": "claude",
+                    "new_worktree": { "branch": branch }
+                }
+            }
+        }))
+        .expect("tools/call responds")
+    };
+
+    let mut recovered = Vec::new();
+    for (request_id, branch) in [(21, "feature/controller-a"), (22, "feature/controller-b")] {
+        let response = call(branch, request_id);
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool error text");
+        assert!(
+            message.contains("recoverable checkout project_id="),
+            "{message}"
+        );
+        assert!(
+            message.contains("CLAUDE_CONFIG_DIR") || message.contains("claude-config-is-a-file"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("session_id"),
+            "a Worker must not have started: {message}"
+        );
+
+        let recovery = message
+            .split_once("recoverable checkout project_id=")
+            .expect("controller preserves the recoverable checkout identity")
+            .1;
+        let (project_id, path) = recovery
+            .split_once(" path=")
+            .expect("controller preserves the recoverable checkout path");
+        recovered.push((branch, project_id.to_owned(), path.trim().to_owned()));
+    }
+
+    assert_ne!(
+        recovered[0].1, recovered[1].1,
+        "each checkout gets its own project id"
+    );
+    assert_ne!(
+        recovered[0].2, recovered[1].2,
+        "each branch gets its own directory"
+    );
+    for (branch, project_id, path) in &recovered {
+        let path = std::path::Path::new(path);
+        assert!(
+            path.is_dir(),
+            "recoverable worktree survives at {}",
+            path.display()
+        );
+        let current_branch = Command::new("git")
+            .args([
+                "-C",
+                path.to_str().expect("UTF-8 fixture path"),
+                "branch",
+                "--show-current",
+            ])
+            .output()?;
+        assert!(current_branch.status.success());
+        assert_eq!(String::from_utf8(current_branch.stdout)?.trim(), *branch);
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+        assert!(
+            state["projects"].as_array().unwrap().iter().any(|project| {
+                project["id"] == project_id.as_str()
+                    && project["path"] == path.to_string_lossy().as_ref()
+            }),
+            "project identity and exact path remain registered after failed launch"
+        );
+    }
+    Ok(())
+}
+
+/// Exercise the real controller-to-Workers launch route without invoking a
+/// provider CLI. The fake Host runs the enabled shell preset in the supplied
+/// cwd and publishes the same manifest fields the StartingWorker monitor
+/// checks. Each independent branch must reach a separate directory.
+#[cfg(unix)]
+#[test]
+fn controller_launches_independent_new_worktrees_in_distinct_cwds_and_returns_hook_warning()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new()?;
+    let _home = UnpeelHomeGuard::set(home.path());
+
+    let repo = home.path().join("repo");
+    fs::create_dir_all(&repo)?;
+    let git = |args: &[&str]| -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new("git").args(args).current_dir(&repo).status()?;
+        if !status.success() {
+            return Err(format!("git {args:?} failed with {status}").into());
+        }
+        Ok(())
+    };
+    git(&["init", "--quiet", "--initial-branch=main"])?;
+    git(&["config", "user.email", "controller@example.test"])?;
+    git(&["config", "user.name", "Controller Test"])?;
+    fs::write(repo.join("README.md"), "controller fixture\n")?;
+    fs::create_dir_all(repo.join(".config"))?;
+    fs::write(repo.join(".config/wt.toml"), "post-start = \"true\"\n")?;
+    git(&["add", "README.md", ".config/wt.toml"])?;
+    git(&["commit", "--quiet", "-m", "fixture"])?;
+
+    let state_path = home.path().join("app-state.json");
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&json!({
+            "projects": [{
+                "id": "root",
+                "name": "Root",
+                "path": repo,
+                "workspace_id": "personal",
+                "sort_order": 0,
+                "is_folder": false
+            }],
+            "presets": [{
+                "id": "test-shell",
+                "label": "Test shell",
+                "command": "sh -c 'pwd > worker-cwd.txt'",
+                "enabled": true,
+                "quick_launch": false
+            }],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))?,
+    )?;
+
+    let fake_host = home.path().join("fake-host.py");
+    fs::write(
+        &fake_host,
+        r#"#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+launch_path = Path(sys.argv[1])
+launch = json.loads(launch_path.read_text())
+session = launch["session"]
+cwd = Path(launch["cwd"])
+completed = subprocess.run(session["command"], cwd=cwd, shell=True, check=False)
+session_dir = Path(os.environ["UNPEEL_HOME"]) / "app-sessions" / session["id"]
+session_dir.mkdir(parents=True, exist_ok=True)
+manifest = {
+    "session": session,
+    "cwd": str(cwd),
+    "state": "exited",
+    "pid": None,
+    "exit_code": completed.returncode,
+}
+(session_dir / "manifest.json").write_text(json.dumps(manifest))
+sys.exit(completed.returncode)
+"#,
+    )?;
+    let mut permissions = fs::metadata(&fake_host)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_host, permissions)?;
+    let _host = EnvironmentVariableGuard::set("UNPEEL_HOST_CMD", &fake_host);
+
+    let call = |branch: &str, request_id: u64| {
+        controller_mcp_handle_request(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "workers",
+                "arguments": {
+                    "action": "launch_worker",
+                    "project_id": "root",
+                    "preset_id": "test-shell",
+                    "new_worktree": { "branch": branch }
+                }
+            }
+        }))
+        .expect("tools/call responds")
+    };
+
+    let first = call("feature/controller-launch-a", 41);
+    let second = call("feature/controller-launch-b", 42);
+    for response in [&first, &second] {
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(response["result"]["structuredContent"]["launched"], true);
+        assert!(
+            response["result"]["structuredContent"]["session_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{response}"
+        );
+        let warning = response["result"]["structuredContent"]["hook_warning"]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("post-start hook"), "{warning}");
+        assert!(warning.contains("pending approval"), "{warning}");
+    }
+
+    let first = &first["result"]["structuredContent"];
+    let second = &second["result"]["structuredContent"];
+    assert_ne!(first["project_id"], second["project_id"]);
+    assert_ne!(first["path"], second["path"]);
+    assert_ne!(first["session_id"], second["session_id"]);
+    for launch in [first, second] {
+        let path = std::path::Path::new(launch["path"].as_str().unwrap());
+        assert!(
+            path.is_dir(),
+            "created checkout survives at {}",
+            path.display()
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("worker-cwd.txt"))?.trim(),
+            path.canonicalize()?.to_string_lossy()
+        );
+        let manifest =
+            unpeel_core::session_host::load_manifest(launch["session_id"].as_str().unwrap())
+                .expect("fake Host publishes a manifest for the launched session");
+        assert_eq!(manifest.session.project_id, launch["project_id"]);
+        assert_eq!(
+            std::fs::canonicalize(manifest.cwd)?,
+            path.canonicalize()?,
+            "Host received the exact isolated checkout cwd"
+        );
+    }
+
+    // The detached-start guard is intentionally retained until the Host's
+    // manifest confirms the checkout and exact project. Wait for its release
+    // before restoring UNPEEL_HOME so this test doesn't leak a reservation.
+    let client = zeron_workers_unpeel::LocalWorkersClient::new();
+    for launch in [first, second] {
+        let path = std::path::Path::new(launch["path"].as_str().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while client.checkout_is_busy(path)? && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !client.checkout_is_busy(path)?,
+            "confirmed exited Host manifest releases the StartingWorker reservation"
+        );
+    }
     Ok(())
 }
 
