@@ -2482,12 +2482,17 @@ impl Shell {
                     chat_id,
                     message_id,
                     has_appshots,
+                    compacting,
                 } => {
                     if *has_appshots {
                         this.last_appshot_chat = Some(chat_id.clone());
                     }
                     transcript.update(cx, |t, cx| {
-                        t.on_own_send(chat_id.clone(), message_id.clone(), cx)
+                        if *compacting {
+                            t.jump_to_bottom(cx)
+                        } else {
+                            t.on_own_send(chat_id.clone(), message_id.clone(), cx)
+                        }
                     });
                 }
                 ComposerEvent::WorktreeSetup {

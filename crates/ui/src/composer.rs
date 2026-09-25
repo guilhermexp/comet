@@ -5318,6 +5318,9 @@ pub enum ComposerEvent {
         /// The optimistic send contained one or more staged Appshots. Shell
         /// uses this to remember a newly minted Chat for Last Chat routing.
         has_appshots: bool,
+        /// A `/compact`: its status line lands at the tail instead of taking
+        /// the prompt runway (at the top it hid under the sticky prompt).
+        compacting: bool,
     },
     /// A new worktree's host-side setup attempt completed after its chat id
     /// was minted. The shell attaches an already-open terminal to that exact
@@ -8835,7 +8838,7 @@ impl Composer {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
-            if let Some(before) = compaction_before {
+            if let Some(before) = compaction_before.clone() {
                 s.begin_compaction(&chat_id, before);
             }
             s.push_echo(&chat_id, echo);
@@ -8854,6 +8857,7 @@ impl Composer {
             chat_id: chat_id.clone(),
             message_id: message_id.clone(),
             has_appshots: !staged_appshots.is_empty(),
+            compacting: compaction_before.is_some(),
         });
         cx.notify();
 
