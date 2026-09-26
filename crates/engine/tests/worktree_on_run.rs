@@ -16,7 +16,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use zeron_doc::{
-    MessageRole, MessageStatus, SessionCommandPayload, SessionCommandStatus, SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionCommandStatus,
+    SessionMessageEntry,
 };
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
@@ -422,8 +423,14 @@ async fn check_failed_setup_and_retry() {
         r#"{"setup-worktree":"test -f \"$ROOT_WORKTREE_PATH/allow-setup\" && printf setup > setup-marker"}"#,
     )
     .unwrap();
+    std::fs::write(repo_dir.join(".gitignore"), "cache/\n").unwrap();
+    std::fs::write(repo_dir.join(".worktreeinclude"), "cache/\n").unwrap();
     git(&repo_dir, &["add", "."]);
     git(&repo_dir, &["commit", "-m", "init"]);
+    std::fs::create_dir_all(repo_dir.join("cache")).unwrap();
+    std::fs::write(repo_dir.join("cache/real.txt"), "cached\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real.txt", repo_dir.join("cache/link.txt")).unwrap();
     let repo_path = repo_dir.to_string_lossy().to_string();
 
     let cwds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -512,6 +519,23 @@ async fn check_failed_setup_and_retry() {
         .expect("failed setup produces a Project Action handoff");
     assert!(handoff.setup_action.is_none());
     assert!(handoff.setup_error.is_some());
+    #[cfg(unix)]
+    {
+        assert!(
+            handoff
+                .setup_warning
+                .as_deref()
+                .is_some_and(|warning| warning.starts_with("1 entry selected by .worktreeinclude")),
+            "a failed setup keeps the copy advisory: {:?}",
+            handoff.setup_warning
+        );
+        assert!(
+            resolution
+                .as_deref()
+                .is_some_and(|resolution| resolution.contains("not copied")),
+            "the rejected Run names the skipped copy: {resolution:?}"
+        );
+    }
 
     std::fs::write(repo_dir.join("allow-setup"), "yes\n").unwrap();
     let mut retry = run_payload("msg-wt-retry", &repo_path, None);
@@ -533,6 +557,22 @@ async fn check_failed_setup_and_retry() {
     assert_eq!(
         std::fs::read_to_string(checkout.join("setup-marker")).unwrap(),
         "setup"
+    );
+    #[cfg(unix)]
+    assert!(
+        core.doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.role == MessageRole::System
+                && entry.parts.iter().any(|part| matches!(
+                    part,
+                    MessagePart::Text { text, .. } if text.contains("not copied")
+                ))),
+        "a successful retry records the copy advisory in the transcript"
     );
     let listing = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
