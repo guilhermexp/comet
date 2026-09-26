@@ -580,22 +580,21 @@ mod tests {
         let worktree = Dir::new();
         let config = WorktreeConfig {
             shared: vec![
-                "sleep 0.5; touch first.txt".to_owned(),
-                "sleep 0.5; touch second.txt".to_owned(),
+                "sleep 1; touch first.txt".to_owned(),
+                "sleep 1; touch second.txt".to_owned(),
             ],
             ..Default::default()
         };
+        // Each command fits the budget alone, with a wide margin for shell
+        // startup on a loaded runner; only together do they exceed it.
         let outcome = run_setup_with_timeout(
             worktree.path(),
             main.path(),
             &config,
-            Duration::from_millis(800),
+            Duration::from_millis(1800),
         );
         assert_eq!(outcome.commands_run, 1, "{outcome:?}");
-        assert_eq!(
-            outcome.failed.as_deref(),
-            Some("sleep 0.5; touch second.txt")
-        );
+        assert_eq!(outcome.failed.as_deref(), Some("sleep 1; touch second.txt"));
         assert!(worktree.path().join("first.txt").exists());
         assert!(!worktree.path().join("second.txt").exists());
     }

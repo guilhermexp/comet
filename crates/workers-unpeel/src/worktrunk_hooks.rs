@@ -433,20 +433,6 @@ fn parse_template(source: &str) -> Result<Vec<TemplatePart>, TemplateProblem> {
             // constructs already occurred in the command; it is safer than
             // misclassifying a nested shell context as an ordinary word.
             let prefix = &source[..cursor];
-            let current_word = prefix
-                .rsplit(|character: char| {
-                    character.is_whitespace() || "|&;()<>".contains(character)
-                })
-                .next()
-                .unwrap_or_default();
-            if current_word.contains('$') {
-                return Err(TemplateProblem {
-                    token: variable.name,
-                    message:
-                        "interpolation in a shell word with parameter expansion is unsupported"
-                            .into(),
-                });
-            }
             if unsupported_ansi_quote {
                 return Err(TemplateProblem {
                     token: variable.name,
@@ -467,6 +453,20 @@ fn parse_template(source: &str) -> Result<Vec<TemplatePart>, TemplateProblem> {
                 return Err(TemplateProblem {
                     token: variable.name,
                     message: "interpolation in or after a heredoc or nested shell expansion is unsupported".into(),
+                });
+            }
+            let current_word = prefix
+                .rsplit(|character: char| {
+                    character.is_whitespace() || "|&;()<>".contains(character)
+                })
+                .next()
+                .unwrap_or_default();
+            if current_word.contains('$') {
+                return Err(TemplateProblem {
+                    token: variable.name,
+                    message:
+                        "interpolation in a shell word with parameter expansion is unsupported"
+                            .into(),
                 });
             }
             parts.push(TemplatePart::Variable {
