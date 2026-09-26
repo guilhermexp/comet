@@ -60,7 +60,8 @@ merge, release ou deploy.
 
 ## Limite deste incremento
 
-O suporte a Worktrunk é intencionalmente parcial: apenas os hooks de início e
-remoção descritos na change. `wt merge`, status estilo `wt list`, configuração
-de usuário, `copy-ignored` e remoção automática da branch ficam para mudanças
-posteriores. Nenhum binário `wt` é exigido em runtime.
+Na data desta primeira verificação, o suporte a Worktrunk incluía os hooks de
+início e remoção. A cópia opt-in de ignorados e a limpeza conservadora de
+branches foram entregues no [incremento seguinte](2026-09-25-worktree-worktrunk-completion.md).
+`wt merge`, status estilo `wt list` e configuração de usuário continuam fora
+desse ciclo. Nenhum binário `wt` é exigido em runtime.

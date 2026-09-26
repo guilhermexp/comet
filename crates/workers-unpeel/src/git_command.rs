@@ -10,6 +10,30 @@ pub(crate) fn run_git_mutation(path: &Path, args: &[&str]) -> Result<String, Str
     run_git_with_timeout(path, args, std::time::Duration::from_secs(300))
 }
 
+/// Bounded Git mutation with a small literal stdin payload. The caller is
+/// responsible for building Git's protocol; no shell is involved.
+pub(crate) fn run_git_mutation_with_stdin(
+    path: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Result<String, String> {
+    use std::process::Command;
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    run_command_with_input(
+        &mut command,
+        std::time::Duration::from_secs(300),
+        Some(input),
+    )
+}
+
 fn run_git_with_timeout(
     path: &Path,
     args: &[&str],
@@ -32,7 +56,16 @@ fn run_command(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
+    run_command_with_input(command, timeout, None)
+}
+
+fn run_command_with_input(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    input: Option<&[u8]>,
+) -> Result<String, String> {
     use std::io::Read;
+    use std::io::Write;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     #[cfg(unix)]
@@ -40,11 +73,34 @@ fn run_command(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
+    if let Some(input) = input {
+        // update-ref transactions contain only a handful of short refs and
+        // OIDs, so writing them cannot fill the OS pipe. Dropping stdin tells
+        // Git to commit or reject the complete transaction.
+        let written = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Git stdin was not piped".to_string())
+            .and_then(|mut stdin| stdin.write_all(input).map_err(|error| error.to_string()));
+        if let Err(error) = written {
+            #[cfg(unix)]
+            // SAFETY: process_group(0) created a dedicated child group.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
     fn drain(mut stream: impl Read) -> Result<Vec<u8>, String> {
         let mut output = Vec::new();
         let mut buf = [0; 8192];

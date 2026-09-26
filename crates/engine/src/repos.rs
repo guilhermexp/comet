@@ -1824,7 +1824,8 @@ impl Repos {
 
     /// Remove one linked worktree through the shared ownership and safety
     /// checks. Externally-created checkouts, missing ownership proof, active
-    /// checkouts, and dirty trees are refused; the branch is always preserved.
+    /// checkouts, and dirty trees are refused. An integrated local branch may
+    /// be removed after the checkout; unproven work keeps its branch.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,

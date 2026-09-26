@@ -321,12 +321,13 @@ fn worktree_lifecycle_removes_checkout_but_retains_child_history()
     assert!(historical.checkout_archived);
     assert_eq!(historical.parent_project_id.as_deref(), Some("root"));
     assert!(
-        Command::new("git")
+        !Command::new("git")
             .arg("-C")
             .arg(&repo)
             .args(["show-ref", "--verify", "refs/heads/feature/sidebar"])
             .status()?
-            .success()
+            .success(),
+        "the branch adds nothing to main and should leave with the checkout"
     );
     Ok(())
 }
@@ -1086,7 +1087,7 @@ fn legacy_worker_app_managed_record_migrates_with_matching_git_evidence()
 
     client.remove_worktree(&worker_id, false)?;
     assert!(!checkout.exists());
-    assert!(git_ref_exists(&repo, "refs/heads/feature/legacy-worker")?);
+    assert!(!git_ref_exists(&repo, "refs/heads/feature/legacy-worker")?);
     let archived = client
         .bootstrap()?
         .projects
@@ -1167,7 +1168,7 @@ fn approved_pre_remove_hook_cleans_ignored_cache_before_final_cleanliness_check(
     client.approve_worktrunk_hook(&child.project_id, "pre-remove", None, hook)?;
     client.remove_worktree(&child.project_id, false)?;
     assert!(!checkout.exists());
-    assert!(git_ref_exists(
+    assert!(!git_ref_exists(
         &repo,
         "refs/heads/feature/pre-remove-cleanup"
     )?);

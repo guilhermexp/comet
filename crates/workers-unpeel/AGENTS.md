@@ -24,6 +24,8 @@ internal host modes (`__session_host__` et al.).
 | `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
 | `project_ledger.rs` | Historical project metadata, grouped Settings catalog and persistent Forget suppression |
 | `checkout_lifecycle.rs` | Shared Chat/Workers worktree creation, guarded physical removal, stale registration pruning, archive/restore and action coordination |
+| `copy_ignored.rs` | Opt-in `.worktreeinclude` copy of Git-ignored files during shared checkout preparation, with reflink and no overwrite |
+| `branch_cleanup.rs` | Conservative local branch cleanup after a proven owned checkout is removed; integrated-only decision and old-OID compare-and-swap |
 | `worktree_ownership.rs` | Canonical worktree root and durable Git identity/ownership journal; path prefix and branch name never grant deletion rights |
 | `checkout_activity.rs` | Device-local reservations for Chat runs, preparation and Worker starts; an expired lease stays busy until reconciled |
 | `worktrunk_hooks.rs`, `worktrunk_lifecycle.rs`, `worktrunk_approvals.rs` | Supported `.config/wt.toml` start/remove hooks, bounded execution, per-command local approvals and background logs |
@@ -471,7 +473,11 @@ zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
   um Chat em `cwd` ainda ausente, a reserva examina o ancestral existente mais
   próximo: prende um worktree linkado que contenha o futuro diretório e não
   impede o run em uma pasta comum ainda não criada.
-- **Preparo e hooks:** `.comet/worktree.json`/`.cursor/worktrees.json` e os
+- **Preparo e hooks:** `.worktreeinclude`, quando existe no checkout principal,
+  seleciona apenas arquivos ignorados pelo Git para copiar antes do setup.
+  Destino existente não é sobrescrito; falha mantém o checkout pendente para
+  retry. Esses caches continuam sujeitos à regra de remoção limpa, então um
+  `pre-remove` aprovado pode limpá-los. `.comet/worktree.json`/`.cursor/worktrees.json` e os
   hooks suportados de `.config/wt.toml` rodam após criação; falha mantém o
   checkout e o próximo pedido retenta no mesmo caminho antes de executar o
   agente. Aprovação local é por comando e identidade do repositório; mudança
@@ -481,6 +487,12 @@ zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
   continuação de linha por backslash antes da execução, em vez de inserir
   valores sem escape. Remoção sem hooks exige
   ação explícita, mas não pula posse, atividade ou limpeza.
+- **Branch integrada é limpa depois do checkout:** a remoção física continua
+  exigindo posse, árvore limpa e ausência de execução. Depois de remover o
+  worktree, `branch_cleanup` tenta apagar apenas a branch local comprovadamente
+  integrada à padrão, sem tocar a default, refs simbólicas, refs remotas ou branches ocupadas.
+  Uma transação `git update-ref --stdin` verifica os OIDs da branch e da ref padrão usada como prova antes da deleção; falha conserva a branch
+  e não reverte a remoção já concluída. Prune de leaf ausente nunca apaga branch.
 - **Chat com nome gerado cria exclusivamente.** `PendingChatCheckout` mantém a
   reserva `Preparing` enquanto a engine persiste `cwd`/branch. A API
   `create_new_checkout_for_chat_unprepared` verifica branch e path sob
@@ -555,7 +567,7 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (criação/preparo Chat e Workers), `src/checkout_lifecycle.rs`, `src/checkout_activity.rs`, `src/worktree_ownership.rs`, `src/worktrunk_{hooks,lifecycle,approvals}.rs`, `src/worktree_config.rs` (setup e retries) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (criação/preparo Chat e Workers), `src/checkout_lifecycle.rs`, `src/checkout_activity.rs`, `src/worktree_ownership.rs`, `src/copy_ignored.rs`, `src/branch_cleanup.rs`, `src/worktrunk_{hooks,lifecycle,approvals}.rs`, `src/worktree_config.rs` (setup e retries) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/hook_migration.rs`, `src/activity_bridge.rs`, `src/resources.rs`, `src/session_event_journal.rs`, `src/project_ledger.rs`, `src/project_git.rs` | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
 | `tests/controller_mcp.rs` — Comet-owned MCP surface, including `launch_worker.new_worktree` validation and recoverable launch failures | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
