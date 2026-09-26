@@ -24,7 +24,7 @@ mod worktrunk_hooks;
 mod worktrunk_lifecycle;
 
 pub use checkout_activity::{
-    ActivityKind, CheckoutActivityReservation, reserve_chat_run, reserve_terminal,
+    ActivityKind, CheckoutActivityReservation, PendingRelease, reserve_chat_run, reserve_terminal,
 };
 pub use controller_mcp::{
     CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,

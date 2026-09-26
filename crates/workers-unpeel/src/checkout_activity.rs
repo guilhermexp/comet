@@ -9,7 +9,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -75,16 +75,27 @@ impl Drop for CheckoutActivityReservation {
 }
 
 impl CheckoutActivityReservation {
-    /// Release during an orderly process shutdown, waiting (bounded) until the
-    /// durable entry is gone so a quitting process does not leave it behind.
-    pub fn release_and_wait(self, timeout: Duration) {
+    /// Start releasing during an orderly process shutdown. Callers release
+    /// every reservation first, then wait on all of them against one deadline.
+    pub fn begin_release(self) -> PendingRelease {
         let (acknowledge, released) = mpsc::channel();
-        if self
-            .release
-            .send(LeaseMessage::Release(Some(acknowledge)))
-            .is_ok()
-        {
-            let _ = released.recv_timeout(timeout);
+        PendingRelease(
+            self.release
+                .send(LeaseMessage::Release(Some(acknowledge)))
+                .is_ok()
+                .then_some(released),
+        )
+    }
+}
+
+/// A release whose durable entry may still be on disk.
+pub struct PendingRelease(Option<mpsc::Receiver<()>>);
+
+impl PendingRelease {
+    /// Wait until the entry is gone or `deadline` passes, whichever is first.
+    pub fn wait_until(self, deadline: Instant) {
+        if let Some(released) = self.0 {
+            let _ = released.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         }
     }
 }
@@ -585,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn release_and_wait_removes_the_entry_before_returning() {
+    fn completed_release_removes_the_entry_before_returning() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("activity.json");
         let lock_file = temp.path().join("actions.lock");
@@ -601,9 +612,58 @@ mod tests {
             .unwrap(),
         };
 
-        reservation.release_and_wait(Duration::from_secs(5));
+        reservation
+            .begin_release()
+            .wait_until(Instant::now() + Duration::from_secs(5));
 
         assert!(!read(&file).unwrap().entries.contains_key("terminal"));
+    }
+
+    #[test]
+    fn blocked_releases_share_one_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("activity.json");
+        let lock_file = temp.path().join("actions.lock");
+        let held = lock_action_file(&lock_file).unwrap();
+        let pending = (0..4)
+            .map(|index| {
+                let operation = format!("terminal-{index}");
+                let lease =
+                    begin_at(&file, &operation, temp.path(), ActivityKind::Terminal).unwrap();
+                CheckoutActivityReservation {
+                    release: start_lease_worker_at(
+                        file.clone(),
+                        lock_file.clone(),
+                        operation,
+                        lease,
+                        Duration::from_secs(60),
+                    )
+                    .unwrap(),
+                }
+                .begin_release()
+            })
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        for release in pending {
+            release.wait_until(deadline);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "waiting took {:?}",
+            started.elapsed()
+        );
+
+        drop(held);
+        let settle = Instant::now() + Duration::from_secs(5);
+        while !read(&file).unwrap().entries.is_empty() {
+            assert!(
+                Instant::now() < settle,
+                "released entries must still be removed"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
