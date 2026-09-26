@@ -231,7 +231,7 @@ Test: integration — preset válido e falha injetada na inicialização do host
 
 ### Requirement: Arquivos ignorados escolhidos pelo projeto acompanham um checkout novo
 
-Quando `.worktreeinclude` existe no checkout principal, o serviço comum SHALL copiar para um checkout novo somente arquivos ignorados pelo Git que casem com os padrões do arquivo. Sem `.worktreeinclude`, a cópia SHALL ser omitida. Arquivos rastreados, metadados de VCS, worktrees aninhados e caminhos que saiam das raízes SHALL NOT ser copiados. Um destino existente SHALL NOT ser sobrescrito. A cópia SHALL tentar reflink e usar cópia comum quando o sistema de arquivos não oferecer reflink. Falha de cópia SHALL manter o checkout e sua associação, bloquear o primeiro run e permitir retry de preparo no mesmo caminho.
+Quando `.worktreeinclude` existe no checkout principal, o serviço comum SHALL copiar para um checkout novo somente arquivos ignorados pelo Git que casem com os padrões do arquivo. Sem `.worktreeinclude`, a cópia SHALL ser omitida. Arquivos rastreados, metadados de VCS, worktrees aninhados e caminhos que saiam das raízes SHALL NOT ser copiados. Um destino existente SHALL NOT ser sobrescrito. A cópia SHALL tentar reflink e usar cópia comum quando o sistema de arquivos não oferecer reflink. Falha de cópia SHALL manter o checkout e sua associação, bloquear o primeiro run e permitir retry de preparo no mesmo caminho. Symlinks e caminhos inseguros selecionados SHALL NOT ser copiados; quando algum é pulado, o Chat SHALL exibir um aviso de cópia incompleta, inclusive junto de uma falha de setup e no retry.
 
 #### Scenario: Cache selecionado chega ao checkout novo
 Test: unit — `chat_and_workers_copy_only_selected_gitignored_files_before_setup` e `copy_ignored::tests::copies_only_included_ignored_files_from_the_principal_worktree` em repositórios temporários.
@@ -247,6 +247,13 @@ Test: unit — `copy_ignored::tests::rerun_preserves_existing_destination_conten
 - **WHEN** o preparo é repetido no mesmo checkout
 - **THEN** o arquivo preexistente mantém seu conteúdo
 - **AND** apenas arquivos elegíveis ausentes são copiados
+
+#### Scenario: Entrada pulada fica visível
+Test: unit — `copy_ignored::tests::skipped_symlinks_are_counted_but_unselected_files_are_not`, `skipped_copy_warning_is_visible_after_successful_setup` e `run_with_worktree_spec_materializes_on_host_and_reuses`.
+
+- **WHEN** `.worktreeinclude` seleciona um diretório que contém symlink
+- **THEN** o symlink não é copiado
+- **AND** o Chat mostra o aviso mesmo que o setup falhe ou seja repetido
 
 #### Scenario: Sem opt-in não há cópia
 Test: unit — `absent_worktreeinclude_does_not_copy_ignored_files`.
