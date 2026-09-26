@@ -10,7 +10,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 ## Stack
 
-- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,preview}` + `apps/zeron` (membro padrão do workspace).
+- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,sessions-mcp,preview}` + `apps/zeron` (membro padrão do workspace).
 - **UI = gpui**, snapshot vendorizado de `zeronsh/zui` em `third_party/zui` (Apache-2.0; proveniência em `third_party/zui-upstream.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
 - **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres nem Hono server. Sync não usa WebRTC; previews de servidores usam RTC autenticado por PreviewRoom.
@@ -25,6 +25,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Dev nativo (macOS com identidade Zeron) | `cargo run` |
 | Suite completa | `cargo test --workspace` |
 | Testes de uma crate | `cargo test -p zeron-ui` |
+| Verificação Cargo local no macOS/Linux | `scripts/cargo-verify.py -- cargo test -p zeron-ui` |
 | Formatação (obrigatória antes de merge do upstream) | `cargo fmt --all` |
 | Demo local offline (harness mock, seeded) | `scripts/dev-demo.sh` (`--slow` pra ver streaming) |
 | Smoke e2e | `scripts/e2e-smoke.sh` |
@@ -35,7 +36,7 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 
 ## Remotes e publicação
 
-- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/comet` (terceiro, MIT).
+- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/zeron` (terceiro, MIT; renomeado de `zeronsh/comet`). O upstream reassinou o histórico em set/2026: o último sync de ancestralidade é o merge de `d721f301` (v0.2.83) em `sync/upstream-v0.2.83`.
 - **Nunca pushar para o upstream.** Qualquer push vai pro fork.
 - `gh` resolve pro upstream por default: **sempre passar `-R guilhermexp/comet`** em `gh run list`, `gh release view`, etc.
 - `.github/workflows/{deploy,release}.yml` são herdados do upstream: `deploy` publica o Worker Cloudflare em push na `main` que toque `edge/`; `release` dispara em tag `v*` e publica no R2. **Não pushar tag `v*` no fork sem entender o efeito.**
@@ -43,7 +44,8 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 
 ## Gotchas duráveis
 
-- **Worktrees de verificação usam `target` próprio.** Não compartilhar `CARGO_TARGET_DIR` entre checkouts com fontes diferentes: o Cargo pode reutilizar artefatos locais stale e acusar tipos ausentes que já existem no fonte. Se ocorrer, limpar somente a crate afetada (`cargo clean -p <crate>`) e reconstruir no checkout de execução.
+- **Verificações Cargo locais no macOS/Linux usam `scripts/cargo-verify.py -- <comando>`.** O wrapper impede verificações simultâneas entre checkouts, usa um `CARGO_TARGET_DIR` temporário isolado, limita os jobs a 4 por padrão, recusa começar com menos de 60 GiB livres, interrompe se cair abaixo de 20 GiB e remove o target ao terminar ou receber SIGINT/SIGTERM/SIGHUP. Se o wrapper levar SIGKILL, um watchdog derruba o grupo do Cargo e a próxima execução remove o target órfão. Agrupar testes da mesma rodada em uma invocação (`scripts/cargo-verify.py -- bash -c 'cargo test -p zeron-engine && cargo test -p zeron-ui'`) para reutilizar a compilação dentro dela. Vale também para testes locais durante o no-mistakes; CI remoto e Windows seguem os comandos Cargo da tabela. `cargo run` do app de desenvolvimento continua usando o target incremental normal. Não compartilhar um target persistente entre checkouts com fontes diferentes: isso pode reutilizar artefatos stale.
+- **No macOS, rode um único gate `no-mistakes` com testes Rust por vez.** Cada run tem um checkout/target próprio, e dois runs simultâneos podem somar dezenas de gigabytes mesmo quando cada um limpa no fim. Antes de abrir outro gate, aguarde o primeiro terminar e confira o espaço livre. Não rode testes Cargo manuais em paralelo com o gate.
 
 - **`cargo run` usa o checkout atual do Comet e o OMP instalado.** Não impor OMP de fonte em `.cargo/config.toml`: desenvolvimento com o checkout irmão é opt-in via `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` (contrato em `scripts/AGENTS.md`). Outro worktree tem código e binário próprios; executar ali não inclui mudanças locais deste checkout.
 
@@ -94,7 +96,7 @@ Suítes canônicas por superfície (detalhe e matriz `Test:` ficam no `AGENTS.md
 
 | Superfície | Comando |
 |---|---|
-| Workspace Rust | `cargo test --workspace` |
+| Workspace Rust | `cargo test --workspace` (no macOS/Linux local: `scripts/cargo-verify.py -- cargo test --workspace`) |
 | Edge Cloudflare | `npm -C edge run test` (unit + workerd) |
 | Cliente iOS | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=<device do runtime instalado>'` |
 | Fluxo headed/headless | `scripts/e2e-smoke.sh` |

@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "6804915f2a7d15031d82a1147a812203cbac93e9"
+vendored_tree = "c0e0d0ca0b2d6d0c4cf2042551f58c185990f3a2"
 vendored_from = "working-tree"
 local_modifications_count = 31
 local_deletions = ["apps/website"]
@@ -60,3 +60,10 @@ base_revision_resolves_upstream = false
 # 2026-09-22 — session_host initializes the PTY and terminal viewport with the
 # same launch geometry. A fixed 80x24 viewport lost final answers emitted by a
 # 120x40 worker before desktop attach. Proven via the Comet adapter and real OMP.
+#
+# 2026-09-24 — Host create accepts an optional `title` (whitespace-collapsed,
+# control characters rejected, ≤256 bytes) that becomes the Session label with
+# custom_title. Without it, native startup — which never crosses the PTY prompt
+# auto-title — labels the Session from the briefing's first line via
+# normalize_prompt_title. Workers launched after 2026-09-22 were all titled by
+# their bare command. Change lives in controller_api.rs.

@@ -99,7 +99,7 @@ redirects, WebSocket traffic, and a real WebRTC pair in both directions.
 
 `npm --prefix edge test` includes real workerd tests for room isolation,
 organization authorization, stamped signaling, disconnect cleanup and binary
-traffic rejection. Local evidence and any unexecuted platform gates are recorded in the adoption change validation report.
+traffic rejection. CI runs networking tests on Linux and macOS. Local evidence and any unexecuted platform gates are recorded in the adoption change validation report.
 
 Build `cargo build -p zeron --bin preview-fixture --features browser-fixture`.
 Run the fixture with an output directory, an available display and `VITE_BINARY`

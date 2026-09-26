@@ -17,6 +17,7 @@ fn run_request_attachments_survive_command_round_trip() {
         auto_approve: true,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         attachments: vec!["/tmp/a.png".into()],
         worktree: None,
         resume: None,

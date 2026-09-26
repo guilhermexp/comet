@@ -139,6 +139,10 @@ pub struct Repos {
 }
 
 impl Repos {
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.inner.data_dir
+    }
+
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
     /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
@@ -448,8 +452,8 @@ impl Repos {
             let is_untracked = files.iter().any(|file| {
                 let reported = file.path.trim_end_matches('/');
                 (reported == path.as_str() || file.path == *path)
-                    && (file.index == zeron_proto::GitFileStatus::Untracked
-                        || file.worktree == zeron_proto::GitFileStatus::Untracked)
+                    && (file.index == zeron_proto::GitStatusCode::Untracked
+                        || file.worktree == zeron_proto::GitStatusCode::Untracked)
             });
             if is_untracked {
                 untracked.push(path.clone());

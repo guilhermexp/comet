@@ -15,6 +15,10 @@
 //!   completion.
 
 pub(crate) mod inline_chips;
+mod link_destination;
+mod link_interaction;
+mod link_presentation;
+pub mod links;
 pub mod mend;
 pub mod parser;
 pub mod render;
@@ -22,3 +26,5 @@ pub mod selection;
 pub mod veil;
 
 pub use parser::{Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full};
+
+pub mod mermaid;

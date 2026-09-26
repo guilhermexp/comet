@@ -347,6 +347,9 @@ pub fn project_label(cwd: Option<&str>) -> String {
     let Some(cwd) = cwd.map(str::trim).filter(|c| !c.is_empty()) else {
         return "No project".to_string();
     };
+    if matches!(cwd, "~" | "~/") {
+        return "No project".to_string();
+    }
     std::path::Path::new(cwd.trim_end_matches(['/', '\\']))
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -488,6 +491,11 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
                     "Workers",
                     workers_chip_detail(input.as_ref()).unwrap_or_else(|| tool.clone()),
                 )
+            } else if tool == "sessions" || server == "comet-sessions" {
+                (
+                    "Sessions",
+                    sessions_chip_detail(input.as_ref()).unwrap_or_else(|| tool.clone()),
+                )
             } else {
                 ("MCP", format!("{server} · {tool}"))
             }
@@ -592,6 +600,26 @@ fn eval_chip_detail(input: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+fn sessions_chip_detail(input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    let action = input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|action| !action.is_empty())?;
+    let target = ["space_id", "chat_id"].into_iter().find_map(|key| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    Some(match target {
+        Some(target) => format!("{action} {target}"),
+        None => action.to_owned(),
+    })
+}
+
 fn workers_chip_detail(input: Option<&serde_json::Value>) -> Option<String> {
     let input = input?;
     let action = input
@@ -672,6 +700,11 @@ pub fn tool_presentation(
             if tool == "workers" || server == "comet-workers" =>
         {
             "Called workers"
+        }
+        (ToolCall::Mcp { tool, server, .. }, _)
+            if tool == "sessions" || server == "comet-sessions" =>
+        {
+            "Sessions"
         }
         (ToolCall::Mcp { .. }, false) => "Calling tool",
         (ToolCall::Mcp { .. }, true) => "Called tool",
@@ -910,6 +943,20 @@ mod tool_presentation_tests {
         assert_eq!(workers_active.detail, "wait_for_status worker-1");
         let workers_done = tool_presentation(&workers, true, false);
         assert_eq!(workers_done.label, "Called workers");
+        let sessions = ToolCall::Mcp {
+            server: "comet-sessions".into(),
+            tool: "sessions".into(),
+            input: Some(serde_json::json!({
+                "action": "create",
+                "prompt": "secret prompt",
+                "space_id": "space-1",
+            })),
+        };
+        assert_eq!(
+            tool_chip_content(&sessions),
+            ("Sessions", "create space-1".into())
+        );
+        assert_eq!(tool_presentation(&sessions, false, false).label, "Sessions");
         assert_eq!(
             tool_chip_content(&workers),
             ("Workers", "wait_for_status worker-1".into())

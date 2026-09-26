@@ -59,6 +59,7 @@ fn run_request(prompt: &str) -> RunRequest {
         auto_approve: true,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -252,13 +253,13 @@ where
 /// self-started turn — the watchdog must settle it back to Idle.
 #[tokio::test]
 async fn parked_self_continuation_folds_and_requiesces() {
-    let rig = assemble("pull waku and benchmark it");
+    let rig = assemble("pull the app and benchmark it");
     rig.core
         .sessions
         .dispatch(
             CHAT,
             HarnessId::Mock,
-            run_request("pull waku and benchmark it"),
+            run_request("pull the app and benchmark it"),
             None,
         )
         .await
@@ -287,7 +288,7 @@ async fn parked_self_continuation_folds_and_requiesces() {
     // trip — the incident's came five minutes after the park).
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
-        .send(text("Build finished successfully. Launching Waku."))
+        .send(text("Build finished successfully. Launching the app."))
         .unwrap();
     wait_for(
         || status(&rig.core) == Some(SessionStatus::Working),
@@ -340,13 +341,13 @@ async fn parked_self_continuation_folds_and_requiesces() {
 /// — the watchdog settles it, and the answer text survives in the doc.
 #[tokio::test]
 async fn missing_turn_end_settles_instead_of_working_forever() {
-    let rig = assemble("pull waku and benchmark it");
+    let rig = assemble("pull the app and benchmark it");
     rig.core
         .sessions
         .dispatch(
             CHAT,
             HarnessId::Mock,
-            run_request("pull waku and benchmark it"),
+            run_request("pull the app and benchmark it"),
             None,
         )
         .await

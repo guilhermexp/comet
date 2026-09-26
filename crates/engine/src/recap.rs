@@ -411,6 +411,7 @@ pub async fn run_recap_model(
                 auto_approve: false,
                 enable_workers_mcp: false,
                 workers_parent_chat_id: None,
+                sessions: None,
                 attachments: Vec::new(),
                 resume: None,
                 worktree: None,
@@ -525,6 +526,7 @@ mod tests {
         assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
         assert!(!request.auto_approve);
         assert!(!request.enable_workers_mcp);
+        assert!(request.sessions.is_none());
         assert!(request.resume.is_none());
     }
 

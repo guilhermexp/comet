@@ -284,6 +284,8 @@ pub enum MessagePart {
         id: String,
         text: String,
     },
+    /// Model thinking. Streams through the doc `text` LoroText; parts written
+    /// by upstream builds in the dedicated `reasoning` field are read too.
     Reasoning {
         id: String,
         text: String,
@@ -820,10 +822,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     zeron_proto::DoneStatus::Errored => SubagentStatus::Failed,
                     _ => SubagentStatus::Done,
                 }),
-                // A steer RESURRECTS a settled chip — it announces more work
-                // (claude: a queued SendMessage relaunches the agent), so
-                // this is the one event allowed past the no-regress guard.
-                AgentEvent::UserMessage { .. } => Some(SubagentStatus::Running),
+                // A new assignment reopens a settled chip. Providers may
+                // announce it with user text or a confirmed turn boundary.
+                AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. } => {
+                    Some(SubagentStatus::Running)
+                }
                 _ => None,
             };
             for p in out.iter_mut() {
@@ -861,6 +864,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
+        | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. }
         | AgentEvent::UserMessage { .. }
         | AgentEvent::NativeTitle { .. } => {}
@@ -962,6 +966,7 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
 const HUB_INPUT_KEEP: [&str; 5] = ["op", "name", "to", "from", "application"];
 const SKILL_INPUT_KEEP: [&str; 3] = ["skill", "path", "name"];
 const EVAL_INPUT_KEEP: [&str; 2] = ["language", "title"];
+const SESSIONS_INPUT_KEEP: [&str; 3] = ["action", "space_id", "chat_id"];
 const WORKERS_INPUT_KEEP: [&str; 6] = [
     "action",
     "session_id",
@@ -993,6 +998,7 @@ fn chip_badge(call: &ToolCall) -> Option<serde_json::Value> {
         "eval" => &EVAL_INPUT_KEEP,
         kind if kind.eq_ignore_ascii_case("skill") => &SKILL_INPUT_KEEP,
         "workers" => &WORKERS_INPUT_KEEP,
+        "sessions" => &SESSIONS_INPUT_KEEP,
         _ => return None,
     };
     let mut kept = keep_short_strings(input, keys);
@@ -1738,6 +1744,30 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_sessions_create_drops_the_prompt() {
+        let call = ToolCall::Mcp {
+            server: "comet-sessions".into(),
+            tool: "sessions".into(),
+            input: Some(serde_json::json!({
+                "action": "create",
+                "prompt": "private prompt",
+                "space_id": "space-1",
+                "chat_id": "child-1",
+                "model": "secret-model"
+            })),
+        };
+        let clean = sanitize_tool_call(&call);
+        let ToolCall::Mcp { input, .. } = &clean else {
+            panic!("MCP call");
+        };
+        assert_eq!(
+            input.as_ref().unwrap(),
+            &serde_json::json!({"action":"create", "space_id":"space-1", "chat_id":"child-1"})
+        );
+        assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    #[test]
     fn sanitize_workers_launch_keeps_preset_identity_without_briefing() {
         let call = ToolCall::Mcp {
             server: "comet-workers".into(),
@@ -2435,6 +2465,24 @@ mod tests {
             } => assert_eq!(*subagent_status, Some(SubagentStatus::Done)),
             other => panic!("{other:?}"),
         }
+        // A confirmed follow-up can reopen the same chip without user text.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: None,
+                }),
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                subagent_status: Some(SubagentStatus::Running),
+                ..
+            }
+        ));
         // Content never leaked into the parent parts.
         assert_eq!(parts.len(), 1);
     }

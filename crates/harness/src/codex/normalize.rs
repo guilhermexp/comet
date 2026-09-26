@@ -417,6 +417,16 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
         // child's own traffic routes separately (see `route_child_notification`
         // in mod.rs); this is only the spawn tool call the chip folds from.
         "subAgentActivity" | "sub_agent_activity" => {
+            // A lifecycle marker is not another spawn. Only started/spawned
+            // may open a chip; a completion frame (fork contract, see
+            // `Subagents::parent_item`, which rewrites the id to the first
+            // spawn's owner) may also carry completed/failed/errored to close it.
+            let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+            let opens = matches!(kind, "started" | "spawned");
+            let closes = matches!(kind, "completed" | "failed" | "errored");
+            if !(opens || (phase == Phase::Completed && closes)) {
+                return Vec::new();
+            }
             let name = str_field(item, &["agentPath"])
                 .rsplit('/')
                 .find(|s| !s.is_empty())
@@ -495,6 +505,9 @@ impl ChildStream {
             }
             if self.settled {
                 self.settled = false;
+                // v2 followup_task starts a new child turn without echoing a
+                // userMessage. Reopen the existing document without inventing
+                // a user prompt or attributing an activity id as a new spawn.
                 return vec![AgentEvent::Steered {
                     assistant_message_id: None,
                     next_assistant_message_id: None,
@@ -667,7 +680,7 @@ pub(crate) fn route_child_notification(method: &str) -> ChildRoute {
         | "turn/aborted"
         | "error"
         | "thread/closed" => ChildRoute::Subagent,
-        // Child turn/status bookkeeping with no subagent meaning: consumed
+        // Child status bookkeeping with no subagent meaning: consumed
         // so it can never settle the PARENT turn (the exact bug class the
         // explicit table exists for).
         "thread/status/changed"
@@ -924,6 +937,72 @@ mod tests {
     }
 
     #[test]
+    fn v1_spawns_and_controls_have_distinct_roles() {
+        for tool in ["spawnAgent", "spawn_agent"] {
+            let mut item = json!({"type":"collabAgentToolCall", "id":"spawn", "tool":tool,
+                "status":"completed", "receiverThreadIds":["child"], "model":"child-model"});
+            assert_eq!(collab_spawn_child(&item), Some("child"));
+            let events = map_item(Phase::Completed, &item);
+            assert!(matches!(&events[0], AgentEvent::ToolCall { call, .. }
+                if call.is_subagent_spawn() && call.subagent_model() == Some("child-model")));
+            assert!(matches!(
+                &events[1],
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            ));
+            item["status"] = "failed".into();
+            assert_eq!(collab_spawn_child(&item), None);
+            assert!(matches!(
+                map_item(Phase::Completed, &item).last(),
+                Some(AgentEvent::ToolResult { is_error: true, .. })
+            ));
+        }
+        for tool in [
+            "sendInput",
+            "send_input",
+            "wait",
+            "closeAgent",
+            "resumeAgent",
+            "futureControl",
+        ] {
+            let item = json!({"type":"collabAgentToolCall", "id":"control", "tool":tool,
+                "receiverThreadIds":["child"]});
+            assert_eq!(collab_spawn_child(&item), None);
+            assert!(
+                matches!(&map_item(Phase::Started, &item)[0], AgentEvent::ToolCall { call, .. } if !call.is_subagent_spawn())
+            );
+        }
+        for receivers in [json!([]), json!(["one", "two"]), json!([""])] {
+            assert_eq!(
+                collab_spawn_child(
+                    &json!({"type":"collabAgentToolCall", "tool":"spawnAgent", "receiverThreadIds":receivers})
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn activity_updates_are_not_spawns_in_either_item_phase() {
+        for kind in ["interacted", "futureActivity"] {
+            let item = json!({"type":"subAgentActivity", "id":"activity", "kind":kind,
+                "agentThreadId":"child", "agentPath":"/root/alpha"});
+            assert!(map_item(Phase::Started, &item).is_empty());
+            assert!(map_item(Phase::Completed, &item).is_empty());
+        }
+        // Terminal kinds never open a chip; on completion they close the
+        // original one (the fork's `parent_item` retargets the id).
+        for kind in ["completed", "failed", "errored"] {
+            let item = json!({"type":"subAgentActivity", "id":"activity", "kind":kind,
+                "agentThreadId":"child", "agentPath":"/root/alpha"});
+            assert!(map_item(Phase::Started, &item).is_empty());
+            assert!(!map_item(Phase::Completed, &item).is_empty());
+        }
+    }
+
+    #[test]
     fn sub_agent_activity_maps_to_a_named_parent_chip() {
         let started = map_item(
             Phase::Started,
@@ -1014,45 +1093,42 @@ mod tests {
         assert_eq!(turn_error_message(&json!({"turn": {"id": "t"}})), None);
         assert_eq!(turn_error_message(&json!({"turn": {"error": null}})), None);
     }
+}
+
+#[cfg(test)]
+mod generated_image_tests {
+    use super::*;
+    use serde_json::json;
 
     #[test]
-    fn image_generation_uses_saved_path_without_forwarding_inline_payload() {
+    fn image_generation_lifecycle_ignores_inline_result_and_preserves_ids() {
         for (kind, path_key) in [
             ("imageGeneration", "savedPath"),
             ("image_generation", "saved_path"),
         ] {
-            let mut item = json!({
-                "id": "img-1",
-                "type": kind,
-                "status": "completed",
-                "result": "INLINE_IMAGE_SENTINEL".repeat(20_000),
-                "revisedPrompt": "private prompt",
-                "failure": null
-            });
-            item[path_key] = "/codex/generated_images/picture.png".into();
-
+            let mut item = json!({"id":"img-1", "type":kind, "status":"completed", "result":"INLINE_IMAGE_SENTINEL".repeat(200_000), "revisedPrompt":"private prompt", "failure":null});
+            item[path_key] = json!("/codex/generated_images/picture.png");
             let started = map_item(Phase::Started, &item);
-            assert!(matches!(
-                started.as_slice(),
-                [AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, input: None } }]
-                    if id == "img-1" && name == "Generate image"
-            ));
-
+            assert_eq!(
+                started,
+                vec![AgentEvent::ToolCall {
+                    id: "img-1".into(),
+                    call: ToolCall::Unknown {
+                        name: "Generate image".into(),
+                        input: None
+                    }
+                }]
+            );
             let completed = map_item(Phase::Completed, &item);
             assert_eq!(completed.len(), 3);
-            assert!(matches!(
-                &completed[1],
-                AgentEvent::ToolResult { id, is_error: false, output: None, .. }
-                    if id == "img-1"
-            ));
-            assert!(matches!(
-                &completed[2],
-                AgentEvent::GeneratedImage { id, path, name, .. }
-                    if id == "img-1:image"
-                        && path == "/codex/generated_images/picture.png"
-                        && name == "picture.png"
-            ));
-
+            assert_eq!(completed[0], started[0]);
+            assert!(
+                matches!(&completed[1], AgentEvent::ToolResult { id, is_error: false, output: None, .. } if id == "img-1")
+            );
+            assert!(
+                matches!(&completed[2], AgentEvent::GeneratedImage { id, path, name, .. } if id == "img-1:image" && path == "/codex/generated_images/picture.png" && name == "picture.png")
+            );
+            assert_eq!(map_item(Phase::Completed, &item), completed);
             let wire = serde_json::to_string(&completed).unwrap();
             assert!(wire.len() < 500);
             assert!(!wire.contains("INLINE_IMAGE_SENTINEL"));
@@ -1061,36 +1137,31 @@ mod tests {
     }
 
     #[test]
-    fn image_generation_failures_close_the_tool_without_publishing_an_image() {
+    fn image_generation_errors_resolve_the_chip_without_an_image() {
         for (extra, expected) in [
             (
-                json!({"failure": {"type": "usageLimitExceeded"}}),
+                json!({"failure":{"type":"usageLimitExceeded"}, "savedPath":"/must/not/use.png"}),
                 "Image generation usage limit exceeded",
             ),
             (
-                json!({"failure": {"type": "futureFailure", "message": "untrusted"}}),
+                json!({"failure":{"type":"futureFailure","message":"untrusted payload"}}),
                 "Image generation failed",
             ),
             (
-                json!({"status": "failed", "savedPath": "/must/not/use.png"}),
+                json!({"status":"failed", "savedPath":"/must/not/use.png"}),
                 "Image generation failed",
             ),
             (
-                json!({"savedPath": null}),
+                json!({"savedPath":null}),
                 "Image generation completed without a saved file",
             ),
             (
-                json!({"savedPath": "  "}),
+                json!({"savedPath":"  "}),
                 "Image generation completed without a saved file",
             ),
             (json!({}), "Image generation completed without a saved file"),
         ] {
-            let mut item = json!({
-                "type": "imageGeneration",
-                "id": "img-1",
-                "status": "completed",
-                "result": "INLINE_SENTINEL"
-            });
+            let mut item = json!({"type":"imageGeneration", "id":"i", "status":"completed", "result":"INLINE_SENTINEL"});
             item.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());

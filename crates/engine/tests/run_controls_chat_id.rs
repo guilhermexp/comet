@@ -139,6 +139,7 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
                 auto_approve: true,
                 enable_workers_mcp: false,
                 workers_parent_chat_id: None,
+                sessions: None,
                 attachments: Vec::new(),
                 worktree: None,
                 resume: None,

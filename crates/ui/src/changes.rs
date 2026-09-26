@@ -11,9 +11,9 @@
 //!   hunk header, and diff line is its own row (the flat model Zed's editor
 //!   uses for its project diff: only the visible slice materializes, and a
 //!   collapsed file's body rows are removed from the list outright, not
-//!   hidden); each section collapses with a 180 ms height tween on a
+//!   hidden); nowrap sections collapse with a 180 ms height tween on a
 //!   clipped stand-in row (analytic heights, capped to what the clip can
-//!   reveal) and a 200 ms chevron transition;
+//!   reveal), while variable-height wrapped sections settle immediately;
 //! - syntax highlight reuses the markdown tokenizer per diff line, computed
 //!   time-sliced on the background executor and applied as paint-only run
 //!   colors (layout never changes);
@@ -28,6 +28,9 @@
 //!   Its left column is inert: notes are cited against the post-change file,
 //!   so only the right column takes a `+` (already-staged old-side notes
 //!   still show their cards).
+//! - long-line wrapping is a persisted toolbar choice. It only changes the
+//!   code plane: gutters, comment affordances, and sticky headers stay fixed,
+//!   while the virtual list measures each logical row's resulting height.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -38,11 +41,12 @@ use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, ListAlignment, ListState,
     SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
+use unicode_width::UnicodeWidthChar as _;
 
 use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
 use zeron_rpc::methods;
 
-use crate::comments::{self, CommentSide, DiffComment};
+use crate::comments::{self, CommentSide, ReviewComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{
     GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton, GitHistorySearchControl,
@@ -53,13 +57,13 @@ use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
-use comet_syntax::LanguageId as Lang;
+use zeron_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
 // ---------------------------------------------------------------------------
 
-pub const FILE_HEADER_HEIGHT: f32 = 36.0;
+pub const FILE_HEADER_HEIGHT: f32 = crate::surface_chrome::HEADER_HEIGHT;
 const STICKY_FILE_HEADER_BLUR: f32 = 16.0;
 /// Coverage of the theme's content-plane tint over the sticky header blur.
 /// Light needs substantially more coverage: dark text is much more vulnerable
@@ -84,12 +88,29 @@ pub const SPLIT_MARKER_WIDTH: f32 = 18.0;
 /// Hairline between the two split columns.
 pub const SPLIT_DIVIDER_WIDTH: f32 = 1.0;
 const DIFF_TEXT_SIZE: f32 = 12.0;
+const DIFF_TAB_SIZE: usize = 4;
+/// One shared `code_font_size` setting drives several surfaces that never
+/// agreed on a size historically. Each scales off its own baseline so the
+/// default setting reproduces the size that surface always had, and a
+/// user-chosen size moves them all while keeping those proportions.
+const DIFF_TEXT_SIZE_RATIO: f32 = DIFF_TEXT_SIZE / crate::typography::CODE_FONT_SIZE_DEFAULT;
+
+/// Size of the painted diff body text, and the size the column measurement in
+/// [`DiffHorizontalGeometry::resolve`] must use: they desync otherwise.
 fn diff_text_size(theme: &Theme) -> f32 {
-    DIFF_TEXT_SIZE * theme.code_font_size / crate::typography::CODE_FONT_SIZE_DEFAULT
+    crate::typography::clamp_font_size(theme.code_font_size * DIFF_TEXT_SIZE_RATIO)
 }
+
+/// The row box and the painted line box must agree, or code clips once the
+/// user moves the code font size off [`DIFF_TEXT_SIZE`].
 fn diff_line_height(theme: &Theme) -> f32 {
-    DIFF_LINE_HEIGHT * theme.code_font_size / crate::typography::CODE_FONT_SIZE_DEFAULT
+    diff_text_size(theme) * (DIFF_LINE_HEIGHT / DIFF_TEXT_SIZE)
 }
+
+const UNIFIED_CODE_PADDING_LEFT: f32 = 12.0;
+const SPLIT_CODE_PADDING_LEFT: f32 = 6.0;
+/// Breathing room after the widest source line when scrolled fully right.
+const CODE_PADDING_RIGHT: f32 = 24.0;
 
 /// How the diff is laid out. Persisted in `ui-settings.json` (`diffSplit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -164,8 +185,8 @@ pub struct SourceLineRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffHighlights {
-    pub old: Option<Arc<comet_syntax::HighlightedDocument>>,
-    pub new: Option<Arc<comet_syntax::HighlightedDocument>>,
+    pub old: Option<Arc<zeron_syntax::HighlightedDocument>>,
+    pub new: Option<Arc<zeron_syntax::HighlightedDocument>>,
 }
 
 impl DiffHighlights {
@@ -196,7 +217,7 @@ impl DiffHighlights {
         }
     }
 
-    pub fn spans(&self, line: &DiffLine) -> &[comet_syntax::HighlightSpan] {
+    pub fn spans(&self, line: &DiffLine) -> &[zeron_syntax::HighlightSpan] {
         let Some(source_ref) = self.source_ref(line) else {
             return &[];
         };
@@ -267,6 +288,134 @@ impl FileDiff {
 pub fn gutter_width(file: &FileDiff) -> f32 {
     let digits = file.max_line.max(1).ilog10() + 1;
     (digits as f32 * 6.6 + 8.0 + 6.0).max(GUTTER_WIDTH)
+}
+
+/// Width inputs that are independent of the active window's font metrics.
+/// They are computed once with the parsed patch, off the render path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DiffHorizontalGeometry {
+    max_code_columns: usize,
+    max_gutter_width: f32,
+}
+
+impl DiffHorizontalGeometry {
+    fn from_file(file: &FileDiff) -> Self {
+        let max_code_columns = file
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .map(|line| visual_columns(&line.text))
+            .max()
+            .unwrap_or(0);
+        let max_gutter_width = gutter_width(file);
+        Self {
+            max_code_columns,
+            max_gutter_width,
+        }
+    }
+}
+
+/// Measure the same runs the row paints. Color boundaries can break kerning
+/// and ligatures on native platforms even when every run uses the same font.
+fn max_shaped_text_width(
+    file: &FileDiff,
+    highlights: Option<&DiffHighlights>,
+    theme: &Theme,
+    text_system: &gpui::WindowTextSystem,
+) -> f32 {
+    let mono = font(theme.font_mono.clone());
+    let size = px(diff_text_size(theme));
+    let column_width = text_system
+        .ch_advance(text_system.resolve_font(&mono), size)
+        .unwrap_or(size * 0.6)
+        .as_f32();
+    file.hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .fold(0.0f32, |widest, line| {
+            let runs = line_runs(line, highlights, theme);
+            let shaped = text_system
+                .shape_line(line.text.clone().into(), size, &runs, None)
+                .width()
+                .as_f32();
+            // Preserve the old column estimate as a floor, including tab stops.
+            widest
+                .max(shaped)
+                .max(visual_columns(&line.text) as f32 * column_width)
+        })
+}
+
+/// Count terminal-style display columns, including tab stops and wide
+/// Unicode glyphs. This is only a floor; actual shaped runs determine the extent.
+fn visual_columns(text: &str) -> usize {
+    text.chars().fold(0usize, |columns, ch| {
+        if ch == '\t' {
+            columns + (DIFF_TAB_SIZE - columns % DIFF_TAB_SIZE)
+        } else {
+            columns + ch.width().unwrap_or(0)
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DiffHorizontalMetrics {
+    max_text_width: f32,
+    max_gutter_width: f32,
+}
+
+impl DiffHorizontalMetrics {
+    /// Compensating for the file-local gutter keeps every unified code
+    /// viewport's effective scroll range identical.
+    fn unified_content_width(self, gutter_width: f32) -> f32 {
+        self.max_text_width
+            + UNIFIED_CODE_PADDING_LEFT
+            + CODE_PADDING_RIGHT
+            + 2.0 * (self.max_gutter_width - gutter_width)
+    }
+
+    /// Split has one gutter per half. Both halves use this same extent so old
+    /// and new remain synchronized even when one side is a filler.
+    fn split_content_width(self, gutter_width: f32) -> f32 {
+        self.max_text_width
+            + SPLIT_CODE_PADDING_LEFT
+            + CODE_PADDING_RIGHT
+            + (self.max_gutter_width - gutter_width)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DiffCodeWidth {
+    /// Inline tool diffs keep their existing local clipping behavior.
+    Clipped,
+    /// Changes rows expose a stable intrinsic code width.
+    Scrollable(DiffHorizontalMetrics),
+    /// Changes rows consume their viewport width and grow vertically.
+    Wrapped,
+}
+
+#[derive(Clone)]
+struct DiffCodeScroll {
+    handle: gpui::ScrollHandle,
+    id: SharedString,
+}
+
+#[derive(Clone)]
+struct DiffCodeScrollContext {
+    handle: gpui::ScrollHandle,
+    prefix: SharedString,
+}
+
+impl DiffCodeScrollContext {
+    fn slot(&self, suffix: impl std::fmt::Display) -> DiffCodeScroll {
+        DiffCodeScroll {
+            handle: self.handle.clone(),
+            id: SharedString::from(format!("{}-{suffix}", self.prefix)),
+        }
+    }
+}
+
+fn reset_horizontal_scroll(handle: &gpui::ScrollHandle) {
+    handle.set_offset(gpui::Point::default());
 }
 
 fn strip_git_prefix(path: &str) -> &str {
@@ -509,18 +658,19 @@ pub fn truncate_file_lines(file: &mut FileDiff, max_lines: usize) {
 /// Analytic expanded-body height — drives the 180 ms fold tween without
 /// measurement.
 pub fn body_height(file: &FileDiff) -> f32 {
-    body_height_with(file, &[], None, DiffMode::Unified)
+    body_height_with(file, &[], None, DiffMode::Unified, DIFF_LINE_HEIGHT)
 }
 
 pub fn body_height_with(
     file: &FileDiff,
-    comments: &[DiffComment],
+    comments: &[ReviewComment],
     draft: Option<(CommentSide, u32)>,
     mode: DiffMode,
+    line_h: f32,
 ) -> f32 {
     body_rows(0, file, comments, draft, mode)
         .iter()
-        .map(|row| row.height(comments))
+        .map(|row| row.height(comments, line_h))
         .sum()
 }
 
@@ -858,8 +1008,14 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
     }
 }
 
-fn comment_state_key(comments: &[DiffComment], draft: Option<&(String, CommentSide, u32)>) -> u64 {
-    let mut parts: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
+fn comment_state_key(
+    comments: &[ReviewComment],
+    draft: Option<&(String, CommentSide, u32)>,
+) -> u64 {
+    let mut parts: Vec<String> = comments
+        .iter()
+        .flat_map(|comment| [comment.id.clone(), comment.body.clone()])
+        .collect();
     if let Some((path, side, line)) = draft {
         parts.push(format!("draft:{path}:{}:{line}", side.tag()));
     }
@@ -882,7 +1038,7 @@ fn excerpt_side(
     side: SourceSide,
     language: Lang,
     path: &str,
-) -> Option<Arc<comet_syntax::HighlightedDocument>> {
+) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
     let max_line = file
         .hunks
         .iter()
@@ -917,7 +1073,7 @@ fn excerpt_side(
             .map(|(_, text)| *text)
             .collect::<Vec<_>>()
             .join("\n");
-        let document = comet_syntax::highlight(comet_syntax::HighlightRequest {
+        let document = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
             source: &source,
             path: Some(path),
             fence_tag: None,
@@ -927,14 +1083,14 @@ fn excerpt_side(
             lines[number as usize - 1] = spans;
         }
     }
-    Some(Arc::new(comet_syntax::HighlightedDocument {
+    Some(Arc::new(zeron_syntax::HighlightedDocument {
         language,
         lines,
     }))
 }
 
 fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights> {
-    if !comet_syntax::supports_language(language) {
+    if !zeron_syntax::supports_language(language) {
         return None;
     }
     let old = if file.status == FileStatus::Added {
@@ -998,7 +1154,7 @@ fn full_highlights(
         return None;
     }
     let parse = |source: &str, path: &str| {
-        comet_syntax::highlight(comet_syntax::HighlightRequest {
+        zeron_syntax::highlight(zeron_syntax::HighlightRequest {
             source,
             path: Some(path),
             fence_tag: None,
@@ -1017,7 +1173,7 @@ fn full_highlights(
         Some(source) => Some(parse(source, &file.path)?),
         None => None,
     };
-    if old.is_none() && new.is_none() && comet_syntax::supports_language(language) {
+    if old.is_none() && new.is_none() && zeron_syntax::supports_language(language) {
         return None;
     }
     Some(DiffHighlights { old, new })
@@ -1027,6 +1183,71 @@ fn full_highlights(
 // Entity
 // ---------------------------------------------------------------------------
 
+struct MeasuredDiffWidth {
+    key: (u32, u32, u32, SharedString),
+    // Retaining the Arc makes pointer identity safe against allocator reuse.
+    highlights: Option<Arc<DiffHighlights>>,
+    width: f32,
+}
+
+struct FileHorizontalState {
+    geometry: DiffHorizontalGeometry,
+    scroll: gpui::ScrollHandle,
+    /// Shape once per file, typography/theme, and highlight revision.
+    measured: std::cell::RefCell<Option<MeasuredDiffWidth>>,
+}
+
+impl FileHorizontalState {
+    fn new(file: &FileDiff) -> Self {
+        Self {
+            geometry: DiffHorizontalGeometry::from_file(file),
+            scroll: gpui::ScrollHandle::new(),
+            measured: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn metrics(
+        &self,
+        file: &FileDiff,
+        highlights: Option<&Arc<DiffHighlights>>,
+        theme: &Theme,
+        text_system: &gpui::WindowTextSystem,
+        generation: u32,
+    ) -> DiffHorizontalMetrics {
+        let key = (
+            generation,
+            crate::theme::style_generation(),
+            diff_text_size(theme).to_bits(),
+            theme.font_mono.clone(),
+        );
+        let mut cached = self.measured.borrow_mut();
+        let current = cached.as_ref().is_some_and(|cached| {
+            cached.key == key
+                && match (cached.highlights.as_ref(), highlights) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                }
+        });
+        if !current {
+            *cached = Some(MeasuredDiffWidth {
+                key,
+                highlights: highlights.cloned(),
+                width: max_shaped_text_width(
+                    file,
+                    highlights.map(AsRef::as_ref),
+                    theme,
+                    text_system,
+                ),
+            });
+        }
+        DiffHorizontalMetrics {
+            max_text_width: cached.as_ref().unwrap().width,
+            max_gutter_width: self.geometry.max_gutter_width,
+        }
+    }
+}
+
 struct ParsedDiff {
     /// `checkout_id:checksum` — identity of the parsed content.
     key: String,
@@ -1034,6 +1255,8 @@ struct ParsedDiff {
     additions: u32,
     deletions: u32,
     file_count: usize,
+    /// Indexed like `files`; survives row virtualization and folding.
+    horizontal: Vec<FileHorizontalState>,
     files: Arc<Vec<FileDiff>>,
 }
 
@@ -1045,7 +1268,8 @@ struct ParsedDiff {
 /// its own row (Zed's editor draws exactly the visible line range the same
 /// way): scrolling a 10k-line file materializes ~50 line rows per frame, not
 /// one 10k-line element, and a collapsed file contributes no body rows at
-/// all. Heights are the analytic constants above — no measurement.
+/// all. Nowrap heights use the analytic constants above; wrapped line rows
+/// are measured by the list at the current pane width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffRow {
     FileHeader {
@@ -1096,18 +1320,28 @@ pub enum DiffRow {
 }
 
 impl DiffRow {
-    /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
-    /// height sum.
-    fn height(self, comments: &[DiffComment]) -> f32 {
-        self.height_with_line_height(comments, DIFF_LINE_HEIGHT)
+    fn file(self) -> usize {
+        match self {
+            Self::FileHeader { file }
+            | Self::Notice { file, .. }
+            | Self::HunkHeader { file, .. }
+            | Self::Line { file, .. }
+            | Self::SplitLine { file, .. }
+            | Self::CommentCard { file, .. }
+            | Self::CommentDraft { file }
+            | Self::BodyPad { file }
+            | Self::FoldingBody { file } => file as usize,
+        }
     }
 
-    fn height_with_line_height(self, comments: &[DiffComment], line_height: f32) -> f32 {
+    /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
+    /// height sum.
+    fn height(self, comments: &[ReviewComment], line_h: f32) -> f32 {
         match self {
             DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
             DiffRow::Notice { .. } => NOTICE_HEIGHT,
             DiffRow::HunkHeader { .. } => HUNK_HEADER_HEIGHT,
-            DiffRow::Line { .. } | DiffRow::SplitLine { .. } => line_height,
+            DiffRow::Line { .. } | DiffRow::SplitLine { .. } => line_h,
             DiffRow::CommentCard { card, .. } => comments
                 .get(card as usize)
                 .map(|comment| comments::card_height(&comment.body))
@@ -1129,20 +1363,20 @@ pub fn body_row_count(file: &FileDiff) -> usize {
 pub fn body_rows(
     file_ix: u32,
     file: &FileDiff,
-    comments: &[DiffComment],
+    comments: &[ReviewComment],
     draft: Option<(CommentSide, u32)>,
     mode: DiffMode,
 ) -> Vec<DiffRow> {
     fn push_cards(
         rows: &mut Vec<DiffRow>,
         file_ix: u32,
-        comments: &[DiffComment],
+        comments: &[ReviewComment],
         draft: Option<(CommentSide, u32)>,
         anchors: &[Option<(CommentSide, u32)>],
     ) {
         for anchor in anchors.iter().flatten() {
             for (ix, comment) in comments.iter().enumerate() {
-                if comment.anchor() == *anchor {
+                if comment.diff_anchor() == Some(*anchor) {
                     rows.push(DiffRow::CommentCard {
                         file: file_ix,
                         card: ix as u32,
@@ -1205,7 +1439,7 @@ pub fn body_rows(
 /// path's slice.
 pub fn flatten_rows(
     files: &[FileDiff],
-    comments: &[DiffComment],
+    comments: &[ReviewComment],
     draft: Option<(&str, CommentSide, u32)>,
     mode: DiffMode,
     mut collapsed: impl FnMut(usize) -> bool,
@@ -1216,9 +1450,9 @@ pub fn flatten_rows(
         let start = rows.len();
         rows.push(DiffRow::FileHeader { file: ix as u32 });
         if !collapsed(ix) {
-            let file_comments: Vec<DiffComment> = comments
+            let file_comments: Vec<ReviewComment> = comments
                 .iter()
-                .filter(|comment| comment.path == file.path)
+                .filter(|comment| !comment.is_file() && comment.path == file.path)
                 .cloned()
                 .collect();
             let file_draft = draft
@@ -1397,6 +1631,7 @@ struct HoverRow {
 }
 
 struct CommentDraft {
+    editing_id: Option<String>,
     /// Composer the note will stage onto, captured when the card opened. A
     /// draft belongs to the checkout it was written over, so it must not
     /// follow the user onto whatever chat is selected by commit time.
@@ -1444,6 +1679,8 @@ pub struct Changes {
     scope: DiffScope,
     /// Unified or side-by-side (toolbar toggle, persisted per user).
     mode: DiffMode,
+    /// Wrap long source lines instead of exposing the horizontal code plane.
+    wrap_lines: bool,
     /// Comparison ref for [`DiffScope::Branch`] — preset to the repo's
     /// default branch once the branch list lands.
     base_ref: Option<String>,
@@ -1484,15 +1721,36 @@ pub enum ChangesEvent {
 
 impl gpui::EventEmitter<ChangesEvent> for Changes {}
 
+struct DiffHeaderTooltip(&'static str);
+
+impl Render for DiffHeaderTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(self.0)
+    }
+}
+
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
-        let mode = DiffMode::from_split(crate::settings::current(cx).diff_split);
+        let settings = crate::settings::current(cx);
+        let mode = DiffMode::from_split(settings.diff_split);
         Self {
             typography_generation: crate::typography::generation(cx),
             state,
             explicit_cwd: None,
             mode,
+            wrap_lines: settings.diff_wrap,
             diffs: Vec::new(),
             started: false,
             error: None,
@@ -1926,9 +2184,18 @@ impl Changes {
         }));
     }
 
+    fn reset_horizontal_scroll(&self) {
+        if let Some(parsed) = &self.parsed {
+            for file in &parsed.horizontal {
+                reset_horizontal_scroll(&file.scroll);
+            }
+        }
+    }
+
     fn set_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
+            self.reset_horizontal_scroll();
             if scope == DiffScope::History {
                 self.history_pane(cx)
                     .update(cx, |history, cx| history.ensure_loaded(cx));
@@ -2106,6 +2373,7 @@ impl Changes {
                 } else {
                     files.len()
                 };
+                let horizontal = files.iter().map(FileHorizontalState::new).collect();
                 changes.folds.clear();
                 changes.highlights.clear();
                 let staged = changes.staged_comments(cx);
@@ -2123,9 +2391,10 @@ impl Changes {
                 // The uniform hint keeps offsets for never-rendered rows
                 // sane (most rows ARE lines); real heights land as rows
                 // render.
+                let row_height = px(diff_line_height(Theme::of(cx)));
                 changes
                     .list
-                    .reset_with_uniform_height(rows.len(), px(diff_line_height(Theme::of(cx))));
+                    .reset_with_uniform_height(rows.len(), row_height);
                 changes.rows = rows;
                 changes.row_ranges = ranges;
                 changes.parsed = Some(ParsedDiff {
@@ -2134,6 +2403,7 @@ impl Changes {
                     additions,
                     deletions,
                     file_count,
+                    horizontal,
                     files: Arc::new(files),
                 });
                 cx.notify();
@@ -2190,17 +2460,36 @@ impl Changes {
         let Some(file) = parsed.files.get(file_ix) else {
             return;
         };
-        let comments = self.comments_for(&file.path, cx);
-        let expanded_height: f32 = body_rows(
-            0,
+        if self.wrap_lines {
+            let collapsed = !self
+                .folds
+                .get(&file.path)
+                .is_some_and(|fold| fold.collapsed);
+            let body = if collapsed {
+                Vec::new()
+            } else {
+                body_rows(
+                    file_ix as u32,
+                    file,
+                    &self.comments_for(&file.path, cx),
+                    self.draft_anchor_in(&file.path),
+                    self.mode,
+                )
+            };
+            let fold = self.folds.entry(file.path.clone()).or_default();
+            fold.collapsed = collapsed;
+            fold.toggled_at = None;
+            self.replace_file_body(file_ix, body);
+            cx.notify();
+            return;
+        }
+        let expanded_height = body_height_with(
             file,
-            &comments,
+            &self.comments_for(&file.path, cx),
             self.draft_anchor_in(&file.path),
             self.mode,
-        )
-        .into_iter()
-        .map(|row| row.height_with_line_height(&comments, diff_line_height(Theme::of(cx))))
-        .sum();
+            diff_line_height(Theme::of(cx)),
+        );
         let fold = self.folds.entry(file.path.clone()).or_default();
         let currently_collapsed = fold.collapsed;
         fold.from = if currently_collapsed {
@@ -2330,9 +2619,9 @@ impl Changes {
                 0
             } else {
                 let file = &files[file_ix];
-                let comments: Vec<DiffComment> = staged
+                let comments: Vec<ReviewComment> = staged
                     .iter()
-                    .filter(|comment| comment.path == file.path)
+                    .filter(|comment| !comment.is_file() && comment.path == file.path)
                     .cloned()
                     .collect();
                 body_rows(
@@ -2368,10 +2657,38 @@ impl Changes {
     /// indices do not survive the re-pairing).
     fn toggle_mode(&mut self, cx: &mut Context<Self>) {
         self.mode = self.mode.toggled();
+        self.reset_horizontal_scroll();
         persist_split(self.mode.is_split(), cx);
         // A draft's `+` sits in a column that may not exist after the swap.
         self.hover = None;
         self.reflatten(cx);
+    }
+
+    fn toggle_wrap(&mut self, cx: &mut Context<Self>) {
+        self.wrap_lines = !self.wrap_lines;
+        self.reset_horizontal_scroll();
+        let wrap = self.wrap_lines;
+        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+            settings.diff_wrap = wrap;
+        });
+
+        // A folding stand-in has an analytic fixed-line height. Settle it
+        // before switching to variable-height rows; steady rows can then be
+        // measured by the virtual list at the current pane width.
+        let folding = self
+            .rows
+            .iter()
+            .any(|row| matches!(row, DiffRow::FoldingBody { .. }));
+        if folding {
+            self.fold_settle = None;
+            for fold in self.folds.values_mut() {
+                fold.toggled_at = None;
+            }
+            self.reflatten(cx);
+        } else {
+            self.list.remeasure();
+            cx.notify();
+        }
     }
 
     fn reflatten(&mut self, cx: &mut Context<Self>) {
@@ -2404,8 +2721,8 @@ impl Changes {
             self.mode,
             |ix| collapsed.get(ix).copied().unwrap_or(false),
         );
-        self.list
-            .reset_with_uniform_height(rows.len(), px(diff_line_height(Theme::of(cx))));
+        let row_height = px(diff_line_height(Theme::of(cx)));
+        self.list.reset_with_uniform_height(rows.len(), row_height);
         self.rows = rows;
         self.row_ranges = ranges;
         if let Some(start) = anchor_file
@@ -2418,15 +2735,25 @@ impl Changes {
     }
 
     /// Cloned because rendering borrows `self` mutably a moment later.
-    fn staged_comments(&self, cx: &App) -> Vec<DiffComment> {
+    fn staged_comments(&self, cx: &App) -> Vec<ReviewComment> {
         let state = self.state.read(cx);
-        state.diff_comments(&state.composer_key()).to_vec()
+        state
+            .review_comments(&state.composer_key())
+            .iter()
+            .filter(|comment| {
+                self.draft
+                    .as_ref()
+                    .and_then(|draft| draft.editing_id.as_ref())
+                    != Some(&comment.id)
+            })
+            .cloned()
+            .collect()
     }
 
-    fn comments_for(&self, path: &str, cx: &App) -> Vec<DiffComment> {
+    fn comments_for(&self, path: &str, cx: &App) -> Vec<ReviewComment> {
         self.staged_comments(cx)
             .into_iter()
-            .filter(|comment| comment.path == path)
+            .filter(|comment| !comment.is_file() && comment.path == path)
             .collect()
     }
 
@@ -2499,9 +2826,9 @@ impl Changes {
             {
                 continue;
             }
-            let comments: Vec<DiffComment> = staged
+            let comments: Vec<ReviewComment> = staged
                 .iter()
-                .filter(|comment| comment.path == file.path)
+                .filter(|comment| !comment.is_file() && comment.path == file.path)
                 .cloned()
                 .collect();
             let body = body_rows(
@@ -2564,6 +2891,7 @@ impl Changes {
         let key = self.state.read(cx).composer_key();
         let old_path = self.old_path_of(&path);
         self.draft = Some(CommentDraft {
+            editing_id: None,
             key,
             path,
             old_path,
@@ -2573,6 +2901,32 @@ impl Changes {
             _events: events,
         });
         window.focus(&handle, cx);
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn edit_comment(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(comment) = state
+            .review_comments(&state.composer_key())
+            .iter()
+            .find(|comment| comment.id == id && !comment.is_file())
+            .cloned()
+        else {
+            return;
+        };
+        let Some((side, line)) = comment.diff_anchor() else {
+            return;
+        };
+        self.open_draft(comment.path.clone(), side, line, window, cx);
+        let draft = self.draft.as_mut().unwrap();
+        draft.editing_id = Some(comment.id);
+        if let comments::CommentSource::Diff { old_path, .. } = comment.source {
+            draft.old_path = old_path;
+        }
+        draft
+            .input
+            .update(cx, |input, cx| input.set_text(comment.body, cx));
         self.sync_comment_rows(cx);
         cx.notify();
     }
@@ -2593,13 +2947,18 @@ impl Changes {
             cx.notify();
             return;
         }
-        let comment =
-            DiffComment::new(draft.path, draft.side, draft.line, body).renamed_from(draft.old_path);
+
         // `draft.key`, not the live one: the note stages onto the composer it
         // was written against even if the selection moved under it.
         let key = draft.key;
         self.state.update(cx, |state, cx| {
-            state.add_diff_comment(&key, comment);
+            if let Some(id) = draft.editing_id {
+                state.update_review_comment_body(&key, &id, body);
+            } else {
+                let comment = ReviewComment::new(draft.path, draft.side, draft.line, body)
+                    .renamed_from(draft.old_path);
+                state.add_review_comment(&key, comment);
+            }
             cx.notify();
         });
         self.sync_comment_rows(cx);
@@ -2609,7 +2968,7 @@ impl Changes {
     fn remove_comment(&mut self, id: &str, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             let key = state.composer_key();
-            state.remove_diff_comment(&key, id);
+            state.remove_review_comment(&key, id);
             cx.notify();
         });
         self.sync_comment_rows(cx);
@@ -2626,6 +2985,20 @@ impl Changes {
         if self.ref_menu.begin_close() {
             popover::reap_popup(cx, |changes: &mut Self| &mut changes.ref_menu);
         }
+    }
+
+    /// Handle Escape before focused descendants such as a terminal receive it.
+    /// A popup in its exit animation remains a blocker until it unmounts.
+    pub(crate) fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ref_menu.is_open() {
+            self.close_ref_menu(cx);
+            return true;
+        }
+        if self.scope_menu.is_open() {
+            self.close_scope_menu(cx);
+            return true;
+        }
+        self.scope_menu.get().is_some() || self.ref_menu.get().is_some()
     }
 
     fn open_ref_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2685,7 +3058,10 @@ impl Changes {
             event.keystroke.modifiers.control,
         );
         match key {
-            popover::MenuKey::Escape => self.close_ref_menu(cx),
+            popover::MenuKey::Escape => {
+                self.close_ref_menu(cx);
+                cx.stop_propagation();
+            }
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let count = self.ref_menu_rows(cx).len();
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
@@ -2717,7 +3093,7 @@ impl Changes {
         parsed_key: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DiffHighlights>> {
-        let lang = comet_syntax::language_for_path(&file.path)?;
+        let lang = zeron_syntax::language_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
@@ -2729,7 +3105,7 @@ impl Changes {
                 DiffHighlightState::Pending | DiffHighlightState::Plain => None,
             };
         }
-        if !comet_syntax::supports_language(lang) {
+        if !zeron_syntax::supports_language(lang) {
             self.highlights.insert(
                 file.path.clone(),
                 HighlightSlot {
@@ -2846,12 +3222,7 @@ impl Changes {
 
     // ---- rendering ----
 
-    fn render_row(
-        &mut self,
-        ix: usize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(parsed) = &self.parsed else {
             return gpui::Empty.into_any_element();
         };
@@ -2861,6 +3232,24 @@ impl Changes {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
+        let highlight = files
+            .get(row.file())
+            .and_then(|file| self.request_highlight(file, &parsed_key, cx));
+        let horizontal = &self.parsed.as_ref().unwrap().horizontal[row.file()];
+        let code_width = match files.get(row.file()) {
+            Some(file) if !self.wrap_lines => DiffCodeWidth::Scrollable(horizontal.metrics(
+                file,
+                highlight.as_ref(),
+                &theme,
+                window.text_system(),
+                crate::typography::generation(cx),
+            )),
+            _ => DiffCodeWidth::Wrapped,
+        };
+        let code_scroll = DiffCodeScrollContext {
+            handle: horizontal.scroll.clone(),
+            prefix: SharedString::from(format!("changes-code-row-{ix}")),
+        };
         match row {
             DiffRow::FileHeader { file } => {
                 let Some(file_diff) = files.get(file as usize) else {
@@ -2895,7 +3284,6 @@ impl Changes {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
                 };
-                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
                 let Some(line) = file_diff
                     .hunks
                     .get(hunk as usize)
@@ -2908,7 +3296,14 @@ impl Changes {
                     .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
                 let gutter_px = gutter_width(file_diff);
-                let row = diff_line_row(line, spans, &theme, gutter_px);
+                let row = diff_line_row(
+                    line,
+                    spans,
+                    &theme,
+                    gutter_px,
+                    code_width,
+                    Some(code_scroll.slot("unified")),
+                );
                 let Some((side, line_no)) = line_anchor(line) else {
                     return row;
                 };
@@ -2946,7 +3341,6 @@ impl Changes {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
                 };
-                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
                 let Some(lines) = file_diff.hunks.get(hunk as usize).map(|h| &h.lines) else {
                     return gpui::Empty.into_any_element();
                 };
@@ -2983,7 +3377,15 @@ impl Changes {
                             .clone()
                             .unwrap_or_else(|| line_runs(line, highlight.as_deref(), &theme));
                         let number = if old { line.old_no } else { line.new_no };
-                        split_line_cell(line, number, runs, &theme, gutter_px)
+                        split_line_cell(
+                            line,
+                            number,
+                            runs,
+                            &theme,
+                            gutter_px,
+                            code_width,
+                            Some(code_scroll.slot(if old { "old" } else { "new" })),
+                        )
                     })
                 };
                 // The left column is inert. It shows the pre-change file, and
@@ -3020,7 +3422,7 @@ impl Changes {
                     (Some(cell), None) => cell.into_any_element(),
                     (None, _) => split_filler().into_any_element(),
                 };
-                split_row(left, right, &theme).into_any_element()
+                split_row(left, right, self.wrap_lines, &theme).into_any_element()
             }
             DiffRow::CommentCard { file, card } => {
                 let Some(file_diff) = files.get(file as usize) else {
@@ -3028,7 +3430,14 @@ impl Changes {
                 };
                 let comments = self.comments_for(&file_diff.path, cx);
                 match comments.get(card as usize) {
-                    Some(comment) => render_comment_card(comment, &theme, cx),
+                    Some(comment) => crate::comment_ui::render_comment_card(
+                        comment,
+                        &theme,
+                        cx,
+                        Self::edit_comment,
+                        Self::remove_comment,
+                        None,
+                    ),
                     None => gpui::Empty.into_any_element(),
                 }
             }
@@ -3043,12 +3452,16 @@ impl Changes {
                 {
                     // Header cites the same path the staged card and the
                     // prompt bullet will.
-                    Some(draft) => render_comment_draft(
+                    Some(draft) => crate::comment_ui::render_comment_draft(
                         draft_cite_path(draft),
                         draft.line,
                         draft.input.clone(),
+                        draft.editing_id.is_some(),
                         &theme,
                         cx,
+                        Self::cancel_draft,
+                        Self::commit_draft,
+                        None,
                     ),
                     None => gpui::Empty.into_any_element(),
                 }
@@ -3059,12 +3472,25 @@ impl Changes {
                     return gpui::Empty.into_any_element();
                 };
                 let fold = self.folds.get(&file_diff.path).copied().unwrap_or_default();
-                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
                 let (from, to) = (fold.from, fold.to);
                 // Only the revealable slice is built — the tween never pays
                 // for lines it cannot show.
                 let cap = from.max(to).min(FOLD_TWEEN_MAX_PX);
-                let body = render_file_body_upto(file_diff, highlight, &theme, cap, self.mode);
+                let body = render_file_body_upto(
+                    file_diff,
+                    highlight,
+                    &theme,
+                    cap,
+                    self.mode,
+                    code_width,
+                    Some(DiffCodeScrollContext {
+                        handle: code_scroll.handle.clone(),
+                        prefix: SharedString::from(format!(
+                            "changes-fold-code-{file}-{}",
+                            fold.epoch
+                        )),
+                    }),
+                );
                 let clipped = div().w_full().overflow_hidden().child(body);
                 if fold.animating() {
                     clipped
@@ -3171,6 +3597,15 @@ impl Changes {
                 cx.notify();
             }))
             .child(chevron)
+            // File identity uses the fork's Material icon theme, the same
+            // mapping as Files and the inline file chips.
+            .children(
+                crate::tool_icons::tool_icon_descriptor(&zeron_proto::ToolCall::ReadFile {
+                    path: file.path.to_string(),
+                })
+                .material_image()
+                .map(|image| gpui::img(image).size(px(14.0)).flex_none()),
+            )
             .child(
                 div()
                     .flex_1()
@@ -3292,12 +3727,12 @@ impl Changes {
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
-            .size(px(24.0))
+            .size(px(crate::surface_chrome::CONTROL_SIZE))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
+            .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
             .cursor_pointer()
             // Latched: the blend is neither read nor driven, and its listener
             // would dirty the whole window on every enter/leave for nothing.
@@ -3319,7 +3754,7 @@ impl Changes {
             })
             .child(
                 crate::icons::icon(icon_path)
-                    .size(px(14.0))
+                    .size(px(crate::surface_chrome::ICON_SIZE))
                     .text_color(if active {
                         theme.text
                     } else {
@@ -3344,6 +3779,22 @@ impl Changes {
         .into_any_element()
     }
 
+    fn wrap_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        Self::header_toggle(
+            "changes-wrap",
+            crate::icons::WRAP_TEXT,
+            self.wrap_lines,
+            theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            cx.stop_propagation();
+            this.toggle_wrap(cx);
+        }))
+        .tooltip(|_, cx| cx.new(|_| DiffHeaderTooltip("Wrap long lines")).into())
+        .tooltip_show_delay(Duration::from_millis(350))
+        .into_any_element()
+    }
+
     /// The pane-header controls: scope dropdown, `{branch} → {base ⌄}` ref
     /// selector (branch scope), fold-all. Rendered BY THE SHELL inside the
     /// session titlebar's trailing section (the band above the pane) — the
@@ -3362,13 +3813,13 @@ impl Changes {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(crate::surface_chrome::CONTROL_GAP))
                 .child(
                     div()
                         .flex_none()
-                        .h(px(22.0))
+                        .h(px(crate::surface_chrome::CONTROL_SIZE))
                         .px(px(6.0))
-                        .rounded(px(5.0))
+                        .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
                         .flex()
                         .items_center()
                         .bg(crate::theme::ink(0.05))
@@ -3387,6 +3838,7 @@ impl Changes {
                         .child(SharedString::from(commit.subject.clone())),
                 )
                 .child(self.split_toggle(&theme, cx))
+                .child(self.wrap_toggle(&theme, cx))
                 .child(
                     Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3413,14 +3865,14 @@ impl Changes {
             (scope == DiffScope::History).then(|| self.history_view_button(cx));
         let scope_trigger = div()
             .id("changes-scope-trigger")
-            .h(px(24.0))
+            .h(px(crate::surface_chrome::CONTROL_SIZE))
             .px(px(8.0))
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .rounded(px(6.0))
+            .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
             .cursor_pointer()
             .bg(motion::hover_blend(
                 "changes-scope-trigger",
@@ -3462,9 +3914,12 @@ impl Changes {
             // slot for the current branch instead of repeating the surface name.
             div()
                 .id("history-surface-title")
-                .h(px(24.0))
+                .min_w_0()
+                .max_w(px(160.0))
+                .truncate()
+                .h(px(crate::surface_chrome::CONTROL_SIZE))
                 .px(px(8.0))
-                .flex_none()
+                .flex_shrink(1.0)
                 .flex()
                 .items_center()
                 .font_family(theme.font_mono.clone())
@@ -3491,10 +3946,11 @@ impl Changes {
 
         let trailing: AnyElement = if scope == DiffScope::History {
             div()
-                .flex_none()
+                .min_w_0()
+                .flex_shrink(1.0)
                 .flex()
                 .items_center()
-                .gap(px(2.0))
+                .gap(px(crate::surface_chrome::CONTROL_GAP))
                 .children(history_search_control)
                 .children(history_fetch_button)
                 .children(history_view_button)
@@ -3513,8 +3969,9 @@ impl Changes {
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(2.0))
+                .gap(px(crate::surface_chrome::CONTROL_GAP))
                 .child(self.split_toggle(&theme, cx))
+                .child(self.wrap_toggle(&theme, cx))
                 .child(
                     Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3530,14 +3987,15 @@ impl Changes {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(crate::surface_chrome::CONTROL_GAP))
             .child(trigger)
             .when_some(history_count, |element, count| {
                 element.child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .h(px(24.0))
+                        .overflow_hidden()
+                        .h(px(crate::surface_chrome::CONTROL_SIZE))
                         .flex()
                         .items_center()
                         .child(count),
@@ -3552,6 +4010,7 @@ impl Changes {
     }
 
     fn render_scope_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &theme.for_popup();
         let current = self.scope;
         let scopes = if self.explicit_cwd.is_some() {
             DiffScope::WORKERS.as_slice()
@@ -3609,7 +4068,7 @@ impl Changes {
         let base_weight = (base.chars().count().max(1) as f32).powi(2);
         let trigger = div()
             .id("changes-ref-trigger")
-            .h(px(22.0))
+            .h(px(crate::surface_chrome::CONTROL_SIZE))
             .px(px(6.0))
             // Shrinkable, like the branch label beside it — a flex_none
             // trigger with a long base name plowed over the header buttons
@@ -3681,7 +4140,7 @@ impl Changes {
                 .gap(px(6.0))
                 // Extra room off the scope dropdown (row gap alone read
                 // cramped — user report).
-                .ml(px(6.0))
+                .ml(px(crate::surface_chrome::CONTROL_GAP))
                 .child(
                     div()
                         .min_w_0()
@@ -3704,6 +4163,7 @@ impl Changes {
     }
 
     fn render_ref_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &theme.for_popup();
         let (search, active, focus, list_scroll) = {
             let Some(menu) = self.ref_menu.get() else {
                 return div().into_any_element();
@@ -3792,7 +4252,7 @@ impl Changes {
         Some(
             div()
                 .flex_none()
-                .h(px(36.0))
+                .h(px(crate::surface_chrome::HEADER_HEIGHT))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -3887,14 +4347,72 @@ fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// The only part of a diff row allowed to exceed its viewport. The outer
+/// element keeps row chrome fixed; the inner element owns the intrinsic code
+/// width and is the only plane moved by the file's horizontal scroll handle.
+fn code_text_viewport(
+    text: String,
+    runs: Vec<gpui::TextRun>,
+    theme: &Theme,
+    padding_left: f32,
+    content_width: Option<f32>,
+    wrapped: bool,
+    scroll: Option<DiffCodeScroll>,
+) -> AnyElement {
+    let content = div()
+        .when(wrapped, |el| el.w_full().min_w_0())
+        .when_some(content_width, |el, width| {
+            // Keep every tracked row's scroll extent identical. The width
+            // already includes shaping slack on the right, so clipping here
+            // only prevents a child from redefining the shared maximum.
+            el.w(px(width)).flex_none().overflow_hidden()
+        })
+        .pl(px(padding_left))
+        .font_family(theme.font_mono.clone())
+        .text_size(px(diff_text_size(theme)))
+        .line_height(px(diff_line_height(theme)))
+        .map(|el| {
+            if wrapped {
+                el.whitespace_normal()
+            } else {
+                el.whitespace_nowrap()
+            }
+        })
+        .child(gpui::StyledText::new(text).with_runs(runs));
+    let viewport = div()
+        .flex_1()
+        .min_w_0()
+        .min_h(px(diff_line_height(theme)))
+        .overflow_hidden()
+        .child(content);
+    if wrapped {
+        return viewport.into_any_element();
+    }
+    match scroll {
+        Some(scroll) => {
+            let mut viewport = viewport
+                .id(scroll.id)
+                .overflow_x_scroll()
+                .track_scroll(&scroll.handle);
+            // Without this GPUI maps a vertical-only wheel delta onto x for
+            // an x-only scroller, starving the virtualized list underneath.
+            viewport.style().restrict_scroll_to_axis = Some(true);
+            viewport.into_any_element()
+        }
+        None => viewport.into_any_element(),
+    }
+}
+
 /// One +/−/context/meta diff line: coloured accent bar, dual line-number
 /// gutters (`gutter_px` wide — see [`gutter_width`]), marker column, and
 /// paint-only syntax runs.
 fn diff_line_row(
     line: &DiffLine,
-    spans: &[comet_syntax::HighlightSpan],
+    spans: &[zeron_syntax::HighlightSpan],
     theme: &Theme,
     gutter_px: f32,
+    code_width: DiffCodeWidth,
+    scroll: Option<DiffCodeScroll>,
 ) -> AnyElement {
     if line.kind == LineKind::Meta {
         return meta_line_row(
@@ -3939,6 +4457,7 @@ fn diff_line_row(
             .flex_none()
             .font_family(theme.font_mono.clone())
             .text_size(px(11.0))
+            .line_height(px(diff_line_height(theme)))
             .text_color(color)
             .flex()
             .justify_end()
@@ -3955,20 +4474,32 @@ fn diff_line_row(
         theme.text.opacity(0.92),
         theme,
     );
+    let content_width = match code_width {
+        DiffCodeWidth::Clipped => None,
+        DiffCodeWidth::Scrollable(metrics) => Some(metrics.unified_content_width(gutter_px)),
+        DiffCodeWidth::Wrapped => None,
+    };
+    let wrapped = matches!(code_width, DiffCodeWidth::Wrapped);
     div()
-        .h(px(diff_line_height(theme)))
+        .map(|el| {
+            if wrapped {
+                el.min_h(px(diff_line_height(theme)))
+            } else {
+                el.h(px(diff_line_height(theme)))
+            }
+        })
         .w_full()
         .flex_none()
         .flex()
         .flex_row()
-        .items_center()
+        .items_start()
         .when_some(row_bg, |el, bg| el.bg(bg))
         // Accent bar: solid colour on +/− rows, invisible spacer on
         // context rows so columns always align.
         .child(
             div()
                 .w(px(ACCENT_BAR_WIDTH))
-                .h_full()
+                .self_stretch()
                 .flex_none()
                 .when_some(accent, |el, color| el.bg(color)),
         )
@@ -3995,21 +4526,20 @@ fn diff_line_row(
                 .flex()
                 .justify_center()
                 .text_size(px(diff_text_size(theme)))
+                .line_height(px(diff_line_height(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
                 .child(SharedString::from(marker)),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .pl(px(12.0))
-                .font_family(theme.font_mono.clone())
-                .text_size(px(diff_text_size(theme)))
-                .whitespace_nowrap()
-                .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
-        )
+        .child(code_text_viewport(
+            line.text.clone(),
+            runs,
+            theme,
+            UNIFIED_CODE_PADDING_LEFT,
+            content_width,
+            wrapped,
+            scroll,
+        ))
         .into_any_element()
 }
 
@@ -4061,6 +4591,8 @@ fn split_line_cell(
     runs: Vec<gpui::TextRun>,
     theme: &Theme,
     gutter_px: f32,
+    code_width: DiffCodeWidth,
+    scroll: Option<DiffCodeScroll>,
 ) -> gpui::Div {
     let mut add_bg = add_color(theme);
     add_bg.a = 0.055;
@@ -4089,19 +4621,25 @@ fn split_line_cell(
             theme.text_faint.opacity(0.8),
         ),
     };
+    let content_width = match code_width {
+        DiffCodeWidth::Clipped => None,
+        DiffCodeWidth::Scrollable(metrics) => Some(metrics.split_content_width(gutter_px)),
+        DiffCodeWidth::Wrapped => None,
+    };
+    let wrapped = matches!(code_width, DiffCodeWidth::Wrapped);
     div()
         .flex_1()
         .min_w_0()
-        .h_full()
+        .self_stretch()
         .overflow_hidden()
         .flex()
         .flex_row()
-        .items_center()
+        .items_start()
         .when_some(row_bg, |el, bg| el.bg(bg))
         .child(
             div()
                 .w(px(ACCENT_BAR_WIDTH))
-                .h_full()
+                .self_stretch()
                 .flex_none()
                 .when_some(accent, |el, color| el.bg(color)),
         )
@@ -4111,6 +4649,7 @@ fn split_line_cell(
                 .flex_none()
                 .font_family(theme.font_mono.clone())
                 .text_size(px(11.0))
+                .line_height(px(diff_line_height(theme)))
                 .text_color(number_color)
                 .flex()
                 .justify_end()
@@ -4126,21 +4665,20 @@ fn split_line_cell(
                 .flex()
                 .justify_center()
                 .text_size(px(diff_text_size(theme)))
+                .line_height(px(diff_line_height(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
                 .child(SharedString::from(marker)),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .pl(px(6.0))
-                .font_family(theme.font_mono.clone())
-                .text_size(px(diff_text_size(theme)))
-                .whitespace_nowrap()
-                .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
-        )
+        .child(code_text_viewport(
+            line.text.clone(),
+            runs,
+            theme,
+            SPLIT_CODE_PADDING_LEFT,
+            content_width,
+            wrapped,
+            scroll,
+        ))
 }
 
 /// The empty half of a one-sided split row — a pure-insert row has no old
@@ -4150,14 +4688,20 @@ fn split_filler() -> gpui::Div {
     div()
         .flex_1()
         .min_w_0()
-        .h_full()
+        .self_stretch()
         .bg(crate::theme::ink(0.03))
 }
 
 /// Compose the two halves with the centre hairline.
-fn split_row(left: AnyElement, right: AnyElement, theme: &Theme) -> gpui::Div {
+fn split_row(left: AnyElement, right: AnyElement, wrapped: bool, theme: &Theme) -> gpui::Div {
     div()
-        .h(px(diff_line_height(theme)))
+        .map(|el| {
+            if wrapped {
+                el.min_h(px(diff_line_height(theme)))
+            } else {
+                el.h(px(diff_line_height(theme)))
+            }
+        })
         .w_full()
         .flex_none()
         .flex()
@@ -4167,7 +4711,7 @@ fn split_row(left: AnyElement, right: AnyElement, theme: &Theme) -> gpui::Div {
         .child(
             div()
                 .w(px(SPLIT_DIVIDER_WIDTH))
-                .h_full()
+                .self_stretch()
                 .flex_none()
                 .bg(crate::theme::hairline(0.06)),
         )
@@ -4213,229 +4757,20 @@ fn render_comment_adder(
     cx: &Context<Changes>,
 ) -> AnyElement {
     let target = path.to_string();
-    div()
-        .id(SharedString::from(format!(
-            "cmt-add-{path}-{}-{line}",
-            side.tag()
-        )))
-        .size(px(COMMENT_ADDER_SIZE))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.0))
-        .bg(theme.solid)
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_draft(target.clone(), side, line, window, cx);
-        }))
-        .child(
-            crate::icons::icon(crate::icons::PLUS)
-                .size(px(11.0))
-                .text_color(theme.on_solid),
-        )
-        .into_any_element()
+    crate::comment_ui::render_comment_adder(
+        format!("cmt-add-{path}-{}-{line}", side.tag()).into(),
+        theme,
+        cx,
+        move |this, window, cx| this.open_draft(target.clone(), side, line, window, cx),
+    )
 }
 
-fn render_comment_card(comment: &DiffComment, theme: &Theme, cx: &Context<Changes>) -> AnyElement {
-    let group: SharedString = format!("cmt-card-{}", comment.id).into();
-    let id = comment.id.clone();
-    div()
-        .group(group.clone())
-        .h(px(comments::card_height(&comment.body)))
-        .w_full()
-        .flex_none()
-        .flex()
-        .flex_row()
-        .bg(crate::theme::ink(0.05))
-        // A bar, not a border: it must match ACCENT_BAR_WIDTH exactly or the
-        // card's edge steps in and out of the column.
-        .child(comment_accent_bar(theme.solid.opacity(0.35)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .px(px(Theme::SPACE_LG))
-                .py(px(comments::CARD_PAD_V / 2.0))
-                .child(
-                    div()
-                        .h(px(comments::CARD_HEADER_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(12.0))
-                                .text_color(theme.text_faint),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(comment.location())),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("cmt-remove-{}", comment.id)))
-                                .flex_none()
-                                .size(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .opacity(0.0)
-                                .group_hover(group, |s| s.opacity(1.0))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.remove_comment(&id, cx)),
-                                )
-                                .child(
-                                    crate::icons::icon(crate::icons::CLOSE_CIRCLE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        // Height is analytic, so an over-long body clips
-                        // inside the card rather than past the fold height.
-                        .overflow_hidden()
-                        .text_size(px(12.0))
-                        .line_height(px(comments::CARD_LINE_HEIGHT))
-                        .text_color(theme.text_dim)
-                        .child(SharedString::from(comment.body.clone())),
-                ),
-        )
-        .into_any_element()
-}
-
-fn comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
-    div().w(px(ACCENT_BAR_WIDTH)).h_full().flex_none().bg(color)
-}
-
-/// Mirrors [`DiffComment::cite_path`] for the not-yet-staged note.
+/// Mirrors [`ReviewComment::cite_path`] for the not-yet-staged note.
 fn draft_cite_path(draft: &CommentDraft) -> &str {
     match draft.side {
         CommentSide::Old => draft.old_path.as_deref().unwrap_or(&draft.path),
         CommentSide::New => &draft.path,
     }
-}
-
-/// Fixed height, so an open draft never fights the fold tween.
-fn render_comment_draft(
-    path: &str,
-    line: u32,
-    input: Entity<ComposerInput>,
-    theme: &Theme,
-    cx: &Context<Changes>,
-) -> AnyElement {
-    div()
-        .h(px(comments::DRAFT_CARD_HEIGHT))
-        .w_full()
-        .flex_none()
-        .flex()
-        .flex_row()
-        .bg(crate::theme::ink(0.08))
-        .child(comment_accent_bar(theme.solid.opacity(0.7)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .px(px(Theme::SPACE_LG))
-                .py(px(10.0))
-                .child(
-                    div()
-                        .h(px(comments::CARD_HEADER_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(12.0))
-                                .text_color(theme.text_faint),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(format!("{path}:{line}"))),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(46.0))
-                        .flex_none()
-                        .overflow_hidden()
-                        .text_size(px(12.0))
-                        .child(input.into_any_element()),
-                )
-                .child(
-                    div()
-                        .h(px(28.0))
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_end()
-                        .gap(px(6.0))
-                        .child(
-                            comment_action("cmt-cancel", "Cancel", false, theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_draft(cx))),
-                        )
-                        .child(
-                            comment_action("cmt-commit", "Comment", true, theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.commit_draft(cx))),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn comment_action(
-    id: &'static str,
-    label: &'static str,
-    primary: bool,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(22.0))
-        .px(px(10.0))
-        .flex()
-        .items_center()
-        .rounded(px(6.0))
-        .text_size(px(11.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .cursor_pointer()
-        .when(primary, |el| el.bg(theme.solid).text_color(theme.on_solid))
-        .when(!primary, |el| {
-            el.text_color(motion::hover_blend(id, theme.text_muted, theme.text))
-                .bg(motion::hover_blend(
-                    id,
-                    gpui::transparent_black(),
-                    theme.element_hover,
-                ))
-                .on_hover(motion::hover_listener(id))
-        })
-        .child(SharedString::from(label))
 }
 
 /// The expanded body of one file section: notices, hunk headers, +/-/context
@@ -4463,7 +4798,14 @@ pub(crate) fn render_file_body_with_syntax(
                 .as_deref()
                 .map(|highlights| highlights.spans(line))
                 .unwrap_or(&[]);
-            children.push(diff_line_row(line, spans, theme, gutter_px));
+            children.push(diff_line_row(
+                line,
+                spans,
+                theme,
+                gutter_px,
+                DiffCodeWidth::Clipped,
+                None,
+            ));
         }
     }
     div()
@@ -4482,10 +4824,13 @@ fn render_file_body_upto(
     theme: &Theme,
     max_px: f32,
     mode: DiffMode,
+    code_width: DiffCodeWidth,
+    scroll: Option<DiffCodeScrollContext>,
 ) -> AnyElement {
     let mut children: Vec<AnyElement> = Vec::new();
     let mut y = 0.0f32;
     let gutter_px = gutter_width(file);
+    let wrapped = matches!(code_width, DiffCodeWidth::Wrapped);
     let spans_for = |line: &DiffLine| {
         highlight
             .as_deref()
@@ -4501,7 +4846,7 @@ fn render_file_body_upto(
             children.push(notice_row(notice, theme));
             y += NOTICE_HEIGHT;
         }
-        for hunk in &file.hunks {
+        for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
             if y >= max_px {
                 break 'build;
             }
@@ -4509,11 +4854,20 @@ fn render_file_body_upto(
             y += HUNK_HEADER_HEIGHT;
             match mode {
                 DiffMode::Unified => {
-                    for line in &hunk.lines {
+                    for (line_ix, line) in hunk.lines.iter().enumerate() {
                         if y >= max_px {
                             break 'build;
                         }
-                        children.push(diff_line_row(line, spans_for(line), theme, gutter_px));
+                        children.push(diff_line_row(
+                            line,
+                            spans_for(line),
+                            theme,
+                            gutter_px,
+                            code_width,
+                            scroll
+                                .as_ref()
+                                .map(|scroll| scroll.slot(format_args!("{hunk_ix}-{line_ix}"))),
+                        ));
                         y += diff_line_height(theme);
                     }
                 }
@@ -4522,7 +4876,10 @@ fn render_file_body_upto(
                     // arm breaks out of a lazy walk, so the split arm must not
                     // materialize the whole hunk first.
                     let budget = ((max_px - y) / diff_line_height(theme)).ceil().max(0.0) as usize;
-                    for (left, right) in split_pairs_upto(&hunk.lines, budget) {
+                    for (pair_ix, (left, right)) in split_pairs_upto(&hunk.lines, budget)
+                        .into_iter()
+                        .enumerate()
+                    {
                         if y >= max_px {
                             break 'build;
                         }
@@ -4535,6 +4892,13 @@ fn render_file_body_upto(
                                 line_runs(line, highlight.as_deref(), theme),
                                 theme,
                                 gutter_px,
+                                code_width,
+                                scroll.as_ref().map(|scroll| {
+                                    scroll.slot(format_args!(
+                                        "{hunk_ix}-{pair_ix}-{}",
+                                        if old { "old" } else { "new" }
+                                    ))
+                                }),
                             )
                             .into_any_element(),
                             None => split_filler().into_any_element(),
@@ -4550,7 +4914,7 @@ fn render_file_body_upto(
                                 theme,
                                 2.0 * (ACCENT_BAR_WIDTH + gutter_px),
                             ),
-                            None => split_row(cell(left, true), cell(right, false), theme)
+                            None => split_row(cell(left, true), cell(right, false), wrapped, theme)
                                 .into_any_element(),
                         });
                         y += diff_line_height(theme);
@@ -4756,6 +5120,74 @@ impl Render for Changes {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[gpui::test]
+    fn editing_staged_diff_comments_preserves_identity_and_cancellation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Changes::new(state, cx)
+        });
+        window
+            .update(cx, |changes, window, cx| {
+                for side in [CommentSide::Old, CommentSide::New] {
+                    let original =
+                        ReviewComment::new("new.rs", side, 7, "Original 🦀\nSecond line")
+                            .renamed_from(Some("old.rs"));
+                    changes.state.update(cx, |state, _| {
+                        state.add_review_comment("", original.clone())
+                    });
+                    changes.edit_comment(&original.id, window, cx);
+                    let draft = changes.draft.as_ref().unwrap();
+                    assert_eq!(draft.input.read(cx).text(), original.body);
+                    assert_eq!(draft_cite_path(draft), original.cite_path());
+                    assert!(draft.input.read(cx).focus_handle(cx).is_focused(window));
+                    let input = draft.input.clone();
+                    input.update(cx, |input, cx| input.set_text("Cancelled", cx));
+                    assert_eq!(changes.state.read(cx).review_comments("")[0], original);
+                    changes.cancel_draft(cx);
+                    assert_eq!(
+                        changes.state.read(cx).review_comments(""),
+                        &[original.clone()]
+                    );
+
+                    changes.edit_comment(&original.id, window, cx);
+                    changes
+                        .draft
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .clone()
+                        .update(cx, |input, cx| {
+                            input.set_text("  Revised\nMore detail  ", cx)
+                        });
+                    changes.commit_draft(cx);
+                    let mut expected = original.clone();
+                    expected.body = "Revised\nMore detail".into();
+                    assert_eq!(
+                        changes.state.read(cx).review_comments(""),
+                        &[expected.clone()]
+                    );
+                    assert_ne!(
+                        comment_state_key(&[original], None),
+                        comment_state_key(&[expected.clone()], None)
+                    );
+                    changes.edit_comment(&expected.id, window, cx);
+                    let sent = changes
+                        .state
+                        .update(cx, |state, _| state.take_review_comments(""));
+                    assert!(comments::with_comments("", &sent).contains("Revised\n  More detail"));
+                    changes.commit_draft(cx);
+                    assert!(changes.state.read(cx).review_comments("").is_empty());
+                }
+            })
+            .unwrap();
+    }
 
     const PATCH: &str = "\
 diff --git a/src/main.rs b/src/main.rs
@@ -4991,7 +5423,10 @@ rename to new_name.rs
         assert_eq!(sticky_header_push_offset(None), 0.0);
         assert_eq!(sticky_header_push_offset(Some(80.0)), 0.0);
         assert_eq!(sticky_header_push_offset(Some(FILE_HEADER_HEIGHT)), 0.0);
-        assert_eq!(sticky_header_push_offset(Some(24.0)), -12.0);
+        assert_eq!(
+            sticky_header_push_offset(Some(FILE_HEADER_HEIGHT - 12.0)),
+            -12.0
+        );
         assert_eq!(sticky_header_push_offset(Some(0.0)), -FILE_HEADER_HEIGHT);
     }
 
@@ -5187,7 +5622,7 @@ rename to new_name.rs
 
         // Heights stay analytic — the fold tween needs no measurement.
         assert_eq!(
-            body_height_with(&files[0], &[], None, DiffMode::Split),
+            body_height_with(&files[0], &[], None, DiffMode::Split, DIFF_LINE_HEIGHT),
             2.0 * HUNK_HEADER_HEIGHT + 6.0 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
         );
     }
@@ -5248,7 +5683,7 @@ rename to new_name.rs
     fn split_rows_carry_the_comments_of_both_columns() {
         let files = parse_patch(PATCH);
         // A context row must not stack the same card twice.
-        let comment = DiffComment::new("src/main.rs", CommentSide::New, 1, "why");
+        let comment = ReviewComment::new("src/main.rs", CommentSide::New, 1, "why");
         let rows = body_rows(0, &files[0], &[comment], None, DiffMode::Split);
         assert_eq!(
             rows.iter()
@@ -5259,8 +5694,8 @@ rename to new_name.rs
 
         // Both sides of one paired row hang off that row, in column order.
         let staged = vec![
-            DiffComment::new("src/main.rs", CommentSide::Old, 2, "left"),
-            DiffComment::new("src/main.rs", CommentSide::New, 2, "right"),
+            ReviewComment::new("src/main.rs", CommentSide::Old, 2, "left"),
+            ReviewComment::new("src/main.rs", CommentSide::New, 2, "right"),
         ];
         let rows = body_rows(0, &files[0], &staged, None, DiffMode::Split);
         let edit = rows
@@ -5366,6 +5801,206 @@ rename to new_name.rs
     }
 
     #[test]
+    fn horizontal_geometry_counts_tabs_and_unicode_columns() {
+        assert_eq!(visual_columns("ab\tc"), 5);
+        assert_eq!(visual_columns("界"), 2);
+        assert_eq!(visual_columns("e\u{301}"), 1);
+
+        let files = parse_patch("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+ab\t界\n");
+        let geometry = DiffHorizontalGeometry::from_file(&files[0]);
+        assert_eq!(geometry.max_code_columns, 6);
+        assert_eq!(geometry.max_gutter_width, GUTTER_WIDTH);
+    }
+
+    #[test]
+    fn horizontal_content_width_compensates_for_local_gutters() {
+        let metrics = DiffHorizontalMetrics {
+            max_text_width: 240.0,
+            max_gutter_width: 52.0,
+        };
+        let narrow = 36.0;
+        let wide = 52.0;
+
+        let unified_total = |gutter| {
+            ACCENT_BAR_WIDTH + 2.0 * gutter + MARKER_WIDTH + metrics.unified_content_width(gutter)
+        };
+        assert_eq!(unified_total(narrow), unified_total(wide));
+
+        let split_total = |gutter| {
+            ACCENT_BAR_WIDTH + gutter + SPLIT_MARKER_WIDTH + metrics.split_content_width(gutter)
+        };
+        assert_eq!(split_total(narrow), split_total(wide));
+    }
+
+    /// Uses the native font backend, not TestAppContext's simulated metrics.
+    #[test]
+    fn native_diff_font_geometry() {
+        // Windows headless mode uses NoopTextSystem. This regression needs
+        // actual DirectWrite metrics, as it does CoreText/fontconfig elsewhere.
+        // Share the process-wide native text system: a second concurrent
+        // native platform aborts in HIToolbox when tests run in parallel.
+        let text_system =
+            gpui::WindowTextSystem::new(crate::file_preview::loader::PREVIEW_TEXT_SYSTEM.clone());
+        text_system
+            .add_fonts(
+                crate::typography::bundled_font_faces()
+                    .map(std::borrow::Cow::Borrowed)
+                    .collect(),
+            )
+            .unwrap();
+        let mut theme = Theme::dark();
+        theme.font_mono = "Geist".into();
+        let wide = "W".repeat(100);
+        let source = format!("{wide}\n{}\n\t漢字🙂e\u{301}\n", "WWW(WWW);".repeat(200));
+        let patch = format!(
+            "diff --git a/x.ts b/x.ts\n@@ -0,0 +1,3 @@\n+{}",
+            source.trim_end_matches('\n').replace('\n', "\n+")
+        );
+        let files = parse_patch(&patch);
+        let file = &files[0];
+        let state = FileHorizontalState::new(file);
+        let highlight = Arc::new(DiffHighlights {
+            old: None,
+            new: Some(Arc::new(
+                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                    source: &source,
+                    path: Some("x.ts"),
+                    fence_tag: None,
+                })
+                .unwrap(),
+            )),
+        });
+        let mono = font(theme.font_mono.clone());
+        let column = text_system
+            .ch_advance(text_system.resolve_font(&mono), px(12.))
+            .unwrap()
+            .as_f32();
+        let line = &file.hunks[0].lines[0];
+        let width = text_system
+            .shape_line(wide.into(), px(12.), &line_runs(line, None, &theme), None)
+            .width()
+            .as_f32();
+        assert!(
+            width > 100. * column * 1.1,
+            "requires a real proportional font: {width} vs {}",
+            100. * column
+        );
+
+        // Simulate plain -> excerpt -> full highlighting, including replacement
+        // while an old cached Arc is still alive. Every paint must be reachable.
+        for size in [12.5, 32., 8.] {
+            theme.code_font_size = size;
+            for highlights in [
+                None,
+                Some(highlight.clone()),
+                Some(Arc::new(DiffHighlights {
+                    old: None,
+                    new: highlight.new.clone(),
+                })),
+            ] {
+                let metrics = state.metrics(file, highlights.as_ref(), &theme, &text_system, 0);
+                for line in &file.hunks[0].lines {
+                    let runs = line_runs(line, highlights.as_deref(), &theme);
+                    let painted = text_system
+                        .shape_line(
+                            line.text.clone().into(),
+                            px(diff_text_size(&theme)),
+                            &runs,
+                            None,
+                        )
+                        .width()
+                        .as_f32();
+                    assert!(metrics.max_text_width >= painted);
+                    assert!(
+                        metrics.unified_content_width(gutter_width(file))
+                            >= UNIFIED_CODE_PADDING_LEFT + painted
+                    );
+                    assert!(
+                        metrics.split_content_width(gutter_width(file))
+                            >= SPLIT_CODE_PADDING_LEFT + painted
+                    );
+                }
+                assert_eq!(
+                    state.metrics(file, highlights.as_ref(), &theme, &text_system, 0),
+                    metrics
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_and_width_are_independent_per_file() {
+        let files = parse_patch(
+            "diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+short\n\
+             diff --git a/b b/b\n@@ -1 +1 @@\n-old\n+a much longer source line\n",
+        );
+        let states: Vec<_> = files.iter().map(FileHorizontalState::new).collect();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].geometry.max_code_columns, 5);
+        assert_eq!(states[1].geometry.max_code_columns, 25);
+
+        let row = DiffRow::Line {
+            file: 0,
+            hunk: 0,
+            line: 0,
+            flat: 0,
+        };
+        let folding = DiffRow::FoldingBody { file: 0 };
+        let split = DiffRow::SplitLine {
+            file: 1,
+            hunk: 0,
+            left: Some(0),
+            right: Some(1),
+        };
+        let first = DiffCodeScrollContext {
+            handle: states[row.file()].scroll.clone(),
+            prefix: "first".into(),
+        };
+        let second = DiffCodeScrollContext {
+            handle: states[split.file()].scroll.clone(),
+            prefix: "second".into(),
+        };
+        first
+            .slot("unified")
+            .handle
+            .set_offset(gpui::Point::new(px(-96.0), px(0.0)));
+        assert_eq!(states[folding.file()].scroll.offset().x, px(-96.0));
+        assert_eq!(second.slot("old").handle.offset(), gpui::Point::default());
+
+        second
+            .slot("old")
+            .handle
+            .set_offset(gpui::Point::new(px(-48.0), px(0.0)));
+        assert_eq!(second.slot("new").handle.offset().x, px(-48.0));
+        assert_eq!(first.slot("unified").handle.offset().x, px(-96.0));
+    }
+
+    #[test]
+    fn horizontal_scroll_reset_returns_to_origin() {
+        let handle = gpui::ScrollHandle::new();
+        handle.set_offset(gpui::Point::new(px(-120.0), px(-18.0)));
+
+        reset_horizontal_scroll(&handle);
+
+        assert_eq!(handle.offset(), gpui::Point::default());
+    }
+
+    #[test]
+    fn horizontal_scroll_slots_share_offset_but_keep_unique_ids() {
+        let context = DiffCodeScrollContext {
+            handle: gpui::ScrollHandle::new(),
+            prefix: "row-7".into(),
+        };
+        let old = context.slot("old");
+        let new = context.slot("new");
+
+        old.handle.set_offset(gpui::Point::new(px(-96.0), px(0.0)));
+
+        assert_eq!(new.handle.offset(), old.handle.offset());
+        assert_ne!(old.id, new.id);
+    }
+
+    #[test]
     fn body_height_is_analytic() {
         let files = parse_patch(PATCH);
         let main = &files[0];
@@ -5413,9 +6048,11 @@ rename to new_name.rs
             created_at: Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            origin_chat_id: None,
         }
     }
 
@@ -5604,7 +6241,7 @@ rename to new_name.rs
         let new_source = "export function new(value: string) {\n    return value.trim();\n}\n";
         let parse = |source| {
             Arc::new(
-                comet_syntax::highlight(comet_syntax::HighlightRequest {
+                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
                     source,
                     path: Some("src/derive.ts"),
                     fence_tag: None,
@@ -5659,14 +6296,39 @@ rename to new_name.rs
             highlights
                 .spans(&deleted)
                 .iter()
-                .any(|span| span.kind == comet_syntax::HighlightKind::Function)
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
         );
         assert!(
             highlights
                 .spans(&added)
                 .iter()
-                .any(|span| span.kind == comet_syntax::HighlightKind::Function)
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
         );
+    }
+
+    /// The regression this guards: rendering the diff at the raw shared
+    /// setting silently enlarged it from 12.0 to 12.5 on a fresh install.
+    #[test]
+    fn the_default_code_font_size_reproduces_the_historical_diff_size() {
+        let theme = Theme::dark();
+        assert_eq!(
+            theme.code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(diff_text_size(&theme), DIFF_TEXT_SIZE);
+        assert_eq!(diff_line_height(&theme), DIFF_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn scaled_diff_sizes_keep_their_proportions_and_stay_clamped() {
+        let mut theme = Theme::dark();
+        theme.code_font_size = 2.0 * crate::typography::CODE_FONT_SIZE_DEFAULT;
+        assert_eq!(diff_text_size(&theme), 2.0 * DIFF_TEXT_SIZE);
+        assert_eq!(diff_line_height(&theme), 2.0 * DIFF_LINE_HEIGHT);
+
+        theme.code_font_size = crate::typography::FONT_SIZE_MAX;
+        assert!(diff_text_size(&theme) <= crate::typography::FONT_SIZE_MAX);
+        assert!(diff_text_size(&theme) >= crate::typography::FONT_SIZE_MIN);
     }
 
     #[test]
@@ -5676,21 +6338,21 @@ rename to new_name.rs
             (
                 "src/card.tsx",
                 "const view: JSX.Element = <main id=\"app\" />;",
-                comet_syntax::HighlightKind::Tag,
+                zeron_syntax::HighlightKind::Tag,
             ),
             (
                 "src/Greeter.kt",
                 "fun greet(name: String) = println(name)",
-                comet_syntax::HighlightKind::Function,
+                zeron_syntax::HighlightKind::Function,
             ),
             (
                 "Dockerfile",
                 "RUN echo \"hello\"",
-                comet_syntax::HighlightKind::Function,
+                zeron_syntax::HighlightKind::Function,
             ),
         ] {
             let document = Arc::new(
-                comet_syntax::highlight(comet_syntax::HighlightRequest {
+                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
                     source,
                     path: Some(path),
                     fence_tag: None,
@@ -5783,13 +6445,13 @@ rename to new_name.rs
             highlights
                 .spans(deleted)
                 .iter()
-                .any(|span| span.kind == comet_syntax::HighlightKind::Comment)
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
         );
         assert!(
             highlights
                 .spans(added)
                 .iter()
-                .any(|span| span.kind == comet_syntax::HighlightKind::Comment)
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
         );
     }
 

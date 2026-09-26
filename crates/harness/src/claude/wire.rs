@@ -168,7 +168,7 @@ pub(crate) struct RateLimitInfo {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ResultFrame {
     #[serde(default, rename = "modelUsage")]
-    pub model_usage: std::collections::HashMap<String, Value>,
+    pub model_usage: std::collections::BTreeMap<String, Value>,
     #[serde(default)]
     pub subtype: String,
     #[serde(default)]

@@ -1,10 +1,11 @@
-//! Authorized filesystem access for the file tree and native preview RPC surface.
+//! Authorized filesystem access for the file tree, native preview, and editor
+//! RPC surface.
 //!
 //! Every operation resolves a synced chat or space to a checkout owned by this
 //! device before accepting a workspace-relative path.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -18,10 +19,13 @@ use zeron_proto::{
     ListWorkspaceDirectoryRequest, MoveWorkspaceEntryRequest, ReadWorkspaceFileRequest,
     RenameWorkspaceEntryRequest, SearchWorkspaceFilesRequest, WatchWorkspaceFilesRequest,
     WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind, WorkspaceEntryMutation,
-    WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges, WorkspaceFileSearchMatch,
-    WorkspaceFileText, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
-    WorkspaceTextEncoding, join_workspace_relative, sibling_name_taken, unique_copy_name,
-    validate_workspace_component, validate_workspace_create_name,
+    WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges,
+    WorkspaceFileConflictReason, WorkspaceFileSearchMatch, WorkspaceFileText,
+    WorkspaceFileWriteResult, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
+    WorkspaceTextEncoding, WorkspaceWritableEncoding, WorkspaceWritableLineEnding,
+    WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest, join_workspace_relative,
+    sibling_name_taken, unique_copy_name, validate_workspace_component,
+    validate_workspace_create_name,
 };
 use zeron_rpc::RpcError;
 
@@ -54,9 +58,16 @@ struct WorkspaceFilesInner {
     repos: Repos,
     workspace: WorkspaceHost,
     device_id: String,
+    write_locks: Mutex<HashMap<WorkspaceFileKey, Weak<tokio::sync::Mutex<()>>>>,
     watches: Mutex<HashMap<String, Arc<CheckoutWatch>>>,
     mutation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkspaceFileKey {
+    checkout_id: String,
+    path: PathBuf,
 }
 
 struct CheckoutWatch {
@@ -210,6 +221,7 @@ impl WorkspaceFiles {
                 repos,
                 workspace,
                 device_id: device_id.into(),
+                write_locks: Mutex::new(HashMap::new()),
                 watches: Mutex::new(HashMap::new()),
                 mutation_locks: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
@@ -385,6 +397,70 @@ impl WorkspaceFiles {
         result
     }
 
+    pub async fn read_image(
+        &self,
+        request: zeron_proto::ReadWorkspaceImageRequest,
+    ) -> Result<zeron_proto::WorkspaceImageChunk, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        if request.expected_checkout_id.is_empty()
+            || request.expected_checkout_id != workspace.checkout_id
+        {
+            return Err(WorkspaceFilesError::Authorization(
+                "Workspace changed before image read".into(),
+            ));
+        }
+        let relative = WorkspaceRelativePath::file(&request.path)?;
+        tokio::task::spawn_blocking(move || {
+            read_image_blocking(&workspace.root, &relative, &request)
+        })
+        .await
+        .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?
+    }
+
+    pub async fn write_file(
+        &self,
+        request: WriteWorkspaceFileRequest,
+    ) -> Result<WriteWorkspaceFileOutcome, WorkspaceFilesError> {
+        let bytes = encode_write_text(&request)?;
+        let workspace = self.resolve_target(&request.target).await?;
+        if request.expected_checkout_id.is_empty()
+            || request.expected_checkout_id != workspace.checkout_id
+        {
+            return Err(WorkspaceFilesError::Authorization(
+                "Workspace changed since this file was opened. Switch back to save your edits."
+                    .into(),
+            ));
+        }
+        let relative = WorkspaceRelativePath::file(&request.path)?;
+        let key = WorkspaceFileKey {
+            checkout_id: workspace.checkout_id.clone(),
+            path: relative.as_path().to_path_buf(),
+        };
+        let file_lock = {
+            let mut locks = lock(&self.inner.write_locks);
+            locks.retain(|_, slot| slot.strong_count() > 0);
+            if let Some(existing) = locks.get(&key).and_then(Weak::upgrade) {
+                existing
+            } else {
+                let file_lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&file_lock));
+                file_lock
+            }
+        };
+        let write_guard = file_lock.lock_owned().await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = CancelOnDrop::new(cancel.clone());
+        let expected_hash = request.expected_content_hash;
+        let result = tokio::task::spawn_blocking(move || {
+            let _write_guard = write_guard;
+            write_file_blocking(&workspace.root, &relative, &expected_hash, &bytes, &cancel)
+        })
+        .await
+        .map_err(|error| WorkspaceFilesError::Io(format!("file write worker failed: {error}")))?;
+        cancel_on_drop.disarm();
+        result
+    }
+
     pub async fn watch_files(
         &self,
         request: WatchWorkspaceFilesRequest,
@@ -451,6 +527,7 @@ impl WorkspaceFiles {
         for task in tasks {
             let _ = task.await;
         }
+        lock(&self.inner.write_locks).clear();
     }
 
     fn mutation_lock(&self, checkout_id: &str) -> Arc<Mutex<()>> {
@@ -1209,6 +1286,98 @@ fn compare_workspace_search_matches(
         .then_with(|| left.path.cmp(&right.path))
 }
 
+fn read_image_blocking(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+    request: &zeron_proto::ReadWorkspaceImageRequest,
+) -> Result<zeron_proto::WorkspaceImageChunk, WorkspaceFilesError> {
+    use base64::Engine as _;
+    use zeron_proto::{MAX_WORKSPACE_IMAGE_BYTES, WORKSPACE_IMAGE_CHUNK_BYTES};
+    let mime = match relative
+        .as_path()
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => {
+            return Err(WorkspaceFilesError::Unsupported(
+                "Unsupported workspace image format".into(),
+            ));
+        }
+    };
+    if request.offset > 0 && request.expected_content_hash.is_none() {
+        return Err(bad_path("Image continuation requires a content hash"));
+    }
+    let before = checked_file_metadata(root, relative)?;
+    if before.len() > MAX_WORKSPACE_IMAGE_BYTES as u64 {
+        return Err(WorkspaceFilesError::Unsupported(
+            "Image exceeds 8 MiB preview limit".into(),
+        ));
+    }
+    let mut file = std::fs::File::open(root.join(relative.as_path()))
+        .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
+    if !same_file_revision(&before, &opened) {
+        return Err(WorkspaceFilesError::Io("Image changed before open".into()));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_WORKSPACE_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
+    let after = checked_file_metadata(root, relative)?;
+    let handle_after = file
+        .metadata()
+        .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
+    if bytes.len() > MAX_WORKSPACE_IMAGE_BYTES
+        || !same_file_revision(&before, &after)
+        || !same_file_revision(&opened, &handle_after)
+        || bytes.len() as u64 != after.len()
+    {
+        return Err(WorkspaceFilesError::Io(
+            "Image changed during read or exceeds preview limit".into(),
+        ));
+    }
+    let hash = hash_bytes(&bytes);
+    if request
+        .expected_content_hash
+        .as_ref()
+        .is_some_and(|expected| expected != &hash)
+    {
+        return Err(WorkspaceFilesError::Io(
+            "Image changed between chunks; reload preview".into(),
+        ));
+    }
+    if request.offset > bytes.len() {
+        return Err(bad_path("Invalid image offset"));
+    }
+    let end = request
+        .offset
+        .saturating_add(WORKSPACE_IMAGE_CHUNK_BYTES)
+        .min(bytes.len());
+    Ok(zeron_proto::WorkspaceImageChunk {
+        checkout_id: request.expected_checkout_id.clone(),
+        content_hash: hash,
+        mime_type: mime.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes[request.offset..end]),
+        next_offset: end,
+        size: bytes.len(),
+        done: end == bytes.len(),
+    })
+}
+
 fn read_file_blocking(
     root: &Path,
     relative: &WorkspaceRelativePath,
@@ -1559,6 +1728,296 @@ fn same_file_revision(before: &std::fs::Metadata, after: &std::fs::Metadata) -> 
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+fn encode_write_text(request: &WriteWorkspaceFileRequest) -> Result<Vec<u8>, WorkspaceFilesError> {
+    if request.text.contains('\0') {
+        return Err(WorkspaceFilesError::BadParams(
+            "write text must not contain NUL bytes".into(),
+        ));
+    }
+    if request.text.contains('\r') {
+        return Err(WorkspaceFilesError::BadParams(
+            "write text must use normalized LF line endings".into(),
+        ));
+    }
+    if request.expected_content_hash.is_empty() {
+        return Err(WorkspaceFilesError::BadParams(
+            "expectedContentHash must not be empty".into(),
+        ));
+    }
+    let source = match request.line_ending {
+        WorkspaceWritableLineEnding::Lf => request.text.clone(),
+        WorkspaceWritableLineEnding::Crlf => request.text.replace('\n', "\r\n"),
+    };
+    let mut bytes = Vec::with_capacity(
+        source.len() + usize::from(request.encoding == WorkspaceWritableEncoding::Utf8Bom) * 3,
+    );
+    if request.encoding == WorkspaceWritableEncoding::Utf8Bom {
+        bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    }
+    bytes.extend_from_slice(source.as_bytes());
+    if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+        return Err(WorkspaceFilesError::Unsupported(format!(
+            "write exceeds the {MAX_EDITABLE_FILE_BYTES}-byte editable limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_writable_source(bytes: &[u8]) -> Result<(), WorkspaceFilesError> {
+    if bytes.contains(&0) {
+        return Err(WorkspaceFilesError::Unsupported(
+            "binary files are not writable".into(),
+        ));
+    }
+    let source = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let source = std::str::from_utf8(source).map_err(|_| {
+        WorkspaceFilesError::Unsupported("unsupported text encoding is not writable".into())
+    })?;
+    if detect_line_ending(source.as_bytes()) == WorkspaceLineEnding::Mixed {
+        return Err(WorkspaceFilesError::Unsupported(
+            "mixed line endings are not writable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_file_blocking(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+    expected_hash: &str,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> Result<WriteWorkspaceFileOutcome, WorkspaceFilesError> {
+    let target = root.join(relative.as_path());
+    let (metadata, current_bytes) = match current_write_revision(root, relative) {
+        Ok(revision) => revision,
+        Err(WorkspaceFilesError::NotFound(_)) => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::Deleted,
+                None,
+                None,
+            ));
+        }
+        Err(WorkspaceFilesError::Unsupported(message)) if message.contains("symlink") => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::Replaced,
+                None,
+                None,
+            ));
+        }
+        Err(WorkspaceFilesError::Unsupported(message)) if message.contains("editable limit") => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::Changed,
+                None,
+                None,
+            ));
+        }
+        Err(WorkspaceFilesError::Unsupported(_)) => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::NotRegularFile,
+                None,
+                None,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    validate_writable_source(&current_bytes)?;
+    let current_hash = hash_bytes(&current_bytes);
+    if current_hash != expected_hash {
+        return Ok(write_conflict(
+            WorkspaceFileConflictReason::Changed,
+            Some(current_hash),
+            metadata.modified().ok().map(chrono::DateTime::from),
+        ));
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(WorkspaceFilesError::Io("file write cancelled".into()));
+    }
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| WorkspaceFilesError::Io("file has no parent directory".into()))?;
+    let temp_path = parent.join(format!(".zeron-save-{}.tmp", uuid::Uuid::new_v4()));
+    let mut temp = TempFileGuard::new(temp_path.clone());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    std::fs::set_permissions(&temp_path, metadata.permissions())
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    file.write_all(bytes)
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+
+    if cancel.load(Ordering::Acquire) {
+        return Err(WorkspaceFilesError::Io("file write cancelled".into()));
+    }
+    let (latest_metadata, latest_bytes) = match current_write_revision(root, relative) {
+        Ok(revision) => revision,
+        Err(WorkspaceFilesError::NotFound(_)) => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::Deleted,
+                None,
+                None,
+            ));
+        }
+        Err(WorkspaceFilesError::Unsupported(message)) if message.contains("symlink") => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::Replaced,
+                None,
+                None,
+            ));
+        }
+        Err(WorkspaceFilesError::Unsupported(message)) if message.contains("editable limit") => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::Changed,
+                None,
+                None,
+            ));
+        }
+        Err(WorkspaceFilesError::Unsupported(_)) => {
+            return Ok(write_conflict(
+                WorkspaceFileConflictReason::NotRegularFile,
+                None,
+                None,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    validate_writable_source(&latest_bytes)?;
+    let latest_hash = hash_bytes(&latest_bytes);
+    if latest_hash != expected_hash || !same_file_revision(&metadata, &latest_metadata) {
+        return Ok(write_conflict(
+            WorkspaceFileConflictReason::Changed,
+            Some(latest_hash),
+            latest_metadata.modified().ok().map(chrono::DateTime::from),
+        ));
+    }
+
+    atomic_replace(&temp_path, &target)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    temp.disarm();
+    sync_parent_directory(parent);
+    let published = checked_file_metadata(root, relative)?;
+    let published_bytes =
+        std::fs::read(&target).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    let published_hash = hash_bytes(&published_bytes);
+    if published_hash != hash_bytes(bytes) {
+        return Err(WorkspaceFilesError::Io(
+            "published file verification failed".into(),
+        ));
+    }
+    Ok(WriteWorkspaceFileOutcome::Written {
+        file: WorkspaceFileWriteResult {
+            path: relative.wire_path(),
+            content_hash: published_hash,
+            size: published.len(),
+            modified_at: published.modified().ok().map(chrono::DateTime::from),
+        },
+    })
+}
+
+fn current_write_revision(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+) -> Result<(std::fs::Metadata, Vec<u8>), WorkspaceFilesError> {
+    let metadata = checked_file_metadata(root, relative)?;
+    if metadata.len() > MAX_EDITABLE_FILE_BYTES {
+        return Err(WorkspaceFilesError::Unsupported(
+            "file exceeds the editable limit".into(),
+        ));
+    }
+    let path = root.join(relative.as_path());
+    let bytes = std::fs::read(path).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    let after = checked_file_metadata(root, relative)?;
+    if !same_file_revision(&metadata, &after) || bytes.len() as u64 != after.len() {
+        return Err(WorkspaceFilesError::Io(
+            "file changed while preparing write; retry".into(),
+        ));
+    }
+    Ok((after, bytes))
+}
+
+fn write_conflict(
+    reason: WorkspaceFileConflictReason,
+    current_content_hash: Option<String>,
+    current_modified_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> WriteWorkspaceFileOutcome {
+    WriteWorkspaceFileOutcome::Conflict {
+        reason,
+        current_content_hash,
+        current_modified_at,
+    }
+}
+
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path.take();
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both pointers reference NUL-terminated buffers for the duration of the call.
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+fn sync_parent_directory(parent: &Path) {
+    #[cfg(unix)]
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
     }
 }
 
@@ -2809,6 +3268,169 @@ mod tests {
         );
     }
 
+    fn write_request(
+        text: &str,
+        expected_content_hash: String,
+        encoding: WorkspaceWritableEncoding,
+        line_ending: WorkspaceWritableLineEnding,
+    ) -> WriteWorkspaceFileRequest {
+        WriteWorkspaceFileRequest {
+            expected_checkout_id: "checkout-test".into(),
+            target: WorkspaceTarget {
+                chat_id: Some("chat".into()),
+                space_id: None,
+                checkout_path: None,
+            },
+            path: "file.txt".into(),
+            text: text.into(),
+            expected_content_hash,
+            encoding,
+            line_ending,
+        }
+    }
+
+    #[test]
+    fn write_preserves_requested_encoding_line_endings_and_permissions() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        std::fs::write(&path, b"old\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let relative = WorkspaceRelativePath::file("file.txt").unwrap();
+        let request = write_request(
+            "first\nsecond\n",
+            hash_bytes(b"old\n"),
+            WorkspaceWritableEncoding::Utf8Bom,
+            WorkspaceWritableLineEnding::Crlf,
+        );
+        let bytes = encode_write_text(&request).unwrap();
+        let outcome = write_file_blocking(
+            &canonical,
+            &relative,
+            &request.expected_content_hash,
+            &bytes,
+            &no_cancel(),
+        )
+        .unwrap();
+        let expected = b"\xef\xbb\xbffirst\r\nsecond\r\n";
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        let WriteWorkspaceFileOutcome::Written { file } = outcome else {
+            panic!("expected written outcome");
+        };
+        assert_eq!(file.content_hash, hash_bytes(expected));
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn write_conflicts_leave_the_current_file_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        std::fs::write(&path, b"current\n").unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let relative = WorkspaceRelativePath::file("file.txt").unwrap();
+        let request = write_request(
+            "replacement\n",
+            hash_bytes(b"stale\n"),
+            WorkspaceWritableEncoding::Utf8,
+            WorkspaceWritableLineEnding::Lf,
+        );
+        let bytes = encode_write_text(&request).unwrap();
+        let outcome = write_file_blocking(
+            &canonical,
+            &relative,
+            &request.expected_content_hash,
+            &bytes,
+            &no_cancel(),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WriteWorkspaceFileOutcome::Conflict {
+                reason: WorkspaceFileConflictReason::Changed,
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"current\n");
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zeron-save-")
+        }));
+    }
+
+    #[test]
+    fn write_requires_normalized_text_and_enforces_size_limit() {
+        let cr = write_request(
+            "not\r\nnormalized",
+            "hash".into(),
+            WorkspaceWritableEncoding::Utf8,
+            WorkspaceWritableLineEnding::Lf,
+        );
+        assert!(encode_write_text(&cr).is_err());
+        let nul = write_request(
+            "not\0text",
+            "hash".into(),
+            WorkspaceWritableEncoding::Utf8,
+            WorkspaceWritableLineEnding::Lf,
+        );
+        assert!(encode_write_text(&nul).is_err());
+        let large = write_request(
+            &"x".repeat(MAX_EDITABLE_FILE_BYTES as usize + 1),
+            "hash".into(),
+            WorkspaceWritableEncoding::Utf8,
+            WorkspaceWritableLineEnding::Lf,
+        );
+        assert!(encode_write_text(&large).is_err());
+    }
+
+    #[test]
+    fn write_rejects_binary_and_mixed_source_files() {
+        for source in [
+            b"binary\0source".as_slice(),
+            b"mixed\r\nsource\n".as_slice(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("file.txt"), source).unwrap();
+            let canonical = std::fs::canonicalize(root.path()).unwrap();
+            let result = write_file_blocking(
+                &canonical,
+                &WorkspaceRelativePath::file("file.txt").unwrap(),
+                &hash_bytes(source),
+                b"replacement\n",
+                &no_cancel(),
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(root.path().join("file.txt")).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn write_deleted_file_returns_typed_conflict_without_creating_it() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let relative = WorkspaceRelativePath::file("file.txt").unwrap();
+        let outcome =
+            write_file_blocking(&canonical, &relative, "old-hash", b"new\n", &no_cancel()).unwrap();
+        assert!(matches!(
+            outcome,
+            WriteWorkspaceFileOutcome::Conflict {
+                reason: WorkspaceFileConflictReason::Deleted,
+                ..
+            }
+        ));
+        assert!(!root.path().join("file.txt").exists());
+    }
+
     #[test]
     fn watch_normalizes_renames_deduplicates_and_filters_git() {
         use notify::EventKind;
@@ -3104,5 +3726,81 @@ mod tests {
         let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
         assert!(subscription.recv().await.unwrap().resync_required);
         watch.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use zeron_proto::{ReadWorkspaceImageRequest, WORKSPACE_IMAGE_CHUNK_BYTES, WorkspaceTarget};
+    fn request() -> ReadWorkspaceImageRequest {
+        ReadWorkspaceImageRequest {
+            target: WorkspaceTarget {
+                chat_id: Some("chat".into()),
+                space_id: None,
+                checkout_path: None,
+            },
+            path: "image.png".into(),
+            expected_checkout_id: "checkout".into(),
+            offset: 0,
+            expected_content_hash: None,
+        }
+    }
+    #[test]
+    fn workspace_image_chunks_are_bounded_and_versioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("image.png"),
+            vec![1; WORKSPACE_IMAGE_CHUNK_BYTES + 1],
+        )
+        .unwrap();
+        let path = WorkspaceRelativePath::file("image.png").unwrap();
+        let mut request = request();
+        let first = read_image_blocking(&root, &path, &request).unwrap();
+        assert!(!first.done);
+        assert_eq!(first.next_offset, WORKSPACE_IMAGE_CHUNK_BYTES);
+        assert!(first.data.len() < 1024 * 1024);
+        request.offset = first.next_offset;
+        assert!(read_image_blocking(&root, &path, &request).is_err());
+        request.expected_content_hash = Some(first.content_hash);
+        assert!(read_image_blocking(&root, &path, &request).unwrap().done);
+        std::fs::write(
+            root.join("image.png"),
+            vec![2; WORKSPACE_IMAGE_CHUNK_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_image_blocking(&root, &path, &request).is_err());
+        request.expected_content_hash = None;
+        request.offset = usize::MAX;
+        assert!(read_image_blocking(&root, &path, &request).is_err());
+    }
+    #[test]
+    fn workspace_images_reject_large_files_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = std::fs::File::create(root.join("image.png")).unwrap();
+        file.set_len(zeron_proto::MAX_WORKSPACE_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(
+            read_image_blocking(
+                &root,
+                &WorkspaceRelativePath::file("image.png").unwrap(),
+                &request()
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", root.join("link.png")).unwrap();
+            assert!(
+                read_image_blocking(
+                    &root,
+                    &WorkspaceRelativePath::file("link.png").unwrap(),
+                    &request()
+                )
+                .is_err()
+            );
+        }
     }
 }

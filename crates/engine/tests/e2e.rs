@@ -42,6 +42,7 @@ fn run_request(prompt: &str) -> RunRequest {
         auto_approve: true,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -439,6 +440,77 @@ fn omp_chat_config() -> ChatConfig {
     }
 }
 
+/// Two-run harness for interrupt isolation. Run B stays parked until the test
+/// releases it, then records whether its own token was cancelled before it
+/// completes. This makes a cross-chat cancellation observable even if B has
+/// not yet had a chance to publish `Done` when A's interrupt returns.
+struct InterruptIsolationHarness {
+    release_b: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Harness for InterruptIsolationHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Interrupt isolation"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(8);
+        let release_b = self.release_b.clone();
+        let token = controls.interrupt.clone();
+        tokio::spawn(async move {
+            if tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: format!("{} started", request.prompt),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            if request.prompt == "run-b" {
+                release_b.notified().await;
+                if token.is_cancelled() {
+                    let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+                } else {
+                    let _ = tx
+                        .send(Ok(AgentEvent::TextDelta {
+                            text: "; completed independently".into(),
+                        }))
+                        .await;
+                    let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                }
+            } else {
+                token.cancelled().await;
+                let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(harness);
@@ -510,8 +582,12 @@ where
 }
 
 fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    entries_for(core, CHAT)
+}
+
+fn entries_for(core: &EngineCore, chat_id: &str) -> Vec<SessionMessageEntry> {
     core.doc_host
-        .open(CHAT)
+        .open(chat_id)
         .expect("open chat")
         .doc()
         .read_entries()
@@ -1128,6 +1204,95 @@ async fn errored_done_persists_assistant_duration() {
             .map(|session| session.status),
         Some(SessionStatus::Errored)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_is_scoped_to_the_target_chat() {
+    const CHAT_A: &str = "chat-interrupt-a";
+    const CHAT_B: &str = "chat-interrupt-b";
+
+    let dir = tempfile::tempdir().unwrap();
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let core = assemble(
+        dir.path(),
+        Arc::new(InterruptIsolationHarness {
+            release_b: release_b.clone(),
+        }),
+    );
+
+    for (chat_id, command_id, message_id, prompt) in [
+        (CHAT_A, "cmd-run-a", "message-a", "run-a"),
+        (CHAT_B, "cmd-run-b", "message-b", "run-b"),
+    ] {
+        let handle = core.doc_host.open(chat_id).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            command_id,
+            SessionCommandPayload::Run {
+                request: run_request(prompt),
+                message_id: message_id.into(),
+            },
+        );
+    }
+
+    wait_for(
+        || {
+            [CHAT_A, CHAT_B].into_iter().all(|chat_id| {
+                core.sessions.session_status(chat_id).map(|s| s.status)
+                    == Some(SessionStatus::Working)
+                    && entries_for(&core, chat_id)
+                        .iter()
+                        .any(|entry| entry.status == Some(MessageStatus::Streaming))
+            })
+        },
+        "both chats to be streaming",
+    )
+    .await;
+
+    assert!(core.sessions.interrupt(CHAT_A).await.unwrap());
+    assert_eq!(
+        core.sessions.session_status(CHAT_A).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    assert!(
+        entries_for(&core, CHAT_A)
+            .iter()
+            .any(|entry| entry.status == Some(MessageStatus::Aborted))
+    );
+    assert!(
+        !core.sessions.interrupt(CHAT_A).await.unwrap(),
+        "a settled chat must report that there is no live run to interrupt"
+    );
+
+    // B has not observed any completion signal yet. Release it through its
+    // independent test control; it checks its own token before completing, so
+    // a cancellation leaked from A cannot hide behind an early status read.
+    assert_eq!(
+        core.sessions.session_status(CHAT_B).map(|s| s.status),
+        Some(SessionStatus::Working),
+        "interrupting chat A must leave chat B running"
+    );
+    assert!(
+        entries_for(&core, CHAT_B)
+            .iter()
+            .any(|entry| entry.status == Some(MessageStatus::Streaming))
+    );
+    release_b.notify_one();
+
+    wait_for(
+        || core.sessions.session_status(CHAT_B).map(|s| s.status) == Some(SessionStatus::Idle),
+        "chat B to complete independently",
+    )
+    .await;
+
+    let assistant_b = entries_for(&core, CHAT_B)
+        .into_iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .expect("chat B assistant entry");
+    assert_eq!(assistant_b.status, Some(MessageStatus::Complete));
+    assert!(assistant_b.parts.iter().any(|part| {
+        matches!(part, MessagePart::Text { text, .. } if text.contains("completed independently"))
+    }));
 }
 
 #[tokio::test]
@@ -2176,7 +2341,10 @@ async fn rpc_surface_over_in_memory_transport() {
         .unwrap()
         .unwrap();
     // Delta protocol: the stream opens with a full reset frame.
-    assert_eq!(initial, serde_json::json!({ "reset": [] }));
+    assert_eq!(
+        initial,
+        serde_json::json!({ "reset": [], "contextUsage": null, "replayBaseline": {"entries": {}} })
+    );
 
     // QueueCommand (as this device's composer would over IPC).
     let command = serde_json::to_value(SessionCommandPayload::Run {
@@ -3120,6 +3288,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         auto_approve: false,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         attachments: vec![path],
         resume: None,
         worktree: None,
@@ -3526,6 +3695,79 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
             .duration_ms
             .is_some_and(|duration| duration > 0)
     );
+}
+
+/// OpenCode/ACP report occupancy through the dedicated `ContextUsage` event
+/// (upstream v0.2.83), not `Usage`. The composer gauge reads the session row,
+/// so that event must reach it too, not only the chat doc's meta.
+#[tokio::test]
+async fn context_usage_event_reaches_the_session_row() {
+    struct ReportsContextEvent;
+
+    #[async_trait]
+    impl Harness for ReportsContextEvent {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Context event"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let script = vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-ctx".into(),
+                    assistant_message_id: format!("a-{}", request.prompt),
+                },
+                AgentEvent::ContextUsage {
+                    tokens: Some(42_000),
+                    window: Some(200_000),
+                },
+                AgentEvent::TextDelta { text: "ok".into() },
+                done(DoneStatus::Completed),
+            ];
+            Ok(futures::stream::iter(script.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ReportsContextEvent));
+    let watch = core.sessions.watch_sessions();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-context-event",
+        SessionCommandPayload::Run {
+            request: run_request("measure"),
+            message_id: "m-context-event".into(),
+        },
+    );
+    let expected = zeron_proto::ContextUsage::reported(Some(42_000), Some(200_000));
+    wait_for(
+        || watch.borrow().first().and_then(|s| s.context_usage) == Some(expected),
+        "the ContextUsage event to reach the session row",
+    )
+    .await;
+    core.shutdown().await;
 }
 
 /// Regression: turn 2 spawns a fresh runtime process that has not reported a
@@ -4205,4 +4447,105 @@ async fn real_image_generation_profile_smoke() {
             .contains("generated_images/")
     );
     core.sessions.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.note_local_ipc("ws://127.0.0.1:43111");
+    core.workspace
+        .create_space(
+            "space-e2e",
+            &core.device_id,
+            "/tmp/e2e-space",
+            Some("E2E".into()),
+            false,
+        )
+        .unwrap();
+    core.workspace
+        .create_chat(
+            "parent-e2e",
+            Some("space-e2e"),
+            Some(&core.device_id),
+            Some(ChatConfig {
+                harness: HarnessId::Mock,
+                model: Some("parent-model".into()),
+                reasoning: Some(ReasoningLevel::High),
+                model_options: Default::default(),
+                sandbox: SandboxLevel::ReadOnly,
+            }),
+            None,
+        )
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let mut chats = client
+        .subscribe(zeron_rpc::methods::WATCH_CHATS, serde_json::Value::Null)
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), chats.recv()).await;
+    let created = client
+        .call(
+            zeron_rpc::methods::SPAWN_CHAT,
+            serde_json::json!({
+                "parentChatId": "parent-e2e",
+                "prompt": "e2e child prompt",
+            }),
+        )
+        .await
+        .unwrap();
+    let child_id = created["chatId"].as_str().unwrap().to_owned();
+    let mut saw_origin = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(200), chats.recv()).await
+        {
+            let rows: Vec<zeron_proto::Chat> = serde_json::from_value(frame).unwrap_or_default();
+            if rows.iter().any(|chat| {
+                chat.id == child_id && chat.origin_chat_id.as_deref() == Some("parent-e2e")
+            }) {
+                saw_origin = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_origin, "WatchChats emits the child with origin");
+    wait_for(
+        || {
+            let entries = core
+                .doc_host
+                .open(&child_id)
+                .ok()
+                .and_then(|handle| handle.doc().read_entries().ok())
+                .unwrap_or_default();
+            let prompt_landed = entries.iter().any(|entry| {
+                entry.role == MessageRole::User
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Text { text, .. } if text == "e2e child prompt")
+                    })
+            });
+            let finished = entries.iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            });
+            prompt_landed && finished
+        },
+        "child first run",
+    )
+    .await;
+    let child = core.workspace.chat(&child_id).unwrap().unwrap();
+    assert_eq!(
+        child
+            .config
+            .as_ref()
+            .and_then(|config| config.model.as_deref()),
+        Some("parent-model")
+    );
+    core.shutdown().await;
 }

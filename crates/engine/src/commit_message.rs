@@ -127,6 +127,7 @@ pub(crate) async fn generate(
             auto_approve: false,
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
+            sessions: None,
             attachments: Vec::new(),
             resume: None,
             worktree: None,
@@ -223,6 +224,7 @@ mod tests {
             assert!(Path::new(&request.cwd).is_dir());
             assert!(matches!(request.sandbox, SandboxLevel::ReadOnly));
             assert!(!request.auto_approve && !request.enable_workers_mcp);
+            assert!(request.sessions.is_none());
             assert!(request.resume.is_none());
             self.requests.lock().unwrap().push(request);
             Ok(futures::stream::iter(vec![

@@ -402,6 +402,21 @@ mod tests {
     }
 
     #[test]
+    fn curl_installer_declares_the_service_directives() {
+        // Git for Windows can check out this source fixture with CRLF. These
+        // assertions cover the installer directives, not checkout line endings.
+        let installer = include_str!("../../../edge/src/install.sh").replace("\r\n", "\n");
+        assert!(!installer.contains("session.json"));
+        assert!(installer.contains("StartLimitIntervalSec=60\n"));
+        assert!(installer.contains("StartLimitBurst=5\n"));
+        assert!(installer.contains("systemctl --user enable zeron"));
+        assert!(installer.contains("systemctl --user restart zeron"));
+    }
+
+    // Executes the POSIX installer against shimmed tools, so it only runs where
+    // `sh` and Unix permissions exist.
+    #[cfg(unix)]
+    #[test]
     fn curl_installer_always_starts_the_local_capable_service() {
         use std::collections::HashMap;
         use std::os::unix::fs::PermissionsExt as _;

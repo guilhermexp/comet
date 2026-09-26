@@ -1,6 +1,8 @@
 //! Regression tests for #296: quiet output never relinquishes a pending prompt.
 //! The retired env knob stays set so reintroducing its old behavior fails fast.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;
@@ -49,6 +51,7 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: true,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -119,6 +122,7 @@ fn assert_done(events: &[AgentEvent], expected: DoneStatus) {
 async fn delayed_turn(scenario: &str) {
     init_env();
     let harness = AcpHarness::pi().with_executable(fixture_path());
+    assert!(harness.authoritative_prompt_end());
     let (controls, steer, token) = controls();
     let mut stream = harness.run(request(scenario), controls).await.unwrap();
     // Queue multiple follow-ups while the first prompt remains outstanding.

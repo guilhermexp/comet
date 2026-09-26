@@ -1,7 +1,7 @@
 //! Browser state shared by the chrome and platform host. No native handles.
 use std::net::IpAddr;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct PageState {
     pub url: Option<String>,
     pub title: String,
@@ -66,6 +66,34 @@ pub fn normalize_address(input: &str) -> Result<String, &'static str> {
         let _ = parsed.set_scheme("http");
     }
     Ok(parsed.into())
+}
+
+/// Chat links require an explicit web authority; never infer a scheme or
+/// silently strip controls, credentials, malformed escapes or backslashes.
+pub fn transcript_address(input: &str) -> Result<String, &'static str> {
+    let lower = input.to_ascii_lowercase();
+    let authority = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .ok_or("Only explicit http and https links are supported.")?;
+    if input.chars().any(|c| c.is_control() || c.is_whitespace())
+        || input.contains('\\')
+        || authority.is_empty()
+        || authority.starts_with(['/', '?', '#'])
+    {
+        return Err("This link contains an invalid address.");
+    }
+    for (i, byte) in input.bytes().enumerate() {
+        if byte == b'%'
+            && !input
+                .as_bytes()
+                .get(i + 1..i + 3)
+                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        {
+            return Err("This link contains an invalid escape.");
+        }
+    }
+    normalize_address(input)
 }
 
 pub fn allowed_navigation(address: &str) -> bool {

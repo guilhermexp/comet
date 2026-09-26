@@ -9,23 +9,56 @@ publish.workspace = true
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [features]
+project-palette-fixture = []
+
 browser-fixture = []
+windows-render-fixture = []
+appshots-fixture = ["gpui_platform/test-support"]
+resource-profile = ["gpui/bench", "gpui_platform/test-support"]
+
+[[example]]
+name = "macos-resource-profile"
+required-features = ["resource-profile"]
+
+[[example]]
+name = "preview-fixture"
+required-features = ["browser-fixture"]
+
+[[example]]
+name = "browser-fixture"
+required-features = ["browser-fixture"]
+
+[[example]]
+name = "windows-render-fixture"
+required-features = ["windows-render-fixture"]
+
+[[example]]
+name = "appshots-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "new-project-fixture"
+required-features = ["project-palette-fixture"]
+
+[[example]]
+name = "sidebar-fixture"
+required-features = ["project-palette-fixture"]
 
 [dependencies]
 url.workspace = true
-
 zeron-proto.workspace = true
 similar.workspace = true
 zeron-doc.workspace = true
 zeron-engine.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
-comet-syntax.workspace = true
+zeron-syntax.workspace = true
 zeron-workers-unpeel.workspace = true
 zeron-theme.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
+gpui-base.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
@@ -35,7 +68,11 @@ pulldown-cmark.workspace = true
 rquickjs.workspace = true
 alacritty_terminal.workspace = true
 base64 = "0.22"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
+usvg = "0.46"
+mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
 unicode-segmentation.workspace = true
+unicode-width.workspace = true
 fontdb.workspace = true
 ttf-parser.workspace = true
 uuid.workspace = true
@@ -49,6 +86,7 @@ calamine = "0.36.1"
 roxmltree.workspace = true
 png.workspace = true
 thiserror.workspace = true
+rust-embed = "=8.7.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
@@ -56,7 +94,7 @@ objc = "0.2"
 wry.workspace = true
 raw-window-handle.workspace = true
 objc2.workspace = true
-objc2-app-kit.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSResponder"] }
 objc2-foundation.workspace = true
 objc2-web-kit.workspace = true
 reqwest.workspace = true
@@ -75,6 +113,9 @@ atspi.workspace = true
 async-io.workspace = true
 x11rb.workspace = true
 image = { workspace = true, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
 
 [dev-dependencies]
 zeron-preview.workspace = true

@@ -1,4 +1,4 @@
-# AGENTS.md — crates/syntax (`comet-syntax`)
+# AGENTS.md — crates/syntax (`zeron-syntax`)
 
 Syntax-highlighting contracts shared by Zeron's desktop surfaces — a
 tree-sitter-based (syntect-class) tokenizer producing paint-only text runs.
@@ -62,13 +62,13 @@ in per fenced block via `fence_tag`).
 
 ## Verification
 
-`cargo test -p comet-syntax` — includes concurrent configuration reuse and
+`cargo test -p zeron-syntax` — includes concurrent configuration reuse and
 reference-span integration tests; the timing benchmark is opt-in.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (span splitting/normalization, precedence, detection, limits, per-grammar basics, concurrent configuration reuse) | unit | `cargo test -p comet-syntax --lib` |
-| `tests/quality.rs` (reference-span snapshots, unicode/incomplete-source invariants, timing guard) | integration | `cargo test -p comet-syntax --test quality` |
+| `src/lib.rs` (span splitting/normalization, precedence, detection, limits, per-grammar basics, concurrent configuration reuse) | unit | `cargo test -p zeron-syntax --lib` |
+| `tests/quality.rs` (reference-span snapshots, unicode/incomplete-source invariants, timing guard) | integration | `cargo test -p zeron-syntax --test quality` |
 
 ## Child DOX Index
 

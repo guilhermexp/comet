@@ -3,14 +3,18 @@
 //! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
 //! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
 //! - `messages`: LoroList of LoroMap {
-//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
+//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?,
+//!   continuationOf?, durationMs? }
 //! - `commands`: LoroList of LoroMap {
 //!   id, kind, payload(json), issuedBy, issuedAt, basedOn?, expiresAt?, status, resolution? }
+//! - `queue`:    LoroMovableList of LoroMap {
+//!   id, text, attachments?, issuedBy, issuedAt, editedAt? }        (any device writes)
 //!
-//! Part maps: { id, kind: "text"|"tool"|"input"|"error"|"workflowTask", text?: LoroText,
-//! call?: json, isError?, questions?: json, resolved?, message?, task?: json }. Text bodies are
-//! **LoroText** so streaming appends RLE-merge (1.03x oplog overhead vs 125x for whole-value
-//! rewrites).
+//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image"|"workflowTask",
+//! text?: LoroText, reasoning?: LoroText, call?: json, isError?, questions?: json, resolved?,
+//! message?, task?: json }. Text and reasoning bodies stream as **LoroText** in `text` so
+//! appends RLE-merge (1.03x oplog overhead vs 125x for whole-value rewrites); `reasoning`
+//! is only read, for parts written by upstream builds that keep thinking out of `text`.
 
 use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
@@ -58,6 +62,28 @@ pub struct SessionMessageEntry {
     pub continuation_of: Option<String>,
 }
 
+/// Host-owned context snapshot replicated in the chat doc's `meta.contextUsage`
+/// (upstream wire shape). Missing fields mean "not reported", never zero; the
+/// device-local session row keeps [`zeron_proto::ContextUsage`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatContextUsage {
+    pub tokens: Option<u64>,
+    pub window: Option<u64>,
+}
+
+impl ChatContextUsage {
+    pub fn fraction(self) -> Option<f64> {
+        Some(self.tokens? as f64 / self.window.filter(|n| *n > 0)? as f64)
+    }
+}
+
+impl From<ChatContextUsage> for zeron_proto::ContextUsage {
+    fn from(usage: ChatContextUsage) -> Self {
+        zeron_proto::ContextUsage::reported(usage.tokens, usage.window)
+    }
+}
+
 /// The doc-resident flat part map (`DocMessagePart` in TS). Distinct from the app-layer
 /// [`MessagePart`]: input parts key on their request id, error parts store `message`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -67,6 +93,10 @@ struct DocPartJson {
     kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Thinking body for `kind: "reasoning"` as written by upstream builds
+    /// (read-only here: this fork streams reasoning through `text`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,7 +276,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "image" => image_part(p.id, p.path, p.name, p.mime_type),
         "reasoning" => MessagePart::Reasoning {
             id: p.id,
-            text: p.text.unwrap_or_default(),
+            text: p.text.or(p.reasoning).unwrap_or_default(),
             completed: p.completed.unwrap_or(false),
             duration_ms: p.duration_ms,
         },
@@ -363,6 +393,41 @@ impl SessionDoc {
         &self.doc
     }
 
+    /// A single atomic value prevents tokens and capacity from tearing on sync.
+    pub fn context_usage(&self) -> Option<ChatContextUsage> {
+        let loro::ValueOrContainer::Value(LoroValue::String(value)) =
+            self.doc.get_map("meta").get("contextUsage")?
+        else {
+            return None;
+        };
+        serde_json::from_str(&value).ok()
+    }
+
+    pub fn update_context_usage(
+        &self,
+        tokens: Option<u64>,
+        window: Option<u64>,
+    ) -> Result<(), DocError> {
+        let previous = self.context_usage().unwrap_or_default();
+        let next = ChatContextUsage {
+            tokens: tokens.or(previous.tokens),
+            window: window.filter(|n| *n > 0).or(previous.window),
+        };
+        if next != previous {
+            self.doc
+                .get_map("meta")
+                .insert("contextUsage", serde_json::to_string(&next)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    pub fn clear_context_usage(&self) -> Result<(), DocError> {
+        self.doc.get_map("meta").delete("contextUsage")?;
+        self.doc.commit();
+        Ok(())
+    }
+
     pub fn chat_id(&self) -> Option<String> {
         match self.doc.get_map("meta").get("chatId") {
             Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
@@ -414,6 +479,54 @@ impl SessionDoc {
                 }
             })
             .collect())
+    }
+
+    /// Read a bounded suffix directly from the containers, without expanding
+    /// the full messages tree. For first paint only: the full watch must follow.
+    /// Limits count parts rather than joined messages (one turn can have tens
+    /// of thousands of parts). Never truncate a part's text or persisted data.
+    pub fn read_opening_tail(
+        &self,
+        max_parts: usize,
+    ) -> Result<Vec<SessionMessageEntry>, DocError> {
+        use loro::{Container, ValueOrContainer};
+        let messages = self.doc.get_list("messages");
+        let mut remaining = max_parts;
+        let mut entries = Vec::new();
+        for index in (0..messages.len()).rev() {
+            if remaining == 0 {
+                break;
+            }
+            let Some(ValueOrContainer::Container(Container::Map(map))) = messages.get(index) else {
+                continue;
+            };
+            let mut value = map.get_value().to_json_value();
+            let mut tail = Vec::new();
+            if let Some(ValueOrContainer::Container(Container::List(parts))) = map.get("parts") {
+                let count = remaining.min(parts.len());
+                for part_index in parts.len().saturating_sub(count)..parts.len() {
+                    if let Some(part) = parts.get(part_index) {
+                        tail.push(part.get_deep_value().to_json_value());
+                    }
+                }
+                remaining -= count.max(1).min(remaining);
+            } else {
+                remaining -= 1;
+            }
+            value["parts"] = serde_json::Value::Array(tail);
+            if let Ok(entry) = entry_from_json(value) {
+                entries.push(entry);
+            }
+        }
+        entries.reverse();
+        // Preserve the joined id even when the first included segment's root
+        // is outside the window, so its text rows survive the full reset.
+        if let Some(first) = entries.first_mut()
+            && let Some(root) = first.continuation_of.take()
+        {
+            first.id = root;
+        }
+        Ok(join_continuation_entries(entries))
     }
 
     /// Read the commands ledger.
@@ -1191,12 +1304,15 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         ));
     }
 
-    if obj.get("kind").and_then(|x| x.as_str()) == Some("reasoning") {
+    let upstream_reasoning = obj.get("reasoning").and_then(|x| x.as_str());
+    if obj.get("kind").and_then(|x| x.as_str()) == Some("reasoning") || upstream_reasoning.is_some()
+    {
         return Some(MessagePart::Reasoning {
             id,
             text: obj
                 .get("text")
                 .and_then(|x| x.as_str())
+                .or(upstream_reasoning)
                 .unwrap_or_default()
                 .to_owned(),
             completed: obj
@@ -1580,7 +1696,7 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     Ok(())
 }
 
-fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
+pub(crate) fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
     LoroValue::from(v.clone())
 }
 
@@ -1672,6 +1788,46 @@ mod tests {
                 Some(MessagePart::Error { .. })
             ));
         }
+    }
+
+    #[test]
+    fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
+        let doc = SessionDoc::init("whale").unwrap();
+        for segment in 0..4 {
+            doc.push_message(&SessionMessageEntry {
+                id: format!("segment-{segment}"),
+                role: MessageRole::Assistant,
+                parts: (0..100)
+                    .map(|part| MessagePart::Text {
+                        id: format!("part-{}", segment * 100 + part),
+                        text: "body".into(),
+                    })
+                    .collect(),
+                created_at: segment,
+                device_id: "device".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: (segment > 0).then(|| "segment-0".into()),
+                duration_ms: None,
+            })
+            .unwrap();
+        }
+        let before = doc.export_snapshot().unwrap();
+        let tail = doc.read_opening_tail(128).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].id, "segment-0");
+        assert_eq!(tail[0].parts.len(), 128);
+        assert_eq!(tail[0].parts[0].id(), "part-272");
+        assert_eq!(tail[0].parts.last().unwrap().id(), "part-399");
+        assert_eq!(
+            doc.read_opening_tail(1000).unwrap(),
+            join_continuation_entries(doc.read_entries().unwrap())
+        );
+        assert!(doc.read_opening_tail(0).unwrap().is_empty());
+        assert_eq!(
+            before,
+            doc.export_snapshot().unwrap(),
+            "preview never mutates storage"
+        );
     }
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
@@ -2750,5 +2906,43 @@ mod tests {
         })));
         assert!(!transient_part_shell(&serde_json::json!({"opaque": true})));
         assert!(!transient_part_shell(&serde_json::json!(null)));
+    }
+}
+
+#[cfg(test)]
+mod context_usage_tests {
+    use super::*;
+    #[test]
+    fn context_snapshot_survives_remote_import_restart_and_rebuild() {
+        let host = SessionDoc::init("context-chat").unwrap();
+        assert_eq!(host.context_usage(), None);
+        host.update_context_usage(Some(150_000), Some(200_000))
+            .unwrap();
+        let replica = SessionDoc::from_doc(LoroDoc::new());
+        replica
+            .doc()
+            .import(&host.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(replica.context_usage(), host.context_usage());
+        let version = host.doc().oplog_vv();
+        // Compaction is a replacement, not an accumulating counter. Zero capacity is invalid.
+        host.update_context_usage(Some(0), Some(0)).unwrap();
+        replica
+            .doc()
+            .import(&host.doc().export(ExportMode::updates(&version)).unwrap())
+            .unwrap();
+        assert_eq!(
+            replica.context_usage(),
+            Some(ChatContextUsage {
+                tokens: Some(0),
+                window: Some(200_000)
+            })
+        );
+        host.update_context_usage(None, Some(1_000_000)).unwrap();
+        assert_eq!(host.context_usage().unwrap().tokens, Some(0));
+        let rebuilt = crate::rebuild_thin_doc(&host).unwrap().doc;
+        assert_eq!(rebuilt.context_usage(), host.context_usage());
+        rebuilt.clear_context_usage().unwrap();
+        assert_eq!(rebuilt.context_usage(), None);
     }
 }

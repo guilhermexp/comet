@@ -137,8 +137,8 @@ rpc_methods! {
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
     SET_HARNESS_ENABLED / SetHarnessEnabled = "SetHarnessEnabled" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
-    LIST_MODELS / ListModels = "ListModels" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
-    LIST_COMMANDS / ListCommands = "ListCommands" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    LIST_MODELS / ListModels = "ListModels" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 100 },
+    LIST_COMMANDS / ListCommands = "ListCommands" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 100 },
     QUEUE_COMMAND / QueueCommand = "QueueCommand" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// App-owned durable delivery of a Worker lifecycle event to its existing
     /// parent chat. Uses a deterministic command id and fsync-equivalent store
@@ -189,6 +189,10 @@ rpc_methods! {
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     MUTATE / Mutate = "Mutate" { params: serde_json::Value, reply: serde_json::Value },
+    /// Create a child native chat from a parent row and queue its first run.
+    /// Params `{parentChatId, prompt, spaceId?}`; reply `{chatId, spaceId?, deviceId}`.
+    /// Local IPC only: the caller is the engine-stamped sessions server.
+    SPAWN_CHAT / SpawnChat = "SpawnChat" { params: zeron_proto::SpawnChatParams, reply: zeron_proto::SpawnChatResult, local_only: true },
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     LOCAL_DEVICE / LocalDevice = "LocalDevice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
@@ -305,6 +309,31 @@ rpc_methods! {
     /// with no timeout of its own. The engine's `recap::RUN_BUDGET_SECS` is the
     /// only real ceiling; tune it there.
     GENERATE_CHAT_RECAP / GenerateChatRecap = "GenerateChatRecap" { params: crate::GenerateChatRecapParams, reply: crate::GenerateChatRecapReply, local_only: true },
+    // Upstream v0.2.83 surface (sync/upstream-v0.2.83): explicit agent
+    // installs, skills, the shared message queue (coexists with steering),
+    // Project Actions, sidebar preferences and workspace image/save/git status.
+    INSTALL_HARNESS / InstallHarness = "InstallHarness" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
+    CANCEL_INSTALL / CancelInstall = "CancelInstall" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    LIST_SKILLS / ListSkills = "ListSkills" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    TAKE_PROJECT_ACTION_SETUP / TakeProjectActionSetup = "TakeProjectActionSetup" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    WATCH_QUEUE / WatchQueue = "WatchQueue" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
+    QUEUE_MESSAGE / QueueMessage = "QueueMessage" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    UPDATE_QUEUED_MESSAGE / UpdateQueuedMessage = "UpdateQueuedMessage" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    BEGIN_QUEUED_MESSAGE_EDIT / BeginQueuedMessageEdit = "BeginQueuedMessageEdit" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    RENEW_QUEUED_MESSAGE_EDIT / RenewQueuedMessageEdit = "RenewQueuedMessageEdit" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    FINISH_QUEUED_MESSAGE_EDIT / FinishQueuedMessageEdit = "FinishQueuedMessageEdit" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    MOVE_QUEUED_MESSAGE / MoveQueuedMessage = "MoveQueuedMessage" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    REMOVE_QUEUED_MESSAGE / RemoveQueuedMessage = "RemoveQueuedMessage" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SEND_QUEUED_MESSAGE_NOW / SendQueuedMessageNow = "SendQueuedMessageNow" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    STEER_QUEUED_MESSAGE_NOW / SteerQueuedMessageNow = "SteerQueuedMessageNow" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    WATCH_SIDEBAR_PREFERENCES / WatchSidebarPreferences = "WatchSidebarPreferences" { params: serde_json::Value, reply: serde_json::Value },
+    WATCH_WORKSPACE_GIT_STATUS / WatchWorkspaceGitStatus = "WatchWorkspaceGitStatus" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
+    READ_WORKSPACE_IMAGE / ReadWorkspaceImage = "ReadWorkspaceImage" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    WRITE_WORKSPACE_FILE / WriteWorkspaceFile = "WriteWorkspaceFile" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    LIST_PROJECT_ACTIONS / ListProjectActions = "ListProjectActions" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    UPSERT_PROJECT_ACTION / UpsertProjectAction = "UpsertProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    DELETE_PROJECT_ACTION / DeleteProjectAction = "DeleteProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    RUN_PROJECT_ACTION / RunProjectAction = "RunProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
 }
 
 #[cfg(test)]

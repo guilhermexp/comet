@@ -528,6 +528,8 @@ pub struct WorkersLaunchRequest {
     pub command: Option<String>,
     pub worktree_path: Option<String>,
     pub worktree_branch: Option<String>,
+    /// Final Session title; the Host marks it `custom_title`.
+    pub title: Option<String>,
     pub initial_text: Option<String>,
     pub initial_text_submit_mode: Option<InitialTextSubmitMode>,
 }
@@ -544,6 +546,7 @@ impl WorkersLaunchRequest {
             command: None,
             worktree_path: None,
             worktree_branch: None,
+            title: None,
             initial_text: None,
             initial_text_submit_mode: None,
         }
@@ -556,6 +559,7 @@ impl WorkersLaunchRequest {
             command: Some(command.into()),
             worktree_path: None,
             worktree_branch: None,
+            title: None,
             initial_text: None,
             initial_text_submit_mode: None,
         }
@@ -564,6 +568,11 @@ impl WorkersLaunchRequest {
     pub fn with_worktree(mut self, path: impl Into<String>, branch: impl Into<String>) -> Self {
         self.worktree_path = Some(path.into());
         self.worktree_branch = Some(branch.into());
+        self
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
         self
     }
 
@@ -602,6 +611,9 @@ impl WorkersLaunchRequest {
         }
         if let Some(value) = &self.worktree_branch {
             body.insert("worktreeBranch".into(), value.clone().into());
+        }
+        if let Some(value) = &self.title {
+            body.insert("title".into(), value.clone().into());
         }
         if let Some(value) = &self.initial_text {
             body.insert("initialText".into(), value.clone().into());

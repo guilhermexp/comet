@@ -182,6 +182,28 @@ fn controller_defers_a_sanitized_briefing_until_after_session_creation() {
 }
 
 #[test]
+fn launch_title_reaches_the_host_as_a_sanitized_session_title() {
+    let launch = controller_mcp_parse_launch(json!({
+        "project_id": "p",
+        "preset_id": "claude",
+        "title": "WT-1\u{1b} fix parser"
+    }))
+    .expect("titled launch parses");
+    assert_eq!(
+        launch.wire_body(),
+        json!({ "projectID": "p", "presetID": "claude", "title": "WT-1 fix parser" })
+    );
+    assert!(
+        controller_mcp_parse_launch(json!({
+            "project_id": "p",
+            "preset_id": "claude",
+            "title": " \u{0} "
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn key_encoder_is_bounded_and_deterministic() {
     assert_eq!(
         controller_mcp_encode_keys(&["escape".into(), "down".into(), "enter".into()])

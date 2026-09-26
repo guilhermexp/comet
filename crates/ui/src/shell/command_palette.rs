@@ -1,5 +1,6 @@
 //! Global action and conversation search, using the sidebar's conversation rows.
 use super::*;
+use crate::appearance::AppearanceMode;
 
 const HISTORY_RESULT_LIMIT: usize = 30;
 const RESULTS_SCROLL_GUTTER: f32 = 8.0;
@@ -9,6 +10,7 @@ pub(super) struct CommandPalette {
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
     active: usize,
+    enter_press: EnterPress,
     // Claim focus during mount so the shell does not restore the composer
     // while this input is still absent from the dispatch tree.
     focus_pending: bool,
@@ -16,11 +18,30 @@ pub(super) struct CommandPalette {
     _search_events: Subscription,
 }
 
+// X11 suppresses synthetic repeat releases but sends repeated keydowns with
+// is_held=false. Keep our own latch until the physical key is released.
+#[derive(Default)]
+struct EnterPress {
+    down: bool,
+}
+
+impl EnterPress {
+    fn press(&mut self, is_held: bool) -> bool {
+        let was_down = std::mem::replace(&mut self.down, true);
+        !was_down && !is_held
+    }
+
+    fn release(&mut self) {
+        self.down = false;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Entry {
     NewChat,
     NewProject,
     Settings,
+    Theme(AppearanceMode),
     Chat(String),
 }
 
@@ -30,6 +51,14 @@ impl Entry {
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
+            Self::Theme(mode) => Some((
+                match mode {
+                    AppearanceMode::System => "Switch to system theme",
+                    AppearanceMode::Light => "Switch to light theme",
+                    AppearanceMode::Dark => "Switch to dark theme",
+                },
+                mode.icon(),
+            )),
             Self::Chat(_) => None,
         }
     }
@@ -40,14 +69,29 @@ fn matches_query(query: &str, text: &str) -> bool {
     query.split_whitespace().all(|word| text.contains(word))
 }
 
-fn actions_for(query: &str) -> Vec<Entry> {
-    [Entry::NewChat, Entry::NewProject, Entry::Settings]
-        .into_iter()
-        .filter(|entry| matches_query(query, entry.action().unwrap().0))
-        .collect()
+fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
+    [
+        Entry::NewChat,
+        Entry::NewProject,
+        Entry::Settings,
+        Entry::Theme(if is_dark {
+            AppearanceMode::Light
+        } else {
+            AppearanceMode::Dark
+        }),
+    ]
+    .into_iter()
+    .filter(|entry| matches_query(query, entry.action().unwrap().0))
+    .collect()
 }
 
 impl Shell {
+    pub(super) fn reset_command_palette_key_state(&mut self) {
+        if let Some(palette) = self.command_palette.as_mut() {
+            palette.enter_press.release();
+        }
+    }
+
     pub(super) fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.command_palette.is_some() {
             self.close_command_palette(window, cx);
@@ -55,7 +99,7 @@ impl Shell {
         }
         self.add_space = None;
         let search = cx.new(|cx| {
-            ComposerInput::with_context("Type a command or search chats…", "PaletteSearch", cx)
+            ComposerInput::with_context("Search commands and chats…", "PaletteSearch", cx)
         });
         let events = cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
@@ -72,6 +116,7 @@ impl Shell {
             focus: cx.focus_handle(),
             previous_focus,
             active: 0,
+            enter_press: EnterPress::default(),
             focus_pending: true,
             scroll: gpui::ScrollHandle::new(),
             _search_events: events,
@@ -93,7 +138,7 @@ impl Shell {
             return Vec::new();
         };
         let query = palette.search.read(cx).text().trim().to_lowercase();
-        let mut entries = actions_for(&query);
+        let mut entries = actions_for(&query, Theme::of(cx).appearance.is_dark());
         let state = self.state.read(cx);
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
@@ -138,11 +183,18 @@ impl Shell {
     }
 
     fn activate_command(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
+        if let Entry::Theme(mode) = entry {
+            // Keep the palette open so this ordinary action updates to its next state.
+            crate::appearance::set_mode(mode, cx);
+            cx.notify();
+            return;
+        }
         self.close_command_palette(window, cx);
         match entry {
             Entry::NewChat => self.open_new_session(cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
+            Entry::Theme(_) => unreachable!(),
             Entry::Chat(id) => self.open_chat(id, cx),
         }
     }
@@ -164,7 +216,7 @@ impl Shell {
         let query = search.read(cx).text().to_string();
         let focus = palette.focus.clone();
         let scroll = palette.scroll.clone();
-        let theme = Theme::of(cx).clone();
+        let theme = Theme::of(cx).for_popup();
         let action_count = entries.iter().take_while(|e| e.action().is_some()).count();
         let mut rows = Vec::new();
         for (ix, entry) in entries.iter().enumerate() {
@@ -205,16 +257,22 @@ impl Shell {
                 popover::menu_row(&theme, ix == active, format!("command-action-{ix}"))
                     .id(("command-action", ix))
                     .h(px(32.0))
+                    .role(gpui::Role::Button)
+                    .aria_label(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.activate_command(entry.clone(), window, cx)
                     }))
-                    .child(icon(glyph).size(px(17.0)).text_color(theme.text_muted))
-                    .child(popover::search_highlight(
+                    .child(
+                        icon(glyph)
+                            .size(px(17.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(div().flex_1().min_w_0().child(popover::search_highlight(
                         label.into(),
                         Some(&query),
                         &theme,
-                    ))
-                    .child(div().flex_1())
+                    )))
                     .when_some(shortcut, |row, shortcut| {
                         row.child(
                             popover::key_cap(&theme)
@@ -267,6 +325,8 @@ impl Shell {
                     state.display_status_for(chat, Utc::now()),
                     ix == active,
                     chat.archived,
+                    false,
+                    None,
                     None,
                     Some(&query),
                     &theme,
@@ -292,9 +352,21 @@ impl Shell {
             .when(entries.is_empty(), |el| {
                 el.child(
                     div()
-                        .p(px(24.0))
+                        .w_full()
+                        .py(px(24.0))
+                        .px(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(6.0))
                         .text_color(theme.text_muted)
-                        .child("No actions or chats found"),
+                        .child("No actions or chats found")
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text_faint)
+                                .child("Try a command, chat title, project, or device."),
+                        ),
                 )
             });
         let card = div()
@@ -327,6 +399,14 @@ impl Shell {
                             }
                         }
                         "enter" => {
+                            let activate = this
+                                .command_palette
+                                .as_mut()
+                                .is_some_and(|palette| palette.enter_press.press(event.is_held));
+                            if !activate {
+                                cx.stop_propagation();
+                                return;
+                            }
                             let entries = this.command_entries(cx);
                             if let Some(entry) = this
                                 .command_palette
@@ -343,6 +423,14 @@ impl Shell {
                     cx.stop_propagation();
                 }),
             )
+            .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _, cx| {
+                if event.keystroke.key == "enter" {
+                    if let Some(palette) = this.command_palette.as_mut() {
+                        palette.enter_press.release();
+                    }
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down_out(
                 cx.listener(|this, _, window, cx| this.close_command_palette(window, cx)),
             )
@@ -433,14 +521,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn x11_unflagged_enter_repeats_activate_once_until_release() {
+        let mut enter = EnterPress::default();
+        // The pinned X11 backend drops synthetic repeat releases and emits
+        // every repeated KeyDownEvent with is_held=false.
+        assert!(enter.press(false));
+        for _ in 0..35 {
+            assert!(!enter.press(false));
+        }
+        enter.release();
+        assert!(enter.press(false));
+    }
+
+    #[test]
+    fn flagged_enter_repeats_do_not_activate() {
+        let mut enter = EnterPress::default();
+        assert!(!enter.press(true));
+        assert!(!enter.press(false));
+        enter.release();
+        assert!(enter.press(false));
+        assert!(!enter.press(true));
+    }
+
+    #[test]
     fn action_search_hides_empty_section_and_preserves_order() {
         assert_eq!(
-            actions_for(""),
-            vec![Entry::NewChat, Entry::NewProject, Entry::Settings]
+            actions_for("", true),
+            vec![
+                Entry::NewChat,
+                Entry::NewProject,
+                Entry::Settings,
+                Entry::Theme(AppearanceMode::Light)
+            ]
         );
-        assert_eq!(actions_for("new"), vec![Entry::NewChat, Entry::NewProject]);
-        assert_eq!(actions_for("settings"), vec![Entry::Settings]);
-        assert!(actions_for("deployment").is_empty());
+        assert_eq!(
+            actions_for("new", true),
+            vec![Entry::NewChat, Entry::NewProject]
+        );
+        assert_eq!(actions_for("settings", true), vec![Entry::Settings]);
+        assert_eq!(
+            actions_for("theme", true),
+            vec![Entry::Theme(AppearanceMode::Light)]
+        );
+        assert!(actions_for("deployment", true).is_empty());
+    }
+
+    #[test]
+    fn theme_action_targets_the_opposite_resolved_appearance() {
+        assert_eq!(
+            actions_for("theme", true),
+            vec![Entry::Theme(AppearanceMode::Light)]
+        );
+        assert_eq!(
+            actions_for("theme", false),
+            vec![Entry::Theme(AppearanceMode::Dark)]
+        );
+        assert_eq!(
+            actions_for("light", true),
+            vec![Entry::Theme(AppearanceMode::Light)]
+        );
+        assert_eq!(
+            actions_for("dark", false),
+            vec![Entry::Theme(AppearanceMode::Dark)]
+        );
     }
 
     #[test]

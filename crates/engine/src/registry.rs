@@ -30,11 +30,24 @@ pub struct HarnessDescriptor {
     /// field never read as uninstallable.
     #[serde(default = "default_installed")]
     pub installed: bool,
+    /// Explicit CLI installation is available on this listing device.
+    #[serde(default)]
+    pub can_install: bool,
     /// Whether the listing device offers this harness (Settings → Agents).
     /// `None` — the catalog came from an engine predating the setting — means
     /// "unknown": consumers fall back to detection (see [`descriptor_enabled`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+}
+
+impl HarnessDescriptor {
+    /// Whether this harness can accept a prompt inside the turn that is
+    /// currently running. Turn-boundary steering is still useful to the
+    /// automatic queue drain, but it is not the non-interrupting "Steer"
+    /// action exposed on an individual queued row.
+    pub fn steers_mid_turn(&self) -> bool {
+        self.supports_steering && self.steering_mode == SteeringMode::StepBoundary
+    }
 }
 
 fn default_installed() -> bool {
@@ -66,6 +79,7 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         steering_mode: harness.steering_mode(),
         reasoning_levels: harness.reasoning_levels().to_vec(),
         installed: harness.installed(),
+        can_install: false,
         enabled: None,
     }
 }
@@ -110,6 +124,7 @@ enum Slot {
 }
 
 pub struct HarnessRegistry {
+    pub(crate) installs: crate::rpc::Installations,
     slots: Mutex<HashMap<HarnessId, Slot>>,
     order: Mutex<Vec<HarnessId>>,
     /// This device's enabled set; `None` inner value = the default set.
@@ -127,6 +142,7 @@ impl Default for HarnessRegistry {
 impl HarnessRegistry {
     pub fn new() -> Self {
         Self {
+            installs: Default::default(),
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
             prefs: Mutex::new(HarnessPrefsFile::default()),
@@ -221,13 +237,15 @@ impl HarnessRegistry {
         let enabled = self.enabled_set();
         match (on, enabled.contains(&id)) {
             (true, false) => {
-                self.prefs().disabled.retain(|h| *h != id);
+                let mut prefs = self.prefs();
+                prefs.disabled.retain(|h| *h != id);
             }
             (false, true) => {
                 if enabled.len() == 1 {
                     return Err("cannot disable the last enabled harness".into());
                 }
-                self.prefs().disabled.push(id);
+                let mut prefs = self.prefs();
+                prefs.disabled.push(id);
             }
             _ => return Ok(()),
         }
@@ -342,6 +360,7 @@ impl HarnessRegistry {
                     None => return None,
                 };
                 descriptor.enabled = Some(enabled.contains(id));
+                descriptor.can_install = zeron_harness::install::can_install(*id);
                 Some(descriptor)
             })
             .collect()
@@ -418,6 +437,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::ClaudeHarness::new().installed()),
@@ -445,6 +465,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Ultra,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::CodexHarness::new().installed()),
@@ -461,10 +482,29 @@ pub fn default_registry() -> HarnessRegistry {
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::CursorHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::CursorHarness::new()) as Arc<dyn Harness>)),
+    );
+    // Devin over ACP (`devin acp`), same lazy pattern: the static descriptor
+    // mirrors AcpHarness::devin() exactly. No steering extension (turn
+    // boundaries) and no effort ladder — Devin bakes effort into the
+    // advertised model ids instead of a `thought_level` option.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Devin,
+            name: "Devin".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::devin().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
@@ -482,6 +522,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::High,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::grok().installed()),
@@ -499,6 +540,7 @@ pub fn default_registry() -> HarnessRegistry {
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
@@ -522,6 +564,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
@@ -545,6 +588,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::OmpHarness::new().installed()),
@@ -569,10 +613,29 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
+    );
+    // antigravity over acp (google's agy_acp_server), same lazy pattern: the
+    // static descriptor mirrors AcpHarness::antigravity() exactly. No steering
+    // extension (turn boundaries), and effort is baked into the model ids, so
+    // the ladder lives on each model rather than the harness.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Antigravity,
+            name: "Antigravity".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
     );
     registry
 }
@@ -580,6 +643,28 @@ pub fn default_registry() -> HarnessRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mid_turn_steering_requires_support_and_a_step_boundary() {
+        let mut descriptor = HarnessDescriptor {
+            id: HarnessId::Mock,
+            name: "Mock".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: Some(true),
+        };
+        assert!(descriptor.steers_mid_turn());
+
+        descriptor.steering_mode = SteeringMode::TurnBoundary;
+        assert!(!descriptor.steers_mid_turn());
+
+        descriptor.steering_mode = SteeringMode::StepBoundary;
+        descriptor.supports_steering = false;
+        assert!(!descriptor.steers_mid_turn());
+    }
 
     #[test]
     fn lazy_slot_lists_without_resolving() {
@@ -595,6 +680,7 @@ mod tests {
                 steering_mode: SteeringMode::StepBoundary,
                 reasoning_levels: vec![],
                 installed: true,
+                can_install: false,
                 enabled: None,
             },
             Box::new(|| false),
@@ -628,11 +714,13 @@ mod tests {
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
                 HarnessId::Cursor,
+                HarnessId::Devin,
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
                 HarnessId::Omp,
-                HarnessId::Opencode
+                HarnessId::Opencode,
+                HarnessId::Antigravity
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -655,12 +743,17 @@ mod tests {
                 ReasoningLevel::High
             ]
         );
-        // Cursor, Hermes and Pi mirror their specs the same way.
+        // Cursor, Devin, Hermes and Pi mirror their specs the same way.
         let cursor = registry.resolve(HarnessId::Cursor).unwrap();
         assert_eq!(cursor.id(), HarnessId::Cursor);
         assert_eq!(cursor.display_name(), "Cursor");
         assert_eq!(cursor.steering_mode(), SteeringMode::TurnBoundary);
         assert!(cursor.reasoning_levels().is_empty());
+        let devin = registry.resolve(HarnessId::Devin).unwrap();
+        assert_eq!(devin.id(), HarnessId::Devin);
+        assert_eq!(devin.display_name(), "Devin");
+        assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(devin.reasoning_levels().is_empty());
         let hermes = registry.resolve(HarnessId::Hermes).unwrap();
         assert_eq!(hermes.id(), HarnessId::Hermes);
         assert_eq!(hermes.display_name(), "Hermes");
@@ -680,6 +773,11 @@ mod tests {
                 ReasoningLevel::Max,
             ]
         );
+        let antigravity = registry.resolve(HarnessId::Antigravity).unwrap();
+        assert_eq!(antigravity.id(), HarnessId::Antigravity);
+        assert_eq!(antigravity.display_name(), "Antigravity");
+        assert_eq!(antigravity.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(antigravity.reasoning_levels().is_empty());
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
@@ -743,12 +841,14 @@ mod tests {
         };
         let claude = parse("claude-code");
         assert!(claude.installed);
+        assert!(!claude.can_install);
         assert_eq!(claude.enabled, None);
         // Unknown enablement follows detection: a found CLI is offered...
         assert!(descriptor_enabled(&claude));
         // ...and one this device never found is not.
         let missing = HarnessDescriptor {
             installed: false,
+            can_install: false,
             ..parse("grok")
         };
         assert!(!descriptor_enabled(&missing));
@@ -765,6 +865,7 @@ mod tests {
                 steering_mode: SteeringMode::StepBoundary,
                 reasoning_levels: vec![],
                 installed: true,
+                can_install: false,
                 enabled: None,
             },
             Box::new(move || installed),
@@ -870,6 +971,7 @@ mod tests {
                 steering_mode: SteeringMode::TurnBoundary,
                 reasoning_levels: vec![],
                 installed: true,
+                can_install: false,
                 enabled: None,
             },
             Box::new(move || probe.load(Ordering::SeqCst)),
@@ -894,6 +996,89 @@ mod tests {
             reloaded.enabled_set(),
             vec![HarnessId::ClaudeCode, HarnessId::Grok]
         );
+    }
+
+    #[test]
+    fn antigravity_detection_ignores_legacy_opt_in_and_preserves_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        test_slot(&registry, HarnessId::ClaudeCode, true);
+        test_slot(&registry, HarnessId::Antigravity, true);
+        let prefs: HarnessPrefsFile =
+            serde_json::from_str(r#"{"optedIn":["antigravity"],"disabled":["antigravity"]}"#)
+                .unwrap();
+        *registry.prefs() = prefs;
+        assert_eq!(registry.enabled_set(), vec![HarnessId::ClaudeCode]);
+
+        registry.set_enabled(HarnessId::Antigravity, true).unwrap();
+        let both = vec![HarnessId::ClaudeCode, HarnessId::Antigravity];
+        assert_eq!(registry.enabled_set(), both);
+
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        test_slot(&reloaded, HarnessId::ClaudeCode, true);
+        test_slot(&reloaded, HarnessId::Antigravity, true);
+        assert_eq!(reloaded.enabled_set(), both);
+
+        reloaded.set_enabled(HarnessId::Antigravity, false).unwrap();
+        assert_eq!(reloaded.enabled_set(), vec![HarnessId::ClaudeCode]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_detection_subprocess() {
+        let Ok(expected) = std::env::var("ZERON_TEST_AGY_INSTALLED") else {
+            return;
+        };
+        let registry = HarnessRegistry::new();
+        let data = tempfile::tempdir().unwrap();
+        registry.load_prefs(data.path());
+        registry.register(Arc::new(zeron_harness::AcpHarness::antigravity()));
+        let expected = expected == "true";
+        assert_eq!(registry.descriptors()[0].installed, expected);
+        assert_eq!(
+            registry.enabled_set().contains(&HarnessId::Antigravity),
+            expected
+        );
+        assert_eq!(descriptor_enabled(&registry.descriptors()[0]), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_server_path_controls_detection_and_enablement() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let cli = bin.join("agy");
+        std::fs::write(&cli, "#!/bin/sh\nexit 91\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let server = bin.join("agy_acp_server.par");
+        for installed in [false, true] {
+            if installed {
+                std::fs::write(&server, "#!/bin/sh\nexit 91\n").unwrap();
+                std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "registry::tests::antigravity_detection_subprocess",
+                    "--nocapture",
+                ])
+                .env("HOME", home.path())
+                .env("PATH", &bin)
+                .env_remove("ANTIGRAVITY_ACP_EXECUTABLE")
+                .env("ZERON_NO_LOGIN_SHELL", "1")
+                .env("ZERON_TEST_AGY_INSTALLED", installed.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
 
     /// The mock resolves on every machine, so detection alone would enable it

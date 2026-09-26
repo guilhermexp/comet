@@ -31,6 +31,10 @@ _Avoid_: session, workspace, thread, conversa
 O estado de execução de um Chat num device — parado, trabalhando, esperando resposta, ou em erro. É efêmero e por device: um Chat existe sem nenhuma Session viva.
 _Avoid_: run state, chat status, sessão (quando se quer dizer Chat)
 
+**Agent-created Chat**:
+Chat aberto pela tool `sessions` a partir de um Chat de orquestrador. Grava o Chat pai em `origin_chat_id`, herda a configuração efetiva do pai e nunca recebe a tool `sessions` de novo. Continua recebendo `workers`. Não confundir com o filho do Zeron MCP (`zeron mcp` `create_chat`, `parent_chat_id`), que some da sidebar e escolhe harness/modelo livremente; o filho de `sessions` aparece na sidebar. Nenhum dos dois recebe `sessions`.
+_Avoid_: child session, subagent, worker
+
 **Chat Transcript**:
 O registro sincronizado de um Chat — mensagens e ferramentas usadas — já filtrado para o que pode ser exibido e sincronizado. É a única fonte de qualquer leitura ou export de um Chat.
 _Avoid_: history, messages, doc, conversa

@@ -151,6 +151,7 @@ fn run_payload(message_id: &str, pending_ref: &str) -> SessionCommandPayload {
             auto_approve: true,
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
+            sessions: None,
             attachments: vec![pending_ref.to_string()],
             worktree: None,
             resume: None,

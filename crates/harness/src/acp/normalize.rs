@@ -344,6 +344,21 @@ fn typed_call(update: &Value) -> ToolCall {
                 .unwrap_or_else(|| "Agent".into()),
             input: raw.cloned(),
         },
+        // Devin's run_subagent tool uses a coarse ACP kind; its private meta
+        // field is the stable identity across pending/in-progress frames.
+        _ if update
+            .get("_meta")
+            .and_then(|m| m.get("cognition.ai/inferenceToolName"))
+            .and_then(Value::as_str)
+            == Some("run_subagent") =>
+        {
+            ToolCall::Unknown {
+                name: raw_str("title")
+                    .map(|d| format!("Agent: {d}"))
+                    .unwrap_or_else(|| "Agent".into()),
+                input: raw.cloned(),
+            }
+        }
         // opencode's subagent spawn (`task` tool — rawInput carries
         // description/prompt/subagent_type): same naming as grok's, so the
         // chip and its subagent tab say what the agent is doing.
@@ -521,6 +536,13 @@ impl UpdateNormalizer {
     }
 }
 
+/// Stateless mapping for callers that own no per-turn normalizer (Devin's
+/// subagent tracker): tool-call folding still applies, progressive
+/// Write/Edit preview state does not carry across frames.
+pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
+    UpdateNormalizer::default().map_update(update)
+}
+
 /// Map one `session/update` payload's `update` object to events.
 /// Message/thought chunks are handled here too (unlike codex, ACP has no
 /// separate delta channel).
@@ -612,10 +634,11 @@ fn map_update_frame(update: &Value) -> Vec<AgentEvent> {
                 .or_else(|| update.get("tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or_default();
-            let context_window = update
-                .get("size")
-                .or_else(|| update.get("contextWindow"))
-                .and_then(Value::as_u64)
+            // Agents disagree on the window key; take the first positive one.
+            let context_window = ["size", "contextWindow", "context_window", "max", "limit"]
+                .iter()
+                .find_map(|key| update.get(*key).and_then(Value::as_u64))
+                .filter(|n| *n > 0)
                 .unwrap_or_default();
             (context_window > 0)
                 .then(|| AgentEvent::Usage {
@@ -1351,4 +1374,16 @@ mod tests {
             ] if name == "Agent: Viz probe"
         ));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn empty_assistant_delta_does_not_open_a_segment() {
+    assert!(
+        map_update(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": ""},
+        }))
+        .is_empty()
+    );
 }

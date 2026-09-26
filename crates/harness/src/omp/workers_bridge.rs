@@ -25,6 +25,7 @@ pub struct WorkersBridge {
     client: RpcClient,
     child: tokio::sync::Mutex<Child>,
     definition: Value,
+    tool_name: String,
     pending: Arc<Mutex<HashMap<String, Arc<CancellationToken>>>>,
     request_timeout: Duration,
 }
@@ -66,6 +67,23 @@ impl WorkersBridge {
         .ok_or_else(|| {
             HarnessError::Protocol("Workers controller sidecar is unavailable".into())
         })?;
+        Self::launch(server, "workers").await.map(Some)
+    }
+
+    pub async fn start_sessions(
+        executable: &std::path::Path,
+        grant: &zeron_proto::SessionsGrant,
+    ) -> Result<Option<Self>, HarnessError> {
+        let Some(server) = workers_mcp::resolve_sessions_for(executable, grant) else {
+            return Ok(None);
+        };
+        Self::launch(server, "sessions").await.map(Some)
+    }
+
+    async fn launch(
+        server: workers_mcp::WorkersMcpServer,
+        expected_tool: &str,
+    ) -> Result<Self, HarnessError> {
         let executable = server.command.to_string_lossy().into_owned();
         let mut command = Command::new(&executable);
         command.args(&server.args);
@@ -147,7 +165,7 @@ impl WorkersBridge {
         let name = tool
             .get("name")
             .and_then(Value::as_str)
-            .filter(|name| *name == "workers")
+            .filter(|name| *name == expected_tool)
             .ok_or_else(|| {
                 HarnessError::Protocol("Workers controller advertised an unexpected tool".into())
             })?;
@@ -163,13 +181,14 @@ impl WorkersBridge {
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object" })),
         });
-        Ok(Some(Self {
+        Ok(Self {
             client,
             child: tokio::sync::Mutex::new(child),
             definition,
+            tool_name: expected_tool.to_owned(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             request_timeout: TOOL_CALL_TIMEOUT,
-        }))
+        })
     }
 
     pub fn definition(&self) -> &Value {
@@ -194,7 +213,7 @@ impl WorkersBridge {
         if id.is_empty() || id.len() > 256 {
             return Err(error_result(id, "OMP host tool request has an invalid id"));
         }
-        if tool_name != "workers" {
+        if tool_name != self.tool_name {
             return Err(error_result(id, "Unknown OMP host tool"));
         }
         if !arguments.is_object() {

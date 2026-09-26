@@ -167,7 +167,7 @@ fn main() -> anyhow::Result<()> {
         theme_library::init(data.clone(), cx);
         appearance::init(appearance::AppearanceMode::Dark, settings.theme_selection, settings.accent, settings.surface, cx);
         history::init(settings.git_history_columns, settings.git_history_column_widths, settings.git_history_column_order, settings.git_history_author_display, cx);
-        composer::init(cx); terminal::panel::init(cx); app_menus::init(cx);
+        composer::init(cx, settings.composer_send_behavior); terminal::panel::init(cx); app_menus::init(cx);
         let state = cx.new(|_| {
             let mut s = state::AppState::new();
             s.connection = zeron_proto::view::ConnectionStatus::Ready;
@@ -410,14 +410,14 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("Browser fixture: resize drag and CSS viewport passed");
                     // Left sidebar does not occlude the browser at any point.
                     for _ in 0..4 {
-                        window.update(cx,|s,w,cx|s.fixture_toggle_sidebar(false,w,cx))?;
+                        window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(false,cx))?;
                         for _ in 0..20 {pause(cx,16).await;anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_native_visible() && b.fixture_visibility_changes()==before),"left sidebar toggle hid the browser");}
                     }
                     eprintln!("Browser fixture: left sidebar transitions passed");
                     // Reverse the right sidebar mid-animation. It must remain
                     // live inside a narrowing mask, without bleeding into chat.
                     for _ in 0..3 {
-                        window.update(cx,|s,w,cx|s.fixture_toggle_sidebar(true,w,cx))?;
+                        window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
                         let deadline=std::time::Instant::now()+Duration::from_secs(2);
                         loop {
                             pause(cx,1).await;
@@ -426,14 +426,14 @@ fn main() -> anyhow::Result<()> {
                             if clip<width { break; }
                             anyhow::ensure!(std::time::Instant::now()<deadline,"closing sidebar did not clip the live browser");
                         }
-                        window.update(cx,|s,w,cx|s.fixture_toggle_sidebar(true,w,cx))?;
+                        window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
                         pause(cx,350).await;
                         anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_native_visible()),"interrupted toggle lost browser visibility");
                     }
-                    window.update(cx,|s,w,cx|s.fixture_toggle_sidebar(true,w,cx))?;
+                    window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
                     pause(cx,350).await;
                     anyhow::ensure!(!first.read_with(cx,|b,_|b.fixture_native_visible()),"closed sidebar retained native content");
-                    window.update(cx,|s,w,cx|s.fixture_toggle_sidebar(true,w,cx))?;
+                    window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
                     pause(cx,350).await;
                     first.read_with(cx,|b,_|b.fixture_eval("document.title='Fieldnotes'"));
                     eprintln!("Browser fixture: right sidebar transitions passed");

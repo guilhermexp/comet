@@ -110,7 +110,12 @@ impl DetailsSidebarState {
     }
 
     pub fn tab(&self) -> DetailsTab {
-        self.preferences.active_tab
+        // Changes moved into the Files explorer's Changes tab; a persisted
+        // legacy value opens on Details instead of a tab that no longer exists.
+        match self.preferences.active_tab {
+            DetailsTab::SourceControl => DetailsTab::Details,
+            tab => tab,
+        }
     }
 
     pub fn set_tab(&mut self, tab: DetailsTab) {
@@ -568,7 +573,7 @@ impl DetailsSidebar {
             }
         });
         let commit_input = cx.new(|cx| {
-            ComposerInput::new("Message (Enter to commit)", cx).with_text_metrics(13.0, 20.0)
+            ComposerInput::new("Message (Enter to commit)", cx).with_text_metrics(12.0, 18.0)
         });
         let commit_events = cx.subscribe(&commit_input, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
@@ -1215,7 +1220,11 @@ impl DetailsSidebar {
         cx.notify();
     }
 
-    fn render_source_control(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    pub(crate) fn render_source_control(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         self.ensure_source_control_watch(cx);
         let mut content = div().w_full().min_w_0().flex().flex_col().pb(px(12.0));
         if self.sidebar.context().is_none() {
@@ -1283,7 +1292,7 @@ impl DetailsSidebar {
         let can_generate = !busy && status.files.iter().any(source_control::is_staged);
         let mut generate_btn = div()
             .id("details-generate-commit-message")
-            .size(px(24.0))
+            .size(px(20.0))
             .flex_none()
             .flex()
             .items_center()
@@ -1314,7 +1323,7 @@ impl DetailsSidebar {
         } else {
             generate_btn = generate_btn.child(
                 icons::icon(icons::THOUGHT_SPARKLE)
-                    .size(px(15.0))
+                    .size(px(13.0))
                     .text_color(theme.text_muted),
             );
         }
@@ -1327,23 +1336,23 @@ impl DetailsSidebar {
         let mut commit_btn = div()
             .id("details-source-control-commit")
             .w_full()
-            .h(px(32.0))
+            .h(px(26.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .gap(px(8.0))
+            .gap(px(6.0))
             .rounded(px(6.0))
             .bg(theme.text)
             .text_color(theme.bg)
-            .text_size(px(13.0))
+            .text_size(px(12.0))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .opacity(if can_commit { 1.0 } else { 0.4 })
             .role(gpui::Role::Button)
             .aria_label("Commit staged changes")
             .child(
                 icons::icon(icons::CHECK)
-                    .size(px(16.0))
+                    .size(px(13.0))
                     .text_color(theme.bg),
             )
             .child("Commit");
@@ -1355,15 +1364,15 @@ impl DetailsSidebar {
         let mut sync_btn = div()
             .id("details-source-control-sync")
             .w_full()
-            .h(px(32.0))
+            .h(px(26.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .gap(px(8.0))
+            .gap(px(6.0))
             .rounded(px(6.0))
             .bg(theme.text.opacity(0.08))
-            .text_size(px(13.0))
+            .text_size(px(12.0))
             .text_color(theme.text)
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .role(gpui::Role::Button)
@@ -1375,7 +1384,7 @@ impl DetailsSidebar {
                 } else {
                     icons::ARROW_UP
                 })
-                .size(px(16.0))
+                .size(px(13.0))
                 .text_color(theme.text),
             )
             .child(sync_label);
@@ -1405,9 +1414,9 @@ impl DetailsSidebar {
                 .flex_none()
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
-                .p(px(10.0))
-                .pb(px(12.0))
+                .gap(px(6.0))
+                .p(px(8.0))
+                .pb(px(10.0))
                 .border_b_1()
                 .border_color(theme.border)
                 .child(header)
@@ -1415,10 +1424,10 @@ impl DetailsSidebar {
                     div()
                         .w_full()
                         .min_w_0()
-                        .h(px((message.lines().count().max(1) as f32 * 20.0 + 14.0)
-                            .clamp(34.0, 134.0)))
+                        .h(px((message.lines().count().max(1) as f32 * 18.0 + 10.0)
+                            .clamp(28.0, 118.0)))
                         .flex_none()
-                        .px(px(9.0))
+                        .px(px(8.0))
                         .rounded(px(6.0))
                         .bg(theme.text.opacity(0.05))
                         .flex()
@@ -1543,7 +1552,7 @@ impl DetailsSidebar {
         }
         let header = div()
             .id(("source-control-section", slot))
-            .h(px(34.0))
+            .h(px(27.0))
             .w_full()
             .flex_none()
             .px(px(8.0))
@@ -1648,7 +1657,7 @@ impl DetailsSidebar {
                                 this.request_discard(vec![file.clone()], cx);
                             }),
                         )
-                        .size(px(24.0)),
+                        .size(px(22.0)),
                     );
                 }
                 let action_path = path.clone();
@@ -1674,7 +1683,7 @@ impl DetailsSidebar {
                             }
                         }),
                     )
-                    .size(px(24.0)),
+                    .size(px(22.0)),
                 );
             }
             let open_path = path.clone();
@@ -1684,7 +1693,7 @@ impl DetailsSidebar {
                     index,
                 ))
                 .group(group)
-                .h(px(28.0))
+                .h(px(27.0))
                 .flex_none()
                 .w_full()
                 .min_w_0()
@@ -1720,8 +1729,7 @@ impl DetailsSidebar {
                                 .min_w_0()
                                 .flex_shrink(1.0)
                                 .truncate()
-                                .text_size(px(13.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(11.5))
                                 .text_color(theme.text)
                                 .child(name.to_string()),
                         )
@@ -1743,7 +1751,7 @@ impl DetailsSidebar {
                         .w(px(12.0))
                         .flex_none()
                         .text_center()
-                        .text_size(px(11.0))
+                        .text_size(px(10.5))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(status_color)
                         .child(row.letter.to_string()),
@@ -1753,7 +1761,7 @@ impl DetailsSidebar {
         list
     }
 
-    fn render_discard_dialog(
+    pub(crate) fn render_discard_dialog(
         &mut self,
         viewport: gpui::Size<gpui::Pixels>,
         theme: &Theme,
@@ -2694,33 +2702,7 @@ impl DetailsSidebar {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_tab(DetailsTab::Files, cx)
                                     })),
-                            )
-                            .child({
-                                let badge = self
-                                    .checkout_status
-                                    .as_ref()
-                                    .map(|status| source_control::change_badge(&status.files))
-                                    .unwrap_or(0);
-                                let mut tab_pill =
-                                    pill("Changes", tab == DetailsTab::SourceControl)
-                                        .id("source-control-tab")
-                                        .gap(px(6.0))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_tab(DetailsTab::SourceControl, cx)
-                                        }));
-                                if badge > 0 {
-                                    tab_pill = tab_pill.child(
-                                        div()
-                                            .px(px(6.0))
-                                            .rounded(px(8.0))
-                                            .bg(crate::theme::ink(0.08))
-                                            .text_size(px(10.0))
-                                            .text_color(theme.text_muted)
-                                            .child(format!("{badge}")),
-                                    );
-                                }
-                                tab_pill
-                            }),
+                            ),
                     ),
             )
             .when(tab == DetailsTab::Details, |header| {
@@ -5380,6 +5362,58 @@ impl DetailsSidebar {
 
 impl EventEmitter<DetailsSidebarEvent> for DetailsSidebar {}
 
+/// The Details sidebar's Changes panel mounted in another surface (the Files
+/// explorer's Changes tab). It renders the ONE source-control state owned by
+/// [`DetailsSidebar`] — commit message, staging, sync, discard prompt — so a
+/// commit from either place is the same commit and both stay in step.
+pub struct SourceControlPane {
+    sidebar: Entity<DetailsSidebar>,
+    _observe: gpui::Subscription,
+}
+
+impl SourceControlPane {
+    pub fn new(sidebar: Entity<DetailsSidebar>, cx: &mut Context<Self>) -> Self {
+        let _observe = cx.observe(&sidebar, |_, _, cx| cx.notify());
+        Self { sidebar, _observe }
+    }
+
+    /// Staged + unstaged paths, for the host tab's badge.
+    pub fn change_count(&self, cx: &gpui::App) -> usize {
+        self.sidebar
+            .read(cx)
+            .checkout_status
+            .as_ref()
+            .map(|status| source_control::change_badge(&status.files))
+            .unwrap_or(0)
+    }
+}
+
+impl Render for SourceControlPane {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        let viewport = window.viewport_size();
+        let (body, discard_dialog) = self.sidebar.update(cx, |sidebar, cx| {
+            (
+                sidebar.render_source_control(&theme, cx),
+                sidebar.render_discard_dialog(viewport, &theme, cx),
+            )
+        });
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("files-changes-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .children(discard_dialog)
+    }
+}
+
 impl Render for DetailsSidebar {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -5387,7 +5421,8 @@ impl Render for DetailsSidebar {
         let body: AnyElement = match self.sidebar.tab() {
             DetailsTab::Details => self.render_details(&theme, cx).into_any_element(),
             DetailsTab::Files => self.render_files(&theme, cx).into_any_element(),
-            DetailsTab::SourceControl => self.render_source_control(&theme, cx).into_any_element(),
+            // Legacy value; `tab()` already maps it to Details.
+            DetailsTab::SourceControl => self.render_details(&theme, cx).into_any_element(),
         };
         let file_menu = self.render_file_context_menu(&theme, cx);
         let delete_dialog = self.render_delete_dialog(viewport, &theme, cx);
@@ -5596,10 +5631,12 @@ mod tests {
     }
 
     #[test]
-    fn source_control_tab_persists_like_files() {
+    fn legacy_source_control_tab_opens_on_details() {
+        // Changes now lives in the Files explorer; an old persisted value
+        // must not strand the sidebar on a tab with no pill.
         let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
         state.set_tab(DetailsTab::SourceControl);
-        assert_eq!(state.preferences().active_tab, DetailsTab::SourceControl);
+        assert_eq!(state.tab(), DetailsTab::Details);
     }
 
     #[test]

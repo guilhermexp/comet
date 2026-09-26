@@ -301,6 +301,7 @@ fn proc_address(value: &str, ipv6: bool) -> Option<SocketAddr> {
     ))
 }
 
+/// `ps lstart=` tokens ("Thu Sep 11 16:14:42 2026") to ms since the epoch.
 #[cfg(target_os = "macos")]
 fn parse_lstart(parts: &[&str]) -> u64 {
     use chrono::TimeZone;
@@ -448,6 +449,8 @@ mod tests {
             }
         }
         let _guard = Kill(child);
+        // `listeners()` only reports sockets; derive the scanner's start time
+        // through the same platform path it uses.
         #[cfg(target_os = "linux")]
         let started_at = {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
@@ -475,7 +478,10 @@ mod tests {
         assert!(!same_process(pid, started_at + 1000));
         assert!(!same_process(pid, 0));
         drop(_guard);
-        assert!(!same_process(pid, started_at));
+        assert!(
+            !same_process(pid, started_at),
+            "a reaped pid no longer matches"
+        );
     }
 
     #[test]

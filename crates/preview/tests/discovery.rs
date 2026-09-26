@@ -4,8 +4,9 @@ use std::{
     time::Duration,
 };
 use zeron_preview::PreviewService;
-/// Every service binds the fixed proxy port, so tests in this binary must not
-/// run concurrently.
+/// Every service binds the fixed proxy port, so tests in this binary must
+/// not run concurrently: one test freeing 7331 for its own proxy to reclaim
+/// would otherwise race another test's service for it.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Child(std::process::Child);
 impl Drop for Child {
@@ -103,7 +104,9 @@ async fn only_current_project_http_processes_are_exposed_and_removals_are_live()
     }
 }
 
-/// A discovered dev server receives exactly one probe for its lifetime.
+/// A discovered dev server receives exactly one probe for its lifetime. The
+/// scanner used to send `HEAD /` every cycle to every project listener, which
+/// showed up as request spam (and growing memory) in dev servers like Expo.
 #[tokio::test]
 async fn a_discovered_server_is_probed_once_not_every_cycle() {
     let _serial = SERIAL.lock().await;
@@ -139,9 +142,18 @@ async fn a_discovered_server_is_probed_once_not_every_cycle() {
     let roots = vec![app.clone()];
     service.start(Arc::new(move || roots.clone()), None).await;
     wait(&service, Some(server.0.id())).await;
+    // Several scan cycles (2s cadence) pass while the server stays discovered.
     tokio::time::sleep(Duration::from_secs(7)).await;
-    assert_eq!(service.catalog().snapshot().services.len(), 1);
+    assert_eq!(
+        service.catalog().snapshot().services.len(),
+        1,
+        "the server stays listed without being re-probed"
+    );
     let requests = std::fs::read_to_string(&log).unwrap_or_default();
-    assert_eq!(requests.lines().count(), 1, "expected one discovery probe");
+    assert_eq!(
+        requests.lines().count(),
+        1,
+        "expected a single discovery probe, got:\n{requests}"
+    );
     service.shutdown().await;
 }

@@ -207,6 +207,12 @@ impl TitleGenerator {
                 [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Mock]
                     .into_iter()
                     .find(|id| enabled.contains(id))
+                    .or_else(|| {
+                        enabled
+                            .iter()
+                            .copied()
+                            .find(|id| zeron_harness::supports_titles(*id))
+                    })
             }
         })?;
         if !zeron_harness::supports_titles(harness_id)
@@ -252,6 +258,7 @@ impl TitleGenerator {
                     auto_approve: false,
                     enable_workers_mcp: false,
                     workers_parent_chat_id: None,
+                    sessions: None,
                     attachments: Vec::new(),
                     resume: None,
                     worktree: None,
@@ -476,6 +483,7 @@ mod tests {
             auto_approve: false,
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
+            sessions: None,
             resume: None,
             attachments: vec![],
             worktree: None,
@@ -670,6 +678,7 @@ mod tests {
             assert_eq!(request.model.as_deref(), Some("chosen-title-model"));
             assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
             assert!(!request.auto_approve);
+            assert!(request.sessions.is_none());
             assert!(request.resume.is_none());
             assert_ne!(std::path::Path::new(&request.cwd), dir.path());
             assert!(

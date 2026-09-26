@@ -19,6 +19,20 @@ final class AppshotTests: XCTestCase {
         XCTAssertEqual(parsed.attachments[0].appshot?.title, "Planning & review")
         XCTAssertNil(parsed.attachments[1].appshot)
         XCTAssertFalse(parsed.text.contains("Private observed text"))
+        XCTAssertEqual(MessageQueue.visibleText("Review this" + context, attachments: [path]), "Review this")
+        XCTAssertEqual(MessageQueue.visibleText(content, attachments: [path, "/host/ordinary.png"]), "Review this")
+    }
+
+    func testPhoneQueueEditKeepsContextAndAttachmentOnlyMessage() {
+        let lease = QueueEditLease(rowId: "row", leaseId: "lease", text: "Review this" + context,
+                                   baseTextHash: "hash", expiresAtMs: 60_000)
+        let edit = QueueComposerEdit(lease: lease, originalDraft: "My draft", hasAttachments: true)
+        XCTAssertEqual(edit.textToCommit("Changed prompt"), "Changed prompt" + context)
+        XCTAssertEqual(edit.textToCommit("  \n"), attachmentOnlyText + context)
+        XCTAssertEqual(edit.originalDraft, "My draft")
+        let parsed = parseUserMessageImages(withAttachments(text: edit.textToCommit("")!, paths: [path]))
+        XCTAssertEqual(parsed.text, "")
+        XCTAssertNotNil(parsed.attachments.first?.appshot)
     }
 
     func testMalformedOrAmbiguousContextStaysHidden() {

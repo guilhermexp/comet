@@ -32,6 +32,9 @@ static CAPTURE_SOUND_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_capture_sound_enabled(enabled: bool) {
     CAPTURE_SOUND_ENABLED.store(enabled, Ordering::Relaxed);
+    if enabled {
+        crate::sound::prepare_appshot();
+    }
 }
 
 /// Acknowledge saved pixels immediately; optional semantic enrichment may still be running.
@@ -361,7 +364,7 @@ pub fn safe_app_name(value: &str) -> String {
 /// Native capture surfaces can contain transparent padding (for example Chrome
 /// can return a wider backing surface than its visible window). Crop only rows
 /// and columns that contain no nonzero alpha. Do this before deriving thumbnail
-/// dimensions, so preview and upload share the same image.
+/// dimensions, so preview, upload and restored queue drafts share the same image.
 /// Opaque margins, rounded corners and even alpha=1 pixels remain untouched.
 fn trim_appshot_padding(bytes: &[u8]) -> Result<Option<Vec<u8>>, CaptureError> {
     let invalid = |error: png::DecodingError| {
@@ -692,8 +695,113 @@ pub fn with_appshots(
     out
 }
 
+/// Restore the serialized Appshots in a queued message onto its loaded images.
+/// Reject malformed or unmatched metadata so editing cannot silently drop it.
+/// Icons and capture timestamps are presentation-only and were never transported.
+pub(crate) fn restore_queued_appshots(
+    text: &str,
+    paths: &[String],
+    attachments: &[StagedAttachment],
+) -> Result<(Vec<StagedAttachment>, Vec<CapturedAppshot>), String> {
+    let marker = format!("\n\n{CONTEXT_MARKER}");
+    let Some((_, context)) = text.split_once(&marker) else {
+        return Ok((attachments.to_vec(), Vec::new()));
+    };
+    let invalid = || {
+        "Couldn't restore this Appshot's context. Cancel and retry from the original device."
+            .to_string()
+    };
+    if paths.len() != attachments.len() || context.len() > 4 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    // Older hosts retained the ordinary attachment trailer inside queue text.
+    // Use the shared trailer parser so both `Attached files` and the legacy
+    // `Attached images` wording, and markers inside AX text, are handled.
+    let context = crate::attachments::parse_user_message_images(context).text;
+    let xml = format!("<appshots>{context}</appshots>");
+    let doc = roxmltree::Document::parse_with_options(
+        &xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 4096,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| invalid())?;
+    let mut used = std::collections::HashSet::new();
+    let mut shots = Vec::new();
+    for node in doc.root_element().children() {
+        if node.is_text() && node.text().unwrap_or_default().trim().is_empty() {
+            continue;
+        }
+        if !node.has_tag_name("appshot") || node.children().any(|child| !child.is_text()) {
+            return Err(invalid());
+        }
+        let image = node.attribute("image").ok_or_else(invalid)?;
+        let index = paths
+            .iter()
+            .position(|path| path == image)
+            .ok_or_else(invalid)?;
+        if !used.insert(index) {
+            return Err(invalid());
+        }
+        let mut screenshot = attachments[index].clone();
+        // Older captures may already have backing-surface padding stored in
+        // their PNG. Normalize their bytes too, without changing attachment IDs.
+        if png_dimensions(screenshot.bytes()).is_some() {
+            if let Some(bytes) = trim_appshot_padding(screenshot.bytes()).map_err(|_| invalid())? {
+                screenshot.size = bytes.len() as u64;
+                screenshot.image = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
+            }
+        }
+        let content = node.text().unwrap_or_default();
+        // Remove only the serializer's surrounding newlines, preserving content.
+        let content = content.strip_prefix('\n').unwrap_or(content);
+        let content = content.strip_suffix('\n').unwrap_or(content);
+        shots.push(CapturedAppshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            app_name: node.attribute("app").ok_or_else(invalid)?.to_string(),
+            bundle_identifier: node.attribute("bundle-identifier").map(str::to_string),
+            window_title: node.attribute("window-title").map(str::to_string),
+            accessibility: AccessibilitySnapshot {
+                format_version: node
+                    .attribute("accessibility-format")
+                    .ok_or_else(invalid)?
+                    .parse()
+                    .map_err(|_| invalid())?,
+                content: content.to_string(),
+                truncated: node
+                    .attribute("truncated")
+                    .ok_or_else(invalid)?
+                    .parse()
+                    .map_err(|_| invalid())?,
+            },
+            screenshot_dimensions: png_dimensions(screenshot.bytes()),
+            screenshot,
+            app_icon: None,
+            captured_at: Utc::now(),
+        });
+    }
+    if shots.is_empty()
+        || shots
+            .iter()
+            .map(|shot| shot.screenshot.bytes().len() as u64)
+            .sum::<u64>()
+            > MAX_STAGED_APPSHOT_BYTES
+    {
+        return Err(invalid());
+    }
+    let ordinary = attachments
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used.contains(index))
+        .map(|(_, attachment)| attachment.clone())
+        .collect();
+    Ok((ordinary, shots))
+}
+
 /// Safe display metadata carried by the existing prompt format. The observed
-/// accessibility payload is never returned to the transcript UI.
+/// accessibility payload is never returned to the transcript or queue UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppshotPresentation {
     pub app_name: String,
@@ -937,6 +1045,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn restored_queue_appshots_trim_legacy_padding_without_changing_attachment_identity() {
+        let pixels = [[0, 0, 0, 0], [44, 55, 66, 255], [0, 0, 0, 0]].concat();
+        let mut original = shot();
+        original.screenshot = crate::attachments::stage_png_bytes(
+            "Chrome.png".into(),
+            fixture_png(3, 1, &pixels, png::BitDepth::Eight),
+        );
+        let path = "/host/legacy.png".to_string();
+        let text = with_appshots(
+            "edit",
+            &[original.clone()],
+            &HashMap::from([(original.screenshot.id.clone(), path.clone())]),
+        );
+        let (_, restored) =
+            restore_queued_appshots(&text, &[path], &[original.screenshot.clone()]).unwrap();
+        assert_eq!(restored[0].screenshot.id, original.screenshot.id);
+        assert_eq!(restored[0].screenshot_dimensions, Some((1, 1)));
+        assert_eq!(restored[0].accessibility, original.accessibility);
+        assert_eq!(
+            decoded_pixels(restored[0].screenshot.bytes()).1,
+            [44, 55, 66, 255]
+        );
+        // The original upload remains immutable.
+        assert_eq!(png_dimensions(original.screenshot.bytes()), Some((3, 1)));
+    }
+
+    #[test]
     fn png_dimensions_reads_ihdr_and_rejects_invalid_images() {
         let mut png = Vec::from(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".as_slice());
         png.extend_from_slice(&1440_u32.to_be_bytes());
@@ -971,7 +1106,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn appshot_invalid_xml_characters_are_escaped_for_presentation() {
+    fn appshot_invalid_xml_characters_round_trip_through_queue_and_presentation() {
         let mut original = shot();
         original.app_name = "App\0 & Notes".into();
         original.window_title = Some("Title\u{1b}\u{fffe}\u{ffff}".into());
@@ -988,6 +1123,85 @@ pub(crate) mod tests {
         let sources = presentations(&encoded);
         assert_eq!(sources[&path].app_name, "App� & Notes");
         assert_eq!(sources[&path].window_title.as_deref(), Some("Title���"));
+        let (_, restored) =
+            restore_queued_appshots(&encoded, &[path], &[original.screenshot.clone()]).unwrap();
+        assert_eq!(restored[0].app_name, "App� & Notes");
+        assert_eq!(restored[0].window_title.as_deref(), Some("Title���"));
+        assert_eq!(
+            restored[0].accessibility.content,
+            format!(
+                "{}\t\n{}\r{}valid\t\r\n<&>é🦀\u{7f}\u{85}\u{10000}",
+                "�".repeat(9),
+                "�".repeat(2),
+                "�".repeat(18)
+            )
+        );
+    }
+
+    #[test]
+    fn queued_edit_round_trip_keeps_context_and_rebinds_uploaded_images() {
+        let mut original = shot();
+        original.window_title = Some("Line 1\nLine 2\t&\"".into());
+        original.accessibility.content = "\n<&secret>\r\n  text\n".into();
+        let mut ordinary = original.screenshot.clone();
+        ordinary.id = "ordinary".into();
+        let paths: Vec<String> = vec!["/host/ordinary.png".into(), "/host/a&b.png".into()];
+        let encoded = with_appshots(
+            "inspect",
+            &[original.clone()],
+            &HashMap::from([(original.screenshot.id.clone(), paths[1].clone())]),
+        );
+        for text in [
+            encoded.clone(),
+            crate::attachments::with_attachments(&encoded, &paths),
+        ] {
+            let (ordinary_restored, restored) = restore_queued_appshots(
+                &text,
+                &paths,
+                &[ordinary.clone(), original.screenshot.clone()],
+            )
+            .unwrap();
+            assert_eq!(ordinary_restored.len(), 1);
+            assert_eq!(ordinary_restored[0].id, "ordinary");
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].accessibility, original.accessibility);
+            assert_eq!(restored[0].window_title, original.window_title);
+            assert_eq!(restored[0].app_name, original.app_name);
+            let rebound = with_appshots(
+                "edited",
+                &restored,
+                &HashMap::from([(restored[0].screenshot.id.clone(), "/new/renamed.png".into())]),
+            );
+            assert!(rebound.contains("image=\"/new/renamed.png\""));
+            assert!(!rebound.contains("/host/"));
+            assert_eq!(strip_context_for_display(&rebound), "edited");
+            assert_eq!(with_appshots("edited", &[], &HashMap::new()), "edited");
+        }
+    }
+
+    #[test]
+    fn queued_edit_rejects_invalid_or_unmatched_context_without_losing_images() {
+        let original = shot();
+        let paths: Vec<String> = vec!["/host/image.png".into()];
+        let valid = with_appshots(
+            "",
+            &[original.clone()],
+            &HashMap::from([(original.screenshot.id.clone(), paths[0].clone())]),
+        );
+        for invalid in [
+            valid.replace("/host/image.png", "/missing.png"),
+            valid.replace("</appshot>", "</broken>"),
+            valid.replace("<appshot ", "<other "),
+            format!("{valid}\n{}", valid.split_once(CONTEXT_MARKER).unwrap().1),
+        ] {
+            assert!(
+                restore_queued_appshots(&invalid, &paths, &[original.screenshot.clone()]).is_err()
+            );
+        }
+        let (ordinary, shots) =
+            restore_queued_appshots("plain", &paths, &[original.screenshot]).unwrap();
+        assert_eq!(ordinary.len(), 1);
+        assert!(shots.is_empty());
     }
 
     #[test]

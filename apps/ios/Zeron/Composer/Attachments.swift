@@ -267,8 +267,9 @@ func uploadAttachmentChunked(relay: DeviceRelayClient, name: String, data: Data,
 
 /// Decoded transcript images keyed by `(deviceId, path)`, loaded over the
 /// owning device's relay in 45KB base64 chunks, seeded locally after a send
-/// so own bubbles never round-trip. Bounded by an encoded-byte LRU budget;
-/// failed loads retry on the 2s→15s ladder.
+/// so own bubbles never round-trip. Bounded by an LRU byte budget: generated
+/// images count decoded memory toward it; ordinary attachments retain their
+/// encoded-byte accounting. Failed loads retry on the 2s→15s ladder.
 @MainActor
 @Observable
 final class AttachmentImageCache {
@@ -350,7 +351,7 @@ final class AttachmentImageCache {
         Task { @MainActor [weak self] in
             let loaded = await Self.readImage(relay: relay, path: path,
                                               expectedMimeType: expectedMimeType)
-            guard let self else { return }
+            guard let self, case .loading? = self.entries[key] else { return }
             if let loaded {
                 self.store(key: key, name: loaded.name, image: loaded.image, bytes: loaded.bytes)
             } else {
@@ -528,8 +529,10 @@ struct UserAttachmentsStrip: View {
 
     var body: some View {
         if attachments.contains(where: { $0.appshot != nil }) {
-            // Captures keep a larger, readable card on mobile. Ordinary
-            // images can share the same strip when a prompt mixes both.
+            // Captures keep a larger, readable card on mobile, and each one
+            // stays reachable when a prompt mixes captures with ordinary
+            // images. Fixed card width avoids squeezing three into one
+            // clipped row; scrolling does not alter transcript height.
             ScrollView(.horizontal) {
                 HStack(alignment: .top, spacing: 8) {
                     ForEach(attachments) { att in
@@ -757,6 +760,15 @@ struct AttachmentLightbox: View {
             }
             .contentShape(Rectangle())
             .onTapGesture { dismiss() }
+            .overlay(alignment: .topTrailing) {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark").font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.white).frame(width: 44, height: 44)
+                        .background(.black.opacity(0.6), in: Circle())
+                }
+                .accessibilityLabel("Close image preview")
+                .padding(12)
+            }
         }
         .presentationBackground(.clear)
     }

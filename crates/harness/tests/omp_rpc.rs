@@ -20,7 +20,7 @@ use zeron_harness::{
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole, ReasoningLevel, RunRequest,
-    SandboxLevel, ToolCall, ToolDiff, UserInputAnswer,
+    SandboxLevel, SessionsGrant, ToolCall, ToolDiff, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -114,6 +114,7 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: false,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
+        sessions: None,
         resume: None,
         attachments: Vec::new(),
         worktree: None,
@@ -1230,6 +1231,31 @@ async fn workers_host_tool_is_registered_only_when_enabled() {
     assert_eq!(result["isError"], false);
     assert_eq!(result["result"]["content"][0]["text"], "worker help");
     enabled.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sessions_and_workers_host_calls_are_answered_once_by_their_own_server() {
+    let harness = fake_harness("mixed-host-tools")
+        .with_workers_mcp_executable(fake_workers_controller_path());
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("mixed");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    run_request.sessions = Some(SessionsGrant {
+        parent_chat_id: "chat-1".into(),
+        endpoint: "ws://127.0.0.1:9".into(),
+        engine_id: "engine-1".into(),
+    });
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+    let texts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["after both tools"], "{events:?}");
 }
 
 #[tokio::test]

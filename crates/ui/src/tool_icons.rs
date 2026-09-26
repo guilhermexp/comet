@@ -263,6 +263,16 @@ fn value_string<'a>(input: Option<&'a Value>, keys: &[&str]) -> &'a str {
 /// colour image, and these are control-plane verbs. Solar renders through
 /// `icons::icon()` tinted with the row's own muted text, like the worktree and
 /// pathless-patch glyphs beside them.
+fn sessions_action_icon(action: &str) -> &'static str {
+    use crate::icons;
+    match action {
+        "list_spaces" => icons::LIST,
+        "create" => icons::ADD_CIRCLE,
+        "help" => icons::INFO_CIRCLE,
+        _ => icons::ADD_CIRCLE,
+    }
+}
+
 fn workers_action_icon(action: &str) -> &'static str {
     use crate::icons;
     match action {
@@ -315,6 +325,11 @@ fn semantic_tool_icon(name: &str, input: Option<&Value>) -> ToolIconDescriptor {
     }
     if lower == "hub" {
         let op = value_string(input, &["op"]).to_ascii_lowercase();
+        // Waiting on jobs is a pause, not configuration: the same clock the
+        // Workers `wait_for_status` row wears, never the generic gear.
+        if op == "wait" {
+            return ToolIconDescriptor::Solar(crate::icons::CLOCK_CIRCLE);
+        }
         return material(match op.as_str() {
             "start" | "stop" | "restart" | "ps" | "logs" => "console",
             "send" | "inbox" => "prompt",
@@ -342,6 +357,10 @@ fn semantic_tool_icon(name: &str, input: Option<&Value>) -> ToolIconDescriptor {
     if lower == "workers" {
         let action = value_string(input, &["action"]).to_ascii_lowercase();
         return ToolIconDescriptor::Solar(workers_action_icon(&action));
+    }
+    if lower == "sessions" {
+        let action = value_string(input, &["action"]).to_ascii_lowercase();
+        return ToolIconDescriptor::Solar(sessions_action_icon(&action));
     }
     if lower.contains("agent") {
         return material("robot");
@@ -377,6 +396,23 @@ mod tests {
 
     fn material(name: &str) -> ToolIconDescriptor {
         ToolIconDescriptor::Material(format!("file-icons/{name}.svg").into())
+    }
+
+    #[test]
+    fn hub_wait_wears_the_workers_wait_clock() {
+        let wait = ToolCall::Unknown {
+            name: "hub".into(),
+            input: Some(serde_json::json!({ "op": "wait", "ids": ["j1", "j2"] })),
+        };
+        assert!(matches!(
+            tool_icon_descriptor(&wait),
+            ToolIconDescriptor::Solar(path) if path == crate::icons::CLOCK_CIRCLE
+        ));
+        assert_eq!(
+            super::workers_action_icon("wait_for_status"),
+            crate::icons::CLOCK_CIRCLE,
+            "both waits read the same"
+        );
     }
 
     #[test]
@@ -459,6 +495,27 @@ mod tests {
                 }),
                 material(expected),
                 "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn sessions_rows_use_a_distinct_icon_per_action() {
+        use crate::icons;
+        for (action, icon) in [
+            ("list_spaces", icons::LIST),
+            ("create", icons::ADD_CIRCLE),
+            ("help", icons::INFO_CIRCLE),
+        ] {
+            let call = zeron_proto::ToolCall::Mcp {
+                server: "comet-sessions".into(),
+                tool: "sessions".into(),
+                input: Some(serde_json::json!({"action": action})),
+            };
+            assert_eq!(
+                tool_icon_descriptor(&call),
+                ToolIconDescriptor::Solar(icon),
+                "{action}"
             );
         }
     }

@@ -267,6 +267,13 @@ pub fn parse_launch_briefing(
         (None, None) => {}
         _ => return Err("worktree_path and worktree_branch must be provided together".into()),
     }
+    if let Some(title) = optional_string(&arguments, "title") {
+        let title = sanitize_text(&title);
+        if title.trim().is_empty() {
+            return Err("title is empty after removing control characters".into());
+        }
+        request = request.with_title(title);
+    }
     let briefing = if let Some(text) = optional_string(&arguments, "initial_text") {
         if text.len() > 64 * 1024 {
             return Err("initial_text exceeds 64 KiB".into());
@@ -1380,6 +1387,7 @@ fn tool_definition() -> Value {
                 "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: how long to block, chosen by you to fit the work (default 30, maximum 4h); expiration returns timed_out: true with a worker snapshot and a next hint as a normal read, not a failure. The wait is cancellable and does not block other actions." },
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
                 "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing delivered once at launch. OMP, Claude, Pi and Codex receive it through native startup. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
+                "title": { "type": "string", "description": "launch_worker: the worker's display name in the Workers list, final for the session and kept across restart — name the ticket or task (e.g. `WT-20260924-fix-parser`), at most 256 bytes. Omitted: the first line of `initial_text`." },
                 "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },
                 "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." },
                 "expected_old_fingerprint": { "type": "string", "description": "recover_project_identity: required fingerprint reported as the old side of the diagnosed conflict." },

@@ -32,16 +32,28 @@ if has "$line" '"method":"config/read"'; then
 fi
 thread_line="$line"
 if has "$line" '"method":"skills/list"'; then
-  # Command discovery probe: answer with two cwd groups sharing one skill
-  # (dedupe by name) and settle; no thread ever starts.
-  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"cwd\":\"/w\",\"skills\":[{\"name\":\"imagegen\",\"description\":\"Model-facing paragraph about images.\",\"interface\":{\"displayName\":\"Image Gen\",\"shortDescription\":\"Generate or edit images\"}},{\"name\":\"bare\",\"description\":\"No interface block\"}]},{\"cwd\":\"/x\",\"skills\":[{\"name\":\"imagegen\",\"description\":\"dupe\",\"interface\":{\"shortDescription\":\"dupe\"}}]}]}}"
+  # Skill discovery probe: answer with two cwd groups sharing one skill
+  # (dedupe by identity) and settle; no thread ever starts.
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"cwd\":\"/w\",\"skills\":[{\"name\":\"imagegen\",\"path\":\"/skills/imagegen/SKILL.md\",\"description\":\"Model-facing paragraph about images.\",\"interface\":{\"displayName\":\"Image Gen\",\"shortDescription\":\"Generate or edit images\"}},{\"name\":\"bare\",\"path\":\"/skills/bare/SKILL.md\",\"description\":\"No interface block\"}]},{\"cwd\":\"/x\",\"skills\":[{\"name\":\"imagegen\",\"path\":\"/skills/imagegen/SKILL.md\",\"description\":\"dupe\",\"interface\":{\"shortDescription\":\"dupe\"}}]}]}}"
+  exec sleep 30
+fi
+if has "$line" '"method":"model/list"'; then
+  # Live model discovery: force pagination and put the default model second,
+  # proving the harness consumes nextCursor and honors isDefault.
+  has "$line" '"includeHidden":false' || exit 1
+  has "$line" '"limit":20' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"gpt-5.6-terra\",\"model\":\"gpt-5.6-terra\",\"displayName\":\"GPT-5.6-Terra\",\"description\":\"Balanced agentic coding model for everyday work.\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"high\"}],\"additionalSpeedTiers\":[],\"serviceTiers\":[],\"defaultServiceTier\":null,\"isDefault\":false},{\"id\":\"gpt-6-astra\",\"model\":\"gpt-6-astra\",\"displayName\":\"GPT-6-Astra\",\"description\":\"Our most capable model for complex, demanding work.\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"medium\"},{\"reasoningEffort\":\"high\"},{\"reasoningEffort\":\"xhigh\"},{\"reasoningEffort\":\"max\"},{\"reasoningEffort\":\"ultra\"}],\"additionalSpeedTiers\":[\"fast\"],\"serviceTiers\":[{\"id\":\"priority\",\"name\":\"Fast\"}],\"defaultServiceTier\":null,\"isDefault\":true}],\"nextCursor\":\"page-2\"}}"
+  read -r line || exit 1
+  has "$line" '"method":"model/list"' || exit 1
+  has "$line" '"cursor":"page-2"' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",\"model\":\"gpt-5.6-sol\",\"displayName\":\"GPT-5.6-Sol\",\"description\":\"Reliable agentic workhorse for everyday tasks.\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"ultra\"}],\"additionalSpeedTiers\":[],\"serviceTiers\":[],\"defaultServiceTier\":null,\"isDefault\":false}],\"nextCursor\":null}}"
   exec sleep 30
 fi
 if has "$line" '"method":"thread/resume"'; then
   if has "$line" '"threadId":"resume-with-child-v1"'; then
-    emit "{\"id\":$(rid \"$line\"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"collabAgentToolCall\",\"id\":\"spawn-alpha\",\"tool\":\"spawnAgent\",\"status\":\"completed\",\"receiverThreadIds\":[\"child-alpha\"]}]}]}}}"
+    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"collabAgentToolCall\",\"id\":\"spawn-alpha\",\"tool\":\"spawnAgent\",\"status\":\"completed\",\"receiverThreadIds\":[\"child-alpha\"]}]}]}}}"
   elif has "$line" '"threadId":"resume-with-child-v2"'; then
-    emit "{\"id\":$(rid \"$line\"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"subAgentActivity\",\"id\":\"spawn-alpha\",\"kind\":\"started\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"},{\"type\":\"subAgentActivity\",\"id\":\"subagent-completed-old\",\"kind\":\"completed\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"}]}]}}}"
+    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"subAgentActivity\",\"id\":\"spawn-alpha\",\"kind\":\"started\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"},{\"type\":\"subAgentActivity\",\"id\":\"subagent-completed-old\",\"kind\":\"completed\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"}]}]}}}"
   elif has "$line" '"threadId":"resume-fail"'; then
     # Missing/foreign rollout: reject, expect the fresh-start fallback.
     emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32600,\"message\":\"rollout not found\"}}"
@@ -61,7 +73,88 @@ fi
 read -r turnline || exit 1
 tid=$(rid "$turnline")
 
+if has "$turnline" '"method":"thread/compact/start"'; then
+  emit "{\"id\":$tid,\"result\":{}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"native-1"}}}'
+  emit '{"method":"item/completed","params":{"item":{"id":"compact-1","type":"contextCompaction"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"native-1","status":"completed"}}}'
+  exec sleep 30
+fi
+if has "$turnline" '"method":"review/start"'; then
+  has "$turnline" '"delivery":"inline"' || exit 1
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"native-1\"}}}"
+  emit '{"method":"item/completed","params":{"item":{"id":"review-1","type":"exitedReviewMode","review":"Review fixture result"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"native-1","status":"completed"}}}'
+  exec sleep 30
+fi
+
 case "$turnline" in
+*scenario:native-skills*)
+  for want in '"type":"skill"' '"path":"/repo/a b/SKILL.md"' '[lib.rs](src/lib.rs)'; do
+    has "$turnline" "$want" || { fail_turn "$tid" "initial native skill or file path missing"; exit 0; }
+  done
+  if has "$turnline" 'zeron-invoke:' || has "$turnline" 'zeron-file:'; then
+    fail_turn "$tid" "private chip URI leaked"; exit 0
+  fi
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  for want in '"method":"turn/steer"' '"type":"skill"' '"path":"/repo/other/SKILL.md"'; do
+    has "$steerline" "$want" || { fail_turn "$sid" "steered native skill missing"; exit 0; }
+  done
+  emit "{\"id\":$sid,\"result\":{}}"
+  emit '{"method":"item/agentMessage/delta","params":{"delta":"native skills accepted"}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"completed"}}}'
+  ;;
+
+*scenario:native-queue-order*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"item/agentMessage/delta","params":{"delta":"working"}}'
+  sleep 0.1
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"completed"}}}'
+  read -r next || exit 1
+  has "$next" '"method":"review/start"' || { fail_turn "$(rid "$next")" "followup overtook queued review"; exit 0; }
+  emit "{\"id\":$(rid "$next"),\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
+  emit '{"method":"item/completed","params":{"item":{"id":"review-2","type":"exitedReviewMode","review":"Queued review result"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-2","status":"completed"}}}'
+  read -r next || exit 1
+  has "$next" '"method":"turn/start"' && has "$next" 'Follow up after review' || { fail_turn "$(rid "$next")" "followup was lost"; exit 0; }
+  emit "{\"id\":$(rid "$next"),\"result\":{\"turn\":{\"id\":\"t-3\"}}}"
+  emit '{"method":"item/agentMessage/delta","params":{"delta":"followup"}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-3","status":"completed"}}}'
+  ;;
+
+*scenario:native-queue*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"item/agentMessage/delta","params":{"delta":"working"}}'
+  sleep 0.1
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"completed"}}}'
+  read -r next || exit 1
+  has "$next" '"method":"review/start"' || { fail_turn "$(rid "$next")" "native command was sent as prompt text"; exit 0; }
+  emit "{\"id\":$(rid "$next"),\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
+  emit '{"method":"item/completed","params":{"item":{"id":"review-2","type":"exitedReviewMode","review":"Queued review result"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-2","status":"completed"}}}'
+  ;;
+
+
+*scenario:image-*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"image-1","type":"imageGeneration","status":"in_progress","result":""}}}'
+  if has "$turnline" 'scenario:image-success'; then
+    emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"id":"image-1","type":"imageGeneration","status":"completed","result":"INLINE_IMAGE_SENTINEL","savedPath":"/codex/generated_images/goblin.png"}}}'
+  elif has "$turnline" 'scenario:image-failure'; then
+    emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"id":"image-1","type":"imageGeneration","status":"failed","result":"INLINE_IMAGE_SENTINEL","failure":{"type":"usageLimitExceeded"}}}}'
+  else
+    emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"id":"image-1","type":"imageGeneration","status":"completed","result":"INLINE_IMAGE_SENTINEL"}}}'
+  fi
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
+  ;;
+
+
+
 *scenario:reasoning*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"call_alpha","type":"subAgentActivity","kind":"spawned","agentThreadId":"child-1","agentPath":"/root/alpha"}}}'
@@ -101,6 +194,11 @@ case "$turnline" in
   ;;
 
 
+*scenario:publication*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"publication-turn\"}}}"
+  emit '{"method":"item/agentMessage/delta","params":{"itemId":"publication-answer","delta":"Publication turn completed"}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"publication-turn","status":"completed"}}}'
+  ;;
 
 *scenario:happy*)
   # Verify the turn/start + thread/start params the harness must send.
@@ -141,6 +239,21 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 
+*scenario:child-identity*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  cat "$(dirname "$0")/codex/child-identity.jsonl"
+  ;;
+
+*scenario:v1-subagents*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  cat "$(dirname "$0")/codex/v1-subagents.jsonl"
+  ;;
+
+*scenario:v2-lifecycle*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  cat "$(dirname "$0")/codex/v2-lifecycle.jsonl"
+  ;;
+
 *scenario:subagent*)
   # Multi-agent v2 child-thread routing: registration via subAgentActivity,
   # tagged child items, consumed child turn bookkeeping (must never settle
@@ -149,6 +262,7 @@ case "$turnline" in
   emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
   # Parent spawn item registers the child (call id = the parent chip).
   emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"call_alpha","type":"subAgentActivity","kind":"started","agentThreadId":"child-1","agentPath":"/root/alpha"}}}'
+  emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"id":"call_alpha","type":"subAgentActivity","kind":"started","agentThreadId":"child-1","agentPath":"/root/alpha"}}}'
   # The wire also emits subAgentActivity about the ROOT during collab runs:
   # no chip, no registration.
   emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"call_root","type":"subAgentActivity","kind":"interacted","agentThreadId":"th-1","agentPath":"/root"}}}'
@@ -168,23 +282,8 @@ case "$turnline" in
   emit '{"method":"thread/somethingBrandNew","params":{"threadId":"child-1"}}'
   # Child closes → tagged terminal; the spawn chip resolves on the parent.
   emit '{"method":"thread/closed","params":{"threadId":"child-1"}}'
-  emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"id":"call_alpha","type":"subAgentActivity","kind":"completed","agentThreadId":"child-1","agentPath":"/root/alpha"}}}'
+  emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"id":"subagent-completed-alpha","type":"subAgentActivity","kind":"completed","agentThreadId":"child-1","agentPath":"/root/alpha"}}}'
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
-  ;;
-
-*scenario:child-identity*)
-  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
-  cat "$(dirname "$0")/codex/child-identity.jsonl"
-  ;;
-
-*scenario:v1-subagents*)
-  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
-  cat "$(dirname "$0")/codex/v1-subagents.jsonl"
-  ;;
-
-*scenario:v2-lifecycle*)
-  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
-  cat "$(dirname "$0")/codex/v2-lifecycle.jsonl"
   ;;
 
 *scenario:resumed-child*)
@@ -210,6 +309,10 @@ case "$turnline" in
   # The harness must fall back to a follow-up turn/start carrying the text.
   read -r followline || exit 1
   fid=$(rid "$followline")
+  if has "$steerline" '"type":"skill"'; then
+    has "$followline" '"type":"skill"' && has "$followline" '"path":"/repo/followup/SKILL.md"' ||
+      { fail_turn "$fid" "native skill lost on steer fallback"; exit 0; }
+  fi
   if has "$followline" '"method":"turn/start"' && has "$followline" 'redirect please'; then
     emit "{\"id\":$fid,\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
     emit '{"method":"turn/started","params":{"turn":{"id":"t-2"}}}'

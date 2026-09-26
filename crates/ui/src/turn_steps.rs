@@ -188,6 +188,19 @@ fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> Activ
         };
     }
 
+    if normalized == "sessions" {
+        return match input
+            .and_then(|value| value.get("action"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("list_spaces") => ActivityBucket::Read,
+            Some("create") => ActivityBucket::Command,
+            _ => ActivityBucket::Tool,
+        };
+    }
+
     if normalized == "workers" {
         return match input
             .and_then(|value| value.get("action"))
@@ -277,6 +290,20 @@ impl ActivityBucket {
 mod tests {
     use super::*;
     use zeron_doc::SubagentStatus;
+
+    #[test]
+    fn sessions_actions_land_in_distinct_buckets() {
+        let bucket = |action: &str| {
+            activity_bucket(&zeron_proto::ToolCall::Mcp {
+                server: "comet-sessions".into(),
+                tool: "sessions".into(),
+                input: Some(serde_json::json!({"action": action})),
+            })
+        };
+        assert_eq!(bucket("list_spaces"), ActivityBucket::Read);
+        assert_eq!(bucket("create"), ActivityBucket::Command);
+        assert_eq!(bucket("help"), ActivityBucket::Tool);
+    }
 
     fn text(id: &str, value: &str) -> MessagePart {
         MessagePart::Text {
