@@ -37,7 +37,7 @@ transcript scrolling or runway geometry.
 ## Validation
 
 The PR's macOS CI job compiles the application and runs the native
-`frame_source_recovery` integration test in the pinned dependency. Its custom
+`frame_source_recovery` integration test in the vendored `third_party/zui`. Its custom
 harness runs on the native main thread, creates a real dispatch source, and
 checks that stopping it clears the latch. The test executable overrides the
 imported `CVDisplayLinkStart` symbol to force two start errors while using real
