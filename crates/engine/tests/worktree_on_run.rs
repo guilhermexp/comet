@@ -210,8 +210,14 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     git(&repo_dir, &["config", "user.email", "t@example.com"]);
     git(&repo_dir, &["config", "user.name", "Test"]);
     std::fs::write(repo_dir.join("README.md"), "hello\n").unwrap();
+    std::fs::write(repo_dir.join(".gitignore"), "cache/\n").unwrap();
+    std::fs::write(repo_dir.join(".worktreeinclude"), "cache/\n").unwrap();
     git(&repo_dir, &["add", "."]);
     git(&repo_dir, &["commit", "-m", "init"]);
+    std::fs::create_dir_all(repo_dir.join("cache")).unwrap();
+    std::fs::write(repo_dir.join("cache/real.txt"), "cached\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real.txt", repo_dir.join("cache/link.txt")).unwrap();
     let repo_path = repo_dir.to_string_lossy().to_string();
     #[cfg(unix)]
     let project_dir = if use_project_symlink {
@@ -318,6 +324,22 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         setup.setup_error
     );
     assert!(setup.setup_action.is_some());
+    assert_eq!(
+        std::fs::read_to_string(first.join("cache/real.txt")).unwrap(),
+        "cached\n"
+    );
+    #[cfg(unix)]
+    {
+        let warning = setup
+            .setup_warning
+            .as_deref()
+            .expect("skipped symlink is surfaced to the Chat");
+        assert!(
+            warning.starts_with("1 entry selected by .worktreeinclude"),
+            "{warning}"
+        );
+        assert!(!first.join("cache/link.txt").exists());
+    }
     wait_for(|| first.join("setup-marker").is_file(), "setup Action").await;
     assert_eq!(
         std::fs::read_to_string(first.join("setup-project-root")).unwrap(),

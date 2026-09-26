@@ -333,14 +333,16 @@ pub(crate) fn checkout_is_busy(
     path: &Path,
 ) -> Result<bool, crate::WorkersError> {
     let _action = lock_checkout_actions()?;
-    checkout_is_busy_under_lock(client, path, None)
+    checkout_is_busy_under_lock(client, path, None, false)
 }
 
-/// `own_operation` excludes the caller's own activity reservation.
+/// `own_operation` excludes the caller's own activity reservation. Open
+/// terminals count only when `for_removal` is set.
 fn checkout_is_busy_under_lock(
     client: &crate::LocalWorkersClient,
     path: &Path,
     own_operation: Option<&str>,
+    for_removal: bool,
 ) -> Result<bool, crate::WorkersError> {
     use crate::WorkersError;
     let canonical =
@@ -349,6 +351,7 @@ fn checkout_is_busy_under_lock(
         &crate::checkout_activity::activity_file(),
         &canonical,
         own_operation,
+        for_removal,
     )
     .map_err(WorkersError::State)?
     .is_some()
@@ -390,7 +393,7 @@ pub(crate) fn remove_checkout_under_lock(
             "This checkout has no matching Comet ownership proof; archive it instead".into(),
         ));
     }
-    if checkout_is_busy_under_lock(client, &checkout, None)? {
+    if checkout_is_busy_under_lock(client, &checkout, None, true)? {
         return Err(WorkersError::State(
             "Stop active Chats and Workers before removing this checkout".into(),
         ));
@@ -441,7 +444,7 @@ pub(crate) fn remove_checkout_under_lock(
             "Checkout identity changed while pre-remove ran; refusing removal".into(),
         ));
     }
-    if checkout_is_busy_under_lock(client, &checkout, Some(&removal_operation))? {
+    if checkout_is_busy_under_lock(client, &checkout, Some(&removal_operation), true)? {
         return Err(WorkersError::State(
             "A Chat or Worker became active during pre-remove; refusing removal".into(),
         ));
@@ -650,7 +653,7 @@ pub(crate) fn remove_owned_checkout(
             "Checkout has no matching Comet ownership proof; archive it instead".into(),
         ));
     }
-    if path.exists() && checkout_is_busy_under_lock(client, path, None)? {
+    if path.exists() && checkout_is_busy_under_lock(client, path, None, true)? {
         return Err(WorkersError::State(
             "Stop active Chats and Workers before removing this checkout".into(),
         ));

@@ -5329,6 +5329,7 @@ pub enum ComposerEvent {
         chat_id: String,
         setup_action: Option<zeron_proto::ProjectActionRun>,
         setup_error: Option<String>,
+        setup_warning: Option<String>,
         target_device_id: Option<String>,
     },
     /// A locally-authored queue row was accepted. It is not a transcript send
@@ -9231,11 +9232,16 @@ impl Composer {
                                             .get("setupError")
                                             .and_then(|value| value.as_str())
                                             .map(str::to_string);
+                                        let setup_warning = value
+                                            .get("setupWarning")
+                                            .and_then(|value| value.as_str())
+                                            .map(str::to_string);
                                         this.update(cx, |_, cx| {
                                             cx.emit(ComposerEvent::WorktreeSetup {
                                                 chat_id: poll_chat_id.clone(),
                                                 setup_action,
                                                 setup_error,
+                                                setup_warning,
                                                 target_device_id: poll_target_device_id.clone(),
                                             });
                                         })

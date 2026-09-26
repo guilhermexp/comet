@@ -109,6 +109,8 @@ pub struct CheckoutIdentity {
 pub struct WorktreeCreationOutcome {
     pub worktree: Worktree,
     pub setup_error: Option<String>,
+    /// Advisory: `.worktreeinclude` entries that were not copied.
+    pub copy_warning: Option<String>,
 }
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
@@ -1727,6 +1729,7 @@ impl Repos {
                         checkout_id: None,
                     },
                     setup_error: None,
+                    copy_warning: None,
                 });
             }
         };
@@ -1780,6 +1783,7 @@ impl Repos {
         Ok(WorktreeCreationOutcome {
             worktree,
             setup_error,
+            copy_warning: creation.copy_warning,
         })
     }
 

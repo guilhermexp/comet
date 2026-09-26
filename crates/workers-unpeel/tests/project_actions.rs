@@ -1208,6 +1208,50 @@ fn removal_hooks_come_from_the_principal_checkout_not_the_removed_branch()
 }
 
 #[test]
+fn open_terminal_blocks_removal_until_it_closes() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = isolated_home()?;
+    let repo = home.path().join("terminal-repo");
+    fixture_repo(&repo)?;
+    let client = LocalWorkersClient::new();
+    let parent_id = client.add_project(&repo)?;
+    let child = client.create_worktree(WorkersCreateWorktreeRequest {
+        project_id: parent_id,
+        branch: "feature/terminal-open".into(),
+        name: None,
+        base_ref: Some("main".into()),
+    })?;
+    let checkout = std::path::PathBuf::from(&child.path);
+    let nested = checkout.join("nested");
+    fs::create_dir_all(&nested)?;
+    let terminal = zeron_workers_unpeel::reserve_terminal("terminal-test", &nested)?
+        .expect("a linked checkout is reserved");
+
+    assert!(!client.checkout_is_busy(&checkout)?);
+    let error = client
+        .remove_worktree(&child.project_id, false)
+        .expect_err("an open terminal keeps the checkout in use");
+    assert!(error.to_string().contains("Stop active"), "{error}");
+    assert!(checkout.exists());
+
+    fs::remove_dir(&nested)?;
+    drop(terminal);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match client.remove_worktree(&child.project_id, false) {
+            Ok(()) => break,
+            Err(error) if std::time::Instant::now() < deadline => {
+                assert!(error.to_string().contains("Stop active"), "{error}");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert!(!checkout.exists());
+    Ok(())
+}
+
+#[test]
 fn removing_without_hooks_still_rejects_ignored_files() -> Result<(), Box<dyn std::error::Error>> {
     let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
     let (home, _guard) = isolated_home()?;

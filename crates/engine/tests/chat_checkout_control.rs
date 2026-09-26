@@ -279,7 +279,7 @@ async fn local_retarget_is_blocked_by_live_worker_and_allowed_after_it_stops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn terminal_inside_linked_checkout_keeps_it_in_use_until_closed() {
+async fn terminal_inside_linked_checkout_reserves_it_only_against_removal() {
     let _env_lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
     let temp = tempfile::Builder::new()
         .prefix("wt-")
@@ -324,18 +324,37 @@ async fn terminal_inside_linked_checkout_keeps_it_in_use_until_closed() {
             Some("/bin/sh"),
         )
         .expect("open terminal in checkout");
+    // checkout-activity.json is the persisted cross-process reservation
+    // record that physical removal consults.
+    let activity = unpeel_home.join("checkout-activity.json");
+    let canonical = worktree.canonicalize().expect("canonical worktree");
+    let terminal_reserved = || {
+        fs::read(&activity)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|state| state["entries"].as_object().cloned())
+            .is_some_and(|entries| {
+                entries.values().any(|entry| {
+                    entry["kind"] == "terminal" && entry["path"].as_str() == canonical.to_str()
+                })
+            })
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !workers.checkout_is_busy(&worktree).expect("busy probe") {
+    while !terminal_reserved() {
         assert!(
             std::time::Instant::now() < deadline,
-            "an open terminal inside the checkout must block removal"
+            "an open terminal inside the checkout must reserve it against removal"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(
+        !workers.checkout_is_busy(&worktree).expect("retarget probe"),
+        "an open terminal must not block moving a Chat into the checkout"
+    );
 
     terminals.close(&session.id).expect("close terminal");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while workers.checkout_is_busy(&worktree).expect("release probe") {
+    while terminal_reserved() {
         assert!(
             std::time::Instant::now() < deadline,
             "closing the terminal must release the checkout"
