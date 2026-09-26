@@ -286,19 +286,25 @@ pub(crate) fn checkout_is_busy(
     path: &Path,
 ) -> Result<bool, crate::WorkersError> {
     let _action = lock_checkout_actions()?;
-    checkout_is_busy_under_lock(client, path)
+    checkout_is_busy_under_lock(client, path, None)
 }
 
+/// `own_operation` excludes the caller's own activity reservation.
 fn checkout_is_busy_under_lock(
     client: &crate::LocalWorkersClient,
     path: &Path,
+    own_operation: Option<&str>,
 ) -> Result<bool, crate::WorkersError> {
     use crate::WorkersError;
     let canonical =
         std::fs::canonicalize(path).map_err(|error| WorkersError::State(error.to_string()))?;
-    if crate::checkout_activity::busy_at(&crate::checkout_activity::activity_file(), &canonical)
-        .map_err(WorkersError::State)?
-        .is_some()
+    if crate::checkout_activity::busy_except_at(
+        &crate::checkout_activity::activity_file(),
+        &canonical,
+        own_operation,
+    )
+    .map_err(WorkersError::State)?
+    .is_some()
     {
         return Ok(true);
     }
@@ -337,11 +343,17 @@ pub(crate) fn remove_checkout_under_lock(
             "This checkout has no matching Comet ownership proof; archive it instead".into(),
         ));
     }
-    if checkout_is_busy_under_lock(client, &checkout)? {
+    if checkout_is_busy_under_lock(client, &checkout, None)? {
         return Err(WorkersError::State(
             "Stop active Chats and Workers before removing this checkout".into(),
         ));
     }
+    let removal_operation = format!("remove-{}", uuid::Uuid::new_v4());
+    let _removing = crate::checkout_activity::reserve_operation_under_lock(
+        &removal_operation,
+        &checkout,
+        crate::checkout_activity::ActivityKind::Removing,
+    )?;
     let branch = current_branch(&checkout).unwrap_or_default();
     if skip_hooks {
         unpeel_core::hook_assets::append_trace_log_line(&format!(
@@ -382,7 +394,7 @@ pub(crate) fn remove_checkout_under_lock(
             "Checkout identity changed while pre-remove ran; refusing removal".into(),
         ));
     }
-    if checkout_is_busy_under_lock(client, &checkout)? {
+    if checkout_is_busy_under_lock(client, &checkout, Some(&removal_operation))? {
         return Err(WorkersError::State(
             "A Chat or Worker became active during pre-remove; refusing removal".into(),
         ));
@@ -589,6 +601,11 @@ pub(crate) fn remove_owned_checkout(
     {
         return Err(WorkersError::State(
             "Checkout has no matching Comet ownership proof; archive it instead".into(),
+        ));
+    }
+    if path.exists() && checkout_is_busy_under_lock(client, path, None)? {
+        return Err(WorkersError::State(
+            "Stop active Chats and Workers before removing this checkout".into(),
         ));
     }
     set_removal_pending(project_id, &checkout, true)?;
