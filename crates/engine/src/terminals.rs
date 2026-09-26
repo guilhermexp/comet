@@ -36,10 +36,13 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
+const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct LiveTerminal {
     // Keep the private action script alive until the shell exits or the tab is closed.
     initial_script: Option<tempfile::NamedTempFile>,
+    /// Keeps a linked checkout in use (not removable) while the shell lives.
+    checkout_activity: Option<zeron_workers_unpeel::CheckoutActivityReservation>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -78,6 +81,7 @@ impl LiveTerminal {
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
         if matches!(event, TerminalEvent::Exit { .. }) {
             self.initial_script.take();
+            self.checkout_activity.take();
             self.exited = true;
             self.subscribers.clear();
         }
@@ -258,6 +262,7 @@ impl Terminals {
                 "Too many open terminals (maximum {MAX_TERMINALS})"
             )));
         }
+        let checkout_activity = reserve_checkout(cwd)?;
         if !std::fs::metadata(cwd).map(|m| m.is_dir()).unwrap_or(false) {
             return Err(EngineError::Other(
                 "Session working directory is unavailable".into(),
@@ -331,6 +336,7 @@ impl Terminals {
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
             initial_script,
+            checkout_activity,
             master: Some(master),
             writer: Some(writer),
             killer,
@@ -503,8 +509,15 @@ impl Terminals {
     /// Engine shutdown: kill every live shell.
     pub fn shutdown(&self) {
         let sessions: Vec<_> = lock(&self.inner.sessions).drain().map(|(_, s)| s).collect();
+        let mut releases = Vec::new();
         for session in sessions {
+            let reservation = lock(&session).checkout_activity.take();
+            releases.extend(reservation.map(|reservation| reservation.begin_release()));
             dispose(&session, true);
+        }
+        let deadline = std::time::Instant::now() + SHUTDOWN_RELEASE_TIMEOUT;
+        for release in releases {
+            release.wait_until(deadline);
         }
     }
 }
@@ -519,6 +532,7 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
         tracing::debug!(error = %err, "terminal kill failed (already exited?)");
     }
     session.initial_script.take();
+    session.checkout_activity.take();
     #[cfg(windows)]
     {
         let cleanup = windows::Cleanup::start(&mut session);
@@ -529,6 +543,28 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
         }
     }
     true
+}
+
+/// The device-wide checkout action lock is waited on only briefly, so the
+/// terminal fails as busy well inside the OpenTerminal deadline; a
+/// multi-threaded runtime still yields its worker while waiting. The
+/// reservation exists before the shell starts, so removal never races it.
+fn reserve_checkout(
+    cwd: &str,
+) -> Result<Option<zeron_workers_unpeel::CheckoutActivityReservation>, EngineError> {
+    let reserve = || {
+        let operation_id = format!("terminal-{}", new_id());
+        zeron_workers_unpeel::reserve_terminal(&operation_id, std::path::Path::new(cwd)).map_err(
+            |error| EngineError::Other(format!("Terminal could not reserve its checkout: {error}")),
+        )
+    };
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(reserve)
+    } else {
+        reserve()
+    }
 }
 
 /// Blocking PTY reader: forwards raw chunks until EOF. A closed PTY reads as an

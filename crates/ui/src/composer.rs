@@ -5329,6 +5329,7 @@ pub enum ComposerEvent {
         chat_id: String,
         setup_action: Option<zeron_proto::ProjectActionRun>,
         setup_error: Option<String>,
+        setup_warning: Option<String>,
         target_device_id: Option<String>,
     },
     /// A locally-authored queue row was accepted. It is not a transcript send
@@ -9199,7 +9200,13 @@ impl Composer {
                     let poll_target_device_id = host_device_id.clone();
                     this.update(cx, |_, cx| {
                         cx.spawn(async move |this, cx| {
-                            for _ in 0..480 {
+                            // Checkout creation, copy, setup and pre-start are
+                            // chained and the engine waits for each to settle
+                            // rather than abandoning it, so there is no engine
+                            // deadline to mirror. Poll quickly at first, then
+                            // back off for the long tail.
+                            let started = std::time::Instant::now();
+                            while started.elapsed() < Duration::from_secs(60 * 60) {
                                 let mut params = serde_json::json!({
                                     "chatId": poll_chat_id,
                                     "commandId": command_id,
@@ -9231,11 +9238,16 @@ impl Composer {
                                             .get("setupError")
                                             .and_then(|value| value.as_str())
                                             .map(str::to_string);
+                                        let setup_warning = value
+                                            .get("setupWarning")
+                                            .and_then(|value| value.as_str())
+                                            .map(str::to_string);
                                         this.update(cx, |_, cx| {
                                             cx.emit(ComposerEvent::WorktreeSetup {
                                                 chat_id: poll_chat_id.clone(),
                                                 setup_action,
                                                 setup_error,
+                                                setup_warning,
                                                 target_device_id: poll_target_device_id.clone(),
                                             });
                                         })
@@ -9245,9 +9257,12 @@ impl Composer {
                                     Err(error) if error.starts_with("unknown method: ") => return,
                                     Ok(_) | Err(_) => {}
                                 }
-                                cx.background_executor()
-                                    .timer(Duration::from_millis(250))
-                                    .await;
+                                let interval = if started.elapsed() < Duration::from_secs(60) {
+                                    Duration::from_millis(250)
+                                } else {
+                                    Duration::from_secs(2)
+                                };
+                                cx.background_executor().timer(interval).await;
                             }
                             tracing::warn!(
                                 chat = %poll_chat_id,
@@ -9997,6 +10012,7 @@ impl Composer {
             let mut live_started = false;
             let mut chat_created = false;
             let mut probed_availability: Option<LiveVoiceAvailability> = None;
+            let mut copy_warning: Option<String> = None;
             let result: Result<(), String> = async {
                 let availability = match engine
                     .client()
@@ -10032,7 +10048,7 @@ impl Composer {
                                 "repoPath": repo_path,
                                 "branch": base,
                             }),
-                            Duration::from_secs(150),
+                            Duration::from_secs(1800),
                         )
                         .await?;
                         if let (Some(repo_path), Some(path)) = (
@@ -10041,6 +10057,13 @@ impl Composer {
                         ) {
                             created_worktree = Some((repo_path.to_owned(), path.to_owned()));
                         }
+                        if let Some(setup_error) = value.get("setupError").and_then(|v| v.as_str()) {
+                            return Err(format!("Worktree setup failed: {setup_error}"));
+                        }
+                        copy_warning = value
+                            .get("copyWarning")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
                         let worktree: zeron_proto::Worktree = serde_json::from_value(value)
                             .map_err(|error| {
                                 format!("CreateWorktree returned invalid data: {error}")
@@ -10094,6 +10117,7 @@ impl Composer {
             }
             .await;
 
+            let mut retained_checkout = None;
             if result.is_err() {
                 if live_started {
                     let _ = attachments::call_with_timeout(
@@ -10116,7 +10140,7 @@ impl Composer {
                     .await;
                 }
                 if let Some((repo_path, worktree_path)) = created_worktree {
-                    let _ = attachments::call_with_timeout(
+                    if let Err(cleanup_error) = attachments::call_with_timeout(
                         &engine,
                         cx.background_executor(),
                         methods::DELETE_WORKTREE,
@@ -10126,7 +10150,12 @@ impl Composer {
                         }),
                         Duration::from_secs(30),
                     )
-                    .await;
+                    .await
+                    {
+                        retained_checkout = Some(format!(
+                            "Checkout kept at {worktree_path}: {cleanup_error}. Remove it after preserving any local files."
+                        ));
+                    }
                 }
             }
 
@@ -10139,9 +10168,21 @@ impl Composer {
                     Ok(()) => {
                         composer.failure = None;
                         composer.failure_key = None;
+                        if let Some(warning) = copy_warning {
+                            cx.emit(ComposerEvent::WorktreeSetup {
+                                chat_id: chat_id.clone(),
+                                setup_action: None,
+                                setup_error: None,
+                                setup_warning: Some(warning),
+                                target_device_id: Some(device_id.clone()),
+                            });
+                        }
                     }
                     Err(error) => {
-                        composer.failure = Some(format!("Live Voice failed: {error}").into());
+                        let detail = retained_checkout
+                            .map(|warning| format!("{error}. {warning}"))
+                            .unwrap_or(error);
+                        composer.failure = Some(format!("Live Voice failed: {detail}").into());
                         composer.failure_key = Some(String::new());
                     }
                 }

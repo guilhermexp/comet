@@ -2,9 +2,172 @@
 use crate::git_command::run_git;
 use std::path::{Path, PathBuf};
 
+/// The local branch checked out at `checkout`, read from its full refname so
+/// a same-named tag cannot turn it into an ambiguous short name.
+pub(crate) fn current_branch(checkout: &Path) -> Result<String, String> {
+    let head = run_git(checkout, &["symbolic-ref", "--quiet", "HEAD"])?;
+    head.trim()
+        .strip_prefix("refs/heads/")
+        .map(str::to_owned)
+        .ok_or_else(|| format!("HEAD is not a local branch: {}", head.trim()))
+}
+
+pub(crate) struct CreatedCheckout {
+    pub path: PathBuf,
+    pub branch: String,
+}
+
+fn default_base_ref(repository: &Path) -> Option<String> {
+    if let Ok(base) = run_git(
+        repository,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    ) {
+        let base = base.trim();
+        if !base.is_empty() {
+            return Some(base.into());
+        }
+    }
+    for candidate in ["origin/main", "origin/master", "main", "master"] {
+        if run_git(repository, &["rev-parse", "--verify", "--quiet", candidate]).is_ok() {
+            return Some(candidate.into());
+        }
+    }
+    None
+}
+
+/// Caller holds the shared action lock across creation and association. The
+/// journal, rather than the directory prefix, establishes ownership.
+pub(crate) fn create_checkout_under_lock(
+    _action: &CheckoutActionLock,
+    repository: &Path,
+    name: &str,
+    branch: &str,
+    base_ref: Option<&str>,
+    root: &Path,
+    journal: &crate::worktree_ownership::OwnershipJournal,
+) -> Result<CreatedCheckout, crate::WorkersError> {
+    use crate::WorkersError;
+    let branch = branch.trim();
+    if branch.is_empty() || run_git(repository, &["check-ref-format", "--branch", branch]).is_err()
+    {
+        return Err(WorkersError::State("Invalid worktree branch".into()));
+    }
+    if base_ref.is_some_and(|base| base.is_empty() || base.starts_with('-')) {
+        return Err(WorkersError::State("Invalid worktree base ref".into()));
+    }
+    let repo_root =
+        run_git(repository, &["rev-parse", "--show-toplevel"]).map_err(WorkersError::State)?;
+    let repo_root = std::fs::canonicalize(repo_root.trim())
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    let target = crate::worktree_ownership::worktree_path(root, &repo_root, name)
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    if std::fs::symlink_metadata(&target).is_ok() {
+        let target_canonical = std::fs::canonicalize(&target)
+            .map_err(|error| WorkersError::State(error.to_string()))?;
+        let listed = run_git(&repo_root, &["worktree", "list", "--porcelain", "-z"])
+            .map_err(WorkersError::State)?;
+        let found = listed
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|path| std::fs::canonicalize(path).ok().as_ref() == Some(&target_canonical));
+        if !found {
+            return Err(WorkersError::State(format!(
+                "Worktree destination exists but is not a linked checkout: {}",
+                target.display()
+            )));
+        }
+        let current_branch = current_branch(&target_canonical).map_err(WorkersError::State)?;
+        if current_branch != branch {
+            return Err(WorkersError::State(format!(
+                "Worktree destination already checks out `{current_branch}`, not `{branch}`"
+            )));
+        }
+        return Ok(CreatedCheckout {
+            path: target_canonical,
+            branch: branch.into(),
+        });
+    }
+
+    let target_text = target
+        .to_str()
+        .ok_or_else(|| WorkersError::State("Worktree path is not UTF-8".into()))?;
+    let branch_exists = run_git(
+        &repo_root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    journal
+        .pending_create(
+            &repo_root,
+            &target,
+            &operation_id,
+            (!branch_exists).then_some(branch),
+        )
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    // An unavailable remote must not prevent local work, as in the previous
+    // Workers path. The mutation itself remains bounded by git_command.
+    let _ = crate::git_command::run_git_mutation(&repo_root, &["fetch", "--quiet", "origin"]);
+    let base = base_ref
+        .map(str::to_owned)
+        .or_else(|| default_base_ref(&repo_root));
+    let mut args = vec!["worktree", "add"];
+    if branch_exists {
+        args.extend([target_text, branch]);
+    } else {
+        args.extend(["-b", branch, target_text]);
+        if let Some(base) = base.as_deref() {
+            args.push(base);
+        }
+    }
+    if let Err(error) = crate::git_command::run_git_mutation(&repo_root, &args) {
+        // A failed Git command can leave a partial worktree. Release the
+        // reservation only when both filesystem and Git agree that nothing
+        // was created. A checkout Git did register (for example, only its
+        // post-checkout hook failed) is recorded as owned so a retry can
+        // prepare or remove it; anything else stays PendingCreate.
+        let adopted = std::fs::symlink_metadata(&target).is_ok()
+            && journal
+                .created_observed(&repo_root, &target, &operation_id)
+                .is_ok()
+            && journal
+                .finalize_owned(&repo_root, &target, &operation_id)
+                .is_ok();
+        if !adopted {
+            let _ = journal.abort_absent_create(&repo_root, &target, &operation_id);
+        }
+        return Err(WorkersError::State(error));
+    }
+    journal
+        .created_observed(&repo_root, &target, &operation_id)
+        .map_err(|error| WorkersError::State(format!(
+            "Worktree {} was created but its Git identity could not be recorded: {error}; it has been preserved for explicit recovery",
+            target.display()
+        )))?;
+    journal
+        .finalize_owned(&repo_root, &target, &operation_id)
+        .map_err(|error| WorkersError::State(format!(
+            "Worktree {} was created but ownership could not be finalized: {error}; it has been preserved for recovery",
+            target.display()
+        )))?;
+    Ok(CreatedCheckout {
+        path: target,
+        branch: branch.into(),
+    })
+}
+
 pub(crate) fn validate_removal(
     path: &Path,
-    managed_root: &Path,
     owned: bool,
     active_worker: bool,
 ) -> Result<PathBuf, String> {
@@ -15,11 +178,6 @@ pub(crate) fn validate_removal(
         return Err("Stop the checkout's Workers before removing it".into());
     }
     let target = std::fs::canonicalize(path).map_err(|e| format!("Checkout unavailable: {e}"))?;
-    let root = std::fs::canonicalize(managed_root)
-        .map_err(|e| format!("Managed worktree root unavailable: {e}"))?;
-    if target == root || !target.starts_with(&root) {
-        return Err("Refusing to remove a checkout outside the managed worktree directory".into());
-    }
     let top = run_git(&target, &["rev-parse", "--show-toplevel"])?;
     if std::fs::canonicalize(top.trim()).map_err(|e| e.to_string())? != target {
         return Err("The removal target must be the checkout root".into());
@@ -56,6 +214,11 @@ pub(crate) fn validate_removal(
             "Preserve local changes and untracked files before removing this checkout".into(),
         );
     }
+    if has_hidden_local_edits(&target)? {
+        return Err(
+            "Clear skip-worktree or assume-unchanged flags and preserve those files before removing this checkout".into(),
+        );
+    }
     let retained = run_git(
         &target,
         &[
@@ -74,20 +237,66 @@ pub(crate) fn validate_removal(
     Ok(target)
 }
 
+/// `git status` does not report files flagged skip-worktree or
+/// assume-unchanged. A flagged file present on disk may hold local edits, so it
+/// blocks removal; sparse-checkout entries absent from disk do not.
+fn has_hidden_local_edits(checkout: &Path) -> Result<bool, String> {
+    let output = crate::git_command::git_at(checkout)
+        .args(["ls-files", "-v", "-z"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("Cannot list checkout index flags: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|record| match record {
+            [tag, b' ', path @ ..] if *tag == b'S' || tag.is_ascii_lowercase() => Some(path),
+            _ => None,
+        })
+        .any(|path| {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::symlink_metadata(checkout.join(std::ffi::OsStr::from_bytes(path))).is_ok()
+        }))
+}
+
 /// Serializes Comet launches/removals across UI and controller MCP processes.
 /// Kept separate from app-state.lock: Git and host creation never hold the
 /// shared JSON write lock.
-pub(crate) struct CheckoutActionLock(std::fs::File);
+pub(crate) struct CheckoutActionLock(std::fs::File, PathBuf);
+
+const CHECKOUT_ACTION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(360);
+/// Interactive requests answer within their RPC deadline: a checkout action
+/// that holds the lock longer than this reports the checkout as busy.
+const INTERACTIVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub(crate) fn lock_checkout_actions() -> Result<CheckoutActionLock, crate::WorkersError> {
+    lock_checkout_actions_within(CHECKOUT_ACTION_LOCK_WAIT)?.ok_or_else(|| {
+        crate::WorkersError::State("Timed out waiting for the checkout action lock".into())
+    })
+}
+
+/// `None` when another checkout action still holds the lock after a short wait.
+pub(crate) fn lock_checkout_actions_briefly()
+-> Result<Option<CheckoutActionLock>, crate::WorkersError> {
+    lock_checkout_actions_within(INTERACTIVE_LOCK_WAIT)
+}
+
+fn lock_checkout_actions_within(
+    wait: std::time::Duration,
+) -> Result<Option<CheckoutActionLock>, crate::WorkersError> {
     let root = unpeel_core::app_paths::unpeel_home();
     std::fs::create_dir_all(&root).map_err(|e| crate::WorkersError::State(e.to_string()))?;
-    lock_checkout_actions_at(&root.join("checkout-actions.lock"))
+    lock_checkout_actions_at(&root.join("checkout-actions.lock"), wait)
         .map_err(crate::WorkersError::State)
 }
 
-fn lock_checkout_actions_at(path: &Path) -> Result<CheckoutActionLock, String> {
-    use std::os::fd::AsRawFd;
+fn lock_checkout_actions_at(
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<Option<CheckoutActionLock>, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -97,11 +306,328 @@ fn lock_checkout_actions_at(path: &Path) -> Result<CheckoutActionLock, String> {
         .mode(0o600)
         .open(path)
         .map_err(|e| e.to_string())?;
-    // SAFETY: the descriptor is owned and stays open for the guard's lifetime.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+    if !flock_exclusive(&file, wait)? {
+        return Ok(None);
     }
-    Ok(CheckoutActionLock(file))
+    Ok(Some(CheckoutActionLock(file, path.to_owned())))
+}
+
+impl CheckoutActionLock {
+    /// Run long, repository-supplied work without blocking unrelated checkout
+    /// actions. Callers must revalidate everything after this returns.
+    fn released<T>(&mut self, work: impl FnOnce() -> T) -> Result<T, String> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: this guard still owns the valid descriptor.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+        let result = work();
+        if !flock_exclusive(&self.0, CHECKOUT_ACTION_LOCK_WAIT)? {
+            return Err(format!(
+                "Timed out waiting for checkout action lock {}",
+                self.1.display()
+            ));
+        }
+        Ok(result)
+    }
+}
+
+/// `false` when the lock is still held by another action after `wait`.
+fn flock_exclusive(file: &std::fs::File, wait: std::time::Duration) -> Result<bool, String> {
+    use std::os::fd::AsRawFd;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        // SAFETY: the descriptor is owned and stays open for the guard's lifetime.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+        {
+            return Err(error.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Ok(true)
+}
+
+pub(crate) fn checkout_is_busy(
+    client: &crate::LocalWorkersClient,
+    path: &Path,
+) -> Result<bool, crate::WorkersError> {
+    let Some(_action) = lock_checkout_actions_briefly()? else {
+        return Ok(true);
+    };
+    checkout_is_busy_under_lock(client, path, None, false)
+}
+
+/// `own_operation` excludes the caller's own activity reservation. Open
+/// terminals count only when `for_removal` is set.
+fn checkout_is_busy_under_lock(
+    client: &crate::LocalWorkersClient,
+    path: &Path,
+    own_operation: Option<&str>,
+    for_removal: bool,
+) -> Result<bool, crate::WorkersError> {
+    use crate::WorkersError;
+    let canonical =
+        std::fs::canonicalize(path).map_err(|error| WorkersError::State(error.to_string()))?;
+    if crate::checkout_activity::busy_except_at(
+        &crate::checkout_activity::activity_file(),
+        &canonical,
+        own_operation,
+        for_removal,
+    )
+    .map_err(WorkersError::State)?
+    .is_some()
+    {
+        return Ok(true);
+    }
+    let snapshot = client.bootstrap()?;
+    Ok(snapshot.sessions.iter().any(|session| {
+        session.is_live()
+            && snapshot.projects.iter().any(|project| {
+                project.id == session.project_id
+                    && std::fs::canonicalize(&project.path)
+                        .is_ok_and(|path| path.starts_with(&canonical))
+            })
+    }))
+}
+
+/// The physical removal used by both Chat and Workers. The action lock covers
+/// ownership proof through the final Git mutation, except while pre-remove
+/// runs; every proof is repeated after the hook. It is not enough for a
+/// checkout to sit below the configured worktree root.
+pub(crate) fn remove_checkout_under_lock(
+    action: &mut CheckoutActionLock,
+    client: &crate::LocalWorkersClient,
+    repository: &Path,
+    checkout: &Path,
+    journal: &crate::worktree_ownership::OwnershipJournal,
+    state_path: &Path,
+    skip_hooks: bool,
+) -> Result<(), crate::WorkersError> {
+    use crate::WorkersError;
+    let checkout = std::fs::canonicalize(checkout)
+        .map_err(|error| WorkersError::State(format!("Checkout unavailable: {error}")))?;
+    if !journal
+        .verify_owned(repository, &checkout)
+        .map_err(|error| WorkersError::State(error.to_string()))?
+    {
+        return Err(WorkersError::State(
+            "This checkout has no matching Comet ownership proof; archive it instead".into(),
+        ));
+    }
+    if checkout_is_busy_under_lock(client, &checkout, None, true)? {
+        return Err(WorkersError::State(
+            "Stop active Chats and Workers and close terminals in this checkout before removing it"
+                .into(),
+        ));
+    }
+    let removal_operation = format!("remove-{}", uuid::Uuid::new_v4());
+    let _removing = crate::checkout_activity::reserve_operation_under_lock(
+        &removal_operation,
+        &checkout,
+        crate::checkout_activity::ActivityKind::Removing,
+    )?;
+    let branch = current_branch(&checkout).unwrap_or_default();
+    if skip_hooks {
+        unpeel_core::hook_assets::append_trace_log_line(&format!(
+            "Worktree removal without hooks requested for {}",
+            checkout.display()
+        ));
+    }
+    let post = action
+        .released(|| {
+            crate::worktrunk_lifecycle::run_pre_remove(
+                state_path, repository, &checkout, &branch, skip_hooks,
+            )?;
+            // Prepare the post hook while the source checkout and its config
+            // still exist. A pending post hook is advisory; removal is still
+            // safe to finish.
+            Ok::<_, String>(
+                match crate::worktrunk_lifecycle::prepare_post_remove(
+                    state_path, repository, &checkout, &branch, skip_hooks,
+                ) {
+                    Ok(post) => post,
+                    Err(error) => {
+                        unpeel_core::hook_assets::append_trace_log_line(&format!(
+                            "Post-remove hook skipped for {}: {error}",
+                            checkout.display()
+                        ));
+                        None
+                    }
+                },
+            )
+        })
+        .and_then(|result| result)
+        .map_err(WorkersError::State)?;
+    if !journal
+        .verify_owned(repository, &checkout)
+        .map_err(|error| WorkersError::State(error.to_string()))?
+    {
+        return Err(WorkersError::State(
+            "Checkout identity changed while pre-remove ran; refusing removal".into(),
+        ));
+    }
+    if checkout_is_busy_under_lock(client, &checkout, Some(&removal_operation), true)? {
+        return Err(WorkersError::State(
+            "A Chat or Worker became active during pre-remove; refusing removal".into(),
+        ));
+    }
+    crate::worktrunk_hooks::stop_post_start(&checkout)
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    validate_removal(&checkout, true, false).map_err(WorkersError::State)?;
+    // The pre-remove hook may run Git itself. Never delete the old branch if
+    // the checkout changed refs during that hook; capture the exact tip only
+    // after the final validation, then use Git's old-OID CAS after removal.
+    let final_branch = current_branch(&checkout).unwrap_or_default();
+    if final_branch != branch {
+        return Err(WorkersError::State(
+            "Checkout branch changed during pre-remove; refusing removal".into(),
+        ));
+    }
+    let created_branch = journal
+        .created_branch(repository, &checkout)
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    let branch_tip = if branch.is_empty() {
+        None
+    } else if created_branch.as_deref() != Some(branch.as_str()) {
+        unpeel_core::hook_assets::append_trace_log_line(&format!(
+            "Branch {branch} retained after worktree removal: Comet did not create it"
+        ));
+        None
+    } else {
+        let branch_ref = format!("refs/heads/{branch}");
+        match run_git(repository, &["rev-parse", "--verify", &branch_ref]) {
+            Ok(oid) => Some(oid.trim().to_owned()),
+            Err(error) => {
+                unpeel_core::hook_assets::append_trace_log_line(&format!(
+                    "Branch cleanup skipped for {}: could not read {}: {error}",
+                    checkout.display(),
+                    branch_ref
+                ));
+                None
+            }
+        }
+    };
+    let path = checkout
+        .to_str()
+        .ok_or_else(|| WorkersError::State("Checkout path is not UTF-8".into()))?;
+    crate::git_command::run_git_mutation(repository, &["worktree", "remove", path])
+        .map_err(WorkersError::State)?;
+    if let Some(expected_oid) = branch_tip {
+        match crate::branch_cleanup::cleanup_integrated_branch(repository, &branch, &expected_oid) {
+            Ok(crate::branch_cleanup::BranchCleanupOutcome::Deleted) => {}
+            Ok(crate::branch_cleanup::BranchCleanupOutcome::Retained(reason)) => {
+                unpeel_core::hook_assets::append_trace_log_line(&format!(
+                    "Branch {} retained after worktree removal: {reason}",
+                    branch
+                ));
+            }
+            Err(error) => {
+                unpeel_core::hook_assets::append_trace_log_line(&format!(
+                    "Branch {} could not be cleaned up after worktree removal: {error}",
+                    branch
+                ));
+            }
+        }
+    }
+    journal
+        .retire_removed(repository, &checkout)
+        .map_err(|error| {
+            WorkersError::State(format!(
+                "Checkout removed, but ownership journal could not be retired: {error}"
+            ))
+        })?;
+    if let Some(post) = post {
+        if let Err(error) =
+            crate::worktrunk_lifecycle::spawn_post_remove(post, repository, &checkout)
+        {
+            unpeel_core::hook_assets::append_trace_log_line(&format!(
+                "Post-remove hook failed to start for {}: {error}",
+                checkout.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Prune only Git's stale administrative entry for a previously Comet-owned
+/// checkout whose leaf has vanished. This never removes a directory or branch.
+pub(crate) fn prune_missing_checkout_under_lock(
+    _action: &CheckoutActionLock,
+    repository: &Path,
+    checkout: &Path,
+    journal: &crate::worktree_ownership::OwnershipJournal,
+) -> Result<(), crate::WorkersError> {
+    use crate::WorkersError;
+    let missing = match std::fs::symlink_metadata(checkout) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(_) => false,
+        Err(error) => return Err(WorkersError::State(error.to_string())),
+    };
+    if !missing {
+        return Err(WorkersError::State(
+            "Checkout still exists; stale-registration prune refused".into(),
+        ));
+    }
+    let parent = checkout
+        .parent()
+        .ok_or_else(|| WorkersError::State("Checkout has no parent".into()))?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| WorkersError::State(format!("Checkout parent is unavailable: {error}")))?;
+    let leaf = checkout
+        .file_name()
+        .ok_or_else(|| WorkersError::State("Checkout has no leaf".into()))?;
+    let target = parent.join(leaf);
+    if !journal
+        .was_owned_missing(repository, &target)
+        .map_err(|error| WorkersError::State(error.to_string()))?
+    {
+        return Err(WorkersError::State(
+            "Missing checkout has no Comet ownership proof".into(),
+        ));
+    }
+    let registered = |listing: &str| {
+        listing
+            .split('\0')
+            .filter_map(|part| part.strip_prefix("worktree "))
+            .any(|path| Path::new(path) == target)
+    };
+    let before = run_git(repository, &["worktree", "list", "--porcelain", "-z"])
+        .map_err(WorkersError::State)?;
+    if !registered(&before) {
+        return Err(WorkersError::State(
+            "Missing checkout is not registered with Git".into(),
+        ));
+    }
+    // Without --force Git refuses a leaf recreated after the absence probe, and
+    // other missing worktrees, such as unmounted external checkouts, keep
+    // their administrative entries.
+    let target_text = target
+        .to_str()
+        .ok_or_else(|| WorkersError::State("Checkout path is not UTF-8".into()))?;
+    crate::git_command::run_git_mutation(repository, &["worktree", "remove", target_text])
+        .map_err(WorkersError::State)?;
+    let after = run_git(repository, &["worktree", "list", "--porcelain", "-z"])
+        .map_err(WorkersError::State)?;
+    if registered(&after) {
+        return Err(WorkersError::State(
+            "Git did not prune the missing checkout registration".into(),
+        ));
+    }
+    journal
+        .retire_removed(repository, &target)
+        .map_err(|error| {
+            WorkersError::State(format!(
+                "Git registration pruned, but ownership journal could not be retired: {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 impl Drop for CheckoutActionLock {
@@ -117,9 +643,10 @@ impl Drop for CheckoutActionLock {
 pub(crate) fn remove_owned_checkout(
     client: &crate::LocalWorkersClient,
     project_id: &str,
+    skip_hooks: bool,
 ) -> Result<(), crate::WorkersError> {
     use crate::{CheckoutKind, CheckoutOwnership, WorkersError};
-    let _checkout_action = lock_checkout_actions()?;
+    let mut action = lock_checkout_actions()?;
     client.reconcile_project_identity()?;
     let registry = client.project_identity_registry()?;
     let checkout = registry
@@ -132,74 +659,59 @@ pub(crate) fn remove_owned_checkout(
     {
         return Err(WorkersError::State("Only an unchanged Comet-owned linked worktree can be removed; archive this checkout instead".into()));
     }
+    let repository = checkout
+        .repository_id
+        .as_deref()
+        .and_then(|id| registry.repository(id))
+        .and_then(|record| record.primary_path.as_deref())
+        .or(checkout.main_repo.as_deref())
+        .ok_or_else(|| {
+            WorkersError::State("Checkout has no principal repository identity".into())
+        })?;
+    let repository = Path::new(repository);
     let path = Path::new(&checkout.path);
-    let common = run_git(
-        path,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .map_err(WorkersError::State)?;
-    let observed = checkout.observed_common_dir.as_deref().ok_or_else(|| {
-        WorkersError::State("Checkout ownership has no Git identity evidence".into())
-    })?;
-    let current_common =
-        std::fs::canonicalize(common.trim()).map_err(|e| WorkersError::State(e.to_string()))?;
-    let expected_common =
-        std::fs::canonicalize(observed).map_err(|e| WorkersError::State(e.to_string()))?;
-    if current_common != expected_common {
+    let journal = crate::worktree_ownership::OwnershipJournal::for_current_user()
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    // Only the authoritative legacy Workers registry may import its old
+    // AppManaged evidence. Chat legacy records and roots alone never migrate.
+    journal
+        .migrate_legacy_worker(
+            repository,
+            path,
+            checkout.ownership,
+            checkout.observed_common_dir.as_deref().map(Path::new),
+        )
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    if !journal
+        .verify_owned(repository, path)
+        .map_err(|error| WorkersError::State(error.to_string()))?
+    {
         return Err(WorkersError::State(
-            "Checkout Git identity changed; refusing removal".into(),
+            "Checkout has no matching Comet ownership proof; archive it instead".into(),
         ));
     }
-    let active = |snapshot: &crate::WorkersBootstrap| {
-        snapshot.sessions.iter().any(|session| {
-            session.is_live()
-                && snapshot.projects.iter().any(|project| {
-                    project.id == session.project_id
-                        && (project.id == project_id
-                            || std::fs::canonicalize(&project.path).ok()
-                                == std::fs::canonicalize(path).ok())
-                })
-        })
-    };
-    let target = validate_removal(
-        path,
-        &unpeel_core::app_paths::worktrees_root(),
-        true,
-        active(&client.bootstrap()?),
-    )
-    .map_err(WorkersError::State)?;
+    if path.exists() && checkout_is_busy_under_lock(client, path, None, true)? {
+        return Err(WorkersError::State(
+            "Stop active Chats and Workers and close terminals in this checkout before removing it"
+                .into(),
+        ));
+    }
     set_removal_pending(project_id, &checkout, true)?;
-    let result = (|| {
-        if active(&client.bootstrap()?) {
-            return Err(WorkersError::State(
-                "A Worker became active; stop it before removing the checkout".into(),
-            ));
+    let result = remove_checkout_under_lock(
+        &mut action,
+        client,
+        repository,
+        path,
+        &journal,
+        &unpeel_core::app_paths::app_state_path(),
+        skip_hooks,
+    )
+    .and_then(|()| edit_archived(project_id, true));
+    if let Err(error) = &result {
+        if !path.exists() {
+            let _ = mark_removal_interrupted(project_id, &error.to_string());
         }
-        validate_removal(
-            &target,
-            &unpeel_core::app_paths::worktrees_root(),
-            true,
-            false,
-        )
-        .map_err(WorkersError::State)?;
-        // No --force, no branch deletion, no recursive filesystem fallback.
-        crate::git_command::run_git_mutation(
-            &target,
-            &[
-                "worktree",
-                "remove",
-                target.to_str().ok_or_else(|| {
-                    WorkersError::State("Checkout path is not valid UTF-8".into())
-                })?,
-            ],
-        )
-        .map_err(|error| {
-            let note = format!("Checkout removal did not complete: {error}. Session history is retained; inspect the checkout before restoring it.");
-            let _ = mark_removal_interrupted(project_id, &note);
-            WorkersError::State(note)
-        })?;
-        edit_archived(project_id, true)
-    })();
+    }
     let released = set_removal_pending(project_id, &checkout, false);
     result.and(released)
 }
@@ -488,11 +1000,93 @@ mod tests {
     #[test]
     fn clean_owned_linked_checkout_is_removable_without_touching_the_branch() {
         let f = Fixture::new();
-        let target = validate_removal(&f.checkout, &f.managed, true, false).unwrap();
+        let target = validate_removal(&f.checkout, true, false).unwrap();
         assert_eq!(target, std::fs::canonicalize(&f.checkout).unwrap());
         assert!(f.checkout.is_dir());
         git(&f.repo, &["show-ref", "--verify", "refs/heads/feature"]);
     }
+    #[test]
+    fn failed_git_add_without_checkout_does_not_block_corrected_retry() {
+        let f = Fixture::new();
+        let root = f.root.join("common-worktrees");
+        let journal = crate::worktree_ownership::OwnershipJournal::at(
+            f.root.join("worktree-ownership.json"),
+            root.clone(),
+        );
+        let action = lock_checkout_actions_at(
+            &f.root.join("checkout-actions.lock"),
+            CHECKOUT_ACTION_LOCK_WAIT,
+        )
+        .unwrap()
+        .unwrap();
+        let failed = create_checkout_under_lock(
+            &action,
+            &f.repo,
+            "retry",
+            "retrybranch",
+            Some("no-such-ref"),
+            &root,
+            &journal,
+        );
+        assert!(failed.is_err());
+        let created = create_checkout_under_lock(
+            &action,
+            &f.repo,
+            "retry",
+            "retrybranch",
+            Some("HEAD"),
+            &root,
+            &journal,
+        )
+        .unwrap();
+        assert!(journal.verify_owned(&f.repo, &created.path).unwrap());
+    }
+    #[test]
+    fn failed_post_checkout_hook_leaves_an_owned_retryable_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let hook = f.repo.join(".git/hooks/post-checkout");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = f.root.join("common-worktrees");
+        let journal = crate::worktree_ownership::OwnershipJournal::at(
+            f.root.join("worktree-ownership.json"),
+            root.clone(),
+        );
+        let action = lock_checkout_actions_at(
+            &f.root.join("checkout-actions.lock"),
+            CHECKOUT_ACTION_LOCK_WAIT,
+        )
+        .unwrap()
+        .unwrap();
+
+        let failed = create_checkout_under_lock(
+            &action,
+            &f.repo,
+            "hooked",
+            "hookedbranch",
+            Some("HEAD"),
+            &root,
+            &journal,
+        );
+        assert!(failed.is_err());
+        std::fs::remove_file(&hook).unwrap();
+        let retried = create_checkout_under_lock(
+            &action,
+            &f.repo,
+            "hooked",
+            "hookedbranch",
+            Some("HEAD"),
+            &root,
+            &journal,
+        )
+        .unwrap();
+
+        assert!(journal.verify_owned(&f.repo, &retried.path).unwrap());
+        assert!(journal.preparation_pending(&f.repo, &retried.path).unwrap());
+    }
+
     #[test]
     fn rejects_external_main_arbitrary_and_active_checkout() {
         let f = Fixture::new();
@@ -502,15 +1096,54 @@ mod tests {
             (&f.managed, true, false),
             (&f.checkout, true, true),
         ] {
-            assert!(validate_removal(path, &f.managed, owned, active).is_err());
+            assert!(validate_removal(path, owned, active).is_err());
             assert!(path.exists());
         }
     }
     #[test]
+    fn skip_worktree_and_assume_unchanged_edits_block_checkout_removal() {
+        let f = Fixture::new();
+        for (file, flag) in [
+            ("local.yml", "--skip-worktree"),
+            ("tuned.yml", "--assume-unchanged"),
+        ] {
+            std::fs::write(f.checkout.join(file), "shared").unwrap();
+            git(&f.checkout, &["add", file]);
+            git(
+                &f.checkout,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            );
+            assert!(validate_removal(&f.checkout, true, false).is_ok());
+            git(&f.checkout, &["update-index", flag, file]);
+            std::fs::write(f.checkout.join(file), "local edit").unwrap();
+
+            let error = validate_removal(&f.checkout, true, false).unwrap_err();
+            assert!(error.contains("skip-worktree"), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(f.checkout.join(file)).unwrap(),
+                "local edit"
+            );
+            git(
+                &f.checkout,
+                &["update-index", &flag.replace("--", "--no-"), file],
+            );
+            git(&f.checkout, &["checkout", "--", file]);
+        }
+    }
+
+    #[test]
     fn untracked_and_modified_files_block_checkout_removal() {
         let f = Fixture::new();
         std::fs::write(f.checkout.join("precious.txt"), "user work").unwrap();
-        assert!(validate_removal(&f.checkout, &f.managed, true, false).is_err());
+        assert!(validate_removal(&f.checkout, true, false).is_err());
         git(&f.checkout, &["add", "precious.txt"]);
         git(
             &f.checkout,
@@ -525,7 +1158,7 @@ mod tests {
             ],
         );
         std::fs::write(f.checkout.join("precious.txt"), "modified work").unwrap();
-        assert!(validate_removal(&f.checkout, &f.managed, true, false).is_err());
+        assert!(validate_removal(&f.checkout, true, false).is_err());
         assert_eq!(
             std::fs::read_to_string(f.checkout.join("precious.txt")).unwrap(),
             "modified work"
@@ -534,7 +1167,7 @@ mod tests {
     #[test]
     fn principal_inside_managed_directory_is_still_protected() {
         let f = Fixture::new();
-        assert!(validate_removal(&f.repo, &f.root, true, false).is_err());
+        assert!(validate_removal(&f.repo, true, false).is_err());
         assert!(f.repo.join(".git").is_dir());
     }
     #[cfg(unix)]
@@ -543,7 +1176,7 @@ mod tests {
         let f = Fixture::new();
         let alias = f.managed.join("alias");
         std::os::unix::fs::symlink(&f.repo, &alias).unwrap();
-        assert!(validate_removal(&alias, &f.managed, true, false).is_err());
+        assert!(validate_removal(&alias, true, false).is_err());
         assert!(f.repo.is_dir());
     }
     #[test]
@@ -564,7 +1197,7 @@ mod tests {
             ],
         );
         std::fs::write(f.checkout.join("precious.local"), "local only").unwrap();
-        assert!(validate_removal(&f.checkout, &f.managed, true, false).is_err());
+        assert!(validate_removal(&f.checkout, true, false).is_err());
         assert!(f.checkout.join("precious.local").exists());
     }
 
@@ -585,16 +1218,20 @@ mod tests {
                 "only reference",
             ],
         );
-        assert!(validate_removal(&f.checkout, &f.managed, true, false).is_err());
+        assert!(validate_removal(&f.checkout, true, false).is_err());
     }
     #[test]
     fn checkout_actions_wait_until_the_previous_operation_releases_its_lock() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("checkout-actions.lock");
-        let first = lock_checkout_actions_at(&path).unwrap();
+        let first = lock_checkout_actions_at(&path, CHECKOUT_ACTION_LOCK_WAIT)
+            .unwrap()
+            .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let _second = lock_checkout_actions_at(&path).unwrap();
+            let _second = lock_checkout_actions_at(&path, CHECKOUT_ACTION_LOCK_WAIT)
+                .unwrap()
+                .unwrap();
             entered_tx.send(()).unwrap();
         });
         assert!(
@@ -607,5 +1244,20 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         worker.join().unwrap();
+    }
+    #[test]
+    fn an_interactive_wait_gives_up_while_another_action_holds_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("checkout-actions.lock");
+        let _first = lock_checkout_actions_at(&path, CHECKOUT_ACTION_LOCK_WAIT)
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            lock_checkout_actions_at(&path, std::time::Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

@@ -5,6 +5,7 @@
 //! branch. A second spec-carrying Run for the same chat REUSES the checkout
 //! instead of minting another.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -14,7 +15,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use zeron_doc::{MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry};
+use zeron_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionCommandStatus,
+    SessionMessageEntry,
+};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
@@ -23,6 +27,29 @@ use zeron_proto::{
 };
 
 const CHAT: &str = "chat-worktree-run";
+
+struct EnvGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let original = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.original {
+            unsafe { std::env::set_var(self.key, value) };
+        } else {
+            unsafe { std::env::remove_var(self.key) };
+        }
+    }
+}
 
 /// Completes a one-line turn and records the cwd each run spawned with.
 struct RecordingHarness {
@@ -105,6 +132,18 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
         .count()
 }
 
+fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, Option<String>)> {
+    core.doc_host
+        .open(CHAT)
+        .ok()?
+        .doc()
+        .read_commands()
+        .ok()?
+        .into_iter()
+        .find(|command| command.id == id)
+        .map(|command| (command.status, command.resolution))
+}
+
 fn run_payload(message_id: &str, repo_path: &str, space_id: Option<&str>) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
@@ -150,6 +189,7 @@ async fn run_with_worktree_spec_materializes_on_host_and_reuses() {
     check_worktree_setup_and_reuse(false).await;
     #[cfg(unix)]
     check_worktree_setup_and_reuse(true).await;
+    check_failed_setup_and_retry().await;
 }
 
 async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
@@ -158,7 +198,12 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     // macOS tempdirs live behind the /var → /private/var symlink.
     let tmp_path = tmp.path().canonicalize().unwrap();
     let worktrees_root = tmp_path.join("worktrees");
-    unsafe { std::env::set_var("ZERON_WORKTREES_DIR", &worktrees_root) };
+    let _root_guard = EnvGuard::set("ZERON_WORKTREES_DIR", &worktrees_root);
+    let _journal_guard = EnvGuard::set(
+        "ZERON_WORKTREE_OWNERSHIP_FILE",
+        &tmp_path.join("ownership.json"),
+    );
+    let _unpeel_guard = EnvGuard::set("UNPEEL_HOME", &tmp_path.join("unpeel"));
 
     let repo_dir = tmp_path.join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -166,8 +211,14 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     git(&repo_dir, &["config", "user.email", "t@example.com"]);
     git(&repo_dir, &["config", "user.name", "Test"]);
     std::fs::write(repo_dir.join("README.md"), "hello\n").unwrap();
+    std::fs::write(repo_dir.join(".gitignore"), "cache/\n").unwrap();
+    std::fs::write(repo_dir.join(".worktreeinclude"), "cache/\n").unwrap();
     git(&repo_dir, &["add", "."]);
     git(&repo_dir, &["commit", "-m", "init"]);
+    std::fs::create_dir_all(repo_dir.join("cache")).unwrap();
+    std::fs::write(repo_dir.join("cache/real.txt"), "cached\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real.txt", repo_dir.join("cache/link.txt")).unwrap();
     let repo_path = repo_dir.to_string_lossy().to_string();
     #[cfg(unix)]
     let project_dir = if use_project_symlink {
@@ -274,6 +325,22 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         setup.setup_error
     );
     assert!(setup.setup_action.is_some());
+    assert_eq!(
+        std::fs::read_to_string(first.join("cache/real.txt")).unwrap(),
+        "cached\n"
+    );
+    #[cfg(unix)]
+    {
+        let warning = setup
+            .setup_warning
+            .as_deref()
+            .expect("skipped symlink is surfaced to the Chat");
+        assert!(
+            warning.starts_with("1 entry selected by .worktreeinclude"),
+            "{warning}"
+        );
+        assert!(!first.join("cache/link.txt").exists());
+    }
     wait_for(|| first.join("setup-marker").is_file(), "setup Action").await;
     assert_eq!(
         std::fs::read_to_string(first.join("setup-project-root")).unwrap(),
@@ -314,8 +381,13 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         second_cwd, first_cwd,
         "a second Run with the spec must reuse the chat's worktree"
     );
-    let minted = std::fs::read_dir(worktrees_root.join("repo"))
-        .map(|entries| entries.count())
+    let minted = std::fs::read_dir(first.parent().unwrap())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().join(".git").is_file())
+                .count()
+        })
         .unwrap_or(0);
     assert_eq!(minted, 1, "exactly one worktree minted for the chat");
     let reused = core
@@ -326,5 +398,195 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     assert!(reused.setup_error.is_none());
     assert!(!first.join("setup-marker").exists());
 
+    core.shutdown().await;
+}
+
+async fn check_failed_setup_and_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().canonicalize().unwrap();
+    let worktrees_root = tmp_path.join("worktrees");
+    let _root_guard = EnvGuard::set("ZERON_WORKTREES_DIR", &worktrees_root);
+    let _journal_guard = EnvGuard::set(
+        "ZERON_WORKTREE_OWNERSHIP_FILE",
+        &tmp_path.join("ownership.json"),
+    );
+    let _unpeel_guard = EnvGuard::set("UNPEEL_HOME", &tmp_path.join("unpeel"));
+
+    let repo_dir = tmp_path.join("repo");
+    std::fs::create_dir_all(repo_dir.join(".comet")).unwrap();
+    git(&repo_dir, &["init", "-b", "main"]);
+    git(&repo_dir, &["config", "user.email", "t@example.com"]);
+    git(&repo_dir, &["config", "user.name", "Test"]);
+    std::fs::write(repo_dir.join("README.md"), "hello\n").unwrap();
+    std::fs::write(
+        repo_dir.join(".comet/worktree.json"),
+        r#"{"setup-worktree":"test -f \"$ROOT_WORKTREE_PATH/allow-setup\" && printf setup > setup-marker"}"#,
+    )
+    .unwrap();
+    std::fs::write(repo_dir.join(".gitignore"), "cache/\n").unwrap();
+    std::fs::write(repo_dir.join(".worktreeinclude"), "cache/\n").unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(&repo_dir, &["commit", "-m", "init"]);
+    std::fs::create_dir_all(repo_dir.join("cache")).unwrap();
+    std::fs::write(repo_dir.join("cache/real.txt"), "cached\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real.txt", repo_dir.join("cache/link.txt")).unwrap();
+    let repo_path = repo_dir.to_string_lossy().to_string();
+
+    let cwds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(RecordingHarness { cwds: cwds.clone() }));
+    let core = EngineCore::assemble(
+        &tmp_path.join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("engine core assembles");
+    core.workspace
+        .create_space(
+            "space-worktree-run",
+            &core.device_id,
+            &repo_path,
+            Some("Repo".into()),
+            true,
+        )
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            zeron_rpc::methods::UPSERT_PROJECT_ACTION,
+            serde_json::json!({
+                "spaceId": "space-worktree-run",
+                "action": ProjectActionDraft {
+                    name: "Setup Action".into(),
+                    command: "printf action > action-marker".into(),
+                    icon: ProjectActionIcon::Configure,
+                    run_on_worktree_create: true,
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": CHAT,
+                "deviceId": core.device_id,
+            }),
+        )
+        .await
+        .unwrap();
+    core.workspace.rename_chat(CHAT, "Pre-titled").unwrap();
+
+    let failed_command = core
+        .doc_host
+        .queue_command(
+            CHAT,
+            run_payload("msg-wt-failed", &repo_path, Some("space-worktree-run")),
+        )
+        .unwrap();
+    wait_for(
+        || {
+            command_status(&core, &failed_command)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "failed setup command",
+    )
+    .await;
+    let (status, resolution) = command_status(&core, &failed_command).unwrap();
+    assert_eq!(status, SessionCommandStatus::Rejected, "{resolution:?}");
+    let chat = core.workspace.chat(CHAT).unwrap().unwrap();
+    let checkout = PathBuf::from(chat.cwd.expect("failed setup still records cwd"));
+    assert_ne!(checkout, repo_dir);
+    assert!(checkout.join(".git").is_file());
+    assert!(
+        chat.branch
+            .as_deref()
+            .is_some_and(|branch| branch.starts_with("zeron/"))
+    );
+    assert!(
+        cwds.lock().unwrap().is_empty(),
+        "harness must not start before setup"
+    );
+    assert!(!checkout.join("setup-marker").exists());
+    assert!(!checkout.join("action-marker").exists());
+    let handoff = core
+        .project_actions
+        .take_setup_handoff(&failed_command, CHAT)
+        .expect("failed setup produces a Project Action handoff");
+    assert!(handoff.setup_action.is_none());
+    assert!(handoff.setup_error.is_some());
+    #[cfg(unix)]
+    {
+        assert!(
+            handoff
+                .setup_warning
+                .as_deref()
+                .is_some_and(|warning| warning.starts_with("1 entry selected by .worktreeinclude")),
+            "a failed setup keeps the copy advisory: {:?}",
+            handoff.setup_warning
+        );
+        assert!(
+            resolution
+                .as_deref()
+                .is_some_and(|resolution| resolution.contains("not copied")),
+            "the rejected Run names the skipped copy: {resolution:?}"
+        );
+    }
+
+    std::fs::write(repo_dir.join("allow-setup"), "yes\n").unwrap();
+    let mut retry = run_payload("msg-wt-retry", &repo_path, None);
+    let SessionCommandPayload::Run { request, .. } = &mut retry else {
+        unreachable!()
+    };
+    request.worktree = None;
+    request.cwd = checkout.to_string_lossy().to_string();
+    let retry_command = core.doc_host.queue_command(CHAT, retry).unwrap();
+    wait_for(|| complete_assistant_count(&core) == 1, "retry run").await;
+    assert_eq!(
+        command_status(&core, &retry_command).unwrap().0,
+        SessionCommandStatus::Applied
+    );
+    assert_eq!(
+        cwds.lock().unwrap().as_slice(),
+        &[checkout.to_string_lossy().to_string()]
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("setup-marker")).unwrap(),
+        "setup"
+    );
+    #[cfg(unix)]
+    assert!(
+        core.doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.role == MessageRole::System
+                && entry.parts.iter().any(|part| matches!(
+                    part,
+                    MessagePart::Text { text, .. } if text.contains("not copied")
+                ))),
+        "a successful retry records the copy advisory in the transcript"
+    );
+    let listing = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        2,
+        "retry must not create another checkout"
+    );
     core.shutdown().await;
 }

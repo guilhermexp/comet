@@ -107,6 +107,25 @@ enum TransferError {
     Permanent(String),
 }
 
+fn copy_warning_notice(warning: &str) -> String {
+    format!("Some ignored files were not copied into this worktree: {warning}")
+}
+
+fn with_copy_warning(message: String, warning: Option<&str>) -> String {
+    match warning {
+        Some(warning) => format!("{message}. {}", copy_warning_notice(warning)),
+        None => message,
+    }
+}
+
+struct MaterializedWorktree {
+    cwd: String,
+    fresh: Option<zeron_proto::Worktree>,
+    branch: Option<String>,
+    setup_error: Option<String>,
+    copy_warning: Option<String>,
+}
+
 /// Peer-relay delivery fallback pacing (`spawn_command_delivery`): the grace
 /// the normal rows→edge path gets before the relay road opens, the poll while
 /// waiting, the relay retry curve, its per-call deadline, and the give-up cap
@@ -4464,11 +4483,17 @@ impl DocHost {
                 // and steer→new-turn fallbacks reuse the created path instead of
                 // minting another checkout.
                 let worktree_spec = request.worktree.take();
+                let mut worktree_branch = None;
+                let mut worktree_setup_error = None;
+                let mut worktree_copy_warning = None;
                 let fresh_worktree = match &worktree_spec {
                     Some(spec) => {
-                        let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;
-                        request.cwd = cwd;
-                        fresh
+                        let materialized = self.materialize_worktree(chat_id, spec).await?;
+                        request.cwd = materialized.cwd;
+                        worktree_branch = materialized.branch;
+                        worktree_setup_error = materialized.setup_error;
+                        worktree_copy_warning = materialized.copy_warning;
+                        materialized.fresh
                     }
                     None => None,
                 };
@@ -4484,11 +4509,69 @@ impl DocHost {
                         if let Err(err) = ws.set_chat_cwd(chat_id, &wt.path) {
                             tracing::warn!(chat = %chat_id, error = %err, "worktree cwd stamp failed");
                         }
-                        if let Err(err) = ws.set_chat_branch(chat_id, &wt.branch) {
+                    }
+                    if let Some(branch) = worktree_branch.as_deref()
+                        && !branch.is_empty()
+                    {
+                        if let Err(err) = ws.set_chat_branch(chat_id, branch) {
                             tracing::warn!(chat = %chat_id, error = %err, "worktree branch stamp failed");
                         }
                     }
                 }
+                // Timestamp canonicalization: the user message lands in
+                // history at the moment the user SENT it (the entry's
+                // issued_at, clamped against clock skew) — not whenever this
+                // host got around to draining a queued command. Idempotent by
+                // id, so the dispatch path's own execution-time write dedupes
+                // to a no-op.
+                if let Err(err) = handle.write_user_message(
+                    message_id,
+                    &request.prompt,
+                    entry.issued_at.min(now_ms()),
+                ) {
+                    tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
+                }
+                if let Some(error) = worktree_setup_error.as_deref() {
+                    if let Some(spec) = worktree_spec.as_ref()
+                        && spec.space_id.is_some()
+                    {
+                        self.complete_worktree_setup_handoff(
+                            &entry.id,
+                            chat_id,
+                            spec,
+                            None,
+                            Some(error),
+                            worktree_copy_warning.as_deref(),
+                        );
+                    }
+                    return Err(EngineError::Other(with_copy_warning(
+                        format!(
+                            "worktree setup failed; the checkout was preserved at {}: {error}",
+                            request.cwd
+                        ),
+                        worktree_copy_warning.as_deref(),
+                    )));
+                }
+                // A failed worktree setup is recorded durably in the ownership
+                // journal. A later ordinary Run (WorktreeSpec has already been
+                // consumed) retries it in the Chat's exact checkout; external or
+                // already-prepared worktrees are a no-op.
+                if worktree_spec.is_none() {
+                    let (setup_error, copy_warning) = self
+                        .prepare_pending_chat_checkout(chat_id, &request.cwd)
+                        .await?;
+                    if let Some(error) = setup_error {
+                        return Err(EngineError::Other(with_copy_warning(
+                            format!(
+                                "worktree setup failed; the checkout remains at {}: {error}",
+                                request.cwd
+                            ),
+                            copy_warning.as_deref(),
+                        )));
+                    }
+                    worktree_copy_warning = copy_warning;
+                }
+                let mut transcript_copy_warning = worktree_copy_warning;
                 if let Some(spec) = worktree_spec.as_ref()
                     && spec.space_id.is_some()
                 {
@@ -4497,6 +4580,8 @@ impl DocHost {
                         chat_id,
                         spec,
                         fresh_worktree.as_ref(),
+                        None,
+                        transcript_copy_warning.take().as_deref(),
                     );
                 }
                 let harness = self.harness_for_request(chat_id, &request);
@@ -4519,18 +4604,10 @@ impl DocHost {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
                     }
                 }
-                // Timestamp canonicalization: the user message lands in
-                // history at the moment the user SENT it (the entry's
-                // issued_at, clamped against clock skew) — not whenever this
-                // host got around to draining a queued command. Idempotent by
-                // id, so the dispatch path's own execution-time write dedupes
-                // to a no-op.
-                if let Err(err) = handle.write_user_message(
-                    message_id,
-                    &request.prompt,
-                    entry.issued_at.min(now_ms()),
-                ) {
-                    tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
+                if let Some(warning) = transcript_copy_warning.as_deref()
+                    && let Err(err) = handle.write_marker(&copy_warning_notice(warning))
+                {
+                    tracing::warn!(chat = %chat_id, error = %err, "copy warning notice write failed");
                 }
                 self.dispatch_with_source_context(
                     sessions,
@@ -4793,7 +4870,12 @@ impl DocHost {
         &self,
         chat_id: &str,
         spec: &zeron_proto::WorktreeSpec,
-    ) -> Result<(String, Option<zeron_proto::Worktree>), EngineError> {
+    ) -> Result<MaterializedWorktree, EngineError> {
+        let repos = self
+            .inner
+            .repos
+            .get()
+            .ok_or_else(|| EngineError::Other("repos engine not wired".into()))?;
         if let Some(ws) = self.workspace()
             && let Ok(Some(chat)) = ws.chat(chat_id)
             && let Some(cwd) = chat.cwd
@@ -4802,23 +4884,102 @@ impl DocHost {
                 == Some(spec.repo_path.as_str())
         {
             tracing::info!(chat = %chat_id, cwd = %cwd, "worktree spec: reusing the chat's existing worktree");
-            return Ok((cwd, None));
+            let prepared = repos
+                .prepare_worktree_for_chat(
+                    std::path::Path::new(&spec.repo_path),
+                    std::path::Path::new(&cwd),
+                )
+                .await?;
+            return Ok(MaterializedWorktree {
+                cwd,
+                fresh: None,
+                branch: Some(prepared.worktree.branch),
+                setup_error: prepared.setup_error,
+                copy_warning: prepared.copy_warning,
+            });
         }
+        let ws = self.workspace().ok_or_else(|| {
+            EngineError::Other("the Chat workspace is unavailable for a new worktree".into())
+        })?;
+        let repository = std::path::Path::new(&spec.repo_path);
+        let pending = repos
+            .create_worktree_unprepared(repository, &spec.base)
+            .await?;
+        let pending_cwd = pending.path.to_string_lossy().to_string();
+        // Persist the checkout association before setup or pre-start can
+        // block/fail. PendingChatCheckout keeps a Preparing reservation
+        // alive, so removal cannot race this handoff.
+        let persisted = (|| -> Result<(), EngineError> {
+            ws.claim_chat(chat_id, Some(&pending_cwd))?;
+            ws.set_chat_cwd(chat_id, &pending_cwd).map_err(|error| {
+                EngineError::Other(format!(
+                    "worktree {} was created, but its Chat cwd could not be saved: {error}",
+                    pending.path.display()
+                ))
+            })?;
+            ws.set_chat_branch(chat_id, &pending.branch)
+                .map_err(|error| {
+                    EngineError::Other(format!(
+                        "worktree {} was created, but its Chat branch could not be saved: {error}",
+                        pending.path.display()
+                    ))
+                })
+                .map(|_| ())
+        })();
+        if let Err(error) = persisted {
+            let path = pending.path.clone();
+            drop(pending);
+            return Err(match repos.delete_worktree(repository, &path).await {
+                Ok(()) => error,
+                Err(rollback) => EngineError::Other(format!(
+                    "{error}; the unused worktree {} could not be removed: {rollback}",
+                    path.display()
+                )),
+            });
+        }
+        let creation = repos
+            .finish_created_worktree_for_chat(repository, pending)
+            .await?;
+        tracing::info!(
+            chat = %chat_id,
+            path = %creation.worktree.path,
+            branch = %creation.worktree.branch,
+            "worktree materialized for run"
+        );
+        Ok(MaterializedWorktree {
+            cwd: creation.worktree.path.clone(),
+            branch: Some(creation.worktree.branch.clone()),
+            fresh: Some(creation.worktree),
+            setup_error: creation.setup_error,
+            copy_warning: creation.copy_warning,
+        })
+    }
+
+    /// Returns the setup error and the ignored-file copy advisory.
+    async fn prepare_pending_chat_checkout(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+    ) -> Result<(Option<String>, Option<String>), EngineError> {
+        let path = std::path::Path::new(cwd);
+        let Some(repository) = crate::workspace_host::linked_worktree_root(path) else {
+            return Ok((None, None));
+        };
         let repos = self
             .inner
             .repos
             .get()
             .ok_or_else(|| EngineError::Other("repos engine not wired".into()))?;
-        let worktree = repos
-            .create_worktree(std::path::Path::new(&spec.repo_path), &spec.base)
+        let prepared = repos
+            .prepare_worktree_for_chat(std::path::Path::new(&repository), path)
             .await?;
-        tracing::info!(
-            chat = %chat_id,
-            path = %worktree.path,
-            branch = %worktree.branch,
-            "worktree materialized for run"
-        );
-        Ok((worktree.path.clone(), Some(worktree)))
+        if !prepared.worktree.branch.is_empty()
+            && let Some(ws) = self.workspace()
+            && let Err(error) = ws.set_chat_branch(chat_id, &prepared.worktree.branch)
+        {
+            tracing::warn!(cwd, error = %error, "prepared checkout branch stamp failed");
+        }
+        Ok((prepared.setup_error, prepared.copy_warning))
     }
 
     fn complete_worktree_setup_handoff(
@@ -4827,12 +4988,19 @@ impl DocHost {
         chat_id: &str,
         spec: &zeron_proto::WorktreeSpec,
         fresh_worktree: Option<&zeron_proto::Worktree>,
+        setup_error: Option<&str>,
+        copy_warning: Option<&str>,
     ) {
         let Some((project_actions, terminals)) = self.inner.project_action_runtime.get() else {
             return;
         };
-        let outcome = match (spec.space_id.as_deref(), fresh_worktree) {
-            (Some(space_id), Some(worktree)) => self
+        let mut outcome = match (setup_error, spec.space_id.as_deref(), fresh_worktree) {
+            (Some(error), Some(_), _) => ProjectActionSetupHandoff {
+                setup_action: None,
+                setup_error: Some(error.to_owned()),
+                setup_warning: None,
+            },
+            (None, Some(space_id), Some(worktree)) => self
                 .resolve_and_launch_worktree_setup(
                     project_actions,
                     terminals,
@@ -4843,12 +5011,15 @@ impl DocHost {
                 .unwrap_or_else(|err| ProjectActionSetupHandoff {
                     setup_action: None,
                     setup_error: Some(err.to_string()),
+                    setup_warning: None,
                 }),
             _ => ProjectActionSetupHandoff {
                 setup_action: None,
                 setup_error: None,
+                setup_warning: None,
             },
         };
+        outcome.setup_warning = copy_warning.map(str::to_owned);
         project_actions.complete_setup_handoff(command_id, chat_id, outcome);
     }
 
@@ -4896,6 +5067,7 @@ impl DocHost {
         Ok(ProjectActionSetupHandoff {
             setup_action,
             setup_error: None,
+            setup_warning: None,
         })
     }
 

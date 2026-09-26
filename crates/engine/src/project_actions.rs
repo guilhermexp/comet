@@ -32,6 +32,8 @@ const SETUP_HANDOFF_TTL: Duration = Duration::from_secs(10 * 60);
 pub struct ProjectActionSetupHandoff {
     pub setup_action: Option<ProjectActionRun>,
     pub setup_error: Option<String>,
+    /// Advisory shown with a successful or failed setup, e.g. skipped copies.
+    pub setup_warning: Option<String>,
 }
 
 struct StoredSetupHandoff {
@@ -689,6 +691,7 @@ mod tests {
             ProjectActionSetupHandoff {
                 setup_action: None,
                 setup_error: Some("setup failed".into()),
+                setup_warning: None,
             },
         );
 

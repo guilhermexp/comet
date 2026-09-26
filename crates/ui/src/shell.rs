@@ -2498,11 +2498,13 @@ impl Shell {
                     chat_id,
                     setup_action,
                     setup_error,
+                    setup_warning,
                     target_device_id,
                 } => this.attach_worktree_setup(
                     chat_id.clone(),
                     setup_action.clone(),
                     setup_error.clone(),
+                    setup_warning.clone(),
                     target_device_id.clone(),
                     cx,
                 ),

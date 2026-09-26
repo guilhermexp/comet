@@ -4,7 +4,7 @@
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.zeron/worktrees/<repoName>/<worktreeName>` (NOT the data
+//! created under `~/.zeron/worktrees/<repo-slug>-<hash>/<worktreeName>` (NOT the data
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
 //! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
 //!
@@ -41,13 +41,32 @@ const GIT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 /// Hard wall-clock ceiling for a folder listing (the walk runs in a disposable
 /// blocking task; on expiry the caller unblocks and the task is abandoned).
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
-/// Ceiling on the fallback recursive delete of a worktree directory. It has to
-/// fit INSIDE the `DeleteWorktree` deadline (no `deadline_secs`, so the 30s
-/// default in `rpc::method`), which also has to cover the porcelain listing,
-/// the path resolution, `worktree remove`, the prune and the branch delete —
-/// on a forwarded call across devices. 10s leaves that headroom while still
-/// being generous for a large checkout on a healthy disk.
-const WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Warning threshold for a shared checkout mutation. A blocking task cannot
+/// be cancelled by dropping its JoinHandle; once this elapses, keep awaiting
+/// the authoritative outcome instead of returning a false timeout while Git
+/// or a hook may still be changing the checkout.
+const WORKTREE_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(720);
+
+async fn settle_worktree_mutation<T: Send + 'static>(
+    mut worker: tokio::task::JoinHandle<Result<T, EngineError>>,
+    operation: &'static str,
+    warning_after: Duration,
+) -> Result<T, EngineError> {
+    let result = match tokio::time::timeout(warning_after, &mut worker).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                operation,
+                ?warning_after,
+                "worktree mutation exceeded reply budget; waiting for the checkout state to settle"
+            );
+            worker.await
+        }
+    };
+    result.map_err(|error| {
+        EngineError::Other(format!("worktree {operation} worker failed: {error}"))
+    })?
+}
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
 /// Cap on returned drives (a machine with more mounts than this is a server
@@ -84,6 +103,16 @@ pub struct CheckoutIdentity {
     pub git_dir: PathBuf,
 }
 
+/// The result of creating a Chat worktree. The checkout remains available if
+/// setup fails so the caller can persist its path and retry preparation later.
+#[derive(Debug, Clone)]
+pub struct WorktreeCreationOutcome {
+    pub worktree: Worktree,
+    pub setup_error: Option<String>,
+    /// Advisory: `.worktreeinclude` entries that were not copied.
+    pub copy_warning: Option<String>,
+}
+
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
 pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -111,6 +140,7 @@ struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
+    ownership_journal_path: Result<PathBuf, String>,
     runner: std::sync::Arc<dyn ProcessRunner>,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     mutation_locks: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -143,10 +173,24 @@ impl Repos {
         &self.inner.data_dir
     }
 
+    fn ownership_journal_path(&self) -> Result<PathBuf, EngineError> {
+        self.inner
+            .ownership_journal_path
+            .clone()
+            .map_err(|error| EngineError::Other(format!("worktree ownership journal: {error}")))
+    }
+
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
     /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
-        Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
+        Self::build(
+            data_dir,
+            device_id,
+            default_worktrees_root(),
+            zeron_workers_unpeel::worktree_ownership::current_journal_path()
+                .map_err(|error| error.to_string()),
+            std::sync::Arc::new(SystemProcessRunner),
+        )
     }
 
     /// Explicit worktree root (tests).
@@ -155,6 +199,7 @@ impl Repos {
             data_dir,
             device_id,
             worktrees_root,
+            Ok(data_dir.join("worktree-ownership.json")),
             std::sync::Arc::new(SystemProcessRunner),
         )
     }
@@ -167,13 +212,20 @@ impl Repos {
         device_id: &str,
         runner: std::sync::Arc<dyn ProcessRunner>,
     ) -> Self {
-        Self::build(data_dir, device_id, default_worktrees_root(), runner)
+        Self::build(
+            data_dir,
+            device_id,
+            default_worktrees_root(),
+            Ok(data_dir.join("worktree-ownership.json")),
+            runner,
+        )
     }
 
     fn build(
         data_dir: &Path,
         device_id: &str,
         worktrees_root: PathBuf,
+        ownership_journal_path: Result<PathBuf, String>,
         runner: std::sync::Arc<dyn ProcessRunner>,
     ) -> Self {
         Self {
@@ -181,6 +233,7 @@ impl Repos {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
+                ownership_journal_path,
                 runner,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
                 mutation_locks: std::sync::Mutex::new(HashMap::new()),
@@ -347,6 +400,29 @@ impl Repos {
         matches!(
             tokio::time::timeout(PATH_EXISTS_TIMEOUT, tokio::fs::metadata(path)).await,
             Ok(Ok(_))
+        )
+    }
+
+    /// A stale Git registration is eligible for cleanup only when its leaf is
+    /// definitely absent and its parent remains reachable. A failed stat,
+    /// missing parent, or timed-out mount probe is not evidence of deletion.
+    async fn checkout_leaf_missing_with_parent(path: &Path) -> bool {
+        let path = path.to_path_buf();
+        let worker = tokio::task::spawn_blocking(move || {
+            let leaf_missing = matches!(
+                std::fs::symlink_metadata(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            if !leaf_missing {
+                return false;
+            }
+            path.parent()
+                .and_then(|parent| std::fs::metadata(parent).ok())
+                .is_some_and(|metadata| metadata.is_dir())
+        });
+        matches!(
+            tokio::time::timeout(PATH_EXISTS_TIMEOUT, worker).await,
+            Ok(Ok(true))
         )
     }
 
@@ -1507,68 +1583,215 @@ impl Repos {
 
     // ── worktrees ───────────────────────────────────────────────────────────
 
-    /// `git worktree add` an isolated checkout under
-    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `zeron/<name>`
-    /// branch off `branch`.
+    /// Create a Chat checkout through the common lifecycle service. This
+    /// compatibility wrapper reports setup failure as an error; callers that
+    /// need to preserve the path and expose a retry use
+    /// [`Self::create_worktree_with_setup`].
     pub async fn create_worktree(
         &self,
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, EngineError> {
-        let repo_name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string());
-        let base = self.inner.worktrees_root.join(&repo_name);
-        std::fs::create_dir_all(&base)?;
-        // Auto-generate a name colliding with neither an existing dir nor branch.
+        let outcome = self.create_worktree_with_setup(repo_path, branch).await?;
+        if let Some(error) = outcome.setup_error {
+            return Err(EngineError::Other(format!(
+                "worktree {} was created but setup failed: {error}",
+                outcome.worktree.path
+            )));
+        }
+        Ok(outcome.worktree)
+    }
+
+    /// Create a Chat checkout and return its path even when project setup or
+    /// `pre-start` fails. The caller can save the checkout on the Chat before
+    /// surfacing the setup error, then retry preparation on the next Run.
+    pub async fn create_worktree_with_setup(
+        &self,
+        repo_path: &Path,
+        base_ref: &str,
+    ) -> Result<WorktreeCreationOutcome, EngineError> {
+        let pending = self.create_worktree_unprepared(repo_path, base_ref).await?;
+        self.finish_created_worktree_for_chat(repo_path, pending)
+            .await
+    }
+
+    /// Materialize Git and its ownership proof, retaining a Preparing lease.
+    /// A Chat host must persist `pending.path` and `pending.branch` before it
+    /// consumes the value with `finish_created_worktree_for_chat`.
+    pub async fn create_worktree_unprepared(
+        &self,
+        repo_path: &Path,
+        base_ref: &str,
+    ) -> Result<zeron_workers_unpeel::PendingChatCheckout, EngineError> {
         let existing: HashSet<String> = self
             .branches(repo_path)
             .await
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let mut name = None;
-        for attempt in 0..50u64 {
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as u64)
-                .unwrap_or(attempt)
-                .wrapping_add(attempt.wrapping_mul(0x9E37_79B9));
-            let candidate = format!(
-                "{}-{}",
-                ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
-                NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
-            );
-            if !base.join(&candidate).exists() && !existing.contains(&format!("zeron/{candidate}"))
-            {
-                name = Some(candidate);
-                break;
+        let repo = repo_path.to_path_buf();
+        let root = self.inner.worktrees_root.clone();
+        let journal = self.ownership_journal_path()?;
+        let base_ref = base_ref.to_owned();
+        let worker = tokio::task::spawn_blocking(move || {
+            for attempt in 0..50u64 {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.subsec_nanos() as u64)
+                    .unwrap_or(attempt)
+                    .wrapping_add(attempt.wrapping_mul(0x9E37_79B9));
+                let name = format!(
+                    "{}-{}",
+                    ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
+                    NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
+                );
+                let branch_name = format!("zeron/{name}");
+                if existing.contains(&branch_name) {
+                    continue;
+                }
+                let candidate_path =
+                    zeron_workers_unpeel::worktree_ownership::worktree_path(&root, &repo, &name)
+                        .map_err(|error| EngineError::Other(error.to_string()))?;
+                if candidate_path.exists() {
+                    continue;
+                }
+                let creation = zeron_workers_unpeel::create_new_checkout_for_chat_unprepared(
+                    &repo,
+                    &branch_name,
+                    Some(&base_ref),
+                    &root,
+                    &journal,
+                );
+                match creation {
+                    Ok(creation) => return Ok(creation),
+                    // The earlier branch/path snapshot is only an optimization.
+                    // The service decides exclusivity under CheckoutActionLock;
+                    // another Chat may have won this name while we waited.
+                    Err(zeron_workers_unpeel::WorkersError::CheckoutNameTaken { .. }) => continue,
+                    Err(error) => return Err(EngineError::Other(error.to_string())),
+                }
             }
+            Err(EngineError::Other(
+                "Could not allocate a worktree name".into(),
+            ))
+        });
+        settle_worktree_mutation(worker, "creation", WORKTREE_LIFECYCLE_TIMEOUT).await
+    }
+
+    /// Finish the blocking setup after the Chat row has durably named its new
+    /// checkout. The pending value keeps removal blocked across that handoff.
+    pub async fn finish_created_worktree_for_chat(
+        &self,
+        repo_path: &Path,
+        pending: zeron_workers_unpeel::PendingChatCheckout,
+    ) -> Result<WorktreeCreationOutcome, EngineError> {
+        let name = pending
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("worktree")
+            .to_owned();
+        let worker = tokio::task::spawn_blocking(move || {
+            pending
+                .finish()
+                .map_err(|error| EngineError::Other(error.to_string()))
+        });
+        let creation =
+            settle_worktree_mutation(worker, "preparation", WORKTREE_LIFECYCLE_TIMEOUT).await?;
+        self.chat_worktree_outcome(repo_path, name, creation).await
+    }
+
+    /// Retry a pending project setup in an existing Chat checkout. The common
+    /// service is a no-op for external and already-prepared checkouts.
+    pub async fn prepare_worktree_for_chat(
+        &self,
+        repo_path: &Path,
+        worktree_path: &Path,
+    ) -> Result<WorktreeCreationOutcome, EngineError> {
+        // Only paths that could have been created by either generation of the
+        // app need the ownership journal. An external checkout outside all
+        // those roots is a no-op even if the local journal is unreadable.
+        if let Some((path, branch)) = self
+            .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
+            .await
+            .filter(|(path, _)| definitely_external_checkout(path, &self.inner.worktrees_root))
+        {
+            let branch = branch.unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("worktree")
+                .to_owned();
+            return self
+                .chat_worktree_outcome(
+                    repo_path,
+                    name,
+                    zeron_workers_unpeel::ChatWorktreeCreation {
+                        path,
+                        branch,
+                        setup_failed_command: None,
+                        setup_failed_reason: None,
+                        hook_warning: None,
+                        copy_warning: None,
+                    },
+                )
+                .await;
         }
-        let name =
-            name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
-        let path = base.join(&name);
-        let branch_name = format!("zeron/{name}");
-        self.git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch_name,
-                &path.to_string_lossy(),
-                branch,
-            ],
-            Some(repo_path),
-        )
-        .await?;
-        let checkout = self.checkout_identity(&path).await?;
-        Ok(Worktree {
+        let repo = repo_path.to_path_buf();
+        let path = worktree_path.to_path_buf();
+        let root = self.inner.worktrees_root.clone();
+        let journal = self.ownership_journal_path()?;
+        let worker = tokio::task::spawn_blocking(move || {
+            zeron_workers_unpeel::prepare_checkout_for_chat(&repo, &path, &root, &journal)
+                .map_err(|error| EngineError::Other(error.to_string()))
+        });
+        let creation =
+            settle_worktree_mutation(worker, "preparation", WORKTREE_LIFECYCLE_TIMEOUT).await?;
+        let name = creation
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("worktree")
+            .to_owned();
+        self.chat_worktree_outcome(repo_path, name, creation).await
+    }
+
+    async fn chat_worktree_outcome(
+        &self,
+        repo_path: &Path,
+        name: String,
+        creation: zeron_workers_unpeel::ChatWorktreeCreation,
+    ) -> Result<WorktreeCreationOutcome, EngineError> {
+        if let Some(warning) = creation.hook_warning.as_deref() {
+            tracing::warn!(worktree = %creation.path.display(), warning, "worktree post-start hook warning");
+        }
+        if let Some(warning) = creation.copy_warning.as_deref() {
+            tracing::warn!(worktree = %creation.path.display(), warning, "worktree ignored-file copy was incomplete");
+        }
+        let checkout_id = self
+            .checkout_identity(&creation.path)
+            .await
+            .ok()
+            .map(|identity| identity.id);
+        let worktree = Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
-            path: path.to_string_lossy().to_string(),
-            branch: branch_name,
+            path: creation.path.to_string_lossy().to_string(),
+            branch: creation.branch,
             name,
-            checkout_id: Some(checkout.id),
+            checkout_id,
+        };
+        let setup_error = match (creation.setup_failed_command, creation.setup_failed_reason) {
+            (Some(command), Some(reason)) => {
+                Some(format!("setup command `{command}` failed: {reason}"))
+            }
+            (Some(command), None) => Some(format!("setup command `{command}` failed")),
+            (None, Some(reason)) => Some(reason),
+            (None, None) => None,
+        };
+        Ok(WorktreeCreationOutcome {
+            worktree,
+            setup_error,
+            copy_warning: creation.copy_warning,
         })
     }
 
@@ -1631,105 +1854,70 @@ impl Repos {
             Some(worktree_path),
         )
         .await?;
+        match self.ownership_journal_path() {
+            Ok(journal) => {
+                let checkout = worktree_path.to_path_buf();
+                let root = self.inner.worktrees_root.clone();
+                let (from, to) = (current.clone(), target.clone());
+                let recorded = tokio::task::spawn_blocking(move || {
+                    zeron_workers_unpeel::record_checkout_branch_rename(
+                        &checkout, &root, &journal, &from, &to,
+                    )
+                })
+                .await;
+                if !matches!(recorded, Ok(Ok(()))) {
+                    tracing::warn!(
+                        branch = %target,
+                        "renamed worktree branch will be kept after removal: ownership update failed"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                branch = %target,
+                %error,
+                "renamed worktree branch will be kept after removal: no ownership journal"
+            ),
+        }
         self.current_branch(worktree_path).await
     }
 
-    /// Remove one linked worktree, then prune stale refs. Fails when the
-    /// removal ran and did not succeed — a checkout still on disk is not a
-    /// deletion, and only the caller can act on that.
-    ///
-    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) —
-    /// the user may have checked out their own branch inside the worktree —
-    /// and only once the checkout is provably gone.
+    /// Remove one linked worktree through the shared ownership and safety
+    /// checks. Externally-created checkouts, missing ownership proof, active
+    /// checkouts, and dirty trees are refused. An integrated local branch may
+    /// be removed after the checkout; unproven work keeps its branch.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
-        // Resolve BEFORE removing: with `worktree_path` coming from the caller
-        // (the method is forwardable, so from another device too), an unrelated
-        // folder must never reach the recursive delete below. The registration
-        // also carries the branch, which outlives the directory — that is how a
-        // `zeron/…` branch still gets pruned once the folder is already gone.
         let resolved = self
             .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
             .await;
-        // A removal that never ran must not pass as a success: the folder is
-        // still there and only the caller can act on that.
-        let branch = match resolved {
-            Some((path, branch)) => {
-                let removed = self
-                    .git(
-                        &["worktree", "remove", "--force", &path.to_string_lossy()],
-                        Some(repo_path),
-                    )
-                    .await
-                    .is_ok();
-                // git reports success only after the checkout is gone; anything
-                // else has to be proven by the fallback below.
-                let removed = if removed {
-                    true
-                } else {
-                    // git refused (or the dir is half-gone) — delete the folder
-                    // directly. Safe now: the path is a resolved linked
-                    // worktree. Off the executor under a ceiling: a big
-                    // checkout takes a while, a dead mount takes forever.
-                    let target = path;
-                    let worker = disposable_worker("worktree-rm", move || {
-                        match std::fs::remove_dir_all(&target) {
-                            Ok(()) => Ok(true),
-                            // Nothing there — but "deleted" and "out of reach"
-                            // both read as NotFound, and an unmounted volume
-                            // reports it for the whole subtree. Only a missing
-                            // leaf under a parent that IS still there proves
-                            // the checkout is gone for good.
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Ok(target.parent().is_some_and(Path::exists))
-                            }
-                            // Permission, EIO, a file still in use: the removal
-                            // ran and failed. Say so instead of reporting ok.
-                            Err(e) => Err(format!("could not remove the worktree folder: {e}")),
-                        }
-                    });
-                    match tokio::time::timeout(WORKTREE_REMOVE_TIMEOUT, worker).await {
-                        Ok(Some(Ok(removed))) => removed,
-                        Ok(Some(Err(error))) => return Err(EngineError::Other(error)),
-                        Ok(None) => {
-                            return Err(EngineError::Other(
-                                "worktree removal worker could not run on the device".into(),
-                            ));
-                        }
-                        Err(_) => {
-                            return Err(EngineError::Other(
-                                "worktree removal timed out on the device".into(),
-                            ));
-                        }
-                    }
-                };
-                // The branch outlives the directory, but `-D` skips the
-                // unmerged check: dropping it while the checkout is merely
-                // unreachable (unmounted volume, moved folder) orphans every
-                // commit that was never pushed. Only delete it once the
-                // checkout is provably gone.
-                branch.filter(|_| removed)
+        let Some((path, _branch)) = resolved else {
+            // Already unregistered and gone: only a stale entry remains.
+            if Self::checkout_leaf_missing_with_parent(worktree_path).await {
+                return Ok(());
             }
-            None => {
-                // Unregistered. A folder still on disk is somebody else's
-                // checkout: refuse. Nothing on disk is just stale bookkeeping —
-                // prune it. Probed under a ceiling, like every other path here.
-                if Self::path_exists(worktree_path).await {
-                    return Err(EngineError::Other(
-                        "not a linked worktree of this repository".into(),
-                    ));
-                }
-                None
-            }
+            return Err(EngineError::Other(
+                "not a linked worktree of this repository".into(),
+            ));
         };
-        let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if let Some(branch) = branch.filter(|branch| branch.starts_with("zeron/")) {
-            let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
-        }
-        Ok(())
+        // `resolve_checkout` proved this exact path appears in the repository's
+        // porcelain. The lifecycle service revalidates that registration,
+        // journal ownership, and the missing leaf under its action lock.
+        let prune_missing = Self::checkout_leaf_missing_with_parent(&path).await;
+        let repo = repo_path.to_path_buf();
+        let root = self.inner.worktrees_root.clone();
+        let journal = self.ownership_journal_path()?;
+        let worker = tokio::task::spawn_blocking(move || {
+            let result = if prune_missing {
+                zeron_workers_unpeel::prune_missing_checkout_for_chat(&repo, &path, &root, &journal)
+            } else {
+                zeron_workers_unpeel::remove_checkout_for_chat(&repo, &path, &root, &journal)
+            };
+            result.map_err(|error| EngineError::Other(error.to_string()))
+        });
+        settle_worktree_mutation(worker, "removal", WORKTREE_LIFECYCLE_TIMEOUT).await
     }
 
     // ── ListFolders ─────────────────────────────────────────────────────────
@@ -2737,6 +2925,24 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
     }
 }
 
+/// A negative ownership check only. Paths beneath any current or historical
+/// app root still require the journal to prove whether setup is pending.
+/// `path` must already be canonical: it is never touched on disk here.
+fn definitely_external_checkout(path: &Path, configured_root: &Path) -> bool {
+    let home = home_dir();
+    let unpeel_home = std::env::var_os("UNPEEL_HOME")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".unpeel"));
+    [
+        configured_root.to_path_buf(),
+        home.join(".zeron/worktrees"),
+        unpeel_home.join("worktrees"),
+    ]
+    .iter()
+    .all(|root| !path.starts_with(canonicalize_lossy(root)))
+}
+
 /// Absolute form of a possibly-relative path (no filesystem access).
 fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -2760,6 +2966,35 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::process::ProcessOutput;
+
+    #[test]
+    fn only_checkouts_outside_all_app_roots_skip_the_ownership_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("repo/feature")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        assert!(!definitely_external_checkout(
+            &std::fs::canonicalize(root.join("repo/feature")).unwrap(),
+            &root
+        ));
+        assert!(definitely_external_checkout(
+            &std::fs::canonicalize(&external).unwrap(),
+            &root
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkout_mutation_deadline_waits_for_authoritative_result() {
+        let worker = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok::<_, EngineError>("checkout created")
+        });
+        let result = settle_worktree_mutation(worker, "creation", Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(result, "checkout created");
+    }
 
     #[tokio::test]
     async fn refs_excludes_origin_head_and_preserves_normal_branches() {
@@ -2938,10 +3173,6 @@ prunable gitdir file points to non-existent location
                 envs: std::sync::Mutex::new(Vec::new()),
             })
         }
-
-        fn called(&self, argv: &[&str]) -> bool {
-            self.calls.lock().unwrap().iter().any(|args| args == argv)
-        }
     }
 
     #[async_trait::async_trait]
@@ -2971,13 +3202,12 @@ prunable gitdir file points to non-existent location
         }
     }
 
-    /// A detached worktree has no `branch` line, and a deleted one has no
-    /// directory left — neither may cost it its authorization or its branch.
-    /// The checkouts are reached through a symlinked parent, because that is
-    /// the real shape: git registers the fully resolved path while the app
-    /// hands back the raw join of the worktrees root.
+    /// Git's porcelain authorizes a detached checkout and retains a stale
+    /// registration after the path is deleted; only the main checkout is
+    /// excluded from linked-worktree resolution. Physical cleanup is covered
+    /// through the shared lifecycle service in the engine integration tests.
     #[tokio::test]
-    async fn detached_and_vanished_worktrees_stay_deletable() {
+    async fn registration_resolves_detached_and_prunable_worktrees() {
         let data = tempfile::tempdir().unwrap();
         let real = data.path().join("real");
         let link = data.path().join("link");
@@ -2987,10 +3217,6 @@ prunable gitdir file points to non-existent location
         let root = link.join("repo");
         let detached = link.join("detached");
         let gone = link.join("gone");
-        // What git actually emits: paths with every symlink resolved, the
-        // vanished stanza included.
-        // Spelled out with `std::fs` on purpose: building it through the
-        // production helper would make this test agree with itself.
         let as_git_reports = |path: &Path| {
             std::fs::canonicalize(path)
                 .unwrap_or_else(|_| {
@@ -3001,8 +3227,6 @@ prunable gitdir file points to non-existent location
                 .display()
                 .to_string()
         };
-        // `worktree remove` refuses a stanza whose directory is already gone,
-        // so the recursive-delete fallback is what actually runs here.
         let git = FakeGit::new(
             format!(
                 "worktree {}\nbranch refs/heads/main\n\nworktree {}\ndetached\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\nprunable gitdir file points to non-existent location\n",
@@ -3010,9 +3234,9 @@ prunable gitdir file points to non-existent location
                 as_git_reports(&detached),
                 as_git_reports(&gone),
             ),
-            &["worktree", "remove"],
+            &[],
         );
-        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+        let repos = Repos::with_runner(data.path(), "dev", git);
 
         assert!(
             repos
@@ -3023,97 +3247,33 @@ prunable gitdir file points to non-existent location
         );
         assert!(
             repos
+                .resolve_checkout(&root, &gone, CheckoutQuery::Registration)
+                .await
+                .is_some(),
+            "a stale Git registration remains resolvable until prune"
+        );
+        assert!(
+            repos
                 .resolve_checkout(&root, &root, CheckoutQuery::Registration)
                 .await
                 .is_none(),
             "the main checkout is not a linked worktree"
         );
-        assert!(
-            repos.workspace_checkout(&root, &root).await.is_some(),
-            "the repository root is a workspace checkout"
-        );
-        let dead = link.join("dead-mount");
-        assert!(
-            repos.workspace_checkout(&dead, &dead).await.is_none(),
-            "a path that no longer exists must never authorize itself"
-        );
-
-        repos.delete_worktree(&root, &gone).await.unwrap();
-        assert!(
-            git.called(&["branch", "-D", "zeron/lucky-otter"]),
-            "the orphan branch of a deleted worktree must still be pruned: {:?}",
-            git.calls.lock().unwrap()
-        );
     }
 
-    /// A checkout that is merely UNREACHABLE — its whole parent subtree is
-    /// missing, as when the volume holding it is unmounted or the folder was
-    /// moved — is not a checkout that was deleted. `branch -D` skips the
-    /// unmerged check, so dropping the branch here strands every commit that
-    /// worktree never pushed, and remounting brings back a tree with no ref.
     #[tokio::test]
-    async fn unreachable_worktree_keeps_its_branch() {
+    async fn missing_checkout_probe_requires_existing_parent() {
         let data = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(data.path()).unwrap();
-        let root = data.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        // Nothing under `volume/` exists — the mount is gone, not the checkout.
-        let unmounted = data.path().join("volume").join("wt");
-        let git = FakeGit::new(
-            format!(
-                "worktree {}\nbranch refs/heads/main\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\n",
-                base.join("repo").display(),
-                base.join("volume").join("wt").display(),
-            ),
-            &["worktree", "remove"],
-        );
-        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+        let parent = data.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let missing = parent.join("missing-worktree");
+        assert!(Repos::checkout_leaf_missing_with_parent(&missing).await);
 
-        repos.delete_worktree(&root, &unmounted).await.unwrap();
-        assert!(
-            !git.called(&["branch", "-D", "zeron/lucky-otter"]),
-            "an unreachable worktree must keep its branch: {:?}",
-            git.calls.lock().unwrap()
-        );
-    }
+        let unreachable = data.path().join("missing-parent").join("worktree");
+        assert!(!Repos::checkout_leaf_missing_with_parent(&unreachable).await);
 
-    /// A recursive delete that RAN and FAILED is not a removal: report the
-    /// error rather than an ok, and touch neither the registration nor the
-    /// branch. A regular file at the registered path stands in for the
-    /// permission / EIO / still-in-use cases — `remove_dir_all` fails on it
-    /// with something other than `NotFound`.
-    #[tokio::test]
-    async fn failed_removal_is_reported_and_keeps_the_branch() {
-        let data = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(data.path()).unwrap();
-        let root = data.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        let blocked = data.path().join("wt");
-        std::fs::write(&blocked, b"not a directory").unwrap();
-        let git = FakeGit::new(
-            format!(
-                "worktree {}\nbranch refs/heads/main\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\n",
-                base.join("repo").display(),
-                base.join("wt").display(),
-            ),
-            &["worktree", "remove"],
-        );
-        let repos = Repos::with_runner(data.path(), "dev", git.clone());
-
-        let error = repos
-            .delete_worktree(&root, &blocked)
-            .await
-            .expect_err("a removal that failed must not report success");
-        assert!(
-            error.to_string().contains("could not remove the worktree"),
-            "the real filesystem error must surface: {error}"
-        );
-        assert!(
-            !git.called(&["worktree", "prune"])
-                && !git.called(&["branch", "-D", "zeron/lucky-otter"]),
-            "nothing was removed, so nothing may be pruned: {:?}",
-            git.calls.lock().unwrap()
-        );
+        std::fs::write(parent.join("present"), "not missing").unwrap();
+        assert!(!Repos::checkout_leaf_missing_with_parent(&parent.join("present")).await);
     }
 
     fn history_commit(sha: String, parent_sha: Option<String>) -> GitHistoryCommit {
@@ -3592,6 +3752,56 @@ tmpfs /run tmpfs rw 0 0
             output.status.success(),
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn external_checkout_preparation_ignores_a_broken_local_ownership_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let external = temp.path().join("external");
+        let managed = temp.path().join("managed");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_cmd(&repo, &["init", "-b", "main"]);
+        git_cmd(&repo, &["commit", "--allow-empty", "-m", "base"]);
+        git_cmd(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                external.to_str().unwrap(),
+            ],
+        );
+        let journal_path = temp.path().join("ownership.json");
+        std::fs::write(&journal_path, "not valid JSON").unwrap();
+        let repos = Repos::build(
+            temp.path(),
+            "device",
+            managed,
+            Ok(journal_path),
+            std::sync::Arc::new(SystemProcessRunner),
+        );
+        let outcome = repos
+            .prepare_worktree_for_chat(&repo, &external)
+            .await
+            .expect("an external checkout has no app setup to prepare");
+        assert_eq!(
+            outcome.worktree.path,
+            std::fs::canonicalize(&external).unwrap().to_string_lossy()
+        );
+        assert_eq!(outcome.worktree.branch, "feature");
+        assert!(outcome.setup_error.is_none());
+
+        let unrelated = temp.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        assert!(
+            repos
+                .prepare_worktree_for_chat(&repo, &unrelated)
+                .await
+                .is_err(),
+            "an arbitrary external directory is not a checkout to prepare"
         );
     }
 
