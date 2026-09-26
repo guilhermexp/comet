@@ -246,13 +246,7 @@ pub fn prepare_checkout_for_chat(
         std::fs::canonicalize(checkout).map_err(|error| WorkersError::State(error.to_string()))?;
     let pending = journal
         .preparation_pending(repository, &checkout)
-        .unwrap_or_else(|error| {
-            unpeel_core::hook_assets::append_trace_log_line(&format!(
-                "Checkout preparation state unavailable for {}: {error}",
-                checkout.display()
-            ));
-            false
-        });
+        .map_err(|error| WorkersError::State(error.to_string()))?;
     let branch_result = checkout_lifecycle::current_branch(&checkout);
     let branch = if pending {
         branch_result.map_err(WorkersError::State)?
@@ -5057,6 +5051,35 @@ mod worktree_setup_wiring_tests {
             "cache bytes"
         );
         assert!(!chat.path.join("other/private.bin").exists());
+    }
+
+    #[test]
+    fn chat_preparation_fails_closed_on_unreadable_journal_but_accepts_external_checkout() {
+        let fixture = Fixture::new(None);
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let created =
+            create_checkout_for_chat(&fixture.repo(), "zeron/fail-closed", None, &root, &journal)
+                .unwrap();
+        fixture.created.borrow_mut().push(created.path.clone());
+        let external = fixture.dir.join("external-checkout");
+        let added = Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "external-branch"])
+            .arg(&external)
+            .current_dir(fixture.repo())
+            .status()
+            .unwrap();
+        assert!(added.success());
+        fixture.created.borrow_mut().push(external.clone());
+
+        prepare_checkout_for_chat(&fixture.repo(), &external, &root, &journal)
+            .expect("a checkout with no ownership record stays usable");
+
+        std::fs::write(&journal, "not a journal").unwrap();
+        assert!(
+            prepare_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal).is_err(),
+            "an unreadable journal must not let an owned checkout skip preparation"
+        );
     }
 
     #[test]

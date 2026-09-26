@@ -36,6 +36,7 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
+const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct LiveTerminal {
     // Keep the private action script alive until the shell exits or the tab is closed.
@@ -509,6 +510,10 @@ impl Terminals {
     pub fn shutdown(&self) {
         let sessions: Vec<_> = lock(&self.inner.sessions).drain().map(|(_, s)| s).collect();
         for session in sessions {
+            let reservation = lock(&session).checkout_activity.take();
+            if let Some(reservation) = reservation {
+                reservation.release_and_wait(SHUTDOWN_RELEASE_TIMEOUT);
+            }
             dispose(&session, true);
         }
     }

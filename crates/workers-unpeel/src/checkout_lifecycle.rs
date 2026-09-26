@@ -395,7 +395,8 @@ pub(crate) fn remove_checkout_under_lock(
     }
     if checkout_is_busy_under_lock(client, &checkout, None, true)? {
         return Err(WorkersError::State(
-            "Stop active Chats and Workers before removing this checkout".into(),
+            "Stop active Chats and Workers and close terminals in this checkout before removing it"
+                .into(),
         ));
     }
     let removal_operation = format!("remove-{}", uuid::Uuid::new_v4());
@@ -655,7 +656,8 @@ pub(crate) fn remove_owned_checkout(
     }
     if path.exists() && checkout_is_busy_under_lock(client, path, None, true)? {
         return Err(WorkersError::State(
-            "Stop active Chats and Workers before removing this checkout".into(),
+            "Stop active Chats and Workers and close terminals in this checkout before removing it"
+                .into(),
         ));
     }
     set_removal_pending(project_id, &checkout, true)?;

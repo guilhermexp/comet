@@ -68,7 +68,16 @@ Test: integration — falha após registrar identidade Git e rename posterior da
 Depois da criação, o mesmo setup `.comet/worktree.json` ou `.cursor/worktrees.json` SHALL rodar para
 Chat e Worker antes do primeiro run/launch. Falha SHALL preservar checkout e associação, nomear o
 comando e impedir o harness/preset de iniciar. Retry de preparo SHALL reutilizar o mesmo checkout.
-`post-start` SHALL iniciar somente após o preparo bloqueante ter sucesso.
+`post-start` SHALL iniciar somente após o preparo bloqueante ter sucesso. Se o journal de ownership
+não puder ser lido ou não corresponder à identidade Git registrada, o preparo SHALL falhar fechado e o
+Run SHALL NOT iniciar; um checkout sem registro no journal é externo e segue utilizável.
+
+#### Scenario: Journal ilegível não pula o preparo
+Test: unit — `chat_preparation_fails_closed_on_unreadable_journal_but_accepts_external_checkout`.
+
+- **WHEN** o journal está corrompido e um Chat prepara um checkout do app
+- **THEN** o preparo falha e nenhum Run começa sem cópia, setup e hooks
+- **AND** um checkout sem registro no journal continua utilizável
 
 #### Scenario: Setup de Chat bem-sucedido
 Test: integration — engine em repositório temporário com setup que grava marcador.
@@ -91,6 +100,26 @@ checkout. A decisão SHALL vir de
 estado device-local consultado pelo serviço, sem depender de uma lista opcional fornecida pela UI.
 Se a atividade local não puder ser verificada com segurança, a remoção SHALL ser recusada; expiração
 de heartbeat sozinha SHALL NOT provar que a execução acabou.
+
+Um terminal do app aberto dentro do checkout SHALL bloquear apenas a remoção física; SHALL NOT
+bloquear mover um Chat para o checkout, o preparo nem Runs. O encerramento ordenado do processo SHALL
+liberar as reservas de terminal antes de terminar. Reservas `Terminal` e `Removing` cujo processo
+registrado não existe mais SHALL ser recuperadas; as demais reservas órfãs continuam fechadas.
+
+#### Scenario: Terminal aberto bloqueia só a remoção
+Test: integration — `open_terminal_blocks_removal_until_it_closes` e
+`terminal_inside_linked_checkout_reserves_it_only_against_removal`.
+
+- **WHEN** um terminal está aberto numa subpasta do checkout
+- **THEN** a remoção é recusada e a pasta permanece
+- **AND** o checkout continua disponível para Chats; fechar o terminal libera a remoção
+
+#### Scenario: Processo encerrado não deixa reserva de terminal
+Test: unit — `removing_and_terminal_entries_of_a_dead_process_are_reclaimed_but_other_kinds_stay_busy`
+e `release_and_wait_removes_the_entry_before_returning`.
+
+- **WHEN** o app encerra normalmente ou morre com um terminal aberto
+- **THEN** a reserva é liberada no shutdown ou recuperada quando seu processo não existe mais
 
 #### Scenario: Chat ativo bloqueia remoção Workers
 Test: integration — `project_actions` com Chat `Working` no checkout; UI chama o mesmo cliente.

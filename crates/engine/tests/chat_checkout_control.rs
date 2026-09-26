@@ -361,5 +361,26 @@ async fn terminal_inside_linked_checkout_reserves_it_only_against_removal() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let session = terminals
+        .open_with_shell(
+            nested.to_str().expect("nested path utf8"),
+            80,
+            24,
+            Some("/bin/sh"),
+        )
+        .expect("reopen terminal in checkout");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !terminal_reserved() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reopened terminal must reserve the checkout"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     terminals.shutdown();
+    assert!(
+        !terminal_reserved(),
+        "an orderly shutdown releases terminal reservations before returning"
+    );
+    drop(session);
 }
