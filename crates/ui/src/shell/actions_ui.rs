@@ -31,17 +31,32 @@ fn project_actions_menu_surface(
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
 }
 
+/// A setup failure takes precedence; a skipped-copy advisory is still shown
+/// when setup itself succeeded.
+fn worktree_setup_notice(setup_error: Option<&str>, setup_warning: Option<&str>) -> Option<String> {
+    match (setup_error, setup_warning) {
+        (Some(error), _) => Some(format!("Setup action failed: {error}")),
+        (None, Some(warning)) => Some(format!(
+            "Worktree created, but some ignored files were not copied: {warning}"
+        )),
+        (None, None) => None,
+    }
+}
+
 impl Shell {
     pub(super) fn attach_worktree_setup(
         &mut self,
         chat_id: String,
         setup_action: Option<ProjectActionRun>,
         setup_error: Option<String>,
+        setup_warning: Option<String>,
         target_device_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(error) = setup_error {
-            self.sidebar_notice = Some(format!("Setup action failed: {error}").into());
+        if let Some(notice) =
+            worktree_setup_notice(setup_error.as_deref(), setup_warning.as_deref())
+        {
+            self.sidebar_notice = Some(notice.into());
         }
         let Some(run) = setup_action else {
             cx.notify();
@@ -1177,5 +1192,23 @@ mod project_actions_scroll_tests {
             scroll.bounds().size.height < px(300.0),
             "short menus should stay compact"
         );
+    }
+}
+
+#[cfg(test)]
+mod worktree_setup_notice_tests {
+    use super::worktree_setup_notice;
+
+    #[test]
+    fn skipped_copy_warning_is_visible_after_successful_setup() {
+        assert_eq!(
+            worktree_setup_notice(None, Some("1 entry was skipped")).as_deref(),
+            Some("Worktree created, but some ignored files were not copied: 1 entry was skipped")
+        );
+        assert_eq!(
+            worktree_setup_notice(Some("exit 1"), Some("1 entry was skipped")).as_deref(),
+            Some("Setup action failed: exit 1")
+        );
+        assert_eq!(worktree_setup_notice(None, None), None);
     }
 }

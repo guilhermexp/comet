@@ -112,6 +112,7 @@ struct MaterializedWorktree {
     fresh: Option<zeron_proto::Worktree>,
     branch: Option<String>,
     setup_error: Option<String>,
+    copy_warning: Option<String>,
 }
 
 /// Peer-relay delivery fallback pacing (`spawn_command_delivery`): the grace
@@ -4473,12 +4474,14 @@ impl DocHost {
                 let worktree_spec = request.worktree.take();
                 let mut worktree_branch = None;
                 let mut worktree_setup_error = None;
+                let mut worktree_copy_warning = None;
                 let fresh_worktree = match &worktree_spec {
                     Some(spec) => {
                         let materialized = self.materialize_worktree(chat_id, spec).await?;
                         request.cwd = materialized.cwd;
                         worktree_branch = materialized.branch;
                         worktree_setup_error = materialized.setup_error;
+                        worktree_copy_warning = materialized.copy_warning;
                         materialized.fresh
                     }
                     None => None,
@@ -4514,6 +4517,7 @@ impl DocHost {
                             spec,
                             None,
                             Some(error),
+                            worktree_copy_warning.as_deref(),
                         );
                     }
                     return Err(EngineError::Other(format!(
@@ -4545,6 +4549,7 @@ impl DocHost {
                         spec,
                         fresh_worktree.as_ref(),
                         None,
+                        worktree_copy_warning.as_deref(),
                     );
                 }
                 let harness = self.harness_for_request(chat_id, &request);
@@ -4866,6 +4871,7 @@ impl DocHost {
                 fresh: None,
                 branch: Some(prepared.worktree.branch),
                 setup_error: prepared.setup_error,
+                copy_warning: prepared.copy_warning,
             });
         }
         let repository = std::path::Path::new(&spec.repo_path);
@@ -4910,6 +4916,7 @@ impl DocHost {
             branch: Some(creation.worktree.branch.clone()),
             fresh: Some(creation.worktree),
             setup_error: creation.setup_error,
+            copy_warning: creation.copy_warning,
         })
     }
 
@@ -4946,14 +4953,16 @@ impl DocHost {
         spec: &zeron_proto::WorktreeSpec,
         fresh_worktree: Option<&zeron_proto::Worktree>,
         setup_error: Option<&str>,
+        copy_warning: Option<&str>,
     ) {
         let Some((project_actions, terminals)) = self.inner.project_action_runtime.get() else {
             return;
         };
-        let outcome = match (setup_error, spec.space_id.as_deref(), fresh_worktree) {
+        let mut outcome = match (setup_error, spec.space_id.as_deref(), fresh_worktree) {
             (Some(error), Some(_), _) => ProjectActionSetupHandoff {
                 setup_action: None,
                 setup_error: Some(error.to_owned()),
+                setup_warning: None,
             },
             (None, Some(space_id), Some(worktree)) => self
                 .resolve_and_launch_worktree_setup(
@@ -4966,12 +4975,15 @@ impl DocHost {
                 .unwrap_or_else(|err| ProjectActionSetupHandoff {
                     setup_action: None,
                     setup_error: Some(err.to_string()),
+                    setup_warning: None,
                 }),
             _ => ProjectActionSetupHandoff {
                 setup_action: None,
                 setup_error: None,
+                setup_warning: None,
             },
         };
+        outcome.setup_warning = copy_warning.map(str::to_owned);
         project_actions.complete_setup_handoff(command_id, chat_id, outcome);
     }
 
@@ -5019,6 +5031,7 @@ impl DocHost {
         Ok(ProjectActionSetupHandoff {
             setup_action,
             setup_error: None,
+            setup_warning: None,
         })
     }
 

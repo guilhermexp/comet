@@ -2090,6 +2090,7 @@ impl RpcService for EngineRpc {
                         "ready": true,
                         "setupAction": outcome.setup_action,
                         "setupError": outcome.setup_error,
+                        "setupWarning": outcome.setup_warning,
                     })),
                     None => RpcReply::value(&serde_json::json!({ "ready": false })),
                 }

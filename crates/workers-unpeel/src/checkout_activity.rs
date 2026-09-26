@@ -390,12 +390,14 @@ pub(crate) fn end_at(file: &Path, operation_id: &str, lease_id: &str) -> Result<
 }
 
 /// A stale entry remains busy until the host reconciles it. Corrupt or
-/// unreadable state is an error, so deletion fails closed.
+/// unreadable state is an error, so deletion fails closed. An open terminal
+/// only blocks physical removal, so it is not activity here.
 pub(crate) fn busy_at(file: &Path, checkout: &Path) -> Result<Option<ActivityEntry>, String> {
-    busy_except_at(file, checkout, None)
+    busy_except_at(file, checkout, None, false)
 }
 
-/// Like [`busy_at`], ignoring the caller's own `operation_id`.
+/// Like [`busy_at`], ignoring the caller's own `operation_id`. Removal passes
+/// `include_terminals` so an open terminal keeps the checkout in use.
 ///
 /// A `Removing` entry whose recorded process has died is reclaimed here: a
 /// crashed removal must not block every later removal of the same checkout.
@@ -404,6 +406,7 @@ pub(crate) fn busy_except_at(
     file: &Path,
     checkout: &Path,
     operation_id: Option<&str>,
+    include_terminals: bool,
 ) -> Result<Option<ActivityEntry>, String> {
     let canonical = std::fs::canonicalize(checkout).map_err(|error| error.to_string())?;
     let mut state = read(file)?;
@@ -417,7 +420,11 @@ pub(crate) fn busy_except_at(
     Ok(state
         .entries
         .into_iter()
-        .find(|(id, entry)| Some(id.as_str()) != operation_id && entry.path == canonical)
+        .find(|(id, entry)| {
+            Some(id.as_str()) != operation_id
+                && entry.path == canonical
+                && (include_terminals || entry.kind != ActivityKind::Terminal)
+        })
         .map(|(_, entry)| entry))
 }
 
@@ -562,6 +569,22 @@ mod tests {
     }
 
     #[test]
+    fn open_terminal_blocks_only_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("activity.json");
+        begin_at(&file, "terminal", temp.path(), ActivityKind::Terminal).unwrap();
+
+        assert!(busy_at(&file, temp.path()).unwrap().is_none());
+        assert_eq!(
+            busy_except_at(&file, temp.path(), None, true)
+                .unwrap()
+                .unwrap()
+                .kind,
+            ActivityKind::Terminal
+        );
+    }
+
+    #[test]
     fn in_flight_removal_blocks_others_but_not_its_own_recheck() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("activity.json");
@@ -572,13 +595,13 @@ mod tests {
             ActivityKind::Removing
         );
         assert!(
-            busy_except_at(&file, temp.path(), Some("remove-a"))
+            busy_except_at(&file, temp.path(), Some("remove-a"), true)
                 .unwrap()
                 .is_none()
         );
         begin_at(&file, "run", temp.path(), ActivityKind::ChatRun).unwrap();
         assert_eq!(
-            busy_except_at(&file, temp.path(), Some("remove-a"))
+            busy_except_at(&file, temp.path(), Some("remove-a"), true)
                 .unwrap()
                 .unwrap()
                 .kind,
