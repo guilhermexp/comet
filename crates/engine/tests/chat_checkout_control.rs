@@ -218,7 +218,7 @@ async fn local_retarget_is_blocked_by_live_worker_and_allowed_after_it_stops() {
         .call(methods::MUTATE, params(local_chat))
         .await
         .expect_err("a live Worker blocks local retarget");
-    assert!(error.to_string().contains("Worker is working"), "{error}");
+    assert!(error.to_string().contains("checkout is in use"), "{error}");
     assert_eq!(
         core.workspace
             .chat(local_chat)
