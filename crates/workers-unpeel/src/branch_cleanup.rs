@@ -60,7 +60,7 @@ pub(crate) fn cleanup_integrated_branch(
             "default branch could not be resolved",
         ));
     };
-    if default_ref == branch_ref {
+    if default_ref.eq_ignore_ascii_case(&branch_ref) {
         return Ok(BranchCleanupOutcome::Retained(
             "the branch is the repository's default branch",
         ));
@@ -252,12 +252,13 @@ fn origin_default_branch_name(repository: &Path) -> Result<Option<String>, Strin
 fn is_protected_default_branch(repository: &Path, branch_ref: &str) -> Result<bool, String> {
     // These names are protected even when origin/HEAD is configured to a
     // differently named branch. They are the only safe fallback defaults in a
-    // local-only repository.
-    if matches!(branch_ref, "refs/heads/main" | "refs/heads/master") {
+    // local-only repository. Case-insensitive filesystems resolve `Main` to
+    // the loose `main` ref, so the comparison ignores ASCII case.
+    let protected = |name: &str| branch_ref.eq_ignore_ascii_case(&format!("refs/heads/{name}"));
+    if protected("main") || protected("master") {
         return Ok(true);
     }
-    Ok(origin_default_branch_name(repository)?
-        .is_some_and(|name| branch_ref == format!("refs/heads/{name}")))
+    Ok(origin_default_branch_name(repository)?.is_some_and(|name| protected(&name)))
 }
 
 fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -620,6 +621,34 @@ mod tests {
             git(repo.path(), &["rev-parse", "refs/remotes/origin/main"]),
             upstream_oid
         );
+    }
+
+    #[test]
+    fn a_case_variant_of_the_default_branch_is_never_deleted() {
+        let repo = Repo::new();
+        let local_main_oid = repo.main_commit();
+        let upstream_oid = repo.create_feature();
+        git(repo.path(), &["checkout", "--quiet", "main"]);
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", &upstream_oid],
+        );
+        git(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        // On a case-insensitive filesystem `refs/heads/Main` resolves to the
+        // loose `main` ref; elsewhere it does not exist. Neither may delete it.
+        assert!(matches!(
+            cleanup_integrated_branch(repo.path(), "Main", &local_main_oid).unwrap(),
+            BranchCleanupOutcome::Retained(_)
+        ));
+        assert_eq!(repo.main_commit(), local_main_oid);
     }
 
     #[test]

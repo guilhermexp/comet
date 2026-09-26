@@ -741,6 +741,27 @@ fn controller_new_worktree_launch_failure_returns_recoverable_distinct_checkouts
             "project identity and exact path remain registered after failed launch"
         );
     }
+
+    // An agent-named branch the user already owns must not be adopted, even
+    // when no worktree checks it out.
+    git(&["branch", "feature/user-owned"])?;
+    let projects_before = fs::read(&state_path)?;
+    let response = call("feature/user-owned", 23);
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let message = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool error text");
+    assert!(message.contains("already taken"), "{message}");
+    assert!(!message.contains("recoverable checkout"), "{message}");
+    assert_eq!(fs::read(&state_path)?, projects_before);
+    let worktrees = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repo)
+        .output()?;
+    assert!(
+        !String::from_utf8(worktrees.stdout)?.contains("refs/heads/feature/user-owned"),
+        "the existing branch was checked out into a Comet worktree"
+    );
     Ok(())
 }
 

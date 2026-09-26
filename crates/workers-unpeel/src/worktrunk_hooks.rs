@@ -37,6 +37,11 @@ const SUPPORTED_VARIABLES: &[&str] = &[
     "cwd",
 ];
 
+/// Ref names reach hooks from agent input. Quoting protects only the first
+/// shell level, so a hook that re-evaluates them (`sh -c`, `tmux`, `eval`)
+/// must never see shell syntax in these values.
+const REF_NAME_VARIABLES: &[&str] = &["branch", "base", "default_branch"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum HookKind {
     PreStart,
@@ -201,6 +206,14 @@ impl HookCommand {
                             "variable has no value for this hook",
                         ));
                     };
+                    if REF_NAME_VARIABLES.contains(&name.as_str()) && !is_plain_ref_name(value) {
+                        return Err(template_error(
+                            kind,
+                            self.name.as_deref(),
+                            &name,
+                            "value may contain only letters, digits and . _ / @ + -",
+                        ));
+                    }
                     let value = if sanitize {
                         sanitize_value(value)
                     } else {
@@ -574,6 +587,12 @@ fn is_identifier(value: &str) -> bool {
     };
     (first == '_' || first.is_ascii_alphabetic())
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn is_plain_ref_name(value: &str) -> bool {
+    value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '@' | '+' | '-')
+    })
 }
 
 fn sanitize_value(value: &str) -> String {
@@ -1708,13 +1727,19 @@ generated = "rm -rf generated"
         assert!(target_hooks.hook(HookKind::PreStart).is_none());
     }
 
+    fn path_context(worktree_path: &str) -> HookRenderContext {
+        let mut context = render_context("feature/a");
+        context.insert("worktree_path", worktree_path);
+        context
+    }
+
     #[test]
-    fn renders_branch_with_spaces_and_sanitize_as_shell_words() {
+    fn renders_path_with_spaces_and_sanitize_as_shell_words() {
         let plan = hook(
-            "pre-start = \"printf '%s|%s' {{ branch }} {{ branch | sanitize }}\"",
+            "pre-start = \"printf '%s|%s' {{ worktree_path }} {{ worktree_path | sanitize }}\"",
             HookKind::PreStart,
         );
-        let rendered = plan.render(&render_context("feature/it's ready")).unwrap();
+        let rendered = plan.render(&path_context("feature/it's ready")).unwrap();
         assert_eq!(
             rendered.stages[0][0].command,
             r"printf '%s|%s' 'feature/it'\''s ready' 'feature-it'\''s ready'"
@@ -1722,20 +1747,44 @@ generated = "rm -rf generated"
     }
 
     #[test]
+    fn ref_name_values_with_shell_syntax_fail_render_for_nested_shells() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("must-not-exist");
+        let payload = format!("x;$(touch${{IFS}}{})", marker.display());
+        let plan = hook(
+            "pre-start = \"sh -c 'echo {{ branch }} {{ base }}'\"",
+            HookKind::PreStart,
+        );
+        for name in ["branch", "base"] {
+            let mut context = render_context("feature/a");
+            context.insert("base", "origin/main");
+            context.insert(name, payload.clone());
+            let error = plan.render(&context).unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+        }
+
+        let mut context = render_context("feature/a.b_c@d+e-1");
+        context.insert("base", "origin/main");
+        let rendered = plan.render(&context).unwrap();
+        run_pre_hook(&rendered, temp.path(), TEST_TIMEOUT).unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn double_quoted_interpolation_does_not_run_command_substitution() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("must-not-exist");
         let output = temp.path().join("output.txt");
-        let branch = format!("$(touch {})", marker.display());
+        let value = format!("$(touch {})", marker.display());
         let source = format!(
             "pre-start = {:?}\n",
             format!(
-                "printf '%s' \"{{{{ branch }}}}\" > {}",
+                "printf '%s' \"{{{{ worktree_path }}}}\" > {}",
                 shell_quote(output.to_str().unwrap())
             )
         );
         let rendered = hook(&source, HookKind::PreStart)
-            .render(&render_context(&branch))
+            .render(&path_context(&value))
             .unwrap();
         run_pre_hook(&rendered, temp.path(), TEST_TIMEOUT).unwrap();
 
@@ -1743,21 +1792,21 @@ generated = "rm -rf generated"
             !marker.exists(),
             "template data must not become shell syntax"
         );
-        assert_eq!(fs::read_to_string(output).unwrap(), branch);
+        assert_eq!(fs::read_to_string(output).unwrap(), value);
     }
 
     #[test]
     fn shell_comment_apostrophe_does_not_change_later_template_context() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("output.txt");
-        let branch = "$(printf INJECTED)";
+        let value = "$(printf INJECTED)";
         let command = format!(
-            "# user's note\nprintf '%s\\n' {{{{ branch }}}} > {}",
+            "# user's note\nprintf '%s\\n' {{{{ worktree_path }}}} > {}",
             shell_quote(output.to_str().unwrap())
         );
         let source = format!("pre-start = {command:?}\n");
         let rendered = hook(&source, HookKind::PreStart)
-            .render(&render_context(branch))
+            .render(&path_context(value))
             .unwrap();
 
         run_pre_hook(&rendered, temp.path(), TEST_TIMEOUT).unwrap();
@@ -1972,14 +2021,14 @@ generated = "rm -rf generated"
     fn quoted_newline_keeps_template_inside_double_quotes() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("output.txt");
-        let branch = "$(printf INJECTED)";
+        let value = "$(printf INJECTED)";
         let command = format!(
-            "printf '%s' \"prefix\n{{{{ branch }}}}\" > {}",
+            "printf '%s' \"prefix\n{{{{ worktree_path }}}}\" > {}",
             shell_quote(output.to_str().unwrap())
         );
         let source = format!("pre-start = {command:?}\n");
         let rendered = hook(&source, HookKind::PreStart)
-            .render(&render_context(branch))
+            .render(&path_context(value))
             .unwrap();
 
         run_pre_hook(&rendered, temp.path(), TEST_TIMEOUT).unwrap();

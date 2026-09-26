@@ -262,6 +262,7 @@ impl Terminals {
                 "Too many open terminals (maximum {MAX_TERMINALS})"
             )));
         }
+        let checkout_activity = reserve_checkout(cwd)?;
         if !std::fs::metadata(cwd).map(|m| m.is_dir()).unwrap_or(false) {
             return Err(EngineError::Other(
                 "Session working directory is unavailable".into(),
@@ -335,7 +336,7 @@ impl Terminals {
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
             initial_script,
-            checkout_activity: None,
+            checkout_activity,
             master: Some(master),
             writer: Some(writer),
             killer,
@@ -351,7 +352,6 @@ impl Terminals {
             exited: false,
         }));
         lock(&self.inner.sessions).insert(id.clone(), session.clone());
-        reserve_checkout(Arc::downgrade(&session), cwd.to_owned());
 
         // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -546,26 +546,24 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
 }
 
 /// The device-wide checkout action lock can be held for minutes by a Git
-/// mutation, so the reservation is taken off the async executor and attached
-/// once acquired. A shell that already exited never receives it.
-fn reserve_checkout(session: Weak<Mutex<LiveTerminal>>, cwd: String) {
-    tokio::task::spawn_blocking(move || {
+/// mutation, so a multi-threaded runtime yields its worker while waiting. The
+/// reservation exists before the shell starts, so removal never races it.
+fn reserve_checkout(
+    cwd: &str,
+) -> Result<Option<zeron_workers_unpeel::CheckoutActivityReservation>, EngineError> {
+    let reserve = || {
         let operation_id = format!("terminal-{}", new_id());
-        match zeron_workers_unpeel::reserve_terminal(&operation_id, std::path::Path::new(&cwd)) {
-            Ok(Some(reservation)) => {
-                if let Some(session) = session.upgrade() {
-                    let mut session = lock(&session);
-                    if !session.exited {
-                        session.checkout_activity = Some(reservation);
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(cwd, error = %error, "terminal could not reserve its checkout");
-            }
-        }
-    });
+        zeron_workers_unpeel::reserve_terminal(&operation_id, std::path::Path::new(cwd)).map_err(
+            |error| EngineError::Other(format!("Terminal could not reserve its checkout: {error}")),
+        )
+    };
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(reserve)
+    } else {
+        reserve()
+    }
 }
 
 /// Blocking PTY reader: forwards raw chunks until EOF. A closed PTY reads as an

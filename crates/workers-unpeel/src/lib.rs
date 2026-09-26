@@ -144,6 +144,48 @@ pub fn create_new_checkout_for_chat_unprepared(
     create_chat_checkout_unprepared(repository, branch, base_ref, root, journal_path, true)
 }
 
+/// Refuse to adopt an existing branch or destination: a checkout requested as
+/// new must never record a user's branch as Comet-owned.
+fn ensure_new_checkout(
+    repository: &Path,
+    root: &Path,
+    branch: &str,
+    name: &str,
+) -> Result<(), WorkersError> {
+    git_command::run_git(repository, &["check-ref-format", "--branch", branch])
+        .map_err(WorkersError::State)?;
+    let repo_root = git_command::run_git(repository, &["rev-parse", "--show-toplevel"])
+        .map_err(WorkersError::State)?;
+    let repo_root = std::fs::canonicalize(repo_root.trim())
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    let target = worktree_ownership::worktree_path(root, &repo_root, name)
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let refs = git_command::run_git(
+        &repo_root,
+        &["for-each-ref", "--format=%(refname)", &branch_ref],
+    )
+    .map_err(WorkersError::State)?;
+    let branch_exists = refs.lines().any(|line| line.trim() == branch_ref);
+    let target_exists = match std::fs::symlink_metadata(&target) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(WorkersError::State(format!(
+                "cannot inspect checkout destination {}: {error}",
+                target.display()
+            )));
+        }
+    };
+    if branch_exists || target_exists {
+        return Err(WorkersError::CheckoutNameTaken {
+            branch: branch.to_owned(),
+            path: target,
+        });
+    }
+    Ok(())
+}
+
 fn create_chat_checkout_unprepared(
     repository: &Path,
     branch: &str,
@@ -163,37 +205,7 @@ fn create_chat_checkout_unprepared(
     let name = branch.strip_prefix("zeron/").unwrap_or(branch);
     let action = checkout_lifecycle::lock_checkout_actions()?;
     if require_new {
-        git_command::run_git(repository, &["check-ref-format", "--branch", branch])
-            .map_err(WorkersError::State)?;
-        let repo_root = git_command::run_git(repository, &["rev-parse", "--show-toplevel"])
-            .map_err(WorkersError::State)?;
-        let repo_root = std::fs::canonicalize(repo_root.trim())
-            .map_err(|error| WorkersError::State(error.to_string()))?;
-        let target = worktree_ownership::worktree_path(&root, &repo_root, name)
-            .map_err(|error| WorkersError::State(error.to_string()))?;
-        let branch_ref = format!("refs/heads/{branch}");
-        let refs = git_command::run_git(
-            &repo_root,
-            &["for-each-ref", "--format=%(refname)", &branch_ref],
-        )
-        .map_err(WorkersError::State)?;
-        let branch_exists = refs.lines().any(|line| line.trim() == branch_ref);
-        let target_exists = match std::fs::symlink_metadata(&target) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(WorkersError::State(format!(
-                    "cannot inspect Chat checkout destination {}: {error}",
-                    target.display()
-                )));
-            }
-        };
-        if branch_exists || target_exists {
-            return Err(WorkersError::CheckoutNameTaken {
-                branch: branch.to_owned(),
-                path: target,
-            });
-        }
+        ensure_new_checkout(repository, &root, branch, name)?;
     }
     let created = checkout_lifecycle::create_checkout_under_lock(
         &action, repository, name, branch, base_ref, &root, &journal,
@@ -1599,7 +1611,7 @@ pub enum WorkersError {
     Protocol(String),
     #[error("Unpeel state operation failed: {0}")]
     State(String),
-    #[error("Chat checkout name is already taken: branch `{branch}`, path {}", .path.display())]
+    #[error("Checkout name is already taken: branch `{branch}`, path {}", .path.display())]
     CheckoutNameTaken { branch: String, path: PathBuf },
     #[error("Invalid project directory {path}: {message}")]
     InvalidProject { path: String, message: String },
@@ -2594,13 +2606,14 @@ impl LocalWorkersClient {
         state_path: &Path,
         request: WorkersCreateWorktreeRequest,
     ) -> Result<WorkersWorktreeResult, WorkersError> {
-        Self::create_worktree_at_inner(state_path, request, false).map(|(result, _)| result)
+        Self::create_worktree_at_inner(state_path, request, false, false).map(|(result, _)| result)
     }
 
     fn create_worktree_at_inner(
         state_path: &Path,
         request: WorkersCreateWorktreeRequest,
         hold_for_launch: bool,
+        require_new: bool,
     ) -> Result<(WorkersWorktreeResult, Option<CheckoutActivityReservation>), WorkersError> {
         let branch = request.branch.trim();
         if branch.is_empty() {
@@ -2646,6 +2659,9 @@ impl LocalWorkersClient {
             .and_then(Value::as_str)
             .ok_or_else(|| WorkersError::State("parent project path is missing".into()))?
             .to_owned();
+        if require_new {
+            ensure_new_checkout(Path::new(&parent_path), &root, branch, branch)?;
+        }
         let worktree = checkout_lifecycle::create_checkout_under_lock(
             &action,
             Path::new(&parent_path),
@@ -2829,12 +2845,32 @@ impl LocalWorkersClient {
     pub fn create_worktree_and_launch(
         &self,
         request: WorkersCreateWorktreeRequest,
+        launch: WorkersLaunchRequest,
+    ) -> Result<WorkersWorktreeLaunchResult, WorkersError> {
+        self.create_worktree_and_launch_inner(request, launch, false)
+    }
+
+    /// Agent-requested checkouts name a new branch; an existing branch or
+    /// destination is refused rather than adopted as Comet-owned.
+    pub fn create_new_worktree_and_launch(
+        &self,
+        request: WorkersCreateWorktreeRequest,
+        launch: WorkersLaunchRequest,
+    ) -> Result<WorkersWorktreeLaunchResult, WorkersError> {
+        self.create_worktree_and_launch_inner(request, launch, true)
+    }
+
+    fn create_worktree_and_launch_inner(
+        &self,
+        request: WorkersCreateWorktreeRequest,
         mut launch: WorkersLaunchRequest,
+        require_new: bool,
     ) -> Result<WorkersWorktreeLaunchResult, WorkersError> {
         let (worktree, starting_worker) = Self::create_worktree_at_inner(
             &unpeel_core::app_paths::app_state_path(),
             request,
             true,
+            require_new,
         )?;
         if let Err(error) = ensure_setup_succeeded(&worktree) {
             return Err(WorkersError::State(format!(

@@ -339,14 +339,10 @@ async fn terminal_inside_linked_checkout_reserves_it_only_against_removal() {
                 })
             })
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !terminal_reserved() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "an open terminal inside the checkout must reserve it against removal"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    assert!(
+        terminal_reserved(),
+        "a terminal inside the checkout reserves it before its shell starts"
+    );
     assert!(
         !workers.checkout_is_busy(&worktree).expect("retarget probe"),
         "an open terminal must not block moving a Chat into the checkout"

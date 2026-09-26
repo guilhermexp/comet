@@ -888,7 +888,7 @@ fn dispatch_action(
             let worktree_launch = if let Some(worktree) = plan.new_worktree {
                 Some(
                     client
-                        .create_worktree_and_launch(
+                        .create_new_worktree_and_launch(
                             WorkersCreateWorktreeRequest {
                                 project_id: request.project_id.clone(),
                                 branch: worktree.branch,

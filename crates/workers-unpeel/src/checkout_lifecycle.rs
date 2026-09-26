@@ -236,14 +236,8 @@ pub(crate) fn validate_removal(
 /// assume-unchanged. A flagged file present on disk may hold local edits, so it
 /// blocks removal; sparse-checkout entries absent from disk do not.
 fn has_hidden_local_edits(checkout: &Path) -> Result<bool, String> {
-    let output = std::process::Command::new("git")
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-C")
-        .arg(checkout)
+    let output = crate::git_command::git_at(checkout)
         .args(["ls-files", "-v", "-z"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("Cannot list checkout index flags: {error}"))?;

@@ -17,16 +17,8 @@ pub(crate) fn run_git_mutation_with_stdin(
     args: &[&str],
     input: &[u8],
 ) -> Result<String, String> {
-    use std::process::Command;
-    let mut command = Command::new("git");
-    command
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0");
+    let mut command = git_at(path);
+    command.args(args);
     run_command_with_input(
         &mut command,
         std::time::Duration::from_secs(300),
@@ -34,21 +26,51 @@ pub(crate) fn run_git_mutation_with_stdin(
     )
 }
 
-fn run_git_with_timeout(
-    path: &Path,
-    args: &[&str],
-    timeout: std::time::Duration,
-) -> Result<String, String> {
-    use std::process::Command;
-    let mut command = Command::new("git");
+/// Repository-local variables from `git rev-parse --local-env-vars`. An
+/// inherited value (Comet launched from a Git hook or `rebase --exec`) would
+/// otherwise redirect every command away from the `-C` checkout.
+const REPOSITORY_ENV_VARS: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// Non-interactive Git bound to the checkout at `path`.
+pub(crate) fn git_at(path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
     command
         .arg("-c")
         .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(path)
-        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
+    for name in REPOSITORY_ENV_VARS {
+        command.env_remove(name);
+    }
+    command
+}
+
+fn run_git_with_timeout(
+    path: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let mut command = git_at(path);
+    command.args(args);
     run_command(&mut command, timeout)
 }
 
@@ -183,6 +205,27 @@ fn run_command_with_input(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn git_at_clears_every_repository_local_variable_git_reports() {
+        let output = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let command = git_at(Path::new("."));
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in String::from_utf8(output.stdout).unwrap().lines() {
+            assert!(
+                removed.iter().any(|removed| removed == name),
+                "{name} is inherited"
+            );
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn inherited_pipes_cannot_outlive_the_command_deadline() {

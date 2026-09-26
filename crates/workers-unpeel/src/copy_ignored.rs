@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
@@ -341,21 +341,14 @@ fn stream_ignored_paths(
     repository: &Path,
     mut on_path: impl FnMut(PathBuf) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut command = Command::new("git");
-    command
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-C")
-        .arg(repository)
-        .args([
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0");
+    let mut command = crate::git_command::git_at(repository);
+    command.args([
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+    ]);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
