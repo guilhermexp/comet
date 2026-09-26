@@ -1372,6 +1372,8 @@ pub struct CreateWorktreeOutcome {
     pub setup_action: Option<ProjectActionRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_warning: Option<String>,
 }
 
 /// An open PTY session on the owning device (`OpenTerminal` reply).
@@ -1616,13 +1618,20 @@ mod tests {
         assert_eq!(outcome.worktree.path, "/worktree");
         assert!(outcome.setup_action.is_none());
         assert!(outcome.setup_error.is_none());
+        assert!(outcome.copy_warning.is_none());
 
         let encoded = serde_json::to_value(outcome).unwrap();
         assert_eq!(encoded["path"], legacy["path"]);
         assert!(encoded.get("worktree").is_none());
         assert!(encoded.get("setupAction").is_none());
         assert!(encoded.get("setupError").is_none());
+        assert!(encoded.get("copyWarning").is_none());
         assert!(serde_json::from_value::<Worktree>(encoded).is_ok());
+
+        let mut with_warning: CreateWorktreeOutcome = serde_json::from_value(legacy).unwrap();
+        with_warning.copy_warning = Some("cache was skipped".into());
+        let encoded = serde_json::to_value(with_warning).unwrap();
+        assert_eq!(encoded["copyWarning"], "cache was skipped");
     }
 
     #[test]

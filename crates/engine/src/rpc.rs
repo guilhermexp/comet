@@ -3254,6 +3254,7 @@ impl RpcService for EngineRpc {
                     worktree: creation.worktree,
                     setup_action: None,
                     setup_error: creation.setup_error,
+                    copy_warning: creation.copy_warning,
                 };
                 if outcome.setup_error.is_none()
                     && let Some((space, project_root)) = setup_space

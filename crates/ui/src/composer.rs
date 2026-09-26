@@ -10007,6 +10007,7 @@ impl Composer {
             let mut live_started = false;
             let mut chat_created = false;
             let mut probed_availability: Option<LiveVoiceAvailability> = None;
+            let mut copy_warning: Option<String> = None;
             let result: Result<(), String> = async {
                 let availability = match engine
                     .client()
@@ -10051,6 +10052,13 @@ impl Composer {
                         ) {
                             created_worktree = Some((repo_path.to_owned(), path.to_owned()));
                         }
+                        if let Some(setup_error) = value.get("setupError").and_then(|v| v.as_str()) {
+                            return Err(format!("Worktree setup failed: {setup_error}"));
+                        }
+                        copy_warning = value
+                            .get("copyWarning")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
                         let worktree: zeron_proto::Worktree = serde_json::from_value(value)
                             .map_err(|error| {
                                 format!("CreateWorktree returned invalid data: {error}")
@@ -10155,6 +10163,15 @@ impl Composer {
                     Ok(()) => {
                         composer.failure = None;
                         composer.failure_key = None;
+                        if let Some(warning) = copy_warning {
+                            cx.emit(ComposerEvent::WorktreeSetup {
+                                chat_id: chat_id.clone(),
+                                setup_action: None,
+                                setup_error: None,
+                                setup_warning: Some(warning),
+                                target_device_id: Some(device_id.clone()),
+                            });
+                        }
                     }
                     Err(error) => {
                         let detail = retained_checkout
