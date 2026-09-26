@@ -19,6 +19,7 @@ pub enum ActivityKind {
     ChatRun,
     Preparing,
     StartingWorker,
+    Removing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,11 +378,21 @@ pub(crate) fn end_at(file: &Path, operation_id: &str, lease_id: &str) -> Result<
 /// A stale entry remains busy until the host reconciles it. Corrupt or
 /// unreadable state is an error, so deletion fails closed.
 pub(crate) fn busy_at(file: &Path, checkout: &Path) -> Result<Option<ActivityEntry>, String> {
+    busy_except_at(file, checkout, None)
+}
+
+/// Like [`busy_at`], ignoring the caller's own `operation_id`.
+pub(crate) fn busy_except_at(
+    file: &Path,
+    checkout: &Path,
+    operation_id: Option<&str>,
+) -> Result<Option<ActivityEntry>, String> {
     let canonical = std::fs::canonicalize(checkout).map_err(|error| error.to_string())?;
     Ok(read(file)?
         .entries
-        .into_values()
-        .find(|entry| entry.path == canonical))
+        .into_iter()
+        .find(|(id, entry)| Some(id.as_str()) != operation_id && entry.path == canonical)
+        .map(|(_, entry)| entry))
 }
 
 #[cfg(test)]
@@ -474,6 +485,31 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("positive settlement should remove the lease");
+    }
+
+    #[test]
+    fn in_flight_removal_blocks_others_but_not_its_own_recheck() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("activity.json");
+        begin_at(&file, "remove-a", temp.path(), ActivityKind::Removing).unwrap();
+
+        assert_eq!(
+            busy_at(&file, temp.path()).unwrap().unwrap().kind,
+            ActivityKind::Removing
+        );
+        assert!(
+            busy_except_at(&file, temp.path(), Some("remove-a"))
+                .unwrap()
+                .is_none()
+        );
+        begin_at(&file, "run", temp.path(), ActivityKind::ChatRun).unwrap();
+        assert_eq!(
+            busy_except_at(&file, temp.path(), Some("remove-a"))
+                .unwrap()
+                .unwrap()
+                .kind,
+            ActivityKind::ChatRun
+        );
     }
 
     #[test]
