@@ -277,3 +277,70 @@ async fn local_retarget_is_blocked_by_live_worker_and_allowed_after_it_stops() {
     drop(client);
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_inside_linked_checkout_keeps_it_in_use_until_closed() {
+    let _env_lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let temp = tempfile::Builder::new()
+        .prefix("wt-")
+        .tempdir_in("/tmp")
+        .expect("tempdir");
+    let unpeel_home = temp.path().join("unpeel");
+    fs::create_dir_all(&unpeel_home).expect("unpeel home");
+    let _home_guard = UnpeelHomeGuard::set(&unpeel_home);
+
+    let repo = temp.path().join("repo");
+    let worktree = temp.path().join("repo-terminal");
+    fs::create_dir_all(&repo).expect("repo directory");
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["config", "user.name", "Terminal test"]);
+    fs::write(repo.join("README.md"), "fixture\n").expect("repo file");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-m", "fixture"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/terminal-in-use",
+            worktree.to_str().expect("worktree path utf8"),
+            "HEAD",
+        ],
+    );
+    let nested = worktree.join("nested");
+    fs::create_dir_all(&nested).expect("nested directory");
+
+    let workers = zeron_workers_unpeel::LocalWorkersClient::new();
+    assert!(!workers.checkout_is_busy(&worktree).expect("idle probe"));
+
+    let terminals = zeron_engine::Terminals::new();
+    let session = terminals
+        .open_with_shell(
+            nested.to_str().expect("nested path utf8"),
+            80,
+            24,
+            Some("/bin/sh"),
+        )
+        .expect("open terminal in checkout");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !workers.checkout_is_busy(&worktree).expect("busy probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an open terminal inside the checkout must block removal"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    terminals.close(&session.id).expect("close terminal");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while workers.checkout_is_busy(&worktree).expect("release probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "closing the terminal must release the checkout"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    terminals.shutdown();
+}

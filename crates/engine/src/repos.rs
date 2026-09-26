@@ -1709,7 +1709,27 @@ impl Repos {
         let repo = repo_path.to_path_buf();
         let path = worktree_path.to_path_buf();
         let root = self.inner.worktrees_root.clone();
-        let journal = self.ownership_journal_path()?;
+        let journal = match self.ownership_journal_path() {
+            Ok(journal) => journal,
+            Err(error) => {
+                // Without a journal no checkout can be pending Comet setup.
+                tracing::warn!(worktree = %worktree_path.display(), error = %error, "checkout preparation state unavailable");
+                return Ok(WorktreeCreationOutcome {
+                    worktree: Worktree {
+                        repo_path: repo_path.to_string_lossy().to_string(),
+                        path: worktree_path.to_string_lossy().to_string(),
+                        branch: String::new(),
+                        name: worktree_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("worktree")
+                            .to_owned(),
+                        checkout_id: None,
+                    },
+                    setup_error: None,
+                });
+            }
+        };
         let worker = tokio::task::spawn_blocking(move || {
             zeron_workers_unpeel::prepare_checkout_for_chat(&repo, &path, &root, &journal)
                 .map_err(|error| EngineError::Other(error.to_string()))
@@ -1733,6 +1753,9 @@ impl Repos {
     ) -> Result<WorktreeCreationOutcome, EngineError> {
         if let Some(warning) = creation.hook_warning.as_deref() {
             tracing::warn!(worktree = %creation.path.display(), warning, "worktree post-start hook warning");
+        }
+        if let Some(warning) = creation.copy_warning.as_deref() {
+            tracing::warn!(worktree = %creation.path.display(), warning, "worktree ignored-file copy was incomplete");
         }
         let checkout_id = self
             .checkout_identity(&creation.path)

@@ -1176,6 +1176,38 @@ fn approved_pre_remove_hook_cleans_ignored_cache_before_final_cleanliness_check(
 }
 
 #[test]
+fn removal_hooks_come_from_the_principal_checkout_not_the_removed_branch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = isolated_home()?;
+    let repo = home.path().join("branch-hook-repo");
+    fixture_repo(&repo)?;
+    let client = LocalWorkersClient::new();
+    let parent_id = client.add_project(&repo)?;
+    let child = client.create_worktree(WorkersCreateWorktreeRequest {
+        project_id: parent_id,
+        branch: "feature/branch-only-hook".into(),
+        name: None,
+        base_ref: Some("main".into()),
+    })?;
+    let checkout = std::path::PathBuf::from(&child.path);
+    fs::create_dir_all(checkout.join(".config"))?;
+    fs::write(
+        checkout.join(".config/wt.toml"),
+        "pre-remove = \"exit 1\"\n",
+    )?;
+    commit_all(&checkout, "branch-only pre-remove hook")?;
+
+    client.remove_worktree(&child.project_id, false)?;
+    assert!(!checkout.exists());
+    assert!(git_ref_exists(
+        &repo,
+        "refs/heads/feature/branch-only-hook"
+    )?);
+    Ok(())
+}
+
+#[test]
 fn removing_without_hooks_still_rejects_ignored_files() -> Result<(), Box<dyn std::error::Error>> {
     let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
     let (home, _guard) = isolated_home()?;

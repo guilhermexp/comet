@@ -128,8 +128,19 @@ pub(crate) fn create_checkout_under_lock(
     if let Err(error) = crate::git_command::run_git_mutation(&repo_root, &args) {
         // A failed Git command can leave a partial worktree. Release the
         // reservation only when both filesystem and Git agree that nothing
-        // was created; otherwise keep PendingCreate for explicit recovery.
-        let _ = journal.abort_absent_create(&repo_root, &target, &operation_id);
+        // was created. A checkout Git did register (for example, only its
+        // post-checkout hook failed) is recorded as owned so a retry can
+        // prepare or remove it; anything else stays PendingCreate.
+        let adopted = std::fs::symlink_metadata(&target).is_ok()
+            && journal
+                .created_observed(&repo_root, &target, &operation_id)
+                .is_ok()
+            && journal
+                .finalize_owned(&repo_root, &target, &operation_id)
+                .is_ok();
+        if !adopted {
+            let _ = journal.abort_absent_create(&repo_root, &target, &operation_id);
+        }
         return Err(WorkersError::State(error));
     }
     journal
@@ -198,6 +209,11 @@ pub(crate) fn validate_removal(
             "Preserve local changes and untracked files before removing this checkout".into(),
         );
     }
+    if has_hidden_local_edits(&target)? {
+        return Err(
+            "Clear skip-worktree or assume-unchanged flags and preserve those files before removing this checkout".into(),
+        );
+    }
     let retained = run_git(
         &target,
         &[
@@ -214,6 +230,37 @@ pub(crate) fn validate_removal(
         );
     }
     Ok(target)
+}
+
+/// `git status` does not report files flagged skip-worktree or
+/// assume-unchanged. A flagged file present on disk may hold local edits, so it
+/// blocks removal; sparse-checkout entries absent from disk do not.
+fn has_hidden_local_edits(checkout: &Path) -> Result<bool, String> {
+    let output = std::process::Command::new("git")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-C")
+        .arg(checkout)
+        .args(["ls-files", "-v", "-z"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("Cannot list checkout index flags: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|record| match record {
+            [tag, b' ', path @ ..] if *tag == b'S' || tag.is_ascii_lowercase() => Some(path),
+            _ => None,
+        })
+        .any(|path| {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::symlink_metadata(checkout.join(std::ffi::OsStr::from_bytes(path))).is_ok()
+        }))
 }
 
 /// Serializes Comet launches/removals across UI and controller MCP processes.
@@ -949,6 +996,47 @@ mod tests {
         assert!(journal.verify_owned(&f.repo, &created.path).unwrap());
     }
     #[test]
+    fn failed_post_checkout_hook_leaves_an_owned_retryable_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let hook = f.repo.join(".git/hooks/post-checkout");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = f.root.join("common-worktrees");
+        let journal = crate::worktree_ownership::OwnershipJournal::at(
+            f.root.join("worktree-ownership.json"),
+            root.clone(),
+        );
+        let action = lock_checkout_actions_at(&f.root.join("checkout-actions.lock")).unwrap();
+
+        let failed = create_checkout_under_lock(
+            &action,
+            &f.repo,
+            "hooked",
+            "hookedbranch",
+            Some("HEAD"),
+            &root,
+            &journal,
+        );
+        assert!(failed.is_err());
+        std::fs::remove_file(&hook).unwrap();
+        let retried = create_checkout_under_lock(
+            &action,
+            &f.repo,
+            "hooked",
+            "hookedbranch",
+            Some("HEAD"),
+            &root,
+            &journal,
+        )
+        .unwrap();
+
+        assert!(journal.verify_owned(&f.repo, &retried.path).unwrap());
+        assert!(journal.preparation_pending(&f.repo, &retried.path).unwrap());
+    }
+
+    #[test]
     fn rejects_external_main_arbitrary_and_active_checkout() {
         let f = Fixture::new();
         for (path, owned, active) in [
@@ -961,6 +1049,45 @@ mod tests {
             assert!(path.exists());
         }
     }
+    #[test]
+    fn skip_worktree_and_assume_unchanged_edits_block_checkout_removal() {
+        let f = Fixture::new();
+        for (file, flag) in [
+            ("local.yml", "--skip-worktree"),
+            ("tuned.yml", "--assume-unchanged"),
+        ] {
+            std::fs::write(f.checkout.join(file), "shared").unwrap();
+            git(&f.checkout, &["add", file]);
+            git(
+                &f.checkout,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            );
+            assert!(validate_removal(&f.checkout, true, false).is_ok());
+            git(&f.checkout, &["update-index", flag, file]);
+            std::fs::write(f.checkout.join(file), "local edit").unwrap();
+
+            let error = validate_removal(&f.checkout, true, false).unwrap_err();
+            assert!(error.contains("skip-worktree"), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(f.checkout.join(file)).unwrap(),
+                "local edit"
+            );
+            git(
+                &f.checkout,
+                &["update-index", &flag.replace("--", "--no-"), file],
+            );
+            git(&f.checkout, &["checkout", "--", file]);
+        }
+    }
+
     #[test]
     fn untracked_and_modified_files_block_checkout_removal() {
         let f = Fixture::new();

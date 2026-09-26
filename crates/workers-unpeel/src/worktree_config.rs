@@ -213,6 +213,8 @@ pub struct SetupOutcome {
     /// dois sem confundir payload executado com diagnostico.
     pub failed_reason: Option<String>,
     pub output: Vec<String>,
+    /// Advisory from copying `.worktreeinclude` entries before setup ran.
+    pub copy_warning: Option<String>,
 }
 
 impl SetupOutcome {
