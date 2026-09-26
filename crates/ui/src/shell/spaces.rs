@@ -524,7 +524,12 @@ pub(super) mod pinned_session_tests {
     fn sidebar_optimistic_writes_preserve_newer_edits_and_watch_state_on_failure(
         cx: &mut gpui::TestAppContext,
     ) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        // GPUI's test scheduler is single-threaded. A multi-thread Tokio
+        // reader can wake its local task from a worker thread during this test.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
         let (engine, mut requests, _replies) = pin_test_engine();
         let dir = tempfile::tempdir().unwrap();

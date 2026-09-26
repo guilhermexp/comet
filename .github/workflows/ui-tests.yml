@@ -98,6 +98,9 @@ jobs:
         timeout-minutes: 3
         env:
           RUST_BACKTRACE: 1
+          # Give the headed CI runner time to paint a frame during the 200ms
+          # sidebar transition before the fixture samples native visibility.
+          ZERON_MOTION_SCALE: 1.5
         run: |
           bash scripts/run-macos-browser-fixture.sh target/release/examples/browser-fixture "$RUNNER_TEMP/browser-captures"
           test -f "$RUNNER_TEMP/browser-captures/result.txt"

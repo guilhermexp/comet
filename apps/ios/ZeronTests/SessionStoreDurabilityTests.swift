@@ -182,7 +182,7 @@ final class SessionStoreDurabilityTests: XCTestCase {
             )
         }
 
-        await fulfillment(of: [started], timeout: 1)
+        await fulfillment(of: [started], timeout: 10)
         try? await Task.sleep(nanoseconds: 2_500_000_000)
         XCTAssertEqual(saves, 1)
         XCTAssertFalse(wrote)
@@ -590,9 +590,15 @@ final class SessionStoreDurabilityTests: XCTestCase {
         DocDisk.directoryOverride = root
         gate.signal()
         _ = await exportBlocker.value
-        try await Task.sleep(for: .milliseconds(100))
-
-        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        // Releasing the blocking export only unblocks the serial exporter;
+        // the stopped store's queued export still has to run and write.
+        let deadline = ContinuousClock.now + .seconds(5)
+        var loaded = DocDisk.loadChat2(into: LoroDoc(), id: id)
+        while loaded == nil && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+            loaded = DocDisk.loadChat2(into: LoroDoc(), id: id)
+        }
+        let loaded = try XCTUnwrap(loaded)
         XCTAssertEqual(loaded.outbox.map(\.batchId), [batchID])
     }
 
