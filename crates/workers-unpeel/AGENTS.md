@@ -493,8 +493,9 @@ zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
   ação explícita, mas não pula posse, atividade ou limpeza.
 - **Branch integrada é limpa depois do checkout:** a remoção física continua
   exigindo posse, árvore limpa e ausência de execução. Depois de remover o
-  worktree, `branch_cleanup` tenta apagar apenas a branch local comprovadamente
-  integrada à padrão, sem tocar a default, refs simbólicas, refs remotas ou branches ocupadas.
+  worktree, `branch_cleanup` tenta apagar apenas a branch que o journal de posse
+  registra como criada pelo app (`created_branch`, seguida em renomeações) e
+  comprovadamente integrada à padrão, sem tocar a default, refs simbólicas, refs remotas ou branches ocupadas.
   Uma transação `git update-ref --stdin` verifica os OIDs da branch e da ref padrão usada como prova antes da deleção; falha conserva a branch
   e não reverte a remoção já concluída. Prune de leaf ausente nunca apaga branch.
 - **Chat com nome gerado cria exclusivamente.** `PendingChatCheckout` mantém a

@@ -19,7 +19,7 @@ For a proven owned checkout, removal SHALL refuse a live Worker, a local `Workin
 or ignored files, tracked changes and HEAD not preserved by a ref. An approved `pre-remove` hook,
 when present, SHALL run before the final cleanliness check so it can remove generated files;
 identity and activity SHALL be checked again afterward. The operation SHALL NOT use `--force` or
-recursive filesystem deletion. It SHALL delete the local branch only after proving it is integrated into the default branch and unchanged since that check; otherwise the branch SHALL remain, with an advisory warning for an inconclusive or failed cleanup.
+recursive filesystem deletion. Local branch cleanup afterwards follows the worktree-lifecycle integrated-branch requirement; any other branch SHALL remain.
 For a registered worktree whose directory is already gone, it SHALL prune the stale Git
 registration only after checking the stored repository/worktree identity, without deleting a
 filesystem path.

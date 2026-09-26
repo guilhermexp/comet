@@ -154,8 +154,8 @@ Test: integration — setup e spawn de Worker atrasados com remoção concorrent
 
 ### Requirement: Hooks de projeto selecionados são executados com semântica declarada
 
-O app SHALL ler `.config/wt.toml` do checkout de origem escolhido para criar e do checkout a
-remover para remover. SHALL aceitar `pre-start`, `post-start`, `pre-remove` e `post-remove` como
+O app SHALL ler `.config/wt.toml` do checkout de origem escolhido para criar e do checkout
+principal para remover, a mesma origem listada para aprovação. SHALL aceitar `pre-start`, `post-start`, `pre-remove` e `post-remove` como
 string, tabela concorrente ou pipeline ordenado. O subconjunto de templates suportado SHALL ser:
 `branch`, `worktree_path`, `worktree_name`, `repo`, `repo_path`, `primary_worktree_path`, `commit`,
 `short_commit`, `base`, `default_branch`, `hook_type`, `cwd` e `sanitize`. Um token ou sintaxe fora
@@ -238,7 +238,7 @@ Test: integration — preset válido e falha injetada na inicialização do host
 
 ### Requirement: Arquivos ignorados escolhidos pelo projeto acompanham um checkout novo
 
-Quando `.worktreeinclude` existe no checkout principal, o serviço comum SHALL copiar para um checkout novo somente arquivos ignorados pelo Git que casem com os padrões do arquivo. Sem `.worktreeinclude`, a cópia SHALL ser omitida. Arquivos rastreados, metadados de VCS, worktrees aninhados e caminhos que saiam das raízes SHALL NOT ser copiados. Um destino existente SHALL NOT ser sobrescrito. A cópia SHALL tentar reflink e usar cópia comum quando o sistema de arquivos não oferecer reflink. Falha de cópia SHALL manter o checkout e sua associação, bloquear o primeiro run e permitir retry de preparo no mesmo caminho. Symlinks e caminhos inseguros selecionados SHALL NOT ser copiados; quando algum é pulado, o Chat SHALL exibir um aviso de cópia incompleta, inclusive junto de uma falha de setup e no retry.
+Quando `.worktreeinclude` existe no checkout principal, o serviço comum SHALL copiar para um checkout novo somente arquivos ignorados pelo Git que casem com os padrões do arquivo. Sem `.worktreeinclude`, a cópia SHALL ser omitida. Arquivos rastreados, metadados de VCS, worktrees aninhados e caminhos que saiam das raízes SHALL NOT ser copiados. Um destino existente SHALL NOT ser sobrescrito. A cópia SHALL tentar reflink e usar cópia comum quando o sistema de arquivos não oferecer reflink; cópias comuns SHALL respeitar o prazo da cópia e um limite total por checkout, e arquivos acima do limite SHALL ser pulados com o mesmo aviso de cópia incompleta. Falha de cópia SHALL manter o checkout e sua associação, bloquear o primeiro run e permitir retry de preparo no mesmo caminho. Symlinks e caminhos inseguros selecionados SHALL NOT ser copiados; quando algum é pulado, o Chat SHALL exibir um aviso de cópia incompleta, inclusive junto de uma falha de setup e no retry.
 
 #### Scenario: Cache selecionado chega ao checkout novo
 Test: unit — `chat_and_workers_copy_only_selected_gitignored_files_before_setup` e `copy_ignored::tests::copies_only_included_ignored_files_from_the_principal_worktree` em repositórios temporários.
@@ -270,7 +270,7 @@ Test: unit — `absent_worktreeinclude_does_not_copy_ignored_files`.
 
 ### Requirement: Branch integrada sai após remoção do checkout gerenciado
 
-Após a remoção física segura de um checkout gerenciado, o serviço comum SHALL tentar apagar sua branch local somente quando ela não for a padrão, não estiver em outro worktree, não tiver mudado desde a avaliação e estiver integrada à branch padrão. São evidências de integração: mesmo commit, ancestralidade, diff three-dot vazio, árvore idêntica ou merge simulado que não acrescenta alterações. Falha ou resultado inconclusivo SHALL preservar a branch e gerar aviso; nenhuma branch remota SHALL ser alterada.
+Após a remoção física segura de um checkout gerenciado, o serviço comum SHALL tentar apagar sua branch local somente quando ela for a branch que o app criou junto com esse checkout (registrada na posse e acompanhada em renomeações), não for a padrão, não estiver em outro worktree, não tiver mudado desde a avaliação e estiver integrada à branch padrão. São evidências de integração: mesmo commit, ancestralidade, diff three-dot vazio, árvore idêntica ou merge simulado que não acrescenta alterações. Falha ou resultado inconclusivo SHALL preservar a branch e gerar aviso; nenhuma branch remota SHALL ser alterada.
 
 #### Scenario: Branch integrada é removida
 Test: unit + integration — `branch_cleanup::tests::deletes_a_squash_merged_branch_when_main_has_later_changes`, `project_actions::worktree_lifecycle_removes_checkout_but_retains_child_history` e `m5_repos_diffs_terminals::repos_round_trip_add_branches_worktrees`.
