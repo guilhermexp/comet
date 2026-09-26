@@ -349,7 +349,7 @@ fn finish_chat_preparation(
             hook_warning = Some(error);
         }
     }
-    drop(preparing);
+    release_preparation(preparing);
     Ok(ChatWorktreeCreation {
         path: checkout.to_owned(),
         branch: branch.to_owned(),
@@ -911,6 +911,16 @@ fn reject_pending_checkout_preparation(
 /// is dead, so releasing by elapsed time could let removal race a late start.
 /// If the Host exits without publishing a matching manifest, recovery is
 /// explicit because the checkout activity lease remains busy.
+/// A prepared checkout is returned only after its reservation is gone, so an
+/// immediate retarget or removal does not see the finished preparation.
+fn release_preparation(preparing: Option<CheckoutActivityReservation>) {
+    if let Some(preparing) = preparing {
+        preparing
+            .begin_release()
+            .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    }
+}
+
 fn release_starting_worker_after_manifest(
     reservation: CheckoutActivityReservation,
     session_id: String,
@@ -2826,7 +2836,7 @@ impl LocalWorkersClient {
             })
             .map_err(WorkersError::State)?;
         }
-        drop(preparing);
+        release_preparation(preparing);
         Ok((
             WorkersWorktreeResult {
                 project_id,

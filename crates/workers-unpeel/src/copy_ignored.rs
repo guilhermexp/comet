@@ -21,7 +21,7 @@ const INCLUDE_FILE: &str = ".worktreeinclude";
 const MAX_INCLUDE_BYTES: u64 = 1024 * 1024;
 const MAX_PATH_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 1024 * 1024;
-const INVENTORY_TIMEOUT: Duration = Duration::from_secs(300);
+const COPY_TIMEOUT: Duration = Duration::from_secs(300);
 const CHANNEL_CAPACITY: usize = 32;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -130,9 +130,13 @@ pub(crate) fn copy_selected_ignored(
         }
 
         let source_path = principal.join(&relative);
-        let Some(source_file) = open_regular_source(&principal, &relative)? else {
-            report.skipped_unsafe += 1;
-            return Ok(());
+        let source_file = match open_regular_source(&principal, &relative)? {
+            Source::File(file) => file,
+            Source::Missing => return Ok(()),
+            Source::Unsafe => {
+                report.skipped_unsafe += 1;
+                return Ok(());
+            }
         };
         let source_metadata = source_file
             .metadata()
@@ -339,6 +343,15 @@ fn read_include_matcher(
 
 fn stream_ignored_paths(
     repository: &Path,
+    on_path: impl FnMut(PathBuf) -> Result<(), String>,
+) -> Result<(), String> {
+    stream_ignored_paths_within(repository, COPY_TIMEOUT, on_path)
+}
+
+/// `timeout` bounds the listing and every `on_path` call together.
+fn stream_ignored_paths_within(
+    repository: &Path,
+    timeout: Duration,
     mut on_path: impl FnMut(PathBuf) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut command = crate::git_command::git_at(repository);
@@ -364,23 +377,20 @@ fn stream_ignored_paths(
     let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let reader = thread::spawn(move || send_nul_records(stdout, sender));
     let stderr_reader = thread::spawn(move || read_bounded_stderr(stderr));
-    let mut deadline = Instant::now() + INVENTORY_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut status: Option<ExitStatus> = None;
     let mut failure = None;
 
     loop {
         if Instant::now() >= deadline {
-            failure = Some("listing ignored Git files timed out".to_string());
+            failure = Some("copying ignored Git files timed out".to_string());
             terminate_child(&mut child);
             break;
         }
         match receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(Ok(bytes)) => match path_from_git_bytes(bytes) {
                 Ok(path) => {
-                    let started = Instant::now();
-                    let result = on_path(path);
-                    deadline += started.elapsed();
-                    if let Err(error) = result {
+                    if let Err(error) = on_path(path) {
                         failure = Some(error);
                         terminate_child(&mut child);
                         break;
@@ -398,7 +408,7 @@ fn stream_ignored_paths(
                 break;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) if status.is_some() => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(Duration::from_millis(25)),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if status.is_none() {
@@ -623,7 +633,14 @@ fn source_is_inside_nested_repository(root: &Path, relative: &Path) -> bool {
     false
 }
 
-fn open_regular_source(root: &Path, relative: &Path) -> Result<Option<File>, String> {
+/// A source that vanished after Git listed it is not a safety skip.
+enum Source {
+    File(File),
+    Missing,
+    Unsafe,
+}
+
+fn open_regular_source(root: &Path, relative: &Path) -> Result<Source, String> {
     #[cfg(unix)]
     {
         let components = relative.components().collect::<Vec<_>>();
@@ -631,21 +648,24 @@ fn open_regular_source(root: &Path, relative: &Path) -> Result<Option<File>, Str
             .map_err(|error| format!("cannot open source root {}: {error}", root.display()))?;
         for component in &components[..components.len().saturating_sub(1)] {
             let Component::Normal(name) = component else {
-                return Ok(None);
+                return Ok(Source::Unsafe);
             };
             directory = match open_child_directory(&directory, name) {
                 Ok(directory) => directory,
-                Err(error) if unsafe_traversal_error(&error) => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Source::Missing);
+                }
+                Err(error) if unsafe_traversal_error(&error) => return Ok(Source::Unsafe),
                 Err(error) => return Err(format!("cannot traverse source path: {error}")),
             };
             // The principal checkout's own `.git` marker is intentionally not
             // checked; every descendant directory is checked for a nested repo.
             if has_git_marker(&directory) {
-                return Ok(None);
+                return Ok(Source::Unsafe);
             }
         }
         let Some(Component::Normal(name)) = components.last() else {
-            return Ok(None);
+            return Ok(Source::Unsafe);
         };
         let file = match open_child_file(
             &directory,
@@ -653,7 +673,8 @@ fn open_regular_source(root: &Path, relative: &Path) -> Result<Option<File>, Str
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         ) {
             Ok(file) => file,
-            Err(error) if unsafe_traversal_error(&error) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Source::Missing),
+            Err(error) if unsafe_traversal_error(&error) => return Ok(Source::Unsafe),
             Err(error) => return Err(format!("cannot open source file: {error}")),
         };
         if !file
@@ -662,9 +683,9 @@ fn open_regular_source(root: &Path, relative: &Path) -> Result<Option<File>, Str
             .file_type()
             .is_file()
         {
-            return Ok(None);
+            return Ok(Source::Unsafe);
         }
-        return Ok(Some(file));
+        return Ok(Source::File(file));
     }
     #[cfg(not(unix))]
     {
@@ -672,25 +693,27 @@ fn open_regular_source(root: &Path, relative: &Path) -> Result<Option<File>, Str
         let components = relative.components().collect::<Vec<_>>();
         for (index, component) in components.iter().enumerate() {
             let Component::Normal(name) = component else {
-                return Ok(None);
+                return Ok(Source::Unsafe);
             };
             current.push(name);
             let metadata = match fs::symlink_metadata(&current) {
                 Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Source::Missing);
+                }
                 Err(error) => {
                     return Err(format!("cannot inspect {}: {error}", current.display()));
                 }
             };
             if metadata.file_type().is_symlink() {
-                return Ok(None);
+                return Ok(Source::Unsafe);
             }
             if index + 1 < components.len() {
                 if !metadata.file_type().is_dir() {
-                    return Ok(None);
+                    return Ok(Source::Unsafe);
                 }
             } else if !metadata.file_type().is_file() {
-                return Ok(None);
+                return Ok(Source::Unsafe);
             }
         }
         let file = open_read_no_follow(&current)
@@ -701,9 +724,9 @@ fn open_regular_source(root: &Path, relative: &Path) -> Result<Option<File>, Str
             .file_type()
             .is_file()
         {
-            return Ok(None);
+            return Ok(Source::Unsafe);
         }
-        Ok(Some(file))
+        Ok(Source::File(file))
     }
 }
 
@@ -1271,6 +1294,49 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn time_spent_copying_counts_against_the_copy_deadline() {
+        let fixture = Fixture::new();
+        fs::write(fixture.repository.join(".gitignore"), "cache/\n").unwrap();
+        for name in ["a", "b", "c", "d"] {
+            fixture.write_ignored(&format!("cache/{name}"), name);
+        }
+
+        let error =
+            stream_ignored_paths_within(&fixture.repository, Duration::from_millis(150), |_| {
+                thread::sleep(Duration::from_millis(100));
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vanished_source_is_missing_not_unsafe() {
+        let fixture = Fixture::new();
+        fixture.write_ignored("cache/present", "present");
+        std::os::unix::fs::symlink("present", fixture.repository.join("cache/link")).unwrap();
+
+        assert!(matches!(
+            open_regular_source(&fixture.repository, Path::new("cache/gone")).unwrap(),
+            Source::Missing
+        ));
+        assert!(matches!(
+            open_regular_source(&fixture.repository, Path::new("gone/file")).unwrap(),
+            Source::Missing
+        ));
+        assert!(matches!(
+            open_regular_source(&fixture.repository, Path::new("cache/link")).unwrap(),
+            Source::Unsafe
+        ));
+        assert!(matches!(
+            open_regular_source(&fixture.repository, Path::new("cache/present")).unwrap(),
+            Source::File(_)
+        ));
     }
 
     #[test]

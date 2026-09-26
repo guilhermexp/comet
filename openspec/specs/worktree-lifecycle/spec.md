@@ -103,8 +103,10 @@ de heartbeat sozinha SHALL NOT provar que a execução acabou.
 
 Um terminal do app aberto dentro do checkout SHALL bloquear apenas a remoção física; SHALL NOT
 bloquear mover um Chat para o checkout, o preparo nem Runs. O encerramento ordenado do processo SHALL
-liberar as reservas de terminal antes de terminar. Reservas `Terminal` e `Removing` cujo processo
-registrado não existe mais SHALL ser recuperadas; as demais reservas órfãs continuam fechadas. A espera total do shutdown por essas liberações SHALL ter um único prazo, independente do número de terminais.
+liberar as reservas de terminal antes de terminar. Reservas `ChatRun`, `Terminal` e `Removing` cujo
+processo registrado não existe mais SHALL ser recuperadas; um PID reutilizado por outro processo,
+detectado pelo horário de início registrado, conta como processo inexistente. As demais reservas
+órfãs continuam fechadas. A espera total do shutdown por essas liberações SHALL ter um único prazo, independente do número de terminais.
 
 #### Scenario: Terminal aberto bloqueia só a remoção
 Test: integration — `open_terminal_blocks_removal_until_it_closes` e
@@ -115,10 +117,12 @@ Test: integration — `open_terminal_blocks_removal_until_it_closes` e
 - **AND** o checkout continua disponível para Chats; fechar o terminal libera a remoção
 
 #### Scenario: Processo encerrado não deixa reserva de terminal
-Test: unit — `removing_and_terminal_entries_of_a_dead_process_are_reclaimed_but_other_kinds_stay_busy`,
+Test: unit — `host_entries_of_a_dead_process_are_reclaimed_but_other_kinds_stay_busy`,
+`a_reused_pid_does_not_keep_a_dead_host_entry_busy`,
+`release_after_a_failed_heartbeat_still_removes_the_entry`,
 `completed_release_removes_the_entry_before_returning` e `blocked_releases_share_one_deadline`.
 
-- **WHEN** o app encerra normalmente ou morre com um terminal aberto
+- **WHEN** o app encerra normalmente ou morre com um terminal aberto ou um Chat em execução
 - **THEN** a reserva é liberada no shutdown ou recuperada quando seu processo não existe mais
 
 #### Scenario: Chat ativo bloqueia remoção Workers

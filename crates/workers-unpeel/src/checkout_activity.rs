@@ -28,6 +28,8 @@ pub(crate) struct ActivityEntry {
     pub path: PathBuf,
     pub kind: ActivityKind,
     pub process_id: u32,
+    #[serde(default)]
+    process_started: Option<u64>,
     pub heartbeat_unix_ms: u64,
     #[serde(default)]
     lease_id: String,
@@ -146,7 +148,6 @@ fn start_lease_worker_at(
                         unpeel_core::hook_assets::append_trace_log_line(&format!(
                             "Checkout activity heartbeat failed for {operation_id}: {error}; removal remains blocked"
                         ));
-                        break;
                     }
                 }
             }
@@ -379,6 +380,7 @@ pub(crate) fn begin_at(
             path: canonical,
             kind,
             process_id: std::process::id(),
+            process_started: process_start_time(std::process::id()),
             heartbeat_unix_ms: now_ms(),
             lease_id: lease_id.clone(),
         },
@@ -429,9 +431,9 @@ pub(crate) fn busy_at(file: &Path, checkout: &Path) -> Result<Option<ActivityEnt
 /// Like [`busy_at`], ignoring the caller's own `operation_id`. Removal passes
 /// `include_terminals` so an open terminal keeps the checkout in use.
 ///
-/// `Removing` and `Terminal` entries whose recorded process has died are
-/// reclaimed here: a crashed or force-quit process must not block every later
-/// removal of the same checkout. Other kinds stay fail-closed.
+/// `ChatRun`, `Removing` and `Terminal` entries whose recording process has
+/// died are reclaimed here: a crashed or quit host must not block every later
+/// preparation or removal of the same checkout. Other kinds stay fail-closed.
 pub(crate) fn busy_except_at(
     file: &Path,
     checkout: &Path,
@@ -442,8 +444,10 @@ pub(crate) fn busy_except_at(
     let mut state = read(file)?;
     let before = state.entries.len();
     state.entries.retain(|_, entry| {
-        !matches!(entry.kind, ActivityKind::Removing | ActivityKind::Terminal)
-            || process_is_alive(entry.process_id)
+        !matches!(
+            entry.kind,
+            ActivityKind::ChatRun | ActivityKind::Removing | ActivityKind::Terminal
+        ) || process_is_alive(entry.process_id, entry.process_started)
     });
     if state.entries.len() != before {
         write(file, &state)?;
@@ -459,16 +463,54 @@ pub(crate) fn busy_except_at(
         .map(|(_, entry)| entry))
 }
 
-fn process_is_alive(process_id: u32) -> bool {
-    let Ok(process_id) = libc::pid_t::try_from(process_id) else {
+/// A recorded start time that no longer matches means the PID was reused.
+/// An unreadable start time keeps the entry busy.
+fn process_is_alive(process_id: u32, recorded_start: Option<u64>) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(process_id) else {
         return true;
     };
-    if process_id <= 0 {
+    if pid <= 0 {
         return true;
     }
     // SAFETY: signal 0 only probes whether the process exists.
-    let probed = unsafe { libc::kill(process_id, 0) };
-    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    let probed = unsafe { libc::kill(pid, 0) };
+    if probed != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    match (recorded_start, process_start_time(process_id)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time(process_id: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(process_id).ok()?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(process_id: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_time(_process_id: u32) -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -564,14 +606,16 @@ mod tests {
     }
 
     #[test]
-    fn removing_and_terminal_entries_of_a_dead_process_are_reclaimed_but_other_kinds_stay_busy() {
+    fn host_entries_of_a_dead_process_are_reclaimed_but_other_kinds_stay_busy() {
         let removing = tempfile::tempdir().unwrap();
         let running = tempfile::tempdir().unwrap();
         let terminal = tempfile::tempdir().unwrap();
+        let preparing = tempfile::tempdir().unwrap();
         let file = removing.path().join("activity.json");
         begin_at(&file, "remove", removing.path(), ActivityKind::Removing).unwrap();
         begin_at(&file, "run", running.path(), ActivityKind::ChatRun).unwrap();
         begin_at(&file, "terminal", terminal.path(), ActivityKind::Terminal).unwrap();
+        begin_at(&file, "prepare", preparing.path(), ActivityKind::Preparing).unwrap();
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let dead = child.id();
         child.wait().unwrap();
@@ -589,10 +633,66 @@ mod tests {
                 .is_none()
         );
         assert!(!read(&file).unwrap().entries.contains_key("terminal"));
+        assert!(busy_at(&file, running.path()).unwrap().is_none());
+        assert!(!read(&file).unwrap().entries.contains_key("run"));
         assert_eq!(
-            busy_at(&file, running.path()).unwrap().unwrap().kind,
-            ActivityKind::ChatRun
+            busy_at(&file, preparing.path()).unwrap().unwrap().kind,
+            ActivityKind::Preparing
         );
+    }
+
+    #[test]
+    fn a_reused_pid_does_not_keep_a_dead_host_entry_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("activity.json");
+        begin_at(&file, "terminal", temp.path(), ActivityKind::Terminal).unwrap();
+        let recorded = read(&file).unwrap().entries["terminal"].process_started;
+        assert!(recorded.is_some(), "the host records its start time");
+        assert!(
+            busy_except_at(&file, temp.path(), None, true)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut state = read(&file).unwrap();
+        state.entries.get_mut("terminal").unwrap().process_started =
+            recorded.map(|started| started + 1);
+        write(&file, &state).unwrap();
+
+        assert!(
+            busy_except_at(&file, temp.path(), None, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!read(&file).unwrap().entries.contains_key("terminal"));
+    }
+
+    #[test]
+    fn release_after_a_failed_heartbeat_still_removes_the_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("activity.json");
+        let lock_file = temp.path().join("actions.lock");
+        let lease = begin_at(&file, "run", temp.path(), ActivityKind::ChatRun).unwrap();
+        let valid = std::fs::read(&file).unwrap();
+        let reservation = CheckoutActivityReservation {
+            release: start_lease_worker_at(
+                file.clone(),
+                lock_file,
+                "run".into(),
+                lease,
+                Duration::from_millis(10),
+            )
+            .unwrap(),
+        };
+
+        std::fs::write(&file, b"not json").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(&file, valid).unwrap();
+        reservation
+            .begin_release()
+            .wait_until(Instant::now() + Duration::from_secs(5));
+
+        assert!(read(&file).unwrap().entries.is_empty());
     }
 
     #[test]
