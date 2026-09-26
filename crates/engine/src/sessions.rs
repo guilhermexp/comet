@@ -159,8 +159,6 @@ fn apply_run_error_to_session(session: &mut Session, status: SessionStatus, erro
 
 struct RunHandle {
     run_id: String,
-    /// Prevent physical removal until this run has actually left the host.
-    _checkout_activity: Option<zeron_workers_unpeel::CheckoutActivityReservation>,
     steerable: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
@@ -1274,7 +1272,6 @@ impl SessionsEngine {
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
-                _checkout_activity: activity_reservation,
                 steerable: harness.supports_steering(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
@@ -1312,6 +1309,7 @@ impl SessionsEngine {
                 resume_injected,
                 startup_retry,
             },
+            activity_reservation,
         ));
         Ok(run_id)
     }
@@ -3001,7 +2999,11 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    checkout_activity: Option<zeron_workers_unpeel::CheckoutActivityReservation>,
 ) {
+    // Prevent physical removal until this run has actually left the host,
+    // even after a newer run replaced its handle.
+    let _checkout_activity = checkout_activity;
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();

@@ -244,8 +244,7 @@ pub fn prepare_checkout_for_chat(
     let pending = journal
         .preparation_pending(repository, &checkout)
         .map_err(|error| WorkersError::State(error.to_string()))?;
-    let branch_result =
-        git_command::run_git(&checkout, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let branch_result = checkout_lifecycle::current_branch(&checkout);
     let branch = if pending {
         branch_result.map_err(WorkersError::State)?
     } else {
@@ -351,11 +350,11 @@ pub fn remove_checkout_for_chat(
     root: &Path,
     journal_path: &Path,
 ) -> Result<(), WorkersError> {
-    let action = checkout_lifecycle::lock_checkout_actions()?;
+    let mut action = checkout_lifecycle::lock_checkout_actions()?;
     let journal =
         worktree_ownership::OwnershipJournal::at(journal_path.to_owned(), root.to_owned());
     checkout_lifecycle::remove_checkout_under_lock(
-        &action,
+        &mut action,
         &LocalWorkersClient::new(),
         repository,
         checkout,
@@ -2118,20 +2117,27 @@ impl LocalWorkersClient {
         let starting_worker = bootstrap
             .projects
             .iter()
-            .find(|project| project.id == launch.project_id && project.owns_worktree_checkout())
+            .find(|project| project.id == launch.project_id && !project.is_group)
             .map(|project| {
+                let Some(checkout) =
+                    checkout_activity::linked_checkout_root(Path::new(&project.path))
+                        .map_err(WorkersError::State)?
+                else {
+                    return Ok(None);
+                };
                 let reservation = checkout_activity::reserve_operation_under_lock(
                     &format!("start-worker-{}", uuid::Uuid::new_v4()),
-                    Path::new(&project.path),
+                    &checkout,
                     checkout_activity::ActivityKind::StartingWorker,
                 )?;
-                Ok::<_, WorkersError>((
+                Ok::<_, WorkersError>(Some((
                     reservation,
                     project.id.clone(),
                     PathBuf::from(&project.path),
-                ))
+                )))
             })
-            .transpose()?;
+            .transpose()?
+            .flatten();
         // The durable StartingWorker reservation now protects the checkout
         // while the controller spawns its detached Host process.
         drop(checkout_action);

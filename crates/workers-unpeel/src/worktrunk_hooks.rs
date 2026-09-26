@@ -655,7 +655,19 @@ impl PostStartControl {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut manifest = match options.open(&manifest_path) {
+        let mut opened = options.open(&manifest_path);
+        if opened
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+        {
+            if let Ok(Some(existing)) = Self::for_directory(directory) {
+                if existing.is_orphaned().unwrap_or(false) {
+                    existing.cleanup();
+                    opened = options.open(&manifest_path);
+                }
+            }
+        }
+        let mut manifest = match opened {
             Ok(manifest) => manifest,
             Err(error) => {
                 let _ = fs::remove_file(&fifo_path);
@@ -688,11 +700,16 @@ impl PostStartControl {
 
     fn for_checkout(checkout: &Path) -> Result<Option<Self>, HookError> {
         let name = checkout.file_name().unwrap_or_else(|| checkout.as_os_str());
-        let directory = checkout
-            .parent()
-            .unwrap_or(checkout)
-            .join(".logs")
-            .join(name);
+        Self::for_directory(
+            &checkout
+                .parent()
+                .unwrap_or(checkout)
+                .join(".logs")
+                .join(name),
+        )
+    }
+
+    fn for_directory(directory: &Path) -> Result<Option<Self>, HookError> {
         let manifest_path = directory.join("post-start.control");
         let Some(contents) = read_private_control_contents(&manifest_path)? else {
             return Ok(None);
@@ -793,6 +810,16 @@ impl PostStartControl {
     fn request_stop(&self) -> std::io::Result<()> {
         let mut writer = open_verified_fifo_writer(&self.fifo_path)?;
         writeln!(writer, "{}", self.token)
+    }
+
+    #[cfg(unix)]
+    fn is_orphaned(&self) -> Result<bool, HookError> {
+        let listening = self.watcher_is_open().map_err(|error| {
+            HookError::new(format!(
+                "could not inspect post-start stop channel: {error}"
+            ))
+        })?;
+        Ok(!listening && !process_group_exists(self.process_group))
     }
 
     #[cfg(unix)]
@@ -1242,6 +1269,10 @@ pub(crate) fn stop_post_start(checkout_path: &Path) -> Result<bool, HookError> {
         }
         return Ok(false);
     };
+    if control.is_orphaned()? {
+        control.cleanup();
+        return Ok(false);
+    }
 
     match control.request_stop() {
         Ok(()) => {}
@@ -1387,6 +1418,7 @@ fn run_blocking_script(
     })?;
     let group_leader = child.id();
     let stderr_reader = child.stderr.take().map(|mut stderr| {
+        let (sender, receiver) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let mut tail = Vec::new();
             let mut chunk = [0_u8; 8 * 1024];
@@ -1404,8 +1436,9 @@ fn run_blocking_script(
                 }
                 tail.extend_from_slice(&chunk[..read]);
             }
-            String::from_utf8_lossy(&tail).trim().to_owned()
-        })
+            let _ = sender.send(String::from_utf8_lossy(&tail).trim().to_owned());
+        });
+        receiver
     });
 
     let deadline = Instant::now() + timeout;
@@ -1449,9 +1482,9 @@ fn run_blocking_script(
     }
 }
 
-fn join_stderr(reader: Option<thread::JoinHandle<String>>) -> String {
+fn join_stderr(reader: Option<std::sync::mpsc::Receiver<String>>) -> String {
     reader
-        .and_then(|reader| reader.join().ok())
+        .and_then(|reader| reader.recv_timeout(std::time::Duration::from_secs(1)).ok())
         .unwrap_or_default()
 }
 
@@ -2183,7 +2216,7 @@ generated = "rm -rf generated"
 
     #[cfg(unix)]
     #[test]
-    fn orphaned_post_start_manifest_blocks_removal_without_signaling_a_process() {
+    fn orphaned_post_start_manifest_is_cleared_without_signaling_a_process() {
         let temp = tempfile::tempdir().unwrap();
         let checkout = temp.path().join("worktree");
         fs::create_dir_all(&checkout).unwrap();
@@ -2193,10 +2226,25 @@ generated = "rm -rf generated"
         // record parse, while no watcher has ever opened this FIFO.
         control.set_process_group(1_900_000_000).unwrap();
 
-        let error = stop_post_start(&checkout).unwrap_err();
-        assert!(error.to_string().contains("not listening"), "{error}");
-        assert!(checkout.exists(), "orphaned hook evidence blocks removal");
-        control.cleanup();
+        assert!(!stop_post_start(&checkout).unwrap());
+        assert!(!control.manifest_path.exists());
+        assert!(!control.fifo_path.exists());
+        assert!(checkout.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_post_start_manifest_does_not_block_a_new_post_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_dir = temp.path().join(".logs/worktree");
+        let mut orphan = PostStartControl::create(&log_dir).unwrap();
+        orphan.set_process_group(1_900_000_000).unwrap();
+
+        let replacement = PostStartControl::create(&log_dir).unwrap();
+
+        assert_ne!(replacement.token, orphan.token);
+        assert!(!orphan.fifo_path.exists());
+        replacement.cleanup();
     }
 
     #[cfg(unix)]

@@ -168,17 +168,57 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot resolve {label} {}: {error}", path.display()))
 }
 
-/// The principal worktree is the directory holding Git's common `.git`
-/// directory. Bare repositories and separate Git directories have none, so
-/// there is no opt-in manifest to read.
+/// The principal worktree of an ordinary repository is the directory holding
+/// Git's common `.git` directory. Other layouts (bare, separate Git directory,
+/// submodule) take Git's first listed worktree, validated against the same
+/// common directory before its opt-in manifest is trusted.
 fn principal_worktree(common: &Path) -> Result<Option<PathBuf>, String> {
-    if common.file_name() != Some(OsStr::new(".git")) {
+    if common.file_name() == Some(OsStr::new(".git"))
+        && run_git(common, &["rev-parse", "--is-bare-repository"])?.trim() == "false"
+    {
+        if let Some(principal) = common.parent() {
+            return canonical_directory(principal, "principal worktree").map(Some);
+        }
+    }
+    let output = run_git(common, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut first_path = None;
+    let mut first_is_bare = false;
+    for record in output.split('\0') {
+        if record.is_empty() {
+            if first_path.is_some() {
+                break;
+            }
+            continue;
+        }
+        if let Some(path) = record.strip_prefix("worktree ") {
+            if first_path.is_none() {
+                first_path = Some(PathBuf::from(path));
+            }
+        } else if record == "bare" && first_path.is_some() {
+            first_is_bare = true;
+        }
+    }
+    if first_is_bare {
         return Ok(None);
     }
-    let Some(principal) = common.parent() else {
-        return Ok(None);
+    let Some(path) = first_path else {
+        return Err(format!(
+            "Git returned no principal worktree for {}",
+            common.display()
+        ));
     };
-    canonical_directory(principal, "principal worktree").map(Some)
+    let principal = canonical_directory(&path, "principal worktree")?;
+    if principal == common {
+        return Ok(None);
+    }
+    if git_common_dir(&principal)? != common {
+        return Err(format!(
+            "Git's principal worktree {} does not belong to {}",
+            principal.display(),
+            common.display()
+        ));
+    }
+    Ok(Some(principal))
 }
 
 fn git_common_dir(repository: &Path) -> Result<PathBuf, String> {
@@ -1231,6 +1271,38 @@ mod tests {
 
         assert_eq!(report, CopyIgnoredReport::default());
         assert!(!fixture.destination.join("cache/data").exists());
+    }
+
+    #[test]
+    fn bare_repository_named_dot_git_has_no_principal_manifest() {
+        let fixture = Fixture::new();
+        let project = fixture._temp.path().join("project");
+        let bare = project.join(".git");
+        let output = Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(&fixture.repository)
+            .arg(&bare)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        fs::write(project.join(INCLUDE_FILE), "*\n").unwrap();
+        let destination = fixture._temp.path().join("bare-linked");
+        git(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "bare-worktree",
+                destination.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        let report = copy_selected_ignored(&destination, &destination).unwrap();
+
+        assert_eq!(report, CopyIgnoredReport::default());
     }
 
     #[test]
