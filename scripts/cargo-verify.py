@@ -20,6 +20,9 @@ import tempfile
 
 GIB = 1024**3
 POLL_SECONDS = 2
+# Leads the child's process group and kills it once the wrapper's pipe closes,
+# including when the wrapper itself is SIGKILLed.
+WATCHDOG = "import os, signal, sys; sys.stdin.buffer.read(); os.killpg(0, signal.SIGKILL)"
 
 
 def state_dir() -> Path:
@@ -27,11 +30,9 @@ def state_dir() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".local/state/comet/cargo-verify"
 
 
-def terminate_group(process: subprocess.Popen[bytes], signum: int) -> None:
-    if process.poll() is not None:
-        return
+def terminate_group(pgid: int, signum: int) -> None:
     try:
-        os.killpg(process.pid, signum)
+        os.killpg(pgid, signum)
     except ProcessLookupError:
         pass
 
@@ -44,22 +45,21 @@ def remove_stale_targets(root: Path) -> bool:
             return False
         try:
             pgid = int((target / ".owner-pgid").read_text())
-            if pgid <= 0:
-                raise ValueError("invalid process group")
         except (OSError, ValueError):
-            print(f"Refusing unowned verification target: {target}", file=sys.stderr)
-            return False
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            shutil.rmtree(target)
-            print(f"Removed stale Cargo verification target: {target}", file=sys.stderr)
-        except PermissionError:
-            print(f"Verification target may still be in use: {target}", file=sys.stderr)
-            return False
-        else:
-            print(f"Verification target is still in use: {target}", file=sys.stderr)
-            return False
+            pgid = 0
+        if pgid > 0:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                print(f"Verification target may still be in use: {target}", file=sys.stderr)
+                return False
+            else:
+                print(f"Verification target is still in use: {target}", file=sys.stderr)
+                return False
+        shutil.rmtree(target)
+        print(f"Removed stale Cargo verification target: {target}", file=sys.stderr)
     return True
 
 
@@ -85,16 +85,34 @@ def run(command: list[str], minimum_free_gib: int, floor_free_gib: int) -> int:
             env.setdefault("CARGO_BUILD_JOBS", "4")
             env.setdefault("CARGO_INCREMENTAL", "0")
             print(f"Cargo verification target: {target}", file=sys.stderr, flush=True)
-            process = subprocess.Popen(command, env=env, start_new_session=True)
-            (Path(target) / ".owner-pgid").write_text(str(process.pid))
-            previous_handlers = {}
+            received: list[int] = []
+            pgid: int | None = None
 
             def forward(signum: int, _frame: object) -> None:
-                terminate_group(process, signum)
+                received.append(signum)
+                if pgid is not None:
+                    terminate_group(pgid, signum)
 
-            for signum in (signal.SIGINT, signal.SIGTERM):
-                previous_handlers[signum] = signal.signal(signum, forward)
+            previous_handlers = {
+                signum: signal.signal(signum, forward)
+                for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+            }
+            read_end, write_end = os.pipe()
+            watchdog = None
             try:
+                try:
+                    watchdog = subprocess.Popen(
+                        [sys.executable, "-c", WATCHDOG], stdin=read_end, preexec_fn=os.setpgrp
+                    )
+                finally:
+                    os.close(read_end)
+                (Path(target) / ".owner-pgid").write_text(str(watchdog.pid))
+                process = subprocess.Popen(
+                    command, env=env, preexec_fn=lambda: os.setpgid(0, watchdog.pid)
+                )
+                pgid = watchdog.pid
+                if received:
+                    terminate_group(pgid, received[0])
                 while True:
                     try:
                         return process.wait(timeout=POLL_SECONDS)
@@ -108,23 +126,26 @@ def run(command: list[str], minimum_free_gib: int, floor_free_gib: int) -> int:
                             file=sys.stderr,
                             flush=True,
                         )
-                        terminate_group(process, signal.SIGTERM)
+                        terminate_group(pgid, signal.SIGTERM)
                         try:
                             process.wait(timeout=10)
                         except subprocess.TimeoutExpired:
-                            terminate_group(process, signal.SIGKILL)
+                            terminate_group(pgid, signal.SIGKILL)
                             process.wait()
                         return 75
             finally:
-                for signum, previous in previous_handlers.items():
-                    signal.signal(signum, previous)
-                if process.poll() is None:
-                    terminate_group(process, signal.SIGTERM)
+                if pgid is not None and process.poll() is None:
+                    terminate_group(pgid, signal.SIGTERM)
                     try:
                         process.wait(timeout=10)
                     except subprocess.TimeoutExpired:
-                        terminate_group(process, signal.SIGKILL)
+                        terminate_group(pgid, signal.SIGKILL)
                         process.wait()
+                os.close(write_end)
+                if watchdog is not None:
+                    watchdog.wait()
+                for signum, previous in previous_handlers.items():
+                    signal.signal(signum, previous)
                 print(f"Removing Cargo verification target: {target}", file=sys.stderr, flush=True)
 
 

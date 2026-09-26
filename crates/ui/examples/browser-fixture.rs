@@ -407,6 +407,7 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("Browser fixture: left sidebar transitions passed");
                     // Reverse the right sidebar mid-animation. It must remain
                     // live inside a narrowing mask, without bleeding into chat.
+                    let settle=(350. * motion::speed_scale()) as u64;
                     for _ in 0..3 {
                         window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
                         let deadline=std::time::Instant::now()+Duration::from_secs(2);
@@ -418,14 +419,14 @@ fn main() -> anyhow::Result<()> {
                             anyhow::ensure!(std::time::Instant::now()<deadline,"closing sidebar did not clip the live browser");
                         }
                         window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
-                        pause(cx,350).await;
+                        pause(cx,settle).await;
                         anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_native_visible()),"interrupted toggle lost browser visibility");
                     }
                     window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
-                    pause(cx,350).await;
+                    pause(cx,settle).await;
                     anyhow::ensure!(!first.read_with(cx,|b,_|b.fixture_native_visible()),"closed sidebar retained native content");
                     window.update(cx,|s,_,cx|s.fixture_toggle_sidebar(true,cx))?;
-                    pause(cx,350).await;
+                    pause(cx,settle).await;
                     first.read_with(cx,|b,_|b.fixture_eval("document.title='Fieldnotes'"));
                     eprintln!("Browser fixture: right sidebar transitions passed");
                     capture(&output,"browser-blur-baseline-dark")?;

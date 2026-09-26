@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -102,10 +103,30 @@ class CargoVerifyTests(unittest.TestCase):
         self.assertEqual(self.targets(), [])
 
     def test_termination_stops_child_and_removes_target(self) -> None:
+        self.assert_signal_stops_child(signal.SIGTERM)
+
+    def test_next_run_removes_a_target_without_an_owner(self) -> None:
+        unowned = self.state / "target-unowned"
+        unowned.mkdir(parents=True)
+        result = subprocess.run(self.command("pass"), env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.targets(), [])
+
+    def test_hangup_stops_child_and_removes_target(self) -> None:
+        self.assert_signal_stops_child(signal.SIGHUP)
+
+    def test_killed_wrapper_takes_its_child_down(self) -> None:
+        self.assert_signal_stops_child(signal.SIGKILL, clean_target=False)
+        result = subprocess.run(self.command("pass"), env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Removed stale Cargo verification target", result.stderr)
+        self.assertEqual(self.targets(), [])
+
+    def assert_signal_stops_child(self, signum: int, clean_target: bool = True) -> None:
         ready = Path(self.temporary.name) / "ready"
         process = subprocess.Popen(
             self.command(
-                f"import pathlib, time; pathlib.Path({str(ready)!r}).touch(); time.sleep(30)"
+                f"import os, pathlib, time; pathlib.Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(30)"
             ),
             env=self.env,
             stdout=subprocess.PIPE,
@@ -114,13 +135,22 @@ class CargoVerifyTests(unittest.TestCase):
         )
         try:
             deadline = time.monotonic() + 5
-            while not ready.exists() and time.monotonic() < deadline:
+            while not (ready.exists() and ready.read_text()) and time.monotonic() < deadline:
                 time.sleep(0.02)
-            self.assertTrue(ready.exists(), "verification child did not start")
-            time.sleep(0.1)  # Let the wrapper install its signal handlers after spawn.
-            process.terminate()
+            child = int(ready.read_text())
+            process.send_signal(signum)
             process.communicate(timeout=5)
-            self.assertEqual(self.targets(), [])
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("verification child outlived its wrapper")
+            if clean_target:
+                self.assertEqual(self.targets(), [])
         finally:
             if process.poll() is None:
                 process.kill()
