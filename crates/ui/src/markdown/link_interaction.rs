@@ -985,7 +985,10 @@ mod rendered_tests {
                     let offsets = offsets.unwrap();
                     assert_eq!(offsets.omissions.len(), 1);
                     assert!(layout.bounds().size.width <= px(width));
-                    assert!(layout.bounds().size.height <= px(23.));
+                    assert!(
+                        layout.bounds().size.height
+                            <= px(super::super::render::MD_LINE_HEIGHT + 1.)
+                    );
                     let shown_end = offsets.displayed(url.len());
                     let start =
                         layout.position_for_index(0).unwrap() + gpui::point(px(0.1), px(8.));
@@ -1037,12 +1040,18 @@ mod rendered_tests {
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh();
                 let _ = window.draw(cx);
+                // Table cells carry path-hashed ids (header row, first column).
+                let cell = format!("link-fixture:{}", super::super::render::nested_ix(0, 0, 0));
                 let (original, layout, offsets) =
-                    super::super::render::selection_test_snapshot("link-fixture:0");
+                    super::super::render::selection_test_snapshot(&cell);
                 assert_eq!(original.as_ref(), url);
                 assert_eq!(offsets.unwrap().omissions.len(), 1);
-                assert!(layout.bounds().size.width < px(220.));
-                assert!(layout.bounds().size.height <= px(23.));
+                // Fork tables floor each column at its readable token width
+                // (capped at 320px) and scroll instead of squeezing below it.
+                assert!(layout.bounds().size.width <= px(320.));
+                assert!(
+                    layout.bounds().size.height <= px(super::super::render::MD_LINE_HEIGHT + 1.)
+                );
             })
             .unwrap();
             cx.spawn(async move |cx| {

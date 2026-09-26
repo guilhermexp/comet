@@ -270,6 +270,19 @@ mod tests {
         (dir, doc, store, persistence)
     }
 
+    /// Waits for the background writer without betting on how fast the
+    /// blocking pool runs; the exact count still proves coalescing.
+    async fn wait_for_writes(persistence: &ChatPersistence, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while persistence.writes.load(Ordering::Relaxed) < expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(persistence.writes.load(Ordering::Relaxed), expected);
+    }
+
     #[tokio::test]
     async fn replay_burst_coalesces_and_flush_bypasses_debounce() {
         let (_dir, doc, store, persistence) = fixture();
@@ -286,8 +299,7 @@ mod tests {
             0,
             "no per-row writes"
         );
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert_eq!(persistence.writes.load(Ordering::Relaxed), 1);
+        wait_for_writes(&persistence, 1).await;
         let (bytes, cursor, _) = store.load_snapshot_with_cursor("whale").unwrap().unwrap();
         assert_eq!(cursor, 1000);
         assert!(store.snapshot_cursor_verified("whale").unwrap());
@@ -298,13 +310,7 @@ mod tests {
             doc.doc().get_map("test").get_deep_value()
         );
         persistence.applied(1001, true);
-        tokio::time::timeout(Duration::from_millis(500), async {
-            while persistence.writes.load(Ordering::Relaxed) != 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_for_writes(&persistence, 2).await;
         persistence.applied(1002, false);
         persistence.flush_sync(); // shutdown/eviction must not await the timer
         assert_eq!(store.snapshot_cursor("whale").unwrap(), 1002);

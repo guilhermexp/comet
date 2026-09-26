@@ -15,22 +15,7 @@ fn button(
 ) -> gpui::Stateful<gpui::Div> {
     // Match Files/History chrome, including focus-preserving mouse-down and
     // tooltips. Disabled controls have neither a pointer cursor nor a handler.
-    gpui::div()
-        .id(id)
-        .size(px(surface_chrome::CONTROL_SIZE))
-        .flex_none()
-        .rounded(px(surface_chrome::CONTROL_RADIUS))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .role(gpui::Role::Button)
-        .aria_label(label)
-        .occlude()
-        .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-            window.prevent_default()
-        })
-        .hover(|style| style.bg(crate::theme::wash(0.14)))
+    crate::files::toolbar_button(id, label)
         .when(!enabled, |el| el.cursor_default().opacity(0.35))
         .child(
             icons::icon(glyph)

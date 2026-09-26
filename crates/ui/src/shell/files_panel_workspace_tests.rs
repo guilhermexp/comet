@@ -146,6 +146,8 @@ fn files_panel_workspace_navigation_and_external_updates() {
     let _ipc = runtime
         .block_on(zeron_engine::serve_ipc(port, core.rpc_service()))
         .unwrap();
+    // Engine mutations that spawn background work must run inside Tokio.
+    let tokio_handle = runtime.handle().clone();
     let output = std::env::var_os("ZERON_FILES_CAPTURES").map(PathBuf::from);
     let application = if output.is_some() {
         gpui_platform::application()
@@ -281,14 +283,18 @@ fn files_panel_workspace_navigation_and_external_updates() {
                         window.bounds_changed(cx);
                     })
                     .unwrap();
-                frame(window, cx, output.as_deref(), "01b-picker-files-compact").await;
+                frame(window, cx, output.as_deref(), "01b-empty-surfaces-files").await;
                 window
                     .update(cx, |shell, window, cx| {
-                        assert_eq!(shell.files_visible_width(cx), 284.0);
-                        assert_eq!(shell.files_reserved_width(cx), 284.0);
-                        assert_eq!(shell.right_visible_width(cx), RIGHT_PANE_MIN);
-                        assert_eq!(shell.settings.files_panel_width, FILES_PANEL_MAX);
+                        // Fork: the right pane is open only while it hosts a
+                        // tab, so an empty surface host reserves no column and
+                        // Files keeps its preferred width.
                         assert!(shell.right_surface_rows(cx).is_empty());
+                        assert!(!shell.right_pane_open(cx));
+                        assert_eq!(shell.files_visible_width(cx), FILES_PANEL_MAX);
+                        assert_eq!(shell.files_reserved_width(cx), FILES_PANEL_MAX);
+                        assert_eq!(shell.right_visible_width(cx), 0.0);
+                        assert_eq!(shell.settings.files_panel_width, FILES_PANEL_MAX);
                         shell.set_surfaces_open(false, cx);
                         shell.settings.files_panel_width = FILES_PANEL_DEFAULT;
                         shell.settings.right_pane_width = RIGHT_PANE_DEFAULT;
@@ -516,7 +522,10 @@ fn files_panel_workspace_navigation_and_external_updates() {
                         })
                 })
                 .await;
-                core.workspace.delete_chat("first").unwrap();
+                {
+                    let _tokio = tokio_handle.enter();
+                    core.workspace.delete_chat("first").unwrap();
+                }
                 wait_for(window, cx, "deleted explorer cleanup", |shell, _| {
                     !shell.files.contains_key("first")
                         && !shell.files_subs.contains_key("first")
