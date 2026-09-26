@@ -509,12 +509,15 @@ impl Terminals {
     /// Engine shutdown: kill every live shell.
     pub fn shutdown(&self) {
         let sessions: Vec<_> = lock(&self.inner.sessions).drain().map(|(_, s)| s).collect();
+        let mut releases = Vec::new();
         for session in sessions {
             let reservation = lock(&session).checkout_activity.take();
-            if let Some(reservation) = reservation {
-                reservation.release_and_wait(SHUTDOWN_RELEASE_TIMEOUT);
-            }
+            releases.extend(reservation.map(|reservation| reservation.begin_release()));
             dispose(&session, true);
+        }
+        let deadline = std::time::Instant::now() + SHUTDOWN_RELEASE_TIMEOUT;
+        for release in releases {
+            release.wait_until(deadline);
         }
     }
 }
