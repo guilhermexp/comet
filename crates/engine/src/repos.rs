@@ -1835,6 +1835,10 @@ impl Repos {
             .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
             .await;
         let Some((path, _branch)) = resolved else {
+            // Already unregistered and gone: only a stale entry remains.
+            if Self::checkout_leaf_missing_with_parent(worktree_path).await {
+                return Ok(());
+            }
             return Err(EngineError::Other(
                 "not a linked worktree of this repository".into(),
             ));

@@ -367,9 +367,49 @@ fn integrated(
 
 fn branch_is_checked_out(repository: &Path, branch_ref: &str) -> Result<bool, String> {
     let listing = run_git(repository, &["worktree", "list", "--porcelain"])?;
-    Ok(listing
+    if listing
         .lines()
-        .any(|line| line.strip_prefix("branch ") == Some(branch_ref)))
+        .any(|line| line.strip_prefix("branch ") == Some(branch_ref))
+    {
+        return Ok(true);
+    }
+    let common = run_git(
+        repository,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = PathBuf::from(common.trim());
+    let mut git_dirs = vec![common.clone()];
+    match std::fs::read_dir(common.join("worktrees")) {
+        Ok(entries) => {
+            for entry in entries {
+                git_dirs.push(
+                    entry
+                        .map_err(|error| format!("Cannot list linked worktrees: {error}"))?
+                        .path(),
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Cannot list linked worktrees: {error}")),
+    }
+    let short_name = branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref);
+    for git_dir in git_dirs {
+        for (state, expected) in [
+            ("rebase-merge/head-name", branch_ref),
+            ("rebase-apply/head-name", branch_ref),
+            ("BISECT_START", short_name),
+        ] {
+            match std::fs::read_to_string(git_dir.join(state)) {
+                Ok(contents) if contents.trim() == expected => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("Cannot inspect worktree operation state: {error}"));
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -654,6 +694,49 @@ mod tests {
                 other_worktree.to_str().unwrap(),
                 "feature/test",
             ],
+        );
+
+        assert_eq!(
+            cleanup(&repo, &feature_oid),
+            BranchCleanupOutcome::Retained("another worktree still checks out the branch")
+        );
+        assert!(branch_exists(&repo));
+    }
+
+    #[test]
+    fn does_not_delete_a_branch_being_rebased_in_another_worktree() {
+        let repo = Repo::new();
+        let feature_oid = repo.create_feature();
+        git(repo.path(), &["checkout", "--quiet", "main"]);
+        git(
+            repo.path(),
+            &["merge", "--quiet", "--ff-only", "feature/test"],
+        );
+        let other_worktree = repo.0.path().join("other-worktree");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                other_worktree.to_str().unwrap(),
+                "feature/test",
+            ],
+        );
+        let stopped = Command::new("git")
+            .arg("-C")
+            .arg(&other_worktree)
+            .args(["rebase", "--quiet", "--exec", "false", "HEAD~1"])
+            .output()
+            .expect("git starts");
+        assert!(!stopped.status.success(), "rebase should stop at exec");
+        assert_eq!(
+            git(&other_worktree, &["worktree", "list", "--porcelain"])
+                .lines()
+                .filter(|line| *line == "branch refs/heads/feature/test")
+                .count(),
+            0,
+            "a stopped rebase lists the worktree as detached"
         );
 
         assert_eq!(

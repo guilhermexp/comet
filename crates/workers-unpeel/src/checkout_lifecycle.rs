@@ -2,6 +2,16 @@
 use crate::git_command::run_git;
 use std::path::{Path, PathBuf};
 
+/// The local branch checked out at `checkout`, read from its full refname so
+/// a same-named tag cannot turn it into an ambiguous short name.
+pub(crate) fn current_branch(checkout: &Path) -> Result<String, String> {
+    let head = run_git(checkout, &["symbolic-ref", "--quiet", "HEAD"])?;
+    head.trim()
+        .strip_prefix("refs/heads/")
+        .map(str::to_owned)
+        .ok_or_else(|| format!("HEAD is not a local branch: {}", head.trim()))
+}
+
 pub(crate) struct CreatedCheckout {
     pub path: PathBuf,
     pub branch: String,
@@ -71,15 +81,10 @@ pub(crate) fn create_checkout_under_lock(
                 target.display()
             )));
         }
-        let current_branch = run_git(
-            &target_canonical,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        )
-        .map_err(WorkersError::State)?;
-        if current_branch.trim() != branch {
+        let current_branch = current_branch(&target_canonical).map_err(WorkersError::State)?;
+        if current_branch != branch {
             return Err(WorkersError::State(format!(
-                "Worktree destination already checks out `{}`, not `{branch}`",
-                current_branch.trim()
+                "Worktree destination already checks out `{current_branch}`, not `{branch}`"
             )));
         }
         return Ok(CreatedCheckout {
@@ -214,7 +219,7 @@ pub(crate) fn validate_removal(
 /// Serializes Comet launches/removals across UI and controller MCP processes.
 /// Kept separate from app-state.lock: Git and host creation never hold the
 /// shared JSON write lock.
-pub(crate) struct CheckoutActionLock(std::fs::File);
+pub(crate) struct CheckoutActionLock(std::fs::File, PathBuf);
 
 pub(crate) fn lock_checkout_actions() -> Result<CheckoutActionLock, crate::WorkersError> {
     let root = unpeel_core::app_paths::unpeel_home();
@@ -224,7 +229,6 @@ pub(crate) fn lock_checkout_actions() -> Result<CheckoutActionLock, crate::Worke
 }
 
 fn lock_checkout_actions_at(path: &Path) -> Result<CheckoutActionLock, String> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -234,6 +238,27 @@ fn lock_checkout_actions_at(path: &Path) -> Result<CheckoutActionLock, String> {
         .mode(0o600)
         .open(path)
         .map_err(|e| e.to_string())?;
+    flock_exclusive(&file, path)?;
+    Ok(CheckoutActionLock(file, path.to_owned()))
+}
+
+impl CheckoutActionLock {
+    /// Run long, repository-supplied work without blocking unrelated checkout
+    /// actions. Callers must revalidate everything after this returns.
+    fn released<T>(&mut self, work: impl FnOnce() -> T) -> Result<T, String> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: this guard still owns the valid descriptor.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+        let result = work();
+        flock_exclusive(&self.0, &self.1)?;
+        Ok(result)
+    }
+}
+
+fn flock_exclusive(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(360);
     loop {
         // SAFETY: the descriptor is owned and stays open for the guard's lifetime.
@@ -253,7 +278,7 @@ fn lock_checkout_actions_at(path: &Path) -> Result<CheckoutActionLock, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    Ok(CheckoutActionLock(file))
+    Ok(())
 }
 
 pub(crate) fn checkout_is_busy(
@@ -282,17 +307,18 @@ fn checkout_is_busy_under_lock(
         session.is_live()
             && snapshot.projects.iter().any(|project| {
                 project.id == session.project_id
-                    && std::fs::canonicalize(&project.path).ok().as_deref()
-                        == Some(canonical.as_path())
+                    && std::fs::canonicalize(&project.path)
+                        .is_ok_and(|path| path.starts_with(&canonical))
             })
     }))
 }
 
-/// The physical removal used by both Chat and Workers. The action lock must
-/// cover the first ownership proof through the final Git mutation. It is not
-/// enough for a checkout to sit below the configured worktree root.
+/// The physical removal used by both Chat and Workers. The action lock covers
+/// ownership proof through the final Git mutation, except while pre-remove
+/// runs; every proof is repeated after the hook. It is not enough for a
+/// checkout to sit below the configured worktree root.
 pub(crate) fn remove_checkout_under_lock(
-    _action: &CheckoutActionLock,
+    action: &mut CheckoutActionLock,
     client: &crate::LocalWorkersClient,
     repository: &Path,
     checkout: &Path,
@@ -316,34 +342,38 @@ pub(crate) fn remove_checkout_under_lock(
             "Stop active Chats and Workers before removing this checkout".into(),
         ));
     }
-    let branch = run_git(&checkout, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
+    let branch = current_branch(&checkout).unwrap_or_default();
     if skip_hooks {
         unpeel_core::hook_assets::append_trace_log_line(&format!(
             "Worktree removal without hooks requested for {}",
             checkout.display()
         ));
     }
-    crate::worktrunk_lifecycle::run_pre_remove(
-        state_path, repository, &checkout, &branch, skip_hooks,
-    )
-    .map_err(WorkersError::State)?;
-    // Prepare the post hook while the source checkout and its config still
-    // exist. A pending post hook is advisory; removal is still safe to finish.
-    let post = match crate::worktrunk_lifecycle::prepare_post_remove(
-        state_path, repository, &checkout, &branch, skip_hooks,
-    ) {
-        Ok(post) => post,
-        Err(error) => {
-            unpeel_core::hook_assets::append_trace_log_line(&format!(
-                "Post-remove hook skipped for {}: {error}",
-                checkout.display()
-            ));
-            None
-        }
-    };
+    let post = action
+        .released(|| {
+            crate::worktrunk_lifecycle::run_pre_remove(
+                state_path, repository, &checkout, &branch, skip_hooks,
+            )?;
+            // Prepare the post hook while the source checkout and its config
+            // still exist. A pending post hook is advisory; removal is still
+            // safe to finish.
+            Ok::<_, String>(
+                match crate::worktrunk_lifecycle::prepare_post_remove(
+                    state_path, repository, &checkout, &branch, skip_hooks,
+                ) {
+                    Ok(post) => post,
+                    Err(error) => {
+                        unpeel_core::hook_assets::append_trace_log_line(&format!(
+                            "Post-remove hook skipped for {}: {error}",
+                            checkout.display()
+                        ));
+                        None
+                    }
+                },
+            )
+        })
+        .and_then(|result| result)
+        .map_err(WorkersError::State)?;
     if !journal
         .verify_owned(repository, &checkout)
         .map_err(|error| WorkersError::State(error.to_string()))?
@@ -363,10 +393,7 @@ pub(crate) fn remove_checkout_under_lock(
     // The pre-remove hook may run Git itself. Never delete the old branch if
     // the checkout changed refs during that hook; capture the exact tip only
     // after the final validation, then use Git's old-OID CAS after removal.
-    let final_branch = run_git(&checkout, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
+    let final_branch = current_branch(&checkout).unwrap_or_default();
     if final_branch != branch {
         return Err(WorkersError::State(
             "Checkout branch changed during pre-remove; refusing removal".into(),
@@ -479,10 +506,13 @@ pub(crate) fn prune_missing_checkout_under_lock(
             "Missing checkout is not registered with Git".into(),
         ));
     }
-    // `--expire now` can also drop other stale admin entries, but it never
-    // touches filesystem directories or branches. A targeted forced remove
-    // could erase a leaf recreated between the absence probe and Git spawn.
-    crate::git_command::run_git_mutation(repository, &["worktree", "prune", "--expire", "now"])
+    // Without --force Git refuses a leaf recreated after the absence probe, and
+    // other missing worktrees, such as unmounted external checkouts, keep
+    // their administrative entries.
+    let target_text = target
+        .to_str()
+        .ok_or_else(|| WorkersError::State("Checkout path is not UTF-8".into()))?;
+    crate::git_command::run_git_mutation(repository, &["worktree", "remove", target_text])
         .map_err(WorkersError::State)?;
     let after = run_git(repository, &["worktree", "list", "--porcelain", "-z"])
         .map_err(WorkersError::State)?;
@@ -517,7 +547,7 @@ pub(crate) fn remove_owned_checkout(
     skip_hooks: bool,
 ) -> Result<(), crate::WorkersError> {
     use crate::{CheckoutKind, CheckoutOwnership, WorkersError};
-    let action = lock_checkout_actions()?;
+    let mut action = lock_checkout_actions()?;
     client.reconcile_project_identity()?;
     let registry = client.project_identity_registry()?;
     let checkout = registry
@@ -563,7 +593,7 @@ pub(crate) fn remove_owned_checkout(
     }
     set_removal_pending(project_id, &checkout, true)?;
     let result = remove_checkout_under_lock(
-        &action,
+        &mut action,
         client,
         repository,
         path,

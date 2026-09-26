@@ -484,6 +484,19 @@ impl OwnershipJournal {
     /// recorded but unverified or changed checkout is an error and callers
     /// must not continue as though preparation had succeeded.
     pub fn preparation_pending(&self, repository: &Path, checkout: &Path) -> Result<bool> {
+        let target = fs::canonicalize(checkout).map_err(|error| {
+            OwnershipError::Invalid(format!("cannot canonicalize checkout: {error}"))
+        })?;
+        let target = path_string(&target);
+        if !self.read_document()?.records.iter().any(|record| {
+            record.target_path == target
+                && !matches!(
+                    record.stage,
+                    OwnershipStage::Retired | OwnershipStage::Aborted
+                )
+        }) {
+            return Ok(false);
+        }
         let repository = RepositoryIdentity::observe(repository)?;
         let observed = CheckoutIdentity::observe(checkout, &repository)?;
         self.reconcile_created_observed()?;

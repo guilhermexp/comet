@@ -250,6 +250,7 @@ fn run_one(
     }
     let mut child = process.spawn().map_err(|error| error.to_string())?;
     let mut stderr_reader = child.stderr.take().map(|mut stderr| {
+        let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut tail = Vec::new();
             let mut chunk = [0_u8; 8 * 1024];
@@ -267,8 +268,9 @@ fn run_one(
                 }
                 tail.extend_from_slice(&chunk[..read]);
             }
-            String::from_utf8_lossy(&tail).trim().to_owned()
-        })
+            let _ = sender.send(String::from_utf8_lossy(&tail).trim().to_owned());
+        });
+        receiver
     });
 
     let deadline = std::time::Instant::now() + timeout;
@@ -304,9 +306,9 @@ fn run_one(
     }
 }
 
-fn join_stderr(reader: Option<std::thread::JoinHandle<String>>) -> String {
+fn join_stderr(reader: Option<std::sync::mpsc::Receiver<String>>) -> String {
     reader
-        .and_then(|reader| reader.join().ok())
+        .and_then(|reader| reader.recv_timeout(std::time::Duration::from_secs(1)).ok())
         .unwrap_or_default()
 }
 

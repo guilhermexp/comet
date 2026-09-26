@@ -165,7 +165,7 @@ impl Drop for ActivityActionLock {
     }
 }
 
-fn linked_checkout_root(cwd: &Path) -> Result<Option<PathBuf>, String> {
+pub(crate) fn linked_checkout_root(cwd: &Path) -> Result<Option<PathBuf>, String> {
     // A Chat may name a directory that its harness will create later. Walk to
     // the nearest existing ancestor so such a cwd still reserves an enclosing
     // linked checkout, while an ordinary missing folder does not block runs.
