@@ -1708,6 +1708,47 @@ impl Repos {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<WorktreeCreationOutcome, EngineError> {
+        // Only paths that could have been created by either generation of the
+        // app need the ownership journal. An external checkout outside all
+        // those roots is a no-op even if the local journal is unreadable.
+        if definitely_external_checkout(worktree_path, &self.inner.worktrees_root) {
+            if self
+                .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
+                .await
+                .is_none()
+            {
+                return Err(EngineError::Other(
+                    "not a linked worktree of this repository".into(),
+                ));
+            }
+            let path = std::fs::canonicalize(worktree_path)
+                .map_err(|error| EngineError::Other(error.to_string()))?;
+            let branch = self
+                .git(&["symbolic-ref", "--quiet", "--short", "HEAD"], Some(&path))
+                .await
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("worktree")
+                .to_owned();
+            return self
+                .chat_worktree_outcome(
+                    repo_path,
+                    name,
+                    zeron_workers_unpeel::ChatWorktreeCreation {
+                        path,
+                        branch,
+                        setup_failed_command: None,
+                        setup_failed_reason: None,
+                        hook_warning: None,
+                        copy_warning: None,
+                    },
+                )
+                .await;
+        }
         let repo = repo_path.to_path_buf();
         let path = worktree_path.to_path_buf();
         let root = self.inner.worktrees_root.clone();
@@ -2872,6 +2913,24 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
     }
 }
 
+/// A negative ownership check only. Paths beneath any current or historical
+/// app root still require the journal to prove whether setup is pending.
+fn definitely_external_checkout(path: &Path, configured_root: &Path) -> bool {
+    let path = canonicalize_lossy(path);
+    let home = home_dir();
+    let unpeel_home = std::env::var_os("UNPEEL_HOME")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".unpeel"));
+    [
+        configured_root.to_path_buf(),
+        home.join(".zeron/worktrees"),
+        unpeel_home.join("worktrees"),
+    ]
+    .iter()
+    .all(|root| !path.starts_with(canonicalize_lossy(root)))
+}
+
 /// Absolute form of a possibly-relative path (no filesystem access).
 fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -2895,6 +2954,20 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::process::ProcessOutput;
+
+    #[test]
+    fn only_checkouts_outside_all_app_roots_skip_the_ownership_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("repo/feature")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        assert!(!definitely_external_checkout(
+            &root.join("repo/feature"),
+            &root
+        ));
+        assert!(definitely_external_checkout(&external, &root));
+    }
 
     #[tokio::test]
     async fn checkout_mutation_deadline_waits_for_authoritative_result() {
@@ -3664,6 +3737,53 @@ tmpfs /run tmpfs rw 0 0
             output.status.success(),
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn external_checkout_preparation_ignores_a_broken_local_ownership_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let external = temp.path().join("external");
+        let managed = temp.path().join("managed");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_cmd(&repo, &["init", "-b", "main"]);
+        git_cmd(&repo, &["commit", "--allow-empty", "-m", "base"]);
+        git_cmd(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                external.to_str().unwrap(),
+            ],
+        );
+        let journal_path = temp.path().join("ownership.json");
+        std::fs::write(&journal_path, "not valid JSON").unwrap();
+        let repos = Repos::build(
+            temp.path(),
+            "device",
+            managed,
+            Ok(journal_path),
+            std::sync::Arc::new(SystemProcessRunner),
+        );
+        let outcome = repos
+            .prepare_worktree_for_chat(&repo, &external)
+            .await
+            .expect("an external checkout has no app setup to prepare");
+        assert_eq!(outcome.worktree.path, external.to_string_lossy());
+        assert_eq!(outcome.worktree.branch, "feature");
+        assert!(outcome.setup_error.is_none());
+
+        let unrelated = temp.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        assert!(
+            repos
+                .prepare_worktree_for_chat(&repo, &unrelated)
+                .await
+                .is_err(),
+            "an arbitrary external directory is not a checkout to prepare"
         );
     }
 
