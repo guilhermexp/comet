@@ -107,6 +107,17 @@ enum TransferError {
     Permanent(String),
 }
 
+fn copy_warning_notice(warning: &str) -> String {
+    format!("Some ignored files were not copied into this worktree: {warning}")
+}
+
+fn with_copy_warning(message: String, warning: Option<&str>) -> String {
+    match warning {
+        Some(warning) => format!("{message}. {}", copy_warning_notice(warning)),
+        None => message,
+    }
+}
+
 struct MaterializedWorktree {
     cwd: String,
     fresh: Option<zeron_proto::Worktree>,
@@ -4520,9 +4531,12 @@ impl DocHost {
                             worktree_copy_warning.as_deref(),
                         );
                     }
-                    return Err(EngineError::Other(format!(
-                        "worktree setup failed; the checkout was preserved at {}: {error}",
-                        request.cwd
+                    return Err(EngineError::Other(with_copy_warning(
+                        format!(
+                            "worktree setup failed; the checkout was preserved at {}: {error}",
+                            request.cwd
+                        ),
+                        worktree_copy_warning.as_deref(),
                     )));
                 }
                 // A failed worktree setup is recorded durably in the ownership
@@ -4530,16 +4544,21 @@ impl DocHost {
                 // consumed) retries it in the Chat's exact checkout; external or
                 // already-prepared worktrees are a no-op.
                 if worktree_spec.is_none() {
-                    if let Some(error) = self
+                    let (setup_error, copy_warning) = self
                         .prepare_pending_chat_checkout(chat_id, &request.cwd)
-                        .await?
-                    {
-                        return Err(EngineError::Other(format!(
-                            "worktree setup failed; the checkout remains at {}: {error}",
-                            request.cwd
+                        .await?;
+                    if let Some(error) = setup_error {
+                        return Err(EngineError::Other(with_copy_warning(
+                            format!(
+                                "worktree setup failed; the checkout remains at {}: {error}",
+                                request.cwd
+                            ),
+                            copy_warning.as_deref(),
                         )));
                     }
+                    worktree_copy_warning = copy_warning;
                 }
+                let mut transcript_copy_warning = worktree_copy_warning;
                 if let Some(spec) = worktree_spec.as_ref()
                     && spec.space_id.is_some()
                 {
@@ -4549,7 +4568,7 @@ impl DocHost {
                         spec,
                         fresh_worktree.as_ref(),
                         None,
-                        worktree_copy_warning.as_deref(),
+                        transcript_copy_warning.take().as_deref(),
                     );
                 }
                 let harness = self.harness_for_request(chat_id, &request);
@@ -4584,6 +4603,11 @@ impl DocHost {
                     entry.issued_at.min(now_ms()),
                 ) {
                     tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
+                }
+                if let Some(warning) = transcript_copy_warning.as_deref()
+                    && let Err(err) = handle.write_marker(&copy_warning_notice(warning))
+                {
+                    tracing::warn!(chat = %chat_id, error = %err, "copy warning notice write failed");
                 }
                 self.dispatch_with_source_context(
                     sessions,
@@ -4920,14 +4944,15 @@ impl DocHost {
         })
     }
 
+    /// Returns the setup error and the ignored-file copy advisory.
     async fn prepare_pending_chat_checkout(
         &self,
         chat_id: &str,
         cwd: &str,
-    ) -> Result<Option<String>, EngineError> {
+    ) -> Result<(Option<String>, Option<String>), EngineError> {
         let path = std::path::Path::new(cwd);
         let Some(repository) = crate::workspace_host::linked_worktree_root(path) else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let repos = self
             .inner
@@ -4943,7 +4968,7 @@ impl DocHost {
         {
             tracing::warn!(cwd, error = %error, "prepared checkout branch stamp failed");
         }
-        Ok(prepared.setup_error)
+        Ok((prepared.setup_error, prepared.copy_warning))
     }
 
     fn complete_worktree_setup_handoff(

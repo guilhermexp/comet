@@ -31,16 +31,16 @@ fn project_actions_menu_surface(
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
 }
 
-/// A setup failure takes precedence; a skipped-copy advisory is still shown
-/// when setup itself succeeded.
+/// A skipped-copy advisory stays visible whether or not setup failed.
 fn worktree_setup_notice(setup_error: Option<&str>, setup_warning: Option<&str>) -> Option<String> {
-    match (setup_error, setup_warning) {
-        (Some(error), _) => Some(format!("Setup action failed: {error}")),
-        (None, Some(warning)) => Some(format!(
-            "Worktree created, but some ignored files were not copied: {warning}"
-        )),
-        (None, None) => None,
-    }
+    let notices = [
+        setup_error.map(|error| format!("Setup action failed: {error}")),
+        setup_warning.map(|warning| {
+            format!("Worktree created, but some ignored files were not copied: {warning}")
+        }),
+    ];
+    let notices = notices.into_iter().flatten().collect::<Vec<_>>();
+    (!notices.is_empty()).then(|| notices.join("\n"))
 }
 
 impl Shell {
@@ -1207,7 +1207,9 @@ mod worktree_setup_notice_tests {
         );
         assert_eq!(
             worktree_setup_notice(Some("exit 1"), Some("1 entry was skipped")).as_deref(),
-            Some("Setup action failed: exit 1")
+            Some(
+                "Setup action failed: exit 1\nWorktree created, but some ignored files were not copied: 1 entry was skipped"
+            )
         );
         assert_eq!(worktree_setup_notice(None, None), None);
     }
