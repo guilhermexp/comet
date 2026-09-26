@@ -15,7 +15,7 @@ use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use crate::motion;
 use crate::popover;
 use crate::theme::Theme;
-use crate::transcript::Transcript;
+use crate::transcript::{Row, Transcript};
 
 /// 48rem — the container width below which the rail (and wide gutters) collapse.
 pub const RAIL_MIN_CONTAINER_WIDTH: f32 = 768.0;
@@ -35,6 +35,46 @@ pub struct RailTick {
     pub message_id: String,
     pub prompt: String,
     pub reply: Option<String>,
+}
+
+/// Content-only projection, rebuilt with the transcript rows rather than on
+/// scroll/hover/animation frames. Indices refer to that same row snapshot.
+#[derive(Default)]
+pub(crate) struct RailSnapshot {
+    pub(crate) ticks: Vec<RailTick>,
+    pub(crate) rows: Vec<usize>,
+}
+
+impl RailSnapshot {
+    pub(crate) fn new(
+        entries: &[SessionMessageEntry],
+        echoes: &[SessionMessageEntry],
+        rows: &[Row],
+    ) -> Self {
+        let mut row_indices = std::collections::HashMap::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            // Match the first occurrence, like the former position() lookup.
+            row_indices.entry(row.id.as_ref()).or_insert(index);
+        }
+        let mut snapshot = Self::default();
+        for mut tick in rail_ticks(entries, echoes) {
+            let Some(&index) = row_indices.get(tick.message_id.as_str()) else {
+                continue;
+            };
+            tick.prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
+            tick.reply = tick
+                .reply
+                .map(|reply| truncate_preview(&reply, PREVIEW_REPLY_CHARS));
+            snapshot.ticks.push(tick);
+            snapshot.rows.push(index);
+        }
+        snapshot
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RAIL_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn user_text(entry: &SessionMessageEntry) -> String {
@@ -75,6 +115,8 @@ pub fn rail_ticks(
     entries: &[SessionMessageEntry],
     echoes: &[SessionMessageEntry],
 ) -> Vec<RailTick> {
+    #[cfg(test)]
+    RAIL_PROJECTIONS.with(|count| count.set(count.get() + 1));
     let mut ticks: Vec<RailTick> = Vec::new();
     for (ix, entry) in entries.iter().enumerate() {
         if entry.role != MessageRole::User {
@@ -412,28 +454,12 @@ impl Transcript {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let (entries, echoes) = {
-            let state = self.state_entity().read(cx);
-            (state.transcript.clone(), state.pending_echoes().to_vec())
-        };
-        let ticks = rail_ticks(&entries, &echoes);
-        // Map each tick to its transcript row (user rows share the entry id).
-        let pairs: Vec<(RailTick, usize)> = ticks
-            .into_iter()
-            .filter_map(|tick| {
-                let row = self
-                    .rows()
-                    .iter()
-                    .position(|r| r.id.as_ref() == tick.message_id.as_str())?;
-                Some((tick, row))
-            })
-            .collect();
+        let snapshot = &self.rail_snapshot;
         // A minimap of one exchange is noise, not navigation — the original
         // rail hides below two marks (message-rail.tsx `marks.length < 2`).
-        if pairs.len() < 2 {
+        if snapshot.ticks.len() < 2 {
             return gpui::Empty.into_any_element();
         }
-        let tick_rows: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
         // Active detection reads from the READING line, not the raw clip top:
         // the titlebar overlays the list, so a row whose top sits within that
         // chrome band is what you're reading — the sliver of the previous row
@@ -454,7 +480,7 @@ impl Transcript {
                 break;
             }
         }
-        let active = active_tick(&tick_rows, top_row);
+        let active = active_tick(&snapshot.rows, top_row);
         let hover = self.rail_hover();
         let theme = Theme::of(cx).clone();
 
@@ -465,7 +491,7 @@ impl Transcript {
         // single tick.
         let viewport_h = f32::from(self.list_state().viewport_bounds().size.height);
         let capacity = rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
-        let buckets = tick_buckets(pairs.len(), capacity);
+        let buckets = tick_buckets(snapshot.ticks.len(), capacity);
         let active_bucket = active.and_then(|ix| bucket_of(&buckets, ix));
 
         div()
@@ -484,8 +510,8 @@ impl Transcript {
                 // falls inside (hover then previews what you're reading),
                 // the first prompt of the range otherwise.
                 let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
-                let (tick, row) = &pairs[rep];
-                let (tick, row) = (tick.clone(), *row);
+                let tick = &snapshot.ticks[rep];
+                let row = snapshot.rows[rep];
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
@@ -497,11 +523,6 @@ impl Transcript {
                 } else {
                     crate::theme::ink(0.16)
                 };
-                let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
-                let reply = tick
-                    .reply
-                    .as_deref()
-                    .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
                 let card: Option<AnyElement> = is_hovered.then(|| {
                     let theme = theme.for_popup();
                     let card = popover::popover_card(&theme)
@@ -514,9 +535,9 @@ impl Transcript {
                             div()
                                 .text_size(px(12.0))
                                 .text_color(theme.text)
-                                .child(SharedString::from(prompt.clone())),
+                                .child(SharedString::from(tick.prompt.clone())),
                         )
-                        .when_some(reply.clone(), |el, reply| {
+                        .when_some(tick.reply.clone(), |el, reply| {
                             el.child(
                                 div()
                                     .text_size(px(11.0))

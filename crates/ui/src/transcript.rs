@@ -4300,6 +4300,7 @@ pub struct Transcript {
     selection_scroll_task: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
+    pub(crate) rail_snapshot: crate::rail::RailSnapshot,
     /// Height of the shell's composer/status/terminal stack overlaying the
     /// transcript's bottom (measured last frame): the last row pads past it
     /// so pinned content rests above the glass chrome it scrolls under.
@@ -4676,6 +4677,7 @@ impl Transcript {
             selection_drag_position: None,
             selection_scroll_task: None,
             rail_enabled,
+            rail_snapshot: crate::rail::RailSnapshot::default(),
             bottom_clearance: 0.0,
             rail_hover: None,
             hovered_entry: None,
@@ -4753,10 +4755,6 @@ impl Transcript {
         self.rail_hover = hover;
     }
 
-    pub(crate) fn rows(&self) -> &[Row] {
-        &self.rows
-    }
-
     pub(crate) fn list_state(&self) -> &ListState {
         &self.list
     }
@@ -4828,10 +4826,6 @@ impl Transcript {
             self.saved_viewports
                 .insert(chat_id, SavedViewport::FollowTail);
         }
-    }
-
-    pub(crate) fn state_entity(&self) -> &Entity<AppState> {
-        &self.state
     }
 
     pub(crate) fn begin_scroll_navigation(&mut self) {
@@ -5821,6 +5815,14 @@ impl Transcript {
                     new_rows.extend(self.rows_for(echo, true, &mut todo_history));
                 }
             }
+            // Prepare navigation from the final row order, even while the
+            // width gate hides the rail. Content revisions (including echoes)
+            // and compact-mode changes already invalidate this sync path.
+            self.rail_snapshot = if self.doc_override.is_none() {
+                crate::rail::RailSnapshot::new(entries, state.pending_echoes(), &new_rows)
+            } else {
+                crate::rail::RailSnapshot::default()
+            };
             (
                 entries.is_empty(),
                 entries
@@ -12483,6 +12485,159 @@ mod tests {
                 assert!(crate::markdown::selection::is_dragging());
                 crate::markdown::selection::end_active_drag();
             })
+        });
+    }
+
+    #[gpui::test]
+    fn rail_redraws_do_not_reproject_chat_history(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.selected_chat = Some("rail-chat".into());
+            state.apply_transcript(vec![user_entry("u1"), user_entry("u2")]);
+            state
+        });
+        let view = cx.new(|cx| Transcript::new(state.clone(), cx));
+        view.update(cx, |view, cx| {
+            let before = crate::rail::RAIL_PROJECTIONS.get();
+            for index in 0..120 {
+                view.list.scroll_to(ListOffset {
+                    item_ix: index % 2,
+                    offset_in_item: px(0.0),
+                });
+                view.set_rail_hover(Some(index % 2));
+                let _ = view.render_rail(cx);
+            }
+            assert_eq!(
+                crate::rail::RAIL_PROJECTIONS.get(),
+                before,
+                "scroll and hover redraws must reuse the projected rail"
+            );
+        });
+        state.update(cx, |_, cx| cx.notify());
+        view.update(cx, |view, cx| {
+            let before = crate::rail::RAIL_PROJECTIONS.get();
+            view.sync(cx);
+            let _ = view.render_rail(cx);
+            assert_eq!(crate::rail::RAIL_PROJECTIONS.get(), before);
+        });
+    }
+
+    #[test]
+    fn rail_snapshot_bounds_previews_and_matches_first_visible_row() {
+        let mut prompt = user_entry("u1");
+        prompt.parts = vec![text_part("p", &"pergunta longa ".repeat(100))];
+        let reply = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![text_part("r", &"resposta longa ".repeat(100))],
+        );
+        let rows = vec![viewport_row("u1", "u1"), viewport_row("u1", "u1")];
+        let snapshot = crate::rail::RailSnapshot::new(
+            &[prompt, reply, user_entry("missing-row")],
+            &[user_entry("u1")],
+            &rows,
+        );
+        assert_eq!(snapshot.rows, vec![0]);
+        assert_eq!(snapshot.ticks.len(), 1);
+        assert_eq!(snapshot.ticks[0].message_id, "u1");
+        assert!(snapshot.ticks[0].prompt.chars().count() <= crate::rail::PREVIEW_PROMPT_CHARS);
+        let reply = snapshot.ticks[0].reply.as_deref().unwrap();
+        assert!(reply.chars().count() <= crate::rail::PREVIEW_REPLY_CHARS);
+        assert!(reply.ends_with('…'));
+    }
+
+    #[gpui::test]
+    fn rail_snapshot_refreshes_content_echoes_and_navigation(cx: &mut gpui::TestAppContext) {
+        let mut reply = assistant(
+            "a1",
+            MessageStatus::Streaming,
+            vec![text_part("t", "first")],
+        );
+        let entries = vec![user_entry("u1"), reply.clone(), user_entry("u2")];
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.selected_chat = Some("rail-chat".into());
+            state.apply_transcript(entries.clone());
+            state
+        });
+        let view = cx.new(|cx| Transcript::new(state.clone(), cx));
+        view.update(cx, |view, cx| {
+            assert_eq!(view.rail_snapshot.ticks[0].reply.as_deref(), Some("first"));
+            view.set_rail_enabled(false, cx);
+        });
+        state.update(cx, |state, _| {
+            state.push_echo("rail-chat", user_entry("u3"))
+        });
+        view.update(cx, |view, cx| {
+            view.sync(cx);
+            assert_eq!(view.rail_snapshot.ticks.len(), 3);
+            assert_eq!(view.rail_snapshot.ticks[2].message_id, "u3");
+        });
+        state.update(cx, |state, _| state.remove_echo("rail-chat", "u3"));
+        view.update(cx, |view, cx| {
+            view.sync(cx);
+            assert_eq!(view.rail_snapshot.ticks.len(), 2);
+        });
+        // Content changes without changing message count. Settling splits
+        // markdown rows, so subsequent prompt destinations must move too.
+        reply.status = Some(MessageStatus::Complete);
+        reply.parts = vec![text_part("t", "final reply\n\nsecond paragraph")];
+        state.update(cx, |state, _| {
+            state.push_echo("rail-chat", user_entry("u3"));
+            state.apply_transcript(vec![
+                user_entry("u1"),
+                reply.clone(),
+                user_entry("u2"),
+                user_entry("u3"),
+            ]);
+        });
+        view.update(cx, |view, cx| {
+            view.sync(cx);
+            assert_eq!(
+                view.rail_snapshot.ticks.len(),
+                3,
+                "echo confirmation deduplicates"
+            );
+            assert_eq!(
+                view.rail_snapshot.ticks[0].reply.as_deref(),
+                Some("final reply second paragraph")
+            );
+            for compact in [true, false] {
+                view.compact_mode = compact;
+                view.last_source = None;
+                view.sync(cx);
+                for (tick, &index) in view
+                    .rail_snapshot
+                    .ticks
+                    .iter()
+                    .zip(&view.rail_snapshot.rows)
+                {
+                    assert_eq!(view.rows[index].id.as_ref(), tick.message_id);
+                }
+            }
+            let before = crate::rail::RAIL_PROJECTIONS.get();
+            view.set_rail_enabled(true, cx);
+            assert_eq!(crate::rail::RAIL_PROJECTIONS.get(), before);
+        });
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("other-chat".into());
+            state.apply_transcript(vec![user_entry("other")]);
+        });
+        view.update(cx, |view, cx| {
+            view.sync(cx);
+            assert_eq!(view.rail_snapshot.ticks.len(), 1);
+            assert_eq!(view.rail_snapshot.ticks[0].message_id, "other");
+            assert_eq!(view.rail_snapshot.rows, vec![0]);
+        });
+        state.update(cx, |state, _| {
+            state.selected_chat = None;
+            state.apply_transcript(Vec::new());
+        });
+        view.update(cx, |view, cx| {
+            view.sync(cx);
+            assert!(view.rail_snapshot.ticks.is_empty());
+            assert!(view.rail_snapshot.rows.is_empty());
         });
     }
 
