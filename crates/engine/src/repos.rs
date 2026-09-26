@@ -1711,24 +1711,12 @@ impl Repos {
         // Only paths that could have been created by either generation of the
         // app need the ownership journal. An external checkout outside all
         // those roots is a no-op even if the local journal is unreadable.
-        if definitely_external_checkout(worktree_path, &self.inner.worktrees_root) {
-            if self
-                .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
-                .await
-                .is_none()
-            {
-                return Err(EngineError::Other(
-                    "not a linked worktree of this repository".into(),
-                ));
-            }
-            let path = std::fs::canonicalize(worktree_path)
-                .map_err(|error| EngineError::Other(error.to_string()))?;
-            let branch = self
-                .git(&["symbolic-ref", "--quiet", "--short", "HEAD"], Some(&path))
-                .await
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
+        if let Some((path, branch)) = self
+            .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
+            .await
+            .filter(|(path, _)| definitely_external_checkout(path, &self.inner.worktrees_root))
+        {
+            let branch = branch.unwrap_or_default();
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1866,6 +1854,30 @@ impl Repos {
             Some(worktree_path),
         )
         .await?;
+        match self.ownership_journal_path() {
+            Ok(journal) => {
+                let checkout = worktree_path.to_path_buf();
+                let root = self.inner.worktrees_root.clone();
+                let (from, to) = (current.clone(), target.clone());
+                let recorded = tokio::task::spawn_blocking(move || {
+                    zeron_workers_unpeel::record_checkout_branch_rename(
+                        &checkout, &root, &journal, &from, &to,
+                    )
+                })
+                .await;
+                if !matches!(recorded, Ok(Ok(()))) {
+                    tracing::warn!(
+                        branch = %target,
+                        "renamed worktree branch will be kept after removal: ownership update failed"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                branch = %target,
+                %error,
+                "renamed worktree branch will be kept after removal: no ownership journal"
+            ),
+        }
         self.current_branch(worktree_path).await
     }
 
@@ -2915,8 +2927,8 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
 
 /// A negative ownership check only. Paths beneath any current or historical
 /// app root still require the journal to prove whether setup is pending.
+/// `path` must already be canonical: it is never touched on disk here.
 fn definitely_external_checkout(path: &Path, configured_root: &Path) -> bool {
-    let path = canonicalize_lossy(path);
     let home = home_dir();
     let unpeel_home = std::env::var_os("UNPEEL_HOME")
         .filter(|value| !value.to_string_lossy().trim().is_empty())
@@ -2963,10 +2975,13 @@ mod tests {
         std::fs::create_dir_all(root.join("repo/feature")).unwrap();
         std::fs::create_dir_all(&external).unwrap();
         assert!(!definitely_external_checkout(
-            &root.join("repo/feature"),
+            &std::fs::canonicalize(root.join("repo/feature")).unwrap(),
             &root
         ));
-        assert!(definitely_external_checkout(&external, &root));
+        assert!(definitely_external_checkout(
+            &std::fs::canonicalize(&external).unwrap(),
+            &root
+        ));
     }
 
     #[tokio::test]
@@ -3772,7 +3787,10 @@ tmpfs /run tmpfs rw 0 0
             .prepare_worktree_for_chat(&repo, &external)
             .await
             .expect("an external checkout has no app setup to prepare");
-        assert_eq!(outcome.worktree.path, external.to_string_lossy());
+        assert_eq!(
+            outcome.worktree.path,
+            std::fs::canonicalize(&external).unwrap().to_string_lossy()
+        );
         assert_eq!(outcome.worktree.branch, "feature");
         assert!(outcome.setup_error.is_none());
 

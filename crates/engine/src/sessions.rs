@@ -1104,85 +1104,106 @@ impl SessionsEngine {
         self.stamp_sessions_grant(chat_id, &mut request);
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
-        let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
-            (
-                h.run_id.clone(),
-                h.steerable,
-                h.runtime_config.can_route(harness_id, &request),
-                h.steer_tx.clone(),
-                h.routed_steers.clone(),
-            )
-        });
-        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
-            let user_id = message_id.clone().unwrap_or_else(new_id);
-            let accepted = if steerable && same_runtime {
-                // Warm dispatch uses the same mailbox as explicit steering.
-                // Register acceptance before a fast boundary can retire it.
-                let mut pending = lock(&ledger);
-                let message = SteerMessage {
-                    // OpenCode must see the canonical selection before it
-                    // decodes the provider command: a project-scoped command
-                    // can disappear between composer discovery and delivery.
-                    prompt: if harness_id == HarnessId::Opencode {
-                        request.prompt.clone()
+        let run_id = new_id();
+        let mut displaced = None;
+        let activity_reservation = loop {
+            let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
+                (
+                    h.run_id.clone(),
+                    h.steerable,
+                    h.runtime_config.can_route(harness_id, &request),
+                    h.steer_tx.clone(),
+                    h.routed_steers.clone(),
+                )
+            });
+            if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
+                let user_id = message_id.clone().unwrap_or_else(new_id);
+                let accepted = if steerable && same_runtime {
+                    // Warm dispatch uses the same mailbox as explicit steering.
+                    // Register acceptance before a fast boundary can retire it.
+                    let mut pending = lock(&ledger);
+                    let message = SteerMessage {
+                        // OpenCode must see the canonical selection before it
+                        // decodes the provider command: a project-scoped command
+                        // can disappear between composer discovery and delivery.
+                        prompt: if harness_id == HarnessId::Opencode {
+                            request.prompt.clone()
+                        } else {
+                            zeron_proto::invocation::harness_prompt(&request.prompt, harness_id)
+                        },
+                        message_id: Some(user_id.clone()),
+                    };
+                    if steer_tx.try_send(message).is_ok() {
+                        pending.push_back(RoutedSteer {
+                            prompt: request.prompt.clone(),
+                            message_id: user_id.clone(),
+                        });
+                        true
                     } else {
-                        zeron_proto::invocation::harness_prompt(&request.prompt, harness_id)
-                    },
-                    message_id: Some(user_id.clone()),
-                };
-                if steer_tx.try_send(message).is_ok() {
-                    pending.push_back(RoutedSteer {
-                        prompt: request.prompt.clone(),
-                        message_id: user_id.clone(),
-                    });
-                    true
+                        false
+                    }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
-            if accepted {
-                let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-                if self.is_live(chat_id, &run_id) {
-                    // Working BEFORE the lastMessageAt bump: both ride the
-                    // workspace doc from this one peer, so causal order makes it
-                    // impossible for an observer to hold [new message, old status]
-                    // — that gap read as unseen-with-no-live-run = a phantom
-                    // "completed" flash on every remote send (2026-07-31).
-                    self.set_status(chat_id, SessionStatus::Working, false);
-                    self.inner.note_message(chat_id, &request.prompt);
-                    return Ok(run_id);
-                }
-                // The run died around the send. If its exit drain already
-                // claimed the entry, that re-dispatch owns the message —
-                // otherwise reclaim it and fall through to a fresh run.
-                let reclaimed = {
-                    let mut ledger = lock(&ledger);
-                    let before = ledger.len();
-                    ledger.retain(|s| s.message_id != user_id);
-                    ledger.len() != before
                 };
-                if !reclaimed {
-                    self.inner.note_message(chat_id, &request.prompt);
-                    return Ok(run_id);
+                if accepted {
+                    let handle = self.doc_handle(chat_id)?;
+                    handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                    if self.is_live(chat_id, &run_id) {
+                        // Working BEFORE the lastMessageAt bump: both ride the
+                        // workspace doc from this one peer, so causal order makes it
+                        // impossible for an observer to hold [new message, old status]
+                        // — that gap read as unseen-with-no-live-run = a phantom
+                        // "completed" flash on every remote send (2026-07-31).
+                        self.set_status(chat_id, SessionStatus::Working, false);
+                        self.inner.note_message(chat_id, &request.prompt);
+                        return Ok(run_id);
+                    }
+                    // The run died around the send. If its exit drain already
+                    // claimed the entry, that re-dispatch owns the message —
+                    // otherwise reclaim it and fall through to a fresh run.
+                    let reclaimed = {
+                        let mut ledger = lock(&ledger);
+                        let before = ledger.len();
+                        ledger.retain(|s| s.message_id != user_id);
+                        ledger.len() != before
+                    };
+                    if !reclaimed {
+                        self.inner.note_message(chat_id, &request.prompt);
+                        return Ok(run_id);
+                    }
+                    // Keep the already-written doc entry's id for the fresh run
+                    // below (write_user_message dedupes by id).
+                    message_id = Some(user_id);
                 }
-                // Keep the already-written doc entry's id for the fresh run
-                // below (write_user_message dedupes by id).
-                message_id = Some(user_id);
+                if !same_runtime {
+                    tracing::debug!(
+                        chat = %chat_id,
+                        "restarting live harness to apply changed run configuration"
+                    );
+                }
+                // Mailbox closed (runtime mid-teardown / non-steering harness) or
+                // the routed run died with the message reclaimed, or configuration
+                // changed beyond what the text-only mailbox can carry: replace it.
+                self.interrupt(chat_id).await?;
+                displaced = Some(run_id);
             }
-            if !same_runtime {
-                tracing::debug!(
-                    chat = %chat_id,
-                    "restarting live harness to apply changed run configuration"
-                );
+            let cwd = std::path::PathBuf::from(&request.cwd);
+            let operation_id = run_id.clone();
+            let reservation = tokio::task::spawn_blocking(move || {
+                zeron_workers_unpeel::reserve_chat_run(&operation_id, &cwd)
+            })
+            .await
+            .map_err(|error| {
+                EngineError::Other(format!("Checkout activity worker failed: {error}"))
+            })?
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+            let current = lock(&self.inner.runs)
+                .get(chat_id)
+                .map(|handle| handle.run_id.clone());
+            if current.is_none() || current == displaced {
+                break reservation;
             }
-            // Mailbox closed (runtime mid-teardown / non-steering harness) or
-            // the routed run died with the message reclaimed, or configuration
-            // changed beyond what the text-only mailbox can carry: replace it.
-            self.interrupt(chat_id).await?;
-        }
+        };
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
@@ -1203,19 +1224,6 @@ impl SessionsEngine {
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
 
-        let run_id = new_id();
-        let activity_reservation = {
-            let cwd = std::path::PathBuf::from(&request.cwd);
-            let operation_id = run_id.clone();
-            tokio::task::spawn_blocking(move || {
-                zeron_workers_unpeel::reserve_chat_run(&operation_id, &cwd)
-            })
-            .await
-            .map_err(|error| {
-                EngineError::Other(format!("Checkout activity worker failed: {error}"))
-            })?
-            .map_err(|error| EngineError::Other(error.to_string()))?
-        };
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();

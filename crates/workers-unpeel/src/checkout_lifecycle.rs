@@ -93,16 +93,6 @@ pub(crate) fn create_checkout_under_lock(
         });
     }
 
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    journal
-        .pending_create(&repo_root, &target, &operation_id)
-        .map_err(|error| WorkersError::State(error.to_string()))?;
-    // An unavailable remote must not prevent local work, as in the previous
-    // Workers path. The mutation itself remains bounded by git_command.
-    let _ = crate::git_command::run_git_mutation(&repo_root, &["fetch", "--quiet", "origin"]);
-    let base = base_ref
-        .map(str::to_owned)
-        .or_else(|| default_base_ref(&repo_root));
     let target_text = target
         .to_str()
         .ok_or_else(|| WorkersError::State("Worktree path is not UTF-8".into()))?;
@@ -116,6 +106,21 @@ pub(crate) fn create_checkout_under_lock(
         ],
     )
     .is_ok();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    journal
+        .pending_create(
+            &repo_root,
+            &target,
+            &operation_id,
+            (!branch_exists).then_some(branch),
+        )
+        .map_err(|error| WorkersError::State(error.to_string()))?;
+    // An unavailable remote must not prevent local work, as in the previous
+    // Workers path. The mutation itself remains bounded by git_command.
+    let _ = crate::git_command::run_git_mutation(&repo_root, &["fetch", "--quiet", "origin"]);
+    let base = base_ref
+        .map(str::to_owned)
+        .or_else(|| default_base_ref(&repo_root));
     let mut args = vec!["worktree", "add"];
     if branch_exists {
         args.extend([target_text, branch]);
@@ -262,14 +267,36 @@ fn has_hidden_local_edits(checkout: &Path) -> Result<bool, String> {
 /// shared JSON write lock.
 pub(crate) struct CheckoutActionLock(std::fs::File, PathBuf);
 
+const CHECKOUT_ACTION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(360);
+/// Interactive requests answer within their RPC deadline: a checkout action
+/// that holds the lock longer than this reports the checkout as busy.
+const INTERACTIVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(crate) fn lock_checkout_actions() -> Result<CheckoutActionLock, crate::WorkersError> {
+    lock_checkout_actions_within(CHECKOUT_ACTION_LOCK_WAIT)?.ok_or_else(|| {
+        crate::WorkersError::State("Timed out waiting for the checkout action lock".into())
+    })
+}
+
+/// `None` when another checkout action still holds the lock after a short wait.
+pub(crate) fn lock_checkout_actions_briefly()
+-> Result<Option<CheckoutActionLock>, crate::WorkersError> {
+    lock_checkout_actions_within(INTERACTIVE_LOCK_WAIT)
+}
+
+fn lock_checkout_actions_within(
+    wait: std::time::Duration,
+) -> Result<Option<CheckoutActionLock>, crate::WorkersError> {
     let root = unpeel_core::app_paths::unpeel_home();
     std::fs::create_dir_all(&root).map_err(|e| crate::WorkersError::State(e.to_string()))?;
-    lock_checkout_actions_at(&root.join("checkout-actions.lock"))
+    lock_checkout_actions_at(&root.join("checkout-actions.lock"), wait)
         .map_err(crate::WorkersError::State)
 }
 
-fn lock_checkout_actions_at(path: &Path) -> Result<CheckoutActionLock, String> {
+fn lock_checkout_actions_at(
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<Option<CheckoutActionLock>, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -279,8 +306,10 @@ fn lock_checkout_actions_at(path: &Path) -> Result<CheckoutActionLock, String> {
         .mode(0o600)
         .open(path)
         .map_err(|e| e.to_string())?;
-    flock_exclusive(&file, path)?;
-    Ok(CheckoutActionLock(file, path.to_owned()))
+    if !flock_exclusive(&file, wait)? {
+        return Ok(None);
+    }
+    Ok(Some(CheckoutActionLock(file, path.to_owned())))
 }
 
 impl CheckoutActionLock {
@@ -293,14 +322,20 @@ impl CheckoutActionLock {
             libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
         }
         let result = work();
-        flock_exclusive(&self.0, &self.1)?;
+        if !flock_exclusive(&self.0, CHECKOUT_ACTION_LOCK_WAIT)? {
+            return Err(format!(
+                "Timed out waiting for checkout action lock {}",
+                self.1.display()
+            ));
+        }
         Ok(result)
     }
 }
 
-fn flock_exclusive(file: &std::fs::File, path: &Path) -> Result<(), String> {
+/// `false` when the lock is still held by another action after `wait`.
+fn flock_exclusive(file: &std::fs::File, wait: std::time::Duration) -> Result<bool, String> {
     use std::os::fd::AsRawFd;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(360);
+    let deadline = std::time::Instant::now() + wait;
     loop {
         // SAFETY: the descriptor is owned and stays open for the guard's lifetime.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -312,21 +347,20 @@ fn flock_exclusive(file: &std::fs::File, path: &Path) -> Result<(), String> {
             return Err(error.to_string());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "Timed out waiting for checkout action lock {}",
-                path.display()
-            ));
+            return Ok(false);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn checkout_is_busy(
     client: &crate::LocalWorkersClient,
     path: &Path,
 ) -> Result<bool, crate::WorkersError> {
-    let _action = lock_checkout_actions()?;
+    let Some(_action) = lock_checkout_actions_briefly()? else {
+        return Ok(true);
+    };
     checkout_is_busy_under_lock(client, path, None, false)
 }
 
@@ -456,7 +490,15 @@ pub(crate) fn remove_checkout_under_lock(
             "Checkout branch changed during pre-remove; refusing removal".into(),
         ));
     }
+    let created_branch = journal
+        .created_branch(repository, &checkout)
+        .map_err(|error| WorkersError::State(error.to_string()))?;
     let branch_tip = if branch.is_empty() {
+        None
+    } else if created_branch.as_deref() != Some(branch.as_str()) {
+        unpeel_core::hook_assets::append_trace_log_line(&format!(
+            "Branch {branch} retained after worktree removal: Comet did not create it"
+        ));
         None
     } else {
         let branch_ref = format!("refs/heads/{branch}");
@@ -971,7 +1013,12 @@ mod tests {
             f.root.join("worktree-ownership.json"),
             root.clone(),
         );
-        let action = lock_checkout_actions_at(&f.root.join("checkout-actions.lock")).unwrap();
+        let action = lock_checkout_actions_at(
+            &f.root.join("checkout-actions.lock"),
+            CHECKOUT_ACTION_LOCK_WAIT,
+        )
+        .unwrap()
+        .unwrap();
         let failed = create_checkout_under_lock(
             &action,
             &f.repo,
@@ -1007,7 +1054,12 @@ mod tests {
             f.root.join("worktree-ownership.json"),
             root.clone(),
         );
-        let action = lock_checkout_actions_at(&f.root.join("checkout-actions.lock")).unwrap();
+        let action = lock_checkout_actions_at(
+            &f.root.join("checkout-actions.lock"),
+            CHECKOUT_ACTION_LOCK_WAIT,
+        )
+        .unwrap()
+        .unwrap();
 
         let failed = create_checkout_under_lock(
             &action,
@@ -1172,10 +1224,14 @@ mod tests {
     fn checkout_actions_wait_until_the_previous_operation_releases_its_lock() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("checkout-actions.lock");
-        let first = lock_checkout_actions_at(&path).unwrap();
+        let first = lock_checkout_actions_at(&path, CHECKOUT_ACTION_LOCK_WAIT)
+            .unwrap()
+            .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let _second = lock_checkout_actions_at(&path).unwrap();
+            let _second = lock_checkout_actions_at(&path, CHECKOUT_ACTION_LOCK_WAIT)
+                .unwrap()
+                .unwrap();
             entered_tx.send(()).unwrap();
         });
         assert!(
@@ -1188,5 +1244,20 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         worker.join().unwrap();
+    }
+    #[test]
+    fn an_interactive_wait_gives_up_while_another_action_holds_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("checkout-actions.lock");
+        let _first = lock_checkout_actions_at(&path, CHECKOUT_ACTION_LOCK_WAIT)
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            lock_checkout_actions_at(&path, std::time::Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

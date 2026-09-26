@@ -22,6 +22,10 @@ const MAX_INCLUDE_BYTES: u64 = 1024 * 1024;
 const MAX_PATH_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 1024 * 1024;
 const COPY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Full byte copies are taken only when copy-on-write is unavailable. Past
+/// this per-checkout total, remaining files are skipped instead of filling
+/// the disk with one duplicate cache per worktree.
+const STREAM_COPY_BUDGET: u64 = 1024 * 1024 * 1024;
 const CHANNEL_CAPACITY: usize = 32;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -32,13 +36,14 @@ pub(crate) struct CopyIgnoredReport {
     pub(crate) copied: usize,
     pub(crate) already_present: usize,
     pub(crate) skipped_unsafe: usize,
+    pub(crate) skipped_over_budget: usize,
 }
 
 impl CopyIgnoredReport {
     /// Symlinks and unsafe paths are never copied, so a selected cache such
     /// as `node_modules/` can arrive incomplete.
     pub(crate) fn skipped_warning(&self) -> Option<String> {
-        match self.skipped_unsafe {
+        let unsafe_paths = match self.skipped_unsafe {
             0 => None,
             count => Some(format!(
                 "{count} {} selected by {INCLUDE_FILE} {} not copied because {} symlinks or unsafe paths; copied caches such as node_modules/ may be incomplete",
@@ -46,6 +51,19 @@ impl CopyIgnoredReport {
                 if count == 1 { "was" } else { "were" },
                 if count == 1 { "it is" } else { "they are" },
             )),
+        };
+        let over_budget = match self.skipped_over_budget {
+            0 => None,
+            count => Some(format!(
+                "{count} {} selected by {INCLUDE_FILE} {} not copied because copy-on-write is unavailable here and full copies are limited to {} MiB per worktree",
+                if count == 1 { "file" } else { "files" },
+                if count == 1 { "was" } else { "were" },
+                STREAM_COPY_BUDGET / (1024 * 1024),
+            )),
+        };
+        match (unsafe_paths, over_budget) {
+            (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+            (first, second) => first.or(second),
         }
     }
 }
@@ -59,6 +77,14 @@ impl CopyIgnoredReport {
 pub(crate) fn copy_selected_ignored(
     repository: &Path,
     destination: &Path,
+) -> Result<CopyIgnoredReport, String> {
+    copy_selected_ignored_within(repository, destination, STREAM_COPY_BUDGET)
+}
+
+fn copy_selected_ignored_within(
+    repository: &Path,
+    destination: &Path,
+    mut stream_budget: u64,
 ) -> Result<CopyIgnoredReport, String> {
     let repository = canonical_directory(repository, "repository")?;
     let common = git_common_dir(&repository)?;
@@ -110,7 +136,7 @@ pub(crate) fn copy_selected_ignored(
     let staging = staging_directory(&destination)?;
     let mut report = CopyIgnoredReport::default();
 
-    stream_ignored_paths(&principal, |relative| {
+    stream_ignored_paths(&principal, |relative, deadline| {
         let Some(relative) = safe_relative_path(&relative) else {
             report.skipped_unsafe += 1;
             return Ok(());
@@ -158,9 +184,15 @@ pub(crate) fn copy_selected_ignored(
             &parent,
             &destination_path,
             destination_name,
+            deadline,
+            stream_budget,
         ) {
             Ok(CopyMethod::Reflink) => report.reflinked += 1,
-            Ok(CopyMethod::Stream) => report.copied += 1,
+            Ok(CopyMethod::Stream) => {
+                stream_budget = stream_budget.saturating_sub(source_metadata.len());
+                report.copied += 1;
+            }
+            Ok(CopyMethod::OverBudget) => report.skipped_over_budget += 1,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 report.already_present += 1;
             }
@@ -343,7 +375,7 @@ fn read_include_matcher(
 
 fn stream_ignored_paths(
     repository: &Path,
-    on_path: impl FnMut(PathBuf) -> Result<(), String>,
+    on_path: impl FnMut(PathBuf, Instant) -> Result<(), String>,
 ) -> Result<(), String> {
     stream_ignored_paths_within(repository, COPY_TIMEOUT, on_path)
 }
@@ -352,7 +384,7 @@ fn stream_ignored_paths(
 fn stream_ignored_paths_within(
     repository: &Path,
     timeout: Duration,
-    mut on_path: impl FnMut(PathBuf) -> Result<(), String>,
+    mut on_path: impl FnMut(PathBuf, Instant) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut command = crate::git_command::git_at(repository);
     command.args([
@@ -390,7 +422,7 @@ fn stream_ignored_paths_within(
         match receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(Ok(bytes)) => match path_from_git_bytes(bytes) {
                 Ok(path) => {
-                    if let Err(error) = on_path(path) {
+                    if let Err(error) = on_path(path, deadline) {
                         failure = Some(error);
                         terminate_child(&mut child);
                         break;
@@ -847,6 +879,29 @@ fn ensure_destination_parent(
     }
 }
 
+fn copy_before_deadline(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "copying ignored Git files timed out",
+            ));
+        }
+        let read = match input.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        output.write_all(&buffer[..read])?;
+    }
+}
+
 fn copy_without_overwrite(
     source: &File,
     source_metadata: &fs::Metadata,
@@ -854,6 +909,8 @@ fn copy_without_overwrite(
     destination_parent: &DestinationParent,
     destination: &Path,
     destination_name: &OsStr,
+    deadline: Instant,
+    stream_budget: u64,
 ) -> io::Result<CopyMethod> {
     debug_assert!(destination.starts_with(&destination_parent.path));
     #[cfg(target_os = "macos")]
@@ -886,12 +943,15 @@ fn copy_without_overwrite(
             return Ok(CopyMethod::Reflink);
         }
 
+        if source_metadata.len() > stream_budget {
+            return Ok(CopyMethod::OverBudget);
+        }
         // A failed reflink may have partially changed the empty staging file.
         output.set_len(0)?;
         let mut input = source.try_clone()?;
         input.seek(SeekFrom::Start(0))?;
         output.seek(SeekFrom::Start(0))?;
-        io::copy(&mut input, &mut output)?;
+        copy_before_deadline(&mut input, &mut output, deadline)?;
         output.flush()?;
         set_file_mode(&output, source_metadata)?;
         output.sync_all()?;
@@ -900,6 +960,10 @@ fn copy_without_overwrite(
     drop(output);
 
     let method = match copy_result {
+        Ok(CopyMethod::OverBudget) => {
+            unlink_child(&staging.directory, &temporary_name, &staging.path)?;
+            return Ok(CopyMethod::OverBudget);
+        }
         Ok(method) => method,
         Err(error) => {
             let _ = unlink_child(&staging.directory, &temporary_name, &staging.path);
@@ -922,6 +986,7 @@ fn copy_without_overwrite(
 enum CopyMethod {
     Reflink,
     Stream,
+    OverBudget,
 }
 
 fn open_read_no_follow(path: &Path) -> io::Result<File> {
@@ -1305,13 +1370,34 @@ mod tests {
         }
 
         let error =
-            stream_ignored_paths_within(&fixture.repository, Duration::from_millis(150), |_| {
+            stream_ignored_paths_within(&fixture.repository, Duration::from_millis(150), |_, _| {
                 thread::sleep(Duration::from_millis(100));
                 Ok(())
             })
             .unwrap_err();
 
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn a_streamed_file_copy_stops_at_the_copy_deadline() {
+        struct Endless;
+        impl Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                thread::sleep(Duration::from_millis(20));
+                buffer.fill(1);
+                Ok(buffer.len())
+            }
+        }
+
+        let error = copy_before_deadline(
+            &mut Endless,
+            &mut io::sink(),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[cfg(unix)]
@@ -1549,6 +1635,31 @@ mod tests {
         copy_selected_ignored(&fixture.repository, &fixture.destination).unwrap();
 
         assert!(!outside.join("data").exists());
+    }
+
+    #[test]
+    fn full_copies_stop_at_the_stream_budget() {
+        let fixture = Fixture::new();
+        fs::write(fixture.repository.join(".gitignore"), "cache/\n").unwrap();
+        fixture.include("cache/\n");
+        fixture.write_ignored("cache/a", "first");
+        fixture.write_ignored("cache/b", "second");
+
+        let report =
+            copy_selected_ignored_within(&fixture.repository, &fixture.destination, 0).unwrap();
+
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.reflinked + report.skipped_over_budget, 2);
+        if report.skipped_over_budget > 0 {
+            assert!(report.skipped_warning().unwrap().contains("copy-on-write"));
+        }
+        let staged = fs::read_dir(fixture.destination.join("cache"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            staged, report.reflinked,
+            "skipped files leave nothing behind"
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -182,7 +182,7 @@ pub(crate) fn run_pre_remove(
     }
     if let Some(hook) = prepared_hook(
         state_path,
-        checkout,
+        repository,
         repository,
         checkout,
         branch,
@@ -208,7 +208,7 @@ pub(crate) fn prepare_post_remove(
     }
     prepared_hook(
         state_path,
-        checkout,
+        repository,
         repository,
         checkout,
         branch,

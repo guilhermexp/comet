@@ -178,12 +178,15 @@ impl OwnershipJournal {
     /// Persist a `PendingCreate` record before invoking `git worktree add`.
     /// The parent directory is created and canonicalized first; the target must
     /// be a direct child of this repository's generated directory under the
-    /// configured root and must not already exist.
+    /// configured root and must not already exist. `created_branch` names the
+    /// branch this creation makes; an existing branch checked out here is not
+    /// recorded, so removal never deletes it.
     pub fn pending_create(
         &self,
         repository: &Path,
         path: &Path,
         operation_id: &str,
+        created_branch: Option<&str>,
     ) -> Result<CreateReservation> {
         if operation_id.trim().is_empty() {
             return Err(OwnershipError::Invalid(
@@ -277,6 +280,7 @@ impl OwnershipJournal {
             target_path: path_string(&canonical_target),
             checkout: None,
             preparation_pending: true,
+            created_branch: created_branch.map(str::to_owned),
         });
         self.write_document(&document)?;
         Ok(CreateReservation {
@@ -407,6 +411,7 @@ impl OwnershipJournal {
             // they cannot prove setup completed. Keep them pending until the
             // current setup flow confirms success.
             preparation_pending: true,
+            created_branch: None,
         });
         self.write_document(&document)?;
         Ok(true)
@@ -552,6 +557,39 @@ impl OwnershipJournal {
             self.write_document(&document)?;
         }
         Ok(())
+    }
+
+    /// The branch Comet created together with this owned checkout, if any.
+    pub fn created_branch(&self, repository: &Path, checkout: &Path) -> Result<Option<String>> {
+        let repository = RepositoryIdentity::observe(repository)?;
+        let target = path_string(&canonical_future_path(checkout)?);
+        Ok(self
+            .read_document()?
+            .records
+            .into_iter()
+            .rev()
+            .find(|record| {
+                record.stage == OwnershipStage::Owned
+                    && record.target_path == target
+                    && record.repository == repository
+            })
+            .and_then(|record| record.created_branch))
+    }
+
+    /// Follow a rename of the branch Comet created for an owned checkout.
+    /// Any other branch is left unrecorded.
+    pub fn rename_created_branch(&self, checkout: &Path, from: &str, to: &str) -> Result<()> {
+        let target = path_string(&canonical_future_path(checkout)?);
+        let mut document = self.read_document()?;
+        let Some(record) = document.records.iter_mut().rev().find(|record| {
+            record.stage == OwnershipStage::Owned
+                && record.target_path == target
+                && record.created_branch.as_deref() == Some(from)
+        }) else {
+            return Ok(());
+        };
+        record.created_branch = Some(to.to_owned());
+        self.write_document(&document)
     }
 
     /// Retire ownership only after Git has dropped the linked checkout. This
@@ -772,6 +810,8 @@ struct OwnershipRecord {
     checkout: Option<CheckoutIdentity>,
     #[serde(default = "default_preparation_pending")]
     preparation_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_branch: Option<String>,
 }
 
 fn default_preparation_pending() -> bool {
@@ -1159,7 +1199,7 @@ mod tests {
         let target = worktree_path(&root, &repository, "feature").unwrap();
         let journal = OwnershipJournal::at(temp.path().join("ownership.json"), root);
         let first = journal
-            .pending_create(&repository, &target, "first")
+            .pending_create(&repository, &target, "first", None)
             .unwrap();
         worktree(&repository, &first.path, "feature/first");
         journal
@@ -1179,7 +1219,7 @@ mod tests {
         );
 
         let second = journal
-            .pending_create(&repository, &target, "second")
+            .pending_create(&repository, &target, "second", None)
             .unwrap();
         worktree(&repository, &second.path, "feature/second");
         journal
@@ -1226,7 +1266,7 @@ mod tests {
         let target = worktree_path(&root, &repository, "interrupted").unwrap();
         let journal = OwnershipJournal::at(temp.path().join("ownership.json"), root);
         journal
-            .pending_create(&repository, &target, "interrupted")
+            .pending_create(&repository, &target, "interrupted", None)
             .unwrap();
         worktree(&repository, &target, "feature/interrupted");
         journal
@@ -1252,7 +1292,7 @@ mod tests {
         let target = worktree_path(&root, &repository, "feature").unwrap();
         let journal = OwnershipJournal::at(temp.path().join("ownership.json"), root);
         journal
-            .pending_create(&repository, &target, "failed")
+            .pending_create(&repository, &target, "failed", None)
             .unwrap();
         journal
             .abort_absent_create(&repository, &target, "failed")
@@ -1262,7 +1302,7 @@ mod tests {
             Some(OwnershipStage::Aborted)
         );
         journal
-            .pending_create(&repository, &target, "retry")
+            .pending_create(&repository, &target, "retry", None)
             .unwrap();
     }
 
@@ -1279,7 +1319,7 @@ mod tests {
         // this models failure to persist CreatedObserved after `git worktree add`.
         let pending_path = worktree_path(&journal.worktrees_root, &repository, "pending").unwrap();
         let pending = journal
-            .pending_create(&repository, &pending_path, "op-pending")
+            .pending_create(&repository, &pending_path, "op-pending", None)
             .unwrap();
         worktree(&repository, &pending.path, "feature/pending");
         assert!(
@@ -1300,7 +1340,7 @@ mod tests {
         );
 
         let reservation = journal
-            .pending_create(&repository, &target, "op-owned")
+            .pending_create(&repository, &target, "op-owned", None)
             .unwrap();
         assert_eq!(reservation.path, target);
         worktree(&repository, &reservation.path, "feature/sidebar");
@@ -1347,7 +1387,7 @@ mod tests {
         let journal = OwnershipJournal::at(temp.path().join("journal.json"), root.clone());
         let target = worktree_path(&root, &repository, "feature/setup").unwrap();
         let reservation = journal
-            .pending_create(&repository, &target, "op-setup")
+            .pending_create(&repository, &target, "op-setup", None)
             .unwrap();
         worktree(&repository, &reservation.path, "feature/setup");
         journal
@@ -1399,7 +1439,9 @@ mod tests {
         repo(&foreign);
         let target = worktree_path(&root, &repository, "feature").unwrap();
         let journal = OwnershipJournal::at(temp.path().join("journal.json"), root.clone());
-        let reservation = journal.pending_create(&repository, &target, "op").unwrap();
+        let reservation = journal
+            .pending_create(&repository, &target, "op", None)
+            .unwrap();
         worktree(&repository, &reservation.path, "feature");
         journal
             .created_observed(&repository, &reservation.path, "op")
@@ -1540,7 +1582,8 @@ mod tests {
 
         let pending_target = worktree_path(&root, &repository, "pending-write-fails").unwrap();
         fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o500)).unwrap();
-        let pending_result = journal.pending_create(&repository, &pending_target, "pending-fail");
+        let pending_result =
+            journal.pending_create(&repository, &pending_target, "pending-fail", None);
         fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(pending_result.is_err());
         assert!(
@@ -1550,7 +1593,7 @@ mod tests {
 
         let observed_target = worktree_path(&root, &repository, "observed-write-fails").unwrap();
         let reservation = journal
-            .pending_create(&repository, &observed_target, "observed-fail")
+            .pending_create(&repository, &observed_target, "observed-fail", None)
             .unwrap();
         worktree(&repository, &reservation.path, "feature/observed-fail");
         fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o500)).unwrap();
@@ -1583,7 +1626,7 @@ mod tests {
         // restart reconciliation may safely finish that one transition.
         let final_target = worktree_path(&root, &repository, "finalize-write-fails").unwrap();
         let final_reservation = journal
-            .pending_create(&repository, &final_target, "finalize-fail")
+            .pending_create(&repository, &final_target, "finalize-fail", None)
             .unwrap();
         worktree(
             &repository,

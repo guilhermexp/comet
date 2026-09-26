@@ -1056,7 +1056,7 @@ fn post_start_script(hook: &RenderedHook, control: &PostStartControl) -> String 
     let ready = shell_quote(&control.ready_path.to_string_lossy());
     let token = shell_quote(&control.token);
     format!(
-        "umask 077\n(\n  trap '' TERM\n  while IFS= read -r __comet_stop_token; do\n    if [ \"$__comet_stop_token\" = {token} ]; then\n      kill -TERM -$$ 2>/dev/null\n      sleep 0.15\n      kill -KILL -$$ 2>/dev/null\n      exit 0\n    fi\n  done\n) < {fifo} &\n__comet_stop_watcher=$!\nexec 3> {fifo}\n: > {ready}\nprintf '%s\\n' ready >&3\n{commands}\n__comet_post_status=$?\nexec 3>&-\nwait \"$__comet_stop_watcher\" 2>/dev/null\nexit \"$__comet_post_status\"\n",
+        "(\n  trap '' TERM\n  while IFS= read -r __comet_stop_token; do\n    if [ \"$__comet_stop_token\" = {token} ]; then\n      kill -TERM -$$ 2>/dev/null\n      sleep 0.15\n      kill -KILL -$$ 2>/dev/null\n      exit 0\n    fi\n  done\n) < {fifo} &\n__comet_stop_watcher=$!\nexec 3> {fifo}\n(umask 077; : > {ready})\nprintf '%s\\n' ready >&3\n{commands}\n__comet_post_status=$?\nexec 3>&-\nwait \"$__comet_stop_watcher\" 2>/dev/null\nexit \"$__comet_post_status\"\n",
         commands = rendered_script(hook),
     )
 }

@@ -4518,6 +4518,19 @@ impl DocHost {
                         }
                     }
                 }
+                // Timestamp canonicalization: the user message lands in
+                // history at the moment the user SENT it (the entry's
+                // issued_at, clamped against clock skew) — not whenever this
+                // host got around to draining a queued command. Idempotent by
+                // id, so the dispatch path's own execution-time write dedupes
+                // to a no-op.
+                if let Err(err) = handle.write_user_message(
+                    message_id,
+                    &request.prompt,
+                    entry.issued_at.min(now_ms()),
+                ) {
+                    tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
+                }
                 if let Some(error) = worktree_setup_error.as_deref() {
                     if let Some(spec) = worktree_spec.as_ref()
                         && spec.space_id.is_some()
@@ -4590,19 +4603,6 @@ impl DocHost {
                     if let Err(err) = ws.set_chat_config(chat_id, &config) {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
                     }
-                }
-                // Timestamp canonicalization: the user message lands in
-                // history at the moment the user SENT it (the entry's
-                // issued_at, clamped against clock skew) — not whenever this
-                // host got around to draining a queued command. Idempotent by
-                // id, so the dispatch path's own execution-time write dedupes
-                // to a no-op.
-                if let Err(err) = handle.write_user_message(
-                    message_id,
-                    &request.prompt,
-                    entry.issued_at.min(now_ms()),
-                ) {
-                    tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
                 }
                 if let Some(warning) = transcript_copy_warning.as_deref()
                     && let Err(err) = handle.write_marker(&copy_warning_notice(warning))
@@ -4898,34 +4898,45 @@ impl DocHost {
                 copy_warning: prepared.copy_warning,
             });
         }
+        let ws = self.workspace().ok_or_else(|| {
+            EngineError::Other("the Chat workspace is unavailable for a new worktree".into())
+        })?;
         let repository = std::path::Path::new(&spec.repo_path);
         let pending = repos
             .create_worktree_unprepared(repository, &spec.base)
             .await?;
         let pending_cwd = pending.path.to_string_lossy().to_string();
-        let ws = self.workspace().ok_or_else(|| {
-            EngineError::Other(format!(
-                "worktree {} was created, but the Chat workspace is unavailable",
-                pending.path.display()
-            ))
-        })?;
         // Persist the checkout association before setup or pre-start can
         // block/fail. PendingChatCheckout keeps a Preparing reservation
         // alive, so removal cannot race this handoff.
-        ws.claim_chat(chat_id, Some(&pending_cwd))?;
-        ws.set_chat_cwd(chat_id, &pending_cwd).map_err(|error| {
-            EngineError::Other(format!(
-                "worktree {} was created, but its Chat cwd could not be saved: {error}",
-                pending.path.display()
-            ))
-        })?;
-        ws.set_chat_branch(chat_id, &pending.branch)
-            .map_err(|error| {
+        let persisted = (|| -> Result<(), EngineError> {
+            ws.claim_chat(chat_id, Some(&pending_cwd))?;
+            ws.set_chat_cwd(chat_id, &pending_cwd).map_err(|error| {
                 EngineError::Other(format!(
-                    "worktree {} was created, but its Chat branch could not be saved: {error}",
+                    "worktree {} was created, but its Chat cwd could not be saved: {error}",
                     pending.path.display()
                 ))
             })?;
+            ws.set_chat_branch(chat_id, &pending.branch)
+                .map_err(|error| {
+                    EngineError::Other(format!(
+                        "worktree {} was created, but its Chat branch could not be saved: {error}",
+                        pending.path.display()
+                    ))
+                })
+                .map(|_| ())
+        })();
+        if let Err(error) = persisted {
+            let path = pending.path.clone();
+            drop(pending);
+            return Err(match repos.delete_worktree(repository, &path).await {
+                Ok(()) => error,
+                Err(rollback) => EngineError::Other(format!(
+                    "{error}; the unused worktree {} could not be removed: {rollback}",
+                    path.display()
+                )),
+            });
+        }
         let creation = repos
             .finish_created_worktree_for_chat(repository, pending)
             .await?;

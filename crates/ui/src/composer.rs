@@ -9200,11 +9200,13 @@ impl Composer {
                     let poll_target_device_id = host_device_id.clone();
                     this.update(cx, |_, cx| {
                         cx.spawn(async move |this, cx| {
-                            // Checkout copy, setup and pre-start may each take
-                            // minutes. Keep the handoff alive for the engine's
-                            // 720s lifecycle deadline plus delivery margin.
-                            let deadline = std::time::Instant::now() + Duration::from_secs(750);
-                            while std::time::Instant::now() < deadline {
+                            // Checkout creation, copy, setup and pre-start are
+                            // chained and the engine waits for each to settle
+                            // rather than abandoning it, so there is no engine
+                            // deadline to mirror. Poll quickly at first, then
+                            // back off for the long tail.
+                            let started = std::time::Instant::now();
+                            while started.elapsed() < Duration::from_secs(60 * 60) {
                                 let mut params = serde_json::json!({
                                     "chatId": poll_chat_id,
                                     "commandId": command_id,
@@ -9255,9 +9257,12 @@ impl Composer {
                                     Err(error) if error.starts_with("unknown method: ") => return,
                                     Ok(_) | Err(_) => {}
                                 }
-                                cx.background_executor()
-                                    .timer(Duration::from_millis(250))
-                                    .await;
+                                let interval = if started.elapsed() < Duration::from_secs(60) {
+                                    Duration::from_millis(250)
+                                } else {
+                                    Duration::from_secs(2)
+                                };
+                                cx.background_executor().timer(interval).await;
                             }
                             tracing::warn!(
                                 chat = %poll_chat_id,

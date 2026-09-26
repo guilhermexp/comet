@@ -545,8 +545,9 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
     true
 }
 
-/// The device-wide checkout action lock can be held for minutes by a Git
-/// mutation, so a multi-threaded runtime yields its worker while waiting. The
+/// The device-wide checkout action lock is waited on only briefly, so the
+/// terminal fails as busy well inside the OpenTerminal deadline; a
+/// multi-threaded runtime still yields its worker while waiting. The
 /// reservation exists before the shell starts, so removal never races it.
 fn reserve_checkout(
     cwd: &str,

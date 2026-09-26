@@ -245,6 +245,23 @@ fn create_chat_checkout_unprepared(
 
 /// Retry a previously failed Chat preparation in its existing checkout. An
 /// external checkout or a successfully prepared one is a no-op.
+/// Keep branch ownership attached to a Chat checkout whose Comet-created
+/// branch was renamed, so removal can still clean it up once integrated.
+pub fn record_checkout_branch_rename(
+    checkout: &Path,
+    root: &Path,
+    journal_path: &Path,
+    from: &str,
+    to: &str,
+) -> Result<(), WorkersError> {
+    let journal =
+        worktree_ownership::OwnershipJournal::at(journal_path.to_owned(), root.to_owned());
+    let _action = checkout_lifecycle::lock_checkout_actions()?;
+    journal
+        .rename_created_branch(checkout, from, to)
+        .map_err(|error| WorkersError::State(error.to_string()))
+}
+
 pub fn prepare_checkout_for_chat(
     repository: &Path,
     checkout: &Path,
@@ -5410,6 +5427,58 @@ mod worktree_setup_wiring_tests {
         assert_eq!(
             std::fs::read_to_string(created.path.join("chat-ready.txt")).unwrap(),
             "ready"
+        );
+    }
+
+    #[test]
+    fn chat_checkout_removal_deletes_only_the_branch_comet_created() {
+        let fixture = Fixture::new(None);
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let branch_exists = |branch: &str| {
+            Command::new("git")
+                .args(["show-ref", "--verify", "--quiet"])
+                .arg(format!("refs/heads/{branch}"))
+                .current_dir(fixture.repo())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let status = Command::new("git")
+            .args(["branch", "develop"])
+            .current_dir(fixture.repo())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let existing =
+            create_checkout_for_chat(&fixture.repo(), "develop", None, &root, &journal).unwrap();
+        remove_checkout_for_chat(&fixture.repo(), &existing.path, &root, &journal).unwrap();
+        assert!(!existing.path.exists());
+        assert!(branch_exists("develop"), "a pre-existing branch is kept");
+
+        let created =
+            create_checkout_for_chat(&fixture.repo(), "zeron/first-name", None, &root, &journal)
+                .unwrap();
+        let status = Command::new("git")
+            .args(["branch", "-m", "zeron/first-name", "zeron/titled"])
+            .current_dir(&created.path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        record_checkout_branch_rename(
+            &created.path,
+            &root,
+            &journal,
+            "zeron/first-name",
+            "zeron/titled",
+        )
+        .unwrap();
+        remove_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal).unwrap();
+        assert!(!created.path.exists());
+        assert!(
+            !branch_exists("zeron/titled"),
+            "the integrated branch Comet created is cleaned up after a rename"
         );
     }
 

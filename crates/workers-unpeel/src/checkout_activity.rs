@@ -253,7 +253,19 @@ fn reserve_linked_checkout(
     let Some(checkout) = checkout else {
         return Ok(None);
     };
-    Ok(Some(reserve_operation(operation_id, &checkout, kind)?))
+    if kind != ActivityKind::Terminal {
+        return Ok(Some(reserve_operation(operation_id, &checkout, kind)?));
+    }
+    let Some(_lock) = crate::checkout_lifecycle::lock_checkout_actions_briefly()? else {
+        return Err(crate::WorkersError::State(
+            "another checkout action is in progress; try again shortly".into(),
+        ));
+    };
+    Ok(Some(reserve_operation_under_lock(
+        operation_id,
+        &checkout,
+        kind,
+    )?))
 }
 
 /// Reserve a checkout for an operation whose potentially blocking work will
