@@ -45,8 +45,8 @@ pub(crate) fn copy_selected_ignored(
     destination: &Path,
 ) -> Result<CopyIgnoredReport, String> {
     let repository = canonical_directory(repository, "repository")?;
-    let principal = principal_worktree(&repository)?;
-    let Some(principal) = principal else {
+    let common = git_common_dir(&repository)?;
+    let Some(principal) = principal_worktree(&common)? else {
         return Ok(CopyIgnoredReport::default());
     };
 
@@ -78,9 +78,7 @@ pub(crate) fn copy_selected_ignored(
     if destination == principal {
         return Err("worktree destination is the principal checkout".into());
     }
-    let source_common = git_common_dir(&principal)?;
-    let destination_common = git_common_dir(&destination)?;
-    if source_common != destination_common {
+    if git_common_dir(&destination)? != common {
         return Err(format!(
             "destination {} is not a worktree of the principal repository {}",
             destination.display(),
@@ -93,6 +91,7 @@ pub(crate) fn copy_selected_ignored(
         .into_iter()
         .filter(|path| path != &principal)
         .collect::<Vec<_>>();
+    let staging = staging_directory(&destination)?;
     let mut report = CopyIgnoredReport::default();
 
     stream_ignored_paths(&principal, |relative| {
@@ -132,6 +131,7 @@ pub(crate) fn copy_selected_ignored(
         match copy_without_overwrite(
             &source_file,
             &source_metadata,
+            staging.as_ref().unwrap_or(&parent),
             &parent,
             &destination_path,
             destination_name,
@@ -168,46 +168,17 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot resolve {label} {}: {error}", path.display()))
 }
 
-/// Git lists the repository's principal worktree first, followed by linked
-/// worktrees. Validate the selected root against Git's common directory before
-/// using its opt-in manifest.
-fn principal_worktree(repository: &Path) -> Result<Option<PathBuf>, String> {
-    let output = run_git(repository, &["worktree", "list", "--porcelain", "-z"])?;
-    let mut first_path = None;
-    let mut first_is_bare = false;
-    for record in output.split('\0') {
-        if record.is_empty() {
-            if first_path.is_some() {
-                break;
-            }
-            continue;
-        }
-        if let Some(path) = record.strip_prefix("worktree ") {
-            if first_path.is_none() {
-                first_path = Some(PathBuf::from(path));
-            }
-        } else if record == "bare" && first_path.is_some() {
-            first_is_bare = true;
-        }
-    }
-    if first_is_bare {
+/// The principal worktree is the directory holding Git's common `.git`
+/// directory. Bare repositories and separate Git directories have none, so
+/// there is no opt-in manifest to read.
+fn principal_worktree(common: &Path) -> Result<Option<PathBuf>, String> {
+    if common.file_name() != Some(OsStr::new(".git")) {
         return Ok(None);
     }
-    let Some(path) = first_path else {
-        return Err(format!(
-            "Git returned no principal worktree for {}",
-            repository.display()
-        ));
+    let Some(principal) = common.parent() else {
+        return Ok(None);
     };
-    let principal = canonical_directory(&path, "principal worktree")?;
-    if git_common_dir(&principal)? != git_common_dir(repository)? {
-        return Err(format!(
-            "Git's principal worktree {} does not belong to {}",
-            principal.display(),
-            repository.display()
-        ));
-    }
-    Ok(Some(principal))
+    canonical_directory(principal, "principal worktree").map(Some)
 }
 
 fn git_common_dir(repository: &Path) -> Result<PathBuf, String> {
@@ -227,6 +198,36 @@ fn git_common_dir(repository: &Path) -> Result<PathBuf, String> {
             path.display()
         )
     })
+}
+
+/// Staging files live in the checkout's private Git directory so an
+/// interrupted copy never leaves an untracked file in the worktree. Hard links
+/// cannot cross filesystems, so a Git directory on another filesystem leaves
+/// staging to the destination parent.
+fn staging_directory(destination: &Path) -> Result<Option<DestinationParent>, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let output = run_git(destination, &["rev-parse", "--absolute-git-dir"])?;
+        let path = PathBuf::from(output.trim());
+        let directory = open_directory_no_follow(&path)
+            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        let git_device = directory
+            .metadata()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+            .dev();
+        let destination_device = fs::metadata(destination)
+            .map_err(|error| format!("cannot inspect {}: {error}", destination.display()))?
+            .dev();
+        return Ok(
+            (git_device == destination_device).then_some(DestinationParent { path, directory })
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = destination;
+        Ok(None)
+    }
 }
 
 fn worktree_paths(repository: &Path) -> Result<Vec<PathBuf>, String> {
@@ -311,7 +312,7 @@ fn stream_ignored_paths(
     let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let reader = thread::spawn(move || send_nul_records(stdout, sender));
     let stderr_reader = thread::spawn(move || read_bounded_stderr(stderr));
-    let deadline = Instant::now() + INVENTORY_TIMEOUT;
+    let mut deadline = Instant::now() + INVENTORY_TIMEOUT;
     let mut status: Option<ExitStatus> = None;
     let mut failure = None;
 
@@ -324,7 +325,10 @@ fn stream_ignored_paths(
         match receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(Ok(bytes)) => match path_from_git_bytes(bytes) {
                 Ok(path) => {
-                    if let Err(error) = on_path(path) {
+                    let started = Instant::now();
+                    let result = on_path(path);
+                    deadline += started.elapsed();
+                    if let Err(error) = result {
                         failure = Some(error);
                         terminate_child(&mut child);
                         break;
@@ -771,6 +775,7 @@ fn ensure_destination_parent(
 fn copy_without_overwrite(
     source: &File,
     source_metadata: &fs::Metadata,
+    staging: &DestinationParent,
     destination_parent: &DestinationParent,
     destination: &Path,
     destination_name: &OsStr,
@@ -797,7 +802,7 @@ fn copy_without_overwrite(
         }
     }
 
-    let (temporary_name, mut output) = create_temporary_destination(destination_parent)?;
+    let (temporary_name, mut output) = create_temporary_destination(staging)?;
     let copy_result: io::Result<CopyMethod> = (|| {
         #[cfg(target_os = "linux")]
         if try_ficlone(source, &output).is_ok() {
@@ -822,25 +827,17 @@ fn copy_without_overwrite(
     let method = match copy_result {
         Ok(method) => method,
         Err(error) => {
-            let _ = unlink_child(
-                &destination_parent.directory,
-                &temporary_name,
-                &destination_parent.path,
-            );
+            let _ = unlink_child(&staging.directory, &temporary_name, &staging.path);
             return Err(error);
         }
     };
     let publish_result = publish_temporary(
-        &destination_parent.directory,
+        staging,
         &temporary_name,
+        destination_parent,
         destination_name,
-        &destination_parent.path,
     );
-    let cleanup_result = unlink_child(
-        &destination_parent.directory,
-        &temporary_name,
-        &destination_parent.path,
-    );
+    let cleanup_result = unlink_child(&staging.directory, &temporary_name, &staging.path);
     publish_result?;
     cleanup_result?;
     Ok(method)
@@ -995,10 +992,10 @@ fn create_temporary_destination(parent: &DestinationParent) -> io::Result<(OsStr
 }
 
 fn publish_temporary(
-    parent: &File,
+    staging: &DestinationParent,
     temporary: &OsStr,
+    parent: &DestinationParent,
     destination: &OsStr,
-    _parent_path: &Path,
 ) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -1011,13 +1008,13 @@ fn publish_temporary(
             io::Error::new(io::ErrorKind::InvalidInput, "destination name contains NUL")
         })?;
         // linkat is atomic and fails with EEXIST instead of replacing a file
-        // created concurrently. Both names live in this directory.
-        // SAFETY: parent is an open directory and both NUL strings are single components.
+        // created concurrently. Both directories share one filesystem.
+        // SAFETY: both are open directories and both NUL strings are single components.
         let result = unsafe {
             libc::linkat(
-                parent.as_raw_fd(),
+                staging.directory.as_raw_fd(),
                 temporary.as_ptr(),
-                parent.as_raw_fd(),
+                parent.directory.as_raw_fd(),
                 destination.as_ptr(),
                 0,
             )
@@ -1030,7 +1027,7 @@ fn publish_temporary(
     }
     #[cfg(not(unix))]
     {
-        fs::hard_link(_parent_path.join(temporary), _parent_path.join(destination))
+        fs::hard_link(staging.path.join(temporary), parent.path.join(destination))
     }
 }
 
