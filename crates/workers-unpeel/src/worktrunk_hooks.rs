@@ -211,7 +211,7 @@ impl HookCommand {
                             kind,
                             self.name.as_deref(),
                             &name,
-                            "value may contain only letters, digits and . _ / @ + -",
+                            "value may contain only letters, digits and . _ / @ + - #",
                         ));
                     }
                     let value = if sanitize {
@@ -591,7 +591,7 @@ fn is_identifier(value: &str) -> bool {
 
 fn is_plain_ref_name(value: &str) -> bool {
     value.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '@' | '+' | '-')
+        character.is_alphanumeric() || matches!(character, '.' | '_' | '/' | '@' | '+' | '-' | '#')
     })
 }
 
@@ -1768,6 +1768,24 @@ generated = "rm -rf generated"
         let rendered = plan.render(&context).unwrap();
         run_pre_hook(&rendered, temp.path(), TEST_TIMEOUT).unwrap();
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn git_refs_with_unicode_letters_and_issue_numbers_render_safely() {
+        let plan = hook(
+            "pre-start = \"sh -c 'printf %s {{ branch }}'\"",
+            HookKind::PreStart,
+        );
+        for branch in ["feat/correção", "fix/#123"] {
+            let rendered = plan.render(&render_context(branch)).unwrap();
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&rendered.stages[0][0].command)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), branch);
+        }
     }
 
     #[test]

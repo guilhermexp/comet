@@ -431,9 +431,9 @@ pub(crate) fn busy_at(file: &Path, checkout: &Path) -> Result<Option<ActivityEnt
 /// Like [`busy_at`], ignoring the caller's own `operation_id`. Removal passes
 /// `include_terminals` so an open terminal keeps the checkout in use.
 ///
-/// `ChatRun`, `Removing` and `Terminal` entries whose recording process has
-/// died are reclaimed here: a crashed or quit host must not block every later
-/// preparation or removal of the same checkout. Other kinds stay fail-closed.
+/// `Removing` and `Terminal` entries whose recording process has died are
+/// reclaimed here. A crashed Chat may leave an agent process group running,
+/// so its `ChatRun` reservation remains fail-closed until explicitly settled.
 pub(crate) fn busy_except_at(
     file: &Path,
     checkout: &Path,
@@ -444,10 +444,8 @@ pub(crate) fn busy_except_at(
     let mut state = read(file)?;
     let before = state.entries.len();
     state.entries.retain(|_, entry| {
-        !matches!(
-            entry.kind,
-            ActivityKind::ChatRun | ActivityKind::Removing | ActivityKind::Terminal
-        ) || process_is_alive(entry.process_id, entry.process_started)
+        !matches!(entry.kind, ActivityKind::Removing | ActivityKind::Terminal)
+            || process_is_alive(entry.process_id, entry.process_started)
     });
     if state.entries.len() != before {
         write(file, &state)?;
@@ -606,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn host_entries_of_a_dead_process_are_reclaimed_but_other_kinds_stay_busy() {
+    fn dead_terminal_and_removing_entries_are_reclaimed_but_chat_run_stays_busy() {
         let removing = tempfile::tempdir().unwrap();
         let running = tempfile::tempdir().unwrap();
         let terminal = tempfile::tempdir().unwrap();
@@ -633,8 +631,12 @@ mod tests {
                 .is_none()
         );
         assert!(!read(&file).unwrap().entries.contains_key("terminal"));
-        assert!(busy_at(&file, running.path()).unwrap().is_none());
-        assert!(!read(&file).unwrap().entries.contains_key("run"));
+        assert_eq!(
+            busy_at(&file, running.path()).unwrap().unwrap().kind,
+            ActivityKind::ChatRun,
+            "an orphaned harness may still be writing after the engine dies"
+        );
+        assert!(read(&file).unwrap().entries.contains_key("run"));
         assert_eq!(
             busy_at(&file, preparing.path()).unwrap().unwrap().kind,
             ActivityKind::Preparing

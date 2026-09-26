@@ -901,16 +901,6 @@ fn reject_pending_checkout_preparation(
     Ok(())
 }
 
-/// Keep the removal guard live across the detached Host's startup window. The
-/// launch RPC returns after the Host process was spawned, before that process
-/// necessarily wrote the manifest that bootstrap uses to expose a live Worker.
-/// Once the exact Session/checkout pair appears on disk, every later bootstrap
-/// can see it and the temporary reservation can be released.
-///
-/// Deliberately has no timeout: a missing manifest is not proof that the Host
-/// is dead, so releasing by elapsed time could let removal race a late start.
-/// If the Host exits without publishing a matching manifest, recovery is
-/// explicit because the checkout activity lease remains busy.
 /// A prepared checkout is returned only after its reservation is gone, so an
 /// immediate retarget or removal does not see the finished preparation.
 fn release_preparation(preparing: Option<CheckoutActivityReservation>) {
@@ -921,6 +911,16 @@ fn release_preparation(preparing: Option<CheckoutActivityReservation>) {
     }
 }
 
+/// Keep the removal guard live across the detached Host's startup window. The
+/// launch RPC returns after the Host process was spawned, before that process
+/// necessarily wrote the manifest that bootstrap uses to expose a live Worker.
+/// Once the exact Session/checkout pair appears on disk, every later bootstrap
+/// can see it and the temporary reservation can be released.
+///
+/// Deliberately has no timeout: a missing manifest is not proof that the Host
+/// is dead, so releasing by elapsed time could let removal race a late start.
+/// If the Host exits without publishing a matching manifest, recovery is
+/// explicit because the checkout activity lease remains busy.
 fn release_starting_worker_after_manifest(
     reservation: CheckoutActivityReservation,
     session_id: String,

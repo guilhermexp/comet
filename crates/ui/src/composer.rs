@@ -10100,6 +10100,7 @@ impl Composer {
             }
             .await;
 
+            let mut retained_checkout = None;
             if result.is_err() {
                 if live_started {
                     let _ = attachments::call_with_timeout(
@@ -10122,7 +10123,7 @@ impl Composer {
                     .await;
                 }
                 if let Some((repo_path, worktree_path)) = created_worktree {
-                    let _ = attachments::call_with_timeout(
+                    if let Err(cleanup_error) = attachments::call_with_timeout(
                         &engine,
                         cx.background_executor(),
                         methods::DELETE_WORKTREE,
@@ -10132,7 +10133,12 @@ impl Composer {
                         }),
                         Duration::from_secs(30),
                     )
-                    .await;
+                    .await
+                    {
+                        retained_checkout = Some(format!(
+                            "Checkout kept at {worktree_path}: {cleanup_error}. Remove it after preserving any local files."
+                        ));
+                    }
                 }
             }
 
@@ -10147,7 +10153,10 @@ impl Composer {
                         composer.failure_key = None;
                     }
                     Err(error) => {
-                        composer.failure = Some(format!("Live Voice failed: {error}").into());
+                        let detail = retained_checkout
+                            .map(|warning| format!("{error}. {warning}"))
+                            .unwrap_or(error);
+                        composer.failure = Some(format!("Live Voice failed: {detail}").into());
                         composer.failure_key = Some(String::new());
                     }
                 }
