@@ -732,7 +732,9 @@ fn responsive_right_column_widths(
                 DETAILS_SIDEBAR_MIN + details_extra * extra_scale,
             )
         }
-        (true, _) if budget >= RIGHT_PANE_MIN => (right.clamp(RIGHT_PANE_MIN, budget), 0.0),
+        // An open surface keeps whatever remains below its minimum rather
+        // than vanishing while its tabs are still open.
+        (true, _) => (right.clamp(RIGHT_PANE_MIN.min(budget), budget), 0.0),
         (false, true) if budget >= DETAILS_SIDEBAR_MIN => {
             (0.0, details.clamp(DETAILS_SIDEBAR_MIN, budget))
         }
@@ -747,9 +749,6 @@ fn expanded_right_column_widths(
     requested_details: f32,
 ) -> (f32, f32) {
     let budget = right_pane_takeover_width(viewport, sidebar);
-    if budget < RIGHT_PANE_MIN {
-        return (0.0, 0.0);
-    }
     if details_open && budget >= RIGHT_PANE_MIN + DETAILS_SIDEBAR_MIN {
         let details = requested_details.clamp(DETAILS_SIDEBAR_MIN, budget - RIGHT_PANE_MIN);
         return (budget - details, details);
@@ -15015,6 +15014,11 @@ mod tests {
             responsive_right_column_widths(1000.0, 260.0, true, 520.0, false, 360.0),
             (410.0, 0.0)
         );
+        // Below the surface minimum the open surface keeps the remainder.
+        assert_eq!(
+            responsive_right_column_widths(800.0, 260.0, true, 520.0, true, 360.0),
+            (210.0, 0.0)
+        );
     }
 
     #[test]
@@ -15026,6 +15030,10 @@ mod tests {
         assert_eq!(
             expanded_right_column_widths(850.0, 260.0, true, 500.0),
             (590.0, 0.0)
+        );
+        assert_eq!(
+            expanded_right_column_widths(500.0, 260.0, true, 500.0),
+            (240.0, 0.0)
         );
     }
 

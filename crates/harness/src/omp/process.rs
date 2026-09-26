@@ -36,6 +36,11 @@ enum WriteMessage {
 /// ready" while the child's own reason went to a debug log nobody opens.
 const STDERR_TAIL_LINES: usize = 4;
 
+/// How long a closed stdout waits for the stderr reader to drain. The child
+/// closes both pipes as it exits, but the two readers race: without this wait
+/// the stdout EOF could compose the failure before the reason reached the tail.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Config overlay that keeps USER-level skill roots out of every OMP run:
 /// `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`, `~/.pi/skills`.
 /// A chat should see the skills of the repo it is standing in, not the personal
@@ -217,7 +222,7 @@ impl OmpProcess {
         });
 
         let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-        if let Some(stderr) = stderr {
+        let stderr_reader = stderr.map(|stderr| {
             let tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -241,8 +246,8 @@ impl OmpProcess {
                         }
                     }
                 }
-            });
-        }
+            })
+        });
 
         let inner = Arc::new(Inner {
             writer: write_tx,
@@ -257,7 +262,13 @@ impl OmpProcess {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<OmpCapabilities, String>>();
         let reader_inner = Arc::clone(&inner);
-        tokio::spawn(read_stdout(stdout, reader_inner, event_tx, ready_tx));
+        tokio::spawn(read_stdout(
+            stdout,
+            stderr_reader,
+            reader_inner,
+            event_tx,
+            ready_tx,
+        ));
 
         let mut process = Self {
             inner,
@@ -477,6 +488,7 @@ impl OmpProcess {
 
 async fn read_stdout(
     stdout: tokio::process::ChildStdout,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
     inner: Arc<Inner>,
     event_tx: mpsc::Sender<Value>,
     ready_tx: oneshot::Sender<Result<OmpCapabilities, String>>,
@@ -562,6 +574,9 @@ async fn read_stdout(
                 }
             }
         }
+    }
+    if let Some(stderr_reader) = stderr_reader {
+        let _ = tokio::time::timeout(STDERR_DRAIN_TIMEOUT, stderr_reader).await;
     }
     let message = fatal_message(
         &inner,
