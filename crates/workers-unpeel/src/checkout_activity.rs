@@ -20,6 +20,7 @@ pub enum ActivityKind {
     Preparing,
     StartingWorker,
     Removing,
+    Terminal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,15 +201,28 @@ pub fn reserve_chat_run(
     operation_id: &str,
     cwd: &Path,
 ) -> Result<Option<CheckoutActivityReservation>, crate::WorkersError> {
+    reserve_linked_checkout(operation_id, cwd, ActivityKind::ChatRun)
+}
+
+/// An in-app terminal whose shell starts inside a linked checkout keeps that
+/// checkout in use until the terminal exits or is closed.
+pub fn reserve_terminal(
+    operation_id: &str,
+    cwd: &Path,
+) -> Result<Option<CheckoutActivityReservation>, crate::WorkersError> {
+    reserve_linked_checkout(operation_id, cwd, ActivityKind::Terminal)
+}
+
+fn reserve_linked_checkout(
+    operation_id: &str,
+    cwd: &Path,
+    kind: ActivityKind,
+) -> Result<Option<CheckoutActivityReservation>, crate::WorkersError> {
     let checkout = linked_checkout_root(cwd).map_err(crate::WorkersError::State)?;
     let Some(checkout) = checkout else {
         return Ok(None);
     };
-    Ok(Some(reserve_operation(
-        operation_id,
-        &checkout,
-        ActivityKind::ChatRun,
-    )?))
+    Ok(Some(reserve_operation(operation_id, &checkout, kind)?))
 }
 
 /// Reserve a checkout for an operation whose potentially blocking work will
@@ -382,17 +396,41 @@ pub(crate) fn busy_at(file: &Path, checkout: &Path) -> Result<Option<ActivityEnt
 }
 
 /// Like [`busy_at`], ignoring the caller's own `operation_id`.
+///
+/// A `Removing` entry whose recorded process has died is reclaimed here: a
+/// crashed removal must not block every later removal of the same checkout.
+/// Other kinds stay fail-closed.
 pub(crate) fn busy_except_at(
     file: &Path,
     checkout: &Path,
     operation_id: Option<&str>,
 ) -> Result<Option<ActivityEntry>, String> {
     let canonical = std::fs::canonicalize(checkout).map_err(|error| error.to_string())?;
-    Ok(read(file)?
+    let mut state = read(file)?;
+    let before = state.entries.len();
+    state.entries.retain(|_, entry| {
+        entry.kind != ActivityKind::Removing || process_is_alive(entry.process_id)
+    });
+    if state.entries.len() != before {
+        write(file, &state)?;
+    }
+    Ok(state
         .entries
         .into_iter()
         .find(|(id, entry)| Some(id.as_str()) != operation_id && entry.path == canonical)
         .map(|(_, entry)| entry))
+}
+
+fn process_is_alive(process_id: u32) -> bool {
+    let Ok(process_id) = libc::pid_t::try_from(process_id) else {
+        return true;
+    };
+    if process_id <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only probes whether the process exists.
+    let probed = unsafe { libc::kill(process_id, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(test)]
@@ -485,6 +523,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("positive settlement should remove the lease");
+    }
+
+    #[test]
+    fn removing_entry_of_a_dead_process_is_reclaimed_but_other_kinds_stay_busy() {
+        let removing = tempfile::tempdir().unwrap();
+        let running = tempfile::tempdir().unwrap();
+        let file = removing.path().join("activity.json");
+        begin_at(&file, "remove", removing.path(), ActivityKind::Removing).unwrap();
+        begin_at(&file, "run", running.path(), ActivityKind::ChatRun).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let mut state = read(&file).unwrap();
+        for entry in state.entries.values_mut() {
+            entry.process_id = dead;
+        }
+        write(&file, &state).unwrap();
+
+        assert!(busy_at(&file, removing.path()).unwrap().is_none());
+        assert!(!read(&file).unwrap().entries.contains_key("remove"));
+        assert_eq!(
+            busy_at(&file, running.path()).unwrap().unwrap().kind,
+            ActivityKind::ChatRun
+        );
+    }
+
+    #[test]
+    fn live_removing_entry_stays_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("activity.json");
+        begin_at(&file, "remove", temp.path(), ActivityKind::Removing).unwrap();
+
+        assert_eq!(
+            busy_at(&file, temp.path()).unwrap().unwrap().kind,
+            ActivityKind::Removing
+        );
     }
 
     #[test]

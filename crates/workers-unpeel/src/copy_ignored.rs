@@ -34,6 +34,22 @@ pub(crate) struct CopyIgnoredReport {
     pub(crate) skipped_unsafe: usize,
 }
 
+impl CopyIgnoredReport {
+    /// Symlinks and unsafe paths are never copied, so a selected cache such
+    /// as `node_modules/` can arrive incomplete.
+    pub(crate) fn skipped_warning(&self) -> Option<String> {
+        match self.skipped_unsafe {
+            0 => None,
+            count => Some(format!(
+                "{count} {} selected by {INCLUDE_FILE} {} not copied because {} symlinks or unsafe paths; copied caches such as node_modules/ may be incomplete",
+                if count == 1 { "entry" } else { "entries" },
+                if count == 1 { "was" } else { "were" },
+                if count == 1 { "it is" } else { "they are" },
+            )),
+        }
+    }
+}
+
 /// Copy ignored files selected by the principal checkout's `.worktreeinclude`.
 ///
 /// No include file is an ordinary no-op. Existing destination entries are
@@ -99,11 +115,14 @@ pub(crate) fn copy_selected_ignored(
             report.skipped_unsafe += 1;
             return Ok(());
         };
+        if !matcher
+            .matched_path_or_any_parents(&relative, false)
+            .is_ignore()
+        {
+            return Ok(());
+        }
         if has_blocked_component(&relative)
             || is_inside_another_worktree(&principal, &relative, &nested_worktrees)
-            || !matcher
-                .matched_path_or_any_parents(&relative, false)
-                .is_ignore()
             || source_is_inside_nested_repository(&principal, &relative)
         {
             report.skipped_unsafe += 1;
@@ -1388,6 +1407,43 @@ mod tests {
             fs::read(fixture.destination.join("tracked.txt")).unwrap(),
             b"tracked from principal\n"
         );
+    }
+
+    #[test]
+    fn skipped_symlinks_are_counted_but_unselected_files_are_not() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.repository.join(".gitignore"),
+            "node_modules/\nother/\n",
+        )
+        .unwrap();
+        fixture.include("node_modules/\n");
+        fixture.write_ignored("node_modules/pkg/index.js", "module");
+        fixture.write_ignored("other/a.txt", "unselected");
+        fixture.write_ignored("other/b.txt", "unselected");
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(fixture.repository.join("node_modules/.bin")).unwrap();
+            std::os::unix::fs::symlink(
+                "../pkg/index.js",
+                fixture.repository.join("node_modules/.bin/pkg"),
+            )
+            .unwrap();
+        }
+
+        let report = copy_selected_ignored(&fixture.repository, &fixture.destination).unwrap();
+
+        assert_eq!(report.copied + report.reflinked, 1);
+        #[cfg(unix)]
+        {
+            assert_eq!(report.skipped_unsafe, 1);
+            let warning = report.skipped_warning().unwrap();
+            assert!(
+                warning.starts_with("1 entry selected by .worktreeinclude"),
+                "{warning}"
+            );
+            assert!(!fixture.destination.join("node_modules/.bin/pkg").exists());
+        }
     }
 
     #[test]

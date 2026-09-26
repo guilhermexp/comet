@@ -175,12 +175,14 @@ mod launch_plan_tests {
                 path: "/tmp/repo-wt".into(),
                 branch: "feature/hooks".into(),
                 hook_warning: Some("post-start is pending approval".into()),
+                copy_warning: Some("1 entry was not copied".into()),
             },
         );
 
         assert_eq!(response["project_id"], "checkout-1");
         assert_eq!(response["path"], "/tmp/repo-wt");
         assert_eq!(response["hook_warning"], "post-start is pending approval");
+        assert_eq!(response["copy_warning"], "1 entry was not copied");
     }
 }
 
@@ -190,6 +192,9 @@ fn add_worktree_launch_result(response: &mut Value, result: WorkersWorktreeLaunc
     response["branch"] = result.branch.into();
     if let Some(warning) = result.hook_warning {
         response["hook_warning"] = warning.into();
+    }
+    if let Some(warning) = result.copy_warning {
+        response["copy_warning"] = warning.into();
     }
 }
 

@@ -165,11 +165,12 @@ pub(crate) fn run_start_hooks(
 
 /// Start the advisory hook only after durable preparation has been recorded.
 pub(crate) fn spawn_post_start(hook: RenderedHook, checkout: &Path) -> Result<(), String> {
+    let checkout = std::fs::canonicalize(checkout).map_err(|error| error.to_string())?;
     worktrunk_hooks::spawn_post_hook(
         hook,
-        checkout,
-        checkout,
-        &hook_log_path(checkout, HookKind::PostStart),
+        &checkout,
+        &checkout,
+        &hook_log_path(&checkout, HookKind::PostStart),
     )
     .map_err(|error| error.to_string())
 }
@@ -186,7 +187,7 @@ pub(crate) fn run_pre_remove(
     }
     if let Some(hook) = prepared_hook(
         state_path,
-        checkout,
+        repository,
         repository,
         checkout,
         branch,
@@ -212,7 +213,7 @@ pub(crate) fn prepare_post_remove(
     }
     prepared_hook(
         state_path,
-        checkout,
+        repository,
         repository,
         checkout,
         branch,

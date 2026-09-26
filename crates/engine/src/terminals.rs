@@ -40,6 +40,8 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 struct LiveTerminal {
     // Keep the private action script alive until the shell exits or the tab is closed.
     initial_script: Option<tempfile::NamedTempFile>,
+    /// Keeps a linked checkout in use (not removable) while the shell lives.
+    checkout_activity: Option<zeron_workers_unpeel::CheckoutActivityReservation>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -78,6 +80,7 @@ impl LiveTerminal {
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
         if matches!(event, TerminalEvent::Exit { .. }) {
             self.initial_script.take();
+            self.checkout_activity.take();
             self.exited = true;
             self.subscribers.clear();
         }
@@ -331,6 +334,7 @@ impl Terminals {
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
             initial_script,
+            checkout_activity: None,
             master: Some(master),
             writer: Some(writer),
             killer,
@@ -346,6 +350,7 @@ impl Terminals {
             exited: false,
         }));
         lock(&self.inner.sessions).insert(id.clone(), session.clone());
+        reserve_checkout(Arc::downgrade(&session), cwd.to_owned());
 
         // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -519,6 +524,7 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
         tracing::debug!(error = %err, "terminal kill failed (already exited?)");
     }
     session.initial_script.take();
+    session.checkout_activity.take();
     #[cfg(windows)]
     {
         let cleanup = windows::Cleanup::start(&mut session);
@@ -529,6 +535,29 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
         }
     }
     true
+}
+
+/// The device-wide checkout action lock can be held for minutes by a Git
+/// mutation, so the reservation is taken off the async executor and attached
+/// once acquired. A shell that already exited never receives it.
+fn reserve_checkout(session: Weak<Mutex<LiveTerminal>>, cwd: String) {
+    tokio::task::spawn_blocking(move || {
+        let operation_id = format!("terminal-{}", new_id());
+        match zeron_workers_unpeel::reserve_terminal(&operation_id, std::path::Path::new(&cwd)) {
+            Ok(Some(reservation)) => {
+                if let Some(session) = session.upgrade() {
+                    let mut session = lock(&session);
+                    if !session.exited {
+                        session.checkout_activity = Some(reservation);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(cwd, error = %error, "terminal could not reserve its checkout");
+            }
+        }
+    });
 }
 
 /// Blocking PTY reader: forwards raw chunks until EOF. A closed PTY reads as an

@@ -23,7 +23,9 @@ mod worktrunk_approvals;
 mod worktrunk_hooks;
 mod worktrunk_lifecycle;
 
-pub use checkout_activity::{ActivityKind, CheckoutActivityReservation, reserve_chat_run};
+pub use checkout_activity::{
+    ActivityKind, CheckoutActivityReservation, reserve_chat_run, reserve_terminal,
+};
 pub use controller_mcp::{
     CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,
     worker_output_text,
@@ -65,6 +67,7 @@ pub struct ChatWorktreeCreation {
     pub setup_failed_command: Option<String>,
     pub setup_failed_reason: Option<String>,
     pub hook_warning: Option<String>,
+    pub copy_warning: Option<String>,
 }
 
 /// A Chat checkout created but not yet prepared. The preparation reservation
@@ -243,7 +246,13 @@ pub fn prepare_checkout_for_chat(
         std::fs::canonicalize(checkout).map_err(|error| WorkersError::State(error.to_string()))?;
     let pending = journal
         .preparation_pending(repository, &checkout)
-        .map_err(|error| WorkersError::State(error.to_string()))?;
+        .unwrap_or_else(|error| {
+            unpeel_core::hook_assets::append_trace_log_line(&format!(
+                "Checkout preparation state unavailable for {}: {error}",
+                checkout.display()
+            ));
+            false
+        });
     let branch_result = checkout_lifecycle::current_branch(&checkout);
     let branch = if pending {
         branch_result.map_err(WorkersError::State)?
@@ -280,7 +289,10 @@ pub fn prepare_checkout_for_chat(
 /// leaves the checkout pending, so the next request retries in that path.
 fn run_initial_checkout_setup(repository: &Path, checkout: &Path) -> worktree_config::SetupOutcome {
     match copy_ignored::copy_selected_ignored(repository, checkout) {
-        Ok(_) => worktree_config::run_setup_for_project(checkout, repository),
+        Ok(report) => worktree_config::SetupOutcome {
+            copy_warning: report.skipped_warning(),
+            ..worktree_config::run_setup_for_project(checkout, repository)
+        },
         Err(error) => worktree_config::SetupOutcome {
             failed: Some("copy-ignored".into()),
             failed_reason: Some(error),
@@ -338,6 +350,7 @@ fn finish_chat_preparation(
         setup_failed_command: setup.failed,
         setup_failed_reason: setup.failed_reason,
         hook_warning,
+        copy_warning: setup.copy_warning,
     })
 }
 
@@ -806,6 +819,8 @@ pub struct WorkersWorktreeResult {
     /// Advisory from a post hook. A pending/failed post hook does not roll
     /// back an otherwise prepared checkout.
     pub hook_warning: Option<String>,
+    /// Advisory: selected ignored entries that were not copied.
+    pub copy_warning: Option<String>,
     pub setup_commands_run: usize,
 }
 
@@ -940,6 +955,7 @@ pub struct WorkersWorktreeLaunchResult {
     pub path: String,
     pub branch: String,
     pub hook_warning: Option<String>,
+    pub copy_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2809,6 +2825,7 @@ impl LocalWorkersClient {
                 setup_failed_command: setup.failed,
                 setup_failed_reason: setup.failed_reason,
                 hook_warning,
+                copy_warning: setup.copy_warning,
                 setup_commands_run: setup.commands_run,
             },
             starting_worker,
@@ -2843,6 +2860,7 @@ impl LocalWorkersClient {
                 path: worktree.path,
                 branch: worktree.branch,
                 hook_warning: worktree.hook_warning,
+                copy_warning: worktree.copy_warning,
             }),
             // Falha de launch NAO desfaz o worktree, pela mesma razao que
             // falha de setup nao desfaz (ver `create_worktree` acima): o

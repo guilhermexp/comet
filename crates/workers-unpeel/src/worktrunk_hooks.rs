@@ -728,7 +728,7 @@ impl PostStartControl {
         let process_group = lines
             .next()
             .and_then(|line| line.parse::<i32>().ok())
-            .filter(|process_group| *process_group > 0)
+            .filter(|process_group| *process_group >= 0)
             .ok_or_else(|| {
                 HookError::new("invalid post-start process identity; refusing to stop any process")
             })?;
@@ -819,7 +819,14 @@ impl PostStartControl {
                 "could not inspect post-start stop channel: {error}"
             ))
         })?;
-        Ok(!listening && !process_group_exists(self.process_group))
+        Ok(!listening && self.process_group_is_gone())
+    }
+
+    /// Group `0` records a spawn whose group id was never persisted; only its
+    /// stop watcher can prove it is running.
+    #[cfg(unix)]
+    fn process_group_is_gone(&self) -> bool {
+        self.process_group <= 0 || !process_group_exists(self.process_group)
     }
 
     #[cfg(unix)]
@@ -1298,7 +1305,7 @@ pub(crate) fn stop_post_start(checkout_path: &Path) -> Result<bool, HookError> {
         match control.watcher_is_open() {
             Ok(true) => {}
             Ok(false) => {
-                if !process_group_exists(control.process_group) {
+                if control.process_group_is_gone() {
                     // The in-group watcher sends TERM then KILL before its FIFO
                     // reader closes. No external PID or process group is signaled.
                     control.cleanup();
@@ -1306,7 +1313,7 @@ pub(crate) fn stop_post_start(checkout_path: &Path) -> Result<bool, HookError> {
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !process_group_exists(control.process_group) {
+                if control.process_group_is_gone() {
                     control.cleanup();
                     return Ok(true);
                 }
@@ -2244,6 +2251,23 @@ generated = "rm -rf generated"
 
         assert_ne!(replacement.token, orphan.token);
         assert!(!orphan.fifo_path.exists());
+        replacement.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unfinished_post_start_registration_does_not_block_removal_or_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("worktree");
+        fs::create_dir_all(&checkout).unwrap();
+        let log_dir = temp.path().join(".logs/worktree");
+        let unfinished = PostStartControl::create(&log_dir).unwrap();
+
+        assert!(!stop_post_start(&checkout).unwrap());
+        assert!(!unfinished.manifest_path.exists());
+
+        let _second_unfinished = PostStartControl::create(&log_dir).unwrap();
+        let replacement = PostStartControl::create(&log_dir).unwrap();
         replacement.cleanup();
     }
 

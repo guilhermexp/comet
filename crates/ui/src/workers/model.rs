@@ -188,10 +188,26 @@ pub fn worktree_setup_failure_message(result: &WorkersWorktreeResult) -> Option<
 }
 
 pub fn worktree_hook_warning_message(result: &WorkersWorktreeResult) -> Option<String> {
-    let warning = result.hook_warning.as_deref()?;
-    Some(format!(
-        "Worktree created, but a Worktrunk post-start hook needs attention: {warning}"
-    ))
+    worktree_advisory_notice(
+        result.hook_warning.as_deref(),
+        result.copy_warning.as_deref(),
+    )
+}
+
+fn worktree_advisory_notice(
+    hook_warning: Option<&str>,
+    copy_warning: Option<&str>,
+) -> Option<String> {
+    let notices = [
+        hook_warning.map(|warning| {
+            format!("Worktree created, but a Worktrunk post-start hook needs attention: {warning}")
+        }),
+        copy_warning.map(|warning| {
+            format!("Worktree created, but some ignored files were not copied: {warning}")
+        }),
+    ];
+    let notices = notices.into_iter().flatten().collect::<Vec<_>>();
+    (!notices.is_empty()).then(|| notices.join("\n"))
 }
 
 pub fn sessions_for_project<'a>(
@@ -1505,11 +1521,10 @@ impl WorkersModel {
                 )
             },
             move |model, result| {
-                model.action_notice = result.hook_warning.as_ref().map(|warning| {
-                    format!(
-                        "Worktree created, but a Worktrunk post-start hook needs attention: {warning}"
-                    )
-                });
+                model.action_notice = worktree_advisory_notice(
+                    result.hook_warning.as_deref(),
+                    result.copy_warning.as_deref(),
+                );
                 model.expanded_project_ids.insert(parent_id);
                 model.expanded_project_ids.insert(result.project_id.clone());
                 model.selected_project_id = Some(result.project_id);
@@ -3003,6 +3018,7 @@ mod tests {
             setup_failed_command: Some("bun install".into()),
             setup_failed_reason: Some("exit status: 1".into()),
             hook_warning: None,
+            copy_warning: None,
             setup_commands_run: 0,
         };
 
@@ -3021,6 +3037,7 @@ mod tests {
             setup_failed_command: None,
             setup_failed_reason: None,
             hook_warning: Some("post-start approval is pending".into()),
+            copy_warning: None,
             setup_commands_run: 1,
         };
 
@@ -3028,6 +3045,27 @@ mod tests {
             worktree_hook_warning_message(&result).as_deref(),
             Some(
                 "Worktree created, but a Worktrunk post-start hook needs attention: post-start approval is pending"
+            )
+        );
+    }
+
+    #[test]
+    fn skipped_ignored_copy_is_exposed_as_advisory_after_creation() {
+        let result = WorkersWorktreeResult {
+            project_id: "worktree-1".into(),
+            path: "/tmp/worktree-1".into(),
+            branch: "change/fix".into(),
+            setup_failed_command: None,
+            setup_failed_reason: None,
+            hook_warning: None,
+            copy_warning: Some("2 entries were skipped".into()),
+            setup_commands_run: 1,
+        };
+
+        assert_eq!(
+            worktree_hook_warning_message(&result).as_deref(),
+            Some(
+                "Worktree created, but some ignored files were not copied: 2 entries were skipped"
             )
         );
     }
