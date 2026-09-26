@@ -1,10 +1,4 @@
-# worktree-deletion-safety Specification
-
-## Purpose
-Garantir que a remoção de worktree pela engine só alcance um worktree linkado do repositório
-nomeado — nunca o checkout principal nem uma pasta arbitrária vinda do cliente ou de outro device.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Deletion touches only a linked worktree
 

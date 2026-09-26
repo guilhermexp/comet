@@ -1,9 +1,11 @@
 //! Typed Comet adapter for the pinned Unpeel local worker runtime.
 
 mod activity_bridge;
+mod branch_cleanup;
 mod checkout_activity;
 mod checkout_lifecycle;
 mod controller_mcp;
+mod copy_ignored;
 mod git_command;
 mod hook_migration;
 pub mod maintenance;
@@ -275,6 +277,19 @@ pub fn prepare_checkout_for_chat(
     )
 }
 
+/// Both products prepare owned checkouts in the same order. A failed copy
+/// leaves the checkout pending, so the next request retries in that path.
+fn run_initial_checkout_setup(repository: &Path, checkout: &Path) -> worktree_config::SetupOutcome {
+    match copy_ignored::copy_selected_ignored(repository, checkout) {
+        Ok(_) => worktree_config::run_setup_for_project(checkout, repository),
+        Err(error) => worktree_config::SetupOutcome {
+            failed: Some("copy-ignored".into()),
+            failed_reason: Some(error),
+            ..Default::default()
+        },
+    }
+}
+
 fn finish_chat_preparation(
     repository: &Path,
     checkout: &Path,
@@ -285,7 +300,7 @@ fn finish_chat_preparation(
     preparing: Option<CheckoutActivityReservation>,
 ) -> Result<ChatWorktreeCreation, WorkersError> {
     let mut setup = if pending {
-        worktree_config::run_setup_for_project(checkout, repository)
+        run_initial_checkout_setup(repository, checkout)
     } else {
         worktree_config::SetupOutcome::default()
     };
@@ -328,7 +343,8 @@ fn finish_chat_preparation(
 }
 
 /// Remove an app-owned Chat checkout after the same ownership, activity, hook
-/// and cleanliness checks used for a Worker checkout. The branch remains.
+/// and cleanliness checks used for a Worker checkout. An integrated local
+/// branch may be removed after the checkout; unproven work stays on its branch.
 pub fn remove_checkout_for_chat(
     repository: &Path,
     checkout: &Path,
@@ -2730,7 +2746,7 @@ impl LocalWorkersClient {
             unpeel_core::app_state::announce_app_state_changed();
         }
         let mut setup = if setup_pending {
-            worktree_config::run_setup_for_project(&worktree.path, Path::new(&parent_path))
+            run_initial_checkout_setup(Path::new(&parent_path), &worktree.path)
         } else {
             worktree_config::SetupOutcome::default()
         };
@@ -4968,6 +4984,110 @@ mod worktree_setup_wiring_tests {
             std::fs::read_to_string(worktree.join("raiz.txt")).unwrap(),
             fixture.repo().to_str().unwrap(),
             "ROOT_WORKTREE_PATH tem que apontar para o checkout principal"
+        );
+    }
+
+    #[test]
+    fn chat_and_workers_copy_only_selected_gitignored_files_before_setup() {
+        let fixture = Fixture::new(Some(
+            r#"{"setup-worktree":"test -f cache/seed.bin && test ! -e other/private.bin"}"#,
+        ));
+        std::fs::write(fixture.repo().join(".gitignore"), "cache/\nother/\n").unwrap();
+        std::fs::write(fixture.repo().join(".worktreeinclude"), "cache/\n").unwrap();
+        for (relative, content) in [
+            ("cache/seed.bin", "cache bytes"),
+            ("other/private.bin", "private bytes"),
+        ] {
+            let path = fixture.repo().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+
+        let worker = fixture.create().unwrap();
+        assert!(worker.setup_failed_command.is_none(), "{worker:?}");
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&worker.path).join("cache/seed.bin")).unwrap(),
+            "cache bytes"
+        );
+        assert!(!Path::new(&worker.path).join("other/private.bin").exists());
+
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let chat = create_checkout_for_chat(
+            &fixture.repo(),
+            "zeron/copy-selected-cache",
+            None,
+            &root,
+            &journal,
+        )
+        .unwrap();
+        fixture.created.borrow_mut().push(chat.path.clone());
+        assert!(
+            chat.setup_failed_command.is_none(),
+            "chat preparation failed: {:?}: {:?}",
+            chat.setup_failed_command,
+            chat.setup_failed_reason
+        );
+        assert_eq!(
+            std::fs::read_to_string(chat.path.join("cache/seed.bin")).unwrap(),
+            "cache bytes"
+        );
+        assert!(!chat.path.join("other/private.bin").exists());
+    }
+
+    #[test]
+    fn absent_worktreeinclude_does_not_copy_ignored_files() {
+        let fixture = Fixture::new(None);
+        std::fs::write(fixture.repo().join(".gitignore"), "cache/\n").unwrap();
+        std::fs::create_dir_all(fixture.repo().join("cache")).unwrap();
+        std::fs::write(fixture.repo().join("cache/seed.bin"), "cache bytes").unwrap();
+        let worker = fixture.create().unwrap();
+        assert!(!Path::new(&worker.path).join("cache/seed.bin").exists());
+    }
+
+    #[test]
+    fn failed_copy_retries_on_the_same_chat_checkout_before_running_setup() {
+        let fixture = Fixture::new(Some(
+            r#"{"setup-worktree":"test -f cache/seed.bin && printf ok > prepared.txt"}"#,
+        ));
+        std::fs::write(fixture.repo().join(".gitignore"), "cache/\n").unwrap();
+        std::fs::write(fixture.repo().join(".worktreeinclude"), [0xff]).unwrap();
+        std::fs::create_dir_all(fixture.repo().join("cache")).unwrap();
+        std::fs::write(fixture.repo().join("cache/seed.bin"), "cache bytes").unwrap();
+        let root = fixture.dir.join("chat-worktrees");
+        let journal = fixture.dir.join("chat-ownership.json");
+        let created = create_checkout_for_chat(
+            &fixture.repo(),
+            "zeron/retry-cache-copy",
+            None,
+            &root,
+            &journal,
+        )
+        .unwrap();
+        fixture.created.borrow_mut().push(created.path.clone());
+        assert_eq!(
+            created.setup_failed_command.as_deref(),
+            Some("copy-ignored")
+        );
+        assert!(!created.path.join("prepared.txt").exists());
+
+        std::fs::write(fixture.repo().join(".worktreeinclude"), "cache/\n").unwrap();
+        let retried =
+            prepare_checkout_for_chat(&fixture.repo(), &created.path, &root, &journal).unwrap();
+        assert_eq!(retried.path, created.path);
+        assert!(
+            retried.setup_failed_command.is_none(),
+            "retry failed: {:?}: {:?}",
+            retried.setup_failed_command,
+            retried.setup_failed_reason
+        );
+        assert_eq!(
+            std::fs::read_to_string(created.path.join("cache/seed.bin")).unwrap(),
+            "cache bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(created.path.join("prepared.txt")).unwrap(),
+            "ok"
         );
     }
 

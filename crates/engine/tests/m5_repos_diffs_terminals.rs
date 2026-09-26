@@ -209,7 +209,7 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("wt identity");
     assert_ne!(main_identity.id, wt_identity.id);
 
-    // Delete removes the owned, clean checkout and keeps its branch.
+    // An integrated branch leaves with its owned, clean checkout.
     repos
         .delete_worktree(&repo_dir, Path::new(&worktree.path))
         .await
@@ -220,8 +220,8 @@ async fn repos_round_trip_add_branches_worktrees() {
         .await
         .expect("branches after delete");
     assert!(
-        branches.contains(&worktree.branch),
-        "checkout removal preserves the branch: {branches:?}"
+        !branches.contains(&worktree.branch),
+        "integrated branch should leave with the checkout: {branches:?}"
     );
 
     // A commit that is not in main keeps its branch when the checkout is

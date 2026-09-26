@@ -360,11 +360,56 @@ pub(crate) fn remove_checkout_under_lock(
     crate::worktrunk_hooks::stop_post_start(&checkout)
         .map_err(|error| WorkersError::State(error.to_string()))?;
     validate_removal(&checkout, true, false).map_err(WorkersError::State)?;
+    // The pre-remove hook may run Git itself. Never delete the old branch if
+    // the checkout changed refs during that hook; capture the exact tip only
+    // after the final validation, then use Git's old-OID CAS after removal.
+    let final_branch = run_git(&checkout, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if final_branch != branch {
+        return Err(WorkersError::State(
+            "Checkout branch changed during pre-remove; refusing removal".into(),
+        ));
+    }
+    let branch_tip = if branch.is_empty() {
+        None
+    } else {
+        let branch_ref = format!("refs/heads/{branch}");
+        match run_git(repository, &["rev-parse", "--verify", &branch_ref]) {
+            Ok(oid) => Some(oid.trim().to_owned()),
+            Err(error) => {
+                unpeel_core::hook_assets::append_trace_log_line(&format!(
+                    "Branch cleanup skipped for {}: could not read {}: {error}",
+                    checkout.display(),
+                    branch_ref
+                ));
+                None
+            }
+        }
+    };
     let path = checkout
         .to_str()
         .ok_or_else(|| WorkersError::State("Checkout path is not UTF-8".into()))?;
     crate::git_command::run_git_mutation(repository, &["worktree", "remove", path])
         .map_err(WorkersError::State)?;
+    if let Some(expected_oid) = branch_tip {
+        match crate::branch_cleanup::cleanup_integrated_branch(repository, &branch, &expected_oid) {
+            Ok(crate::branch_cleanup::BranchCleanupOutcome::Deleted) => {}
+            Ok(crate::branch_cleanup::BranchCleanupOutcome::Retained(reason)) => {
+                unpeel_core::hook_assets::append_trace_log_line(&format!(
+                    "Branch {} retained after worktree removal: {reason}",
+                    branch
+                ));
+            }
+            Err(error) => {
+                unpeel_core::hook_assets::append_trace_log_line(&format!(
+                    "Branch {} could not be cleaned up after worktree removal: {error}",
+                    branch
+                ));
+            }
+        }
+    }
     journal
         .retire_removed(repository, &checkout)
         .map_err(|error| {
