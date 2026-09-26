@@ -70,12 +70,27 @@ impl Drop for CheckoutActivityReservation {
         // The lease worker captured both paths when the reservation was
         // created. Drop only signals it; it never recalculates the journal or
         // lock path from process environment and never blocks the caller.
-        let _ = self.release.send(LeaseMessage::Release);
+        let _ = self.release.send(LeaseMessage::Release(None));
+    }
+}
+
+impl CheckoutActivityReservation {
+    /// Release during an orderly process shutdown, waiting (bounded) until the
+    /// durable entry is gone so a quitting process does not leave it behind.
+    pub fn release_and_wait(self, timeout: Duration) {
+        let (acknowledge, released) = mpsc::channel();
+        if self
+            .release
+            .send(LeaseMessage::Release(Some(acknowledge)))
+            .is_ok()
+        {
+            let _ = released.recv_timeout(timeout);
+        }
     }
 }
 
 enum LeaseMessage {
-    Release,
+    Release(Option<Sender<()>>),
 }
 
 /// The lease worker is deliberately the only component that refreshes or
@@ -95,7 +110,8 @@ fn start_lease_worker_at(
         .name("checkout-activity-lease".into())
         .spawn(move || loop {
             match receiver.recv_timeout(interval) {
-                Ok(LeaseMessage::Release) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                message @ (Ok(LeaseMessage::Release(_))
+                | Err(mpsc::RecvTimeoutError::Disconnected)) => {
                     let result = with_action_lock_at(&lock_file, || {
                         end_at(&file, &operation_id, &lease_id)
                     });
@@ -103,6 +119,9 @@ fn start_lease_worker_at(
                         unpeel_core::hook_assets::append_trace_log_line(&format!(
                             "Checkout activity release failed for {operation_id}: {error}; removal remains blocked"
                         ));
+                    }
+                    if let Ok(LeaseMessage::Release(Some(acknowledge))) = message {
+                        let _ = acknowledge.send(());
                     }
                     break;
                 }
@@ -399,9 +418,9 @@ pub(crate) fn busy_at(file: &Path, checkout: &Path) -> Result<Option<ActivityEnt
 /// Like [`busy_at`], ignoring the caller's own `operation_id`. Removal passes
 /// `include_terminals` so an open terminal keeps the checkout in use.
 ///
-/// A `Removing` entry whose recorded process has died is reclaimed here: a
-/// crashed removal must not block every later removal of the same checkout.
-/// Other kinds stay fail-closed.
+/// `Removing` and `Terminal` entries whose recorded process has died are
+/// reclaimed here: a crashed or force-quit process must not block every later
+/// removal of the same checkout. Other kinds stay fail-closed.
 pub(crate) fn busy_except_at(
     file: &Path,
     checkout: &Path,
@@ -412,7 +431,8 @@ pub(crate) fn busy_except_at(
     let mut state = read(file)?;
     let before = state.entries.len();
     state.entries.retain(|_, entry| {
-        entry.kind != ActivityKind::Removing || process_is_alive(entry.process_id)
+        !matches!(entry.kind, ActivityKind::Removing | ActivityKind::Terminal)
+            || process_is_alive(entry.process_id)
     });
     if state.entries.len() != before {
         write(file, &state)?;
@@ -521,7 +541,7 @@ mod tests {
         );
         assert!(busy_at(&file, temp.path()).unwrap().is_some());
 
-        release.send(LeaseMessage::Release).unwrap();
+        release.send(LeaseMessage::Release(None)).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if busy_at(&file, temp.path()).unwrap().is_none() {
@@ -533,12 +553,14 @@ mod tests {
     }
 
     #[test]
-    fn removing_entry_of_a_dead_process_is_reclaimed_but_other_kinds_stay_busy() {
+    fn removing_and_terminal_entries_of_a_dead_process_are_reclaimed_but_other_kinds_stay_busy() {
         let removing = tempfile::tempdir().unwrap();
         let running = tempfile::tempdir().unwrap();
+        let terminal = tempfile::tempdir().unwrap();
         let file = removing.path().join("activity.json");
         begin_at(&file, "remove", removing.path(), ActivityKind::Removing).unwrap();
         begin_at(&file, "run", running.path(), ActivityKind::ChatRun).unwrap();
+        begin_at(&file, "terminal", terminal.path(), ActivityKind::Terminal).unwrap();
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let dead = child.id();
         child.wait().unwrap();
@@ -550,10 +572,38 @@ mod tests {
 
         assert!(busy_at(&file, removing.path()).unwrap().is_none());
         assert!(!read(&file).unwrap().entries.contains_key("remove"));
+        assert!(
+            busy_except_at(&file, terminal.path(), None, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!read(&file).unwrap().entries.contains_key("terminal"));
         assert_eq!(
             busy_at(&file, running.path()).unwrap().unwrap().kind,
             ActivityKind::ChatRun
         );
+    }
+
+    #[test]
+    fn release_and_wait_removes_the_entry_before_returning() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("activity.json");
+        let lock_file = temp.path().join("actions.lock");
+        let lease = begin_at(&file, "terminal", temp.path(), ActivityKind::Terminal).unwrap();
+        let reservation = CheckoutActivityReservation {
+            release: start_lease_worker_at(
+                file.clone(),
+                lock_file,
+                "terminal".into(),
+                lease,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        };
+
+        reservation.release_and_wait(Duration::from_secs(5));
+
+        assert!(!read(&file).unwrap().entries.contains_key("terminal"));
     }
 
     #[test]

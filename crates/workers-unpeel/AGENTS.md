@@ -27,7 +27,7 @@ internal host modes (`__session_host__` et al.).
 | `copy_ignored.rs` | Opt-in `.worktreeinclude` copy of Git-ignored files during shared checkout preparation, with reflink and no overwrite |
 | `branch_cleanup.rs` | Conservative local branch cleanup after a proven owned checkout is removed; integrated-only decision and old-OID compare-and-swap |
 | `worktree_ownership.rs` | Canonical worktree root and durable Git identity/ownership journal; path prefix and branch name never grant deletion rights |
-| `checkout_activity.rs` | Device-local reservations for Chat runs, preparation and Worker starts; an expired lease stays busy until reconciled |
+| `checkout_activity.rs` | Device-local reservations for Chat runs, preparation, Worker starts, in-flight removals and in-app terminals; an expired lease stays busy until reconciled, except `Removing`/`Terminal` entries whose recorded process is dead. Terminals block only physical removal; `release_and_wait` releases synchronously on orderly shutdown |
 | `worktrunk_hooks.rs`, `worktrunk_lifecycle.rs`, `worktrunk_approvals.rs` | Supported `.config/wt.toml` start/remove hooks, bounded execution, per-command local approvals and background logs |
 | `git_command.rs` | Bounded Git subprocesses and pipe collection, separate read/mutation deadlines |
 | `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()` (every runtime attempted, failures accumulated instead of aborting the loop), then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
@@ -215,7 +215,9 @@ zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
   via symlink, continua externo. Registros Workers legados `AppManaged` só
   migram com evidência Git compatível; Chat legado sem essa prova não migra
   automaticamente. `remove_worktree` consulta o journal de novo sob
-  `CheckoutActionLock` antes da remoção física.
+  `CheckoutActionLock` antes da remoção física. `prepare_checkout_for_chat`
+  falha fechado se o journal não puder ser lido ou não bater com a identidade
+  Git; só a ausência de registro (checkout externo) dispensa o preparo.
 - **Hook ingress não morre por sinal de filho.** O accept loop trata
   `WouldBlock` e `Interrupted` como transitórios; setup/Worker encerrando
   processos no mesmo host não pode fechar o endpoint e devolver BrokenPipe ao
