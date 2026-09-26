@@ -1087,7 +1087,9 @@ fn legacy_worker_app_managed_record_migrates_with_matching_git_evidence()
 
     client.remove_worktree(&worker_id, false)?;
     assert!(!checkout.exists());
-    assert!(!git_ref_exists(&repo, "refs/heads/feature/legacy-worker")?);
+    // Adopted legacy records cannot prove Comet created the branch, so removal
+    // keeps it even when it is integrated.
+    assert!(git_ref_exists(&repo, "refs/heads/feature/legacy-worker")?);
     let archived = client
         .bootstrap()?
         .projects
