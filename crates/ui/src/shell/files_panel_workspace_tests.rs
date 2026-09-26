@@ -210,7 +210,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                     },
                     |window, cx| {
                         window.set_window_title("Files panel fixture");
-                        cx.new(|cx| Shell::new(state.clone(), boot.clone(), cx))
+                        cx.new(|cx| test_shell(state.clone(), boot.clone(), cx))
                     },
                 )
                 .unwrap();
