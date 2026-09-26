@@ -593,12 +593,12 @@ final class SessionStoreDurabilityTests: XCTestCase {
         // Releasing the blocking export only unblocks the serial exporter;
         // the stopped store's queued export still has to run and write.
         let deadline = ContinuousClock.now + .seconds(5)
-        var loaded = DocDisk.loadChat2(into: LoroDoc(), id: id)
-        while loaded == nil && ContinuousClock.now < deadline {
+        var snapshot = DocDisk.loadChat2(into: LoroDoc(), id: id)
+        while snapshot == nil && ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(25))
-            loaded = DocDisk.loadChat2(into: LoroDoc(), id: id)
+            snapshot = DocDisk.loadChat2(into: LoroDoc(), id: id)
         }
-        let loaded = try XCTUnwrap(loaded)
+        let loaded = try XCTUnwrap(snapshot)
         XCTAssertEqual(loaded.outbox.map(\.batchId), [batchID])
     }
 
