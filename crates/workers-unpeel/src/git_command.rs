@@ -48,6 +48,14 @@ const REPOSITORY_ENV_VARS: &[&str] = &[
     "GIT_COMMON_DIR",
 ];
 
+/// A child process with checkout cwd must not inherit Git's repository
+/// selection from a parent hook or `rebase --exec` invocation.
+pub(crate) fn clear_repository_env(command: &mut std::process::Command) {
+    for name in REPOSITORY_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
 /// Non-interactive Git bound to the checkout at `path`.
 pub(crate) fn git_at(path: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
@@ -58,9 +66,7 @@ pub(crate) fn git_at(path: &Path) -> std::process::Command {
         .arg(path)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
-    for name in REPOSITORY_ENV_VARS {
-        command.env_remove(name);
-    }
+    clear_repository_env(&mut command);
     command
 }
 

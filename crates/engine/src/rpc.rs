@@ -1251,7 +1251,7 @@ impl EngineRpc {
 
     /// Ref retarget is a local checkout action. Keep the legacy behavior for
     /// Chats hosted on another device, but refuse to point a local Chat at a
-    /// linked worktree while a Workers process is using it.
+    /// linked worktree while local checkout activity is in flight.
     async fn guard_chat_cwd_retarget(&self, chat_id: &str, cwd: &str) -> Result<(), RpcError> {
         let Some(chat) = self
             .workspace
@@ -1277,18 +1277,18 @@ impl EngineRpc {
         .await
         .map_err(|error| {
             RpcError::Failed(format!(
-                "Could not verify Workers activity in the selected checkout: {error}"
+                "Could not verify activity in the selected checkout: {error}"
             ))
         })?
         .map_err(|error| {
             RpcError::Failed(format!(
-                "Could not verify Workers activity in the selected checkout: {error}"
+                "Could not verify activity in the selected checkout: {error}"
             ))
         })?;
 
         if busy {
             return Err(RpcError::Failed(
-                "A Worker is working in this checkout; stop it before switching this Chat to the worktree".into(),
+                "This checkout is in use or being prepared; try switching when it is idle".into(),
             ));
         }
         Ok(())

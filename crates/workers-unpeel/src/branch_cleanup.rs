@@ -226,6 +226,18 @@ fn default_branch(repository: &Path) -> Result<Option<(String, String)>, String>
     Ok(None)
 }
 
+/// The checked default branch name for hook templates, with the same local
+/// fallback used by branch cleanup. Never expose `origin/main` as a branch
+/// name: that is a remote-tracking ref, not the name Worktrunk renders.
+pub(crate) fn default_branch_name(repository: &Path) -> Result<Option<String>, String> {
+    Ok(default_branch(repository)?.and_then(|(reference, _)| {
+        reference
+            .strip_prefix("refs/heads/")
+            .or_else(|| reference.strip_prefix("refs/remotes/origin/"))
+            .map(str::to_owned)
+    }))
+}
+
 fn origin_default_branch_name(repository: &Path) -> Result<Option<String>, String> {
     let symbolic = match run_git(
         repository,

@@ -35,18 +35,9 @@ fn checkout_context(
         .unwrap_or_default()
         .trim()
         .to_owned();
-    let default_branch = run_git(
-        repository,
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-    )
-    .unwrap_or_default()
-    .trim()
-    .to_owned();
+    let default_branch = crate::branch_cleanup::default_branch_name(repository)
+        .ok()
+        .flatten();
     for (key, value) in [
         ("branch", branch.to_owned()),
         ("worktree_path", checkout.display().to_string()),
@@ -57,11 +48,15 @@ fn checkout_context(
         ("commit", commit.clone()),
         ("short_commit", commit.chars().take(7).collect()),
         ("base", base.unwrap_or_default().to_owned()),
-        ("default_branch", default_branch),
         ("hook_type", kind.as_str().to_owned()),
         ("cwd", cwd.display().to_string()),
     ] {
         context.insert(key, value);
+    }
+    // An absent default branch has no truthful template value. Let the
+    // renderer report a missing variable if a hook asks for it.
+    if let Some(default_branch) = default_branch {
+        context.insert("default_branch", default_branch);
     }
     context
 }
@@ -187,7 +182,7 @@ pub(crate) fn run_pre_remove(
     }
     if let Some(hook) = prepared_hook(
         state_path,
-        repository,
+        checkout,
         repository,
         checkout,
         branch,
@@ -213,7 +208,7 @@ pub(crate) fn prepare_post_remove(
     }
     prepared_hook(
         state_path,
-        repository,
+        checkout,
         repository,
         checkout,
         branch,

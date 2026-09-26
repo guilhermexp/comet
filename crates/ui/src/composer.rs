@@ -9200,7 +9200,11 @@ impl Composer {
                     let poll_target_device_id = host_device_id.clone();
                     this.update(cx, |_, cx| {
                         cx.spawn(async move |this, cx| {
-                            for _ in 0..480 {
+                            // Checkout copy, setup and pre-start may each take
+                            // minutes. Keep the handoff alive for the engine's
+                            // 720s lifecycle deadline plus delivery margin.
+                            let deadline = std::time::Instant::now() + Duration::from_secs(750);
+                            while std::time::Instant::now() < deadline {
                                 let mut params = serde_json::json!({
                                     "chatId": poll_chat_id,
                                     "commandId": command_id,

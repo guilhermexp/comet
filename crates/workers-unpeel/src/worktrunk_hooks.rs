@@ -433,6 +433,20 @@ fn parse_template(source: &str) -> Result<Vec<TemplatePart>, TemplateProblem> {
             // constructs already occurred in the command; it is safer than
             // misclassifying a nested shell context as an ordinary word.
             let prefix = &source[..cursor];
+            let current_word = prefix
+                .rsplit(|character: char| {
+                    character.is_whitespace() || "|&;()<>".contains(character)
+                })
+                .next()
+                .unwrap_or_default();
+            if current_word.contains('$') {
+                return Err(TemplateProblem {
+                    token: variable.name,
+                    message:
+                        "interpolation in a shell word with parameter expansion is unsupported"
+                            .into(),
+                });
+            }
             if unsupported_ansi_quote {
                 return Err(TemplateProblem {
                     token: variable.name,
@@ -1143,6 +1157,7 @@ pub(crate) fn spawn_post_hook(
     }
 
     let mut command = Command::new("sh");
+    crate::git_command::clear_repository_env(&mut command);
     let script = {
         #[cfg(unix)]
         {
@@ -1427,6 +1442,7 @@ fn run_blocking_script(
     timeout: Duration,
 ) -> Result<(), HookError> {
     let mut command = Command::new("sh");
+    crate::git_command::clear_repository_env(&mut command);
     command
         .arg("-c")
         .arg(rendered_script(hook))
@@ -1999,6 +2015,22 @@ generated = "rm -rf generated"
         assert!(!earlier_stage_marker.exists());
         let error = rendered.expect_err("literal-dollar interpolation must fail closed");
         assert!(error.to_string().contains("literal '$'"));
+    }
+
+    #[test]
+    fn parameter_expansion_in_the_same_word_as_a_template_is_rejected() {
+        let context = render_context("feature");
+        let rendered = hook(
+            "pre-start = \"printf '%s' $PREFIX{{ branch }}\"",
+            HookKind::PreStart,
+        )
+        .render(&context);
+        assert!(
+            rendered
+                .expect_err("mixed shell expansion must fail before execution")
+                .to_string()
+                .contains("parameter expansion")
+        );
     }
 
     #[test]
