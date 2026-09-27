@@ -310,15 +310,17 @@ mod completion_tests {
             page.toggle_completion(HarnessId::Opencode, true, cx);
         });
         let loaded = settings::UiSettings::load(dir.path());
+        // Upstream default: `$` completion and its own menu are on for every
+        // harness, so each toggle turns one off.
         let claude = loaded.skill_completion(HarnessId::ClaudeCode);
-        assert!(claude.dollar && claude.separate_from_slash);
+        assert!(!claude.dollar && !claude.separate_from_slash);
         let opencode = loaded.skill_completion(HarnessId::Opencode);
-        assert!(opencode.dollar && !opencode.separate_from_slash);
-        assert!(!loaded.skill_completion(HarnessId::Cursor).dollar);
+        assert!(!opencode.dollar && opencode.separate_from_slash);
+        assert!(loaded.skill_completion(HarnessId::Cursor).dollar);
         page.update(cx, |page, cx| page.reset_completion(cx));
         let reset = settings::UiSettings::load(dir.path());
         assert!(reset.skill_completion_by_harness.is_empty());
         assert!(reset.skill_completion(HarnessId::Codex).dollar);
-        assert!(!reset.skill_completion(HarnessId::ClaudeCode).dollar);
+        assert!(reset.skill_completion(HarnessId::ClaudeCode).dollar);
     }
 }

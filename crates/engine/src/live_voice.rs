@@ -1549,6 +1549,7 @@ mod tests {
             resume: None,
             attachments: Vec::new(),
             worktree: None,
+            mcp: None,
         }
     }
 

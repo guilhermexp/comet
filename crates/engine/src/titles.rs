@@ -262,6 +262,7 @@ impl TitleGenerator {
                     attachments: Vec::new(),
                     resume: None,
                     worktree: None,
+                    mcp: None,
                 };
                 match collect_text(harness, chat_id, request).await {
                     Ok(raw) => Some(clean_title(&raw)).filter(|title| !title.is_empty()),
@@ -473,6 +474,7 @@ mod tests {
             ],
         };
         let request = RunRequest {
+            mcp: None,
             prompt: "Title only".into(),
             harness: None,
             model: None,

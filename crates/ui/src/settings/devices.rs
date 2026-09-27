@@ -88,7 +88,12 @@ impl DevicesPage {
         }
     }
 
-    fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
+    pub(crate) fn open_rename(
+        &mut self,
+        device_id: String,
+        current: String,
+        cx: &mut Context<Self>,
+    ) {
         let input = cx.new(|cx| ComposerInput::new("Device name", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {

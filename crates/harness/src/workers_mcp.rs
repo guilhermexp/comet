@@ -274,6 +274,7 @@ mod tests {
             attachments: Vec::new(),
             resume: None,
             worktree: None,
+            mcp: None,
         }
     }
 

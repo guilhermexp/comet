@@ -1,5 +1,6 @@
 //! Settings → Agents / accounts (feature-inventory §1.9): provider cards
-//! (Claude Code, Codex, Kimi Code, Antigravity, Cursor) with account rows — email,
+//! (Claude Code, Codex, Kimi Code, Antigravity, Cursor, Grok, plus the
+//! Devin / OpenCode / Pi / Hermes stores the engine lists) with account rows — email,
 //! plan badge, Active, usage meters (indigo → amber ≥80% → red ≥95%, reset time),
 //! Switch / Forget — plus the add-account dialogs (paste-code and browser-poll flows)
 //! and account-shaped loading skeletons. Zeron retargets devices from the settings
@@ -124,6 +125,23 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 6] = [
     (HarnessId::Antigravity, "Antigravity", "agy"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
     (HarnessId::Grok, "Grok", "grok"),
+];
+
+/// The Accounts page's sections: [`PROVIDERS`] (which the Usage panel also
+/// walks) plus the agents whose credential stores the engine detects and
+/// swaps (upstream #542). They render with the same fork rows; each one's
+/// "Add account" starts the agent's default sign-in.
+pub const ACCOUNT_PROVIDERS: [(HarnessId, &str, &str); 10] = [
+    PROVIDERS[0],
+    PROVIDERS[1],
+    PROVIDERS[2],
+    PROVIDERS[3],
+    PROVIDERS[4],
+    PROVIDERS[5],
+    (HarnessId::Devin, "Devin", "devin auth login"),
+    (HarnessId::Opencode, "OpenCode", "opencode auth login"),
+    (HarnessId::Pi, "Pi", "pi"),
+    (HarnessId::Hermes, "Hermes", "hermes auth add"),
 ];
 
 pub fn provider_can_add(harness: HarnessId) -> bool {
@@ -911,16 +929,19 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(
-                                        if account.switchable
+                                    // The engine's reason for a failed probe
+                                    // ("Rate limited — retrying in 2m") beats
+                                    // the generic fallback.
+                                    .child(SharedString::from(match account.usage_error.clone() {
+                                        Some(reason) => reason,
+                                        None if account.switchable
                                             || account.harness == HarnessId::Kimi
-                                            || account.harness == HarnessId::Antigravity
+                                            || account.harness == HarnessId::Antigravity =>
                                         {
-                                            "Usage unavailable"
-                                        } else {
-                                            "Credentials unavailable"
-                                        },
-                                    )),
+                                            "Usage unavailable".to_string()
+                                        }
+                                        None => "Credentials unavailable".to_string(),
+                                    })),
                             )
                         } else {
                             el.child(
@@ -1293,7 +1314,7 @@ impl Render for AccountsPage {
         // One section per provider (zeron settings.agents.tsx `ProviderSection`):
         // brand header + Add account, then the account rows card.
         let sections: Vec<AnyElement> = match &self.snapshot {
-            Loadable::Idle | Loadable::Loading => PROVIDERS
+            Loadable::Idle | Loadable::Loading => ACCOUNT_PROVIDERS
                 .into_iter()
                 .map(|(harness, name, _cli)| {
                     let skeleton_id = match harness {
@@ -1302,6 +1323,10 @@ impl Render for AccountsPage {
                         HarnessId::Antigravity => "accounts-skeleton-antigravity",
                         HarnessId::Cursor => "accounts-skeleton-cursor",
                         HarnessId::Grok => "accounts-skeleton-grok",
+                        HarnessId::Devin => "accounts-skeleton-devin",
+                        HarnessId::Opencode => "accounts-skeleton-opencode",
+                        HarnessId::Pi => "accounts-skeleton-pi",
+                        HarnessId::Hermes => "accounts-skeleton-hermes",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -1368,7 +1393,7 @@ impl Render for AccountsPage {
             }
             Loadable::Ready(snapshot) => {
                 let snapshot = snapshot.clone();
-                PROVIDERS
+                ACCOUNT_PROVIDERS
                     .into_iter()
                     .map(|(harness, name, cli)| {
                         let accounts = provider_accounts(&snapshot, harness);
@@ -1655,11 +1680,14 @@ mod tests {
             active,
             usage_windows: vec![],
             usage_lines: vec![],
+            usage_fetched_at: None,
+            usage_error: None,
             display_name: None,
             organization: None,
             auth_kind: None,
             switchable: true,
             saved_at: None,
+            provider: None,
         };
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![

@@ -36,6 +36,7 @@ async fn managed_install_reaches_session_started() {
         generate_native_title: false,
     };
     let request = RunRequest {
+        mcp: None,
         prompt: "say the word ok and stop".into(),
         harness: None,
         model: None,

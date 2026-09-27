@@ -88,7 +88,7 @@ fn is_visible_part(part: &MessagePart) -> bool {
         | MessagePart::Reasoning { text, .. }
         | MessagePart::Error { message: text, .. } => !text.trim().is_empty(),
         MessagePart::Image { .. } | MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
-        MessagePart::WorkflowTask { .. } => false,
+        MessagePart::WorkflowTask { .. } | MessagePart::Fork { .. } => false,
     }
 }
 
@@ -107,7 +107,8 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
         | MessagePart::Text { .. }
         | MessagePart::Error { .. }
         | MessagePart::Image { .. }
-        | MessagePart::WorkflowTask { .. } => false,
+        | MessagePart::WorkflowTask { .. }
+        | MessagePart::Fork { .. } => false,
     }
 }
 

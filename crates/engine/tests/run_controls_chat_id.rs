@@ -143,6 +143,7 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
                 attachments: Vec::new(),
                 worktree: None,
                 resume: None,
+                mcp: None,
             },
             None,
         )

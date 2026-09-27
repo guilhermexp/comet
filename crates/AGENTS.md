@@ -59,3 +59,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-preview` | [`preview/AGENTS.md`](preview/AGENTS.md) | Catálogo, proxy HTTP/WebSocket e pairing RTC autenticado |
 | `zeron-ui` | [`ui/AGENTS.md`](ui/AGENTS.md) | App gpui: shell, transcript e export puro, composer/intake e decoração paint-only, terminal, diff |
 | `zeron-update` | [`update/AGENTS.md`](update/AGENTS.md) | Checagem de release e auto-update do binário |
+| `zeron-markdown` | — (`markdown/src/lib.rs`) | Parser markdown por blocos + reparse incremental e heurística de path (`file_path`), UI-free; compartilhado por `zeron-ui` e pelo core mobile |
+| `zeron-text` | — (`text/src/lib.rs`) | Medição e quebra de linha analítica (rustybuzz + fallback CoreText) do app iOS |
+| `zeron-client` | — (`client/src/lib.rs`) | Thin client sem engine (registry, chat2, ledger de comandos, RPC via relay, modo Demo) |
+| `zeron-mobile` | — ([`docs/mobile-rewrite.md`](../docs/mobile-rewrite.md)) | Fachada UniFFI do core mobile; build por `scripts/ios/build-core.sh` |

@@ -426,6 +426,9 @@ mod tests {
             auth_kind: None,
             switchable: true,
             saved_at: None,
+            usage_fetched_at: None,
+            usage_error: None,
+            provider: None,
         }
     }
 

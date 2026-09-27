@@ -106,6 +106,18 @@ impl RpcClient {
 
     /// Send a request and await its response (resolved by the reader task).
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
+        self.request_now(method, params).await
+    }
+
+    /// [`Self::request`], but the line is queued for writing before this
+    /// returns rather than on first poll — so a notification sent afterwards
+    /// (a steer's `session/cancel`) can never overtake it on the wire.
+    pub fn request_now(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> futures::future::BoxFuture<'static, Result<Value, HarnessError>> {
+        let method = method.to_owned();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         {
@@ -113,20 +125,24 @@ impl RpcClient {
             // Check under the same lock as EOF cleanup: a request racing the
             // reader exit must either be rejected here or cleared by it.
             if self.is_closed() {
-                return Err(HarnessError::Protocol(format!(
-                    "{method}: app-server exited before responding"
-                )));
+                return Box::pin(async move {
+                    Err(HarnessError::Protocol(format!(
+                        "{method}: app-server exited before responding"
+                    )))
+                });
             }
             pending.insert(id, tx);
         }
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if self.writer.send(line.to_string()).is_err() {
             self.pending.lock().expect("pending lock").remove(&id);
-            return Err(HarnessError::Protocol(format!(
-                "{method}: app-server stdin closed"
-            )));
+            return Box::pin(async move {
+                Err(HarnessError::Protocol(format!(
+                    "{method}: app-server stdin closed"
+                )))
+            });
         }
-        resolve_request(method, rx).await
+        Box::pin(async move { resolve_request(&method, rx).await })
     }
 
     /// Send a request with host cancellation and a hard deadline. Cancellation

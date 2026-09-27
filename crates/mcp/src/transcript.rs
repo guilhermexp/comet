@@ -156,6 +156,9 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                     tools.push(format!("task: {label} ({:?})", task.status));
                 }
             }
+            // The fork seam is a transcript marker, not agent content: an
+            // orchestrator reads the copied history as ordinary turns.
+            MessagePart::Fork { .. } => {}
         }
     }
     RenderedMessage {

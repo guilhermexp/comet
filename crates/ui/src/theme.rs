@@ -944,6 +944,30 @@ impl Theme {
             ))
     }
 
+    /// The composer pill's fill: the dark frosted tint on dark glass, the
+    /// input glass otherwise. Shared by controls that should read as the
+    /// same material (the titlebar's project-action button, upstream #548).
+    pub fn composer_surface_bg(&self) -> Hsla {
+        if self.is_frost() && matches!(self.appearance, Appearance::Dark) {
+            self.composer_sidebar_tint()
+        } else {
+            self.input_glass_bg()
+        }
+    }
+
+    /// The composer pill's edge: a translucent cool silver/slate on frost,
+    /// the theme border otherwise (upstream #548's project-action button).
+    pub fn composer_surface_border(&self) -> Hsla {
+        if self.is_frost() {
+            match self.appearance {
+                Appearance::Dark => hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
+                Appearance::Light => hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
+            }
+        } else {
+            self.border
+        }
+    }
+
     /// Move toward the right pane tone while keeping the backdrop visible.
     /// Solve the overlay in RGB: target = tint * alpha + canvas * (1 - alpha).
     pub fn composer_sidebar_tint(&self) -> Hsla {

@@ -232,7 +232,8 @@ impl ExportDoc {
                     MessagePart::Reasoning { .. }
                     | MessagePart::Input { .. }
                     | MessagePart::Error { .. }
-                    | MessagePart::WorkflowTask { .. } => {}
+                    | MessagePart::WorkflowTask { .. }
+                    | MessagePart::Fork { .. } => {}
                 }
             }
             messages.push(ExportMessage {

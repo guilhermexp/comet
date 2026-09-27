@@ -37,3 +37,15 @@ Upstream deleted the SwiftUI app. Keeping it would make every future iOS sync ma
 - No gpui render harness: visual smoke is required before promotion.
 - The sync stability port touches the relay/nudge protocol; the production edge is upstream's and already speaks the ACK.
 - iOS: no simulator runtime on this Mac; `xcodebuild test` runs in CI only.
+
+## Resolution notes (after the merge)
+
+- **Dial budget (D6):** the fork's `MAX_CONCURRENT_DIALS` semaphore in `chat_client.rs` was also held by the offline HTTP sync for a whole checkpoint download, so 8 stalled checkpoints capped live joins at 20 of `ACTIVE_SYNC_CAP` (upstream test `slow_checkpoints_survive_idle_grace_with_all_slots_occupied`). Removed with its three tests; `sync::budget` owns sockets/dials/HTTP.
+- **Held steer order:** upstream holds a turn-boundary `Steer` ahead of ordinary queued rows. The fork contract is unchanged (Worker notifications still deliver through Cancel's freeze, user rows stay frozen); only the queue order in `a_frozen_queue_still_delivers_worker_notifications` flipped.
+- **Accounts (D5):** Devin/OpenCode/Hermes stores came in with Pi (inert unless the CLI is installed). Upstream's Grok store is disconnected; the fork's managed Grok row stays.
+- **Settings:** no upstream General section (the fork's Shortcuts page already holds composer behavior; `settings/general` links open Shortcuts). #541 persistence rides `apply_shell_settings`. #541's escape layering is not needed: fork Settings do not close on Escape.
+- **Discard (#81):** the engine `DiscardWorkingTree` RPC is registered but no fork UI calls it; the diff-header trash button was dropped. Guards still to port into `Repos::discard_files` (task 3.3).
+- **Skill completion default:** upstream turns `$` completion on for every harness; taken.
+- **Mobile core:** `crates/{client,mobile,text,markdown}` compile against fork proto (extra fields defaulted; fork `ContextUsage` mapped to the FFI `{tokens, window}`). Pure path heuristics moved to `zeron_markdown::file_path` so the shared parser keeps the fork's inline file autolinks.
+- **Update:** fork `has_release_feed` kept; upstream's metadata size/time limits and subscribe-before-spawn shutdown fix taken.
+- **Environment-only failures:** `zeron-preview` WebRTC tests (`peer::tests::*`, `tests/leak.rs`) fail identically on `origin/main` on this machine.

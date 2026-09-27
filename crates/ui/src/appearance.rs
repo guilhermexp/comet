@@ -329,12 +329,11 @@ fn sync_ns_appearance(_mode: AppearanceMode) {}
 
 /// Push the theme's window background appearance onto every open window.
 pub fn reapply_window_background(cx: &mut App) {
-    // The window handling a settings click is temporarily taken out of App.
-    // Wait until it is returned before updating its native Windows backdrop.
-    #[cfg(target_os = "windows")]
+    // The window handling a settings click is temporarily taken out of App,
+    // so updating it synchronously fails — silently, leaving its native
+    // backdrop (macOS blur view, Windows Acrylic) on the old surface until a
+    // restart. Defer until every window is back, on every platform.
     cx.defer(apply_window_background);
-    #[cfg(not(target_os = "windows"))]
-    apply_window_background(cx);
 }
 
 fn apply_window_background(cx: &mut App) {
@@ -344,12 +343,12 @@ fn apply_window_background(cx: &mut App) {
     let wanted = theme.window_background_appearance();
     let blur_radius = theme.window_background_blur_radius();
     for window in cx.windows() {
-        window
-            .update(cx, |_, window, _| {
-                window.set_background_appearance(wanted);
-                window.set_background_blur_radius(blur_radius);
-            })
-            .ok();
+        if let Err(error) = window.update(cx, |_, window, _| {
+            window.set_background_appearance(wanted);
+            window.set_background_blur_radius(blur_radius);
+        }) {
+            tracing::warn!(%error, "appearance: window background not applied");
+        }
     }
 }
 

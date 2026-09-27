@@ -116,7 +116,7 @@ Suítes canônicas por superfície (detalhe e matriz `Test:` ficam no `AGENTS.md
 
 | Domínio | Doc | O que mora ali |
 |---|---|---|
-| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 12 crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, syntax, tema, workers-unpeel, updater, UI/composer, export de Chat Transcript e decoração markdown |
+| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, syntax, tema, workers-unpeel, updater, UI/composer, export de Chat Transcript e decoração markdown |
 | Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/zeron` (CLI headed/headless) e `apps/ios` |
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |

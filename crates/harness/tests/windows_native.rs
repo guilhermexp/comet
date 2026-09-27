@@ -203,6 +203,7 @@ fn fixture(dir: &Path) -> PathBuf {
 }
 fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -214,6 +215,9 @@ fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
         attachments: Vec::new(),
         worktree: None,
         resume: resume.map(str::to_owned),
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
+        sessions: None,
     }
 }
 

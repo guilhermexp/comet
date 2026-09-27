@@ -118,6 +118,7 @@ fn request(prompt: &str) -> RunRequest {
         resume: None,
         attachments: Vec::new(),
         worktree: None,
+        mcp: None,
     }
 }
 

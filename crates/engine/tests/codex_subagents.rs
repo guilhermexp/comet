@@ -56,6 +56,7 @@ async fn check_persistence(
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt: format!("scenario:{scenario}"),
         harness: None,
         model: None,

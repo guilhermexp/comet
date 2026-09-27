@@ -133,6 +133,7 @@ fn request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: None,

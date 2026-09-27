@@ -6175,6 +6175,8 @@ pub struct Composer {
     escape_armed: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
+    /// A side chat's composer: its footer keeps only the context ring.
+    side_chat: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
     _long_paste_events: Subscription,
@@ -6405,6 +6407,7 @@ impl Composer {
             slash_scroll: gpui::ScrollHandle::new(),
             _observe: observe,
             _pickers_observe: pickers_observe,
+            side_chat: false,
             _picker_focus: picker_focus,
             _input_events: input_events,
             _long_paste_events: long_paste_events,
@@ -6461,6 +6464,12 @@ impl Composer {
     /// attachments and drafts saved for other chats do not count.
     pub fn has_draft(&self, cx: &App) -> bool {
         !self.input.read(cx).text().trim().is_empty()
+    }
+
+    /// Anything a close would lose: typed text, staged files or appshots.
+    /// A side chat tab closed with content stays resident for its reopen.
+    pub(crate) fn has_content(&self, cx: &App) -> bool {
+        self.has_draft(cx) || !self.staged().is_empty() || !self.staged_appshots().is_empty()
     }
 
     pub(crate) fn can_edit_queue_in_composer(&self) -> bool {
@@ -6571,6 +6580,25 @@ impl Composer {
         }
         cx.notify();
         true
+    }
+
+    /// Mark this as a side chat's composer: below the input it shows only
+    /// the context ring (no checkout/ref footer, no plan usage).
+    pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
+        self.side_chat = true;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure(&self) -> Option<&SharedString> {
+        self.failure.as_ref()
+    }
+
+    /// Show a dismissable failure chip for the current draft's session.
+    pub(crate) fn show_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.failure = Some(message.into());
+        self.failure_key = Some(self.current_key.clone());
+        cx.notify();
     }
 
     pub fn show_appshot_error(&mut self, key: String, message: String, cx: &mut Context<Self>) {
@@ -8665,6 +8693,7 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        let create_side_chat = self.state.read(cx).unsaved_side_chat_create(&chat_id);
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
@@ -9139,6 +9168,30 @@ impl Composer {
                         tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
                     }
                 }
+                // A hand-started side chat is minted by its first send. Unlike
+                // a fresh session this one must land: the doc host would
+                // materialize it without its parent link.
+                if let Some(create) = create_side_chat {
+                    if let Err(err) = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::MUTATE,
+                        create,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, "side chat createChat failed");
+                        return Err("Couldn't create the side chat.".to_string());
+                    }
+                    let saved = chat_id.clone();
+                    this.update(cx, |composer, cx| {
+                        composer
+                            .state
+                            .update(cx, |s, cx| s.side_chat_saved(&saved, cx));
+                    })
+                    .ok();
+                }
 
                 let expects_setup_handoff = !steer_cmd
                     && run_worktree
@@ -9167,6 +9220,7 @@ impl Composer {
                             resume: None,
                             attachments: attachment_paths,
                             worktree: run_worktree,
+                            mcp: None,
                         },
                         message_id: message_id.clone(),
                     }
@@ -11324,9 +11378,22 @@ impl Render for Composer {
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists, with model/effort and the context
         // ring on the trailing edge.
-        let footer = self.pickers.update(cx, |pickers, cx| {
-            pickers.render_footer(window, Some(context_indicator), cx)
-        });
+        // A side chat's composer keeps only the context ring below the input.
+        let footer = if self.side_chat {
+            Some(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .px(px(10.0))
+                    .child(context_indicator)
+                    .into_any_element(),
+            )
+        } else {
+            self.pickers.update(cx, |pickers, cx| {
+                pickers.render_footer(window, Some(context_indicator), cx)
+            })
+        };
         let container = match footer {
             Some(footer) => container.child(footer),
             None => container,
@@ -13187,6 +13254,85 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A hand-started side chat writes nothing until its first send, which
+    /// mints it (with its parent link) before the run and only then opens
+    /// its doc.
+    #[gpui::test]
+    fn unsaved_side_chat_is_created_by_its_first_send(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        let parent = cx.new(|_| AppState::new());
+        parent.update(cx, |state, _| {
+            state.data_dir = Some(directory.path().to_path_buf());
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+        });
+        let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "side", "parentChatId": "main", "deviceId": "local", "cwd": "/tmp/main",
+            "archived": false, "createdAt": chrono::Utc::now(),
+        }))
+        .unwrap();
+        let side = cx.new(|cx| AppState::side_chat_state(&parent, chat, true, cx));
+        let mut drain = || {
+            let mut frames = Vec::new();
+            while let Ok(frame) = requests.try_recv() {
+                frames.push(serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap());
+            }
+            frames
+        };
+        // The fork's read-only Live Voice probe may name the chat; only
+        // writes would materialize it.
+        let touches_side = |frame: &zeron_rpc::ClientFrame| {
+            frame.params["chatId"] == "side"
+                && frame.method.as_deref() != Some(zeron_rpc::methods::PROBE_LIVE_VOICE)
+        };
+        cx.run_until_parked();
+        assert!(!drain().iter().any(touches_side));
+
+        let composer = cx.new(|cx| Composer::new(side.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("hello", cx));
+            composer.on_submit(cx);
+        });
+        cx.run_until_parked();
+        let sent: Vec<_> = drain().into_iter().filter(touches_side).collect();
+        let [create] = sent.as_slice() else {
+            panic!("expected only createChat, got {sent:?}");
+        };
+        assert_eq!(create.method.as_deref(), Some(methods::MUTATE));
+        assert_eq!(create.params["op"], "createChat");
+        assert_eq!(create.params["parentChatId"], "main");
+        assert_eq!(create.params["cwd"], "/tmp/main");
+        replies
+            .try_send(
+                serde_json::to_string(&zeron_rpc::ServerFrame {
+                    id: create.id,
+                    ok: Some(serde_json::json!({})),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        let after: Vec<_> = drain().into_iter().filter(touches_side).collect();
+        let called = |method: &str| after.iter().any(|f| f.method.as_deref() == Some(method));
+        assert!(called(methods::WATCH_DOC_MESSAGES), "{after:?}");
+        assert!(called(methods::QUEUE_COMMAND), "{after:?}");
+        assert!(!after.iter().any(|f| f.params["op"] == "createChat"));
+        assert!(!side.read_with(cx, |state, _| state.side_chat_unsaved()));
     }
 
     #[gpui::test]
