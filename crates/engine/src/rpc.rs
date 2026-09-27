@@ -912,6 +912,47 @@ impl EngineRpc {
 
     /// Source Control resolves against this device's Chats/Spaces or live
     /// Worker registry before any git identity or mutation.
+    /// Discards refuse while any local chat on this exact checkout has a
+    /// live run: an agent is never interrupted, nor its edits erased, as a
+    /// side effect of discarding files (upstream #81).
+    async fn ensure_no_active_agent(&self, checkout_id: &str) -> Result<(), RpcError> {
+        let chats = self.workspace.watch_chats().borrow().clone();
+        for candidate in chats {
+            if candidate.device_id != self.doc_host.device_id() {
+                continue;
+            }
+            let active = self
+                .sessions
+                .session_status(&candidate.id)
+                .is_some_and(|session| {
+                    matches!(
+                        session.status,
+                        zeron_proto::SessionStatus::Working
+                            | zeron_proto::SessionStatus::AwaitingInput
+                    )
+                });
+            if !active {
+                continue;
+            }
+            let same_checkout = if candidate.checkout_id.as_deref() == Some(checkout_id) {
+                true
+            } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
+                self.repos
+                    .checkout_identity(std::path::Path::new(candidate_cwd))
+                    .await
+                    .is_ok_and(|identity| identity.id == checkout_id)
+            } else {
+                false
+            };
+            if same_checkout {
+                return Err(RpcError::Failed(
+                    "an agent is active in this working tree".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn authorized_checkout(
         &self,
         cwd: &str,
@@ -3086,6 +3127,7 @@ impl RpcService for EngineRpc {
             methods::DISCARD_FILES => {
                 let request: zeron_proto::CheckoutFilesRequest = parse_params(params)?;
                 let identity = self.authorized_checkout(&request.cwd).await?;
+                self.ensure_no_active_agent(&identity.id).await?;
                 self.repos
                     .discard_files(&identity.root, &request.paths)
                     .await
@@ -3171,44 +3213,7 @@ impl RpcService for EngineRpc {
                         ));
                     }
 
-                    // Refuse the mutation when any local chat on this exact
-                    // checkout has a live run. We never interrupt an agent as a
-                    // side effect of discarding files.
-                    let chats = self.workspace.watch_chats().borrow().clone();
-                    for candidate in chats {
-                        if candidate.device_id != self.doc_host.device_id() {
-                            continue;
-                        }
-                        let same_checkout =
-                            if candidate.checkout_id.as_deref() == Some(identity.id.as_str()) {
-                                true
-                            } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
-                                self.repos
-                                    .checkout_identity(std::path::Path::new(candidate_cwd))
-                                    .await
-                                    .is_ok_and(|candidate_identity| {
-                                        candidate_identity.id == identity.id
-                                    })
-                            } else {
-                                false
-                            };
-                        if same_checkout
-                            && self
-                                .sessions
-                                .session_status(&candidate.id)
-                                .is_some_and(|session| {
-                                    matches!(
-                                        session.status,
-                                        zeron_proto::SessionStatus::Working
-                                            | zeron_proto::SessionStatus::AwaitingInput
-                                    )
-                                })
-                        {
-                            return Err(RpcError::Failed(
-                                "an agent is active in this working tree".into(),
-                            ));
-                        }
-                    }
+                    self.ensure_no_active_agent(&identity.id).await?;
 
                     let snapshot = self
                         .diff_sync

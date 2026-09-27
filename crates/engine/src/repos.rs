@@ -575,18 +575,24 @@ impl Repos {
                 restore.push(path.clone());
             }
         }
+        // A tracked path that is a directory on disk is a submodule (gitlink):
+        // `restore` would not discard inside it and must not pretend to.
+        if let Some(path) = restore.iter().find(|path| repo_path.join(path).is_dir()) {
+            return Err(EngineError::Other(format!(
+                "cannot discard {path}: it is a submodule or directory"
+            )));
+        }
         if !restore.is_empty() {
             let mut args = vec!["restore".into(), "--worktree".into(), "--".into()];
             args.extend(Self::literal_pathspecs(restore));
             self.git_vec(args, Some(repo_path), &[]).await?;
         }
-        for path in &untracked {
-            let full = repo_path.join(path);
-            if full.is_dir() {
-                std::fs::remove_dir_all(&full)?;
-            } else if full.exists() {
-                std::fs::remove_file(&full)?;
-            }
+        if !untracked.is_empty() {
+            // `git clean` without `-x` keeps ignored files, including those
+            // inside an untracked directory (`remove_dir_all` erased them).
+            let mut args = vec!["clean".into(), "-f".into(), "-d".into(), "--".into()];
+            args.extend(Self::literal_pathspecs(untracked));
+            self.git_vec(args, Some(repo_path), &[]).await?;
         }
         Ok(())
     }

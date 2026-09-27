@@ -248,6 +248,56 @@ async fn discard_untracked_deletes_the_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_untracked_directory_keeps_ignored_files() {
+    let h = Harness::new().await;
+    std::fs::write(h.repo.join(".gitignore"), "*.log\n").unwrap();
+    let dir = h.repo.join("scratch");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("new.txt"), "gone\n").unwrap();
+    std::fs::write(dir.join("keep.log"), "ignored\n").unwrap();
+
+    h.client
+        .call(
+            methods::DISCARD_FILES,
+            json!({ "cwd": h.repo.to_str().unwrap(), "paths": ["scratch/"] }),
+        )
+        .await
+        .expect("discard untracked directory");
+
+    assert!(!dir.join("new.txt").exists());
+    assert!(
+        dir.join("keep.log").exists(),
+        "ignored files survive a discard"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_refuses_a_tracked_directory() {
+    let h = Harness::new().await;
+    // A tracked path that is a directory on disk (as a submodule is).
+    std::fs::create_dir_all(h.repo.join("sub")).unwrap();
+    std::fs::write(h.repo.join("sub/inner.txt"), "base\n").unwrap();
+    git_stdout(&h.repo, &["add", "sub/inner.txt"]).await;
+    git_stdout(&h.repo, &["commit", "-qm", "sub"]).await;
+    std::fs::write(h.repo.join("sub/inner.txt"), "edited\n").unwrap();
+    let err = h
+        .client
+        .call(
+            methods::DISCARD_FILES,
+            json!({ "cwd": h.repo.to_str().unwrap(), "paths": ["sub"] }),
+        )
+        .await
+        .expect_err("a directory cannot be restored as a file");
+    assert!(err.to_string().contains("submodule or directory"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(h.repo.join("sub/inner.txt")).unwrap(),
+        "edited\n"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn path_with_dotdot_is_refused() {
     let h = Harness::new().await;
     let before = git_stdout(&h.repo, &["status", "--porcelain=v1"]).await;

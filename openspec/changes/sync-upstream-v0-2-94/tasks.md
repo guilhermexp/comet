@@ -15,7 +15,7 @@
 
 - [x] 3.1 Sync stability chain #544/#550/#552 (D6).
 - [x] 3.2 Accounts: #546, Pi from #542, engine parts of #449 (D5).
-- [ ] 3.3 Discard guards from #81 in `Repos::discard_files`; untracked dirs keep ignored files.
+- [x] 3.3 Discard guards from #81 in `Repos::discard_files`; untracked dirs keep ignored files.
 - [x] 3.4 Side chats core (D4).
 - [x] 3.5 Diff header open-in-Files (#311), canvas terminals (#474), last Settings section (#541).
 
