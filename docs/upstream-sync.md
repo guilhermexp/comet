@@ -53,7 +53,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
   - `comet-sessions` e `zeron` (o `zeron mcp`) vão **só** para o orquestrador raiz com IPC ativo.
   - `RunRequest.mcp` fica sempre vazio: não entra a injeção do upstream em todo run.
 - **Contas e uso:** o painel Usage da Details, os medidores do fork (Grok gerenciado, Cursor, Kimi, Antigravity) e `usage_lines`.
-- **Visual:** Settings com a navegação lateral do fork, Changes dentro do Files, transcript compacto, sem anel de contexto e sem terminal de rodapé.
+- **Visual:** Settings no layout do upstream #449, mas com as seções Projects e Accounts do fork; Changes dentro do Files, transcript compacto, sem anel de contexto e sem terminal de rodapé.
 - **Painel direito:** só conta como aberto se tiver aba viva.
 - **Publicação e update:**
   - versão 0.2.18, `release.yml` do fork, zui vendorizado em `third_party/zui`, com os pins de zui do upstream ignorados;
@@ -70,7 +70,6 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Navegação por passos do New project | #403 | v0.2.83 | Apresentação do fork |
 | Faixa de update | — | v0.2.83 | Fork sem feed próprio |
 | Sempre enfileirar em vez de steer | #284 | v0.2.83 | Steering é contrato do fork |
-| Redesign dos Settings (modal glass → página, switches, Providers, Devices refeito) | #449 (UI) | v0.2.94 | Visual do fork. **A parte de engine entrou**, e o rodapé da sidebar também (pílula avatar+nome, botão Settings que alterna, menu para cima) |
 | Anel de uso do plano ao lado do anel de contexto | #547 | v0.2.94 | Depende do anel removido e duplica o Usage |
 | Paleta do New project igual à do Cmd+K, breadcrumbs dobrados | #549 | v0.2.94 | Bate no `spaces.rs` do fork |
 | Badge de PR sem `#` | f8f9c97f | v0.2.94 | Estilo |
@@ -78,8 +77,6 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Checar update sem sync de workspace; link "unmanaged" para as releases do zeron | #535 | v0.2.94 | Faria o comet atualizar para o Zeron |
 | Rodapé Subagents/Chats do Explorer (`files/sections.rs`) | #498 | v0.2.94 | Duplica Workers › Subagents |
 | Botão "descartar árvore inteira" no diff | #81 (UI) | v0.2.94 | O descarte fica no Changes do Files. **As proteções entraram** |
-| Seção General nos Settings | #449/#541 | v0.2.94 | O Shortcuts do fork já cobre; `settings/general` abre Shortcuts |
-| Escape em camadas nos Settings | #541 | v0.2.94 | O Settings do fork não fecha com Escape |
 | Windows: build ARM64, arrastar abas (sobe zui), cwd do ConPTY, lock de identidade | #545/#536/#528/#527 | v0.2.94 | Fork só roda em macOS |
 
 ## Aceito com adaptação
@@ -94,6 +91,9 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Proteções do descarte | #81 | v0.2.94 | No `DiscardFiles` do fork: agente ativo, submódulo, `git clean` que preserva ignorados |
 | Terminal no canvas de nova chat | #474 | v0.2.94 | Mantida a regra `chatId` xor `cwd` do fork, com exceção só para `space-canvas:` |
 | Última seção dos Settings | #541 | v0.2.94 | Gravada por `apply_shell_settings`; vale para ⌘, / Cmd+K / menu |
+| Redesign dos Settings (página que toma a janela, `section_tab`, switches, selects contidos, Providers com contas/completion embutidos, Devices refeito) | #449 (UI) | v0.2.94 | Páginas do upstream com os deltas do fork: arms OMP/Kimi, textos "Chat", `origin_chat_id`, a11y do Shortcuts. Ficam do fork: Projects (restilizado com os widgets novos), Accounts como seção própria (`ACCOUNT_PROVIDERS` com Kimi, `provider_can_add` sem Add para Kimi/Grok, toggle do widget Usage por conta), rótulos Agents/Accounts, o switcher Orchestrator/Workers no topo da coluna, `nav.push` e o `close_settings` do fork. O tema do Appearance é o do upstream sobre o registro do fork (`zeron-theme`) |
+| Seção General nos Settings | #449/#541 | v0.2.94 | Seção default; `settings/general`/`conversations` abrem nela. Títulos de Chat (`thread_naming.rs`, sem `targetDeviceId`) + comportamento do composer |
+| Escape em camadas nos Settings | #541 | v0.2.94 | `dismiss_settings_escape_surface` + `dismiss_on_escape` das páginas (Devices, Agents, Accounts, Appearance); só na página do Orchestrator — Settings dos Workers mantém o comportamento antigo |
 | App iOS | #570 | v0.2.94 | Reescrita do upstream aceita inteira. As adaptações antigas (OMP, streaming) precisam ser refeitas |
 | Parser de markdown em `crates/markdown` | #570 | v0.2.94 | A heurística de path do fork foi para `zeron_markdown::file_path` |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |

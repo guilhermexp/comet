@@ -11,7 +11,9 @@
 //! classification) lives in free functions with unit tests; the elements only
 //! feed them measurements/events.
 
+mod contained;
 mod hover_intent;
+pub(crate) use contained::contained_menu;
 pub use hover_intent::{HoverAction, HoverIntent};
 
 use gpui::{

@@ -4780,7 +4780,11 @@ impl Pickers {
                         cx.stop_propagation();
                     }))
                     .child(div().flex_1().child(label))
-                    .child(crate::settings::widgets::toggle_switch(&theme, on))
+                    .child(crate::settings::widgets::toggle_switch(
+                        &theme,
+                        on,
+                        format!("model-card-{i}"),
+                    ))
                     .into_any_element()
             })
             .collect();

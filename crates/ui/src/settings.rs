@@ -26,6 +26,7 @@ pub mod harnesses;
 pub mod notifications;
 pub mod projects;
 pub mod shortcuts;
+pub mod thread_naming;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -824,7 +825,7 @@ pub struct UiSettings {
     pub escape_stops_active_agent: bool,
     /// The Settings section last viewed. ⌘, / Ctrl+,, the footer gear and the
     /// palette reopen it; links naming a section replace it. Files without
-    /// it, or with a name this build does not know, open on Devices.
+    /// it, or with a name this build does not know, open on General.
     pub settings_section: crate::shell::SettingsSection,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
@@ -1873,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_section_round_trips_and_old_or_unknown_values_read_as_devices() {
+    fn settings_section_round_trips_and_old_or_unknown_values_read_as_general() {
         use crate::shell::SettingsSection;
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
@@ -1902,9 +1903,9 @@ mod tests {
 
         // A file written before the field existed.
         let legacy: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
-        assert_eq!(legacy.settings_section, SettingsSection::Devices);
+        assert_eq!(legacy.settings_section, SettingsSection::General);
         assert_eq!(legacy.sidebar_width, 300.0);
-        // Unknown names and malformed values read as Devices without
+        // Unknown names and malformed values read as General without
         // defaulting the rest of the file.
         for raw in [r#""billing""#, "42", "null", r#"{"section":"devices"}"#] {
             std::fs::write(
@@ -1913,7 +1914,7 @@ mod tests {
             )
             .unwrap();
             let loaded = UiSettings::load(dir.path());
-            assert_eq!(loaded.settings_section, SettingsSection::Devices, "{raw}");
+            assert_eq!(loaded.settings_section, SettingsSection::General, "{raw}");
             assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
         }
         // The fork keeps Accounts as its own page: "agents" reopens there.

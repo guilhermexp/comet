@@ -925,6 +925,17 @@ impl Theme {
         popup
     }
 
+    /// Settings pages used the authored dark theme before the shared frost
+    /// change. Keep that foreground palette while light pages use popup text
+    /// (upstream #449's settings redesign).
+    pub fn for_settings_surface(&self) -> Self {
+        if matches!(self.appearance, Appearance::Dark) {
+            self.clone()
+        } else {
+            self.for_popup()
+        }
+    }
+
     /// The theme-owned tint floating cards paint over their backdrop blur (see
     /// [`crate::frost::frosted`]). Light coverage stays heavier because dark
     /// text is more vulnerable to unpredictable content behind a popover.

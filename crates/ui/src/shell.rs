@@ -529,19 +529,50 @@ pub fn apply_keymap(
     )]);
 }
 
+/// Tab groups order their descendants but do not trap focus. The trailing
+/// non-tab-stop handle gives reverse traversal a stable end boundary even
+/// when a page adds or removes controls.
+fn move_settings_focus(
+    start: &FocusHandle,
+    end: &FocusHandle,
+    reverse: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if reverse {
+        window.focus_prev(cx);
+    } else {
+        window.focus_next(cx);
+    }
+    if !start.contains_focused(window, cx) {
+        if reverse {
+            window.focus(end, cx);
+            window.focus_prev(cx);
+        } else {
+            window.focus(start, cx);
+            window.focus_next(cx);
+        }
+    }
+}
+
 /// The settings sections (feature-inventory §1.5 routes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {
-    #[default]
     Devices,
-    /// Which harnesses the composer offers (enable/disable toggles).
+    /// Which harnesses the composer offers (install/enable, per-agent
+    /// completion and accounts) — labeled "Agents" in the fork.
     Harnesses,
-    /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
+    /// Per-provider CLI accounts (login, usage) — labeled "Accounts". Upstream
+    /// folds this page into Providers; the fork keeps it as its own page so
+    /// managed identities without a harness row (Kimi Code) stay listed.
     Agents,
     Appearance,
     Files,
     Notifications,
     Shortcuts,
+    /// Composer and conversation behavior plus Chat titles (upstream #449).
+    #[default]
+    General,
     Appshots,
     /// O registro durável de projetos — o ledger, não o working set da sidebar.
     Projects,
@@ -549,32 +580,33 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 10] = [
-        SettingsSection::Devices,
-        SettingsSection::Harnesses,
-        SettingsSection::Agents,
+    pub const ALL: [SettingsSection; 11] = [
+        SettingsSection::General,
         SettingsSection::Appearance,
-        SettingsSection::Files,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
+        SettingsSection::Harnesses,
+        SettingsSection::Agents,
+        SettingsSection::Devices,
+        SettingsSection::Files,
         SettingsSection::Appshots,
         SettingsSection::Projects,
         SettingsSection::Archived,
     ];
 
-    /// Whether the fork's settings nav lists this section on this build.
+    /// Whether the settings nav lists this section on this build.
     fn visible_in_nav(self) -> bool {
         self != Self::Appshots || crate::appshots::is_desktop()
     }
 
     /// Where a generic "open Settings" lands for a remembered section: a
     /// section this build does not show (Appshots off-desktop) falls back to
-    /// Devices.
+    /// General.
     pub(crate) fn reopenable(self) -> Self {
         if self.visible_in_nav() {
             self
         } else {
-            Self::Devices
+            Self::General
         }
     }
 
@@ -588,6 +620,7 @@ impl SettingsSection {
             SettingsSection::Files => "files",
             SettingsSection::Notifications => "notifications",
             SettingsSection::Shortcuts => "shortcuts",
+            SettingsSection::General => "general",
             SettingsSection::Appshots => "appshots",
             SettingsSection::Projects => "projects",
             SettingsSection::Archived => "archived",
@@ -604,13 +637,18 @@ impl SettingsSection {
             "files" => SettingsSection::Files,
             "notifications" => SettingsSection::Notifications,
             "shortcuts" => SettingsSection::Shortcuts,
-            // Upstream's General page is the fork's Shortcuts page.
-            "general" | "conversations" => SettingsSection::Shortcuts,
+            "general" | "conversations" => SettingsSection::General,
             "appshots" => SettingsSection::Appshots,
             "projects" => SettingsSection::Projects,
             "archived" => SettingsSection::Archived,
             _ => return None,
         })
+    }
+
+    /// Nav groups are separated by spacing alone: preferences, agents and
+    /// devices, then workspace data.
+    fn starts_nav_group(self) -> bool {
+        matches!(self, Self::Harnesses | Self::Files)
     }
 
     /// Sidebar + header label (zeron settings-sidebar.tsx SECTIONS / __root.tsx
@@ -624,6 +662,7 @@ impl SettingsSection {
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::General => "General",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Projects => "Projects",
             SettingsSection::Archived => "Archived sessions",
@@ -638,7 +677,7 @@ impl serde::Serialize for SettingsSection {
     }
 }
 
-/// Lenient: an unknown or malformed value reads as Devices instead of
+/// Lenient: an unknown or malformed value reads as General instead of
 /// failing — and so defaulting — the whole settings file.
 impl<'de> serde::Deserialize<'de> for SettingsSection {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -748,7 +787,7 @@ fn settings_catalog_for_mode(
     match mode {
         SidebarMode::Orchestrator => SettingsCatalog::Orchestrator(match app_route {
             Route::Settings(section) => section,
-            Route::Chat => SettingsSection::Devices,
+            Route::Chat => SettingsSection::General,
         }),
         SidebarMode::Workers => SettingsCatalog::Workers(match workers_route {
             WorkersRoute::Settings(tab) => tab,
@@ -2226,11 +2265,10 @@ impl Render for SidebarPane {
             return div().into_any_element();
         };
         let inner = shell.update(cx, |shell, cx| {
+            // Settings takes over the whole window (`render_settings_page`),
+            // so this pane only ever shows the chat sidebar.
             let theme = Theme::of(cx).clone();
-            match shell.route {
-                Route::Settings(section) => shell.render_settings_nav(section, &theme, cx),
-                Route::Chat => shell.render_chat_sidebar(&theme, cx),
-            }
+            shell.render_chat_sidebar(&theme, cx)
         });
         div().size_full().child(inner).into_any_element()
     }
@@ -2348,6 +2386,13 @@ pub struct Shell {
     _file_preview_sub: Subscription,
     /// Chat outlet vs settings pages.
     route: Route,
+    /// Settings keyboard scope (upstream #449): the page root holds focus on
+    /// entry, Tab cycles inside it, and the trailing handle bounds reverse
+    /// traversal.
+    settings_focus: FocusHandle,
+    settings_end_focus: FocusHandle,
+    settings_nav_focus: Vec<FocusHandle>,
+    settings_focus_pending: bool,
     /// Session-local top-level sidebar content. Workers owns an independent,
     /// retained Unpeel workspace while Orchestrator keeps its existing routes.
     sidebar_mode: SidebarMode,
@@ -3061,6 +3106,13 @@ impl Shell {
             file_preview,
             _file_preview_sub: file_preview_sub,
             route,
+            settings_focus: cx.focus_handle(),
+            settings_end_focus: cx.focus_handle(),
+            settings_nav_focus: SettingsSection::ALL
+                .iter()
+                .map(|_| cx.focus_handle())
+                .collect(),
+            settings_focus_pending: matches!(route, Route::Settings(_)),
             sidebar_mode: match std::env::var("ZERON_SIDEBAR_MODE").ok().as_deref() {
                 Some("workers") => SidebarMode::Workers,
                 _ => SidebarMode::default(),
@@ -5659,6 +5711,9 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        if !matches!(self.route, Route::Settings(_)) {
+            self.settings_focus_pending = true;
+        }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
         self.remember_settings_section(section, cx);
@@ -5791,7 +5846,48 @@ impl Shell {
         }
     }
 
+    /// Escape bubbling out of the settings page. Focused controls — open
+    /// dropdowns, the shortcut recorder, a dialog's own input — consume it
+    /// before it gets here. What remains open without holding focus closes
+    /// first: the account menu, a sync prompt, then the routed page's dialog
+    /// or login flow. Returns whether one did; only then does Settings stay.
+    fn dismiss_settings_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sync_flow.has_visible_overlay() {
+            return true;
+        }
+        if self.user_menu.is_open() {
+            self.close_user_menu(cx);
+            return true;
+        }
+        if self.user_menu.get().is_some() {
+            return true;
+        }
+        let Route::Settings(section) = self.route else {
+            return false;
+        };
+        match section {
+            SettingsSection::Devices => self
+                .devices_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            SettingsSection::Harnesses => self
+                .harnesses_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            SettingsSection::Agents => self
+                .accounts_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            SettingsSection::Appearance => self
+                .appearance_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            _ => false,
+        }
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_focus_pending = false;
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
@@ -6030,7 +6126,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Shortcuts | SettingsSection::Appshots => {
+            SettingsSection::Shortcuts | SettingsSection::General | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
@@ -6091,7 +6187,10 @@ impl Shell {
                 match &self.shortcuts_page {
                     Some(page) => {
                         page.update(cx, |page, _| {
-                            page.show_appshots(section == SettingsSection::Appshots)
+                            page.show_section(
+                                section == SettingsSection::Appshots,
+                                section == SettingsSection::General,
+                            )
                         });
                         page.clone().into_any_element()
                     }
@@ -8658,13 +8757,133 @@ impl Shell {
         )
     }
 
-    /// Settings-mode sidebar (zeron settings-sidebar.tsx): window-control
-    /// strip, "Settings" heading, icon section rows styled like session rows,
-    /// and a Back row pinned to the bottom.
+    /// Settings takes over the window: the section list stands where the
+    /// chat sidebar was, the page fills the rest. Opening a preference never
+    /// adds a route-history entry or changes the selected conversation.
+    fn render_settings_page(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).for_settings_surface();
+        if self.settings_focus_pending {
+            self.settings_focus_pending = false;
+            // Keep keyboard dispatch in settings without selecting a control.
+            // Tab remains the explicit way to enter its navigation or content.
+            window.focus(&self.settings_focus, cx);
+        }
+        let sidebar_width = self.settings.sidebar_width;
+        // Dropdowns contain themselves to the page pane beside this column.
+        settings::widgets::set_sidebar_width(sidebar_width, cx);
+        let nav = self.render_settings_nav(section, &theme, window, cx);
+        // The footer uses the chat sidebar's theme so the account and
+        // settings buttons render identically in both places.
+        let footer_theme = Theme::of(cx).clone();
+        let (user_line, menu_identity) = {
+            let state = self.state.read(cx);
+            sidebar_account_identity(state.workspace_scope, self.sync_flow, state.auth_user())
+        };
+        let footer = self.render_user_menu(user_line, menu_identity, &footer_theme, cx);
+        // Fork: the Orchestrator/Workers switcher stays on top, so Settings
+        // can still flip to the Workers catalog (`select_sidebar_mode`).
+        let switcher = self.render_sidebar_mode_switcher(&footer_theme, cx);
+        let outlet = self.settings_outlet(section, window, cx);
+        div()
+            .id("settings-page")
+            .role(gpui::Role::Group)
+            .aria_label("Settings")
+            .track_focus(&self.settings_focus)
+            .tab_group()
+            .tab_stop(false)
+            .size_full()
+            .flex()
+            .flex_row()
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let key = &event.keystroke.key;
+                if key == "escape" {
+                    if !this.dismiss_settings_escape_surface(cx) {
+                        this.close_settings(cx);
+                    }
+                    cx.stop_propagation();
+                } else if key == "tab" {
+                    move_settings_focus(
+                        &this.settings_focus,
+                        &this.settings_end_focus,
+                        event.keystroke.modifiers.shift,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                // Same width and footer wrapper as the chat sidebar, so the
+                // account controls hold their position across the swap.
+                div()
+                    .w(px(sidebar_width))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .pt(px(Theme::TITLEBAR_HEIGHT))
+                    .child(switcher)
+                    .child(
+                        div().flex_none().px(px(Theme::SPACE_SM)).child(
+                            settings::widgets::section_tab(
+                                &theme,
+                                false,
+                                0.0,
+                                "settings-back",
+                                "settings-back-hover",
+                            )
+                            .role(gpui::Role::Button)
+                            .aria_label("Back")
+                            .tab_index(0)
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
+                            .child(icon(icons::ARROW_LEFT).size(px(16.0)).text_color(
+                                motion::hover_blend(
+                                    "settings-back-hover",
+                                    theme.text_muted,
+                                    theme.text,
+                                ),
+                            ))
+                            .child("Back"),
+                        ),
+                    )
+                    .child(div().flex_1().min_h_0().child(nav))
+                    .child(div().p(px(Theme::SPACE_SM)).flex_none().child(footer)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    // Pages scroll to the window's top edge; `page_column`
+                    // carries the titlebar clearance inside the scroll.
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(outlet)),
+            )
+            .child(
+                div()
+                    .id("settings-focus-end")
+                    .track_focus(&self.settings_end_focus)
+                    .tab_index(0)
+                    .tab_stop(false),
+            )
+            .into_any_element()
+    }
+
+    /// Roving section tabs, grouped by spacing alone: preferences, agents and
+    /// devices, then workspace data.
     fn render_settings_nav(
         &mut self,
         section: SettingsSection,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
@@ -8675,112 +8894,113 @@ impl Shell {
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::General => icons::SETTINGS,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Projects => icons::FOLDER,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
-        // Match the user's dragged sidebar width — the pane container clips to
-        // it, so a hardcoded default here left hover washes stopping short of
-        // the sidebar's right edge (user-reported). Device identity lives on
-        // the Accounts page now — the one surface where the device matters.
-        div()
-            .w(px(self.settings.sidebar_width))
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_1()
-                    .px(px(Theme::SPACE_SM))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from("Settings")),
-                    )
-                    .child(
-                        div().flex().flex_col().gap(px(2.0)).children(
+        settings::widgets::scroll_faded(
+            "settings-nav-scroll",
+            div()
+                .id("settings-sections")
+                .role(gpui::Role::TabList)
+                .aria_label("Settings sections")
+                .w_full()
+                .overflow_y_scroll()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(Theme::SPACE_SM))
+                        .pt(px(Theme::SPACE_MD))
+                        .pb(px(Theme::SPACE_SM))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .children(
                             SettingsSection::ALL
                                 .into_iter()
-                                .filter(|item| {
-                                    *item != SettingsSection::Appshots
-                                        || crate::appshots::is_desktop()
-                                })
+                                .filter(|item| item.visible_in_nav())
                                 .map(|item| {
+                                    let index = SettingsSection::ALL
+                                        .iter()
+                                        .position(|s| *s == item)
+                                        .unwrap();
                                     let selected = item == section;
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "settings-nav-{}",
-                                            item.label()
-                                        )))
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(8.0))
-                                        .rounded(px(8.0))
-                                        .px(px(Theme::SPACE_SM))
-                                        .py(px(6.0))
-                                        .text_size(px(13.0))
-                                        .when(selected, |el| {
-                                            // Same tokens as the main sidebar's session
-                                            // rows — the two sidebars must feel alike.
-                                            el.bg(crate::theme::glass_selected_bg())
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                        })
-                                        .text_color(if selected {
-                                            theme.text
-                                        } else {
-                                            theme.text_muted
-                                        })
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.open_settings(item, cx)
-                                        }))
-                                        .child(
-                                            icon(section_icon(item))
-                                                .size(px(16.0))
-                                                .text_color(theme.text_muted),
-                                        )
-                                        .child(SharedString::from(item.label()))
+                                    let key = format!("settings-nav-{}", item.label());
+                                    let hover_key = format!("{key}-hover");
+                                    let selection_t = settings::widgets::tab_selection_t(
+                                        window,
+                                        format!("{key}-selection"),
+                                        selected,
+                                        motion::reduced_motion(cx),
+                                    );
+                                    let tab_text = motion::hover_blend(
+                                        &hover_key,
+                                        motion::mix(theme.text_muted, theme.text, selection_t),
+                                        theme.text,
+                                    );
+                                    settings::widgets::section_tab(
+                                        theme,
+                                        selected,
+                                        selection_t,
+                                        key.clone(),
+                                        hover_key,
+                                    )
+                                    .when(item.starts_nav_group(), |el| el.mt(px(Theme::SPACE_LG)))
+                                    .role(gpui::Role::Tab)
+                                    .aria_label(item.label())
+                                    .aria_selected(selected)
+                                    .track_focus(
+                                        &self.settings_nav_focus[index].clone().tab_stop(selected),
+                                    )
+                                    .tab_index(0)
+                                    .tab_stop(selected)
+                                    .on_key_down(cx.listener(
+                                        move |this, event: &gpui::KeyDownEvent, window, cx| {
+                                            let items: Vec<_> = SettingsSection::ALL
+                                                .into_iter()
+                                                .filter(|s| s.visible_in_nav())
+                                                .collect();
+                                            let current =
+                                                items.iter().position(|s| *s == item).unwrap_or(0);
+                                            let next = match event.keystroke.key.as_str() {
+                                                "up" | "left" => {
+                                                    (current + items.len() - 1) % items.len()
+                                                }
+                                                "down" | "right" => (current + 1) % items.len(),
+                                                "home" => 0,
+                                                "end" => items.len() - 1,
+                                                _ => return,
+                                            };
+                                            let target = items[next];
+                                            this.open_settings(target, cx);
+                                            let index = SettingsSection::ALL
+                                                .iter()
+                                                .position(|s| *s == target)
+                                                .unwrap();
+                                            window.focus(&this.settings_nav_focus[index], cx);
+                                            cx.stop_propagation();
+                                        },
+                                    ))
+                                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_settings(item, cx)
+                                    }))
+                                    .child(
+                                        icon(section_icon(item))
+                                            .size(px(16.0))
+                                            .text_color(tab_text),
+                                    )
+                                    .child(SharedString::from(item.label()))
                                 }),
                         ),
-                    ),
-            )
-            // Back pinned to the bottom (zeron settings-sidebar.tsx).
-            .child(
-                div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
-                    div()
-                        .id("settings-back")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .rounded(px(8.0))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(6.0))
-                        .text_size(px(13.0))
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
-                        .child(
-                            // AltArrowLeft chevron (zeron settings-sidebar.tsx),
-                            // not the straight history arrow.
-                            icon(icons::ALT_ARROW_LEFT)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Back")),
                 ),
-            )
-            .into_any_element()
+        )
+        .into_any_element()
     }
 
     fn render_chat_delete_confirm(
@@ -10729,6 +10949,12 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
+        // The Settings page owns Escape itself (`dismiss_settings_escape_surface`).
+        if self.sidebar_mode == SidebarMode::Orchestrator
+            && matches!(self.route, Route::Settings(_))
+        {
+            return;
+        }
         if event.keystroke.key == "escape" && self.capture_escape_surface(cx) {
             cx.stop_propagation();
         }
@@ -11259,22 +11485,8 @@ impl Shell {
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
-        // Settings route: just the section outlet — the section label lives in
-        // the unified window titlebar now (render_title_bar). Settings never
-        // underlaps: pad below the overlaid titlebar.
-        if let Route::Settings(section) = self.route {
-            let outlet = self.settings_outlet(section, window, cx);
-            return div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
-                .flex()
-                .flex_col()
-                .child(div().flex_1().min_h_0().child(outlet))
-                .into_any_element();
-        }
-
+        // Orchestrator Settings never reaches here: it takes over the whole
+        // window in the Ready render (`render_settings_page`).
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
@@ -14007,7 +14219,7 @@ impl Render for Shell {
             gate.clone()
         };
         let root = match &render_gate {
-            GatePhase::Ready => {
+            GatePhase::Ready => 'ready: {
                 // Focus is a sync signal: on the rising edge of window
                 // activation, nudge every open room to verify liveness — a
                 // broadcast-deaf socket (accepted writes, runtime pongs,
@@ -14049,6 +14261,51 @@ impl Render for Shell {
                 // Stamped for `right_target` — the expanded surface host sizes
                 // itself to the viewport.
                 self.viewport_width = viewport;
+                // Settings replaces the whole workspace, sidebar included
+                // (upstream #449). The chat layout stays unmounted; its
+                // entities keep their state for the return trip. Workers
+                // settings keep the Workers sidebar + content of their mode.
+                if self.sidebar_mode == SidebarMode::Orchestrator
+                    && let Route::Settings(section) = self.route
+                {
+                    let settings_page = self.render_settings_page(section, window, cx);
+                    let overlays = self.render_overlays(window.viewport_size(), window, cx);
+                    let border_color = Theme::of(cx).border;
+                    let window_corner = Self::window_corner_radius(window);
+                    let sidebar_width = self.settings.sidebar_width;
+                    let sidebar_tone = div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(sidebar_width))
+                        .when(window_corner > 0.0, |el| {
+                            el.rounded_tl(px(window_corner))
+                                .rounded_bl(px(window_corner))
+                        })
+                        .bg(Theme::of(cx).sidebar_column_overlay())
+                        .border_r_1()
+                        .border_color(border_color);
+                    let drag = self.titlebar_drag_region(
+                        "settings-titlebar",
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(Theme::TITLEBAR_HEIGHT)),
+                        cx,
+                    );
+                    let page = div()
+                        .size_full()
+                        .relative()
+                        .child(settings_page)
+                        .child(drag)
+                        .children(overlays);
+                    break 'ready root
+                        .child(sidebar_tone)
+                        .child(motion::fade_in("phase-app", page));
+                }
                 let on_chat = matches!(self.route, Route::Chat);
                 let right_target_width = if on_chat {
                     self.right_visible_width(cx)
@@ -14541,7 +14798,7 @@ mod tests {
                 Route::Chat,
                 WorkersRoute::Settings(WorkersSettingsTab::Resources),
             ),
-            Some(SettingsCatalog::Orchestrator(SettingsSection::Devices))
+            Some(SettingsCatalog::Orchestrator(SettingsSection::General))
         );
         assert_eq!(
             sidebar_mode_switch_catalog(
@@ -18039,7 +18296,8 @@ impl Shell {
 #[cfg(test)]
 mod settings_section_persistence {
     //! #541 (last Settings section) mapped onto the fork's settings route:
-    //! the fork keeps its side-nav page and Accounts stays its own section.
+    //! Settings takes over the window like upstream #449; Accounts stays its
+    //! own section in the fork.
     use super::*;
     use gpui::{AppContext, TestAppContext};
 
@@ -18097,7 +18355,7 @@ mod settings_section_persistence {
             if crate::appshots::is_desktop() {
                 SettingsSection::Appshots
             } else {
-                SettingsSection::Devices
+                SettingsSection::General
             }
         );
         for section in SettingsSection::ALL {
@@ -18118,8 +18376,9 @@ mod settings_section_persistence {
             ("settings/providers", SettingsSection::Harnesses),
             ("settings/harnesses", SettingsSection::Harnesses),
             ("settings/agents", SettingsSection::Agents),
-            ("settings/general", SettingsSection::Shortcuts),
-            ("settings/conversations", SettingsSection::Shortcuts),
+            ("settings/general", SettingsSection::General),
+            ("settings/conversations", SettingsSection::General),
+            ("settings/shortcuts", SettingsSection::Shortcuts),
             ("settings/files", SettingsSection::Files),
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/projects", SettingsSection::Projects),
@@ -18200,9 +18459,9 @@ mod settings_section_persistence {
         let window = cx.add_window(|_, cx| settings_test_shell(dir.path(), cx));
         window
             .update(cx, |shell, _, cx| {
-                // Nothing remembered yet: Devices.
+                // Nothing remembered yet: General.
                 shell.open_last_settings(cx);
-                assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+                assert_eq!(shell.route, Route::Settings(SettingsSection::General));
                 // Switching sections inside Settings is remembered.
                 shell.open_settings(SettingsSection::Shortcuts, cx);
                 assert_eq!(shell.settings.settings_section, SettingsSection::Shortcuts);
@@ -18228,8 +18487,126 @@ mod settings_section_persistence {
         );
     }
 
+    struct FocusHost {
+        background: FocusHandle,
+        start: FocusHandle,
+        first: FocusHandle,
+        last: FocusHandle,
+        end: FocusHandle,
+    }
+
+    impl Render for FocusHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(
+                    div()
+                        .id("background")
+                        .track_focus(&self.background)
+                        .tab_index(0),
+                )
+                .child(
+                    div()
+                        .id("modal")
+                        .track_focus(&self.start)
+                        .tab_group()
+                        .tab_stop(false)
+                        .child(div().id("first").track_focus(&self.first).tab_index(0))
+                        .child(div().id("last").track_focus(&self.last).tab_index(0))
+                        .child(
+                            div()
+                                .id("end")
+                                .track_focus(&self.end)
+                                .tab_index(0)
+                                .tab_stop(false),
+                        ),
+                )
+        }
+    }
+
     #[gpui::test]
-    fn unknown_or_hidden_remembered_sections_reopen_devices(cx: &mut TestAppContext) {
+    fn settings_tab_wraps_in_both_directions_without_entering_workspace(cx: &mut TestAppContext) {
+        let host = cx.add_window(|_, cx| FocusHost {
+            background: cx.focus_handle().tab_stop(true),
+            start: cx.focus_handle(),
+            first: cx.focus_handle().tab_stop(true),
+            last: cx.focus_handle().tab_stop(true),
+            end: cx.focus_handle(),
+        });
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        host.update(cx, |host, window, cx| {
+            window.focus(&host.start, cx);
+            assert!(!host.first.is_focused(window));
+            assert!(!host.last.is_focused(window));
+            move_settings_focus(&host.start, &host.end, false, window, cx);
+            assert!(host.first.is_focused(window));
+            for reverse in [false, false, true, true, true, false] {
+                let was_first = host.first.is_focused(window);
+                move_settings_focus(&host.start, &host.end, reverse, window, cx);
+                assert!(host.start.contains_focused(window, cx));
+                assert_eq!(host.last.is_focused(window), was_first);
+                assert!(!host.background.is_focused(window));
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_closes_what_is_open_inside_settings_before_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| settings_test_shell(dir.path(), cx));
+        shell.update(cx, |shell, cx| {
+            // No engine in tests: render the workspace, not the boot gate.
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.open_settings(SettingsSection::Devices, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        // A dialog that does not hold focus (the rename input was never
+        // clicked) still closes before Settings does.
+        let devices = shell.read_with(cx, |shell, _| shell.devices_page.clone().unwrap());
+        devices.update(cx, |page, cx| {
+            page.open_rename("device-1".into(), "Studio".into(), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("escape");
+        assert!(!devices.update(cx, |page, cx| page.dismiss_on_escape(cx)));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+        });
+
+        // So does the account menu opened from the settings footer.
+        shell.update(cx, |shell, cx| {
+            shell.user_menu.open(());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.user_menu.is_open());
+            assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+        });
+        // The exit animation's reap runs on wall-clock time; stand in for it.
+        shell.update(cx, |shell, cx| {
+            shell.user_menu = popover::Popup::default();
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        // With nothing left open, Escape leaves Settings.
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.route, Route::Chat);
+            assert_eq!(shell.settings.settings_section, SettingsSection::Devices);
+        });
+    }
+
+    #[gpui::test]
+    fn unknown_or_hidden_remembered_sections_reopen_general(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             settings::UiSettings::path(dir.path()),
@@ -18243,7 +18620,7 @@ mod settings_section_persistence {
         window
             .update(cx, |shell, _, cx| {
                 shell.open_last_settings(cx);
-                assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+                assert_eq!(shell.route, Route::Settings(SettingsSection::General));
                 shell.close_settings(cx);
                 // A remembered section this build hides falls back as well.
                 shell.settings.settings_section = SettingsSection::Appshots;
