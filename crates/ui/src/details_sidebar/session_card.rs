@@ -464,37 +464,61 @@ impl DetailsSidebar {
                     ),
             );
             if expanded {
-                // Inline, not a nested scroller: the Details pane already
-                // scrolls, and a second scroll region fought it (laggy).
+                // Capped box with its own scroll, virtualized: only the
+                // visible rows render, so scrolling stays smooth with dozens
+                // of skills.
+                const ROW: f32 = 24.0;
+                const MAX_ROWS: usize = 7;
                 let skills = sources.skills.clone();
+                let entity = cx.entity();
+                let muted = theme.text_muted;
+                let hover = theme.element_hover.opacity(0.45);
+                let height = ROW * count.min(MAX_ROWS) as f32 + 4.0;
                 card = card.child(
-                    div()
-                        .pb(px(4.0))
-                        .children(skills.into_iter().enumerate().map(|(ix, skill)| {
-                            let path = skill.relative_path.clone();
-                            div()
-                                .id(("context-source-skill", ix))
-                                .h(px(24.0))
-                                .mx(px(6.0))
-                                .pl(px(29.0))
-                                .pr(px(6.0))
-                                .rounded(px(6.0))
-                                .flex()
-                                .items_center()
-                                .cursor_pointer()
-                                .hover(|row| row.bg(theme.element_hover.opacity(0.45)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.emit_open_file(&path, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(px(12.0))
-                                        .text_color(theme.text_muted)
-                                        .child(skill.name),
-                                )
-                        })),
+                    div().h(px(height)).pb(px(4.0)).child(
+                        gpui::uniform_list(
+                            "context-sources-list",
+                            count,
+                            move |range, _window, _app| {
+                                range
+                                    .filter_map(|ix| {
+                                        let skill = skills.get(ix)?.clone();
+                                        let entity = entity.clone();
+                                        let path = skill.relative_path.clone();
+                                        Some(
+                                            div()
+                                                .id(("context-source-skill", ix))
+                                                .h(px(ROW))
+                                                .mx(px(6.0))
+                                                .pl(px(29.0))
+                                                .pr(px(6.0))
+                                                .rounded(px(6.0))
+                                                .flex()
+                                                .items_center()
+                                                .cursor_pointer()
+                                                .hover(move |row| row.bg(hover))
+                                                .on_click(move |_, _, app| {
+                                                    entity.update(app, |this, cx| {
+                                                        this.emit_open_file(&path, cx)
+                                                    });
+                                                })
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(px(12.0))
+                                                        .text_color(muted)
+                                                        .child(skill.name),
+                                                )
+                                                .into_any_element(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                        .size_full()
+                        .track_scroll(&self.context_sources_scroll),
+                    ),
                 );
             }
         }

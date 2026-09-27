@@ -565,6 +565,7 @@ pub struct DetailsSidebar {
     context_sources_task: Option<Task<()>>,
     context_sources_pending: Option<String>,
     context_sources_expanded: bool,
+    context_sources_scroll: gpui::UniformListScrollHandle,
     turn_stats_collapsed: bool,
 }
 
@@ -686,6 +687,7 @@ impl DetailsSidebar {
             context_sources_task: None,
             context_sources_pending: None,
             context_sources_expanded: false,
+            context_sources_scroll: gpui::UniformListScrollHandle::new(),
             turn_stats_collapsed: false,
             file_task: None,
             branch_task: None,
