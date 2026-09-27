@@ -12214,6 +12214,7 @@ mod tests {
                         )),
                         error: None,
                         last_completed_turn: None,
+                        turn_stats: None,
                     }];
                     cx.notify();
                 });

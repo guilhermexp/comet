@@ -1977,6 +1977,7 @@ impl Inner {
                     updated_at: now,
                     context_usage: None,
                     error: None,
+                    turn_stats: None,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -2016,6 +2017,22 @@ impl Inner {
         if let Some(ws) = self.workspace() {
             ws.record_session(&session);
         }
+    }
+
+    /// Live-only: turn stats ride `WatchSessions` and never the registry row
+    /// (`upsert_session` writes an explicit key set that excludes them).
+    fn set_turn_stats(&self, chat_id: &str, stats: zeron_proto::TurnStats) {
+        let mut statuses = lock(&self.statuses);
+        let Some(entry) = statuses.get_mut(chat_id) else {
+            return;
+        };
+        if entry.turn_stats == Some(stats) {
+            return;
+        }
+        entry.turn_stats = Some(stats);
+        let mut list: Vec<Session> = statuses.values().cloned().collect();
+        list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        self.sessions_tx.send_replace(list);
     }
 
     fn set_context_usage(&self, chat_id: &str, context_usage: zeron_proto::ContextUsage) {
@@ -2554,6 +2571,7 @@ fn trajectory_event_projects(event: &AgentEvent) -> bool {
         | AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::ToolCallPreview { .. }
         | AgentEvent::NativeTitle { .. }
+        | AgentEvent::TurnMetrics { .. }
         | AgentEvent::ContextUsage { .. } => false,
     }
 }
@@ -2563,6 +2581,89 @@ fn should_journal_event(event: &AgentEvent) -> bool {
         AgentEvent::ToolCallPreview { .. } => false,
         AgentEvent::Subagent { event, .. } => should_journal_event(event),
         _ => true,
+    }
+}
+
+/// Sums one top-level turn's events into [`zeron_proto::TurnStats`]. The
+/// clock starts at the run (or at the first event after a finished turn) and
+/// stops at `Done` or a steer boundary; subagent traffic is not counted.
+#[derive(Debug, Default)]
+struct TurnAccumulator {
+    started_ms: Option<i64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    model_ms: Option<u64>,
+    tool_ms: Option<u64>,
+    tools: std::collections::HashSet<String>,
+}
+
+impl TurnAccumulator {
+    fn starting_at(started_ms: i64) -> Self {
+        Self {
+            started_ms: Some(started_ms),
+            ..Self::default()
+        }
+    }
+
+    fn observe(&mut self, event: &AgentEvent) {
+        fn add(slot: &mut Option<u64>, value: Option<u64>) {
+            if let Some(value) = value {
+                *slot = Some(slot.unwrap_or(0).saturating_add(value));
+            }
+        }
+        self.started_ms.get_or_insert_with(now_ms);
+        match event {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                self.input_tokens = self.input_tokens.saturating_add(*input_tokens);
+                self.output_tokens = self.output_tokens.saturating_add(*output_tokens);
+            }
+            AgentEvent::TurnMetrics {
+                cache_read_tokens,
+                cache_write_tokens,
+                cost_usd,
+                model_ms,
+            } => {
+                add(&mut self.cache_read_tokens, *cache_read_tokens);
+                add(&mut self.cache_write_tokens, *cache_write_tokens);
+                add(&mut self.model_ms, *model_ms);
+                if let Some(cost) = cost_usd {
+                    self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+                }
+            }
+            AgentEvent::ToolCall { id, .. } if id != zeron_proto::LIVE_PLAN_TOOL_ID => {
+                self.tools.insert(id.clone());
+            }
+            AgentEvent::ToolResult {
+                execution: Some(execution),
+                ..
+            } => add(&mut self.tool_ms, execution.duration_ms),
+            _ => {}
+        }
+    }
+
+    fn finish(&self, now: i64) -> zeron_proto::TurnStats {
+        let duration_ms = u64::try_from(now - self.started_ms.unwrap_or(now)).unwrap_or(0);
+        let model_ms = self.model_ms.or_else(|| {
+            (duration_ms > 0).then(|| duration_ms.saturating_sub(self.tool_ms.unwrap_or(0)))
+        });
+        zeron_proto::TurnStats {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cost_usd: self.cost_usd,
+            duration_ms,
+            model_ms,
+            tool_ms: self.tool_ms,
+            steps: u32::try_from(self.tools.len()).unwrap_or(u32::MAX),
+        }
     }
 }
 
@@ -3311,6 +3412,7 @@ async fn drive_run(
     let mut prepared_events = std::collections::VecDeque::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
+    let mut turn = TurnAccumulator::starting_at(segment_started);
     let mut writer: Option<SegmentWriter<'_>> = None;
     let mut dirty = false;
     let mut flush_at = tokio::time::Instant::now();
@@ -3571,6 +3673,7 @@ async fn drive_run(
             prepared_events.extend(events);
             event
         };
+        turn.observe(&event);
 
         // Native titles are host-local metadata, not transcript/journal events.
         if let AgentEvent::NativeTitle { title } = &event {
@@ -3981,6 +4084,9 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            // A steer starts the next user turn: close the stats of this one.
+            inner.set_turn_stats(&chat_id, turn.finish(now_ms()));
+            turn = TurnAccumulator::default();
             // A steer boundary means a real prompt owns the turn again — its
             // Done will come; the short self-continued window stands down.
             self_continued_turn = false;
@@ -4055,6 +4161,10 @@ async fn drive_run(
                 inner.set_context_usage(&chat_id, *context_usage);
             }
             _ => {}
+        }
+        if matches!(event, AgentEvent::Done { .. }) {
+            inner.set_turn_stats(&chat_id, turn.finish(now_ms()));
+            turn = TurnAccumulator::default();
         }
 
         inner.publish(&chat_id, &event);
@@ -4617,6 +4727,59 @@ mod tests {
     }
 
     #[test]
+    fn turn_accumulator_sums_usage_metrics_steps_and_tool_time() {
+        let mut turn = super::TurnAccumulator::starting_at(1_000);
+        let tool = |id: &str| AgentEvent::ToolCall {
+            id: id.into(),
+            call: zeron_proto::ToolCall::Unknown {
+                name: "t".into(),
+                input: None,
+            },
+        };
+        turn.observe(&tool("a"));
+        turn.observe(&tool("a"));
+        turn.observe(&tool(zeron_proto::LIVE_PLAN_TOOL_ID));
+        turn.observe(&tool("b"));
+        turn.observe(&AgentEvent::ToolResult {
+            id: "a".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+            execution: Some(zeron_proto::ToolExecutionMeta {
+                exit_code: Some(0),
+                duration_ms: Some(1_500),
+            }),
+        });
+        turn.observe(&AgentEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 40,
+            context_usage: None,
+        });
+        turn.observe(&AgentEvent::TurnMetrics {
+            cache_read_tokens: Some(300),
+            cache_write_tokens: Some(100),
+            cost_usd: Some(0.25),
+            model_ms: None,
+        });
+        let stats = turn.finish(11_000);
+        assert_eq!(
+            stats.steps, 2,
+            "duplicate ids and the live plan do not count"
+        );
+        assert_eq!(stats.duration_ms, 10_000);
+        assert_eq!(stats.tool_ms, Some(1_500));
+        assert_eq!(
+            stats.model_ms,
+            Some(8_500),
+            "falls back to wall time minus tools"
+        );
+        assert_eq!((stats.input_tokens, stats.output_tokens), (100, 40));
+        assert_eq!(stats.cost_usd, Some(0.25));
+        assert_eq!(stats.cache_fraction(), Some(0.6));
+        assert_eq!(stats.output_rate(10_000), Some(4.0));
+    }
+
+    #[test]
     fn finished_subagent_persists_engine_measured_duration() {
         let doc = Arc::new(zeron_doc::SessionDoc::init("subagent-duration").unwrap());
         let sink = SubagentSink {
@@ -4764,6 +4927,7 @@ mod tests {
             updated_at: Utc::now(),
             context_usage: None,
             error: None,
+            turn_stats: None,
         };
         let usage = ContextUsage {
             tokens: 392_000,
@@ -4810,6 +4974,7 @@ mod tests {
             updated_at: Utc::now(),
             context_usage: None,
             error: None,
+            turn_stats: None,
         };
         apply_run_error_to_session(
             &mut session,

@@ -303,6 +303,7 @@ fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
         updated_at: ts(3_500),
         context_usage: None,
         error: None,
+        turn_stats: None,
     }
 }
 

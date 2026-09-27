@@ -1212,6 +1212,7 @@ async fn run_session(session: Session) {
     let mut reasoning_streams: HashMap<String, ReasoningStream> = HashMap::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
+    let mut pending_metrics: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     let mut queued_steers: VecDeque<String> = VecDeque::new();
@@ -1356,7 +1357,18 @@ async fn run_session(session: Session) {
                                 break 'main;
                             }
                             if params.get("tokenUsage").or_else(|| params.get("token_usage")).and_then(|usage| usage.get("last")).is_some() {
-                                pending_usage = Some(AgentEvent::Usage { input_tokens, output_tokens, context_usage: None });
+                                let cached = normalize::cached_input_tokens(&params);
+                                pending_usage = Some(AgentEvent::Usage {
+                                    input_tokens: input_tokens.saturating_sub(cached.unwrap_or(0)),
+                                    output_tokens,
+                                    context_usage: None,
+                                });
+                                pending_metrics = cached.map(|cached| AgentEvent::TurnMetrics {
+                                    cache_read_tokens: Some(cached),
+                                    cache_write_tokens: None,
+                                    cost_usd: None,
+                                    model_ms: None,
+                                });
                             }
                         }
                     }
@@ -1369,6 +1381,11 @@ async fn run_session(session: Session) {
                         streamed_text.clear();
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
+                        {
+                            break 'main;
+                        }
+                        if let Some(metrics) = pending_metrics.take()
+                            && !send(&event_tx, metrics).await
                         {
                             break 'main;
                         }
@@ -1431,6 +1448,11 @@ async fn run_session(session: Session) {
                         router.note_completed(&turn_id(&params));
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
+                        {
+                            break 'main;
+                        }
+                        if let Some(metrics) = pending_metrics.take()
+                            && !send(&event_tx, metrics).await
                         {
                             break 'main;
                         }

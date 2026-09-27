@@ -507,6 +507,7 @@ impl DemoHost {
                 updated_at: now,
                 context_usage: None,
                 error: None,
+                turn_stats: None,
             })
         });
     }

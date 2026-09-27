@@ -422,6 +422,7 @@ pub(crate) fn seed(
                 updated_at: Utc::now(),
                 context_usage: None,
                 error: None,
+                turn_stats: None,
             })?;
         }
         if let (Some((number, state, title)), Some(source)) = (demo.pr, &source_context) {

@@ -92,6 +92,7 @@ mod failure_text_tests {
             updated_at: Utc::now(),
             context_usage: None,
             error: reason.map(str::to_owned),
+            turn_stats: None,
         }
     }
 

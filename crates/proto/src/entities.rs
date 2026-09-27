@@ -313,6 +313,48 @@ pub struct Session {
     /// transition clears it, so a stale reason never outlives its run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Accounting for the last finished turn on this device. Live-only like
+    /// `error`: it rides `WatchSessions`, never the synced registry row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_stats: Option<TurnStats>,
+}
+
+/// One finished turn, summed by the engine from the run's events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStats {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Wall time from the turn's start to its `Done`.
+    pub duration_ms: u64,
+    /// Model API time: harness-measured, else `duration_ms - tool_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ms: Option<u64>,
+    /// Summed tool execution time, from the tools that report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ms: Option<u64>,
+    /// Distinct tool calls in the turn.
+    pub steps: u32,
+}
+
+impl TurnStats {
+    /// Share of prompt tokens served from cache, when the harness reports it.
+    pub fn cache_fraction(&self) -> Option<f64> {
+        let read = self.cache_read_tokens?;
+        let prompt = self.input_tokens + read + self.cache_write_tokens.unwrap_or(0);
+        (prompt > 0).then(|| read as f64 / prompt as f64)
+    }
+
+    /// Output tokens per second over `ms`.
+    pub fn output_rate(&self, ms: u64) -> Option<f64> {
+        (ms > 0 && self.output_tokens > 0).then(|| self.output_tokens as f64 / (ms as f64 / 1000.0))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

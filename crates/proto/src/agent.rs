@@ -612,6 +612,21 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_usage: Option<ContextUsage>,
     },
+    /// End-of-turn accounting beyond input/output tokens, when the harness
+    /// reports it (Claude's `result` frame, Codex's per-turn usage). Folded
+    /// by the engine into [`crate::TurnStats`]; never persisted to docs.
+    #[serde(rename_all = "camelCase")]
+    TurnMetrics {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        /// Time spent in model API calls, when the harness measures it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_ms: Option<u64>,
+    },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
     /// harness for the composer's `/` popup; never persisted to docs.
