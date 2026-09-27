@@ -15,11 +15,14 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 
 
 GIB = 1024**3
 POLL_SECONDS = 2
+# Fixed name so rustc sees the same absolute paths every run: a random target
+# path changes sccache's keys and turned every verification into a cold build.
+# The flock serializes runs, and the target is still removed at the end.
+TARGET_NAME = "target-verify"
 
 
 def state_dir() -> Path:
@@ -79,11 +82,20 @@ def run(command: list[str], minimum_free_gib: int, floor_free_gib: int) -> int:
             )
             return 75
 
-        with tempfile.TemporaryDirectory(prefix="target-", dir=root) as target:
+        target = root / TARGET_NAME
+        target.mkdir(mode=0o700)
+        try:
             env = os.environ.copy()
-            env["CARGO_TARGET_DIR"] = target
+            env["CARGO_TARGET_DIR"] = str(target)
             env.setdefault("CARGO_BUILD_JOBS", "4")
-            env.setdefault("CARGO_INCREMENTAL", "0")
+            # Leave CARGO_INCREMENTAL unset: the dev profile then rebuilds
+            # workspace crates incrementally inside a batched run, while sccache
+            # (which refuses the variable outright) still caches dependencies.
+            # Background QoS pins the build to the efficiency cores on Apple
+            # Silicon: slower, but the Mac stays cool and responsive while
+            # agents verify. COMET_CARGO_VERIFY_FOREGROUND=1 opts out.
+            if sys.platform == "darwin" and not os.environ.get("COMET_CARGO_VERIFY_FOREGROUND"):
+                command = ["taskpolicy", "-b", *command]
             print(f"Cargo verification target: {target}", file=sys.stderr, flush=True)
             process = subprocess.Popen(command, env=env, start_new_session=True)
             (Path(target) / ".owner-pgid").write_text(str(process.pid))
@@ -125,7 +137,9 @@ def run(command: list[str], minimum_free_gib: int, floor_free_gib: int) -> int:
                     except subprocess.TimeoutExpired:
                         terminate_group(process, signal.SIGKILL)
                         process.wait()
-                print(f"Removing Cargo verification target: {target}", file=sys.stderr, flush=True)
+        finally:
+            print(f"Removing Cargo verification target: {target}", file=sys.stderr, flush=True)
+            shutil.rmtree(target, ignore_errors=True)
 
 
 def main() -> int:
