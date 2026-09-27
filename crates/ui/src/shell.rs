@@ -1334,6 +1334,45 @@ const SIDEBAR_LIST_PAD_TOP: f32 = 4.0;
 const SIDEBAR_ACTIVE_HARNESS_ICON_SIZE: f32 = 13.0;
 const SIDEBAR_ACTIVE_HARNESS_TITLE_GAP: f32 = Theme::SPACE_SM;
 
+/// Account pill height and settings button size in the sidebar footer.
+const SIDEBAR_FOOTER_BUTTON_SIZE: f32 = 28.0;
+const SIDEBAR_FOOTER_AVATAR_SIZE: f32 = 16.0;
+
+/// The sidebar footer's profile label and the account menu's identity line.
+/// Anything without a signed-in account reads "Local"; the menu carries the
+/// storage/sync detail.
+fn sidebar_account_identity(
+    scope: Option<WorkspaceScope>,
+    flow: SyncFlow,
+    user: Option<&zeron_proto::UserProfile>,
+) -> (SharedString, SharedString) {
+    match scope {
+        Some(WorkspaceScope::Local) => {
+            let identity = if matches!(flow, SyncFlow::RestartPending { .. }) {
+                "Sync ready after restart"
+            } else {
+                "Stored on this device"
+            };
+            ("Local".into(), identity.into())
+        }
+        Some(WorkspaceScope::Development) => {
+            ("Development".into(), "Authentication disabled".into())
+        }
+        Some(WorkspaceScope::Synced) | None => match user {
+            Some(user) => {
+                let name = user
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&user.email);
+                (name.to_owned().into(), user.email.clone().into())
+            }
+            None => ("Local".into(), "Not signed in".into()),
+        },
+    }
+}
+
 /// Keep the fade short so only the last few glyphs recede. Tracking clipped
 /// content lets the shared paint-time overflow gate leave fitting labels intact.
 pub(crate) fn sidebar_faded_label(
@@ -5744,6 +5783,14 @@ impl Shell {
         }
     }
 
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::Settings(_)) {
+            self.close_settings(cx);
+        } else {
+            self.open_last_settings(cx);
+        }
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.focus_composer(cx);
@@ -9593,10 +9640,7 @@ impl Shell {
         {
             self.cancel_pinned_session_drag(cx);
         }
-        let (user, workspace_scope) = {
-            let state = self.state.read(cx);
-            (state.auth_user().cloned(), state.workspace_scope)
-        };
+        let workspace_scope = self.state.read(cx).workspace_scope;
 
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
@@ -9790,29 +9834,9 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let (user_line, menu_identity): (SharedString, SharedString) = match workspace_scope {
-            Some(WorkspaceScope::Local) => {
-                let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart"
-                } else {
-                    "Local only"
-                };
-                (line.into(), "Stored on this device".into())
-            }
-            Some(WorkspaceScope::Development) => {
-                ("Development".into(), "Authentication disabled".into())
-            }
-            Some(WorkspaceScope::Synced) | None => {
-                let line: SharedString = user
-                    .as_ref()
-                    .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| "Not signed in".into());
-                let email = user
-                    .as_ref()
-                    .map(|u| SharedString::from(u.email.clone()))
-                    .unwrap_or_else(|| line.clone());
-                (line, email)
-            }
+        let (user_line, menu_identity) = {
+            let state = self.state.read(cx);
+            sidebar_account_identity(workspace_scope, self.sync_flow, state.auth_user())
         };
         let user_menu = self.render_user_menu(user_line, menu_identity, theme, cx);
 
@@ -10000,8 +10024,9 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Scope-aware sidebar identity and account menu. Local runtimes advertise
-    /// their storage boundary and offer sync; synced runtimes offer sign-out.
+    /// The sidebar's bottom row (upstream #449): account pill on the left,
+    /// settings toggle on the right. Local runtimes advertise their storage
+    /// boundary and offer sync; synced runtimes offer sign-out.
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
@@ -10012,7 +10037,8 @@ impl Shell {
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
-        // Only the compact avatar button is interactive; footer whitespace is not.
+        // The profile pill hugs avatar + name (shrinking so long names fade
+        // out); the gap between it and the settings button is not interactive.
         let initial: SharedString = user_line
             .trim()
             .chars()
@@ -10025,15 +10051,26 @@ impl Shell {
             .debug_selector(|| "user-menu".into())
             .role(gpui::Role::Button)
             .aria_label(format!("Account menu: {user_line}"))
+            .aria_expanded(open)
+            .tab_index(0)
+            .focus_visible(|s| s.border_2().border_color(theme.accent))
             .relative()
-            .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE + 8.0))
-            .flex_none()
-            .rounded_full()
-            .p(px(4.0))
+            .h(px(SIDEBAR_FOOTER_BUTTON_SIZE))
+            .min_w_0()
+            .flex_shrink_1()
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
             .flex()
             .flex_row()
             .items_center()
-            .justify_center()
+            .gap(px(Theme::SPACE_SM))
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(if open {
+                theme.text
+            } else {
+                motion::hover_blend("user-menu-trigger", theme.text.opacity(0.8), theme.text)
+            })
             .cursor_pointer()
             // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
             // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
@@ -10065,7 +10102,7 @@ impl Shell {
             .child(
                 // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
                 div()
-                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                    .size(px(SIDEBAR_FOOTER_AVATAR_SIZE))
                     .flex_none()
                     .rounded_full()
                     .bg(theme.text)
@@ -10073,12 +10110,17 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(9.0))
-                    .line_height(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                    .text_size(px(10.0))
+                    .line_height(px(SIDEBAR_FOOTER_AVATAR_SIZE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.bg)
                     .child(div().w_full().text_center().child(initial)),
-            );
+            )
+            .child(sidebar_faded_label(
+                "user-menu-label".into(),
+                false,
+                div().line_height(px(17.0)).child(user_line),
+            ));
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
             let menu = popover::popover_card(theme)
@@ -10095,20 +10137,9 @@ impl Shell {
                         .pt(px(6.0))
                         .pb(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.7))
+                        .text_color(theme.text_muted)
                         .truncate()
                         .child(menu_identity),
-                )
-                .child(
-                    popover::menu_row(theme, false, "user-menu-settings")
-                        .id("user-menu-settings")
-                        .on_click(cx.listener(|this, _, _, cx| this.open_last_settings(cx)))
-                        .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Settings")),
                 )
                 .when_some(action, |menu, action| {
                     let row = match action {
@@ -10161,16 +10192,87 @@ impl Shell {
                                 .into_any_element()
                         }
                     };
-                    menu.child(popover::menu_separator()).child(row)
+                    menu.child(row)
                 })
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_right(
+            // Opens upward, left-aligned with the pill: the card is as wide as
+            // the footer row, so it covers the row instead of the pane beside it.
+            trigger = trigger.child(popover::anchored_menu_above(
                 "user-menu-popover",
                 menu,
                 closing,
             ));
         }
-        trigger.into_any_element()
+        // Settings is a toggle: while its page is up the button keeps the
+        // hover wash + full-strength glyph, and a click returns to chat.
+        let settings_open = matches!(self.route, Route::Settings(_));
+        let settings_tooltip: SharedString = match (settings_open, cfg!(target_os = "macos")) {
+            (false, true) => "Settings · ⌘,".into(),
+            (false, false) => "Settings · Ctrl+,".into(),
+            (true, true) => "Close settings · ⌘,".into(),
+            (true, false) => "Close settings · Ctrl+,".into(),
+        };
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(4.0))
+            .child(trigger)
+            .child(
+                div()
+                    .id("settings-trigger")
+                    .debug_selector(|| "settings-trigger".into())
+                    .role(gpui::Role::Button)
+                    .aria_label(if settings_open {
+                        "Close settings"
+                    } else {
+                        "Settings"
+                    })
+                    .aria_toggled(if settings_open {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .tooltip(move |_, cx| {
+                        let text = settings_tooltip.clone();
+                        cx.new(|_| SurfaceTabTooltip { text }).into()
+                    })
+                    .tab_index(0)
+                    .size(px(SIDEBAR_FOOTER_BUTTON_SIZE))
+                    .flex_none()
+                    .rounded(px(8.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(if settings_open {
+                        theme.glass_hover()
+                    } else {
+                        motion::hover_blend(
+                            "settings-trigger",
+                            theme.glass_hover().opacity(0.0),
+                            theme.glass_hover(),
+                        )
+                    })
+                    .on_hover(motion::hover_listener("settings-trigger"))
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx)))
+                    .child(
+                        icon(icons::SETTINGS)
+                            .size(px(15.0))
+                            .text_color(if settings_open {
+                                theme.text
+                            } else {
+                                motion::hover_blend(
+                                    "settings-trigger",
+                                    theme.text_muted,
+                                    theme.text,
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_sync_overlay(

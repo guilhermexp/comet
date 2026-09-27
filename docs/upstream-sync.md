@@ -70,7 +70,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Navegação por passos do New project | #403 | v0.2.83 | Apresentação do fork |
 | Faixa de update | — | v0.2.83 | Fork sem feed próprio |
 | Sempre enfileirar em vez de steer | #284 | v0.2.83 | Steering é contrato do fork |
-| Redesign dos Settings (modal glass → página, switches, Providers, Devices refeito) | #449 (UI) | v0.2.94 | Visual do fork. **A parte de engine entrou** |
+| Redesign dos Settings (modal glass → página, switches, Providers, Devices refeito) | #449 (UI) | v0.2.94 | Visual do fork. **A parte de engine entrou**, e o rodapé da sidebar também (pílula avatar+nome, botão Settings que alterna, menu para cima) |
 | Anel de uso do plano ao lado do anel de contexto | #547 | v0.2.94 | Depende do anel removido e duplica o Usage |
 | Paleta do New project igual à do Cmd+K, breadcrumbs dobrados | #549 | v0.2.94 | Bate no `spaces.rs` do fork |
 | Badge de PR sem `#` | f8f9c97f | v0.2.94 | Estilo |
