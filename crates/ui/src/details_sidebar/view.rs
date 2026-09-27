@@ -451,21 +451,22 @@ fn subagent_row_avatar_path(row_id: &str) -> &'static str {
 /// bare glyph. The loose checkmark read as punctuation next to the row's
 /// avatar, while every other terminal state in the same column already
 /// carries a ring (`CLOSE_CIRCLE`) — the ring is what makes "done" land as a
-/// status instead of a tick.
+/// status instead of a tick. Muted, not green: a finished row is settled
+/// information, not a call to attention.
 fn settled_success_badge(theme: &Theme) -> AnyElement {
     div()
         .size(px(15.0))
         .flex_none()
         .rounded_full()
         .border_1()
-        .border_color(theme.success)
+        .border_color(theme.text_muted)
         .flex()
         .items_center()
         .justify_center()
         .child(
             icons::icon(icons::CHECK)
                 .size(px(9.0))
-                .text_color(theme.success),
+                .text_color(theme.text_muted),
         )
         .into_any_element()
 }
@@ -2857,11 +2858,9 @@ impl DetailsSidebar {
                     .into_any_element()
             }
             WorkerSemantic::Terminal => settled_success_badge(theme),
-            WorkerSemantic::Idle => div()
-                .size(px(7.0))
-                .rounded_full()
-                .bg(theme.text_muted.opacity(0.65))
-                .into_any_element(),
+            // Turn finished, session still open for the next prompt: the
+            // same settled check as a finished subagent.
+            WorkerSemantic::Idle => settled_success_badge(theme),
             WorkerSemantic::Recovery => icons::icon(icons::RESTART)
                 .size(px(13.0))
                 .text_color(theme.text_muted)
