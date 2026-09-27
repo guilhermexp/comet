@@ -318,25 +318,6 @@ Test: unit — ui file_change projection; none — native GPUI layout and shimme
 - **THEN** at most 15 generated lines are bottom aligned in a 72px viewport
 - **AND** completion restores the authoritative diff and permits expansion to 200px
 
-### Requirement: File card layout work remains bounded and preserves the current sticky turn
-Collapsed file cards SHALL use only the bounded durable preview even when full input has been fetched. Reopening SHALL reuse cached full input. Measuring a card SHALL NOT continuously schedule frames and SHALL invalidate only subsequent user-row geometry when its height changes; the current turn header SHALL remain available.
-#### Scenario: Collapse after loading a large file
-Test: unit — ui file_change preview selection; none — native GPUI interaction and frame scheduling.
-- **WHEN** a large fetched file is collapsed and reopened
-- **THEN** collapsed rendering uses the bounded preview and reopening uses the cached full file
-- **AND** unchanged measurements schedule no further render
-#### Scenario: A file below the sticky header changes height
-Test: unit — sticky geometry retention; none — native streaming review.
-- **WHEN** a file card below the current user row changes height
-- **THEN** its current sticky geometry remains valid and only subsequent user rows are invalidated
-
-### Requirement: Sticky geometry uses a consistent layout coordinate system
-The sticky turn SHALL use a scroll offset within the laid-out viewport range. Recorded user positions and scroll offsets SHALL come from the same completed layout. Pending end anchors during streaming SHALL NOT switch the header to another turn.
-#### Scenario: Streaming while anchored at the end
-Test: unit — offset projection; none — native multi-turn streaming.
-- **WHEN** a stream chunk sets a past-end list anchor before layout
-- **THEN** the sticky projection uses the valid scroll range and retains the current turn
-
 ### Requirement: Tool details close without waiting for another event
 A tool detail using natural wrapped height SHALL unmount its body immediately when closed and SHALL NOT retain it for an animation that is not running.
 #### Scenario: Close a completed tool detail
@@ -370,3 +351,23 @@ Markdown body prose SHALL retain its 14px font with 24px line spacing. Inline ch
 - **WHEN** a response streams and then settles, including lines made entirely of inline code
 - **THEN** the line spacing stays consistent and links and selection remain available
 - **Test:** none — native visual QA; existing selection and streaming unit regressions supplement inspection
+
+### Requirement: File card layout work remains bounded and preserves reading position
+
+Collapsed file cards SHALL use only the bounded durable preview even when full input has been fetched. Reopening SHALL reuse cached full input. Measuring a card SHALL NOT continuously schedule frames and SHALL preserve the transcript reading position without maintaining a sticky user header.
+
+#### Scenario: Collapse after loading a large file
+
+Test: unit — ui file_change preview selection; none — native GPUI interaction and frame scheduling.
+
+- **WHEN** a large fetched file is collapsed and reopened
+- **THEN** collapsed rendering uses the bounded preview and reopening uses the cached full file
+- **AND** unchanged measurements schedule no further render
+
+#### Scenario: A file below a user message changes height
+
+Test: unit — transcript viewport regressions; none — native streaming review.
+
+- **WHEN** a file card below the current user row changes height
+- **THEN** the virtualized list updates its measured layout while preserving the reading position
+- **AND** no sticky user-message geometry is required

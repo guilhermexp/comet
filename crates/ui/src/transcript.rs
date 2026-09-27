@@ -13,9 +13,8 @@
 //! - rows are cached per entry keyed by a content fingerprint — only changed
 //!   messages rebuild (the anti-"streaming stutter" trick);
 //! - row-set changes diff by (id, version) into one minimal `splice`;
-//! - the user row for the turn crossing the reading line is repainted as an
-//!   absolute sticky header, bounded by the next user row, so virtualization
-//!   stays flat while historical turns retain their prompt context.
+//! - user rows keep their source alignment and fold long prompts inline while
+//!   virtualization keeps historical turns efficient.
 //!
 //! Stick-to-bottom is a velocity spring (mugen §1e, the same shape as
 //! stackblitz's use-stick-to-bottom): while pinned, a per-frame stepper glides
@@ -176,10 +175,13 @@ pub const ATT_THUMB_H: f32 = 80.0;
 /// (the composer's staged chip bounds, widened for a full name).
 pub const FILE_CHIP_MIN_WIDTH: f32 = 140.0;
 pub const FILE_CHIP_MAX_WIDTH: f32 = 240.0;
-pub const USER_MESSAGE_CARD_MAX_HEIGHT: f32 = 100.0;
-pub const USER_MESSAGE_CARD_PAD_Y: f32 = 8.0;
-pub const USER_MESSAGE_CARD_RADIUS: f32 = 12.0;
-pub const USER_MESSAGE_FADE_HEIGHT: f32 = 40.0;
+/// A user prompt renders at most this many wrapped lines until expanded.
+pub const USER_COLLAPSED_LINES: usize = 5;
+/// The user bubble's line box.
+pub const USER_LINE_HEIGHT: f32 = 22.0;
+/// Conservative first-frame fallback before the wrapped layout is measured.
+const USER_COLLAPSE_CHARS: usize = 400;
+const USER_TOGGLE_GAP: f32 = 8.0;
 
 /// Long pasted prompts travel farther, so their fold takes longer (upstream
 /// `user_resize_duration_ms`): close to the RESIZE timing for ordinary
@@ -199,8 +201,28 @@ pub fn user_resize_spec(height_delta: f32) -> motion::MotionSpec {
     motion::MotionSpec::new(user_resize_duration_ms(height_delta), curve)
 }
 
-fn user_message_overflows(content_height: f32) -> bool {
-    content_height > USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0
+fn user_message_overflows(content_height: f32, line_height: f32) -> bool {
+    content_height > USER_COLLAPSED_LINES as f32 * line_height + 0.5
+}
+
+/// Conservative first-frame fallback for whether a prompt may need a fold.
+/// Once its wrapped text layout is available, the measured height takes over.
+fn user_message_needs_collapse(text: &str) -> bool {
+    text.lines().count() > USER_COLLAPSED_LINES || text.chars().count() > USER_COLLAPSE_CHARS
+}
+
+fn user_fold_target_top(
+    initial_top: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    target_height: f32,
+) -> f32 {
+    let max_top = viewport_bottom - target_height - 12.0;
+    if max_top >= viewport_top {
+        initial_top.clamp(viewport_top, max_top)
+    } else {
+        viewport_top
+    }
 }
 
 /// An attachment ref is an image only when its extension says so — the same
@@ -305,63 +327,6 @@ fn user_message_attachment_summary(
     })
 }
 
-fn user_message_card_background(theme: &Theme) -> gpui::Hsla {
-    theme.composer_glass_bg()
-}
-
-#[derive(Clone, Copy)]
-struct StickyTurnSurface {
-    outer_background: Option<gpui::Hsla>,
-    occlusion_background: Option<gpui::Hsla>,
-    occlusion_radius: f32,
-    occlusion_blur_radius: f32,
-}
-
-/// The positioning wrapper is layout-only. The card-shaped inner layer blurs
-/// scrolling content before the reused translucent user card paints, avoiding
-/// both text ghosting and the old full-width rectangular plate.
-fn sticky_turn_surface(theme: &Theme) -> StickyTurnSurface {
-    StickyTurnSurface {
-        outer_background: None,
-        occlusion_background: (!theme.is_frost()).then_some(theme.bg),
-        occlusion_radius: USER_MESSAGE_CARD_RADIUS,
-        occlusion_blur_radius: 16.0,
-    }
-}
-
-/// Keep the fixed card out of the shell's top fade while clipping both paint
-/// and input below the titlebar when the next turn pushes it upward.
-pub(crate) fn sticky_turn_layer(
-    top: f32,
-    bottom_clearance: f32,
-    card: impl IntoElement,
-) -> AnyElement {
-    crate::edge_fade::edge_faded(
-        Theme::TRANSCRIPT_FADE_BAND,
-        false,
-        // An active bottom edge replaces the inherited GPUI fade scope and
-        // retains the composer's ramp at the same viewport bottom as the shell.
-        true,
-        div()
-            .absolute()
-            .left_0()
-            .right_0()
-            .top(px(STICKY_TURN_TOP_INSET_PX))
-            .bottom_0()
-            .overflow_hidden()
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .top(px(top - STICKY_TURN_TOP_INSET_PX))
-                    .child(card),
-            ),
-    )
-    .band_bottom((bottom_clearance - Theme::STATUS_STRIP_HEIGHT).max(1.0))
-    .into_any_element()
-}
-
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
 // which follows the shape of stackblitz/use-stick-to-bottom)
@@ -401,9 +366,6 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// The titlebar overlays the full-height list, so its height is part of the
 /// inset; the extra 10px matches the first row's breathing room.
 pub(crate) const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
-/// Sticky cards meet the titlebar edge; the fresh-send breathing room would
-/// expose a strip of scrolling text between the chrome and the fixed card.
-const STICKY_TURN_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT;
 /// Epsilon of extra height under the reservation. The runway ends AT the
 /// app's bottom — this is not scroll room (24px of it read as a janky
 /// overshoot-and-fight zone, user report) — it exists only to keep the held
@@ -422,10 +384,6 @@ const OWN_SEND_GLIDE_SNAP_PX: f32 = 1.0;
 fn own_turn_glide_crossed(offset: ListOffset, anchor_ix: usize, inset: f32) -> bool {
     offset.item_ix > anchor_ix
         || (offset.item_ix == anchor_ix && f32::from(offset.offset_in_item) > -inset)
-}
-
-fn runway_owns_user_position(held: bool, positioned: bool, has_landed: bool) -> bool {
-    held && (!has_landed || positioned)
 }
 
 /// Pure stick-to-bottom spring stepper — the mugen `tick()` integration:
@@ -3732,6 +3690,20 @@ struct FoldState {
     /// tween made every once-collapsed group flash open→closed on each
     /// reappearance (user report).
     toggled_at: Option<Instant>,
+    duration_ms: u64,
+    /// Extra user-body height revealed by Show more. It is not reply growth
+    /// and must not permanently consume the sent turn's reservation.
+    user_expansion_height: f32,
+}
+
+/// Screen-space compensation paired with an inline user-message fold.
+struct UserCollapseScroll {
+    started_at: Instant,
+    duration_ms: u64,
+    height_delta: f32,
+    row_ix: usize,
+    initial_top: f32,
+    target_top: f32,
 }
 
 /// Layout state for the most recent locally-sent turn (notes-app parity):
@@ -3750,10 +3722,6 @@ struct OwnTurnAnchor {
     held: bool,
     /// The send glide has landed; the anchor now holds position exactly.
     positioned: bool,
-    /// Distinguishes the initial send glide from a later return-to-bottom
-    /// glide. The initial glide owns the prompt visual; on a restick, the
-    /// sticky copy remains until the original has re-landed.
-    has_landed: bool,
     /// A send may install the anchor before its optimistic prompt appears.
     seen_prompt: bool,
 }
@@ -3762,7 +3730,6 @@ impl OwnTurnAnchor {
     fn released_for_restore(mut self) -> Self {
         self.held = false;
         self.positioned = false;
-        self.has_landed = true;
         self.seen_prompt = true;
         self
     }
@@ -3993,30 +3960,6 @@ impl SavedViewportCache {
     }
 }
 
-#[derive(Clone)]
-struct UserMessagePreview {
-    row_id: SharedString,
-    text: SharedString,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StickyTurnGroup {
-    user_ix: usize,
-    next_user_ix: Option<usize>,
-}
-
-fn sticky_turn_rows(rows: &[Row]) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter_map(|(ix, row)| match &row.kind {
-            // A `/compact` row is a status line, not a prompt to pin.
-            RowKind::User { text, .. } if is_compact_command(text) => None,
-            RowKind::User { .. } => Some(ix),
-            _ => None,
-        })
-        .collect()
-}
-
 /// A sent `/compact` (with or without instructions after it).
 fn is_compact_command(text: &str) -> bool {
     let text = text.trim();
@@ -4027,166 +3970,6 @@ fn is_compact_command(text: &str) -> bool {
 /// (`shell::compaction_marker`; older docs carry the Portuguese form).
 fn is_compaction_marker(text: &str) -> bool {
     text.starts_with("Context compacted") || text.starts_with("Contexto compactado")
-}
-
-fn sticky_turn_group(user_rows: &[usize], reading_row_ix: usize) -> Option<StickyTurnGroup> {
-    let next = user_rows.partition_point(|user_ix| *user_ix <= reading_row_ix);
-    let user_ix = *user_rows.get(next.checked_sub(1)?)?;
-    Some(StickyTurnGroup {
-        user_ix,
-        next_user_ix: user_rows.get(next).copied(),
-    })
-}
-
-fn sticky_turn_group_for_viewport(
-    user_rows: &[usize],
-    sticky_top: f32,
-    fallback_reading_row: Option<usize>,
-    mut user_top: impl FnMut(usize) -> Option<f32>,
-) -> Option<StickyTurnGroup> {
-    let group_at = |position: usize| {
-        Some(StickyTurnGroup {
-            user_ix: *user_rows.get(position)?,
-            next_user_ix: user_rows.get(position + 1).copied(),
-        })
-    };
-    let fallback = sticky_turn_group(user_rows, fallback_reading_row?)?;
-    let mut position = user_rows.binary_search(&fallback.user_ix).ok()?;
-    while user_top(position).is_some_and(|top| top > sticky_top + 0.5) {
-        position = position.checked_sub(1)?;
-    }
-    while position + 1 < user_rows.len()
-        && user_top(position + 1).is_some_and(|top| top <= sticky_top + 0.5)
-    {
-        position += 1;
-    }
-    group_at(position)
-}
-
-fn sticky_turn_overlay_top(
-    sticky_top: f32,
-    source_top: Option<f32>,
-    source_is_above_when_unmeasured: bool,
-    next_turn_top: Option<f32>,
-    header_height: f32,
-) -> Option<f32> {
-    let source_crossed = source_top.map_or(source_is_above_when_unmeasured, |source_top| {
-        source_top < sticky_top - 0.5
-    });
-    if !source_crossed {
-        return None;
-    }
-    Some(
-        next_turn_top
-            .map(|next_top| next_top - header_height)
-            .unwrap_or(sticky_top)
-            .min(sticky_top),
-    )
-}
-
-// An end anchor can temporarily report the entire content height before
-// prepaint resolves it to content height minus viewport height.
-fn sticky_scroll_offset(offset: f32, max_offset: f32) -> f32 {
-    offset.clamp(-max_offset.max(0.0), 0.0)
-}
-
-#[derive(Default)]
-struct StickyTurnState {
-    chat_id: Option<String>,
-    heights: HashMap<SharedString, f32>,
-    geometries: HashMap<SharedString, StickyUserGeometry>,
-    suppress_once: std::collections::HashSet<SharedString>,
-    viewport: Option<(f32, f32)>,
-}
-
-#[derive(Clone, Copy)]
-struct StickyUserGeometry {
-    top: f32,
-    scroll_y: f32,
-}
-
-impl StickyTurnState {
-    fn attach_chat(&mut self, chat_id: Option<&str>) -> bool {
-        if self.chat_id.as_deref() == chat_id {
-            return false;
-        }
-        self.chat_id = chat_id.map(str::to_owned);
-        self.heights.clear();
-        self.geometries.clear();
-        self.suppress_once.clear();
-        self.viewport = None;
-        true
-    }
-
-    fn record_height(&mut self, id: SharedString, height: f32) -> bool {
-        if self
-            .heights
-            .get(&id)
-            .is_some_and(|current| (*current - height).abs() <= 0.5)
-        {
-            return false;
-        }
-        self.heights.insert(id, height);
-        true
-    }
-
-    fn record_geometry(&mut self, id: SharedString, top: f32, height: f32, scroll_y: f32) -> bool {
-        let changed = self.geometries.get(&id).is_none_or(|current| {
-            (current.top - top).abs() > 0.5 || (current.scroll_y - scroll_y).abs() > 0.5
-        });
-        let height_changed = self.record_height(id.clone(), height);
-        self.suppress_once.remove(&id);
-        self.geometries
-            .insert(id, StickyUserGeometry { top, scroll_y });
-        changed || height_changed
-    }
-
-    fn height(&self, id: &str) -> Option<f32> {
-        self.heights.get(id).copied()
-    }
-
-    fn projected_top(&self, id: &str, current_scroll_y: f32) -> Option<f32> {
-        self.geometries
-            .get(id)
-            .map(|geometry| geometry.top + current_scroll_y - geometry.scroll_y)
-    }
-
-    fn invalidate_layout(&mut self) {
-        self.suppress_once.extend(self.geometries.keys().cloned());
-        self.geometries.clear();
-    }
-
-    fn invalidate_user_ids(&mut self, ids: impl IntoIterator<Item = SharedString>) {
-        for id in ids {
-            if self.geometries.remove(&id).is_some() {
-                self.suppress_once.insert(id);
-            }
-        }
-    }
-
-    fn consume_layout_suppression(&mut self, id: &str) -> bool {
-        self.suppress_once.remove(id)
-    }
-
-    fn update_viewport(&mut self, width: f32, height: f32) -> bool {
-        if self
-            .viewport
-            .is_some_and(|(current_width, current_height)| {
-                (current_width - width).abs() <= 0.5 && (current_height - height).abs() <= 0.5
-            })
-        {
-            return false;
-        }
-        self.viewport = Some((width, height));
-        self.invalidate_layout();
-        true
-    }
-
-    fn retain_user_ids(&mut self, live: &std::collections::HashSet<SharedString>) {
-        self.heights.retain(|id, _| live.contains(id));
-        self.geometries.retain(|id, _| live.contains(id));
-        self.suppress_once.retain(|id| live.contains(id));
-    }
 }
 
 pub struct Transcript {
@@ -4202,6 +3985,9 @@ pub struct Transcript {
     typography_generation: u32,
     state: Entity<AppState>,
     list: ListState,
+    /// Row rendering runs inside ListState's mutable layout borrow. Measure
+    /// its width independently so table layout never re-borrows the list.
+    measured_viewport_width: Option<f32>,
     rows: Vec<Row>,
     chat_id: Option<String>,
     /// `Some(doc_id)` pins this instance to a SUBAGENT doc: rows come from
@@ -4298,17 +4084,12 @@ pub struct Transcript {
     /// Queue rows authored in this window. They become own-turn anchors only
     /// after the host promotes their stable id into a transcript message.
     pending_queued_turns: PendingQueuedTurns,
-    /// Per-chat measurements for the virtual sticky copy of user rows. The
-    /// copy is paint-only; none of this state participates in list height.
-    sticky_turn: StickyTurnState,
-    /// Top-level indices of user rows, rebuilt only when the row projection
-    /// changes. Scroll frames binary-search this list instead of walking a
-    /// long transcript.
-    sticky_turn_rows: Vec<usize>,
-    /// Offset from the last completed list layout. Pending stream splices
-    /// may temporarily expose unmeasured heights or a past-end anchor;
-    /// sticky projection must never combine those with painted user bounds.
-    sticky_scroll_y: f32,
+    /// A long-message collapse may hold a screen-space row anchor while its
+    /// height eases, keeping the affected message visible during the change.
+    user_collapse_scroll: Option<UserCollapseScroll>,
+    user_collapse_scroll_scheduled: bool,
+    user_hold_token: u64,
+    user_hold_task: Option<Task<()>>,
     /// A layout-affecting change needs one post-layout own-turn measurement.
     own_turn_kick: bool,
     /// One own-turn `on_next_frame` callback in flight at most.
@@ -4357,12 +4138,9 @@ pub struct Transcript {
     /// Focused while the lightbox is open so Escape reaches it.
     attachment_preview_focus: gpui::FocusHandle,
     attachment_preview_return_focus: Option<gpui::FocusHandle>,
-    /// Shaped-content overflow for each user card, reported after prepaint.
-    user_message_overflow: HashMap<SharedString, bool>,
-    /// Natural (unclipped) card height per overflowing user card, from the
-    /// same prepaint probe. The inline Show more tween travels to it.
-    user_message_heights: HashMap<SharedString, f32>,
-    /// Inline expand/collapse for clipped user cards (upstream `user_folds`).
+    /// Passive wrapped-text measurements used to choose the fold height.
+    user_heights: HashMap<SharedString, Rc<Cell<f32>>>,
+    /// Inline expand/collapse state for long user messages.
     user_folds: HashMap<SharedString, FoldState>,
     /// Entrance epochs for live tool rows, keyed by tool-group row id then
     /// tool id. `None` = present when this transcript attached (history) or
@@ -4371,10 +4149,6 @@ pub struct Transcript {
     /// Compact transcript mode (Settings → Appearance): every turn's work
     /// folds into one `TurnSteps` row, live turns included.
     compact_mode: bool,
-    /// Full text opened from a clipped user-message card.
-    user_message_preview: Option<UserMessagePreview>,
-    /// Focused while the full-message overlay is open so Escape reaches it.
-    user_message_preview_focus: gpui::FocusHandle,
     mermaid_preview: Option<crate::mermaid_preview::MermaidPreview>,
     mermaid_preview_focus: gpui::FocusHandle,
     /// Absolute scale of the open diagram. Opening computes
@@ -4653,6 +4427,7 @@ impl Transcript {
             typography_generation: crate::typography::generation(cx),
             state,
             list,
+            measured_viewport_width: None,
             rows: Vec::new(),
             // Pre-set so `sync` never sees an attach edge — an override
             // instance must not reset (or re-pin) on selection changes.
@@ -4695,9 +4470,10 @@ impl Transcript {
             pinned,
             own_turn: None,
             pending_queued_turns: PendingQueuedTurns::default(),
-            sticky_turn: StickyTurnState::default(),
-            sticky_turn_rows: Vec::new(),
-            sticky_scroll_y: 0.0,
+            user_collapse_scroll: None,
+            user_collapse_scroll_scheduled: false,
+            user_hold_token: 0,
+            user_hold_task: None,
             own_turn_kick: false,
             own_turn_scheduled: false,
             own_turn_last_tick: None,
@@ -4721,13 +4497,10 @@ impl Transcript {
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             attachment_preview_return_focus: None,
-            user_message_overflow: HashMap::new(),
-            user_message_heights: HashMap::new(),
+            user_heights: HashMap::new(),
             user_folds: HashMap::new(),
             tool_reveals: HashMap::new(),
             compact_mode: crate::settings::transcript_compact_mode(cx),
-            user_message_preview: None,
-            user_message_preview_focus: cx.focus_handle(),
             mermaid_preview: None,
             mermaid_preview_focus: cx.focus_handle(),
             mermaid_preview_zoom: 1.0,
@@ -4864,6 +4637,8 @@ impl Transcript {
     pub(crate) fn begin_scroll_navigation(&mut self) {
         self.discard_pending_viewport();
         self.remove_own_turn_runway();
+        self.user_collapse_scroll = None;
+        self.cancel_user_hold();
         self.pinned = false;
         self.spring.reset();
         self.spring_last_tick = None;
@@ -4922,6 +4697,8 @@ impl Transcript {
         // Cancel synchronously, before a queued animation frame can undo the
         // wheel/touch input. Neither operation reads the borrowed ListState.
         self.scroll_anim = None;
+        self.user_collapse_scroll = None;
+        self.cancel_user_hold();
         let released_own_turn = self.own_turn.as_ref().is_some_and(|anchor| anchor.held);
         self.release_own_turn_hold();
         if self.own_turn.is_some() {
@@ -5019,6 +4796,9 @@ impl Transcript {
         if !crate::markdown::selection::is_dragging() {
             return;
         }
+        self.user_collapse_scroll = None;
+        // Keep a user-bubble long-press armed on the initial press; movement
+        // and release cancel it once the gesture becomes a selection drag.
         self.scroll_anim = None;
         self.discard_pending_viewport();
         self.release_own_turn_hold();
@@ -5040,8 +4820,10 @@ impl Transcript {
     ) {
         if !event.dragging() || !crate::markdown::selection::is_dragging() {
             self.stop_selection_scroll();
+            self.cancel_user_hold();
             return;
         }
+        self.cancel_user_hold();
         self.selection_drag_position = Some(event.position);
         if render::update_drag_at(event.position) {
             cx.notify();
@@ -5055,6 +4837,7 @@ impl Transcript {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_user_hold();
         self.stop_selection_scroll();
         if let Some(_text) = crate::markdown::selection::end_active_drag() {
             // X11 middle-click paste parity, including the case where the
@@ -5136,6 +4919,8 @@ impl Transcript {
     /// layout; [`Self::step_own_turn`] drives the glide and hands off to the bottom spring
     /// once the reply outgrows the reserved space.
     pub fn on_own_send(&mut self, chat_id: String, message_id: String, cx: &mut Context<Self>) {
+        self.user_collapse_scroll = None;
+        self.cancel_user_hold();
         self.discard_pending_viewport();
         self.pinned = false;
         self.show_jump_button = false;
@@ -5157,7 +4942,6 @@ impl Transcript {
             message_id: SharedString::from(message_id),
             held: true,
             positioned: false,
-            has_landed: false,
             seen_prompt,
         });
         self.own_turn_last_tick = None;
@@ -5285,11 +5069,27 @@ impl Transcript {
     }
 
     /// Install the reservation before layout; advance the prompt after layout.
-    fn update_runway_minimum(&mut self) {
+    fn update_runway_minimum(&mut self, cx: &gpui::App) {
         if let Some(ix) = self.own_turn_anchor_ix() {
+            let expansion = self.user_folds.get(&self.rows[ix].id).map_or(0.0, |fold| {
+                let target = if fold.open == Some(true) {
+                    fold.user_expansion_height
+                } else {
+                    0.0
+                };
+                match fold.toggled_at {
+                    Some(at) if !motion::reduced_motion(cx) && fold.duration_ms > 0 => {
+                        let raw = (at.elapsed().as_secs_f32() * 1000.0 / fold.duration_ms as f32)
+                            .clamp(0.0, 1.0);
+                        let progress = user_resize_spec(fold.user_expansion_height).progress(raw);
+                        motion::lerp(fold.user_expansion_height - target, target, progress)
+                    }
+                    _ => target,
+                }
+            });
             self.list.set_tail_reservation(Some((
                 ix,
-                px(Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX),
+                px(Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - expansion),
             )));
         } else if self.own_turn.is_none() {
             self.list.set_tail_reservation(None);
@@ -5483,7 +5283,6 @@ impl Transcript {
             land(&self.list);
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
-                anchor.has_landed = true;
             }
             self.own_turn_last_tick = None;
         } else if anchored
@@ -5498,7 +5297,6 @@ impl Transcript {
             }
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
-                anchor.has_landed = true;
             }
             self.own_turn_last_tick = None;
         } else if !anchored && err <= OWN_SEND_GLIDE_SNAP_PX {
@@ -5507,7 +5305,6 @@ impl Transcript {
             land(&self.list);
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
-                anchor.has_landed = true;
             }
             self.own_turn_last_tick = None;
         } else {
@@ -5533,6 +5330,8 @@ impl Transcript {
 
     /// The scroll-to-bottom pill's click: glide back to the end and re-pin.
     pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.user_collapse_scroll = None;
+        self.cancel_user_hold();
         self.discard_pending_viewport();
         self.remove_own_turn_runway();
         self.engage_pin(cx);
@@ -5682,8 +5481,7 @@ impl Transcript {
         if typography_changed {
             self.typography_generation = typography_generation;
             self.render_cache.borrow_mut().clear();
-            self.user_message_overflow.clear();
-            self.sticky_turn.invalidate_layout();
+            self.user_heights.clear();
             self.viewport_layout_revision = self.viewport_layout_revision.wrapping_add(1);
         }
         let (selected, replay) = {
@@ -5731,8 +5529,6 @@ impl Transcript {
                 .as_ref()
                 .and_then(|chat_id| self.saved_viewports.get_cloned_and_touch(chat_id));
             self.remember_current_viewport();
-            self.sticky_turn.attach_chat(selected.as_deref());
-            self.sticky_scroll_y = 0.0;
             let keep_own_turn = self
                 .own_turn
                 .as_ref()
@@ -5743,8 +5539,9 @@ impl Transcript {
                 self.own_turn_last_tick = None;
             }
             self.chat_id = selected;
+            self.user_collapse_scroll = None;
+            self.cancel_user_hold();
             self.rows.clear();
-            self.sticky_turn_rows.clear();
             self.row_cache.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
@@ -5763,11 +5560,9 @@ impl Transcript {
             self.mermaid.clear();
             self.validated_mermaid.clear();
             self.media_clock = 0;
-            self.user_message_overflow.clear();
-            self.user_message_heights.clear();
+            self.user_heights.clear();
             self.user_folds.clear();
             self.tool_reveals.clear();
-            self.user_message_preview = None;
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
@@ -5863,12 +5658,6 @@ impl Transcript {
                     .is_some_and(|e| e.status == Some(MessageStatus::Streaming)),
             )
         };
-        let new_sticky_turn_rows = sticky_turn_rows(&new_rows);
-        let live_sticky_user_ids = new_sticky_turn_rows
-            .iter()
-            .filter_map(|ix| new_rows.get(*ix).map(|row| row.id.clone()))
-            .collect();
-        self.sticky_turn.retain_user_ids(&live_sticky_user_ids);
         self.reasoning_started.retain(|id, _| {
             flat_rows(&new_rows).any(|row| {
                 row.id == *id && matches!(&row.kind, RowKind::Reasoning { active: true, .. })
@@ -6011,7 +5800,6 @@ impl Transcript {
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
-                self.sticky_turn_rows = new_sticky_turn_rows;
                 if typography_changed && !self.rows.is_empty() {
                     self.list.remeasure_items(0..self.rows.len());
                 }
@@ -6027,7 +5815,6 @@ impl Transcript {
                 return;
             }
             Some((old_range, count)) => {
-                self.invalidate_sticky_users_from(old_range.start);
                 // Any replaced row's cached flatten results are stale — and
                 // because live replies splice only the rows whose content hash
                 // changed (the tail), this is O(changed rows) per commit, never
@@ -6056,7 +5843,6 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
-        self.sticky_turn_rows = new_sticky_turn_rows;
         if typography_changed && !self.rows.is_empty() {
             self.list.remeasure_items(0..self.rows.len());
         }
@@ -6185,7 +5971,6 @@ impl Transcript {
             .insert(blob_ref.clone(), self.blob_fetch_counter);
         match self.blob_details.get(&blob_ref) {
             Some(BlobFetch::Ready(_)) => {
-                self.sticky_turn.invalidate_layout();
                 cx.notify();
                 return;
             }
@@ -6220,7 +6005,6 @@ impl Transcript {
             };
             this.update(cx, |this, cx| {
                 this.blob_details.insert(ref_key, fetched);
-                this.sticky_turn.invalidate_layout();
                 cx.notify();
             })
             .ok();
@@ -6370,40 +6154,17 @@ impl Transcript {
         ))
     }
 
-    fn invalidate_sticky_users_from(&mut self, row_ix: usize) {
-        let first_user = self
-            .sticky_turn_rows
-            .partition_point(|user_ix| *user_ix < row_ix);
-        let ids = self.sticky_turn_rows[first_user..]
-            .iter()
-            .filter_map(|user_ix| self.rows.get(*user_ix).map(|row| row.id.clone()))
-            .collect::<Vec<_>>();
-        self.sticky_turn.invalidate_user_ids(ids);
-    }
-
-    fn invalidate_sticky_users_after_row(&mut self, row_id: &SharedString) {
-        if let Some(index) = self
-            .rows
-            .iter()
-            .position(|row| row_contains_id(row, row_id))
-        {
-            self.invalidate_sticky_users_from(index + 1);
-        }
-    }
-
     fn remeasure_row_containing(&mut self, row_id: &SharedString) {
         if let Some(index) = self
             .rows
             .iter()
             .position(|row| row_contains_id(row, row_id))
         {
-            self.invalidate_sticky_users_from(index + 1);
             self.list.remeasure_items(index..index + 1);
         }
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
-        self.invalidate_sticky_users_after_row(&row_id);
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
         entry.from = if currently_open { open_height } else { 0.0 };
@@ -6648,13 +6409,23 @@ impl Transcript {
         notice_divider("/compact".into(), theme)
     }
 
-    /// Inline Show more / Show less for a clipped user card (upstream
-    /// `toggle_user_fold`). The fold owns the viewport like explicit
-    /// navigation: the sent-turn hold and the bottom pin let go so growth
-    /// reveals the prompt instead of being chased by the spring. The runway
-    /// itself stays (only leaving the chat clears it).
-    fn toggle_user_fold(&mut self, row_id: SharedString, natural_h: f32) {
+    /// Expand or collapse one long user bubble while preserving its screen
+    /// position. The action releases the own-send hold while keeping its
+    /// reservation available for the reply.
+    fn toggle_user_fold(
+        &mut self,
+        row_id: SharedString,
+        row_ix: usize,
+        collapsed_h: f32,
+        full_h: f32,
+        reduced_motion: bool,
+    ) {
+        let duration_ms = user_resize_duration_ms(full_h - collapsed_h);
+        // Match upstream's local fold navigation: release the automatic hold
+        // and spring but keep the runway reservation available for the reply.
         self.discard_pending_viewport();
+        self.cancel_user_hold();
+        self.user_collapse_scroll = None;
         self.release_own_turn_hold();
         self.pinned = false;
         self.spring.reset();
@@ -6662,28 +6433,128 @@ impl Transcript {
         self.spring_settled_at = None;
         self.spring_kick = false;
         self.scroll_anim = None;
-        self.invalidate_sticky_users_after_row(&row_id);
         let entry = self.user_folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(false);
-        entry.from = if currently_open {
-            natural_h
-        } else {
-            USER_MESSAGE_CARD_MAX_HEIGHT
-        };
+        entry.from = if currently_open { full_h } else { collapsed_h };
         entry.open = Some(!currently_open);
         entry.epoch += 1;
         entry.toggled_at = Some(Instant::now());
+        entry.duration_ms = duration_ms;
+        entry.user_expansion_height = (full_h - collapsed_h).max(0.0);
+
+        let Some(item_bounds) = self.list.bounds_for_item(row_ix) else {
+            return;
+        };
+        let viewport = self.list.viewport_bounds();
+        let initial_top = f32::from(item_bounds.top());
+        let viewport_top = f32::from(viewport.top()) + Theme::TRANSCRIPT_FADE_BAND + 28.0;
+        let target_height = if currently_open { collapsed_h } else { full_h };
+        let target_top = user_fold_target_top(
+            initial_top,
+            viewport_top,
+            f32::from(viewport.bottom()),
+            target_height,
+        );
+        if (target_top - initial_top).abs() <= 0.5 {
+            return;
+        }
+        if reduced_motion {
+            if let Some(current) = self.list.bounds_for_item(row_ix) {
+                self.list
+                    .scroll_by(px(f32::from(current.top()) - target_top));
+            }
+        } else {
+            self.user_collapse_scroll = Some(UserCollapseScroll {
+                started_at: Instant::now(),
+                duration_ms,
+                height_delta: (full_h - collapsed_h).max(0.0),
+                row_ix,
+                initial_top,
+                target_top,
+            });
+        }
+    }
+
+    fn cancel_user_hold(&mut self) {
+        self.user_hold_token = self.user_hold_token.wrapping_add(1);
+        self.user_hold_task = None;
+    }
+
+    fn arm_user_hold(
+        &mut self,
+        row_id: SharedString,
+        row_ix: usize,
+        collapsed_h: f32,
+        measured_h: Rc<Cell<f32>>,
+        selection_key: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        const USER_HOLD_DELAY: Duration = Duration::from_millis(360);
+        self.cancel_user_hold();
+        self.user_hold_token = self.user_hold_token.wrapping_add(1);
+        let token = self.user_hold_token;
+        self.user_hold_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(USER_HOLD_DELAY).await;
+            this.update(cx, |this, cx| {
+                if this.user_hold_token != token {
+                    return;
+                }
+                this.user_hold_task = None;
+                crate::markdown::selection::clear_if_owner(&selection_key);
+                this.toggle_user_fold(
+                    row_id,
+                    row_ix,
+                    collapsed_h,
+                    measured_h.get().max(collapsed_h),
+                    motion::reduced_motion(cx),
+                );
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn step_user_collapse_scroll(&mut self, cx: &mut Context<Self>) {
+        let Some(scroll) = self.user_collapse_scroll.as_ref() else {
+            return;
+        };
+        let started_at = scroll.started_at;
+        let duration_ms = scroll.duration_ms;
+        let height_delta = scroll.height_delta;
+        let row_ix = scroll.row_ix;
+        let initial_top = scroll.initial_top;
+        let target_top = scroll.target_top;
+        let raw =
+            (started_at.elapsed().as_secs_f32() / (duration_ms as f32 / 1000.0)).clamp(0.0, 1.0);
+        let progress = user_resize_spec(height_delta).progress(raw);
+        let desired_top = motion::lerp(initial_top, target_top, progress);
+        if let Some(current) = self.list.bounds_for_item(row_ix) {
+            let correction = f32::from(current.top()) - desired_top;
+            if correction.abs() > 0.1 {
+                self.list.scroll_by(px(correction));
+            }
+        }
+        if raw >= 1.0 {
+            self.user_collapse_scroll = None;
+            self.last_scroll_distance = self.distance_from_bottom();
+            self.show_jump_button =
+                jump_visibility(self.show_jump_button, self.last_scroll_distance);
+        }
+        cx.notify();
     }
 
     fn render_user_expander(
         &mut self,
         row_id: &SharedString,
+        row_ix: usize,
         expanded: bool,
-        natural_h: f32,
+        collapsed_h: f32,
+        measured_h: Rc<Cell<f32>>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let toggle_key = row_id.clone();
+        let height = measured_h.clone();
         let glyph = if expanded {
             crate::icons::ALT_ARROW_UP
         } else {
@@ -6693,29 +6564,43 @@ impl Transcript {
         let button = div()
             .id(SharedString::from(format!("{row_id}-expander")))
             .group("user-message-toggle")
+            .role(gpui::Role::Button)
+            .aria_label(if expanded {
+                "Collapse message"
+            } else {
+                "Expand message"
+            })
+            .aria_expanded(expanded)
             .flex()
             .items_center()
             .gap(px(5.0))
-            .text_size(px(12.0))
-            .line_height(px(18.0))
+            .text_size(crate::typography::ui_rems(14.0))
+            .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
             .text_color(theme.text_muted)
             .cursor_pointer()
             .hover(|s| s.text_color(theme.text))
             .child(label)
             .child(
                 crate::icons::icon(glyph)
-                    .size(px(11.0))
+                    .size(px(12.0))
                     .text_color(theme.text_muted)
                     .group_hover("user-message-toggle", |s| s.text_color(theme.text)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_user_fold(toggle_key.clone(), natural_h);
+                this.toggle_user_fold(
+                    toggle_key.clone(),
+                    row_ix,
+                    collapsed_h,
+                    height.get().max(collapsed_h),
+                    motion::reduced_motion(cx),
+                );
                 cx.notify();
             }));
         div()
-            .mt(px(6.0))
             .flex()
-            .justify_end()
+            .mt(px(USER_TOGGLE_GAP))
+            .justify_start()
+            .items_start()
             .child(button)
             .into_any_element()
     }
@@ -6960,7 +6845,6 @@ impl Transcript {
                     },
                 );
                 transcript.trim_inline_image_cache();
-                transcript.sticky_turn.invalidate_layout();
                 cx.notify();
             })
             .ok();
@@ -7026,7 +6910,6 @@ impl Transcript {
                             .object_fit(ObjectFit::Contain)
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.user_message_preview = None;
                                 this.attachment_preview_return_focus = window.focused(cx);
                                 preview.viewer.reset();
                                 this.attachment_preview = Some(preview.clone());
@@ -7074,7 +6957,7 @@ impl Transcript {
             .flex_wrap()
             .flex()
             .flex_row()
-            .justify_start()
+            .justify_end()
             .items_start()
             .gap(px(8.0))
             .px(px(4.0))
@@ -7144,7 +7027,6 @@ impl Transcript {
                         .bg(crate::theme::ink(0.035))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.user_message_preview = None;
                             this.attachment_preview_return_focus = window.focused(cx);
                             preview.viewer.reset();
                             this.attachment_preview = Some(preview.clone());
@@ -7473,172 +7355,8 @@ impl Transcript {
         }
     }
 
-    fn sticky_reading_row(&self) -> Option<usize> {
-        let last_ix = self.rows.len().checked_sub(1)?;
-        let viewport = self.list.viewport_bounds();
-        if f32::from(viewport.size.height) <= 0.0
-            || f32::from(self.list.max_offset_for_scrollbar().y) <= 0.5
-        {
-            return None;
-        }
-        let read_top = f32::from(viewport.top()) + STICKY_TURN_TOP_INSET_PX + 0.5;
-        let mut row_ix = self.list.logical_scroll_top().item_ix.min(last_ix);
-        while row_ix < last_ix {
-            let Some(bounds) = self.list.bounds_for_item(row_ix + 1) else {
-                break;
-            };
-            if f32::from(bounds.top()) > read_top {
-                break;
-            }
-            row_ix += 1;
-        }
-        Some(row_ix)
-    }
-
-    fn sticky_user_top(&self, user_ix: usize, current_scroll_y: f32) -> Option<f32> {
-        let row = self.rows.get(user_ix)?;
-        self.list
-            .bounds_for_item(user_ix)
-            .map(|bounds| f32::from(bounds.top()) + self.row_top_gap(user_ix, row))
-            .or_else(|| {
-                self.sticky_turn
-                    .projected_top(row.id.as_ref(), current_scroll_y)
-            })
-    }
-
-    fn render_sticky_turn(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.doc_override.is_some() {
-            return None;
-        }
-        let viewport = self.list.viewport_bounds();
-        let viewport_top = f32::from(viewport.top());
-        let sticky_top = viewport_top + STICKY_TURN_TOP_INSET_PX;
-        if self.sticky_turn.update_viewport(
-            f32::from(viewport.size.width),
-            f32::from(viewport.size.height),
-        ) {
-            let entity = cx.weak_entity();
-            window.on_next_frame(move |_, cx| {
-                entity
-                    .update(cx, |_this: &mut Transcript, cx| cx.notify())
-                    .ok();
-            });
-            return None;
-        }
-        let current_scroll_y = self.sticky_scroll_y;
-        let fallback_reading_ix = self.sticky_reading_row();
-        let group = sticky_turn_group_for_viewport(
-            &self.sticky_turn_rows,
-            sticky_top,
-            fallback_reading_ix,
-            |position| {
-                let user_ix = *self.sticky_turn_rows.get(position)?;
-                self.sticky_user_top(user_ix, current_scroll_y)
-            },
-        )?;
-        let source = self.rows.get(group.user_ix)?.clone();
-        if self.own_turn.as_ref().is_some_and(|anchor| {
-            source.entry_id == anchor.message_id
-                && runway_owns_user_position(anchor.held, anchor.positioned, anchor.has_landed)
-        }) {
-            // The runway already owns this exact visual position. Painting a
-            // second copy would double text/attachments during the landing.
-            return None;
-        }
-
-        let source_top = self.sticky_user_top(group.user_ix, current_scroll_y);
-        let source_was_invalidated = self
-            .sticky_turn
-            .consume_layout_suppression(source.id.as_ref());
-        if source_top.is_none() && source_was_invalidated {
-            let entity = cx.weak_entity();
-            window.on_next_frame(move |_, cx| {
-                entity
-                    .update(cx, |_this: &mut Transcript, cx| cx.notify())
-                    .ok();
-            });
-            return None;
-        }
-        let next_turn_top = group.next_user_ix.and_then(|ix| {
-            self.list
-                .bounds_for_item(ix)
-                .map(|bounds| f32::from(bounds.top()))
-                .or_else(|| {
-                    let body_top = self.sticky_user_top(ix, current_scroll_y)?;
-                    let row = self.rows.get(ix)?;
-                    Some(body_top - self.row_top_gap(ix, row))
-                })
-        });
-        let measured_height = self
-            .sticky_turn
-            .height(source.id.as_ref())
-            .unwrap_or(USER_MESSAGE_CARD_MAX_HEIGHT);
-        let overlay_top = sticky_turn_overlay_top(
-            sticky_top,
-            source_top,
-            fallback_reading_ix.is_some_and(|reading_ix| reading_ix > group.user_ix),
-            next_turn_top,
-            measured_height + GAP_TURN,
-        )?;
-
-        // Namespace the duplicate element ids while preserving every field
-        // and the same renderer/interaction path as the list row.
-        let mut sticky_row = source.clone();
-        sticky_row.id = SharedString::from(format!("{}#sticky", source.id));
-        let theme = Theme::of(cx).clone();
-        let surface = sticky_turn_surface(&theme);
-        let body = self.render_row_body(&sticky_row, None, window, &theme, cx);
-        let source_id = source.id.clone();
-        let weak = cx.weak_entity();
-        let measured = div()
-            .w_full()
-            .min_w_0()
-            .rounded(px(surface.occlusion_radius))
-            .block_mouse_except_scroll()
-            .when_some(surface.occlusion_background, |wrapper, background| {
-                wrapper.bg(background)
-            })
-            .child(body)
-            .on_children_prepainted(move |bounds, _, cx| {
-                let Some(height) = bounds
-                    .first()
-                    .map(|bounds| f32::from(bounds.size.height))
-                    .filter(|height| *height > 0.0)
-                else {
-                    return;
-                };
-                weak.update(cx, |this, cx| {
-                    if this.sticky_turn.record_height(source_id.clone(), height) {
-                        cx.notify();
-                    }
-                })
-                .ok();
-            });
-
-        Some(sticky_turn_layer(
-            overlay_top - viewport_top,
-            self.bottom_clearance,
-            div()
-                .id(SharedString::from(format!("{}#sticky-turn", source.id)))
-                .w_full()
-                .max_w(px(self.content_width + Theme::SPACE_LG * 2.0))
-                .mx_auto()
-                .px(px(Theme::SPACE_LG))
-                .min_w_0()
-                .pb(px(GAP_TURN))
-                .when_some(surface.outer_background, |wrapper, background| {
-                    wrapper.bg(background)
-                })
-                .child(crate::frost::frosted(
-                    surface.occlusion_radius,
-                    surface.occlusion_blur_radius,
-                    measured,
-                )),
-        ))
+    fn viewport_width(&self) -> Option<f32> {
+        self.measured_viewport_width
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -7671,8 +7389,7 @@ impl Transcript {
             .then(|| self.render_working_trailer(cx.entity_id(), self.doc_override.is_none(), cx))
             .flatten();
 
-        let user_geometry = matches!(row.kind, RowKind::User { .. }).then(|| row.id.clone());
-        let inner = self.render_row_body(&row, user_geometry, window, &theme, cx);
+        let inner = self.render_row_body(ix, &row, window, &theme, cx);
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
         // entry's last row. Timestamp, copy action, and copied feedback only
@@ -7800,8 +7517,8 @@ impl Transcript {
 
     fn render_row_body(
         &mut self,
+        row_ix: usize,
         row: &Row,
-        user_geometry: Option<SharedString>,
         window: &mut Window,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -7832,9 +7549,8 @@ impl Transcript {
                 let mentions = mentions.clone();
                 let url_chips = url_chips.clone();
                 let pending = *pending;
-                // Attachment thumbnails and context badges ride above the
-                // full-width user card, aligned to the transcript's leading
-                // edge like Orchestrator.dev's AgentUserMessageBubble.
+                // Attachments, badges and the prompt bubble follow upstream's
+                // right-aligned user-message column.
                 let mut column = div().w_full().flex().flex_col();
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(
@@ -7851,7 +7567,7 @@ impl Transcript {
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .justify_start()
+                            .justify_end()
                             .items_center()
                             .gap(px(6.0))
                             .pb(px(6.0))
@@ -7865,201 +7581,148 @@ impl Transcript {
                     );
                 }
                 if !text.is_empty() {
-                    let overflow = self
-                        .user_message_overflow
-                        .get(&row.id)
-                        .copied()
-                        .unwrap_or(false);
-                    // The sticky clone keeps the clipped card and its
-                    // full-message dialog; the list row expands inline.
-                    let inline_fold = !row.id.ends_with("#sticky");
-                    let fold = self.user_folds.get(&row.id).copied().unwrap_or_default();
-                    let expanded = inline_fold && overflow && fold.open == Some(true);
-                    let natural_h = self
-                        .user_message_heights
-                        .get(&row.id)
-                        .copied()
-                        .unwrap_or(USER_MESSAGE_CARD_MAX_HEIGHT)
-                        .max(USER_MESSAGE_CARD_MAX_HEIGHT);
-                    let card_max_h = if expanded {
-                        natural_h
-                    } else {
-                        USER_MESSAGE_CARD_MAX_HEIGHT
-                    };
-                    let fold_spec = user_resize_spec((card_max_h - fold.from).abs());
-                    let fold_animating = inline_fold
-                        && fold.epoch > 0
-                        && !cx.reduce_motion()
-                        && fold
-                            .toggled_at
-                            .is_some_and(|at| at.elapsed() < fold_spec.total());
-                    let overflow_key = row.id.clone();
-                    let weak = cx.weak_entity();
-                    let preview = UserMessagePreview {
-                        row_id: row.id.clone(),
-                        text: text.clone(),
-                    };
-                    let mut card = div()
-                        .relative()
-                        .min_w_0()
-                        .w_full()
-                        .max_h(px(card_max_h))
-                        .overflow_hidden()
-                        .rounded(px(USER_MESSAGE_CARD_RADIUS))
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(user_message_card_background(&theme))
-                        .px(px(12.0))
-                        .py(px(USER_MESSAGE_CARD_PAD_Y))
-                        .text_size(px(14.0))
-                        .line_height(px(22.0))
-                        .text_color(theme.text)
-                        .when(pending, |el| el.opacity(0.65))
-                        .child(user_bubble_text(&row.id, text, mentions, url_chips, &theme))
-                        .on_children_prepainted(move |bounds, _, cx| {
-                            let measured = bounds
-                                .first()
-                                .map(|bounds| f32::from(bounds.size.height))
-                                .unwrap_or(0.0);
-                            let next = user_message_overflows(measured);
-                            // Card chrome around the text: padding + border.
-                            let natural = measured + USER_MESSAGE_CARD_PAD_Y * 2.0 + 2.0;
-                            weak.update(cx, |this, cx| {
-                                let height_changed = next
-                                    && this
-                                        .user_message_heights
-                                        .insert(overflow_key.clone(), natural)
-                                        .is_none_or(|old| (old - natural).abs() > 0.5);
-                                let overflow_changed = this
-                                    .user_message_overflow
-                                    .insert(overflow_key.clone(), next)
-                                    != Some(next);
-                                if overflow_changed || height_changed {
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        })
-                        .id(SharedString::from(format!("{}#user-card", row.id)));
-                    if overflow && inline_fold {
-                        let toggle_key = row.id.clone();
-                        let hover_border = theme.accent.opacity(0.40);
-                        card = card
-                            .cursor_pointer()
-                            .hover(move |style| style.border_color(hover_border))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_user_fold(toggle_key.clone(), natural_h);
-                                cx.notify();
-                            }));
-                    }
-                    if overflow && !expanded {
-                        let weak = cx.weak_entity();
-                        let fade_bg = user_message_card_background(&theme);
-                        let hover_border = theme.accent.opacity(0.40);
-                        if !inline_fold {
-                            card = card
-                                .cursor_pointer()
-                                .hover(move |style| style.border_color(hover_border))
-                                .on_click(move |_, window, cx| {
-                                    weak.update(cx, |this, cx| {
-                                        this.attachment_preview = None;
-                                        this.user_message_preview = Some(preview.clone());
-                                        window.focus(&this.user_message_preview_focus, cx);
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                });
-                        }
-                        card = card.child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(USER_MESSAGE_FADE_HEIGHT))
-                                .bg(gpui::linear_gradient(
-                                    0.0,
-                                    gpui::linear_color_stop(fade_bg, 0.0),
-                                    gpui::linear_color_stop(fade_bg.opacity(0.0), 1.0),
-                                )),
-                        );
-                    }
-                    if fold_animating {
-                        let from = fold.from;
-                        column = column.child(card.with_animation(
-                            SharedString::from(format!("{}-user-fold{}", row.id, fold.epoch)),
-                            fold_spec.animation(),
-                            move |el, t| el.max_h(px(motion::lerp(from, card_max_h, t))),
-                        ));
-                    } else {
-                        column = column.child(card);
-                    }
-                    if overflow && inline_fold {
-                        column = column.child(
-                            self.render_user_expander(&row.id, expanded, natural_h, &theme, cx),
-                        );
-                    }
-                } else if let Some(summary) = user_message_attachment_summary(&attachments) {
-                    column = column.child(
-                        div()
-                            .w_full()
-                            .rounded(px(USER_MESSAGE_CARD_RADIUS))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(user_message_card_background(&theme))
-                            .px(px(12.0))
-                            .py(px(USER_MESSAGE_CARD_PAD_Y))
-                            .text_size(px(14.0))
-                            .text_color(theme.text_muted)
-                            .italic()
-                            .when(pending, |el| el.opacity(0.65))
-                            .child(summary),
+                    let line_height = f32::from(
+                        crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()),
                     );
-                }
-                if let Some(geometry_id) = user_geometry {
-                    let weak = cx.weak_entity();
-                    column
-                        .on_children_prepainted(move |bounds, _, cx| {
-                            let Some(first) = bounds.first() else {
-                                return;
-                            };
-                            let mut top = f32::from(first.top());
-                            let mut bottom = f32::from(first.bottom());
-                            for bounds in &bounds[1..] {
-                                top = top.min(f32::from(bounds.top()));
-                                bottom = bottom.max(f32::from(bounds.bottom()));
-                            }
-                            let height = bottom - top;
-                            if height <= 0.0 {
-                                return;
-                            }
-                            let weak = weak.clone();
-                            let geometry_id = geometry_id.clone();
-                            // The list resolves pending scroll anchors during
-                            // prepaint. Pair this top with that same layout's
-                            // offset after the list releases its mutable borrow.
-                            cx.defer(move |cx| {
-                                weak.update(cx, |this, cx| {
-                                    let scroll_y = sticky_scroll_offset(
-                                        f32::from(this.list.scroll_px_offset_for_scrollbar().y),
-                                        f32::from(this.list.max_offset_for_scrollbar().y),
+                    let collapsed_text_h = USER_COLLAPSED_LINES as f32 * line_height;
+                    // The separate continuation row keeps the collapsed
+                    // height stable while the five text lines stay clipped.
+                    let collapsed_h = collapsed_text_h + line_height;
+                    let measured_h = self
+                        .user_heights
+                        .entry(row.id.clone())
+                        .or_insert_with(|| Rc::new(Cell::new(0.0)))
+                        .clone();
+                    let measured = measured_h.get();
+                    let fold = self.user_folds.get(&row.id).copied().unwrap_or_default();
+                    let expanded = fold.open.unwrap_or(false);
+                    let collapsible = text.lines().count() > USER_COLLAPSED_LINES
+                        || (measured > 0.0 && user_message_overflows(measured, line_height))
+                        || (measured == 0.0 && user_message_needs_collapse(&text));
+                    let full_h = measured_h.get().max(collapsed_h);
+                    if let Some(fold) = self.user_folds.get_mut(&row.id) {
+                        fold.user_expansion_height = (full_h - collapsed_h).max(0.0);
+                    }
+                    let duration_ms = fold
+                        .duration_ms
+                        .max(user_resize_duration_ms(full_h - collapsed_h));
+                    let fold_spec = user_resize_spec(full_h - collapsed_h);
+                    let fold_animating = collapsible
+                        && fold.epoch > 0
+                        && !motion::reduced_motion(cx)
+                        && fold.toggled_at.is_some_and(|at| {
+                            at.elapsed() < Duration::from_millis(duration_ms + 200)
+                        });
+                    let hold_key = row.id.clone();
+                    let hold_height = measured_h.clone();
+                    let hold_selection: Arc<str> = format!("{}:u", row.id).into();
+                    let text_body = div().child(user_bubble_text(
+                        &row.id,
+                        text.clone(),
+                        mentions,
+                        url_chips,
+                        &theme,
+                        measured_h.clone(),
+                        cx.entity_id(),
+                    ));
+                    let body = div()
+                        .id(SharedString::from(format!("{}-body", row.id)))
+                        .when(collapsible, |el| {
+                            let down_key = hold_key.clone();
+                            let down_height = hold_height.clone();
+                            let down_selection = hold_selection.clone();
+                            el.on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.arm_user_hold(
+                                        down_key.clone(),
+                                        row_ix,
+                                        collapsed_h,
+                                        down_height.clone(),
+                                        down_selection.clone(),
+                                        cx,
                                     );
-                                    if this.sticky_turn.record_geometry(
-                                        geometry_id,
-                                        top,
-                                        height,
-                                        scroll_y,
-                                    ) {
-                                        cx.notify();
-                                    }
-                                })
-                                .ok();
-                            });
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| this.cancel_user_hold()),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| this.cancel_user_hold()),
+                            )
+                            .on_mouse_move(cx.listener(|this, _, _, _| this.cancel_user_hold()))
+                        });
+                    let clipped_body: AnyElement = if fold_animating {
+                        let from = fold.from;
+                        let to = if expanded { full_h } else { collapsed_h };
+                        let ellipsis_h = if expanded { 0.0 } else { line_height };
+                        body.child(div().overflow_hidden().child(text_body).with_animation(
+                            SharedString::from(format!("{}-user-resize-{}", row.id, fold.epoch)),
+                            fold_spec.animation(),
+                            move |el, t| {
+                                el.h(px((motion::lerp(from, to, t) - ellipsis_h).max(0.0)))
+                            },
+                        ))
+                        .when(!expanded, |el| {
+                            el.child(div().h(px(line_height)).child("..."))
                         })
                         .into_any_element()
-                } else {
-                    column.into_any_element()
+                    } else if collapsible && !expanded {
+                        body.child(
+                            div()
+                                .h(px(collapsed_text_h))
+                                .overflow_hidden()
+                                .child(text_body),
+                        )
+                        .child(div().h(px(line_height)).child("..."))
+                        .into_any_element()
+                    } else {
+                        body.child(text_body).into_any_element()
+                    };
+                    let bubble = div()
+                        .min_w_0()
+                        .max_w(px(self.content_width * 0.8))
+                        .bg(crate::theme::user_bubble_bg())
+                        .rounded(px(Theme::BUBBLE_RADIUS))
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .text_size(crate::typography::ui_rems(14.0))
+                        .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
+                        .text_color(theme.text)
+                        .when(pending, |el| el.opacity(0.65))
+                        .child(clipped_body)
+                        .when(collapsible, |el| {
+                            el.child(self.render_user_expander(
+                                &row.id,
+                                row_ix,
+                                expanded,
+                                collapsed_h,
+                                measured_h,
+                                &theme,
+                                cx,
+                            ))
+                        });
+                    column = column.child(div().w_full().flex().justify_end().child(bubble));
+                } else if let Some(summary) = user_message_attachment_summary(&attachments) {
+                    column = column.child(
+                        div().w_full().flex().justify_end().child(
+                            div()
+                                .max_w(px(self.content_width * 0.8))
+                                .bg(crate::theme::user_bubble_bg())
+                                .rounded(px(Theme::BUBBLE_RADIUS))
+                                .px(px(16.0))
+                                .py(px(10.0))
+                                .text_size(crate::typography::ui_rems(14.0))
+                                .text_color(theme.text_muted)
+                                .italic()
+                                .when(pending, |el| el.opacity(0.65))
+                                .child(summary),
+                        ),
+                    );
                 }
+                column.into_any_element()
             }
             RowKind::Markdown { tree, block_ix } => {
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -8068,10 +7731,8 @@ impl Transcript {
                 if should_render_mermaid(&top.block, false) {
                     self.render_mermaid_block(&row.id, tree, *block_ix, window, &theme, cx)
                 } else {
-                    let (md_width, bleed_budget) = column_and_table_bleed_for(
-                        self.sticky_turn.viewport.map(|(w, _)| w),
-                        self.content_width,
-                    );
+                    let (md_width, bleed_budget) =
+                        column_and_table_bleed_for(self.viewport_width(), self.content_width);
                     let opts = RenderOptions {
                         tasks: None,
                         media: None,
@@ -8128,10 +7789,8 @@ impl Transcript {
                         })
                         .clone()
                 });
-                let (md_width, bleed_budget) = column_and_table_bleed_for(
-                    self.sticky_turn.viewport.map(|(w, _)| w),
-                    self.content_width,
-                );
+                let (md_width, bleed_budget) =
+                    column_and_table_bleed_for(self.viewport_width(), self.content_width);
                 let opts = RenderOptions {
                     tasks: None,
                     media: None,
@@ -8240,6 +7899,7 @@ impl Transcript {
                 active,
             } => self.render_turn_steps(
                 &row.id,
+                row_ix,
                 rows,
                 summary,
                 *duration_ms,
@@ -8264,7 +7924,6 @@ impl Transcript {
                     .id(SharedString::from(format!("{}-tasks", row.id)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.invalidate_sticky_users_after_row(&toggle_id);
                         this.folds.entry(toggle_id.clone()).or_default().open = Some(!open);
                         cx.notify();
                     }))
@@ -8523,8 +8182,8 @@ impl Transcript {
                 let measure = viewport.clone();
                 let body = div()
                     // Fixed, not content-sized: a viewport that grew per
-                    // generated line would reflow the transcript (and the
-                    // sticky turn geometry) on every chunk. Matching the
+                    // generated line would reflow the transcript on every
+                    // chunk. Matching the
                     // resolved budget also keeps the card's height stable
                     // across the whole live turn instead of jumping twice.
                     .h(px(if auto_open {
@@ -8915,6 +8574,7 @@ impl Transcript {
     fn render_turn_steps(
         &mut self,
         row_id: &SharedString,
+        row_ix: usize,
         rows: &Arc<Vec<Row>>,
         summary: &SharedString,
         duration_ms: Option<u64>,
@@ -8934,7 +8594,6 @@ impl Transcript {
             .text_color(theme.text_muted)
             .hover(|style| style.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.invalidate_sticky_users_after_row(&toggle_id);
                 toggle_turn_steps_state(&mut this.turn_steps_open, toggle_id.clone());
                 cx.notify();
             }))
@@ -8999,7 +8658,7 @@ impl Transcript {
                 .iter()
                 .enumerate()
                 .map(|(index, child)| {
-                    let body = self.render_row_body(child, None, window, theme, cx);
+                    let body = self.render_row_body(row_ix, child, window, theme, cx);
                     let gap = if index == 0 {
                         render::MD_BLOCK_GAP
                     } else {
@@ -9359,7 +9018,6 @@ impl Transcript {
                 if !has_detail {
                     return;
                 }
-                this.invalidate_sticky_users_after_row(&toggle_id);
                 this.folds.entry(toggle_id.clone()).or_default().open = Some(!open);
                 cx.notify();
             }))
@@ -9405,10 +9063,8 @@ impl Transcript {
 
         let mut column = div().w_full().flex().flex_col().child(header);
         if open {
-            let (md_width, bleed_budget) = column_and_table_bleed_for(
-                self.sticky_turn.viewport.map(|(w, _)| w),
-                self.content_width,
-            );
+            let (md_width, bleed_budget) =
+                column_and_table_bleed_for(self.viewport_width(), self.content_width);
             let opts = RenderOptions {
                 tasks: None,
                 media: None,
@@ -9566,7 +9222,6 @@ impl Transcript {
                     },
                 );
                 transcript.trim_mermaid_cache();
-                transcript.sticky_turn.invalidate_layout();
                 cx.notify();
             })
             .ok();
@@ -9598,10 +9253,8 @@ impl Transcript {
 
         // Fallback on failure: clean syntax-highlighted code block (like Craft)
         if matches!(&state, MermaidSnapshot::Failed) {
-            let (md_width, bleed_budget) = column_and_table_bleed_for(
-                self.sticky_turn.viewport.map(|(w, _)| w),
-                self.content_width,
-            );
+            let (md_width, bleed_budget) =
+                column_and_table_bleed_for(self.viewport_width(), self.content_width);
             let opts = RenderOptions {
                 tasks: None,
                 media: None,
@@ -9759,7 +9412,6 @@ impl Transcript {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.user_message_preview = None;
         self.attachment_preview = None;
         self.mermaid_preview_zoom =
             crate::mermaid_preview::fit_zoom(window.viewport_size(), &preview);
@@ -10575,6 +10227,8 @@ fn user_bubble_text(
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
     url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
     theme: &Theme,
+    measured_h: Rc<Cell<f32>>,
+    entity_id: gpui::EntityId,
 ) -> AnyElement {
     // Split runs at chip boundaries (spans are in order): body text keeps the
     // sans font, chips read as inline code. Size/line-height flow from the
@@ -10718,6 +10372,18 @@ fn user_bubble_text(
                 }
             }
             render::paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
+            // Keep this passive cache based on wrapped glyph geometry, even
+            // while the visible body is height-clipped to five lines.
+            let line_count: usize = layout
+                .line_layouts()
+                .iter()
+                .map(|line| line.wrap_boundaries.len() + 1)
+                .sum();
+            let next_h = line_count.max(1) as f32 * f32::from(layout.line_height());
+            if (measured_h.get() - next_h).abs() > 0.5 {
+                measured_h.set(next_h);
+                cx.notify(entity_id);
+            }
         },
     )
     .absolute()
@@ -10727,106 +10393,6 @@ fn user_bubble_text(
         .child(underlay)
         .child(text_element)
         .into_any_element()
-}
-
-fn full_message_dialog_limits(viewport: gpui::Size<Pixels>) -> (Pixels, Pixels) {
-    (
-        px((f32::from(viewport.width) - 32.0).clamp(0.0, 672.0)),
-        px(f32::from(viewport.height) * 0.80),
-    )
-}
-
-fn user_message_dialog(
-    viewport: gpui::Size<Pixels>,
-    preview: &UserMessagePreview,
-    focus: &gpui::FocusHandle,
-    theme: &Theme,
-    window: &Window,
-    on_close: impl Fn(&mut Window, &mut gpui::App) + 'static,
-) -> AnyElement {
-    let (max_w, max_h) = full_message_dialog_limits(viewport);
-    let on_close = Rc::new(on_close);
-    let close_on_key = on_close.clone();
-    let close_on_scrim = on_close.clone();
-    // O card inline continua plano (mention wash + url chips pintados sobre uma
-    // linha de texto); o overlay tem espaco e mostra a mensagem como ela foi
-    // escrita — mesma pipeline markdown do file preview.
-    // ponytail: sem highlight de codigo aqui, ligar o `code_highlight_for` se
-    // alguem reclamar de fence sem cor.
-    let tree = parse_full(&preview.text);
-    let message = render::render_tree(
-        &tree,
-        &RenderOptions::settled(SharedString::from(format!("{}#full", preview.row_id))),
-        theme,
-        window,
-        &|_| None,
-    );
-
-    gpui::deferred(
-        gpui::anchored()
-            .position(gpui::point(px(0.0), px(0.0)))
-            .child(
-                div()
-                    .id("full-user-message-scrim")
-                    .role(gpui::Role::Dialog)
-                    .aria_label("Full message")
-                    .occlude()
-                    .track_focus(focus)
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .bg(crate::popover::scrim_alpha(0.70))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
-                        if event.keystroke.key == "escape" {
-                            cx.stop_propagation();
-                            close_on_key(window, cx);
-                        }
-                    })
-                    .on_click(move |_, window, cx| close_on_scrim(window, cx))
-                    .child(
-                        div()
-                            .id("full-user-message-card")
-                            .w(max_w)
-                            .max_h(max_h)
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .rounded(px(USER_MESSAGE_CARD_RADIUS))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.surface_dialog)
-                            .shadow_lg()
-                            .on_click(|_, _, cx| cx.stop_propagation())
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .px(px(16.0))
-                                    .pt(px(16.0))
-                                    .pb(px(10.0))
-                                    .text_size(px(13.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted)
-                                    .child("Full message"),
-                            )
-                            .child(
-                                div()
-                                    .id("full-user-message-scroll")
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .px(px(16.0))
-                                    .pb(px(16.0))
-                                    .text_size(px(14.0))
-                                    .line_height(px(22.0))
-                                    .text_color(theme.text)
-                                    .child(message),
-                            ),
-                    ),
-            ),
-    )
-    .into_any_element()
 }
 
 /// The transcript ErrorChip — a port of zeron chat-view.tsx `ErrorChip`
@@ -11933,7 +11499,6 @@ impl Render for Transcript {
             // changes. Invalidate virtual row heights explicitly, retaining
             // their anchors and all live animation/provenance state.
             self.render_cache.borrow_mut().clear();
-            self.sticky_turn.invalidate_layout();
             self.list.remeasure();
             if self.pinned {
                 self.wake_spring();
@@ -12016,12 +11581,24 @@ impl Render for Transcript {
                     .ok();
             });
         }
+        if self.user_collapse_scroll.is_some() && !self.user_collapse_scroll_scheduled {
+            self.user_collapse_scroll_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.user_collapse_scroll_scheduled = false;
+                        this.step_user_collapse_scroll(cx);
+                    })
+                    .ok();
+            });
+        }
         let rail = self.render_rail(cx);
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
         // outlet — an overlay here would be tinted by the fade.
-        self.update_runway_minimum();
+        self.update_runway_minimum(cx);
         let list_el = list(self.list.clone(), cx.processor(Self::render_row))
             .size_full()
             .with_sizing_behavior(gpui::ListSizingBehavior::Auto);
@@ -12047,8 +11624,43 @@ impl Render for Transcript {
         } else {
             list_el.into_any_element()
         };
-        let sticky_turn = self.render_sticky_turn(window, cx);
-        let sticky_layout = cx.weak_entity();
+        let measured_width = self.measured_viewport_width;
+        let viewport_entity = cx.weak_entity();
+        let viewport_probe = canvas(
+            move |bounds, _, cx| {
+                let width = f32::from(bounds.size.width);
+                if width <= 0.0
+                    || measured_width.is_some_and(|previous| (previous - width).abs() <= 0.5)
+                {
+                    return;
+                }
+                let entity = viewport_entity.clone();
+                // Defer until the virtualizer releases its layout borrow.
+                cx.defer(move |cx| {
+                    entity
+                        .update(cx, |this, cx| {
+                            if this
+                                .measured_viewport_width
+                                .is_some_and(|previous| (previous - width).abs() <= 0.5)
+                            {
+                                return;
+                            }
+                            this.measured_viewport_width = Some(width);
+                            // This frame used the previous width for table bleed.
+                            // Re-measure once with the new width; stable layouts
+                            // schedule no additional frame.
+                            this.list.remeasure_items(0..this.rows.len());
+                            this.viewport_layout_revision =
+                                this.viewport_layout_revision.wrapping_add(1);
+                            cx.notify();
+                        })
+                        .ok();
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
         let root = div()
             .relative()
             .size_full()
@@ -12065,25 +11677,8 @@ impl Render for Transcript {
             // (document paint order = selection order; see markdown/render.rs).
             .child(crate::markdown::render::selection_frame_reset())
             .child(content)
-            .children(sticky_turn)
-            .child(rail)
-            .on_children_prepainted(move |_, _, cx| {
-                let sticky_layout = sticky_layout.clone();
-                cx.defer(move |cx| {
-                    sticky_layout
-                        .update(cx, |this, cx| {
-                            let scroll_y = sticky_scroll_offset(
-                                f32::from(this.list.scroll_px_offset_for_scrollbar().y),
-                                f32::from(this.list.max_offset_for_scrollbar().y),
-                            );
-                            if (scroll_y - this.sticky_scroll_y).abs() > 0.5 {
-                                this.sticky_scroll_y = scroll_y;
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                });
-            });
+            .child(viewport_probe)
+            .child(rail);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {
@@ -12129,24 +11724,6 @@ impl Render for Transcript {
                 move |action, window, cx| {
                     weak.update(cx, |this, cx| {
                         this.on_mermaid_preview_action(action, window, cx);
-                    })
-                    .ok();
-                },
-            ));
-        }
-        if let Some(preview) = self.user_message_preview.clone() {
-            let weak = cx.weak_entity();
-            let theme = Theme::of(cx).clone();
-            return root.child(user_message_dialog(
-                window.viewport_size(),
-                &preview,
-                &self.user_message_preview_focus,
-                &theme,
-                window,
-                move |_, cx| {
-                    weak.update(cx, |this, cx| {
-                        this.user_message_preview = None;
-                        cx.notify();
                     })
                     .ok();
                 },
@@ -12494,6 +12071,99 @@ mod tests {
     }
 
     #[gpui::test]
+    fn folding_releases_sent_turn_hold_without_removing_reservation(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let view = cx.new(|cx| Transcript::new(state, cx));
+        view.update(cx, |view, cx| {
+            view.rows = vec![viewport_row("prompt", "prompt")];
+            view.list.reset(1);
+            for reduced_motion in [false, true] {
+                for open in [false, true] {
+                    view.own_turn = Some(OwnTurnAnchor {
+                        chat_id: "chat".into(),
+                        message_id: "prompt".into(),
+                        held: true,
+                        positioned: true,
+                        seen_prompt: true,
+                    });
+                    view.pinned = true;
+                    view.spring_kick = true;
+                    view.own_turn_last_tick = Some(Instant::now());
+                    view.user_folds.entry("prompt".into()).or_default().open = Some(open);
+                    // A zero-height reservation reads as filled with the
+                    // unmeasured test row, exposing whether folding clears it.
+                    view.list.set_tail_reservation(Some((0, px(0.0))));
+
+                    view.toggle_user_fold("prompt".into(), 0, 110.0, 2200.0, reduced_motion);
+
+                    let turn = view.own_turn.as_ref().expect("reservation remains active");
+                    assert!(!turn.held, "folding gives viewport ownership to the user");
+                    assert!(view.own_turn_last_tick.is_none());
+                    assert!(!view.pinned);
+                    assert!(!view.spring_kick);
+                    assert_eq!(view.user_folds["prompt"].open, Some(!open));
+                    assert!(
+                        view.list.tail_reservation_filled(),
+                        "folding must preserve the runway reservation"
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn navigation_cancels_fold_compensation_before_queued_frame(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let view = cx.new(|cx| Transcript::new(state, cx));
+        view.update(cx, |view, cx| {
+            for navigation in ["wheel", "rail", "bottom", "send"] {
+                view.user_collapse_scroll = Some(UserCollapseScroll {
+                    started_at: Instant::now(),
+                    duration_ms: 850,
+                    height_delta: 2000.0,
+                    row_ix: 0,
+                    initial_top: -1000.0,
+                    target_top: 80.0,
+                });
+                view.user_collapse_scroll_scheduled = true;
+                let hold_token = view.user_hold_token;
+                match navigation {
+                    "wheel" => view.handle_scroll(
+                        &ListScrollEvent {
+                            visible_range: 0..0,
+                            count: 0,
+                            is_scrolled: true,
+                            is_following_tail: false,
+                        },
+                        cx,
+                    ),
+                    "rail" => view.begin_scroll_navigation(),
+                    "bottom" => view.jump_to_bottom(cx),
+                    "send" => view.on_own_send("chat".into(), "prompt".into(), cx),
+                    _ => unreachable!(),
+                }
+                assert!(view.user_collapse_scroll.is_none(), "{navigation}");
+                assert_ne!(
+                    view.user_hold_token, hold_token,
+                    "{navigation} cancels holds"
+                );
+                assert!(
+                    view.user_collapse_scroll_scheduled,
+                    "retain the queued-frame guard until the callback runs"
+                );
+
+                let before = view.list.logical_scroll_top();
+                view.user_collapse_scroll_scheduled = false;
+                view.step_user_collapse_scroll(cx);
+                let after = view.list.logical_scroll_top();
+                assert_eq!(after.item_ix, before.item_ix);
+                assert_eq!(after.offset_in_item, before.offset_in_item);
+                assert!(view.user_collapse_scroll.is_none());
+            }
+        });
+    }
+
+    #[gpui::test]
     fn selection_start_stops_stream_follow_before_motion(cx: &mut gpui::TestAppContext) {
         let _selection_state = crate::markdown::selection::tests::state_lock();
         cx.update(|cx| {
@@ -12512,6 +12182,36 @@ mod tests {
                 assert!(crate::markdown::selection::is_dragging());
                 crate::markdown::selection::end_active_drag();
             })
+        });
+    }
+
+    #[gpui::test]
+    fn selection_start_preserves_user_longpress_until_drag_moves(cx: &mut gpui::TestAppContext) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let state = cx.new(|_| AppState::new());
+        let (view, cx) = cx.add_window_view(|_, cx| Transcript::new(state, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.arm_user_hold(
+                    "prompt".into(),
+                    0,
+                    110.0,
+                    Rc::new(Cell::new(2200.0)),
+                    "prompt:u".into(),
+                    cx,
+                );
+                let hold_token = view.user_hold_token;
+                crate::markdown::selection::begin("prompt:u", 0);
+                view.on_selection_mouse_down(&MouseDownEvent::default(), window, cx);
+                assert_eq!(view.user_hold_token, hold_token);
+                assert!(view.user_hold_task.is_some());
+
+                view.on_selection_mouse_move(&MouseMoveEvent::default(), window, cx);
+                assert_ne!(view.user_hold_token, hold_token);
+                assert!(view.user_hold_task.is_none());
+                crate::markdown::selection::end_active_drag();
+            });
         });
     }
 
@@ -13205,86 +12905,6 @@ mod tests {
     }
 
     #[test]
-    fn sticky_turn_header_tracks_the_group_crossing_the_reading_line() {
-        let mut rows = Vec::new();
-        rows.extend(rows_for_entry(&user_entry("user-a"), false, &mut parse));
-        rows.extend(rows_for_entry(
-            &assistant(
-                "assistant-a",
-                MessageStatus::Complete,
-                vec![text_part("answer-a", "First answer")],
-            ),
-            false,
-            &mut parse,
-        ));
-        rows.extend(rows_for_entry(&user_entry("user-b"), false, &mut parse));
-        rows.extend(rows_for_entry(
-            &assistant(
-                "assistant-b",
-                MessageStatus::Complete,
-                vec![text_part("answer-b", "Second answer")],
-            ),
-            false,
-            &mut parse,
-        ));
-
-        let user_rows = sticky_turn_rows(&rows);
-        assert_eq!(user_rows, vec![0, 2]);
-        assert_eq!(
-            sticky_turn_group(&user_rows, 1),
-            Some(StickyTurnGroup {
-                user_ix: 0,
-                next_user_ix: Some(2),
-            })
-        );
-        assert_eq!(
-            sticky_turn_group(&user_rows, 3),
-            Some(StickyTurnGroup {
-                user_ix: 2,
-                next_user_ix: None,
-            })
-        );
-    }
-
-    #[test]
-    fn sticky_turn_header_never_duplicates_the_original_and_yields_to_the_next_turn() {
-        let sticky_top = 48.0;
-        let header_height = 64.0;
-
-        assert_eq!(
-            sticky_turn_overlay_top(sticky_top, Some(sticky_top), false, None, header_height),
-            None,
-            "the original row already occupies the sticky position"
-        );
-        assert_eq!(
-            sticky_turn_overlay_top(
-                sticky_top,
-                Some(sticky_top - 1.0),
-                false,
-                None,
-                header_height,
-            ),
-            Some(sticky_top),
-        );
-        assert_eq!(
-            sticky_turn_overlay_top(sticky_top, None, true, Some(100.0), header_height,),
-            Some(36.0),
-            "the next turn boundary pushes the previous 64px header upward"
-        );
-    }
-
-    #[test]
-    fn runway_and_sticky_copy_hand_off_without_skipping_the_restick_glide() {
-        assert!(runway_owns_user_position(true, false, false));
-        assert!(runway_owns_user_position(true, true, true));
-        assert!(!runway_owns_user_position(false, true, true));
-        assert!(
-            !runway_owns_user_position(true, false, true),
-            "after the first landing, the sticky copy stays visible during a restick glide"
-        );
-    }
-
-    #[test]
     fn tool_fingerprint_changes_when_same_length_invocation_content_changes() {
         let mut tool = ToolItem {
             subagent_batch: None,
@@ -13315,173 +12935,6 @@ mod tests {
         }));
         let after = tool_fingerprint(std::slice::from_ref(&tool), false, false);
         assert_ne!(before, after);
-    }
-
-    #[test]
-    fn file_measurement_keeps_current_sticky_geometry_and_invalidates_following_turns() {
-        let mut state = StickyTurnState::default();
-        state.attach_chat(Some("chat"));
-        state.record_geometry("current".into(), -100.0, 40.0, -200.0);
-        state.record_geometry("next".into(), 700.0, 40.0, -200.0);
-        state.invalidate_user_ids([SharedString::from("next")]);
-        assert_eq!(state.projected_top("current", -200.0), Some(-100.0));
-        assert!(!state.consume_layout_suppression("current"));
-        assert_eq!(state.projected_top("next", -200.0), None);
-        assert!(state.consume_layout_suppression("next"));
-    }
-
-    #[test]
-    fn sticky_turn_state_resets_on_chat_switch_and_accepts_streaming_remeasurement() {
-        let mut state = StickyTurnState::default();
-        assert!(state.attach_chat(Some("chat-a")));
-        assert!(state.record_height("user-a".into(), 42.0));
-        assert!(!state.record_height("user-a".into(), 42.2));
-        assert!(state.record_height("user-a".into(), 68.0));
-        assert_eq!(state.height("user-a"), Some(68.0));
-        assert!(state.record_height("user-b".into(), 32.0));
-        state.retain_user_ids(&std::collections::HashSet::from([SharedString::from(
-            "user-b",
-        )]));
-        assert_eq!(state.height("user-a"), None);
-        assert_eq!(state.height("user-b"), Some(32.0));
-
-        assert!(state.attach_chat(Some("chat-b")));
-        assert_eq!(state.height("user-a"), None);
-        assert!(!state.attach_chat(Some("chat-b")));
-    }
-
-    #[test]
-    fn sticky_projection_does_not_jump_by_a_viewport_at_the_pending_end_anchor() {
-        let mut state = StickyTurnState::default();
-        state.record_geometry("current".into(), -100.0, 40.0, -389.5);
-        // Native trace: pending past-end offset includes the 1170px viewport.
-        let settled = sticky_scroll_offset(-389.5, 389.5);
-        let pending = sticky_scroll_offset(-1559.5, 389.5);
-        assert_eq!(pending, settled);
-        assert_eq!(state.projected_top("current", pending), Some(-100.0));
-        assert_eq!(sticky_scroll_offset(0.0, 0.0), 0.0);
-        assert_eq!(sticky_scroll_offset(-100.0, 389.5), -100.0);
-    }
-
-    #[test]
-    fn measured_user_geometry_prevents_a_glued_list_from_painting_a_duplicate() {
-        let mut state = StickyTurnState::default();
-        state.attach_chat(Some("chat"));
-        assert!(state.update_viewport(800.0, 600.0));
-        assert!(state.record_geometry("user".into(), 320.0, 64.0, -100.0));
-        assert_eq!(state.projected_top("user", -100.0), Some(320.0));
-        assert_eq!(state.projected_top("user", -360.0), Some(60.0));
-
-        assert_eq!(
-            sticky_turn_overlay_top(
-                48.0,
-                state.projected_top("user", -100.0),
-                true,
-                None,
-                state.height("user").unwrap(),
-            ),
-            None,
-            "logical top may be past the user while the original card is still visibly below it"
-        );
-        assert_eq!(
-            sticky_turn_overlay_top(
-                48.0,
-                state.projected_top("user", -380.0),
-                true,
-                None,
-                state.height("user").unwrap(),
-            ),
-            Some(48.0),
-        );
-
-        state.invalidate_layout();
-        assert_eq!(state.projected_top("user", -380.0), None);
-        assert!(state.consume_layout_suppression("user"));
-        assert!(!state.consume_layout_suppression("user"));
-        assert_eq!(
-            state.height("user"),
-            Some(64.0),
-            "a transcript reflow invalidates positions, not the user card's measured height"
-        );
-
-        assert!(state.record_geometry("user".into(), 80.0, 64.0, -380.0));
-        assert!(!state.update_viewport(800.2, 600.0));
-        assert!(state.update_viewport(720.0, 600.0));
-        assert_eq!(state.projected_top("user", -380.0), None);
-        assert!(state.consume_layout_suppression("user"));
-    }
-
-    #[test]
-    fn measured_turn_boundaries_override_the_bottom_glued_logical_sentinel() {
-        let user_rows = vec![0, 2];
-        let first_tops = [Some(-120.0), Some(320.0)];
-        assert_eq!(
-            sticky_turn_group_for_viewport(&user_rows, 48.0, Some(3), |position| {
-                first_tops[position]
-            }),
-            Some(StickyTurnGroup {
-                user_ix: 0,
-                next_user_ix: Some(2),
-            }),
-            "the second original bubble is visible mid-viewport, so the first turn still owns the top"
-        );
-        let second_tops = [Some(-500.0), Some(48.0)];
-        assert_eq!(
-            sticky_turn_group_for_viewport(&user_rows, 48.0, Some(3), |position| {
-                second_tops[position]
-            }),
-            Some(StickyTurnGroup {
-                user_ix: 2,
-                next_user_ix: None,
-            }),
-        );
-
-        let sparse_rows = vec![0, 10, 20, 30];
-        let sparse_tops = [None, None, None, Some(400.0)];
-        assert_eq!(
-            sticky_turn_group_for_viewport(&sparse_rows, 48.0, Some(15), |position| {
-                sparse_tops[position]
-            }),
-            Some(StickyTurnGroup {
-                user_ix: 10,
-                next_user_ix: Some(20),
-            }),
-            "a non-adjacent measurement must not replace the logical group"
-        );
-    }
-
-    #[test]
-    fn sticky_turn_index_rebuild_keeps_the_same_group_during_stream_growth() {
-        let mut rows = rows_for_entry(&user_entry("user-live"), false, &mut parse);
-        rows.extend(rows_for_entry(
-            &assistant(
-                "assistant-live",
-                MessageStatus::Streaming,
-                vec![text_part("stream-1", "Working")],
-            ),
-            false,
-            &mut parse,
-        ));
-        let before = sticky_turn_rows(&rows);
-        assert_eq!(
-            sticky_turn_group(&before, rows.len() - 1).unwrap().user_ix,
-            0
-        );
-
-        rows.extend(rows_for_entry(
-            &assistant(
-                "assistant-live-tail",
-                MessageStatus::Streaming,
-                vec![text_part("stream-2", "Still working")],
-            ),
-            false,
-            &mut parse,
-        ));
-        let after = sticky_turn_rows(&rows);
-        assert_eq!(
-            sticky_turn_group(&after, rows.len() - 1).unwrap().user_ix,
-            0
-        );
     }
 
     fn parse(_: &str, text: &str) -> Arc<BlockTree> {
@@ -14850,36 +14303,13 @@ mod tests {
     }
 
     #[test]
-    fn compact_commands_are_status_lines_not_sticky_prompts() {
+    fn compact_commands_and_markers_are_recognized() {
         assert!(is_compact_command("/compact"));
         assert!(is_compact_command("  /compact focus on the API  "));
         assert!(!is_compact_command("/compactify"));
         assert!(!is_compact_command("please /compact"));
         assert!(is_compaction_marker("Context compacted · 16k → 59k"));
         assert!(is_compaction_marker("Contexto compactado."));
-        let user = |id: &str, text: &str| Row {
-            id: id.into(),
-            version: 0,
-            turn_start: true,
-            kind: RowKind::User {
-                text: text.to_owned().into(),
-                mentions: Arc::default(),
-                url_chips: Arc::default(),
-                attachments: Arc::default(),
-                appshot_presentations: Arc::default(),
-                badges: Arc::default(),
-                pending: false,
-            },
-            entry_id: id.into(),
-            timestamp: None,
-            copy_text: None,
-        };
-        let rows = vec![
-            user("u1", "hello"),
-            user("u2", "/compact"),
-            user("u3", "next"),
-        ];
-        assert_eq!(sticky_turn_rows(&rows), vec![0, 2]);
     }
 
     #[test]
@@ -15888,10 +15318,37 @@ mod tests {
     }
 
     #[test]
-    fn user_message_overflow_uses_the_measured_content_height() {
-        let content_limit = USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0;
-        assert!(!user_message_overflows(content_limit));
-        assert!(user_message_overflows(content_limit + 0.5));
+    fn user_message_fold_starts_after_five_rendered_lines() {
+        let line_height = 22.0;
+        assert!(
+            !user_message_overflows(line_height * 5.0, line_height),
+            "five lines fit in the collapsed message"
+        );
+        assert!(
+            user_message_overflows(line_height * 6.0, line_height),
+            "the sixth line needs the inline expander"
+        );
+    }
+
+    #[test]
+    fn user_fold_keeps_the_target_bubble_inside_the_viewport() {
+        assert_eq!(user_fold_target_top(300.0, 100.0, 700.0, 500.0), 188.0);
+        assert_eq!(user_fold_target_top(300.0, 100.0, 700.0, 200.0), 300.0);
+        assert_eq!(user_fold_target_top(50.0, 100.0, 700.0, 200.0), 100.0);
+    }
+
+    #[test]
+    fn long_prompts_collapse_and_short_ones_do_not() {
+        assert!(!user_message_needs_collapse("short message"));
+        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5"));
+        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
+        assert!(!user_message_needs_collapse(&"x".repeat(240)));
+        assert!(!user_message_needs_collapse(
+            &"x".repeat(USER_COLLAPSE_CHARS)
+        ));
+        assert!(user_message_needs_collapse(
+            &"x".repeat(USER_COLLAPSE_CHARS + 1)
+        ));
     }
 
     fn att(path: &str) -> crate::attachments::UserImageAttachment {
@@ -15991,38 +15448,6 @@ mod tests {
             rows.iter()
                 .all(|row| !matches!(row.kind, RowKind::User { .. }))
         );
-    }
-
-    #[test]
-    fn full_message_dialog_respects_the_reference_viewport_cap() {
-        let viewport = gpui::size(px(1200.0), px(800.0));
-        let (max_width, max_height) = full_message_dialog_limits(viewport);
-        assert_eq!(max_width, px(672.0));
-        assert_eq!(max_height, px(640.0));
-    }
-
-    #[test]
-    fn user_message_card_matches_the_composer_background() {
-        let theme = Theme::dark();
-        assert_eq!(
-            user_message_card_background(&theme),
-            theme.composer_glass_bg()
-        );
-    }
-
-    #[test]
-    fn sticky_turn_occludes_scrolling_text_only_inside_the_user_card_shape() {
-        for theme in [Theme::dark(), Theme::light()] {
-            let surface = sticky_turn_surface(&theme);
-            assert_eq!(surface.outer_background, None);
-            if theme.is_frost() {
-                assert_eq!(surface.occlusion_background, None);
-            } else {
-                assert_eq!(surface.occlusion_background, Some(theme.bg));
-            }
-            assert_eq!(surface.occlusion_radius, USER_MESSAGE_CARD_RADIUS);
-            assert_eq!(surface.occlusion_blur_radius, 16.0);
-        }
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the
