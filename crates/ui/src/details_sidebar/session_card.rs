@@ -133,6 +133,7 @@ impl DetailsSidebar {
         if let Some(device) = &context.target_device_id {
             params["targetDeviceId"] = device.clone().into();
         }
+        let project_root = context.cwd.to_string_lossy().into_owned();
         self.context_sources_pending = Some(key.clone());
         self.context_sources_task = Some(cx.spawn(async move |this, cx| {
             let skills = engine
@@ -151,10 +152,7 @@ impl DetailsSidebar {
                 this.context_sources_pending = None;
                 this.context_sources = Some(ContextSources {
                     key,
-                    skills: skills
-                        .into_iter()
-                        .map(|skill| SharedString::from(skill.name))
-                        .collect(),
+                    skills: project_skills(skills, &project_root),
                 });
                 cx.notify();
             });
@@ -452,6 +450,7 @@ impl DetailsSidebar {
                             .text_size(px(12.5))
                             .text_color(theme.text_muted)
                             .child(match count {
+                                0 => "No project skills".to_owned(),
                                 1 => "1 skill".to_owned(),
                                 n => format!("{n} skills"),
                             }),
@@ -481,6 +480,24 @@ impl DetailsSidebar {
         }
         card.into_any_element()
     }
+}
+
+/// Only skills that live in the project: `ListSkills` also returns the
+/// user-global ones (`~/.claude/skills`, `~/.codex/skills`, …), which are not
+/// this project's context. A relative path is already project-relative.
+pub(super) fn project_skills(
+    skills: Vec<zeron_proto::invocation::Skill>,
+    project_root: &str,
+) -> Vec<SharedString> {
+    let root = std::path::Path::new(project_root);
+    skills
+        .into_iter()
+        .filter(|skill| {
+            let path = std::path::Path::new(&skill.path);
+            !skill.path.is_empty() && (path.is_relative() || path.starts_with(root))
+        })
+        .map(|skill| SharedString::from(skill.name))
+        .collect()
 }
 
 /// `12m56s`, `1h02m`, `4.2s`.
@@ -517,7 +534,28 @@ pub(super) fn format_cost(usd: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_cost, format_duration_ms, format_token_count};
+    use super::{format_cost, format_duration_ms, format_token_count, project_skills};
+
+    #[test]
+    fn context_sources_count_only_project_skills() {
+        let skill = |name: &str, path: &str| zeron_proto::invocation::Skill {
+            name: name.into(),
+            path: path.into(),
+            description: String::new(),
+            enabled: true,
+            command: None,
+        };
+        let names = project_skills(
+            vec![
+                skill("local", "/work/app/.claude/skills/local/SKILL.md"),
+                skill("global", "/Users/me/.claude/skills/global/SKILL.md"),
+                skill("sibling", "/work/app-other/.claude/skills/x/SKILL.md"),
+                skill("relative", ".agents/skills/rel/SKILL.md"),
+            ],
+            "/work/app",
+        );
+        assert_eq!(names, ["local", "relative"]);
+    }
 
     #[test]
     fn turn_stat_values_read_like_the_reference_card() {
