@@ -15,11 +15,12 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 
 
 GIB = 1024**3
 POLL_SECONDS = 2
+# Stable paths allow sccache reuse; the lock serializes runs and cleanup removes the target.
+TARGET_NAME = "target-verify"
 # Leads the child's process group and kills it once the wrapper's pipe closes,
 # including when the wrapper itself is SIGKILLed.
 WATCHDOG = "import os, signal, sys; sys.stdin.buffer.read(); os.killpg(0, signal.SIGKILL)"
@@ -79,11 +80,16 @@ def run(command: list[str], minimum_free_gib: int, floor_free_gib: int) -> int:
             )
             return 75
 
-        with tempfile.TemporaryDirectory(prefix="target-", dir=root) as target:
+        target = root / TARGET_NAME
+        target.mkdir(mode=0o700)
+        try:
             env = os.environ.copy()
-            env["CARGO_TARGET_DIR"] = target
+            env["CARGO_TARGET_DIR"] = str(target)
             env.setdefault("CARGO_BUILD_JOBS", "4")
-            env.setdefault("CARGO_INCREMENTAL", "0")
+            # Leave CARGO_INCREMENTAL unset so the profile controls incremental
+            # builds without forcing sccache to bypass dependency caching.
+            if sys.platform == "darwin" and not os.environ.get("COMET_CARGO_VERIFY_FOREGROUND"):
+                command = ["taskpolicy", "-b", *command]
             print(f"Cargo verification target: {target}", file=sys.stderr, flush=True)
             received: list[int] = []
             pgid: int | None = None
@@ -146,7 +152,9 @@ def run(command: list[str], minimum_free_gib: int, floor_free_gib: int) -> int:
                     watchdog.wait()
                 for signum, previous in previous_handlers.items():
                     signal.signal(signum, previous)
-                print(f"Removing Cargo verification target: {target}", file=sys.stderr, flush=True)
+        finally:
+            print(f"Removing Cargo verification target: {target}", file=sys.stderr, flush=True)
+            shutil.rmtree(target, ignore_errors=True)
 
 
 def main() -> int:

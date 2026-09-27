@@ -5,16 +5,11 @@ name: rust
 # --workspace` on every push/PR to main so the suite stops depending on
 # whoever remembers to run it locally.
 #
-# Runner: ubuntu-24.04, with the apt recipe copied from release.yml's linux
-# job. This is an UNVERIFIED bet, not a proven setup: release.yml has never run
-# (no `v*` tag was ever pushed and `gh run list -R guilhermexp/comet` shows
-# only deploy runs), so no Linux build of this tree exists yet. What we do
-# know is static: every macOS-only dependency is behind
-# `[target.'cfg(target_os = "macos")'.dependencies]` (crates/ui, crates/sync),
-# `native_document` is a cfg-gated module, and the cfg branches in crates/ui
-# all carry Linux arms. The first run of this job is what turns that into
-# evidence — if the workspace does not build on Linux, move this job to
-# macos-latest (~10x the minutes) instead of patching around it.
+# Runner: ubuntu-24.04. A execução 36260843927 comprovou fmt, workspace
+# e unpeel-core na revisão d14c8d0a89d861fe907c5dc1b58b508f4e2e6b5f.
+# https://github.com/guilhermexp/comet/actions/runs/36260843927
+# Isso não aprova outras revisões nem caminhos macOS: confira o run da
+# entrega e os jobs/plataformas obrigatórios antes de reutilizar a prova.
 
 on:
   push:
@@ -32,8 +27,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    # Cold build is huge: 929 packages in Cargo.lock, gpui pinned to a zed fork
-    # by git rev, and `[profile.dev.package."*"] opt-level = 2` optimizes every
+    # Cold build is huge: 929 packages in Cargo.lock, vendored gpui, and `[profile.dev.package."*"] opt-level = 2` optimizes every
     # dependency (a local target/debug is 34 GB). 45 min was not enough to ever
     # reach a populated cache; give the first run room and let the cache make
     # the later ones fast.

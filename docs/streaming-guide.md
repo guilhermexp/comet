@@ -98,7 +98,7 @@ Fonte: [`RowKind`](../crates/ui/src/transcript.rs):734, projeção em 1403 e des
 
 | ID | Row | Conteúdo e apresentação atual | Expansão / destino |
 |---|---|---|---|
-| S01 | `User` | Prompt; menções; chips de URLs reconhecidas; anexos e badges. Eco fica com opacidade menor. Card até 100px. | Prompt excedente abre diálogo. Imagens abrem preview; documento é chip. Clone sticky é só paint, não outra mensagem. |
+| S01 | `User` | Prompt; menções; chips de URLs reconhecidas; anexos e badges. Eco fica com opacidade menor. Bolha à direita, no máximo 80% da coluna (atualizado em 27/09). | Texto longo mostra cinco linhas + `...`, com Show more / Show less inline. Imagens abrem preview; documento é chip. A mensagem sai da tela na rolagem, sem clone sticky. |
 | S02 | `Markdown` | Um bloco de texto assentado. Mesma fonte base das rows compactas; títulos/listas/tabelas têm decoração própria. | Link/arquivo/copy; Mermaid assentado pode virar figura e lightbox. |
 | S03 | `LiveMarkdown` | Um bloco em streaming, mesmos IDs de S02; append recebe fade de paint. | Fences incompletos passam pelo parse/mend; Mermaid permanece código enquanto streaming. |
 | S04 | `Reasoning` | Header fixo `Thinking`/`Thought`; spinner de pontos do indicador de trabalho só enquanto ativo. | Corpo Markdown aberto por padrão, com linha vertical e recuo; escolha manual respeitada, seta sempre visível. |
@@ -185,7 +185,7 @@ Os **3 formatos `ToolDetail`** são `Output`, `Diff`, `Stats`. `tool_detail`:554
 | Header compacto | 28px; ícone 18px; gap 8px; fonte sans regular 14px/22px; detalhe indentado 26px por nível. `stream_event_row`:2201 |
 | Chevron compacto | Reserva espaço, invisível em repouso, aparece no hover do header; acompanha texto. Tool pending troca trail por spinner. S07 é exceção (F03). |
 | Lista e scroll | `diff_rows` substitui intervalo por `(id, version)`; parser/cache e alturas precisam invalidar juntos. Scroll de transcript, payload, arquivo e fence Markdown têm mecanismos próprios. |
-| Sticky do usuário | Clone paint-only, com guarda contra pintar sobre o original e handoff para próximo turno. Não deve ser “deduplicado” removendo a mensagem real. |
+| Mensagem do usuário (27/09) | Apenas a row original, sem sticky. O runway conserva a chegada do envio local ao topo; scroll manual libera o hold. |
 
 ## Saídas fora das rows
 
@@ -213,7 +213,7 @@ Os **3 formatos `ToolDetail`** são `Output`, `Diff`, `Stats`. `tool_detail`:554
 | D07 | Conteúdo de subagente não entra como conteúdo do pai | `sessions.rs` roteia sink filho; `parts.rs`:771 só projeta lifecycle no spawn |
 | D08 | Dedupe de imagem dentro de uma extração/grupo | `inline_media.rs::extract_image_paths`; `transcript.rs::tool_image_paths`:1310. Não cobre o turno inteiro. |
 | D09 | TurnSteps move o prefixo para filhos, sem manter cópia simultânea no nível principal | `rows_for_entry_with_todo_history`:1887–1933; testes de identidade e transição |
-| D10 | Model switch consecutivo e clone sticky têm guards próprios | `is_superseded_notice`:1386; testes `sticky_turn_header_never_duplicates_the_original...` |
+| D10 | Model switch consecutivo tem guard próprio; clone sticky removido em 27/09 | `is_superseded_notice`; mensagens de usuário existem apenas na lista |
 
 **Repetição de apresentação intencional:** header da tool + invocação; resumo de grupo + filhos; preview de reasoning + reasoning completo quando aberto; spawn + widget; histórico de perguntas + pergunta no composer. A mesma frase no header e corpo aberto não prova dois eventos. Reduzir essa repetição é uma decisão de apresentação por superfície.
 
@@ -324,9 +324,9 @@ Write/Edit progressivos: adapters Claude/OMP atualizam a cauda bounded por tempo
 
 Resultados OMP (11/09): o normalizer lê os snapshots de edição de `result.details`, também aceitando um único `perFileResults` e o formato legado no topo. Isso recupera nome do arquivo, stats e preview no card `Edited` quando os argumentos eram texto e não tinham `path` próprio. Snapshots ausentes e lotes multi-file não viram um diff de arquivo fabricado; histórico já persistido sem esses dados não é reescrito.
 
-Render de file cards: snapshot completo só entra na expansão; recolhido usa a cauda durável de até 15 linhas. Medição pós-prepaint adia a atualização da lista até o layout liberar seus borrows e notifica apenas ao mudar a altura, sem ciclo permanente de frames, e preserva a geometria sticky do turno atual.
+Render de file cards: snapshot completo só entra na expansão; recolhido usa a cauda durável de até 15 linhas. Medição pós-prepaint adia a atualização da lista até o layout liberar seus borrows e notifica apenas ao mudar a altura, sem ciclo permanente de frames.
 
-Sticky durante streaming: o scroll usado na projeção é publicado somente após o layout completo da lista. O top de uma mensagem e seu offset são registrados no mesmo ciclo, após liberar o borrow do virtualizador. Ler o sentinela de fim ou alturas ainda não medidas em `Render` fazia o cabeçalho trocar de turno por um frame a cada chunk. Disclosures de tools com altura natural fecham diretamente; não aguardam um tween que não está montado.
+Atualização de 27/09: a projeção sticky e sua geometria por mensagem foram removidas para seguir o upstream. A medição do viewport continua independente para o orçamento das tabelas. Disclosures de tools com altura natural fecham diretamente; não aguardam um tween que não está montado.
 
 Headers Workers (11/09): alvo efetivo `project_id` de Chat local resolve pelo catálogo local e aparece como ação + chip `@nome`, com a aparência de menção do composer. `session_id`, ID não cadastrado e Chat remoto/sem host conhecido mantêm a apresentação técnica. O JSON expandido conserva os IDs; refresh do catálogo atualiza o nome sem reescrever o transcript.
 

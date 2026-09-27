@@ -34,6 +34,10 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes executáveis da extensão lifecycle pi-family do Unpeel vendorizado.
 
+Para baterias pesadas, prefira o CI existente e confira revisão, plataforma, jobs e etapas realmente executados conforme a skill `implement` do harness. Considere também a compilação: mesmo um filtro de `cargo test -p zeron-ui` pode criar gigabytes de dependências. Checks locais baratos e validação nativa específica continuam úteis; quando Cargo local for necessário, use a proteção abaixo. No `no-mistakes`, `test` é validação focada da mudança/uso real; a regressão ampla fica no CI. Não repetir a bateria local apenas para espelhar CI nem dispensar etapas genericamente.
+
+Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml` contém jobs Linux, macOS e iOS; `preview-tests.yml` testa networking em Linux/macOS e coordinator em Linux. Isso descreve a receita, não garante sucesso: confira os logs da revisão avaliada. Linux não cobre o teste AppKit `native_preview_focus`, que requer sessão gráfica macOS, nem substitui outros caminhos macOS/iOS exigidos pela entrega.
+
 ## Remotes e publicação
 
 - `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/zeron` (terceiro, MIT; renomeado de `zeronsh/comet`). O upstream reassinou o histórico em set/2026: o último sync de ancestralidade é o merge de `d721f301` (v0.2.83) em `sync/upstream-v0.2.83`.
@@ -44,7 +48,7 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 
 ## Gotchas duráveis
 
-- **Verificações Cargo locais no macOS/Linux usam `scripts/cargo-verify.py -- <comando>`.** O wrapper impede verificações simultâneas entre checkouts, usa um `CARGO_TARGET_DIR` temporário isolado, limita os jobs a 4 por padrão, recusa começar com menos de 60 GiB livres, interrompe se cair abaixo de 20 GiB e remove o target ao terminar ou receber SIGINT/SIGTERM/SIGHUP. Se o wrapper levar SIGKILL, um watchdog derruba o grupo do Cargo e a próxima execução remove o target órfão. Agrupar testes da mesma rodada em uma invocação (`scripts/cargo-verify.py -- bash -c 'cargo test -p zeron-engine && cargo test -p zeron-ui'`) para reutilizar a compilação dentro dela. Vale também para testes locais durante o no-mistakes; CI remoto e Windows seguem os comandos Cargo da tabela. `cargo run` do app de desenvolvimento continua usando o target incremental normal. Não compartilhar um target persistente entre checkouts com fontes diferentes: isso pode reutilizar artefatos stale.
+- **Verificações Cargo locais no macOS/Linux usam `scripts/cargo-verify.py -- <comando>`.** O wrapper impede verificações simultâneas entre checkouts, usa um `CARGO_TARGET_DIR` isolado de caminho fixo (para o sccache reaproveitar as dependências), compila incremental, roda com QoS de background no macOS (só E-cores; `COMET_CARGO_VERIFY_FOREGROUND=1` desliga), limita os jobs a 4 por padrão, recusa começar com menos de 60 GiB livres, interrompe se cair abaixo de 20 GiB e remove o target ao terminar ou receber SIGINT/SIGTERM/SIGHUP. Se o wrapper levar SIGKILL, um watchdog derruba o grupo do Cargo e a próxima execução remove o target órfão. Agrupar testes da mesma rodada em uma invocação (`scripts/cargo-verify.py -- bash -c 'cargo test -p zeron-engine && cargo test -p zeron-ui'`) para reutilizar a compilação dentro dela. Vale também para testes locais durante o no-mistakes; CI remoto e Windows seguem os comandos Cargo da tabela. `cargo run` do app de desenvolvimento continua usando o target incremental normal. Não compartilhar um target persistente entre checkouts com fontes diferentes: isso pode reutilizar artefatos stale.
 - **No macOS, rode um único gate `no-mistakes` com testes Rust por vez.** Cada run tem um checkout/target próprio, e dois runs simultâneos podem somar dezenas de gigabytes mesmo quando cada um limpa no fim. Antes de abrir outro gate, aguarde o primeiro terminar e confira o espaço livre. Não rode testes Cargo manuais em paralelo com o gate.
 
 - **`cargo run` usa o checkout atual do Comet e o OMP instalado.** Não impor OMP de fonte em `.cargo/config.toml`: desenvolvimento com o checkout irmão é opt-in via `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` (contrato em `scripts/AGENTS.md`). Outro worktree tem código e binário próprios; executar ali não inclui mudanças locais deste checkout.
@@ -121,3 +125,45 @@ Suítes canônicas por superfície (detalhe e matriz `Test:` ficam no `AGENTS.md
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |
 | Código externo | [`third_party/AGENTS.md`](third_party/AGENTS.md) | Unpeel e zui vendorizados, patches Rust licenciados, proveniência e referências locais |
+
+<!-- graft:start -->
+## Graft — repo context graph
+
+This repo is indexed in `graft/`: small linked markdown nodes that explain each
+system and carry exact file:line spans, kept in sync with the code through git.
+
+For ANY task here — understanding how something works, finding where code lives,
+or scoping a change — get context from the graph before grepping or opening
+source files. Re-ask freely (it's cheap) and reuse literal identifiers you
+already have (symbol, error string, file name) as the query. New to this repo?
+Run `graft map` first — a token-budgeted orientation (dir clusters, hubs,
+hotspots), no LLM, no key.
+
+- Run `graft ask "<your question>" --source` → ranked nodes with the relevant
+  code spans inlined (each hit's ≤8-line crux by default; `--full` for whole
+  definitions when the crux isn't enough). Match the tool to the task shape:
+  for understanding or editing, the top node IS the answer — cite its
+  `covers:` file:line spans and edit straight from `--source`. For
+  exhaustive tasks ("every occurrence / every caller of this pattern"), ranked
+  results are top-N, not complete — run `graft grep "<literal>"` instead
+  (exhaustive over indexed files, grouped by enclosing symbol), falling back
+  to raw `grep -rn` only for unindexed files.
+- `graft skeleton <file>` → every definition's signature + span, ~10× cheaper
+  than reading the file; use it to skim an API surface.
+- `graft callers <symbol>` gives precomputed, exact edges — who calls this.
+  Add `--direction out` for what it calls, or `--depth N` to walk
+  transitively for the full blast radius. For structural questions, skip
+  ranking and use this directly.
+- Or browse: `graft/INDEX.md` lists every node; follow the links.
+- Monorepos and folders of multiple repos rank fairly across sub-projects —
+  hits carry `[scope/]` labels naming which one they're from. Narrow with
+  `graft ask "<task>" --in <scope>/` once you know where you're working.
+
+If a returned span is truncated ("+N more lines"), open the file at that exact
+range before finalizing. Only open source files when a node genuinely lacks a
+needed detail, and then at the exact file:line the node points to — never
+re-read whole files.
+
+After big code changes, refresh the graph with `graft build` (deterministic,
+no API key, $0).
+<!-- graft:end -->
