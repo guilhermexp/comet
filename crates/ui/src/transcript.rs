@@ -2706,15 +2706,17 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
 /// Deliberately blind to `resolved`: a command that finished three calls ago is
 /// exactly the output the user scrolls back to mid-turn. Settling the entry
 /// clears `active_group` and closes all of them at once.
-fn tool_detail_default_open(call: &ToolCall, active_group: bool) -> bool {
+/// `collapse_commands` (Settings › General › Collapse command blocks) keeps
+/// command cards closed even while their turn streams.
+fn tool_detail_default_open(call: &ToolCall, active_group: bool, collapse_commands: bool) -> bool {
     active_group
-        && matches!(
-            call,
-            ToolCall::Exec { .. }
-                | ToolCall::WriteFile { .. }
-                | ToolCall::EditFile { .. }
-                | ToolCall::ApplyPatch { .. }
-        )
+        && match call {
+            ToolCall::Exec { .. } => !collapse_commands,
+            ToolCall::WriteFile { .. }
+            | ToolCall::EditFile { .. }
+            | ToolCall::ApplyPatch { .. } => true,
+            _ => false,
+        }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4368,6 +4370,8 @@ pub struct Transcript {
     /// Compact transcript mode (Settings → Appearance): every turn's work
     /// folds into one `TurnSteps` row, live turns included.
     compact_mode: bool,
+    /// Last seen `settings::collapse_command_blocks`; a flip re-renders rows.
+    collapse_commands: bool,
     /// Full text opened from a clipped user-message card.
     user_message_preview: Option<UserMessagePreview>,
     /// Focused while the full-message overlay is open so Escape reaches it.
@@ -4722,6 +4726,7 @@ impl Transcript {
             user_folds: HashMap::new(),
             tool_reveals: HashMap::new(),
             compact_mode: crate::settings::transcript_compact_mode(cx),
+            collapse_commands: crate::settings::collapse_command_blocks(cx),
             user_message_preview: None,
             user_message_preview_focus: cx.focus_handle(),
             mermaid_preview: None,
@@ -10131,9 +10136,10 @@ impl Transcript {
                     .unwrap_or_default()
             })
             .collect();
+        let collapse_commands = crate::settings::collapse_command_blocks(cx);
         let detail_defaults: Vec<bool> = tools
             .iter()
-            .map(|tool| tool_detail_default_open(&tool.call, detail_auto_open))
+            .map(|tool| tool_detail_default_open(&tool.call, detail_auto_open, collapse_commands))
             .collect();
         let detail_opens: Vec<bool> = details
             .iter()
@@ -12027,6 +12033,13 @@ impl Render for Transcript {
             // The row split differs by mode; rebuild every row.
             self.last_source = None;
             self.sync(cx);
+        }
+        let collapse_commands = crate::settings::collapse_command_blocks(cx);
+        if self.collapse_commands != collapse_commands {
+            self.collapse_commands = collapse_commands;
+            // Cached tool rows baked the old default; re-render and re-measure.
+            self.render_cache.borrow_mut().clear();
+            self.list.remeasure();
         }
         let content_width = crate::settings::transcript_width(cx);
         if self.content_width != content_width {
@@ -16263,14 +16276,17 @@ mod tests {
         let patch = ToolCall::ApplyPatch { path: None };
 
         // Live turn: every command payload, no matter where it sits.
-        assert!(tool_detail_default_open(&exec, true));
-        assert!(tool_detail_default_open(&edit, true));
-        assert!(tool_detail_default_open(&patch, true));
+        assert!(tool_detail_default_open(&exec, true, false));
+        assert!(tool_detail_default_open(&edit, true, false));
+        assert!(tool_detail_default_open(&patch, true, false));
         // A read's payload repeats its header; it stays closed even live.
-        assert!(!tool_detail_default_open(&read, true));
+        assert!(!tool_detail_default_open(&read, true, false));
         // Settled turn: nothing opens on its own.
-        assert!(!tool_detail_default_open(&exec, false));
-        assert!(!tool_detail_default_open(&edit, false));
+        assert!(!tool_detail_default_open(&exec, false, false));
+        assert!(!tool_detail_default_open(&edit, false, false));
+        // Collapse command blocks keeps commands closed, not edits.
+        assert!(!tool_detail_default_open(&exec, true, true));
+        assert!(tool_detail_default_open(&edit, true, true));
     }
 
     #[test]

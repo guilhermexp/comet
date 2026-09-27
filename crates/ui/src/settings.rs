@@ -455,6 +455,21 @@ pub fn set_transcript_compact_mode(enabled: bool, cx: &mut App) {
     }
 }
 
+/// Command cards start collapsed (see `UiSettings::collapse_command_blocks`).
+pub fn collapse_command_blocks(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.collapse_command_blocks)
+        .unwrap_or_default()
+}
+
+pub fn set_collapse_command_blocks(enabled: bool, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.collapse_command_blocks = enabled;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
 /// Mutate the central settings value and schedule its single writer.
 pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSettings)) -> bool {
     if !cx.has_global::<SettingsStore>() {
@@ -867,6 +882,9 @@ pub struct UiSettings {
     /// the narration between them) fold into one collapsed accordion, so only
     /// the reply text stays visible.
     pub transcript_compact_mode: bool,
+    /// Command cards ("Ran command") start collapsed, header only, even while
+    /// their turn streams; a click opens the command and its output.
+    pub collapse_command_blocks: bool,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -957,6 +975,7 @@ impl Default for UiSettings {
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
             open_web_links_in_zeron: true,
             transcript_compact_mode: false,
+            collapse_command_blocks: false,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -2425,6 +2444,7 @@ mod tests {
             transcript_width: 960.0,
             open_web_links_in_zeron: false,
             transcript_compact_mode: true,
+            collapse_command_blocks: true,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
