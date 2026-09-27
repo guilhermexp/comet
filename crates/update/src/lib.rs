@@ -231,7 +231,27 @@ fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Some(url) = windows::release_url()? {
         return Ok(url.trim_end_matches('/').to_owned());
     }
-    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
+    edge_release_base(edge_url)
+}
+
+/// `{edge}/releases`, except on the upstream Zeron edge: its feed publishes
+/// Zeron builds (a newer version line), so a Comet install would "update"
+/// into another product. Comet has no hosted feed; set `ZERON_RELEASES_URL`.
+fn edge_release_base(edge_url: &str) -> anyhow::Result<String> {
+    let edge_url = edge_url.trim_end_matches('/');
+    let host = reqwest::Url::parse(edge_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    anyhow::ensure!(
+        !host.is_some_and(|host| host == "zeron.sh" || host.ends_with(".zeron.sh")),
+        "no Comet release feed configured (set ZERON_RELEASES_URL)"
+    );
+    Ok(format!("{edge_url}/releases"))
+}
+
+/// Whether a release feed exists for this edge (see [`edge_release_base`]).
+pub fn has_release_feed(edge_url: &str) -> bool {
+    release_base(edge_url).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1223,22 @@ mod tests {
         .unwrap_err();
         assert!(error.is_timeout());
         server.abort();
+    }
+
+    #[test]
+    fn upstream_zeron_edge_is_not_a_comet_release_feed() {
+        for edge in [
+            "https://edge.zeron.sh",
+            "https://zeron.sh/",
+            "https://EDGE.Zeron.sh",
+        ] {
+            assert!(edge_release_base(edge).is_err(), "accepted {edge}");
+        }
+        assert_eq!(
+            edge_release_base("https://edge.example.com/").unwrap(),
+            "https://edge.example.com/releases"
+        );
+        assert!(edge_release_base("https://notzeron.sh").is_ok());
     }
 
     #[test]

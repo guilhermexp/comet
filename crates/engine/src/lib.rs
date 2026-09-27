@@ -849,7 +849,8 @@ impl Engine {
         core.previews.start(projects, preview_signaling).await;
         // Portable Windows packages explicitly configure an update feed; users
         // should not need to enable workspace sync to receive application updates.
-        let check_updates = edge_enabled;
+        // No feed (the upstream Zeron edge without ZERON_RELEASES_URL): no checker.
+        let check_updates = edge_enabled && zeron_update::has_release_feed(&config.edge_url);
         #[cfg(windows)]
         let check_updates = check_updates
             || matches!(

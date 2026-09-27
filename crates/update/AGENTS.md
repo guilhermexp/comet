@@ -44,6 +44,11 @@ presentation of `UpdateStatus`.
 - Artifact names and the manifest schema are a contract with the release
   workflow and `edge/src/install.sh` — a mismatch silently breaks updates;
   `artifact_names_match_packaging` pins the current pairs.
+- **No feed on the upstream Zeron edge.** `{edge.zeron.sh}/releases` publishes
+  Zeron builds on another version line; treating it as ours would "update" a
+  Comet install into Zeron. `release_base` refuses `zeron.sh`/`*.zeron.sh`
+  unless `ZERON_RELEASES_URL` names a feed, and the engine only spawns the
+  checker when `has_release_feed` holds. Self-hosted edges keep `{edge}/releases`.
 - Downloaded bytes are verified against the manifest sha256 before staging;
   only pre-manifest `latest.txt` releases may skip verification (and must log).
 - `apply_headless` flips the `current` symlink atomically; never patch a
