@@ -605,7 +605,8 @@ impl SessionsEngine {
         &self,
         cwd: &str,
     ) -> Result<LiveVoiceAvailability, EngineError> {
-        let cwd = expand_home(cwd.trim());
+        let cwd = crate::repos::expand_home(cwd.trim())
+            .map_err(|error| EngineError::Other(error.into()))?;
         if cwd.is_empty() {
             return Err(EngineError::Other(
                 "Live Voice requires a working directory".into(),
@@ -3105,18 +3106,6 @@ fn finish_segment<'a>(
 
 fn segment_duration_ms(started_at: i64, finished_at: i64) -> u64 {
     finished_at.saturating_sub(started_at).max(0) as u64
-}
-
-/// `~` / `~/…` → this host's home directory. Anything else passes through.
-pub(crate) fn expand_home(cwd: &str) -> String {
-    match cwd.strip_prefix("~") {
-        Some("") => crate::repos::home_dir().to_string_lossy().into_owned(),
-        Some(rest) if rest.starts_with('/') => crate::repos::home_dir()
-            .join(&rest[1..])
-            .to_string_lossy()
-            .into_owned(),
-        _ => cwd.to_string(),
-    }
 }
 
 /// Resume bookkeeping for one run task: which user entry the run answers (so
