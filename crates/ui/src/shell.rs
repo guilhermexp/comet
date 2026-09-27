@@ -91,6 +91,11 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, ProjectPickerTarget, RenameSpaceDialog};
 
+/// A chat-level sync caption shows only once it has held this long: every
+/// streamed commit is briefly "pending" until the relay ACKs it, which made
+/// "Syncing…" flash every few seconds during normal agent work.
+const CHAT_SYNC_PILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// `connected` already includes the engine's degradation grace. A brief
 /// focus-triggered dial needs no sidebar status; queued changes or a sustained
 /// outage still deserve one.
@@ -2468,6 +2473,10 @@ pub struct Shell {
     /// value to the toast overlay once and remembers it in
     /// `sidebar_notice_toasted`, so the field keeps upstream's read semantics.
     sidebar_notice: Option<SharedString>,
+    /// When the selected chat's sync caption first appeared (see
+    /// [`CHAT_SYNC_PILL_GRACE`]) and the wake that re-renders at the grace.
+    chat_sync_pill_since: std::cell::Cell<Option<std::time::Instant>>,
+    chat_sync_pill_wake: std::cell::RefCell<Option<Task<()>>>,
     sidebar_notice_toasted: Option<SharedString>,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
@@ -3165,6 +3174,8 @@ impl Shell {
             sidebar_pin_write_generation: 0,
             sidebar_pin_write_notice: None,
             sidebar_notice: None,
+            chat_sync_pill_since: std::cell::Cell::new(None),
+            chat_sync_pill_wake: std::cell::RefCell::new(None),
             sidebar_notice_toasted: None,
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
@@ -9714,7 +9725,29 @@ impl Shell {
             ),
             S::Disabled => return None,
             S::Connected => {
-                let caption = chat_sync_pill_caption(chat?)?;
+                let Some(caption) = chat.and_then(chat_sync_pill_caption) else {
+                    self.chat_sync_pill_since.set(None);
+                    self.chat_sync_pill_wake.borrow_mut().take();
+                    return None;
+                };
+                let now = std::time::Instant::now();
+                let since = self.chat_sync_pill_since.get().unwrap_or(now);
+                self.chat_sync_pill_since.set(Some(since));
+                let held = now.saturating_duration_since(since);
+                if held < CHAT_SYNC_PILL_GRACE {
+                    let mut wake = self.chat_sync_pill_wake.borrow_mut();
+                    if wake.is_none() {
+                        let delay = CHAT_SYNC_PILL_GRACE - held;
+                        *wake = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(delay).await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.chat_sync_pill_wake.borrow_mut().take();
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    return None;
+                }
                 (
                     caption.into(),
                     loaders::mini_mono_spinner(
