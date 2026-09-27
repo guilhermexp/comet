@@ -1236,7 +1236,10 @@ pub struct WorkersResourceSettings {
     pub per_worker_critical_gib: u16,
     #[serde(default = "default_true")]
     pub notifications_enabled: bool,
-    #[serde(default)]
+    /// On by default: a finished Worker left idle kept its CLI (100+ MB) and
+    /// host alive for hours. Hibernation archives it; the conversation stays
+    /// resumable. An explicit saved `false` still wins.
+    #[serde(default = "default_true")]
     pub hibernation_enabled: bool,
     #[serde(default = "default_hibernate_idle_minutes")]
     pub hibernate_after_idle_minutes: u16,
@@ -1253,7 +1256,7 @@ const fn default_resource_critical_gib() -> u16 {
 }
 
 const fn default_hibernate_idle_minutes() -> u16 {
-    15
+    30
 }
 
 const fn default_max_live_idle_workers() -> u16 {
@@ -1267,7 +1270,7 @@ impl Default for WorkersResourceSettings {
             per_worker_warning_gib: default_resource_warning_gib(),
             per_worker_critical_gib: default_resource_critical_gib(),
             notifications_enabled: true,
-            hibernation_enabled: false,
+            hibernation_enabled: true,
             hibernate_after_idle_minutes: default_hibernate_idle_minutes(),
             max_live_idle_workers: default_max_live_idle_workers(),
         }
@@ -5650,14 +5653,20 @@ mod hibernation_tests {
     }
 
     #[test]
-    fn hibernation_is_off_by_default_and_never_runs_while_disabled() {
+    fn hibernation_is_on_by_default_and_never_runs_while_disabled() {
         let sessions = vec![worker("idle-for-a-day", 24 * 60)];
+        assert!(WorkersResourceSettings::default().hibernation_enabled);
         let off = WorkersResourceSettings {
+            hibernation_enabled: false,
             max_live_idle_workers: 1,
             ..WorkersResourceSettings::default()
         };
-        assert!(!off.hibernation_enabled);
         assert!(hibernation_candidates(&sessions, &off, None, NOW).is_empty());
+        // A saved settings blob without the key reads as enabled.
+        let legacy: WorkersResourceSettings =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(legacy.hibernation_enabled);
+        assert_eq!(legacy.hibernate_after_idle_minutes, 30);
     }
 
     #[test]

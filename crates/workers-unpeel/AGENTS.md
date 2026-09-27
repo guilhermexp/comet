@@ -76,6 +76,7 @@ zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
   Proveniência e tree id do snapshot vivem em
   `third_party/unpeel-upstream.toml`; alteração no vendorizado atualiza essa
   metadata no mesmo commit.
+- **Idle Workers hibernate by default** (`WorkersResourceSettings.hibernation_enabled`, 30 min): a finished Worker (hook-confirmed idle, resumable, not pinned or selected) is archived by the app's hibernation pass, which also runs on launch, so sessions that went idle while the app was closed are archived at the next open. Separately, a host whose screen has not changed for 60 s slows its menu/runtime scans to 2 s (`session_host::scan_interval_ms`); before this, a finished Worker left at its prompt cost ~2% CPU per host for hours.
 - **Session hosts are re-executed zeron binaries.** A Workers session runs as a
   `__session_host__` process (`unpeel_core::session_host::SESSION_HOST_ARG`)
   spawned from the current executable; `run_session_host_mode_if_requested()`

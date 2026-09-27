@@ -69,6 +69,21 @@ const SESSION_MENU_SCAN_INTERVAL_MS: u64 = 500;
 /// Foreground jobs change on user commands, so live runtime identity needs a
 /// tighter cadence than the heartbeat while remaining cheap per hosted PTY.
 const SESSION_RUNTIME_SCAN_INTERVAL_MS: u64 = 300;
+/// A session whose screen has not changed for this long is idle: the menu and
+/// runtime scans drop to [`SESSION_IDLE_SCAN_INTERVAL_MS`] until the next
+/// change. A finished Worker left at its prompt otherwise polled at full
+/// cadence for hours (~2% CPU per host). (Comet fork change.)
+const SESSION_IDLE_SCAN_AFTER_MS: u64 = 60_000;
+const SESSION_IDLE_SCAN_INTERVAL_MS: u64 = 2_000;
+
+/// Scan cadence for a host whose screen last changed at `last_change_ms`.
+fn scan_interval_ms(base_ms: u64, last_change_ms: u64, now_ms: u64) -> u64 {
+    if now_ms.saturating_sub(last_change_ms) >= SESSION_IDLE_SCAN_AFTER_MS {
+        base_ms.max(SESSION_IDLE_SCAN_INTERVAL_MS)
+    } else {
+        base_ms
+    }
+}
 /// Keep a recognized agent through short-lived foreground tool subprocesses
 /// and transient process-enumeration misses. Returning to the owned shell is
 /// definitive and clears immediately; other misses need this confirmation.
@@ -4906,6 +4921,9 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         // sidebar identity without changing the saved blank launch command or
         // acquiring resume/fork capabilities. Ownership is checked inside the
         // observer against this exact session leader PID + kernel start time.
+        // Last visible screen change, shared by the scan threads' idle backoff.
+        let last_screen_change_ms = Arc::new(AtomicU64::new(current_timestamp_ms()));
+        let screen_change_for_runtime = Arc::clone(&last_screen_change_ms);
         let runtime_observer_session_id = launch.session.id.clone();
         let runtime_observer_has_owned_shell = launch.session.command.trim().is_empty();
         let runtime_observer_shell = PathBuf::from(&shell);
@@ -5084,7 +5102,11 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(SESSION_RUNTIME_SCAN_INTERVAL_MS));
+                thread::sleep(Duration::from_millis(scan_interval_ms(
+                    SESSION_RUNTIME_SCAN_INTERVAL_MS,
+                    screen_change_for_runtime.load(Ordering::Relaxed),
+                    current_timestamp_ms(),
+                )));
             }
         });
 
@@ -5104,17 +5126,27 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         let menu_session_id = launch.session.id.clone();
         let running_for_menu = Arc::clone(&running);
         let viewport_for_menu = Arc::clone(&viewport);
+        let screen_change_for_menu = Arc::clone(&last_screen_change_ms);
         let menu_thread = thread::spawn(move || {
             let mut last_active = false;
             let mut url_tracker = crate::local_urls::LocalUrlTracker::default();
             let mut screen_tracker = ScreenChangeTracker::default();
             let mut ticks_since_probe: u32 = 0;
+            let mut previous_screen = String::new();
             while running_for_menu.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(SESSION_MENU_SCAN_INTERVAL_MS));
+                thread::sleep(Duration::from_millis(scan_interval_ms(
+                    SESSION_MENU_SCAN_INTERVAL_MS,
+                    screen_change_for_menu.load(Ordering::Relaxed),
+                    current_timestamp_ms(),
+                )));
                 if !running_for_menu.load(Ordering::Relaxed) {
                     break;
                 }
                 let screen = viewport_for_menu.lock().unwrap().current_screen_text();
+                if screen != previous_screen {
+                    screen_change_for_menu.store(current_timestamp_ms(), Ordering::Relaxed);
+                    previous_screen.clone_from(&screen);
+                }
                 if let Some(stamp) = screen_tracker.observe(&screen, current_timestamp_ms()) {
                     let _ = update_manifest_session(&menu_session_id, |manifest| {
                         manifest.screen_changed_at = Some(stamp);
@@ -5403,6 +5435,22 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn idle_hosts_back_off_their_scans_until_the_screen_changes() {
+        let changed = 1_000_000;
+        assert_eq!(super::scan_interval_ms(500, changed, changed + 59_999), 500);
+        assert_eq!(
+            super::scan_interval_ms(500, changed, changed + 60_000),
+            2_000
+        );
+        assert_eq!(
+            super::scan_interval_ms(300, changed, changed + 3_600_000),
+            2_000
+        );
+        // A clock that moved backwards is not idleness.
+        assert_eq!(super::scan_interval_ms(300, changed, changed - 5), 300);
+    }
 
     #[test]
     fn agent_control_wire_keeps_legacy_restart_and_adds_resume() {
