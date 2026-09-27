@@ -295,6 +295,9 @@ use zeron_proto::{
 };
 use zeron_rpc::methods;
 
+#[path = "session_card.rs"]
+mod session_card;
+
 use crate::{
     composer::{Composer, ComposerInput, ComposerInputEvent},
     details_sidebar::{
@@ -328,8 +331,8 @@ use crate::{
         },
         widgets::{
             CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState, TabActivity,
-            chat_workers_viewport_height_px, property_row, property_row_custom, widget_card,
-            worker_expansion_key, workers_tab_presence,
+            chat_workers_viewport_height_px, widget_card, worker_expansion_key,
+            workers_tab_presence,
         },
     },
     icons,
@@ -555,6 +558,14 @@ pub struct DetailsSidebar {
     commit_input: Entity<ComposerInput>,
     _commit_events: Subscription,
     discard_prompt: Option<source_control::DiscardPrompt>,
+    session_diff: Option<session_card::SessionDiffTotals>,
+    session_diff_watch: Option<Task<()>>,
+    session_diff_key: Option<String>,
+    context_sources: Option<session_card::ContextSources>,
+    context_sources_task: Option<Task<()>>,
+    context_sources_pending: Option<String>,
+    context_sources_expanded: bool,
+    turn_stats_collapsed: bool,
 }
 
 impl DetailsSidebar {
@@ -668,6 +679,14 @@ impl DetailsSidebar {
             commit_input,
             _commit_events: commit_events,
             discard_prompt: None,
+            session_diff: None,
+            session_diff_watch: None,
+            session_diff_key: None,
+            context_sources: None,
+            context_sources_task: None,
+            context_sources_pending: None,
+            context_sources_expanded: false,
+            turn_stats_collapsed: false,
             file_task: None,
             branch_task: None,
             usage_task: None,
@@ -3576,14 +3595,9 @@ impl DetailsSidebar {
             p.render_workspace_branch_control(repo_target, disabled, cx)
         });
 
-        let mut workspace_body = div()
-            .child(property_row_custom(
-                icons::GIT_BRANCH,
-                "Branch",
-                branch_control,
-                theme,
-            ))
-            .child(property_row(icons::FOLDER, "Path", folder, theme));
+        let _ = folder;
+        let mut workspace_body = div();
+        let mut workspace_extra = false;
 
         if context.mode == super::context::DetailsMode::Orchestrator {
             let home = dirs_home();
@@ -3695,6 +3709,7 @@ impl DetailsSidebar {
                     );
                 }
                 workspace_body = workspace_body.child(worked_section);
+                workspace_extra = true;
             }
             if let Some(entry) = self.sidebar.idle_recap_for(&context.key) {
                 let generated_at =
@@ -3735,16 +3750,19 @@ impl DetailsSidebar {
                             .child(clock_text),
                     );
                 workspace_body = workspace_body.child(recap_row);
+                workspace_extra = true;
             }
         }
         let mut content = div().w_full().flex().flex_col().gap(px(10.0)).p(px(10.0));
         if !hide_workspace {
-            content = content.child(widget_card(
-                "workspace-widget",
-                icons::DETAILS_BOX,
-                "Workspace",
-                workspace_body,
+            let extra = workspace_extra.then_some(workspace_body);
+            content = content.child(self.render_session_card(
+                &context,
+                branch_control,
+                has_git,
+                extra,
                 theme,
+                cx,
             ));
         }
 
