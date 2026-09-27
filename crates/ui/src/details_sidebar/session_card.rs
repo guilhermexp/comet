@@ -383,14 +383,7 @@ impl DetailsSidebar {
                         )
                         .into(),
                     ),
-                    (
-                        "Cache",
-                        stats
-                            .cache_fraction()
-                            .map(|f| format!("{}%", (f * 100.0).round() as u64))
-                            .unwrap_or_else(|| "—".into())
-                            .into(),
-                    ),
+                    ("Cache", format_cache(&stats).into()),
                     (
                         "Cost",
                         stats
@@ -554,6 +547,26 @@ pub(super) fn project_skills(
         .collect()
 }
 
+/// Prompt tokens served from cache, with their share of the prompt:
+/// `781.2K (99.8%)`, or `read · write` when the turn also wrote cache.
+pub(super) fn format_cache(stats: &zeron_proto::TurnStats) -> String {
+    let Some(read) = stats.cache_read_tokens else {
+        return "—".to_owned();
+    };
+    let share = stats
+        .cache_fraction()
+        .map(|f| format!(" ({:.1}%)", f * 100.0))
+        .unwrap_or_default();
+    match stats.cache_write_tokens.filter(|write| *write > 0) {
+        Some(write) => format!(
+            "{} read · {} write{share}",
+            format_token_count(read),
+            format_token_count(write)
+        ),
+        None => format!("{}{share}", format_token_count(read)),
+    }
+}
+
 /// `12m56s`, `1h02m`, `4.2s`.
 pub(super) fn format_duration_ms(ms: u64) -> String {
     let seconds = ms / 1000;
@@ -588,7 +601,25 @@ pub(super) fn format_cost(usd: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_cost, format_duration_ms, format_token_count, project_skills};
+    use super::{
+        format_cache, format_cost, format_duration_ms, format_token_count, project_skills,
+    };
+
+    #[test]
+    fn cache_reads_as_token_counts_with_their_share() {
+        let stats = |read, write| zeron_proto::TurnStats {
+            input_tokens: 1_600,
+            cache_read_tokens: read,
+            cache_write_tokens: write,
+            ..Default::default()
+        };
+        assert_eq!(format_cache(&stats(Some(781_200), None)), "781.2K (99.8%)");
+        assert_eq!(
+            format_cache(&stats(Some(781_200), Some(2_000))),
+            "781.2K read · 2.0K write (99.5%)"
+        );
+        assert_eq!(format_cache(&stats(None, None)), "—");
+    }
 
     #[test]
     fn context_sources_count_only_project_skills() {

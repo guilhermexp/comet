@@ -689,7 +689,7 @@ impl DetailsSidebar {
             context_sources_pending: None,
             context_sources_expanded: false,
             context_sources_scroll: gpui::UniformListScrollHandle::new(),
-            turn_stats_collapsed: false,
+            turn_stats_collapsed: true,
             file_task: None,
             branch_task: None,
             usage_task: None,
