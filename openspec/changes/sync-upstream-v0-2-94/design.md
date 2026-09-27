@@ -14,7 +14,7 @@ The fork's default edge is upstream's `edge.zeron.sh`, whose `/releases` ships Z
 
 ### D3. Zeron MCP injection
 
-Upstream injects `zeron mcp` into every run through `RunRequest.mcp`. The fork already injects `comet-workers`/`comet-sessions` through `harness::workers_mcp` with a root-orchestrator grant. The `mcp` field exists for compatibility but the engine leaves it empty; batch chat tools and side-chat guards land in the fork's MCP server.
+Upstream injects `zeron mcp` into every run through `RunRequest.mcp`. The fork already injects `comet-workers`/`comet-sessions` through `harness::workers_mcp` with a root-orchestrator grant. The `mcp` field exists for compatibility but the engine leaves it empty; batch chat tools and side-chat guards land in the fork's MCP server. Owner decision (post-merge): the same `zeron mcp` server (all chat tools, `ZERON_CHAT_ID` = the run's chat so created chats link back) rides `harness::workers_mcp::servers_for` beside `comet-sessions`, under the same root-orchestrator grant (`RunRequest.sessions`). Subagents, Workers and child/side chats never receive it.
 
 ### D4. Side chats
 

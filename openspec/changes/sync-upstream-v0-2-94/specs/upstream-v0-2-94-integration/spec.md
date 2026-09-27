@@ -14,10 +14,12 @@ Test: `cargo check --workspace --all-targets` and `cargo test --workspace`.
 
 #### Scenario: Runs keep the fork MCP grant
 
-Test: `crates/harness` `workers_mcp` tests.
+Test: `crates/harness` `workers_mcp` tests (`root_grant_also_carries_the_zeron_chat_mcp`, `workers_only_omits_sessions`).
 
 - **WHEN** a non-orchestrator chat starts a run
 - **THEN** no Zeron/sessions MCP server is injected into its harness arguments
+- **AND WHEN** a root orchestrator run holds the sessions grant
+- **THEN** it receives both `comet-sessions` and the `zeron` chat MCP stamped with its own chat id
 
 ### Requirement: Comet never updates from the upstream Zeron feed
 

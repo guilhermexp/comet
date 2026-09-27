@@ -74,6 +74,45 @@ pub(crate) fn resolve_sessions_for(
     })
 }
 
+const ZERON_NAME: &str = "zeron";
+/// `wait_for_turn` blocks up to an hour; the client must outlast it.
+const ZERON_TIMEOUT_SECS: u64 = 3660;
+
+/// Zeron's own chat MCP (`zeron mcp`: list/read/create/send/wait on chats,
+/// batch `create_chats`/`send_messages`). Upstream injects it into every run;
+/// the fork rides the same root-orchestrator grant as `comet-sessions`, so
+/// subagents, Workers and child chats never gain chat control. Chats it
+/// creates link back to `grant.parent_chat_id` (`ZERON_CHAT_ID`).
+pub(crate) fn resolve_zeron_for(
+    executable: &Path,
+    grant: &zeron_proto::SessionsGrant,
+) -> Option<WorkersMcpServer> {
+    let port = grant
+        .endpoint
+        .trim()
+        .trim_end_matches('/')
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)?;
+    if !executable.is_absolute()
+        || grant.parent_chat_id.trim().is_empty()
+        || grant.engine_id.trim().is_empty()
+    {
+        return None;
+    }
+    Some(WorkersMcpServer {
+        name: ZERON_NAME,
+        command: executable.to_path_buf(),
+        args: vec!["mcp".to_owned()],
+        env: vec![
+            ("ZERON_IPC_PORT".into(), port.to_string()),
+            ("ZERON_CHAT_ID".into(), grant.parent_chat_id.clone()),
+            ("ZERON_DEVICE_ID".into(), grant.engine_id.clone()),
+        ],
+        timeout_secs: ZERON_TIMEOUT_SECS,
+    })
+}
+
 pub(crate) fn servers_for_request(request: &zeron_proto::RunRequest) -> Vec<WorkersMcpServer> {
     let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
         .ok()
@@ -101,10 +140,9 @@ pub(crate) fn servers_for(
     ) {
         servers.push(server);
     }
-    if let Some(grant) = &request.sessions
-        && let Some(server) = resolve_sessions_for(executable, grant)
-    {
-        servers.push(server);
+    if let Some(grant) = &request.sessions {
+        servers.extend(resolve_sessions_for(executable, grant));
+        servers.extend(resolve_zeron_for(executable, grant));
     }
     servers
 }
@@ -281,7 +319,7 @@ mod tests {
     #[test]
     fn both_grants_render_workers_and_sessions() {
         let servers = servers_for(Path::new("/opt/zeron"), &request(true, true), false);
-        assert_eq!(servers.len(), 2);
+        assert_eq!(servers.len(), 3);
         let claude: serde_json::Value =
             serde_json::from_str(&claude_config_json(&servers).unwrap()).unwrap();
         assert!(claude["mcpServers"].get("comet-workers").is_some());
@@ -304,7 +342,23 @@ mod tests {
                 .any(|line| line.contains("mcp_servers.comet-workers.tool_timeout_sec="))
         );
         let acp: Vec<_> = servers.iter().map(|server| server.acp_value()).collect();
-        assert_eq!(acp.len(), 2);
+        assert_eq!(acp.len(), 3);
+    }
+
+    #[test]
+    fn root_grant_also_carries_the_zeron_chat_mcp() {
+        let servers = servers_for(Path::new("/opt/zeron"), &request(true, true), false);
+        let claude: serde_json::Value =
+            serde_json::from_str(&claude_config_json(&servers).unwrap()).unwrap();
+        let zeron = &claude["mcpServers"]["zeron"];
+        assert_eq!(zeron["args"], serde_json::json!(["mcp"]));
+        assert_eq!(zeron["env"]["ZERON_IPC_PORT"], "9");
+        assert_eq!(zeron["env"]["ZERON_CHAT_ID"], "parent");
+        assert_eq!(zeron["env"]["ZERON_DEVICE_ID"], "engine-1");
+        // No port, no server: the MCP would dial the default engine.
+        let mut unbound = grant();
+        unbound.endpoint = "ws://127.0.0.1".into();
+        assert!(resolve_zeron_for(Path::new("/opt/zeron"), &unbound).is_none());
     }
 
     #[test]
@@ -314,6 +368,10 @@ mod tests {
         assert_eq!(servers[0].name, "comet-workers");
         let config = claude_config_json(&servers).unwrap();
         assert!(!config.contains("comet-sessions"));
+        assert!(
+            !config.contains("\"zeron\""),
+            "no chat MCP without the root grant"
+        );
     }
 
     #[test]

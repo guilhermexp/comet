@@ -24,8 +24,10 @@ pub struct WorkersBridgeOptions {
 pub struct WorkersBridge {
     client: RpcClient,
     child: tokio::sync::Mutex<Child>,
-    definition: Value,
-    tool_name: String,
+    /// Host-tool definitions this sidecar serves: one for the Workers and
+    /// sessions controllers, every advertised chat tool for `zeron mcp`.
+    definitions: Vec<Value>,
+    tool_names: std::collections::HashSet<String>,
     pending: Arc<Mutex<HashMap<String, Arc<CancellationToken>>>>,
     request_timeout: Duration,
 }
@@ -80,10 +82,36 @@ impl WorkersBridge {
         Self::launch(server, "sessions").await.map(Some)
     }
 
+    /// `zeron mcp` (chat tools) under the same root-orchestrator grant as
+    /// `comet-sessions`; every tool it lists becomes an OMP host tool.
+    pub async fn start_zeron(
+        executable: &std::path::Path,
+        grant: &zeron_proto::SessionsGrant,
+    ) -> Result<Option<Self>, HarnessError> {
+        let Some(server) = workers_mcp::resolve_zeron_for(executable, grant) else {
+            return Ok(None);
+        };
+        Self::launch_with(server, None).await.map(Some)
+    }
+
     async fn launch(
         server: workers_mcp::WorkersMcpServer,
         expected_tool: &str,
     ) -> Result<Self, HarnessError> {
+        Self::launch_with(server, Some(expected_tool)).await
+    }
+
+    /// `Some(tool)`: a single-tool controller that must advertise exactly that
+    /// tool first. `None`: serve every advertised tool.
+    async fn launch_with(
+        server: workers_mcp::WorkersMcpServer,
+        expected_tool: Option<&str>,
+    ) -> Result<Self, HarnessError> {
+        let request_timeout = if expected_tool.is_some() {
+            TOOL_CALL_TIMEOUT
+        } else {
+            Duration::from_secs(server.timeout_secs)
+        };
         let executable = server.command.to_string_lossy().into_owned();
         let mut command = Command::new(&executable);
         command.args(&server.args);
@@ -155,44 +183,79 @@ impl WorkersBridge {
             .map_err(|_| {
                 HarnessError::Protocol("Workers controller tools/list timed out".into())
             })??;
-        let tool = tools
+        let advertised = tools
             .get("tools")
             .and_then(Value::as_array)
-            .and_then(|tools| tools.first())
-            .ok_or_else(|| {
-                HarnessError::Protocol("Workers controller advertised no tool".into())
-            })?;
-        let name = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| *name == expected_tool)
-            .ok_or_else(|| {
-                HarnessError::Protocol("Workers controller advertised an unexpected tool".into())
-            })?;
-        let definition = json!({
-            "name": name,
-            "loadMode": "essential",
-            "description": tool
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("Coordinate Comet Workers"),
-            "parameters": tool
-                .get("inputSchema")
-                .cloned()
-                .unwrap_or_else(|| json!({ "type": "object" })),
-        });
+            .cloned()
+            .unwrap_or_default();
+        let definition_of = |tool: &Value, name: &str| {
+            json!({
+                "name": name,
+                "loadMode": "essential",
+                "description": tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Coordinate Comet Workers"),
+                "parameters": tool
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object" })),
+            })
+        };
+        let definitions: Vec<Value> = match expected_tool {
+            Some(expected) => {
+                let tool = advertised.first().ok_or_else(|| {
+                    HarnessError::Protocol("Workers controller advertised no tool".into())
+                })?;
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| *name == expected)
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(
+                            "Workers controller advertised an unexpected tool".into(),
+                        )
+                    })?;
+                vec![definition_of(tool, name)]
+            }
+            None => advertised
+                .iter()
+                .filter_map(|tool| {
+                    let name = tool.get("name").and_then(Value::as_str)?;
+                    Some(definition_of(tool, name))
+                })
+                .collect(),
+        };
+        if definitions.is_empty() {
+            return Err(HarnessError::Protocol(
+                "MCP sidecar advertised no tool".into(),
+            ));
+        }
+        let tool_names = definitions
+            .iter()
+            .filter_map(|definition| definition["name"].as_str().map(str::to_owned))
+            .collect();
         Ok(Self {
             client,
             child: tokio::sync::Mutex::new(child),
-            definition,
-            tool_name: expected_tool.to_owned(),
+            definitions,
+            tool_names,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            request_timeout: TOOL_CALL_TIMEOUT,
+            request_timeout,
         })
     }
 
+    /// The first (for single-tool controllers, the only) definition.
     pub fn definition(&self) -> &Value {
-        &self.definition
+        &self.definitions[0]
+    }
+
+    pub fn definitions(&self) -> &[Value] {
+        &self.definitions
+    }
+
+    pub fn serves(&self, tool_name: &str) -> bool {
+        self.tool_names.contains(tool_name)
     }
 
     pub async fn handle_call(&self, id: &str, tool_name: &str, arguments: Value) -> Value {
@@ -213,7 +276,7 @@ impl WorkersBridge {
         if id.is_empty() || id.len() > 256 {
             return Err(error_result(id, "OMP host tool request has an invalid id"));
         }
-        if tool_name != self.tool_name {
+        if !self.tool_names.contains(tool_name) {
             return Err(error_result(id, "Unknown OMP host tool"));
         }
         if !arguments.is_object() {
