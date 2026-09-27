@@ -287,6 +287,93 @@ mod tests {
     use std::rc::Rc;
 
     #[gpui::test]
+    fn sticky_card_does_not_inherit_top_fade_and_clips_push_off(cx: &mut gpui::TestAppContext) {
+        use crate::theme::Theme;
+        struct Fixture {
+            top: f32,
+            observed: Rc<
+                RefCell<
+                    Vec<(
+                        Option<EdgeFade>,
+                        Bounds<Pixels>,
+                        Bounds<Pixels>,
+                        Bounds<Pixels>,
+                    )>,
+                >,
+            >,
+        }
+        impl Render for Fixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let observed = self.observed.clone();
+                let card = gpui::canvas(
+                    |_, window, _| window.content_mask().bounds,
+                    move |bounds, prepaint_mask, window, cx| {
+                        observed.borrow_mut().push((
+                            active_fade(window, cx),
+                            window.content_mask().bounds,
+                            prepaint_mask,
+                            bounds,
+                        ));
+                    },
+                )
+                .w_full()
+                .h(px(100.0));
+                edge_faded(
+                    24.0,
+                    true,
+                    true,
+                    div()
+                        .relative()
+                        .w(px(800.0))
+                        .h(px(600.0))
+                        .child(crate::transcript::sticky_turn_layer(self.top, 150.0, card)),
+                )
+                .inset_top(Theme::TITLEBAR_HEIGHT)
+                .band_bottom(150.0 - Theme::STATUS_STRIP_HEIGHT)
+            }
+        }
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let handle = cx.add_window(|_, _| Fixture {
+            top: Theme::TITLEBAR_HEIGHT,
+            observed: observed.clone(),
+        });
+        for top in [Theme::TITLEBAR_HEIGHT, Theme::TITLEBAR_HEIGHT - 40.0] {
+            handle
+                .update(cx, |view, _, cx| {
+                    view.top = top;
+                    cx.notify();
+                })
+                .unwrap();
+            observed.borrow_mut().clear();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+            })
+            .unwrap();
+            let seen = observed.borrow();
+            let (fade, mask, prepaint_mask, bounds) = seen.last().expect("sticky card painted");
+            let fade = fade.expect("bottom chrome fade remains active");
+            assert!(!fade.top, "the fixed card must not dissolve at its top");
+            assert!(fade.bottom);
+            assert_eq!(
+                bounds.top(),
+                px(top),
+                "sticky position must not gain a second inset"
+            );
+            assert_eq!(prepaint_mask, mask, "input and paint must share the clip");
+            assert_eq!(fade.bounds.bottom(), px(600.0));
+            assert_eq!(
+                fade.band_bottom,
+                Some(px(150.0 - Theme::STATUS_STRIP_HEIGHT))
+            );
+            assert_eq!(
+                mask.top(),
+                px(Theme::TITLEBAR_HEIGHT),
+                "pushed card must clip below titlebar"
+            );
+        }
+    }
+
+    #[gpui::test]
     fn painted_label_retains_scroll_fade_across_overflow_transitions(
         cx: &mut gpui::TestAppContext,
     ) {

@@ -329,6 +329,39 @@ fn sticky_turn_surface(theme: &Theme) -> StickyTurnSurface {
     }
 }
 
+/// Keep the fixed card out of the shell's top fade while clipping both paint
+/// and input below the titlebar when the next turn pushes it upward.
+pub(crate) fn sticky_turn_layer(
+    top: f32,
+    bottom_clearance: f32,
+    card: impl IntoElement,
+) -> AnyElement {
+    crate::edge_fade::edge_faded(
+        Theme::TRANSCRIPT_FADE_BAND,
+        false,
+        // An active bottom edge replaces the inherited GPUI fade scope and
+        // retains the composer's ramp at the same viewport bottom as the shell.
+        true,
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(STICKY_TURN_TOP_INSET_PX))
+            .bottom_0()
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(top - STICKY_TURN_TOP_INSET_PX))
+                    .child(card),
+            ),
+    )
+    .band_bottom((bottom_clearance - Theme::STATUS_STRIP_HEIGHT).max(1.0))
+    .into_any_element()
+}
+
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
 // which follows the shape of stackblitz/use-stick-to-bottom)
@@ -7586,32 +7619,26 @@ impl Transcript {
                 .ok();
             });
 
-        Some(
+        Some(sticky_turn_layer(
+            overlay_top - viewport_top,
+            self.bottom_clearance,
             div()
                 .id(SharedString::from(format!("{}#sticky-turn", source.id)))
-                .absolute()
-                .left_0()
-                .right_0()
-                .top(px(overlay_top - viewport_top))
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(self.content_width + Theme::SPACE_LG * 2.0))
-                        .mx_auto()
-                        .px(px(Theme::SPACE_LG))
-                        .min_w_0()
-                        .pb(px(GAP_TURN))
-                        .when_some(surface.outer_background, |wrapper, background| {
-                            wrapper.bg(background)
-                        })
-                        .child(crate::frost::frosted(
-                            surface.occlusion_radius,
-                            surface.occlusion_blur_radius,
-                            measured,
-                        )),
-                )
-                .into_any_element(),
-        )
+                .w_full()
+                .max_w(px(self.content_width + Theme::SPACE_LG * 2.0))
+                .mx_auto()
+                .px(px(Theme::SPACE_LG))
+                .min_w_0()
+                .pb(px(GAP_TURN))
+                .when_some(surface.outer_background, |wrapper, background| {
+                    wrapper.bg(background)
+                })
+                .child(crate::frost::frosted(
+                    surface.occlusion_radius,
+                    surface.occlusion_blur_radius,
+                    measured,
+                )),
+        ))
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
