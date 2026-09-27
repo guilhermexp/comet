@@ -2596,8 +2596,15 @@ struct TurnAccumulator {
     cache_write_tokens: Option<u64>,
     cost_usd: Option<f64>,
     model_ms: Option<u64>,
+    /// Harness-reported tool durations (`ToolExecutionMeta`), used only when
+    /// no call/result span was observed.
     tool_ms: Option<u64>,
     tools: std::collections::HashSet<String>,
+    /// First sighting of each tool call, and the closed `(start, end)` spans.
+    /// Tool time is the union of spans, so parallel tools are not double
+    /// counted and harnesses that report no durations still get one.
+    tool_started: HashMap<String, i64>,
+    tool_spans: Vec<(i64, i64)>,
 }
 
 impl TurnAccumulator {
@@ -2609,12 +2616,16 @@ impl TurnAccumulator {
     }
 
     fn observe(&mut self, event: &AgentEvent) {
+        self.observe_at(event, now_ms());
+    }
+
+    fn observe_at(&mut self, event: &AgentEvent, now: i64) {
         fn add(slot: &mut Option<u64>, value: Option<u64>) {
             if let Some(value) = value {
                 *slot = Some(slot.unwrap_or(0).saturating_add(value));
             }
         }
-        self.started_ms.get_or_insert_with(now_ms);
+        self.started_ms.get_or_insert(now);
         match event {
             AgentEvent::Usage {
                 input_tokens,
@@ -2639,19 +2650,29 @@ impl TurnAccumulator {
             }
             AgentEvent::ToolCall { id, .. } if id != zeron_proto::LIVE_PLAN_TOOL_ID => {
                 self.tools.insert(id.clone());
+                self.tool_started.entry(id.clone()).or_insert(now);
             }
-            AgentEvent::ToolResult {
-                execution: Some(execution),
-                ..
-            } => add(&mut self.tool_ms, execution.duration_ms),
+            AgentEvent::ToolResult { id, execution, .. } => {
+                if let Some(start) = self.tool_started.remove(id) {
+                    self.tool_spans.push((start, now.max(start)));
+                }
+                if let Some(execution) = execution {
+                    add(&mut self.tool_ms, execution.duration_ms);
+                }
+            }
             _ => {}
         }
     }
 
     fn finish(&self, now: i64) -> zeron_proto::TurnStats {
         let duration_ms = u64::try_from(now - self.started_ms.unwrap_or(now)).unwrap_or(0);
+        let tool_ms = if self.tool_spans.is_empty() {
+            self.tool_ms
+        } else {
+            Some(union_ms(&self.tool_spans))
+        };
         let model_ms = self.model_ms.or_else(|| {
-            (duration_ms > 0).then(|| duration_ms.saturating_sub(self.tool_ms.unwrap_or(0)))
+            (duration_ms > 0).then(|| duration_ms.saturating_sub(tool_ms.unwrap_or(0)))
         });
         zeron_proto::TurnStats {
             input_tokens: self.input_tokens,
@@ -2661,10 +2682,32 @@ impl TurnAccumulator {
             cost_usd: self.cost_usd,
             duration_ms,
             model_ms,
-            tool_ms: self.tool_ms,
+            tool_ms,
             steps: u32::try_from(self.tools.len()).unwrap_or(u32::MAX),
         }
     }
+}
+
+/// Total length covered by possibly overlapping `(start, end)` spans.
+fn union_ms(spans: &[(i64, i64)]) -> u64 {
+    let mut spans = spans.to_vec();
+    spans.sort_unstable();
+    let mut total = 0i64;
+    let mut current: Option<(i64, i64)> = None;
+    for (start, end) in spans {
+        match current {
+            Some((open, close)) if start <= close => current = Some((open, close.max(end))),
+            Some((open, close)) => {
+                total += close - open;
+                current = Some((start, end));
+            }
+            None => current = Some((start, end)),
+        }
+    }
+    if let Some((open, close)) = current {
+        total += close - open;
+    }
+    u64::try_from(total).unwrap_or(0)
 }
 
 // ── run task ────────────────────────────────────────────────────────────────
@@ -4729,6 +4772,7 @@ mod tests {
     #[test]
     fn turn_accumulator_sums_usage_metrics_steps_and_tool_time() {
         let mut turn = super::TurnAccumulator::starting_at(1_000);
+        let mut at = 1_000;
         let tool = |id: &str| AgentEvent::ToolCall {
             id: id.into(),
             call: zeron_proto::ToolCall::Unknown {
@@ -4736,20 +4780,35 @@ mod tests {
                 input: None,
             },
         };
-        turn.observe(&tool("a"));
-        turn.observe(&tool("a"));
-        turn.observe(&tool(zeron_proto::LIVE_PLAN_TOOL_ID));
-        turn.observe(&tool("b"));
-        turn.observe(&AgentEvent::ToolResult {
-            id: "a".into(),
-            is_error: false,
-            output: None,
-            diff: None,
-            execution: Some(zeron_proto::ToolExecutionMeta {
-                exit_code: Some(0),
-                duration_ms: Some(1_500),
-            }),
-        });
+        turn.observe_at(&tool("a"), 2_000);
+        turn.observe_at(&tool("a"), 2_500);
+        turn.observe_at(&tool(zeron_proto::LIVE_PLAN_TOOL_ID), 2_500);
+        turn.observe_at(&tool("b"), 3_000);
+        at += 4_000;
+        turn.observe_at(
+            &AgentEvent::ToolResult {
+                id: "a".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+                execution: Some(zeron_proto::ToolExecutionMeta {
+                    exit_code: Some(0),
+                    duration_ms: Some(1_500),
+                }),
+            },
+            at,
+        );
+        // "b" overlaps "a": the union (2s..6s) counts once.
+        turn.observe_at(
+            &AgentEvent::ToolResult {
+                id: "b".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+                execution: None,
+            },
+            6_000,
+        );
         turn.observe(&AgentEvent::Usage {
             input_tokens: 100,
             output_tokens: 40,
@@ -4767,10 +4826,14 @@ mod tests {
             "duplicate ids and the live plan do not count"
         );
         assert_eq!(stats.duration_ms, 10_000);
-        assert_eq!(stats.tool_ms, Some(1_500));
+        assert_eq!(
+            stats.tool_ms,
+            Some(4_000),
+            "measured spans win over reports"
+        );
         assert_eq!(
             stats.model_ms,
-            Some(8_500),
+            Some(6_000),
             "falls back to wall time minus tools"
         );
         assert_eq!((stats.input_tokens, stats.output_tokens), (100, 40));
