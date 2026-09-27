@@ -71,7 +71,6 @@ use crate::trajectory::TrajectoryView;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workers::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
-use crate::workers::session_gallery;
 use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
 use crate::workers::workspace::{WorkersContent, WorkersSidebar, WorkersSidebarEvent};
 use crate::workspace_links::resolve_workspace_file_link;
@@ -807,7 +806,6 @@ fn sidebar_mode_switch_catalog(
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct TitlebarCapabilities {
-    capture: bool,
     right_pane: bool,
     trajectory: bool,
 }
@@ -829,7 +827,6 @@ fn titlebar_capabilities(
         SidebarMode::Workers => has_worker_context,
     };
     TitlebarCapabilities {
-        capture: available,
         right_pane: available,
         trajectory: matches!(mode, SidebarMode::Orchestrator) && has_orchestrator_chat,
     }
@@ -8046,79 +8043,6 @@ impl Shell {
             cx.listener(|this, _, _, cx| this.toggle_details_sidebar(cx)),
         )
         .into_any_element()
-    }
-
-    fn open_orchestrator_capture_menu(&mut self, cx: &mut Context<Self>) {
-        let composer = self.composer.clone();
-        let directory = std::env::temp_dir().join("comet-orchestrator-captures");
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |_, cx| {
-            match session_gallery::pick_and_capture(directory, executor).await {
-                // The composer owns the attachment now; the capture file was
-                // only a hand-off in temp.
-                Ok(Some(path)) => {
-                    let cleanup = path.clone();
-                    composer.update(cx, |composer, cx| composer.add_paths(vec![path], cx));
-                    let _ = std::fs::remove_file(cleanup);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    composer.update(cx, |composer, cx| composer.set_failure(error, cx));
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn render_orchestrator_capture_button(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .h(px(28.0))
-            .flex()
-            .items_center()
-            // Flat like the neighboring titlebar icon buttons (no pill fill or
-            // border); the split segments keep their own rounded hover.
-            .rounded(px(10.0))
-            .overflow_hidden()
-            .child(
-                div()
-                    .id("orchestrator-capture")
-                    .w(px(32.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_orchestrator_capture_menu(cx)))
-                    .child(
-                        icon(icons::WORKER_GALLERY)
-                            .size(px(17.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(div().w(px(1.0)).h(px(14.0)).bg(theme.text.opacity(0.10)))
-            .child(
-                div()
-                    .id("orchestrator-capture-menu")
-                    .w(px(25.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_orchestrator_capture_menu(cx)))
-                    .child(
-                        icon(icons::ALT_ARROW_DOWN)
-                            .size(px(9.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .into_any_element()
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar
@@ -15813,7 +15737,6 @@ mod tests {
         assert_eq!(
             titlebar_capabilities(SidebarMode::Orchestrator, true, false),
             TitlebarCapabilities {
-                capture: true,
                 right_pane: true,
                 trajectory: true,
             }
@@ -15825,7 +15748,6 @@ mod tests {
         assert_eq!(
             titlebar_capabilities(SidebarMode::Workers, false, true),
             TitlebarCapabilities {
-                capture: true,
                 right_pane: true,
                 trajectory: false,
             }
@@ -15842,7 +15764,6 @@ mod tests {
         assert_eq!(
             titlebar_capabilities(SidebarMode::Orchestrator, true, false),
             TitlebarCapabilities {
-                capture: true,
                 right_pane: true,
                 trajectory: true,
             }
@@ -15856,7 +15777,6 @@ mod tests {
         assert_eq!(
             titlebar_capabilities(SidebarMode::Workers, false, true),
             TitlebarCapabilities {
-                capture: true,
                 right_pane: true,
                 trajectory: false,
             }

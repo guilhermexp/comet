@@ -6665,11 +6665,6 @@ impl Composer {
         cx.notify();
     }
 
-    pub(crate) fn set_failure(&mut self, message: String, cx: &mut Context<Self>) {
-        self.failure = Some(message.into());
-        cx.notify();
-    }
-
     /// Add a file-tree or file-tab drop through the existing file-mention
     /// pipeline. This keeps the reference workspace-relative and therefore
     /// valid for local and remote sessions alike.

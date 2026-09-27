@@ -376,7 +376,6 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .child(self.render_orchestrator_capture_button(&theme, cx))
                     .when(capabilities.trajectory, |el| {
                         el.child(self.render_orchestrator_trajectory_button(&theme, cx))
                     })
@@ -403,9 +402,6 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .when(capabilities.capture, |el| {
-                        el.child(self.render_orchestrator_capture_button(&theme, cx))
-                    })
                     .when(capabilities.trajectory, |el| {
                         el.child(self.render_orchestrator_trajectory_button(&theme, cx))
                     })
