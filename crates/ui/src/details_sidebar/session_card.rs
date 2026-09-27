@@ -16,7 +16,14 @@ pub(super) struct SessionDiffTotals {
 /// Skills the chat's agent sees, keyed by what they were listed for.
 pub(super) struct ContextSources {
     pub key: String,
-    pub skills: Vec<SharedString>,
+    pub skills: Vec<ProjectSkill>,
+}
+
+/// A project skill: its name and its file, relative to the project folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectSkill {
+    pub name: SharedString,
+    pub relative_path: String,
 }
 
 impl DetailsSidebar {
@@ -457,23 +464,36 @@ impl DetailsSidebar {
                     ),
             );
             if expanded {
+                // Inline, not a nested scroller: the Details pane already
+                // scrolls, and a second scroll region fought it (laggy).
+                let skills = sources.skills.clone();
                 card = card.child(
                     div()
-                        .id("context-sources-list")
-                        .max_h(px(180.0))
-                        .overflow_y_scroll()
                         .pb(px(4.0))
-                        .children(sources.skills.iter().map(|skill| {
+                        .children(skills.into_iter().enumerate().map(|(ix, skill)| {
+                            let path = skill.relative_path.clone();
                             div()
+                                .id(("context-source-skill", ix))
                                 .h(px(24.0))
-                                .pl(px(35.0))
-                                .pr(px(12.0))
+                                .mx(px(6.0))
+                                .pl(px(29.0))
+                                .pr(px(6.0))
+                                .rounded(px(6.0))
                                 .flex()
                                 .items_center()
-                                .text_size(px(12.0))
-                                .text_color(theme.text_muted)
-                                .truncate()
-                                .child(skill.clone())
+                                .cursor_pointer()
+                                .hover(|row| row.bg(theme.element_hover.opacity(0.45)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.emit_open_file(&path, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(skill.name),
+                                )
                         })),
                 );
             }
@@ -488,15 +508,25 @@ impl DetailsSidebar {
 pub(super) fn project_skills(
     skills: Vec<zeron_proto::invocation::Skill>,
     project_root: &str,
-) -> Vec<SharedString> {
+) -> Vec<ProjectSkill> {
     let root = std::path::Path::new(project_root);
     skills
         .into_iter()
-        .filter(|skill| {
+        .filter_map(|skill| {
+            if skill.path.is_empty() {
+                return None;
+            }
             let path = std::path::Path::new(&skill.path);
-            !skill.path.is_empty() && (path.is_relative() || path.starts_with(root))
+            let relative = if path.is_relative() {
+                path.to_path_buf()
+            } else {
+                path.strip_prefix(root).ok()?.to_path_buf()
+            };
+            Some(ProjectSkill {
+                name: skill.name.into(),
+                relative_path: relative.to_string_lossy().into_owned(),
+            })
         })
-        .map(|skill| SharedString::from(skill.name))
         .collect()
 }
 
@@ -554,7 +584,16 @@ mod tests {
             ],
             "/work/app",
         );
+        let names: Vec<_> = names.iter().map(|skill| skill.name.as_ref()).collect();
         assert_eq!(names, ["local", "relative"]);
+        let paths: Vec<_> = project_skills(
+            vec![skill("local", "/work/app/.claude/skills/local/SKILL.md")],
+            "/work/app",
+        )
+        .into_iter()
+        .map(|skill| skill.relative_path)
+        .collect();
+        assert_eq!(paths, [".claude/skills/local/SKILL.md"]);
     }
 
     #[test]
