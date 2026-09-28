@@ -369,6 +369,20 @@ pub enum MessagePart {
         id: String,
         task: WorkflowTaskUpdate,
     },
+    /// The seam in a forked chat's transcript: everything above was copied
+    /// from `source_chat_id` when the fork was cut, everything below is this
+    /// chat's own. Written once by the fork RPC; renders as a labeled
+    /// divider. Old desktop builds' unknown-kind fallback yields an empty
+    /// text part (invisible); iOS drops unknown kinds.
+    #[serde(rename_all = "camelCase")]
+    Fork {
+        id: String,
+        source_chat_id: String,
+        /// The source's title as of the fork — the transcript reads it
+        /// without a registry lookup, and a later rename or delete of the
+        /// source does not rewrite history.
+        source_title: String,
+    },
 }
 
 impl MessagePart {
@@ -380,7 +394,8 @@ impl MessagePart {
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. }
-            | MessagePart::WorkflowTask { id, .. } => id,
+            | MessagePart::WorkflowTask { id, .. }
+            | MessagePart::Fork { id, .. } => id,
         }
     }
 
@@ -425,6 +440,11 @@ impl MessagePart {
             MessagePart::WorkflowTask { task, .. } => {
                 serde_json::to_vec(task).map_or(0, |value| value.len())
             }
+            MessagePart::Fork {
+                source_chat_id,
+                source_title,
+                ..
+            } => source_chat_id.len() + source_title.len(),
         }
     }
 }
@@ -864,6 +884,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
+        | AgentEvent::TurnMetrics { .. }
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. }
         | AgentEvent::UserMessage { .. }

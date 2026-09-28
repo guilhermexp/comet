@@ -21,6 +21,7 @@ async fn real_pi_mock_lifecycle() {
         let controls = RunControls {
             chat_id: String::new(),
             generate_native_title: false,
+            execution_lease: None,
             steering,
             interrupt: token.clone(),
             request_input: Box::new(|_| {
@@ -33,6 +34,7 @@ async fn real_pi_mock_lifecycle() {
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
             sessions: None,
+            mcp: None,
             prompt: match scenario {
                 "boundary" => "slow-model",
                 "interrupt" | "mid-kill" => "slow-tool",

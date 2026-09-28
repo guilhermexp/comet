@@ -1223,21 +1223,25 @@ impl WorkersSettingsView {
                         ),
                 )
                 .child(
-                    widgets::toggle_switch(theme, enabled)
-                        .id(("workers-preset-enabled", index))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.model.update(cx, |model, cx| {
-                                model.update_preset(
-                                    enabled_id.clone(),
-                                    PresetPatch {
-                                        enabled: Some(!enabled),
-                                        ..PresetPatch::default()
-                                    },
-                                    cx,
-                                )
-                            });
-                        })),
+                    widgets::toggle_switch(
+                        theme,
+                        enabled,
+                        format!("workers-preset-enabled-{index}"),
+                    )
+                    .id(("workers-preset-enabled", index))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model.update(cx, |model, cx| {
+                            model.update_preset(
+                                enabled_id.clone(),
+                                PresetPatch {
+                                    enabled: Some(!enabled),
+                                    ..PresetPatch::default()
+                                },
+                                cx,
+                            )
+                        });
+                    })),
                 )
                 .child(
                     div()
@@ -1554,7 +1558,7 @@ impl WorkersSettingsView {
                     ),
             )
             .child(
-                widgets::toggle_switch(theme, enabled)
+                widgets::toggle_switch(theme, enabled, format!("workers-transcript-{index}"))
                     .id(("workers-transcript-switch", index))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1773,14 +1777,20 @@ impl WorkersSettingsView {
                                 ),
                         )
                         .child(
-                            widgets::toggle_switch(theme, enabled)
-                                .id(("workers-notification-switch", index))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            widgets::toggle_switch(
+                                theme,
+                                enabled,
+                                format!("workers-notification-{index}"),
+                            )
+                            .id(("workers-notification-switch", index))
+                            .cursor_pointer()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.model.update(cx, |model, cx| {
                                         model.set_notification_settings(next.clone(), cx)
                                     });
-                                })),
+                                },
+                            )),
                         )
                 });
         let body = div()
@@ -1907,7 +1917,7 @@ impl WorkersSettingsView {
                             ),
                     )
                     .child(
-                        widgets::toggle_switch(theme, current.show_session_gallery)
+                        widgets::toggle_switch(theme, current.show_session_gallery, "workers-session-gallery")
                             .id("workers-session-gallery-switch")
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2025,7 +2035,7 @@ impl WorkersSettingsView {
                     "Samples hosted workers without adding metrics to the terminal or sidebar.",
                 )
                 .child(
-                    widgets::toggle_switch(theme, settings.monitoring_enabled)
+                    widgets::toggle_switch(theme, settings.monitoring_enabled, "workers-resource-monitoring")
                         .id("workers-resource-monitoring")
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2042,7 +2052,11 @@ impl WorkersSettingsView {
                     "Notify only when a worker crosses a configured memory threshold.",
                 )
                 .child(
-                    widgets::toggle_switch(theme, settings.notifications_enabled)
+                    widgets::toggle_switch(
+                        theme,
+                        settings.notifications_enabled,
+                        "workers-resource-notifications",
+                    )
                         .id("workers-resource-notifications")
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2091,7 +2105,11 @@ impl WorkersSettingsView {
                     "Stops and archives workers that sat idle, keeping the conversation for Restart.",
                 )
                 .child(
-                    widgets::toggle_switch(theme, settings.hibernation_enabled)
+                    widgets::toggle_switch(
+                        theme,
+                        settings.hibernation_enabled,
+                        "workers-resource-hibernation",
+                    )
                         .id("workers-resource-hibernation")
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {

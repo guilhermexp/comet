@@ -161,7 +161,9 @@ pub fn worker_semantic(state: &str, activity: &str) -> WorkerSemantic {
         ("running" | "exited", "done" | "failed" | "cancelled") => WorkerSemantic::Terminal,
         ("running", "idle") => WorkerSemantic::Idle,
         ("running", _) => WorkerSemantic::Working,
-        ("exited" | "recovery", _) => WorkerSemantic::Recovery,
+        // The process ended without a failure: finished, not recovering.
+        ("exited", _) => WorkerSemantic::Terminal,
+        ("recovery", _) => WorkerSemantic::Recovery,
         _ => WorkerSemantic::Disconnected,
     }
 }
@@ -960,7 +962,7 @@ mod tests {
         );
         assert_eq!(worker_semantic("running", "idle"), WorkerSemantic::Idle);
         assert_eq!(worker_semantic("exited", "done"), WorkerSemantic::Terminal);
-        assert_eq!(worker_semantic("exited", "idle"), WorkerSemantic::Recovery);
+        assert_eq!(worker_semantic("exited", "idle"), WorkerSemantic::Terminal);
         assert_eq!(
             worker_semantic("disconnected", "idle"),
             WorkerSemantic::Disconnected
@@ -973,7 +975,6 @@ mod tests {
             worker_semantic("recovery", "done"),
             WorkerSemantic::Recovery
         );
-        assert_ne!(worker_semantic("exited", "idle"), WorkerSemantic::Terminal);
     }
 
     #[test]

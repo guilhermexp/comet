@@ -295,6 +295,9 @@ use zeron_proto::{
 };
 use zeron_rpc::methods;
 
+#[path = "session_card.rs"]
+mod session_card;
+
 use crate::{
     composer::{Composer, ComposerInput, ComposerInputEvent},
     details_sidebar::{
@@ -328,8 +331,8 @@ use crate::{
         },
         widgets::{
             CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState, TabActivity,
-            chat_workers_viewport_height_px, property_row, property_row_custom, widget_card,
-            worker_expansion_key, workers_tab_presence,
+            chat_workers_viewport_height_px, widget_card, worker_expansion_key,
+            workers_tab_presence,
         },
     },
     icons,
@@ -448,21 +451,22 @@ fn subagent_row_avatar_path(row_id: &str) -> &'static str {
 /// bare glyph. The loose checkmark read as punctuation next to the row's
 /// avatar, while every other terminal state in the same column already
 /// carries a ring (`CLOSE_CIRCLE`) — the ring is what makes "done" land as a
-/// status instead of a tick.
+/// status instead of a tick. Muted, not green: a finished row is settled
+/// information, not a call to attention.
 fn settled_success_badge(theme: &Theme) -> AnyElement {
     div()
         .size(px(15.0))
         .flex_none()
         .rounded_full()
         .border_1()
-        .border_color(theme.success)
+        .border_color(theme.text_muted)
         .flex()
         .items_center()
         .justify_center()
         .child(
             icons::icon(icons::CHECK)
                 .size(px(9.0))
-                .text_color(theme.success),
+                .text_color(theme.text_muted),
         )
         .into_any_element()
 }
@@ -555,6 +559,15 @@ pub struct DetailsSidebar {
     commit_input: Entity<ComposerInput>,
     _commit_events: Subscription,
     discard_prompt: Option<source_control::DiscardPrompt>,
+    session_diff: Option<session_card::SessionDiffTotals>,
+    session_diff_watch: Option<Task<()>>,
+    session_diff_key: Option<String>,
+    context_sources: Option<session_card::ContextSources>,
+    context_sources_task: Option<Task<()>>,
+    context_sources_pending: Option<String>,
+    context_sources_expanded: bool,
+    context_sources_scroll: gpui::UniformListScrollHandle,
+    turn_stats_collapsed: bool,
 }
 
 impl DetailsSidebar {
@@ -668,6 +681,15 @@ impl DetailsSidebar {
             commit_input,
             _commit_events: commit_events,
             discard_prompt: None,
+            session_diff: None,
+            session_diff_watch: None,
+            session_diff_key: None,
+            context_sources: None,
+            context_sources_task: None,
+            context_sources_pending: None,
+            context_sources_expanded: false,
+            context_sources_scroll: gpui::UniformListScrollHandle::new(),
+            turn_stats_collapsed: true,
             file_task: None,
             branch_task: None,
             usage_task: None,
@@ -2836,11 +2858,9 @@ impl DetailsSidebar {
                     .into_any_element()
             }
             WorkerSemantic::Terminal => settled_success_badge(theme),
-            WorkerSemantic::Idle => div()
-                .size(px(7.0))
-                .rounded_full()
-                .bg(theme.text_muted.opacity(0.65))
-                .into_any_element(),
+            // Turn finished, session still open for the next prompt: the
+            // same settled check as a finished subagent.
+            WorkerSemantic::Idle => settled_success_badge(theme),
             WorkerSemantic::Recovery => icons::icon(icons::RESTART)
                 .size(px(13.0))
                 .text_color(theme.text_muted)
@@ -3576,14 +3596,9 @@ impl DetailsSidebar {
             p.render_workspace_branch_control(repo_target, disabled, cx)
         });
 
-        let mut workspace_body = div()
-            .child(property_row_custom(
-                icons::GIT_BRANCH,
-                "Branch",
-                branch_control,
-                theme,
-            ))
-            .child(property_row(icons::FOLDER, "Path", folder, theme));
+        let _ = folder;
+        let mut workspace_body = div();
+        let mut workspace_extra = false;
 
         if context.mode == super::context::DetailsMode::Orchestrator {
             let home = dirs_home();
@@ -3695,6 +3710,7 @@ impl DetailsSidebar {
                     );
                 }
                 workspace_body = workspace_body.child(worked_section);
+                workspace_extra = true;
             }
             if let Some(entry) = self.sidebar.idle_recap_for(&context.key) {
                 let generated_at =
@@ -3735,16 +3751,19 @@ impl DetailsSidebar {
                             .child(clock_text),
                     );
                 workspace_body = workspace_body.child(recap_row);
+                workspace_extra = true;
             }
         }
         let mut content = div().w_full().flex().flex_col().gap(px(10.0)).p(px(10.0));
         if !hide_workspace {
-            content = content.child(widget_card(
-                "workspace-widget",
-                icons::DETAILS_BOX,
-                "Workspace",
-                workspace_body,
+            let extra = workspace_extra.then_some(workspace_body);
+            content = content.child(self.render_session_card(
+                &context,
+                branch_control,
+                has_git,
+                extra,
                 theme,
+                cx,
             ));
         }
 

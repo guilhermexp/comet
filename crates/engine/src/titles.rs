@@ -220,6 +220,11 @@ impl TitleGenerator {
         {
             return None;
         }
+        // Order this entire isolated subprocess against a queued update for
+        // the same CLI. The fair registry gate prevents late title work from
+        // jumping ahead of an accepted writer.
+        let execution_lease = Arc::new(self.inner.registry.execution_lease(harness_id).await);
+        // No repository instructions, files, or active coding-session context.
         let scratch = tempfile::tempdir().ok()?;
         let cwd = scratch.path().to_string_lossy().into_owned();
         let harness = match self.inner.registry.resolve(harness_id) {
@@ -231,7 +236,15 @@ impl TitleGenerator {
         };
         let cheap = match settings.model {
             Some(model) => Some(model),
-            None => cheapest_model_before(harness.as_ref(), deadline).await,
+            None => {
+                cheapest_model_before(
+                    self.inner
+                        .registry
+                        .discover_models_with_lease(harness_id, execution_lease.clone()),
+                    deadline,
+                )
+                .await
+            }
         };
         let title_prompt = format!(
             "{}\n\nChat request (JSON string):\n{}",
@@ -242,6 +255,7 @@ impl TitleGenerator {
         let cheap = &cheap;
         let title_prompt = &title_prompt;
         let harness = harness.as_ref();
+        let execution_lease = &execution_lease;
 
         crate::recap::with_retry_budget(
             deadline,
@@ -262,8 +276,9 @@ impl TitleGenerator {
                     attachments: Vec::new(),
                     resume: None,
                     worktree: None,
+                    mcp: None,
                 };
-                match collect_text(harness, chat_id, request).await {
+                match collect_text(harness, chat_id, request, Some(execution_lease.clone())).await {
                     Ok(raw) => Some(clean_title(&raw)).filter(|title| !title.is_empty()),
                     Err(err) => {
                         tracing::warn!(attempt = attempt + 1, error = %err,
@@ -277,14 +292,16 @@ impl TitleGenerator {
     }
 }
 
-/// [`cheapest_model`] of the harness's catalog, given up on early enough to
+/// [`cheapest_model`] of a harness catalog lookup, given up on early enough to
 /// leave one full attempt of the run budget behind: `models()` spawns the agent
 /// process and runs discovery with no timeout of its own, so it is the likeliest
 /// thing to wedge, and a lookup that ate the whole budget would leave nothing to
 /// generate with. `None` (the harness's own default model) is a fine answer for
-/// a lookup that ran out of time.
+/// a lookup that ran out of time. Callers pass the registry's lease-holding
+/// discovery (`discover_models_with_lease`) so the probe is ordered against a
+/// queued agent CLI update (upstream #389).
 pub(crate) async fn cheapest_model_before(
-    harness: &dyn zeron_harness::Harness,
+    lookup: impl std::future::Future<Output = Result<Vec<Model>, zeron_harness::HarnessError>>,
     deadline: tokio::time::Instant,
 ) -> Option<String> {
     let left = deadline
@@ -292,7 +309,7 @@ pub(crate) async fn cheapest_model_before(
         .saturating_sub(std::time::Duration::from_secs(
             crate::recap::RUN_ATTEMPT_SECS,
         ));
-    let models = tokio::time::timeout(left, harness.models())
+    let models = tokio::time::timeout(left, lookup)
         .await
         .ok()
         .and_then(|models| models.ok())
@@ -402,11 +419,13 @@ async fn collect_text(
     harness: &dyn zeron_harness::Harness,
     chat_id: &str,
     request: RunRequest,
+    execution_lease: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
     let interrupt = CancellationToken::new();
     let _cancel_on_drop = interrupt.clone().drop_guard();
     let controls = RunControls {
+        execution_lease,
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());
@@ -473,6 +492,7 @@ mod tests {
             ],
         };
         let request = RunRequest {
+            mcp: None,
             prompt: "Title only".into(),
             harness: None,
             model: None,
@@ -488,7 +508,7 @@ mod tests {
             attachments: vec![],
             worktree: None,
         };
-        let result = collect_text(&harness, "title-test", request).await;
+        let result = collect_text(&harness, "title-test", request, None).await;
         assert!(
             result
                 .unwrap_err()
@@ -753,7 +773,10 @@ mod tests {
 
         let picked = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            cheapest_model_before(&WedgedModelsHarness, deadline),
+            cheapest_model_before(
+                zeron_harness::Harness::models(&WedgedModelsHarness),
+                deadline,
+            ),
         )
         .await
         .expect("the lookup must give up with an attempt's worth of budget left");

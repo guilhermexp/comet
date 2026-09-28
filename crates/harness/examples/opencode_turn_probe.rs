@@ -45,6 +45,7 @@ async fn main() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt,
         harness: None,
         model,
@@ -67,6 +68,7 @@ async fn main() {
             RunControls {
                 chat_id: String::new(),
                 generate_native_title: false,
+                execution_lease: None,
                 request_input: Box::new(move |questions| {
                     assert!(
                         answer_yes,

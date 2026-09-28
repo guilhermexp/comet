@@ -137,7 +137,7 @@ pub(crate) fn workspace_path_drag_ghost(
     cx.new(|_| WorkspacePathDragGhost { payload })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FilesEvent {
     OpenFile(String),
     RevealFile(String),
@@ -228,6 +228,8 @@ pub struct FilesSurface {
     watch_sequence: Option<u64>,
     watch_error: Option<SharedString>,
     preview: FilePreviewState,
+    pending_line_navigation: Option<(u32, Option<u32>)>,
+    line_navigation_generation: u64,
     editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
@@ -266,9 +268,11 @@ impl Render for FilesSurface {
         // Both presentations carry a secondary header of the same height
         // directly under the titlebar: the editor's breadcrumb toolbar, or the
         // explorer's search + visibility toolbar.
-        let tabs =
-            (!is_editor && self.changes.is_some()).then(|| self.render_explorer_tabs(&theme, cx));
-        let on_changes = !is_editor && self.explorer_tab == ExplorerTab::Changes;
+        // A projectless session has no git root, so it has no Changes tab.
+        let changes_available = self.changes_available(cx);
+        let tabs = (!is_editor && changes_available).then(|| self.render_explorer_tabs(&theme, cx));
+        let on_changes =
+            !is_editor && changes_available && self.explorer_tab == ExplorerTab::Changes;
         let header = if is_editor {
             self.render_editor_header(&theme, cx)
         } else if on_changes {
@@ -304,6 +308,20 @@ impl Render for FilesSurface {
 }
 
 impl FilesSurface {
+    /// Whether this chat is projectless (no space, hence no git root).
+    fn is_projectless(&self, cx: &gpui::App) -> bool {
+        self.state
+            .read(cx)
+            .chats
+            .iter()
+            .any(|chat| chat.id == self.chat_id && chat.space_id.is_none())
+    }
+
+    /// The Changes tab needs a mounted source-control view and a git root.
+    fn changes_available(&self, cx: &gpui::App) -> bool {
+        self.changes.is_some() && !self.is_projectless(cx)
+    }
+
     /// Mount the shell's source-control panel as the explorer's Changes tab.
     /// `count` feeds the tab badge; the surface re-renders when `view` does.
     pub fn set_changes_view<V: Render>(
@@ -410,6 +428,19 @@ impl FilesSurface {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let projectless_root = {
+            let state = self.state.read(cx);
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == self.chat_id && chat.space_id.is_none())
+                .map(|chat| {
+                    let device = state
+                        .device_name(&chat.device_id)
+                        .unwrap_or(&chat.device_id);
+                    format!("Files in {} · {device}", chat.cwd.as_deref().unwrap_or("~"))
+                })
+        };
         let phase = self.tree.node("").map(|root| root.load.clone());
         let content = if !self.search_state.query.is_empty() {
             self.render_search_results(cx)
@@ -464,6 +495,19 @@ impl FilesSurface {
             .min_w_0()
             .flex()
             .flex_col()
+            .when_some(projectless_root, |element, label| {
+                element.child(
+                    div()
+                        .id("files-projectless-root")
+                        .flex_none()
+                        .px(px(10.0))
+                        .py(px(5.0))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_faint)
+                        .truncate()
+                        .child(SharedString::from(label)),
+                )
+            })
             .when_some(self.git_status_notice(cx), |element, notice| {
                 element.child(
                     div()
@@ -831,6 +875,8 @@ impl FilesSurface {
                 word_wrap,
                 editor_font_size,
             ),
+            pending_line_navigation: None,
+            line_navigation_generation: 0,
             editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
             error: None,
@@ -1008,7 +1054,18 @@ impl FilesSurface {
         if self.request_context.is_none() {
             return;
         }
-        self.ensure_watch(cx);
+        // A projectless explorer may not have a resolvable home on its host.
+        // Start its watcher only after the root listing succeeds.
+        let projectless_explorer = !self.presentation.is_editor()
+            && self
+                .state
+                .read(cx)
+                .chats
+                .iter()
+                .any(|chat| chat.id == self.chat_id && chat.space_id.is_none());
+        if !projectless_explorer {
+            self.ensure_watch(cx);
+        }
         if self.presentation.is_editor()
             && !self.preview.has_active()
             && let Some(path) = self.editor_path.clone()
@@ -1188,6 +1245,9 @@ impl FilesSurface {
                     Ok(page) => {
                         surface.error = None;
                         surface.tree.apply_page(page, generation);
+                        if directory.is_empty() {
+                            surface.ensure_watch(cx);
+                        }
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -1262,6 +1322,8 @@ impl FilesSurface {
         self.watch_error = None;
         self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
+        self.pending_line_navigation = None;
+        self.line_navigation_generation = self.line_navigation_generation.wrapping_add(1);
         self.tree.reset();
         self.selected_editor_path = None;
         self.cancel_reveal();
@@ -1517,7 +1579,7 @@ impl FilesSurface {
                     include_ignored,
                 )),
             );
-        if self.changes.is_some() {
+        if self.changes_available(cx) {
             row =
                 row.child(
                     toolbar_button("files-open-changes", "Source Control")

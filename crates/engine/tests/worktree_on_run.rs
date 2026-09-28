@@ -147,6 +147,7 @@ fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, 
 fn run_payload(message_id: &str, repo_path: &str, space_id: Option<&str>) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
+            mcp: None,
             prompt: "isolated please".into(),
             harness: None,
             model: None,

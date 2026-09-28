@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Utc};
 use zeron_proto::{AgentAccount, AgentAccountsSnapshot, AgentUsageLine, HarnessId};
 
-use crate::settings::accounts::{PROVIDERS, provider_accounts};
+use crate::settings::accounts::{USAGE_PROVIDERS as PROVIDERS, provider_accounts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderUsageState {
@@ -426,6 +426,9 @@ mod tests {
             auth_kind: None,
             switchable: true,
             saved_at: None,
+            usage_fetched_at: None,
+            usage_error: None,
+            provider: None,
         }
     }
 

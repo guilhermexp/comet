@@ -925,6 +925,17 @@ impl Theme {
         popup
     }
 
+    /// Settings pages used the authored dark theme before the shared frost
+    /// change. Keep that foreground palette while light pages use popup text
+    /// (upstream #449's settings redesign).
+    pub fn for_settings_surface(&self) -> Self {
+        if matches!(self.appearance, Appearance::Dark) {
+            self.clone()
+        } else {
+            self.for_popup()
+        }
+    }
+
     /// The theme-owned tint floating cards paint over their backdrop blur (see
     /// [`crate::frost::frosted`]). Light coverage stays heavier because dark
     /// text is more vulnerable to unpredictable content behind a popover.
@@ -942,6 +953,30 @@ impl Theme {
                 base.a,
                 self.adverse_backdrop(),
             ))
+    }
+
+    /// The composer pill's fill: the dark frosted tint on dark glass, the
+    /// input glass otherwise. Shared by controls that should read as the
+    /// same material (the titlebar's project-action button, upstream #548).
+    pub fn composer_surface_bg(&self) -> Hsla {
+        if self.is_frost() && matches!(self.appearance, Appearance::Dark) {
+            self.composer_sidebar_tint()
+        } else {
+            self.input_glass_bg()
+        }
+    }
+
+    /// The composer pill's edge: a translucent cool silver/slate on frost,
+    /// the theme border otherwise (upstream #548's project-action button).
+    pub fn composer_surface_border(&self) -> Hsla {
+        if self.is_frost() {
+            match self.appearance {
+                Appearance::Dark => hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
+                Appearance::Light => hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
+            }
+        } else {
+            self.border
+        }
     }
 
     /// Move toward the right pane tone while keeping the backdrop visible.
@@ -1890,6 +1925,18 @@ pub fn flatten(fg: Hsla, bg: Hsla) -> Hsla {
         fb * a + bb * (1.0 - a),
     );
     hsla(h, s, l, 1.0)
+}
+
+/// Shared silver/slate edge for the composer and its companion surfaces.
+pub fn composer_surface_border(theme: &Theme) -> Hsla {
+    if theme.is_frost() {
+        match theme.appearance {
+            Appearance::Dark => hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
+            Appearance::Light => hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
+        }
+    } else {
+        theme.border
+    }
 }
 
 /// Linear per-component mix of two colors (paint helper for the gradient spinner).

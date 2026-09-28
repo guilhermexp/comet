@@ -66,9 +66,13 @@ impl OmpNormalizer {
                 .into_iter()
                 .collect(),
             Some("message_update") => self.message_update(&frame),
-            Some("message_start" | "message_end") => {
+            Some("message_start") => {
                 self.streaming_tools.clear();
                 Vec::new()
+            }
+            Some("message_end") => {
+                self.streaming_tools.clear();
+                message_usage(&frame)
             }
             Some("tool_execution_start") => self.tool_start(&frame).into_iter().collect(),
             Some("tool_execution_end") => self.tool_end(&frame),
@@ -685,6 +689,44 @@ fn tool_end(frame: &Value) -> Option<AgentEvent> {
     })
 }
 
+/// An assistant `message_end` carries the model call's usage
+/// (`{input, output, cacheRead, cacheWrite, cost: {total}}`): one Usage plus
+/// the cache/cost accounting the engine folds into the turn's stats.
+fn message_usage(frame: &Value) -> Vec<AgentEvent> {
+    let Some(message) = frame.get("message") else {
+        return Vec::new();
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(usage) = message.get("usage") else {
+        return Vec::new();
+    };
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let input = count("input");
+    let output = count("output");
+    if input.is_none() && output.is_none() {
+        return Vec::new();
+    }
+    let cost = usage
+        .get("cost")
+        .and_then(|cost| cost.get("total"))
+        .and_then(Value::as_f64);
+    vec![
+        AgentEvent::Usage {
+            input_tokens: input.unwrap_or(0),
+            output_tokens: output.unwrap_or(0),
+            context_usage: None,
+        },
+        AgentEvent::TurnMetrics {
+            cache_read_tokens: count("cacheRead"),
+            cache_write_tokens: count("cacheWrite"),
+            cost_usd: cost,
+            model_ms: None,
+        },
+    ]
+}
+
 fn execution_meta(result: &Value) -> Option<ToolExecutionMeta> {
     let details = result.get("details").unwrap_or(result);
     let exit_code = details
@@ -958,6 +1000,49 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zeron_proto::{WorkflowProgressNode, WorkflowTaskStatus, WorkflowUsage};
+
+    #[test]
+    fn assistant_message_end_reports_usage_cache_and_cost() {
+        let mut normalizer = OmpNormalizer::new("/repo", "test");
+        let events = normalizer.push(json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input": 120, "output": 40, "cacheRead": 900, "cacheWrite": 60,
+                    "totalTokens": 1120,
+                    "cost": {"input": 0.1, "output": 0.2, "cacheRead": 0.01, "cacheWrite": 0.0, "total": 0.31}
+                }
+            }
+        }));
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::Usage {
+                    input_tokens: 120,
+                    output_tokens: 40,
+                    context_usage: None
+                },
+                AgentEvent::TurnMetrics {
+                    cache_read_tokens: Some(900),
+                    cache_write_tokens: Some(60),
+                    cost_usd: Some(0.31),
+                    model_ms: None,
+                },
+            ]
+        );
+        // User/tool messages and usage-less ends stay silent.
+        assert!(
+            normalizer
+                .push(json!({"type":"message_end","message":{"role":"user","usage":{"input":1}}}))
+                .is_empty()
+        );
+        assert!(
+            normalizer
+                .push(json!({"type":"message_end","message":{"role":"assistant"}}))
+                .is_empty()
+        );
+    }
 
     #[test]
     fn edit_result_details_preserve_authoritative_snapshots() {

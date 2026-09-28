@@ -470,9 +470,13 @@ mod tests {
             method: &str,
             _params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
-            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST
-                && method != methods::WATCH_TRAJECTORY
-            {
+            if !matches!(
+                method,
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                    | methods::WATCH_TRAJECTORY
+                    | methods::WATCH_HARNESS_UPDATES
+                    | "Silent"
+            ) {
                 if method == "Echo" {
                     return Ok(RpcReply::Value(_params));
                 }
@@ -484,6 +488,15 @@ mod tests {
                 drop(guard);
                 item
             });
+            if method == methods::WATCH_HARNESS_UPDATES {
+                // Update watches send an initial status snapshot, then may stay
+                // quiet indefinitely. Legacy peers do not send a readiness frame.
+                return Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(stream)
+                        .boxed(),
+                ));
+            }
             Ok(RpcReply::Stream(stream.boxed()))
         }
     }
@@ -585,6 +598,66 @@ mod tests {
             .await
             .expect("server stream cancelled")
             .expect("drop signal");
+    }
+
+    #[tokio::test]
+    async fn scoped_subscription_returns_before_first_item_and_cancels_silence() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let service = Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let client = memory_client(service.clone());
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.subscribe_scoped("Silent", serde_json::Value::Null),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        while service.dropped.lock().unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_one_device_update_watch_preserves_the_other() {
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        let first = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(first_tx)),
+        }));
+        let second = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(second_tx)),
+        }));
+        let first_watch = first
+            .subscribe_checked(methods::WATCH_HARNESS_UPDATES, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let second_watch = second
+            .subscribe_checked(methods::WATCH_HARNESS_UPDATES, serde_json::Value::Null)
+            .await
+            .unwrap();
+
+        drop(first_watch);
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_rx)
+            .await
+            .expect("first device's quiet stream cancelled")
+            .expect("first drop signal");
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        drop(second_watch);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_rx)
+            .await
+            .expect("second device's quiet stream cancelled")
+            .expect("second drop signal");
     }
 
     #[tokio::test]

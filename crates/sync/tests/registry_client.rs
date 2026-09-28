@@ -125,6 +125,7 @@ async fn two_clients_converge_and_stream_live_updates() {
             updated_at: ts(3_500),
             context_usage: None,
             error: None,
+            turn_stats: None,
         })
         .unwrap();
     }
@@ -440,6 +441,7 @@ async fn churn_stays_bounded_no_history_growth() {
                 updated_at: ts(i + 1),
                 context_usage: None,
                 error: None,
+                turn_stats: None,
             })
             .unwrap();
         }

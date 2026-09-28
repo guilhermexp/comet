@@ -283,6 +283,7 @@ impl WorkspaceDoc {
             chat.harness_session_cwd.as_deref(),
         )?;
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
+        set_opt_str(&row, "parentChatId", chat.parent_chat_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
         set_opt_str(&row, "parentChatId", chat.parent_chat_id.as_deref())?;
         set_opt_str(&row, "originChatId", chat.origin_chat_id.as_deref())?;
@@ -823,6 +824,7 @@ impl From<RawSession> for Session {
             // status strip on the device that ran the turn. The synced row
             // carries status alone — remote sidebars show a dot, not a cause.
             error: None,
+            turn_stats: None,
         }
     }
 }
@@ -932,6 +934,7 @@ mod tests {
             updated_at: ts(3_500),
             context_usage: None,
             error: None,
+            turn_stats: None,
         }
     }
 
@@ -1312,6 +1315,7 @@ mod partial_context_tests {
                 context_usage: None,
                 error: None,
                 last_completed_turn: None,
+                turn_stats: None,
             };
             row.context_usage = Some(usage);
             doc.upsert_session(&row).unwrap();

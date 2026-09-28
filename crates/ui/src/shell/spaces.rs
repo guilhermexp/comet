@@ -482,7 +482,12 @@ pub(super) mod pinned_session_tests {
     fn sidebar_unconfirmed_write_stops_the_queue_without_overwriting_observed_pins(
         cx: &mut gpui::TestAppContext,
     ) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        // RPC completion (including channel closure during teardown) must wake
+        // GPUI on the deterministic test scheduler's owning thread.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
         let (engine, _requests, _replies) = pin_test_engine();
         let dir = tempfile::tempdir().unwrap();
@@ -524,8 +529,8 @@ pub(super) mod pinned_session_tests {
     fn sidebar_optimistic_writes_preserve_newer_edits_and_watch_state_on_failure(
         cx: &mut gpui::TestAppContext,
     ) {
-        // GPUI's test scheduler is single-threaded. A multi-thread Tokio
-        // reader can wake its local task from a worker thread during this test.
+        // RPC completion (including channel closure during teardown) must wake
+        // GPUI on the deterministic test scheduler's owning thread.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -608,7 +613,12 @@ pub(super) mod pinned_session_tests {
     fn sidebar_write_acknowledgements_ignore_older_watches_and_previous_operations(
         cx: &mut gpui::TestAppContext,
     ) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        // RPC completion (including channel closure during teardown) must wake
+        // GPUI on the deterministic test scheduler's owning thread.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
         let (engine, _requests, _replies) = pin_test_engine();
         let dir = tempfile::tempdir().unwrap();
@@ -649,7 +659,12 @@ pub(super) mod pinned_session_tests {
     fn sidebar_write_replies_cannot_cross_profile_or_engine_boundaries(
         cx: &mut gpui::TestAppContext,
     ) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        // RPC completion (including channel closure during teardown) must wake
+        // GPUI on the deterministic test scheduler's owning thread.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
         let dir = tempfile::tempdir().unwrap();
         let window = pin_test_shell(cx, dir.path());
@@ -2095,7 +2110,7 @@ pub(super) struct RenameSpaceDialog {
 }
 
 /// Dot color for a chat's display status (tab dots + Sessions rows).
-pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
+pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
     match status {
         // Preset activity tone, not warning amber: running is routine.
         // Non-done statuses sit well below full
@@ -3575,6 +3590,7 @@ impl Shell {
                     .child(crate::settings::widgets::toggle_switch(
                         theme,
                         self.settings.sidebar_compact,
+                        "sidebar-view-compact",
                     )),
                 )
                 .into_any_element(),

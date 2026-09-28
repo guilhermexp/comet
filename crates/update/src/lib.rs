@@ -45,6 +45,11 @@ const CHECK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// While an auto-apply is deferred behind active sessions, re-probe idleness
 /// this often.
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Release metadata is tiny. Bound both its buffered size and total transfer
+/// time so a compromised or misconfigured public feed cannot hold a checker
+/// forever or make every local install buffer an unbounded response.
+const RELEASE_METADATA_MAX_BYTES: usize = 1024 * 1024;
+const RELEASE_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Release metadata
@@ -138,30 +143,31 @@ pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
     let base = release_base(edge_url)?;
     let client = http_client()?;
     let manifest_url = format!("{base}/manifest.json");
-    match client.get(&manifest_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let manifest: Manifest = resp.json().await.context("parsing manifest.json")?;
+    match fetch_release_metadata(&client, &manifest_url).await {
+        Ok(response) if response.status.is_success() => {
+            let manifest: Manifest =
+                serde_json::from_slice(&response.body).context("parsing manifest.json")?;
             if manifest.version.trim().is_empty() {
                 bail!("manifest.json has an empty version");
             }
             return Ok(manifest);
         }
-        Ok(resp) => {
-            tracing::debug!(status = %resp.status(), "manifest.json unavailable; trying latest.txt")
+        Ok(response) => {
+            tracing::debug!(status = %response.status, "manifest.json unavailable; trying latest.txt")
         }
         Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
     }
     let latest_url = format!("{base}/latest.txt");
-    let version = client
-        .get(&latest_url)
-        .send()
+    let response = fetch_release_metadata(&client, &latest_url)
         .await
-        .context("fetching latest.txt")?
-        .error_for_status()
-        .context("fetching latest.txt")?
-        .text()
-        .await
-        .context("reading latest.txt")?
+        .context("fetching latest.txt")?;
+    anyhow::ensure!(
+        response.status.is_success(),
+        "fetching latest.txt: HTTP {}",
+        response.status
+    );
+    let version = std::str::from_utf8(&response.body)
+        .context("reading latest.txt as UTF-8")?
         .trim()
         .to_string();
     if version.is_empty() {
@@ -171,6 +177,67 @@ pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
         version,
         files: BTreeMap::new(),
     })
+}
+
+#[derive(Debug)]
+struct ReleaseMetadataResponse {
+    status: reqwest::StatusCode,
+    body: Vec<u8>,
+}
+
+async fn fetch_release_metadata(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<ReleaseMetadataResponse> {
+    fetch_release_metadata_with_limits(
+        client,
+        url,
+        RELEASE_METADATA_TIMEOUT,
+        RELEASE_METADATA_MAX_BYTES,
+    )
+    .await
+}
+
+async fn fetch_release_metadata_with_limits(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> anyhow::Result<ReleaseMetadataResponse> {
+    let request = async {
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Ok(ReleaseMetadataResponse {
+                status,
+                body: Vec::new(),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            bail!("release metadata exceeds {max_bytes} bytes");
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading release metadata")?;
+            anyhow::ensure!(
+                body.len().saturating_add(chunk.len()) <= max_bytes,
+                "release metadata exceeds {max_bytes} bytes"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(ReleaseMetadataResponse { status, body })
+    };
+    tokio::time::timeout(timeout, request)
+        .await
+        .with_context(|| format!("fetching {url} exceeded the metadata deadline"))?
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -231,7 +298,27 @@ fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Some(url) = windows::release_url()? {
         return Ok(url.trim_end_matches('/').to_owned());
     }
-    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
+    edge_release_base(edge_url)
+}
+
+/// `{edge}/releases`, except on the upstream Zeron edge: its feed publishes
+/// Zeron builds (a newer version line), so a Comet install would "update"
+/// into another product. Comet has no hosted feed; set `ZERON_RELEASES_URL`.
+fn edge_release_base(edge_url: &str) -> anyhow::Result<String> {
+    let edge_url = edge_url.trim_end_matches('/');
+    let host = reqwest::Url::parse(edge_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    anyhow::ensure!(
+        !host.is_some_and(|host| host == "zeron.sh" || host.ends_with(".zeron.sh")),
+        "no Comet release feed configured (set ZERON_RELEASES_URL)"
+    );
+    Ok(format!("{edge_url}/releases"))
+}
+
+/// Whether a release feed exists for this edge (see [`edge_release_base`]).
+pub fn has_release_feed(edge_url: &str) -> bool {
+    release_base(edge_url).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -850,8 +937,12 @@ impl Updater {
             shutdown_tx: Arc::new(shutdown_tx),
             check_task: Arc::new(std::sync::Mutex::new(None)),
         };
+        // Subscribe before spawning so an immediate `check_now` cannot land
+        // before the background task first polls and be lost behind the 20s
+        // initial delay.
+        let checks = updater.check_tx.subscribe();
         let for_loop = updater.clone();
-        let task = tokio::spawn(async move { for_loop.check_loop(shutdown_rx).await });
+        let task = tokio::spawn(async move { for_loop.check_loop(shutdown_rx, checks).await });
         *updater.check_task.lock().unwrap() = Some(task);
         updater
     }
@@ -882,14 +973,17 @@ impl Updater {
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
-    async fn check_loop(&self, mut shutdown: watch::Receiver<bool>) {
+    async fn check_loop(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+        mut checks: watch::Receiver<u64>,
+    ) {
         // Shutdown must cut the loop at ANY await point — including mid
         // `check_once()` / `auto_apply_when_idle()` HTTP — so the whole body
         // races the flag rather than checking it between iterations.
         tokio::select! {
             _ = shutdown.wait_for(|stop| *stop) => {}
             _ = async {
-                let mut checks = self.check_tx.subscribe();
                 tokio::select! {
                     _ = tokio::time::sleep(CHECK_INITIAL_DELAY) => {}
                     _ = checks.changed() => {}
@@ -1184,6 +1278,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_metadata_has_size_and_total_time_limits() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Reject an advertised oversized body before buffering it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n01234567890")
+                .await
+                .unwrap();
+        });
+        let client =
+            http_client_with_timeouts(Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        let error = fetch_release_metadata_with_limits(
+            &client,
+            &format!("http://{address}"),
+            Duration::from_secs(1),
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds 10 bytes"));
+        server.await.unwrap();
+
+        // Enforce the same cap when Content-Length is absent.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n01234567890")
+                .await
+                .unwrap();
+        });
+        let error = fetch_release_metadata_with_limits(
+            &client,
+            &format!("http://{address}"),
+            Duration::from_secs(1),
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds 10 bytes"));
+        server.await.unwrap();
+
+        // Progressing bytes stay below the client's inactivity timeout but
+        // must still obey the metadata operation's total deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..10 {
+                if socket.write_all(b"x").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+        let error = fetch_release_metadata_with_limits(
+            &client,
+            &format!("http://{address}"),
+            Duration::from_millis(80),
+            100,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("metadata deadline"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn stalled_update_tls_handshake_has_a_connect_deadline() {
         use std::time::Duration;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1203,6 +1381,22 @@ mod tests {
         .unwrap_err();
         assert!(error.is_timeout());
         server.abort();
+    }
+
+    #[test]
+    fn upstream_zeron_edge_is_not_a_comet_release_feed() {
+        for edge in [
+            "https://edge.zeron.sh",
+            "https://zeron.sh/",
+            "https://EDGE.Zeron.sh",
+        ] {
+            assert!(edge_release_base(edge).is_err(), "accepted {edge}");
+        }
+        assert_eq!(
+            edge_release_base("https://edge.example.com/").unwrap(),
+            "https://edge.example.com/releases"
+        );
+        assert!(edge_release_base("https://notzeron.sh").is_ok());
     }
 
     #[test]

@@ -1,7 +1,14 @@
 #!/bin/sh
 set -eu
 
-if [ "${1:-}" = "__sessions_mcp__" ]; then
+schema='{"type":"object","required":["action"],"properties":{"action":{"type":"string"}}}'
+if [ "${1:-}" = "mcp" ]; then
+  # `zeron mcp`: many chat tools, identified by the originating chat.
+  [ "${ZERON_CHAT_ID:-}" = "chat-1" ] || exit 12
+  tool=zeron
+  label="zeron $ZERON_CHAT_ID"
+  tools="[{\"name\":\"list_chats\",\"description\":\"List chats\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"create_chat\",\"description\":\"Create a chat\",\"inputSchema\":{\"type\":\"object\"}}]"
+elif [ "${1:-}" = "__sessions_mcp__" ]; then
   [ "${COMET_SESSIONS_CONTROLLER:-}" = "1" ] || exit 12
   tool=sessions
   label="sessions help"
@@ -10,6 +17,7 @@ else
   tool=workers
   label="worker help"
 fi
+[ -n "${tools:-}" ] || tools="[{\"name\":\"$tool\",\"description\":\"Coordinate test workers\",\"inputSchema\":$schema}]"
 emit() { printf '%s\n' "$1"; }
 rid() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'; }
 
@@ -19,7 +27,7 @@ while IFS= read -r line; do
       emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake-workers\",\"version\":\"1\"}}}"
       ;;
     *'"method":"tools/list"'*)
-      emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"tools\":[{\"name\":\"$tool\",\"description\":\"Coordinate test workers\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"action\"],\"properties\":{\"action\":{\"type\":\"string\"}}}}]}}"
+      emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"tools\":$tools}}"
       ;;
     *'"method":"tools/call"'*)
       case "$line" in

@@ -67,3 +67,9 @@ base_revision_resolves_upstream = false
 # auto-title — labels the Session from the briefing's first line via
 # normalize_prompt_title. Workers launched after 2026-09-22 were all titled by
 # their bare command. Change lives in controller_api.rs.
+
+# 2026-09-27 — session_host.rs: idle scan backoff. When a hosted session's
+# screen has not changed for 60 s, the menu-prompt and runtime-observer scans
+# drop from 500/300 ms to 2 s until the next change (`scan_interval_ms`).
+# Finished Workers left at their prompt polled at full cadence for hours
+# (~2% CPU per host). Local change only; no upstream patch implied.

@@ -38,6 +38,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     let harness = AcpHarness::pi();
     let (_steer_tx, steering) = mpsc::channel(1);
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
@@ -45,6 +46,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         generate_native_title: false,
     };
     let request = RunRequest {
+        mcp: None,
         prompt: "hi".into(),
         harness: None,
         model: None,

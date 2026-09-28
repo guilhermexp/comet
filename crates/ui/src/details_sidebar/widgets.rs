@@ -277,121 +277,113 @@ impl ChatWorkersWidgetState {
     }
 }
 
+/// A Details widget: one bordered card, titled header, body rows below.
 pub fn widget_card(
     id: &'static str,
-    icon_path: &'static str,
+    _icon_path: &'static str,
     title: impl Into<SharedString>,
     body: Div,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
-    // Header plate matches the composer input (`theme.composer_glass_bg`).
-    // The body stays on the pane — no card fill, no hairline.
-    div()
-        .id(id)
-        .w_full()
-        .child(
-            div()
-                .h(px(36.0))
-                .px(px(10.0))
-                .rounded(px(8.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .bg(theme.composer_glass_bg())
-                .child(
-                    icons::icon(icon_path)
-                        .size(px(15.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(title.into()),
-                ),
-        )
+    details_card(id, theme)
+        .child(card_header(title, None, theme))
         .child(body)
 }
 
-pub fn property_row(
-    icon_path: &'static str,
-    label: impl Into<SharedString>,
-    value: impl Into<SharedString>,
+/// The bordered surface every Details widget sits on. Sections inside are
+/// separated with [`card_divider`].
+pub fn details_card(id: &'static str, theme: &Theme) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(theme.border.opacity(0.8))
+        .bg(theme.composer_glass_bg())
+        .py(px(4.0))
+        .flex()
+        .flex_col()
+}
+
+pub fn card_divider(theme: &Theme) -> Div {
+    div()
+        .mx(px(12.0))
+        .my(px(4.0))
+        .h(px(1.0))
+        .flex_none()
+        .bg(theme.border.opacity(0.7))
+}
+
+/// Section title (semibold) with an optional right-aligned value.
+pub fn card_header(
+    title: impl Into<SharedString>,
+    trailing: Option<AnyElement>,
     theme: &Theme,
 ) -> Div {
     div()
         .h(px(30.0))
-        .px(px(10.0))
+        .px(px(12.0))
         .flex()
         .items_center()
-        .child(
-            div()
-                .w(px(108.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .child(
-                    icons::icon(icon_path)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(label.into()),
-                ),
-        )
+        .gap(px(8.0))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(12.0))
+                .text_size(px(13.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text)
-                .child(value.into()),
+                .child(title.into()),
         )
+        .children(trailing.map(|trailing| {
+            div()
+                .flex_none()
+                .max_w(gpui::relative(0.6))
+                .truncate()
+                .text_size(px(12.5))
+                .text_color(theme.text_muted)
+                .child(trailing)
+        }))
 }
-pub fn property_row_custom(
-    icon_path: &'static str,
-    label: impl Into<SharedString>,
-    value_element: AnyElement,
+
+/// A card row: optional icon, the label in the body color, and a muted
+/// right-aligned value.
+pub fn card_row(
+    icon_path: Option<&'static str>,
+    label: impl IntoElement,
+    trailing: Option<AnyElement>,
     theme: &Theme,
 ) -> Div {
     div()
-        .h(px(30.0))
-        .px(px(10.0))
+        .h(px(28.0))
+        .px(px(12.0))
         .flex()
         .items_center()
-        .child(
-            div()
-                .w(px(108.0))
+        .gap(px(8.0))
+        .children(icon_path.map(|path| {
+            icons::icon(path)
+                .size(px(15.0))
                 .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .child(
-                    icons::icon(icon_path)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(label.into()),
-                ),
-        )
+                .text_color(theme.text_muted)
+        }))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .flex()
-                .items_center()
-                .child(value_element),
+                .truncate()
+                .text_size(px(12.5))
+                .text_color(theme.text)
+                .child(label),
         )
+        .children(trailing.map(|trailing| {
+            div()
+                .flex_none()
+                .text_size(px(12.5))
+                .text_color(theme.text_muted)
+                .child(trailing)
+        }))
 }
 
 #[cfg(test)]

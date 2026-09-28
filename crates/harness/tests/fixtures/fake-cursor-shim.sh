@@ -21,6 +21,20 @@ esac
 
 case "$first" in
 
+*scenario:mcp*)
+  case "$first" in
+    *'"mcp":{"args":["mcp"],"command":"/path with spaces/zeron","env":{"ZERON_CHAT_ID":"origin-chat"},"name":"zeron"}'*) ;;
+    # serde_json `preserve_order` (unified in workspace test runs) keeps
+    # McpServer's field order instead of sorting keys.
+    *'"mcp":{"name":"zeron","command":"/path with spaces/zeron","args":["mcp"],"env":{"ZERON_CHAT_ID":"origin-chat"}}'*) ;;
+    *) exit 1 ;;
+  esac
+  emit '{"ev":"ready","agentId":"agent-1","model":"auto"}'
+  emit '{"ev":"text","text":"mcp configured"}'
+  emit '{"ev":"turn","status":"finished"}'
+  read -r next || exit 0
+  ;;
+
 *scenario:burst*)
   exec node "$(dirname "$0")/cursor-steering-peer.mjs" "$first"
   ;;
@@ -52,7 +66,8 @@ case "$first" in
   # Parked: wait for a follow-up or stdin EOF.
   read -r next || exit 0
   case "$next" in
-  *'"op":"user"'*)
+  *'"op":"steer"'*)
+    emit '{"ev":"steered"}'
     emit '{"ev":"text","text":"second turn"}'
     emit '{"ev":"turn","status":"finished"}'
     ;;

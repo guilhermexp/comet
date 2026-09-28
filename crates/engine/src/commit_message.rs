@@ -114,7 +114,14 @@ pub(crate) async fn generate(
                 )
             })?;
         let harness = registry.resolve(id)?;
-        let model = crate::titles::cheapest_model_before(harness.as_ref(), deadline).await;
+        // Hold one execution lease across discovery and the run so a queued
+        // agent CLI update cannot replace the binary underneath (upstream #389).
+        let execution_lease = Arc::new(registry.execution_lease(id).await);
+        let model = crate::titles::cheapest_model_before(
+            registry.discover_models_with_lease(id, execution_lease.clone()),
+            deadline,
+        )
+        .await;
         let scratch = tempfile::tempdir().map_err(|e| EngineError::Other(e.to_string()))?;
         let request = RunRequest {
             prompt,
@@ -128,6 +135,7 @@ pub(crate) async fn generate(
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
             sessions: None,
+            mcp: None,
             attachments: Vec::new(),
             resume: None,
             worktree: None,
@@ -137,6 +145,7 @@ pub(crate) async fn generate(
             harness.as_ref(),
             &request_id,
             request,
+            Some(execution_lease),
             INSTRUCTIONS,
         )
         .await?;

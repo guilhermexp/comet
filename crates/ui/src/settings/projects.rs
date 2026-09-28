@@ -977,7 +977,7 @@ fn dirs_home() -> Option<PathBuf> {
 
 impl Render for ProjectsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx).clone();
+        let theme = Theme::of(cx).for_settings_surface();
         let query = self.search.read(cx).text().to_owned();
         let groups = project_ledger::group_rows(&self.rows);
         let visible: Vec<project_ledger::ProjectGroup> = groups
@@ -1066,7 +1066,7 @@ impl ProjectsPage {
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(13.0))
+                                .text_size(crate::typography::ui_rems(13.0))
                                 .text_color(if selected {
                                     theme.text
                                 } else {
@@ -1077,8 +1077,8 @@ impl ProjectsPage {
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(11.0))
-                                .text_color(theme.text_muted.opacity(0.5))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(subtitle)),
                         ),
                 )
@@ -1108,7 +1108,8 @@ impl ProjectsPage {
                     .items_center()
                     .gap(px(6.0))
                     .px(px(8.0))
-                    .pt(px(8.0))
+                    // Settings spans the window: clear the overlaid titlebar.
+                    .pt(px(Theme::TITLEBAR_HEIGHT + 8.0))
                     .child(div().flex_1().min_w_0().child(self.search.clone()))
                     .child(action_button(
                         theme,
@@ -1116,19 +1117,23 @@ impl ProjectsPage {
                         cx.listener(|page, _, _, cx| page.reconcile_identity(cx)),
                     ))
                     .child(
-                        div()
+                        widgets::action_button(theme, widgets::ActionTone::Quiet)
                             .id("projects-add")
                             .flex_none()
-                            .size(px(28.0))
-                            .rounded(px(8.0))
-                            .flex()
-                            .items_center()
+                            .w(px(32.0))
+                            .px_0()
                             .justify_center()
-                            .cursor_pointer()
-                            .text_color(theme.text_muted)
-                            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label("Add project")
+                            .tooltip(widgets::text_tooltip("Add project"))
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
                             .on_click(cx.listener(|page, _, _, cx| page.pick_folder(cx)))
-                            .child(crate::icons::icon(crate::icons::PLUS).size(px(16.0))),
+                            .child(
+                                crate::icons::icon(crate::icons::PLUS)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            ),
                     ),
             )
             .child(
@@ -1155,13 +1160,9 @@ impl ProjectsPage {
                     .children(rows)
                     .when(!pending_rows.is_empty(), |el| {
                         el.child(
-                            div()
-                                .px(px(8.0))
+                            widgets::section_label(theme, "Association pending")
                                 .pt(px(10.0))
-                                .pb(px(4.0))
-                                .text_size(px(11.0))
-                                .text_color(theme.text_muted)
-                                .child("Association pending"),
+                                .pb(px(4.0)),
                         )
                         .children(pending_rows)
                     }),
@@ -1316,7 +1317,7 @@ impl ProjectsPage {
                                             .flex_none()
                                             .max_w(px(220.0))
                                             .truncate()
-                                            .text_size(px(12.5))
+                                            .text_size(crate::typography::ui_rems(12.5))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(theme.text)
                                             .child(SharedString::from(checkout.name.clone())),
@@ -1326,7 +1327,7 @@ impl ProjectsPage {
                                             div()
                                                 .min_w_0()
                                                 .truncate()
-                                                .text_size(px(11.5))
+                                                .text_size(crate::typography::ui_rems(11.5))
                                                 .text_color(theme.text_muted)
                                                 .child(SharedString::from(branch.to_string())),
                                         )
@@ -1335,7 +1336,7 @@ impl ProjectsPage {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(11.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
                                     .text_color(theme.text_muted.opacity(0.6))
                                     .child(SharedString::from(display_path(
                                         &checkout.path,
@@ -1352,7 +1353,7 @@ impl ProjectsPage {
                                 .py(px(2.0))
                                 .rounded_full()
                                 .bg(theme.warning.opacity(0.12))
-                                .text_size(px(10.5))
+                                .text_size(crate::typography::ui_rems(10.5))
                                 .text_color(theme.warning_muted)
                                 .child(SharedString::from(status)),
                         )
@@ -1637,7 +1638,7 @@ impl ProjectsPage {
                             .py(px(4.0))
                             .rounded(px(6.0))
                             .bg(ink(0.04))
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text)
                             .child(SharedString::from(current.to_string())),
                     )
@@ -1758,7 +1759,7 @@ impl ProjectsPage {
                             .child(
                                 div()
                                     .w_full()
-                                    .text_size(px(12.0))
+                                    .text_size(crate::typography::ui_rems(12.0))
                                     .line_height(px(17.0))
                                     .text_color(theme.danger)
                                     .child(SharedString::from(error.to_owned())),
@@ -1787,7 +1788,7 @@ impl ProjectsPage {
                 .child(
                     div()
                         .w_full()
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .line_height(px(17.0))
                         .font_family(theme.font_mono.clone())
                         .text_color(theme.text_muted)
@@ -1819,7 +1820,7 @@ impl ProjectsPage {
                     .child(
                         div()
                             .min_w_0()
-                            .text_size(px(13.0))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(SharedString::from(presentation.label.clone())),
@@ -1827,7 +1828,7 @@ impl ProjectsPage {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.5))
+                            .text_size(crate::typography::ui_rems(11.5))
                             .text_color(if needs_approval {
                                 theme.warning
                             } else {
@@ -1844,7 +1845,7 @@ impl ProjectsPage {
                     .py(px(8.0))
                     .rounded(px(6.0))
                     .bg(ink(0.04))
-                    .text_size(px(11.5))
+                    .text_size(crate::typography::ui_rems(11.5))
                     .line_height(px(16.0))
                     .font_family(theme.font_mono.clone())
                     .text_color(theme.text)
@@ -2199,10 +2200,13 @@ pub fn auto_doc_prompt(added: Option<&AnchorCommit>, opened: Option<&AnchorCommi
 /// Tallest the checkout list grows before it scrolls: five rows.
 const CHECKOUT_LIST_MAX_HEIGHT: f32 = 236.0;
 
-/// A section title below the first. `section_card` already puts 24px between
-/// a title and its card; nothing separated a card from the next title.
+/// A section title below the first, in the settings pages' plain section
+/// label (upstream #449). `section_card` keeps its own 24px top margin, so
+/// the label pulls the card back to the 8px gap `widgets::section` uses.
 fn section_header(theme: &Theme, title: &str) -> gpui::Div {
-    widgets::page_header(theme, title, None).mt(px(40.0))
+    widgets::section_label(theme, SharedString::from(title.to_string()))
+        .mt(px(32.0))
+        .mb(px(-16.0))
 }
 
 /// The settings text-field chrome ([`popover::dialog_field`]) at row density:
@@ -2210,7 +2214,7 @@ fn section_header(theme: &Theme, title: &str) -> gpui::Div {
 fn field_frame(input: AnyElement) -> gpui::Div {
     crate::popover::dialog_field(input)
         .py(px(6.0))
-        .text_size(px(13.0))
+        .text_size(crate::typography::ui_rems(13.0))
 }
 
 /// A path for display, with the home directory folded to `~`.
@@ -2226,20 +2230,19 @@ fn label_block(theme: &Theme, label: &str, description: &str) -> AnyElement {
         .min_w_0()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .text_size(px(13.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .truncate()
-                .text_size(px(12.0))
-                .text_color(theme.text_muted)
-                .child(SharedString::from(description.to_string())),
-        )
+        .child(widgets::row_title(
+            theme,
+            SharedString::from(label.to_string()),
+        ))
+        .child(widgets::meta_line(
+            theme,
+            vec![
+                div()
+                    .truncate()
+                    .child(SharedString::from(description.to_string()))
+                    .into_any_element(),
+            ],
+        ))
         .into_any_element()
 }
 
@@ -2251,21 +2254,14 @@ fn label_block_wrapped(theme: &Theme, label: &str, description: &str) -> AnyElem
         .min_w_0()
         .flex()
         .flex_col()
-        .gap(px(2.0))
-        .child(
-            div()
-                .text_size(px(13.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .text_size(px(12.0))
-                .line_height(px(17.0))
-                .text_color(theme.text_muted)
-                .child(SharedString::from(description.to_string())),
-        )
+        .child(widgets::row_title(
+            theme,
+            SharedString::from(label.to_string()),
+        ))
+        .child(widgets::meta_line(
+            theme,
+            vec![SharedString::from(description.to_string()).into_any_element()],
+        ))
         .into_any_element()
 }
 
@@ -2302,7 +2298,7 @@ fn value_block(theme: &Theme, value: &str, commit: Option<&AnchorCommit>) -> Any
         .items_end()
         .child(
             div()
-                .text_size(px(12.5))
+                .text_size(crate::typography::ui_rems(12.5))
                 .text_color(theme.text_muted)
                 .child(SharedString::from(value.to_string())),
         )
@@ -2310,8 +2306,8 @@ fn value_block(theme: &Theme, value: &str, commit: Option<&AnchorCommit>) -> Any
             el.child(
                 div()
                     .truncate()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
                     .child(SharedString::from(format!(
                         "{} · {}",
                         commit.short_hash, commit.subject
@@ -2329,27 +2325,26 @@ fn action_button(
     action_button_with_id(theme, format!("action-{label}"), label, on_click)
 }
 
+/// A row action in the settings pages' shared button language
+/// ([`widgets::text_action`], filled tone on a block).
 fn action_button_with_id(
     theme: &Theme,
     id: String,
     label: &str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
-    div()
-        .id(SharedString::from(id))
-        .flex_none()
-        .px(px(10.0))
-        .py(px(5.0))
-        .rounded(px(7.0))
-        .border_1()
-        .border_color(theme.border)
-        .text_size(px(12.0))
-        .text_color(theme.text_muted)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-        .on_click(on_click)
-        .child(SharedString::from(label.to_string()))
-        .into_any_element()
+    widgets::text_action(
+        theme,
+        widgets::ActionTone::Filled,
+        SharedString::from(label.to_string()),
+    )
+    .id(SharedString::from(id))
+    .flex_none()
+    .tab_index(0)
+    .role(gpui::Role::Button)
+    .focus_visible(|s| s.border_2().border_color(theme.accent))
+    .on_click(on_click)
+    .into_any_element()
 }
 
 /// The confirming half of a destructive action: same shape as
@@ -2359,19 +2354,16 @@ fn danger_button(
     label: &str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
-    div()
+    let danger = theme.danger;
+    widgets::action_button(theme, widgets::ActionTone::Quiet)
         .id(SharedString::from(format!("danger-{label}")))
         .flex_none()
-        .px(px(10.0))
-        .py(px(5.0))
-        .rounded(px(7.0))
-        .border_1()
-        .border_color(theme.danger.opacity(0.4))
-        .bg(theme.danger.opacity(0.1))
-        .text_size(px(12.0))
-        .text_color(theme.danger)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.danger.opacity(0.18)))
+        .bg(danger.opacity(0.1))
+        .text_color(danger)
+        .hover(move |s| s.bg(danger.opacity(0.18)).text_color(danger))
+        .tab_index(0)
+        .role(gpui::Role::Button)
+        .focus_visible(|s| s.border_2().border_color(theme.accent))
         .on_click(on_click)
         .child(SharedString::from(label.to_string()))
         .into_any_element()
@@ -2381,8 +2373,8 @@ fn quiet(theme: &Theme, copy: &str) -> AnyElement {
     div()
         .px(px(8.0))
         .py(px(10.0))
-        .text_size(px(12.0))
-        .text_color(theme.text_muted.opacity(0.7))
+        .text_size(crate::typography::ui_rems(12.0))
+        .text_color(theme.text_muted)
         .child(SharedString::from(copy.to_string()))
         .into_any_element()
 }

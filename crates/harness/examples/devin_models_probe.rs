@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         request_input: Box::new(|_| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -41,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt: "Reply with exactly: Devin model discovery verified. Do not use tools.".into(),
         harness: None,
         model: Some(model.clone()),

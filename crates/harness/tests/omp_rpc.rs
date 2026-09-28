@@ -118,6 +118,7 @@ fn request(prompt: &str) -> RunRequest {
         resume: None,
         attachments: Vec::new(),
         worktree: None,
+        mcp: None,
     }
 }
 
@@ -131,6 +132,7 @@ fn controls_with_answer(
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let answers = questions
@@ -160,6 +162,7 @@ fn controls_with_pending_answer() -> (
     let interrupt = CancellationToken::new();
     let held = Arc::new(Mutex::new(Vec::new()));
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(move |_questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             held.lock().unwrap().push(tx);
@@ -182,6 +185,7 @@ fn controls_declining() -> (
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let answers = questions
@@ -1231,6 +1235,32 @@ async fn workers_host_tool_is_registered_only_when_enabled() {
     assert_eq!(result["isError"], false);
     assert_eq!(result["result"]["content"][0]["text"], "worker help");
     enabled.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn root_grant_serves_every_zeron_chat_tool_as_a_host_tool() {
+    let grant = SessionsGrant {
+        parent_chat_id: "chat-1".into(),
+        endpoint: "ws://127.0.0.1:9".into(),
+        engine_id: "engine-1".into(),
+    };
+    let zeron = WorkersBridge::start_zeron(&fake_workers_controller_path(), &grant)
+        .await
+        .unwrap()
+        .unwrap();
+    let names: Vec<_> = zeron
+        .definitions()
+        .iter()
+        .map(|definition| definition["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["list_chats", "create_chat"]);
+    assert!(zeron.serves("create_chat") && !zeron.serves("sessions"));
+    let result = zeron
+        .handle_call("omp-call-z", "create_chat", json!({}))
+        .await;
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["result"]["content"][0]["text"], "zeron chat-1");
+    zeron.shutdown().await.unwrap();
 }
 
 #[tokio::test]

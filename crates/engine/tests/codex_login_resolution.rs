@@ -20,6 +20,11 @@ fn test_accounts(root: &Path) -> AgentAccounts {
         cursor_sdk_auth_file: root.join("cursor-sdk").join("auth.json"),
         cursor_state_db: root.join("cursor").join("state.vscdb"),
         grok_home: root.join("grok"),
+        // File-only: a temp config must never reach the real Keychain login.
+        claude_keychain_service: None,
+        antigravity_home: Some(root.join("gemini")),
+        antigravity_keychain: false,
+        ..AgentAccountsConfig::isolated(root)
     };
     AgentAccounts::new(config)
 }

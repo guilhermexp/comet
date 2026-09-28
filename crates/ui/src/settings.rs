@@ -26,6 +26,7 @@ pub mod harnesses;
 pub mod notifications;
 pub mod projects;
 pub mod shortcuts;
+pub mod thread_naming;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -454,6 +455,21 @@ pub fn set_transcript_compact_mode(enabled: bool, cx: &mut App) {
     }
 }
 
+/// Command cards start collapsed (see `UiSettings::collapse_command_blocks`).
+pub fn collapse_command_blocks(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.collapse_command_blocks)
+        .unwrap_or_default()
+}
+
+pub fn set_collapse_command_blocks(enabled: bool, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.collapse_command_blocks = enabled;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
 /// Mutate the central settings value and schedule its single writer.
 pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSettings)) -> bool {
     if !cx.has_global::<SettingsStore>() {
@@ -499,6 +515,7 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.sound_attention_enabled = shell.sound_attention_enabled;
     current.notifications_enabled = shell.notifications_enabled;
     current.notifications_background_only = shell.notifications_background_only;
+    current.agent_update_notifications = shell.agent_update_notifications;
     current.files_panel_width = shell.files_panel_width;
     current.right_pane_width = shell.right_pane_width;
     current.details_sidebar_width = shell.details_sidebar_width;
@@ -514,6 +531,8 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.files_autosave_delay_ms = shell.files_autosave_delay_ms;
     current.files_word_wrap = shell.files_word_wrap;
     current.files_show_all = shell.files_show_all;
+    current.settings_section = shell.settings_section;
+    current.github_star_banner_dismissed = shell.github_star_banner_dismissed;
 }
 
 fn schedule(policy: SavePolicy, cx: &mut App) {
@@ -691,11 +710,12 @@ pub struct SkillCompletionSettings {
 }
 
 impl SkillCompletionSettings {
-    pub fn for_harness(harness: zeron_proto::HarnessId) -> Self {
-        let native_dollar = harness == zeron_proto::HarnessId::Codex;
+    /// Every harness defaults to `$` skills kept out of the `/` menu; an
+    /// explicit per-harness choice (or the legacy slash-menu flag) wins.
+    pub fn for_harness(_harness: zeron_proto::HarnessId) -> Self {
         Self {
-            dollar: native_dollar,
-            separate_from_slash: native_dollar,
+            dollar: true,
+            separate_from_slash: true,
         }
     }
 }
@@ -740,6 +760,9 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
+    /// The sidebar's "Star on GitHub" banner was dismissed (its close button
+    /// or following the link). Device-local; never shown again once set.
+    pub github_star_banner_dismissed: bool,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -791,6 +814,9 @@ pub struct UiSettings {
     /// the foreground case).
     pub notifications_background_only: bool,
     pub files_panel_width: f32,
+    /// Desktop banners for newly discovered agent CLI releases. In-app chips
+    /// remain enabled independently of this preference.
+    pub agent_update_notifications: bool,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
@@ -820,6 +846,10 @@ pub struct UiSettings {
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
+    /// The Settings section last viewed. ⌘, / Ctrl+,, the footer gear and the
+    /// palette reopen it; links naming a section replace it. Files without
+    /// it, or with a name this build does not know, open on General.
+    pub settings_section: crate::shell::SettingsSection,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Optional columns shown in every Git History pane.
@@ -860,6 +890,9 @@ pub struct UiSettings {
     /// the narration between them) fold into one collapsed accordion, so only
     /// the reply text stays visible.
     pub transcript_compact_mode: bool,
+    /// Command cards ("Ran command") start collapsed, header only, even while
+    /// their turn streams; a click opens the command and its output.
+    pub collapse_command_blocks: bool,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -898,6 +931,7 @@ impl Default for UiSettings {
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
+            github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
             open_tabs: None,
@@ -914,6 +948,7 @@ impl Default for UiSettings {
             notifications_enabled: true,
             notifications_background_only: true,
             files_panel_width: FILES_PANEL_DEFAULT,
+            agent_update_notifications: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             details_sidebar_width: DETAILS_SIDEBAR_DEFAULT,
@@ -925,6 +960,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
+            settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
             skills_in_slash_menu: false,
             skill_completion_by_harness: Default::default(),
@@ -949,6 +985,7 @@ impl Default for UiSettings {
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
             open_web_links_in_zeron: true,
             transcript_compact_mode: false,
+            collapse_command_blocks: false,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -1050,8 +1087,8 @@ impl ShortcutId {
             ShortcutId::NewSession => "New session",
             ShortcutId::NewProject => "New project",
             ShortcutId::OpenModelPicker => "Open model picker",
-            ShortcutId::NextSession => "Next session",
-            ShortcutId::PrevSession => "Previous session",
+            ShortcutId::NextSession => "Next session or right pane tab",
+            ShortcutId::PrevSession => "Previous session or right pane tab",
             ShortcutId::ArchiveSession => "Archive session",
             ShortcutId::JumpSession(slot) => JUMP_LABELS.get(slot).copied().unwrap_or(""),
         }
@@ -1744,13 +1781,13 @@ mod tests {
         let mut settings = UiSettings::default();
         for (harness, _) in SKILL_COMPLETION_HARNESSES {
             let preferences = settings.skill_completion(harness);
-            assert_eq!(preferences.dollar, harness == HarnessId::Codex);
-            assert_eq!(preferences.separate_from_slash, harness == HarnessId::Codex);
+            assert!(preferences.dollar);
+            assert!(preferences.separate_from_slash);
         }
         settings.skill_completion_by_harness.insert(
             HarnessId::ClaudeCode,
             SkillCompletionSettings {
-                dollar: true,
+                dollar: false,
                 separate_from_slash: true,
             },
         );
@@ -1767,8 +1804,8 @@ mod tests {
             settings.skill_completion_by_harness,
             loaded.skill_completion_by_harness
         );
-        assert!(loaded.skill_completion(HarnessId::ClaudeCode).dollar);
-        assert!(!loaded.skill_completion(HarnessId::Cursor).dollar);
+        assert!(!loaded.skill_completion(HarnessId::ClaudeCode).dollar);
+        assert!(loaded.skill_completion(HarnessId::Cursor).dollar);
         let legacy: UiSettings = serde_json::from_str(r#"{"skillsInSlashMenu":true}"#).unwrap();
         assert!(
             !legacy
@@ -1863,6 +1900,56 @@ mod tests {
         let saved: WindowGeometry = serde_json::from_str(&encoded).unwrap();
         assert_eq!(saved.restore(&[primary, secondary], 0), Some((1, saved)));
         assert_eq!(saved.restore(&[secondary, primary], 1), Some((0, saved)));
+    }
+
+    #[test]
+    fn settings_section_round_trips_and_old_or_unknown_values_read_as_general() {
+        use crate::shell::SettingsSection;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = UiSettings {
+            settings_section: SettingsSection::Appearance,
+            ..Default::default()
+        };
+        settings.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(
+            text.contains(r#""settingsSection": "appearance""#),
+            "{text}"
+        );
+        assert_eq!(
+            UiSettings::load(dir.path()).settings_section,
+            SettingsSection::Appearance
+        );
+        for section in SettingsSection::ALL {
+            let encoded = serde_json::to_string(&UiSettings {
+                settings_section: section,
+                ..Default::default()
+            })
+            .unwrap();
+            let decoded: UiSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.settings_section, section);
+        }
+
+        // A file written before the field existed.
+        let legacy: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(legacy.settings_section, SettingsSection::General);
+        assert_eq!(legacy.sidebar_width, 300.0);
+        // Unknown names and malformed values read as General without
+        // defaulting the rest of the file.
+        for raw in [r#""billing""#, "42", "null", r#"{"section":"devices"}"#] {
+            std::fs::write(
+                UiSettings::path(dir.path()),
+                format!(r#"{{"sidebarWidth": 300, "settingsSection": {raw}}}"#),
+            )
+            .unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.settings_section, SettingsSection::General, "{raw}");
+            assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
+        }
+        // The fork keeps Accounts as its own page: "agents" reopens there.
+        let alias: UiSettings = serde_json::from_str(r#"{"settingsSection":"agents"}"#).unwrap();
+        assert_eq!(alias.settings_section, SettingsSection::Agents);
+        assert_eq!(alias.settings_section.reopenable(), SettingsSection::Agents);
     }
 
     #[test]
@@ -2277,6 +2364,7 @@ mod tests {
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
+            github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
                 "space-1".into(),
@@ -2308,6 +2396,7 @@ mod tests {
             notifications_enabled: false,
             notifications_background_only: false,
             files_panel_width: 310.0,
+            agent_update_notifications: false,
             right_pane_width: 700.0,
             right_pane_open: true,
             details_sidebar_width: 540.0,
@@ -2324,6 +2413,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             escape_stops_active_agent: true,
+            settings_section: crate::shell::SettingsSection::Shortcuts,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             skills_in_slash_menu: true,
             skill_completion_by_harness: Default::default(),
@@ -2366,6 +2456,7 @@ mod tests {
             transcript_width: 960.0,
             open_web_links_in_zeron: false,
             transcript_compact_mode: true,
+            collapse_command_blocks: true,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,

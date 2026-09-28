@@ -140,6 +140,13 @@ rpc_methods! {
     LIST_MODELS / ListModels = "ListModels" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 100 },
     LIST_COMMANDS / ListCommands = "ListCommands" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 100 },
     QUEUE_COMMAND / QueueCommand = "QueueCommand" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    /// Branch a side chat from a parent chat's history (upstream v0.2.94):
+    /// runs on the parent's host device, which owns the fork bootstrap.
+    FORK_SIDE_CHAT / ForkSideChat = "ForkSideChat" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
+    /// connection; automatic subscriptions and retries must not call it.
+    /// IPC-only: never relay-forwarded.
+    FOCUS_CHAT / FocusChat = "FocusChat" { params: serde_json::Value, reply: serde_json::Value },
     /// App-owned durable delivery of a Worker lifecycle event to its existing
     /// parent chat. Uses a deterministic command id and fsync-equivalent store
     /// persistence before acknowledging the RPC.
@@ -267,6 +274,9 @@ rpc_methods! {
     STAGE_FILES / StageFiles = "StageFiles" { params: zeron_proto::CheckoutFilesRequest, reply: serde_json::Value, forwardable: true },
     UNSTAGE_FILES / UnstageFiles = "UnstageFiles" { params: zeron_proto::CheckoutFilesRequest, reply: serde_json::Value, forwardable: true },
     DISCARD_FILES / DiscardFiles = "DiscardFiles" { params: zeron_proto::CheckoutFilesRequest, reply: serde_json::Value, forwardable: true },
+    /// Permanently restore one chat-owned checkout to its current HEAD and
+    /// remove only its untracked, non-ignored paths.
+    DISCARD_WORKING_TREE / DiscardWorkingTree = "DiscardWorkingTree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     GENERATE_COMMIT_MESSAGE / GenerateCommitMessage = "GenerateCommitMessage" { params: zeron_proto::GenerateCommitMessageRequest, reply: zeron_proto::GeneratedCommitMessage, forwardable: true, deadline_secs: 100 },
     COMMIT_CHECKOUT / CommitCheckout = "CommitCheckout" { params: zeron_proto::CommitCheckoutRequest, reply: serde_json::Value, forwardable: true },
     PUSH_CHECKOUT / PushCheckout = "PushCheckout" { params: zeron_proto::CheckoutOpRequest, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
@@ -334,6 +344,20 @@ rpc_methods! {
     UPSERT_PROJECT_ACTION / UpsertProjectAction = "UpsertProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     DELETE_PROJECT_ACTION / DeleteProjectAction = "DeleteProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     RUN_PROJECT_ACTION / RunProjectAction = "RunProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    // Upstream v0.2.96 (#389/#596): device-local agent CLI update lifecycle,
+    // relay-forwardable so another device can inspect/apply this device's CLIs.
+    /// The stream emits the complete ordered status list initially and after
+    /// every transition.
+    WATCH_HARNESS_UPDATES / WatchHarnessUpdates = "WatchHarnessUpdates" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
+    /// A full fleet of enabled providers is checked two at a time; each
+    /// provider may need both a CLI probe and a network request.
+    CHECK_HARNESS_UPDATES / CheckHarnessUpdates = "CheckHarnessUpdates" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 240 },
+    /// Leaves headroom beyond the provider's 15-minute mutation timeout for
+    /// queueing, verification, and the relayed response itself.
+    APPLY_HARNESS_UPDATE / ApplyHarnessUpdate = "ApplyHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 1200 },
+    CANCEL_HARNESS_UPDATE / CancelHarnessUpdate = "CancelHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    DISMISS_HARNESS_UPDATE / DismissHarnessUpdate = "DismissHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SET_HARNESS_UPDATE_POLICY / SetHarnessUpdatePolicy = "SetHarnessUpdatePolicy" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ async fn turn(
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -34,6 +35,7 @@ async fn turn(
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt,
         harness: None,
         model: Some(
@@ -144,6 +146,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
@@ -156,6 +159,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt: format!(
             "Remember this exact token: {nonce}. Reply only that token. Do not use tools or files."
         ),
@@ -258,6 +262,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -270,6 +275,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt: if cancel {
             format!(
                 "Remember token {nonce}. First run shell command `sleep 30`, then reply only {nonce}."
@@ -398,6 +404,7 @@ async fn history(harness: &CursorHarness, count: usize) {
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
@@ -410,6 +417,7 @@ async fn history(harness: &CursorHarness, count: usize) {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        mcp: None,
         prompt: format!(
             "Remember this token in conversation history: {}. Run shell command `sleep 3`, then reply only the token. Every later user message adds a token; retain them all without writing files.",
             tokens[0]

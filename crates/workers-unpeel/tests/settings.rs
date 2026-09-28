@@ -200,15 +200,15 @@ fn malformed_presets_are_not_replaced_with_defaults() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn resource_settings_default_to_invisible_monitoring_and_disabled_hibernation() {
+fn resource_settings_default_to_invisible_monitoring_and_enabled_hibernation() {
     let settings = WorkersResourceSettings::default();
 
     assert!(settings.monitoring_enabled);
     assert_eq!(settings.per_worker_warning_gib, 4);
     assert_eq!(settings.per_worker_critical_gib, 8);
     assert!(settings.notifications_enabled);
-    assert!(!settings.hibernation_enabled);
-    assert_eq!(settings.hibernate_after_idle_minutes, 15);
+    assert!(settings.hibernation_enabled);
+    assert_eq!(settings.hibernate_after_idle_minutes, 30);
     assert_eq!(settings.max_live_idle_workers, 12);
 }
 

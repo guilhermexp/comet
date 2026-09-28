@@ -860,6 +860,12 @@ pub enum RowKind {
     Notice {
         text: SharedString,
     },
+    /// The fork seam: a labeled divider between copied history and the
+    /// chat's own turns.
+    ForkMarker {
+        source_chat_id: SharedString,
+        source_title: SharedString,
+    },
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1585,6 +1591,7 @@ fn rows_for_entry_with_todo_history(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(display_text);
+        let body = agent_message_display(&body);
         let (text, mut mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
             None => (body, Vec::new()),
@@ -2133,6 +2140,28 @@ fn rows_for_entry_with_todo_history(
                             },
                         });
                     }
+                    MessagePart::Fork {
+                        id: part_id,
+                        source_chat_id,
+                        source_title,
+                    } => {
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: fnv1a(source_title.as_bytes()),
+                                turn_start: false,
+                                kind: RowKind::ForkMarker {
+                                    source_chat_id: source_chat_id.clone().into(),
+                                    source_title: single_line(source_title).into(),
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                            },
+                        });
+                    }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } | MessagePart::WorkflowTask { .. } => {}
                 }
@@ -2179,6 +2208,7 @@ fn rows_for_entry_with_todo_history(
             .iter_mut()
             .rev()
             .find(|row| !matches!(row.row.kind, RowKind::InlineImages { .. }))
+        && !matches!(last.row.kind, RowKind::ForkMarker { .. })
     {
         last.row.timestamp = Some(entry.created_at);
         last.row.copy_text = assistant_copy_text(entry);
@@ -2337,6 +2367,7 @@ fn compact_entry_rows(entry: &SessionMessageEntry, rows: Vec<Row>) -> Vec<Row> {
                 | RowKind::ErrorChip { .. }
                 | RowKind::GeneratedImage { .. }
                 | RowKind::Notice { .. }
+                | RowKind::ForkMarker { .. }
         )
     };
     let fold_end = if streaming {
@@ -2666,15 +2697,17 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
 /// Deliberately blind to `resolved`: a command that finished three calls ago is
 /// exactly the output the user scrolls back to mid-turn. Settling the entry
 /// clears `active_group` and closes all of them at once.
-fn tool_detail_default_open(call: &ToolCall, active_group: bool) -> bool {
+/// `collapse_commands` (Settings › General › Collapse command blocks) keeps
+/// command cards closed even while their turn streams.
+fn tool_detail_default_open(call: &ToolCall, active_group: bool, collapse_commands: bool) -> bool {
     active_group
-        && matches!(
-            call,
-            ToolCall::Exec { .. }
-                | ToolCall::WriteFile { .. }
-                | ToolCall::EditFile { .. }
-                | ToolCall::ApplyPatch { .. }
-        )
+        && match call {
+            ToolCall::Exec { .. } => !collapse_commands,
+            ToolCall::WriteFile { .. }
+            | ToolCall::EditFile { .. }
+            | ToolCall::ApplyPatch { .. } => true,
+            _ => false,
+        }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4149,6 +4182,8 @@ pub struct Transcript {
     /// Compact transcript mode (Settings → Appearance): every turn's work
     /// folds into one `TurnSteps` row, live turns included.
     compact_mode: bool,
+    /// Last seen `settings::collapse_command_blocks`; a flip re-renders rows.
+    collapse_commands: bool,
     mermaid_preview: Option<crate::mermaid_preview::MermaidPreview>,
     mermaid_preview_focus: gpui::FocusHandle,
     /// Absolute scale of the open diagram. Opening computes
@@ -4501,6 +4536,7 @@ impl Transcript {
             user_folds: HashMap::new(),
             tool_reveals: HashMap::new(),
             compact_mode: crate::settings::transcript_compact_mode(cx),
+            collapse_commands: crate::settings::collapse_command_blocks(cx),
             mermaid_preview: None,
             mermaid_preview_focus: cx.focus_handle(),
             mermaid_preview_zoom: 1.0,
@@ -7941,6 +7977,7 @@ impl Transcript {
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::Notice { text } => notice_divider(text.clone(), &theme),
+            RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         }
     }
 
@@ -9128,6 +9165,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> MermaidSnapshot {
         let colors = crate::inline_media::MermaidColors::from_theme(theme);
+        let native_palette = crate::markdown::mermaid::Palette::from_theme(theme);
         let key = format!(
             "{}\0{source}",
             if theme.appearance.is_dark() {
@@ -9182,8 +9220,13 @@ impl Transcript {
             MERMAID_MAX_INFLIGHT,
             MERMAID_CACHE_MAX_TOTAL,
         ) {
+            // Admission is full, not failed: a finishing render notifies and
+            // this block is retried then. Showing the source meanwhile read as
+            // "Mermaid doesn't load" whenever a message held several diagrams.
             return if previously_ready {
                 MermaidSnapshot::Reloading
+            } else if inflight > 0 {
+                MermaidSnapshot::Loading
             } else {
                 MermaidSnapshot::Failed
             };
@@ -9196,7 +9239,14 @@ impl Transcript {
                 .background_executor()
                 .spawn(async move {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::inline_media::render_mermaid_svg(&render_source, &colors)
+                        // The QuickJS engine has no gantt/pie/mindmap/gitGraph;
+                        // the native renderer (Files preview) covers those.
+                        crate::inline_media::render_mermaid_svg(&render_source, &colors).or_else(
+                            |_| {
+                                crate::markdown::mermaid::render(&render_source, &native_palette)
+                                    .and_then(crate::inline_media::rendered_from_svg)
+                            },
+                        )
                     }))
                     .unwrap_or_else(|_| Err("diagram renderer failed".into()))
                 })
@@ -9788,9 +9838,10 @@ impl Transcript {
                     .unwrap_or_default()
             })
             .collect();
+        let collapse_commands = crate::settings::collapse_command_blocks(cx);
         let detail_defaults: Vec<bool> = tools
             .iter()
-            .map(|tool| tool_detail_default_open(&tool.call, detail_auto_open))
+            .map(|tool| tool_detail_default_open(&tool.call, detail_auto_open, collapse_commands))
             .collect();
         let detail_opens: Vec<bool> = details
             .iter()
@@ -10229,6 +10280,28 @@ impl Transcript {
 /// run when there are none), with the same selection machinery as rendered
 /// markdown — the element registers into the frame's document-ordered
 /// registry, so drags select, span into adjacent rows, and Cmd+C copies.
+/// Keep routing instructions in the stored prompt for agents, but show a
+/// concise attribution in the human transcript (including existing messages).
+fn agent_message_display(text: &str) -> String {
+    let Some(rest) = text.strip_prefix("[Message from Zeron chat ") else {
+        return text.to_owned();
+    };
+    let Some((header, body)) = rest.split_once("]\n\n") else {
+        return text.to_owned();
+    };
+    let Some((label, id)) =
+        header.rsplit_once(". Reply to it with the Zeron `send_message` tool, chat ")
+    else {
+        return text.to_owned();
+    };
+    let Some(id) = id.strip_suffix('.') else {
+        return text.to_owned();
+    };
+    let suffix = format!(" ({id})");
+    let name = label.strip_suffix(&suffix).unwrap_or(label);
+    format!("Message from {name}\n\n{body}")
+}
+
 fn user_bubble_text(
     row_id: &SharedString,
     text: SharedString,
@@ -10293,6 +10366,39 @@ fn user_bubble_text(
     }
     if at < text.len() {
         runs.push(body_run(text.len() - at));
+    }
+    // Attribution names are bold sans text, never Markdown/italic. Split
+    // existing runs so file-mention styling and selection offsets stay intact.
+    if let Some(rest) = text.strip_prefix("Message from ")
+        && let Some((name, _)) = rest.split_once("\n\n")
+    {
+        let bold = "Message from ".len().."Message from ".len() + name.len();
+        let mut offset = 0;
+        runs = runs
+            .into_iter()
+            .flat_map(|run| {
+                let end = offset + run.len;
+                let mut pieces = Vec::new();
+                while offset < end {
+                    let in_name = bold.contains(&offset);
+                    let next = if offset < bold.start {
+                        end.min(bold.start)
+                    } else if in_name {
+                        end.min(bold.end)
+                    } else {
+                        end
+                    };
+                    let mut piece = run.clone();
+                    piece.len = next - offset;
+                    if in_name {
+                        piece.font.weight = gpui::FontWeight::BOLD;
+                    }
+                    pieces.push(piece);
+                    offset = next;
+                }
+                pieces
+            })
+            .collect();
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
@@ -10396,8 +10502,9 @@ fn user_bubble_text(
     )
     .absolute()
     .size_full();
-    div()
-        .relative()
+    // Same wrapper as the assistant markdown: user-bubble text is
+    // selectable (paint_text_selection above), so it gets the I-beam too.
+    render::selectable_text_wrap()
         .child(underlay)
         .child(text_element)
         .into_any_element()
@@ -10447,6 +10554,49 @@ fn notice_divider_with(leading: AnyElement, text: SharedString, theme: &Theme) -
                 .child(text),
         )
         .child(rule())
+        .into_any_element()
+}
+
+/// A quiet fork seam. The source gets its own constrained line so long
+/// titles cannot widen a narrow side-chat pane. No message metadata lane.
+fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
+    let rule = || div().flex_1().min_w_0().h(px(1.0)).bg(theme.border_strong);
+    div()
+        .py(px(14.0))
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(rule())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child("Forked from"),
+                )
+                .child(rule()),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_center()
+                .text_size(crate::typography::ui_rems(13.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child(source_title),
+        )
         .into_any_element()
 }
 
@@ -11499,6 +11649,13 @@ impl Render for Transcript {
             // The row split differs by mode; rebuild every row.
             self.last_source = None;
             self.sync(cx);
+        }
+        let collapse_commands = crate::settings::collapse_command_blocks(cx);
+        if self.collapse_commands != collapse_commands {
+            self.collapse_commands = collapse_commands;
+            // Cached tool rows baked the old default; re-render and re-measure.
+            self.render_cache.borrow_mut().clear();
+            self.list.remeasure();
         }
         let content_width = crate::settings::transcript_width(cx);
         if self.content_width != content_width {
@@ -15747,14 +15904,17 @@ mod tests {
         let patch = ToolCall::ApplyPatch { path: None };
 
         // Live turn: every command payload, no matter where it sits.
-        assert!(tool_detail_default_open(&exec, true));
-        assert!(tool_detail_default_open(&edit, true));
-        assert!(tool_detail_default_open(&patch, true));
+        assert!(tool_detail_default_open(&exec, true, false));
+        assert!(tool_detail_default_open(&edit, true, false));
+        assert!(tool_detail_default_open(&patch, true, false));
         // A read's payload repeats its header; it stays closed even live.
-        assert!(!tool_detail_default_open(&read, true));
+        assert!(!tool_detail_default_open(&read, true, false));
         // Settled turn: nothing opens on its own.
-        assert!(!tool_detail_default_open(&exec, false));
-        assert!(!tool_detail_default_open(&edit, false));
+        assert!(!tool_detail_default_open(&exec, false, false));
+        assert!(!tool_detail_default_open(&edit, false, false));
+        // Collapse command blocks keeps commands closed, not edits.
+        assert!(!tool_detail_default_open(&exec, true, true));
+        assert!(tool_detail_default_open(&edit, true, true));
     }
 
     #[test]

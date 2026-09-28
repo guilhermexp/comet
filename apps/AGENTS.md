@@ -4,7 +4,7 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headless` como subcomando) e a superfície de CLI: auth, update, daemon. `apps/ios` é o cliente iOS, projeto Xcode, fora do workspace Cargo.
+Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headless` como subcomando) e a superfície de CLI: auth, update, daemon. `apps/ios` é o cliente iOS, projeto Xcode fora do workspace Cargo: UIKit sobre o core Rust `crates/mobile` (desde o sync v0.2.94, que substituiu o app SwiftUI do fork; adaptações antigas de OMP/streaming precisam ser refeitas no app novo). A fase de build do Xcode roda `scripts/ios/build-core.sh`.
 
 ## Ownership
 
@@ -40,9 +40,8 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `zeron/src/**` (wiring, dispatch) | none — casca fina; o comportamento é testado nas crates | `cargo build -p zeron` |
-| `ios/ZeronTests/{TranscriptFollow,TranscriptLayout,TranscriptPresentation,ComposerEditor,Appshot}Tests.swift` e `ios/ZeronUITests/MobilePolishTests.swift` | unit / integration / e2e — UIKit real; exige Xcode + simulador | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` |
 | Fluxo headed/headless real | e2e | `scripts/e2e-smoke.sh` · `scripts/dev-demo.sh` |
-| `ios/**` (`apps/ios/ZeronTests/`) | unit / integration (XCTest: tracking de PRs/checkout, RPC/stream de device relay, gates de versão/resiliência de rede, wire layout de chat frames, generated-image decode/row projection, merge/conformance de registry e persistência/HLC de RegistryDoc) | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` ou Product → Test no Xcode |
+| `ios/**` | unit / integration (XCTest do app UIKit; core Rust coberto por `cargo test -p zeron-mobile -p zeron-client -p zeron-text`) | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` |
 
 ## Child DOX Index
 

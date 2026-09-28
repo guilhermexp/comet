@@ -107,6 +107,68 @@ impl Harness for AckHarness {
     }
 }
 
+/// Upstream's generic ack harness: only checks that pending refs were
+/// resolved to real local files (any media kind).
+struct ResolvedPathsHarness;
+
+#[async_trait]
+impl Harness for ResolvedPathsHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Ack"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // The harness must see ordinary local files, never pending refs.
+        assert!(
+            !request.prompt.contains("pending://"),
+            "prompt reached the harness with unresolved pending refs: {}",
+            request.prompt
+        );
+        for path in &request.attachments {
+            assert!(
+                std::path::Path::new(path).is_file(),
+                "attachment path not a real file: {path}"
+            );
+        }
+        let events: Vec<Result<AgentEvent, HarnessError>> = vec![
+            Ok(AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: request.cwd.clone(),
+                session_id: "sess-qa".into(),
+                assistant_message_id: "a-1".into(),
+            }),
+            Ok(AgentEvent::TextDelta { text: "ack".into() }),
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("sess-qa".into()),
+            }),
+        ];
+        Ok(futures::stream::iter(events).boxed())
+    }
+}
+
 async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
@@ -139,6 +201,7 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 fn run_payload(message_id: &str, pending_ref: &str) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
+            mcp: None,
             prompt: format!(
                 "look at this\n\nAttached files (local files — open them to view):\n- {pending_ref}"
             ),
@@ -256,6 +319,102 @@ async fn text_file_bytes_land_then_execute_with_rewritten_path_in_prompt() {
     );
     assert!(
         user_text.contains("att-1-pasted-1.txt"),
+        "persisted text names the committed file: {user_text}"
+    );
+
+    core.shutdown().await;
+}
+
+/// Mobile sends made while a turn runs park on the shared queue with
+/// `pending://` refs (the bytes chase them over the peer link). The queue
+/// drain must wait for those bytes and hand the harness the committed local
+/// files, exactly like a Run command — never the raw refs.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_row_waits_for_attachment_bytes_then_sends_resolved_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(ResolvedPathsHarness));
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("engine core assembles");
+
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({ "op": "createChat", "chatId": CHAT, "deviceId": core.device_id }),
+        )
+        .await
+        .expect("createChat");
+    core.workspace
+        .rename_chat(CHAT, "Pre-titled")
+        .expect("rename chat");
+    core.workspace
+        .set_chat_cwd(CHAT, "~")
+        .expect("set chat cwd");
+
+    // A clean-text row (attachments ride the row, not the text) whose bytes
+    // have not landed yet: the idle chat must NOT send it.
+    let pending_ref = "pending://att-q1/queued shot.png";
+    core.doc_host
+        .queue_message_with_behavior(CHAT, "what is this", vec![pending_ref.into()], false)
+        .expect("queue row");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        complete_assistant_count(&core),
+        0,
+        "a queued row must wait while its attachment bytes are in transit"
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    assert_eq!(
+        handle.doc().read_queue().unwrap().len(),
+        1,
+        "row stays queued"
+    );
+
+    client
+        .call(
+            zeron_rpc::methods::UPLOAD_CHUNK,
+            serde_json::json!({
+                "uploadId": "att-q1", "seq": 0, "data": BASE64.encode(b"png-bytes"),
+            }),
+        )
+        .await
+        .expect("upload chunk");
+    client
+        .call(
+            zeron_rpc::methods::UPLOAD_COMMIT,
+            serde_json::json!({ "uploadId": "att-q1", "fileName": "queued shot.png" }),
+        )
+        .await
+        .expect("upload commit");
+
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "queued row to send once its bytes land",
+    )
+    .await;
+    assert!(handle.doc().read_queue().unwrap().is_empty());
+    let user_text = entries(&core)
+        .iter()
+        .find(|e| e.role == MessageRole::User)
+        .and_then(|e| {
+            e.parts.iter().find_map(|p| match p {
+                zeron_doc::MessagePart::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .expect("user entry persisted");
+    assert!(
+        !user_text.contains("pending://"),
+        "persisted text must not leak pending refs: {user_text}"
+    );
+    assert!(
+        user_text.contains("att-q1-queued_shot.png"),
         "persisted text names the committed file: {user_text}"
     );
 

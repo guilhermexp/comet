@@ -143,6 +143,15 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
     })
 }
 
+/// Prompt tokens Codex served from cache in the turn's last usage report.
+/// Codex counts them inside `inputTokens`; callers subtract them so
+/// `Usage.input_tokens` means uncached prompt tokens, as it does for Claude.
+pub(crate) fn cached_input_tokens(params: &Value) -> Option<u64> {
+    let usage = field(params, &["tokenUsage", "token_usage"])?;
+    let last = usage.get("last")?;
+    field(last, &["cachedInputTokens", "cached_input_tokens"]).and_then(Value::as_u64)
+}
+
 /// Tool-shaped Codex items must always close the lifecycle they open: started
 /// opens the ToolCall, completed refreshes its metadata and resolves the same
 /// stable id (port of codex.ts `toolLifecycle`).

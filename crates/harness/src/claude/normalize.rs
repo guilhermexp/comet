@@ -838,6 +838,17 @@ impl Normalizer {
                     context_usage: window
                         .map(|window| zeron_proto::ContextUsage::reported(None, Some(window))),
                 };
+                // Only when the CLI reported any of it (older CLIs, some errors).
+                let metrics = (f.usage.cache_read_input_tokens.is_some()
+                    || f.usage.cache_creation_input_tokens.is_some()
+                    || f.total_cost_usd.is_some()
+                    || f.duration_api_ms.is_some())
+                .then(|| AgentEvent::TurnMetrics {
+                    cache_read_tokens: f.usage.cache_read_input_tokens,
+                    cache_write_tokens: f.usage.cache_creation_input_tokens,
+                    cost_usd: f.total_cost_usd,
+                    model_ms: f.duration_api_ms,
+                });
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
                         status: if interrupted {
@@ -899,7 +910,10 @@ impl Normalizer {
                         session_id: f.session_id,
                     }
                 };
-                vec![usage, done]
+                std::iter::once(usage)
+                    .chain(metrics)
+                    .chain([done])
+                    .collect()
             }
 
             // Control frames are handled by the run loop, not normalized.

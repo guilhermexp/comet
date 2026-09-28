@@ -86,6 +86,17 @@ pub fn resolve_codex_executable() -> Option<PathBuf> {
     crate::executable::find_on_paths("codex", extra)
 }
 
+/// Dotted `thread/start` config overrides that add an injected MCP server
+/// to the user's `mcp_servers` table.
+fn codex_mcp_overrides(mcp: &zeron_proto::McpServer) -> Vec<(String, Value)> {
+    let key = |field: &str| format!("mcp_servers.{}.{field}", mcp.name);
+    vec![
+        (key("command"), mcp.command.clone().into()),
+        (key("args"), json!(mcp.args)),
+        (key("env"), json!(mcp.env)),
+    ]
+}
+
 /// A ready-to-spawn `codex login` command for the engine's account flow.
 ///
 /// Shares the harness's full resolution (`CODEX_EXECUTABLE`, PATH, login-shell
@@ -596,6 +607,9 @@ impl Harness for CodexHarness {
     fn installed(&self) -> bool {
         self.resolve_executable().is_ok()
     }
+    fn executable_path(&self) -> Option<PathBuf> {
+        self.resolve_executable().ok()
+    }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {
         true
@@ -674,6 +688,7 @@ impl Harness for CodexHarness {
         request.resume = None;
         request.worktree = None;
         request.attachments.clear();
+        request.mcp = None;
         request.model_options.clear();
         request.auto_approve = false;
         request.enable_workers_mcp = false;
@@ -964,6 +979,7 @@ async fn run_session(session: Session) {
     } = session;
     let title_only = instructions.is_some();
     let RunControls {
+        execution_lease: _execution_lease,
         request_input,
         mut steering,
         interrupt,
@@ -1017,6 +1033,17 @@ async fn run_session(session: Session) {
             );
         }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
+        if let Some(mcp) = request.mcp.as_ref().filter(|_| !title_only) {
+            // Zeron's own MCP server as dotted config overrides on top of the
+            // user's `mcp_servers` table (the same layer the title run uses
+            // to switch servers off).
+            let overrides = p
+                .entry("config")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("thread/start config overrides are an object");
+            overrides.extend(codex_mcp_overrides(mcp));
+        }
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
         if let Some(model) = &request.model {
@@ -1189,6 +1216,7 @@ async fn run_session(session: Session) {
     let mut reasoning_streams: HashMap<String, ReasoningStream> = HashMap::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
+    let mut pending_metrics: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     let mut queued_steers: VecDeque<String> = VecDeque::new();
@@ -1333,7 +1361,18 @@ async fn run_session(session: Session) {
                                 break 'main;
                             }
                             if params.get("tokenUsage").or_else(|| params.get("token_usage")).and_then(|usage| usage.get("last")).is_some() {
-                                pending_usage = Some(AgentEvent::Usage { input_tokens, output_tokens, context_usage: None });
+                                let cached = normalize::cached_input_tokens(&params);
+                                pending_usage = Some(AgentEvent::Usage {
+                                    input_tokens: input_tokens.saturating_sub(cached.unwrap_or(0)),
+                                    output_tokens,
+                                    context_usage: None,
+                                });
+                                pending_metrics = cached.map(|cached| AgentEvent::TurnMetrics {
+                                    cache_read_tokens: Some(cached),
+                                    cache_write_tokens: None,
+                                    cost_usd: None,
+                                    model_ms: None,
+                                });
                             }
                         }
                     }
@@ -1346,6 +1385,11 @@ async fn run_session(session: Session) {
                         streamed_text.clear();
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
+                        {
+                            break 'main;
+                        }
+                        if let Some(metrics) = pending_metrics.take()
+                            && !send(&event_tx, metrics).await
                         {
                             break 'main;
                         }
@@ -1408,6 +1452,11 @@ async fn run_session(session: Session) {
                         router.note_completed(&turn_id(&params));
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
+                        {
+                            break 'main;
+                        }
+                        if let Some(metrics) = pending_metrics.take()
+                            && !send(&event_tx, metrics).await
                         {
                             break 'main;
                         }
@@ -1898,6 +1947,7 @@ mod tests {
             resume: None,
             attachments: Vec::new(),
             worktree: None,
+            mcp: None,
         }
     }
 
@@ -2075,6 +2125,31 @@ mod tests {
         r.note_started("t-3".into());
         assert_eq!(r.active.as_deref(), Some("t-3"));
         assert!(r.is_completed("t-2"));
+    }
+}
+
+#[cfg(test)]
+mod mcp_injection_tests {
+    use super::*;
+
+    #[test]
+    fn codex_mcp_overrides_use_the_dotted_mcp_servers_keys() {
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/opt/zeron/zeron".into(),
+            args: vec!["mcp".into()],
+            env: [("ZERON_CHAT_ID".to_owned(), "chat-1".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let overrides: serde_json::Map<String, Value> =
+            codex_mcp_overrides(&mcp).into_iter().collect();
+        assert_eq!(overrides["mcp_servers.zeron.command"], "/opt/zeron/zeron");
+        assert_eq!(overrides["mcp_servers.zeron.args"], json!(["mcp"]));
+        assert_eq!(
+            overrides["mcp_servers.zeron.env"],
+            json!({ "ZERON_CHAT_ID": "chat-1" })
+        );
     }
 }
 

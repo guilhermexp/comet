@@ -461,10 +461,25 @@ impl Harness for OmpHarness {
         } else {
             None
         };
+        let zeron = if let Some(grant) = &request.sessions {
+            let executable = executable.clone().expect("checked");
+            // Optional: a run without chat tools beats a run that fails to
+            // start because `zeron mcp` could not come up.
+            match WorkersBridge::start_zeron(&executable, grant).await {
+                Ok(bridge) => bridge.map(Arc::new),
+                Err(error) => {
+                    tracing::warn!(target: "zeron_harness::omp", %error, "zeron chat MCP unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let host_tools: Vec<_> = workers
             .iter()
             .chain(sessions.iter())
-            .map(|bridge| bridge.definition().clone())
+            .chain(zeron.iter())
+            .flat_map(|bridge| bridge.definitions().iter().cloned())
             .collect();
         if !host_tools.is_empty() {
             process
@@ -538,6 +553,7 @@ impl Harness for OmpHarness {
             controls,
             workers,
             sessions,
+            zeron,
             request.cwd,
             model,
             session_id,
@@ -881,6 +897,7 @@ async fn run_session(
     controls: RunControls,
     workers: Option<Arc<WorkersBridge>>,
     sessions: Option<Arc<WorkersBridge>>,
+    zeron: Option<Arc<WorkersBridge>>,
     cwd: String,
     model: String,
     mut session_id: String,
@@ -888,6 +905,8 @@ async fn run_session(
     prompt_timeout: Duration,
 ) {
     let RunControls {
+        // Held for the whole turn so a queued CLI update waits for it.
+        execution_lease: _execution_lease,
         request_input,
         mut steering,
         interrupt,
@@ -1141,6 +1160,9 @@ async fn run_session(
                         let arguments = frame.get("arguments").cloned().unwrap_or(Value::Null);
                         let bridge = match tool {
                             "sessions" => sessions.as_ref(),
+                            _ if zeron.as_ref().is_some_and(|bridge| bridge.serves(tool)) => {
+                                zeron.as_ref()
+                            }
                             _ => workers.as_ref(),
                         };
                         match bridge {
@@ -1188,6 +1210,9 @@ async fn run_session(
                             }
                             if let Some(sessions) = &sessions {
                                 sessions.cancel_call(target_id);
+                            }
+                            if let Some(zeron) = &zeron {
+                                zeron.cancel_call(target_id);
                             }
                         }
                     }
@@ -1296,6 +1321,9 @@ async fn run_session(
     }
     if let Some(sessions) = sessions {
         let _ = sessions.shutdown().await;
+    }
+    if let Some(zeron) = zeron {
+        let _ = zeron.shutdown().await;
     }
     let _ = process.shutdown().await;
 }

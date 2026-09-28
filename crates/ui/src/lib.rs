@@ -86,16 +86,6 @@ use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOp
 pub use state::EngineBootConfig;
 pub use zeron_proto::HarnessId;
 
-/// Whether a control whose primary action is click activation may also start
-/// a GPUI drag from the same hitbox. GPUI promotes pointer travel above 2 px
-/// to a drag. Normal Windows click jitter can cross that threshold, cancel the
-/// click, and leave the drag ghost following the pointer instead of activating
-/// the control. Drag-first controls (resize handles, scrollbars, queue rows)
-/// intentionally do not use this policy.
-pub(crate) const fn click_activation_drag_enabled() -> bool {
-    !cfg!(target_os = "windows")
-}
-
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/zeron`, not here).
 #[derive(Debug, Clone)]
@@ -254,8 +244,8 @@ pub fn run_app(config: UiConfig) {
         });
         let click_state = state.clone();
         cx.spawn(async move |cx| {
-            while let Some(chat_id) = click_rx.next().await {
-                let _ = cx.update(|cx| open_notified_chat(chat_id, &click_state, cx));
+            while let Some(target) = click_rx.next().await {
+                let _ = cx.update(|cx| open_notification_target(target, &click_state, cx));
             }
         })
         .detach();
@@ -307,10 +297,9 @@ pub fn run_app(config: UiConfig) {
     });
 }
 
-/// A clicked banner: bring Zeron forward on that chat through the sidebar's
-/// own path (chat route + composer focus), reopening the main window first if
-/// ⌘W closed it.
-fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx: &mut App) {
+/// A clicked banner: bring Zeron forward on its chat or settings destination,
+/// reopening the main window first if ⌘W closed it.
+fn open_notification_target(target: String, state: &gpui::Entity<state::AppState>, cx: &mut App) {
     cx.activate(true);
     if cx.windows().is_empty()
         && let Some(reopen) = cx.try_global::<ReopenState>()
@@ -330,10 +319,17 @@ fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx
         Some(shell) => {
             let _ = shell.update(cx, |shell, window, cx| {
                 window.activate_window();
-                shell.open_chat(chat_id, cx);
+                if target == notify::AGENT_UPDATES_TARGET {
+                    shell.open_settings(shell::SettingsSection::Harnesses, cx);
+                } else {
+                    shell.open_chat(target, cx);
+                }
             });
         }
-        None => state.update(cx, |state, cx| state.select_chat(Some(chat_id), cx)),
+        None if target != notify::AGENT_UPDATES_TARGET => {
+            state.update(cx, |state, cx| state.select_chat(Some(target), cx))
+        }
+        None => {}
     }
 }
 

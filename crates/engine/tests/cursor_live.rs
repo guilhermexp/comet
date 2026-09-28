@@ -76,6 +76,7 @@ fn start(core: &EngineCore, cwd: &std::path::Path, prompt: String) {
                     enable_workers_mcp: false,
                     workers_parent_chat_id: None,
                     sessions: None,
+                    mcp: None,
                     prompt,
                     harness: Some(HarnessId::Cursor),
                     model: Some("muse-spark-1.3".into()),

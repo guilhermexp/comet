@@ -11,7 +11,9 @@
 //! classification) lives in free functions with unit tests; the elements only
 //! feed them measurements/events.
 
+mod contained;
 mod hover_intent;
+pub(crate) use contained::contained_menu;
 pub use hover_intent::{HoverAction, HoverIntent};
 
 use gpui::{
@@ -656,6 +658,18 @@ pub fn anchored_menu_below_gap(
     closing: Option<std::time::Instant>,
     gap: f32,
 ) -> AnyElement {
+    anchored_menu_below_layer(id, content, closing, gap, 1)
+}
+
+/// [`anchored_menu_below_gap`] on an explicit deferred layer. Menus opened
+/// from inside a palette (itself a priority-2 layer) must paint above it.
+pub fn anchored_menu_below_layer(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    gap: f32,
+    priority: usize,
+) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);
     div()
@@ -674,7 +688,7 @@ pub fn anchored_menu_below_gap(
                         div().occlude().pt(px(gap)).child(content),
                     )),
             )
-            .priority(1)
+            .priority(priority)
             .into_any_element(),
         )
         .into_any_element()
@@ -856,6 +870,7 @@ fn modal_with(
             .child(
                 div()
                     .occlude()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .w(viewport.width)
                     .h(viewport.height)
                     .bg(scrim_alpha(scrim))
