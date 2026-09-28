@@ -109,24 +109,80 @@ pub(super) fn fragment(flat: &FlatText, range: Range<usize>) -> FlatText {
 
 /// Prose wraps at word boundaries; code remains one inline box until it exceeds
 /// the column. Offsets are source byte offsets, also stable during append.
+/// A web link always starts a new segment so its favicon leads the link text.
 pub(super) fn segments(flat: &FlatText) -> Vec<(Range<usize>, bool)> {
+    let starts: Vec<usize> = web_links(flat).map(|(range, _)| range.start).collect();
     let mut out = Vec::new();
     let mut at = 0;
     for chip in &flat.chips {
-        prose_segments(&flat.text, at..chip.start, &mut out);
+        prose_segments(&flat.text, at..chip.start, &starts, &mut out);
         out.push((chip.clone(), true));
         at = chip.end;
     }
-    prose_segments(&flat.text, at..flat.text.len(), &mut out);
+    prose_segments(&flat.text, at..flat.text.len(), &starts, &mut out);
     out
 }
 
-fn prose_segments(text: &str, range: Range<usize>, out: &mut Vec<(Range<usize>, bool)>) {
+fn prose_segments(
+    text: &str,
+    range: Range<usize>,
+    breaks: &[usize],
+    out: &mut Vec<(Range<usize>, bool)>,
+) {
     let mut at = range.start;
     for word in text[range].split_inclusive(char::is_whitespace) {
-        out.push((at..at + word.len(), false));
-        at += word.len();
+        let end = at + word.len();
+        let start = at;
+        for &split in breaks.iter().filter(|&&b| b > start && b < end) {
+            out.push((at..split, false));
+            at = split;
+        }
+        out.push((at..end, false));
+        at = end;
     }
+}
+
+/// Link ranges whose destination is on the web (they get a favicon).
+pub(super) fn web_links(flat: &FlatText) -> impl Iterator<Item = &(Range<usize>, String)> {
+    flat.links
+        .iter()
+        .filter(|(_, url)| super::render::is_web_link(url))
+}
+
+/// Paragraphs with code chips or web links lay out as a wrapping flow of
+/// inline boxes; everything else stays one shaped text element.
+pub(super) fn needs_flow(flat: &FlatText) -> bool {
+    !flat.chips.is_empty() || web_links(flat).next().is_some()
+}
+
+/// Width the favicon adds ahead of a link (icon + gap), for table measuring.
+pub(super) const FAVICON_ADVANCE: f32 = 14.0 + 4.0;
+
+/// The favicon box leading a web link: the site's icon once loaded, a globe
+/// until then (or when the site has none).
+fn favicon(url: &str, line_height: f32, theme: &Theme) -> AnyElement {
+    let slot = div()
+        .flex_none()
+        .size(px(14.0))
+        .mr(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center();
+    let slot = match crate::link_favicons::favicon_for(url) {
+        Some(image) => slot.child(gpui::img(image).size(px(14.0)).rounded(px(3.0))),
+        None => slot.child(
+            crate::icons::icon(crate::icons::GLOBE)
+                .size(px(13.0))
+                .text_color(theme.text_muted),
+        ),
+    };
+    div()
+        .flex_none()
+        .h(px(line_height))
+        .flex()
+        .items_center()
+        .child(slot)
+        .into_any_element()
 }
 
 pub(super) fn render(
@@ -147,14 +203,27 @@ pub(super) fn render(
         let mut part_opts = opts.clone();
         part_opts.row_key = format!("{}-inline-{}", group, range.start).into();
         part_opts.selection_group = Some(group.clone());
+        let lead = web_links(flat)
+            .find(|(link, _)| link.start == range.start)
+            .map(|(_, url)| favicon(url, line_height, theme));
         if !is_chip {
-            flow = flow.child(
-                div()
+            let text = flat_text_element(&part, part_ix, &part_opts, theme);
+            flow = flow.child(match lead {
+                // Icon and first word share one box, so a wrap never strands
+                // the favicon at the end of the previous line.
+                Some(icon) => div()
                     .max_w_full()
                     .min_w_0()
-                    .child(flat_text_element(&part, part_ix, &part_opts, theme)),
-            );
+                    .flex()
+                    .items_start()
+                    .child(icon)
+                    .child(div().min_w_0().child(text)),
+                None => div().max_w_full().min_w_0().child(text),
+            });
             continue;
+        }
+        if let Some(icon) = lead {
+            flow = flow.child(icon);
         }
         let target = match part.links.first() {
             Some((_, url)) => super::render::is_previewable_file_link(url).then(|| url.clone()),
@@ -245,6 +314,9 @@ pub(super) fn render(
             if active {
                 run.color = hovered;
             }
+            // A code chip never carries a link underline of its own: either
+            // the box owns opening (hover underline below) or it is inert.
+            run.underline = None;
             if can_open {
                 run.underline = active.then_some(gpui::UnderlineStyle {
                     color: Some(hovered),

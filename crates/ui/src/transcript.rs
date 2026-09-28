@@ -7731,7 +7731,7 @@ impl Transcript {
                 if should_render_mermaid(&top.block, false) {
                     self.render_mermaid_block(&row.id, tree, *block_ix, window, &theme, cx)
                 } else {
-                    let (md_width, bleed_budget) =
+                    let (md_width, _) =
                         column_and_table_bleed_for(self.viewport_width(), self.content_width);
                     let opts = RenderOptions {
                         tasks: None,
@@ -7744,7 +7744,9 @@ impl Transcript {
                         open_file: self.open_file_link(cx),
                         selection_group: None,
                         block_width: md_width,
-                        table_bleed_budget: bleed_budget,
+                        // Tables stay inside the prose column (Codex layout); a table
+                        // wider than the column scrolls instead of bleeding out.
+                        table_bleed_budget: 0.0,
                         file_root: self
                             .state
                             .read(cx)
@@ -7789,7 +7791,7 @@ impl Transcript {
                         })
                         .clone()
                 });
-                let (md_width, bleed_budget) =
+                let (md_width, _) =
                     column_and_table_bleed_for(self.viewport_width(), self.content_width);
                 let opts = RenderOptions {
                     tasks: None,
@@ -7802,7 +7804,9 @@ impl Transcript {
                     open_file: self.open_file_link(cx),
                     selection_group: None,
                     block_width: md_width,
-                    table_bleed_budget: bleed_budget,
+                    // Tables stay inside the prose column (Codex layout); a table
+                    // wider than the column scrolls instead of bleeding out.
+                    table_bleed_budget: 0.0,
                     file_root: self
                         .state
                         .read(cx)
@@ -9063,7 +9067,7 @@ impl Transcript {
 
         let mut column = div().w_full().flex().flex_col().child(header);
         if open {
-            let (md_width, bleed_budget) =
+            let (md_width, _) =
                 column_and_table_bleed_for(self.viewport_width(), self.content_width);
             let opts = RenderOptions {
                 tasks: None,
@@ -9076,7 +9080,9 @@ impl Transcript {
                 open_file: self.open_file_link(cx),
                 selection_group: None,
                 block_width: md_width,
-                table_bleed_budget: bleed_budget,
+                // Tables stay inside the prose column (Codex layout); a table
+                // wider than the column scrolls instead of bleeding out.
+                table_bleed_budget: 0.0,
                 file_root: self
                     .state
                     .read(cx)
@@ -9253,7 +9259,7 @@ impl Transcript {
 
         // Fallback on failure: clean syntax-highlighted code block (like Craft)
         if matches!(&state, MermaidSnapshot::Failed) {
-            let (md_width, bleed_budget) =
+            let (md_width, _) =
                 column_and_table_bleed_for(self.viewport_width(), self.content_width);
             let opts = RenderOptions {
                 tasks: None,
@@ -9267,7 +9273,9 @@ impl Transcript {
                 file_root: None,
                 selection_group: None,
                 block_width: md_width,
-                table_bleed_budget: bleed_budget,
+                // Tables stay inside the prose column (Codex layout); a table
+                // wider than the column scrolls instead of bleeding out.
+                table_bleed_budget: 0.0,
                 link: None,
                 workspace_root: None,
                 code: None,

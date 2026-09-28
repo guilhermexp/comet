@@ -46,6 +46,7 @@ required-features = ["project-palette-fixture"]
 
 [dependencies]
 url.workspace = true
+reqwest.workspace = true
 zeron-proto.workspace = true
 similar.workspace = true
 zeron-doc.workspace = true
@@ -97,7 +98,6 @@ objc2.workspace = true
 objc2-app-kit = { workspace = true, features = ["NSApplication", "NSResponder"] }
 objc2-foundation.workspace = true
 objc2-web-kit.workspace = true
-reqwest.workspace = true
 image.workspace = true
 
 core-foundation.workspace = true

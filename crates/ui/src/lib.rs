@@ -41,6 +41,7 @@ pub(crate) mod image_viewer;
 pub mod inline_media;
 #[cfg(debug_assertions)]
 pub mod inspector;
+pub mod link_favicons;
 pub mod links;
 pub mod live_voice;
 pub mod loaders;
@@ -213,6 +214,7 @@ pub fn run_app(config: UiConfig) {
         composer::init(cx, ui_settings.composer_send_behavior);
         terminal::panel::init(cx);
         app_menus::init(cx);
+        link_favicons::init(cx);
         #[cfg(debug_assertions)]
         inspector::init(cx);
 

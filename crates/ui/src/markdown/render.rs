@@ -71,18 +71,23 @@ const CODE_HEADER_HEIGHT: f32 = 28.0;
 const CODE_ACTION_SIZE: f32 = 22.0;
 const CODE_SCROLLBAR_HIT_HEIGHT: f32 = 10.0;
 
-// Table metrics — a port of mugen-markdown 0.6.2's `TableBlock` under zeron's
-// resolved md theme. The design is frameless ("flat hairline"): 1px horizontal
-// rules under the header and between rows are the only chrome — no outer box,
-// no header fill, no corner radius (theme: headerBackground transparent,
-// radius 0). Cells use the body scale (14/22) with a uniform 12px padding;
-// the header row is weight-700 per `table.headerWeight`.
-/// Uniform cell padding in px (zeron `table.cellPadding`).
+// Table metrics — a port of mugen-markdown 0.6.2's `TableBlock`, restyled after
+// the Codex desktop transcript. The design is frameless ("flat hairline"): 1px
+// horizontal rules under the header and between rows are the only chrome — no
+// outer box, no header fill, no corner radius. Cells sit one step below the
+// body scale (13/21), the header is semibold, and the outer columns drop their
+// outside padding so the table's text edges line up with the prose column.
+/// Horizontal cell padding in px, per side (the column gutter is twice this).
 pub const TABLE_CELL_PADDING: f32 = 12.0;
+/// Vertical cell padding in px.
+pub const TABLE_CELL_PADDING_Y: f32 = 10.0;
+/// Table text scale — one step under [`MD_TEXT_SIZE`].
+pub const TABLE_TEXT_SIZE: f32 = 13.0;
+pub const TABLE_LINE_HEIGHT: f32 = 21.0;
 /// Hairline between rows in px (zeron `table.gap`).
 pub const TABLE_DIVIDER: f32 = 1.0;
-/// Header row font weight (zeron `table.headerWeight` = 700).
-pub const TABLE_HEADER_WEIGHT: FontWeight = FontWeight::BOLD;
+/// Header row font weight.
+pub const TABLE_HEADER_WEIGHT: FontWeight = FontWeight::SEMIBOLD;
 /// Floor for a column's max-content share, so a short column ("1k") beside a
 /// prose column keeps a readable width (mugen `MIN_COLUMN_CONTENT`).
 pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
@@ -93,6 +98,11 @@ pub const TABLE_MIN_COLUMN_WIDTH: f32 = 180.0;
 /// Hairline tone (zeron md theme `table.borderColor`: rgba(255,255,255,0.1)).
 pub fn table_hairline() -> Hsla {
     crate::theme::hairline(0.10)
+}
+
+/// The rule under the header row reads one step stronger than row rules.
+pub fn table_header_rule() -> Hsla {
+    crate::theme::hairline(0.18)
 }
 
 /// Options for one rendered tree (a transcript row or a whole live message).
@@ -155,6 +165,24 @@ pub fn table_bleed(natural_width: f32, block_width: f32, budget: f32) -> f32 {
         return 0.0;
     }
     (((natural_width - block_width) / 2.0).max(0.0)).min(budget.max(0.0))
+}
+
+/// An `http(s)` destination (or a still-streaming link, which almost always
+/// becomes one): drawn link-blue with the site's favicon.
+pub(crate) fn is_web_link(url: &str) -> bool {
+    url == super::mend::PENDING_LINK_URL
+        || url.starts_with("https://")
+        || url.starts_with("http://")
+}
+
+/// Link-blue for web links, tuned per appearance.
+pub(crate) fn web_link_color(theme: &Theme) -> Hsla {
+    gpui::rgb(if theme.appearance.is_dark() {
+        0x6b9bf0
+    } else {
+        0x1f63d6
+    })
+    .into()
 }
 
 /// Um destino de link que o preview interno sabe abrir: caminho local, sem
@@ -924,21 +952,30 @@ fn render_table(
                     .as_ref()
                     .filter(|ui| ui.source_session.is_some())
                     .map(|_| {
-                        super::link_presentation::present(&flat, px(560.), px(MD_TEXT_SIZE), window)
+                        super::link_presentation::present(
+                            &flat,
+                            px(560.),
+                            px(TABLE_TEXT_SIZE),
+                            window,
+                        )
                     });
                 let flat: &FlatText = measured.as_ref().unwrap_or(&flat);
                 let mut cell_width = 0.0f32;
                 for (range, chip) in super::inline_chips::segments(flat) {
+                    let leads_link = super::inline_chips::web_links(flat)
+                        .any(|(link, _)| link.start == range.start);
                     let part = super::inline_chips::fragment(&flat, range);
                     let line: SharedString = part.text.replace('\n', " ").into();
                     let scale = if chip { 0.8 } else { 1.0 };
                     let mut width = f32::from(
                         text_system
-                            .shape_line(line, px(MD_TEXT_SIZE * scale), &part.runs, None)
+                            .shape_line(line, px(TABLE_TEXT_SIZE * scale), &part.runs, None)
                             .width(),
                     );
                     if chip {
-                        width += 12.0; // Native box horizontal padding.
+                        // Native box horizontal padding, plus slack so shaping
+                        // rounding never wraps the token inside its own box.
+                        width += 12.0 + 4.0;
                         if part
                             .links
                             .iter()
@@ -948,6 +985,9 @@ fn render_table(
                         {
                             width += 18.0; // 14px icon + 4px gap.
                         }
+                    }
+                    if leads_link {
+                        width += super::inline_chips::FAVICON_ADVANCE;
                     }
                     cell_width += width;
                     tokens[c] = tokens[c].max(width);
@@ -972,7 +1012,12 @@ fn render_table(
         .min_w(px(geo.min_table_width));
     for (r, row) in flats.iter().enumerate() {
         if r > 0 {
-            inner = inner.child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(hairline));
+            let rule = if has_header && r == 1 {
+                table_header_rule()
+            } else {
+                hairline
+            };
+            inner = inner.child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(rule));
         }
         let mut row_el = div().flex().flex_row().flex_none();
         for (c, cell_flat) in row.iter().enumerate() {
@@ -981,9 +1026,19 @@ fn render_table(
                 .flex_shrink(geo.naturals[c])
                 .flex_basis(px(0.0))
                 .min_w(px(geo.minimums[c]))
-                .p(px(TABLE_CELL_PADDING))
-                .text_size(px(MD_TEXT_SIZE))
-                .line_height(px(MD_LINE_HEIGHT));
+                .py(px(TABLE_CELL_PADDING_Y))
+                .text_size(px(TABLE_TEXT_SIZE))
+                .line_height(px(TABLE_LINE_HEIGHT));
+            // The outer edges carry no padding so text aligns with the prose
+            // column; the edge column moves that padding to its inner side,
+            // keeping every column's geometry (and every gutter) unchanged.
+            let (left, right) = match (c == 0, c + 1 == cols) {
+                (true, true) => (0.0, 0.0),
+                (true, false) => (0.0, 2.0 * TABLE_CELL_PADDING),
+                (false, true) => (2.0 * TABLE_CELL_PADDING, 0.0),
+                (false, false) => (TABLE_CELL_PADDING, TABLE_CELL_PADDING),
+            };
+            cell = cell.pl(px(left)).pr(px(right));
             cell = match align.get(c).copied().unwrap_or_default() {
                 TableAlign::Left => cell,
                 TableAlign::Center => cell.text_center(),
@@ -996,8 +1051,8 @@ fn render_table(
             {
                 cell = cell.child(text_element(
                     &all[r][c],
-                    MD_TEXT_SIZE,
-                    MD_LINE_HEIGHT,
+                    TABLE_TEXT_SIZE,
+                    TABLE_LINE_HEIGHT,
                     has_header && r == 0,
                     top_ix,
                     table_cell_ix(ix, r, c),
@@ -1006,14 +1061,14 @@ fn render_table(
                 ));
             } else if let Some(flat) = cell_flat {
                 let index = table_cell_ix(ix, r, c);
-                cell = cell.child(if flat.chips.is_empty() {
+                cell = cell.child(if !super::inline_chips::needs_flow(flat) {
                     flat_text_element(flat, index, opts, theme)
                 } else {
                     super::inline_chips::render(
                         flat,
                         index,
-                        MD_TEXT_SIZE,
-                        MD_LINE_HEIGHT,
+                        TABLE_TEXT_SIZE,
+                        TABLE_LINE_HEIGHT,
                         opts,
                         theme,
                     )
@@ -1108,11 +1163,16 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             FontStyle::Normal
         };
-        // Links stay monochrome — foreground with an underline (zeron's md
-        // theme underlines in the text color; indigo is reserved for primary
-        // actions).
-        let is_link = run.style.link.is_some();
-        let color = theme.text;
+        // Web links read as links the way the Codex transcript draws them:
+        // link-blue, no underline, a site favicon ahead (inline_chips). File
+        // and other local destinations stay monochrome with an underline.
+        let is_web_link = run.style.link.as_deref().is_some_and(is_web_link);
+        let is_link = run.style.link.is_some() && !is_web_link;
+        let color = if is_web_link && !run.style.code {
+            web_link_color(theme)
+        } else {
+            theme.text
+        };
         if let Some(url) = &run.style.link {
             // A still-streaming link (mend.rs sentinel) keeps link styling —
             // so the URL's completion changes nothing visually — but is not
@@ -1958,7 +2018,7 @@ fn text_element(
         FontWeight::NORMAL
     };
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
-    let inner = if flat.chips.is_empty() {
+    let inner = if !super::inline_chips::needs_flow(&flat) {
         flat_text_element(&flat, ix, opts, theme)
     } else {
         super::inline_chips::render(&flat, ix, size, line_height, opts, theme)
@@ -3502,9 +3562,9 @@ mod tests {
         assert_eq!(flat.links, vec![(3..7, "https://x.dev".to_string())]);
         let total: usize = flat.runs.iter().map(|r| r.len).sum();
         assert_eq!(total, flat.text.len());
-        // Links stay monochrome (foreground + underline), never accent-tinted.
-        assert_eq!(flat.runs[1].color, theme.text);
-        assert!(flat.runs[1].underline.is_some());
+        // Web links are link-blue without an underline (Codex transcript).
+        assert_eq!(flat.runs[1].color, web_link_color(&theme));
+        assert!(flat.runs[1].underline.is_none());
         assert_eq!(flat.runs[2].font.weight, FontWeight::SEMIBOLD);
     }
 
@@ -3537,15 +3597,15 @@ mod tests {
     }
 
     #[test]
-    fn table_header_flattens_at_weight_700() {
+    fn table_header_flattens_semibold() {
         let theme = Theme::dark();
         let runs = vec![InlineRun {
             text: "Header".into(),
             style: InlineStyle::default(),
         }];
         let flat = flatten_runs_weighted(&runs, &theme, TABLE_HEADER_WEIGHT);
-        assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
-        // Strong runs inside a 700 header stay 700 (never drop to semibold).
+        assert_eq!(flat.runs[0].font.weight, FontWeight::SEMIBOLD);
+        // Strong runs inside the header keep the header weight.
         let bold_runs = vec![InlineRun {
             text: "Strong".into(),
             style: InlineStyle {
@@ -3554,7 +3614,7 @@ mod tests {
             },
         }];
         let flat = flatten_runs_weighted(&bold_runs, &theme, TABLE_HEADER_WEIGHT);
-        assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
+        assert_eq!(flat.runs[0].font.weight, FontWeight::SEMIBOLD);
     }
 
     #[test]
