@@ -3379,6 +3379,14 @@ fn format_execution_duration(duration_ms: u64) -> String {
     }
 }
 
+/// Whether a live reasoning viewport should stay pinned to its newest text:
+/// nothing to scroll yet, or the last layout left it within a few pixels of
+/// the bottom (`offset` grows more negative as it scrolls down).
+fn reasoning_follows_tail(offset_y: Pixels, max_offset_y: Pixels) -> bool {
+    let max = f32::from(max_offset_y);
+    max <= 0.0 || max - (-f32::from(offset_y)) <= 24.0
+}
+
 fn format_reasoning_elapsed(duration_ms: u64) -> String {
     format_execution_duration(duration_ms)
 }
@@ -9438,6 +9446,13 @@ impl Transcript {
                 .entry(row_id.clone())
                 .or_insert_with(ScrollHandle::new)
                 .clone();
+            // Live thinking follows its tail inside the capped viewport,
+            // unless the reader scrolled up in it; back at the bottom, the
+            // follow resumes. Measured against the last layout, so a frame
+            // that grew the text still counts as "was at the bottom".
+            if active && reasoning_follows_tail(scroll.offset().y, scroll.max_offset().y) {
+                scroll.scroll_to_bottom();
+            }
             column = column.child(
                 div()
                     .id(SharedString::from(format!("{row_id}-reasoning-body")))
@@ -14408,6 +14423,18 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    #[test]
+    fn live_reasoning_follows_its_tail_until_the_reader_scrolls_up() {
+        // Nothing to scroll yet.
+        assert!(reasoning_follows_tail(px(0.0), px(0.0)));
+        // At (or within a few pixels of) the bottom: keep following.
+        assert!(reasoning_follows_tail(px(-300.0), px(300.0)));
+        assert!(reasoning_follows_tail(px(-290.0), px(300.0)));
+        // Scrolled up to read: leave the viewport where the reader put it.
+        assert!(!reasoning_follows_tail(px(-120.0), px(300.0)));
+        assert!(!reasoning_follows_tail(px(0.0), px(300.0)));
     }
 
     #[test]
