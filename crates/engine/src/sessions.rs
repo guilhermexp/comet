@@ -1673,7 +1673,9 @@ impl SessionsEngine {
                 session_id: None,
             };
             self.inner.publish(&chat_id, &done);
-            let stamped = handle.mark_abandoned_streams(note)?.len();
+            let stamped_entries = handle.mark_abandoned_streams(note)?;
+            let stamped = stamped_entries.len();
+            self.settle_orphaned_subagents(&handle, &stamped_entries, note);
             self.set_status(&chat_id, SessionStatus::Idle, false);
             tracing::info!(chat = %chat_id, stamped, will_resume, attempts, "recovered stale session journal");
             recovered += 1;
@@ -1772,7 +1774,10 @@ impl SessionsEngine {
                 continue;
             };
             let stamped = match handle.mark_abandoned_streams(NOTE) {
-                Ok(stamped) => stamped.len(),
+                Ok(stamped) => {
+                    self.settle_orphaned_subagents(&handle, &stamped, NOTE);
+                    stamped.len()
+                }
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err, "abandoned-stream sweep failed");
                     continue;
@@ -1786,6 +1791,84 @@ impl SessionsEngine {
             recovered += 1;
         }
         Ok(recovered)
+    }
+
+    /// A dead run never finished the subagent sinks it was feeding: their
+    /// docs keep a `streaming` last entry (the subagent tab spins forever)
+    /// while the parent chip was settled `failed` by the entry sweep — the
+    /// Details widget and the tab then disagree. Settle both sides together:
+    /// a spawn chip still `running` (a background subagent whose own entry
+    /// had already finished) flips to `failed`, and every chip this recovery
+    /// settled has its subagent doc's abandoned streams stamped `aborted`. A
+    /// subagent that genuinely resumes in the revived run reopens both as
+    /// `running` (sink open → chip refresh), so they stay in step.
+    fn settle_orphaned_subagents(
+        &self,
+        handle: &ChatDocHandle,
+        stamped: &[(String, i64)],
+        note: &str,
+    ) -> usize {
+        let Some(host) = self.inner.doc_host() else {
+            return 0;
+        };
+        let Ok(entries) = handle.doc().read_entries() else {
+            return 0;
+        };
+        let mut settled = 0;
+        for entry in &entries {
+            let entry_stamped = stamped.iter().any(|(id, _)| id == &entry.id);
+            for part in &entry.parts {
+                let MessagePart::Tool {
+                    id,
+                    call,
+                    subagent_ref: Some(sub_id),
+                    subagent_status,
+                    ..
+                } = part
+                else {
+                    continue;
+                };
+                if !call.is_subagent_spawn() {
+                    continue;
+                }
+                let running = *subagent_status == Some(zeron_doc::SubagentStatus::Running);
+                let just_failed =
+                    entry_stamped && *subagent_status == Some(zeron_doc::SubagentStatus::Failed);
+                if !running && !just_failed {
+                    continue;
+                }
+                if running {
+                    let end = handle.doc().last_entry_slot().map(|(entry, after_part)| {
+                        zeron_doc::SubagentEnd {
+                            entry: Some(entry),
+                            after_part,
+                        }
+                    });
+                    let _ = handle.doc().update_subagent_chip(
+                        id,
+                        None,
+                        Some("failed"),
+                        None,
+                        end.as_ref(),
+                    );
+                }
+                match host.open(sub_id) {
+                    Ok(sub) => match sub.mark_abandoned_streams(note) {
+                        Ok(_) => settled += 1,
+                        Err(err) => {
+                            tracing::warn!(doc = %sub_id, error = %err, "subagent recovery failed")
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(doc = %sub_id, error = %err, "subagent recovery skipped")
+                    }
+                }
+            }
+        }
+        if settled > 0 {
+            tracing::info!(chat = %handle.chat_id(), settled, "settled orphaned subagents");
+        }
+        settled
     }
 
     /// Is a run for this chat live in THIS process right now? The orphan

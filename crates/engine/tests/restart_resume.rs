@@ -1128,6 +1128,167 @@ async fn closed_journal_still_stamps_a_streaming_doc_aborted() {
     );
 }
 
+/// A dead run never finished its subagent sinks: the subagent docs kept a
+/// `streaming` last entry (the subagent tab spun forever) while the parent
+/// chip was settled `failed`, so the Details widget and the tab disagreed.
+/// Recovery settles both sides: chips `failed`, subagent docs `aborted` —
+/// for the chip of the interrupted entry AND for a background subagent whose
+/// spawn entry had already completed.
+#[tokio::test]
+async fn recovery_settles_subagent_docs_in_step_with_their_chips() {
+    use zeron_doc::SubagentStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    let sub_doc = |id: &str| format!("{CHAT}--sub--{id}");
+    let chip = |id: &str| MessagePart::Tool {
+        id: id.into(),
+        call: ToolCall::Unknown {
+            name: "Agent: scan".into(),
+            input: None,
+        },
+        is_error: false,
+        resolved: true,
+        execution: None,
+        output: None,
+        diff: None,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        diff_stats: None,
+        file_preview: None,
+        subagent_ref: Some(sub_doc(id)),
+        subagent_status: Some(SubagentStatus::Running),
+        subagent_tail: None,
+        subagent_end: None,
+    };
+    let entry = |id: &str, role, parts, status| SessionMessageEntry {
+        id: id.into(),
+        role,
+        parts,
+        created_at: 1,
+        device_id: "dev-crash".into(),
+        status: Some(status),
+        duration_ms: None,
+        continuation_of: None,
+    };
+    {
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&entry(
+            "msg-user-1",
+            MessageRole::User,
+            vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "fan out".into(),
+            }],
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+        doc.push_message(&entry(
+            "msg-assistant-1",
+            MessageRole::Assistant,
+            vec![chip("bg")],
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+        doc.push_message(&entry(
+            "msg-assistant-2",
+            MessageRole::Assistant,
+            vec![chip("fg")],
+            MessageStatus::Streaming,
+        ))
+        .unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+        for id in ["bg", "fg"] {
+            let sub = SessionDoc::init(&sub_doc(id)).unwrap();
+            sub.push_message(&entry(
+                "sub-entry",
+                MessageRole::Assistant,
+                vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "working…".into(),
+                }],
+                MessageStatus::Streaming,
+            ))
+            .unwrap();
+            store
+                .save_snapshot(&sub_doc(id), &sub.export_snapshot().unwrap())
+                .unwrap();
+        }
+        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-crash".into(),
+                    assistant_message_id: "msg-assistant-2".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some("hs-crash".into()),
+                },
+            )
+            .unwrap();
+    }
+
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            session_id: "hs-after-crash".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    let chips: Vec<_> = entries_now(&core)
+        .iter()
+        .flat_map(|e| e.parts.clone())
+        .filter_map(|p| match p {
+            MessagePart::Tool {
+                id,
+                subagent_status,
+                ..
+            } => Some((id, subagent_status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chips,
+        vec![
+            ("bg".to_owned(), Some(SubagentStatus::Failed)),
+            ("fg".to_owned(), Some(SubagentStatus::Failed)),
+        ]
+    );
+    for id in ["bg", "fg"] {
+        let sub = core
+            .doc_host
+            .open(&sub_doc(id))
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        assert_eq!(
+            sub.last().and_then(|e| e.status),
+            Some(MessageStatus::Aborted),
+            "subagent {id} must not keep spinning after its run died"
+        );
+    }
+}
+
 /// A question whose run died leaves an OPEN input part on an entry that may
 /// still read `streaming` (no restart happened, so no boot sweep settled it).
 /// The orphan fallback used to refuse those — the panel re-asked the same

@@ -1358,6 +1358,17 @@ impl WorkersSidebar {
         let revealed = self.revealed_projects.contains(&project.id);
         let (visible_indices, hidden_sessions) =
             project_session_row_plan(sessions.len(), selected_index, revealed);
+        // A worktree with sessions has no header row of its own: its sessions
+        // sit at the parent project's level, each led by a branch mark. The
+        // branch name lives in the Details panel. An empty worktree keeps its
+        // header, or it would vanish from the list.
+        let flatten = is_worktree && !sessions.is_empty();
+        let row_depth = if flatten {
+            depth.saturating_sub(1)
+        } else {
+            depth
+        };
+        let branch_marker = flatten.then(|| project_name.clone());
         let rows = visible_indices
             .into_iter()
             .map(|session_index| {
@@ -1365,7 +1376,8 @@ impl WorkersSidebar {
                 self.render_session(
                     session,
                     selected_session_id,
-                    depth,
+                    row_depth,
+                    branch_marker.clone(),
                     index * 10_000 + session_index,
                     theme,
                     cx,
@@ -1373,8 +1385,17 @@ impl WorkersSidebar {
             })
             .collect::<Vec<_>>();
         let reveal_control = hidden_sessions.map(|hidden| {
-            self.render_session_reveal(&project.id, hidden, revealed, depth, index, theme, cx)
+            self.render_session_reveal(&project.id, hidden, revealed, row_depth, index, theme, cx)
         });
+        if flatten {
+            return div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .children(rows)
+                .children(reveal_control)
+                .into_any_element();
+        }
 
         let terminal_project_id = project.id.clone();
         let terminal_worktree_path = project
@@ -1720,6 +1741,7 @@ impl WorkersSidebar {
         session: WorkersSession,
         selected_session_id: Option<&str>,
         depth: usize,
+        branch_marker: Option<SharedString>,
         index: usize,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -1933,6 +1955,26 @@ impl WorkersSidebar {
                 SessionIndicator::Idle | SessionIndicator::Exited => {
                     div().w(px(16.0)).flex().justify_center()
                 }
+            })
+            .when_some(branch_marker, |el, branch| {
+                el.child(
+                    div()
+                        .id(("workers-session-branch", index))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| WorkerContextTooltip {
+                                text: branch.clone(),
+                            })
+                            .into()
+                        })
+                        .child(
+                            icon(icons::WORKER_BRANCH)
+                                .size(px(14.0))
+                                .text_color(theme.success),
+                        ),
+                )
             })
             .child(
                 div()
