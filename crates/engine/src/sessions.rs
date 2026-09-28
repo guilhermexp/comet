@@ -3048,6 +3048,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_ref,
                 subagent_status,
                 subagent_tail,
+                subagent_end,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
@@ -3068,6 +3069,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_ref: subagent_ref.clone(),
                 subagent_status: *subagent_status,
                 subagent_tail: subagent_tail.clone(),
+                subagent_end: subagent_end.clone(),
             },
             other => other.clone(),
         })
@@ -3905,6 +3907,7 @@ async fn drive_run(
                             Some(&sub_id),
                             Some("running"),
                             None,
+                            None,
                         );
                     }
                 }
@@ -3925,11 +3928,18 @@ async fn drive_run(
                 if !chip_streaming && done {
                     // In-place chip refresh on lifecycle transitions only —
                     // content never rewrites the parent doc.
+                    // The chip's turn is over: the end slot is the parent
+                    // entry streaming now, after its latest part.
+                    let end = zeron_doc::SubagentEnd {
+                        entry: Some(entry_id.clone()),
+                        after_part: folded.last().map(|part| part.id().to_owned()),
+                    };
                     let _ = doc_ref.update_subagent_chip(
                         parent_tool_use_id,
                         None,
                         subagent_chip_update(sub_event),
                         None,
+                        Some(&end),
                     );
                 }
                 if done {
@@ -4425,7 +4435,11 @@ async fn drive_run(
     // parent process is gone, so nothing more can arrive on this stream.
     for (parent_id, sink) in subagents.drain() {
         let doc_id = sink.doc_id.clone();
-        let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None);
+        let end = zeron_doc::SubagentEnd {
+            entry: Some(entry_id.clone()),
+            after_part: folded.last().map(|part| part.id().to_owned()),
+        };
+        let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None, Some(&end));
         if let Some(json) = sink.finish(&device_id, MessageStatus::Aborted)
             && let Some(host) = inner.doc_host()
         {
@@ -4666,6 +4680,7 @@ mod tests {
             subagent_ref: Some(child.into()),
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         };
 
         {

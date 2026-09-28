@@ -269,6 +269,20 @@ pub enum SubagentStatus {
     Failed,
 }
 
+/// Where in the parent transcript a subagent reached a terminal status —
+/// the timeline slot for its "finished" line. Stamped on the spawn chip at
+/// the transition to `done`/`failed`, cleared when it is reopened.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentEnd {
+    /// Parent entry active at that moment; `None` = the chip's own entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// Last part of that entry at that moment; `None` = before its first part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_part: Option<String>,
+}
+
 /// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -348,6 +362,10 @@ pub enum MessagePart {
         /// its tagged text deltas (capped; display-only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent_tail: Option<String>,
+        /// Timeline slot of the terminal transition ([`SubagentEnd`]);
+        /// additive, absent on docs written before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_end: Option<SubagentEnd>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -709,6 +727,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    subagent_end: None,
                 });
             }
         }
@@ -849,11 +868,15 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
                 _ => None,
             };
+            // The chip lives in this same entry: its end slot is after the
+            // entry's current last part.
+            let last_part = out.last().map(|p| p.id().to_owned());
             for p in out.iter_mut() {
                 if let MessagePart::Tool {
                     id,
                     call,
                     subagent_status,
+                    subagent_end,
                     ..
                 } = p
                     && id == parent_tool_use_id
@@ -863,8 +886,24 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     // 2026-08-20) must not decorate an ordinary chip.
                     && call.is_subagent_spawn()
                 {
+                    let was_terminal = matches!(
+                        subagent_status,
+                        Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
+                    );
                     match status {
-                        Some(s) => *subagent_status = Some(s),
+                        Some(SubagentStatus::Running) => {
+                            *subagent_status = Some(SubagentStatus::Running);
+                            *subagent_end = None;
+                        }
+                        Some(s) => {
+                            *subagent_status = Some(s);
+                            if !was_terminal {
+                                *subagent_end = Some(SubagentEnd {
+                                    entry: None,
+                                    after_part: last_part.clone(),
+                                });
+                            }
+                        }
                         // Any tagged traffic proves the subagent is live;
                         // never regress a terminal state.
                         None if !matches!(
@@ -1911,6 +1950,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                subagent_end: None,
             },
         ];
         let chunks = split_parts(&parts);
@@ -2506,6 +2546,78 @@ mod tests {
         ));
         // Content never leaked into the parent parts.
         assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn subagent_done_stamps_its_timeline_slot_once_and_reopen_clears_it() {
+        use zeron_proto::DoneStatus;
+        let done = |parts: &mut Vec<MessagePart>| {
+            fold_event_into_parts(
+                parts,
+                &AgentEvent::Subagent {
+                    parent_tool_use_id: "toolu_sub".into(),
+                    event: Box::new(AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    }),
+                },
+            );
+        };
+        let end = |parts: &[MessagePart]| match &parts[0] {
+            MessagePart::Tool { subagent_end, .. } => subagent_end.clone(),
+            other => panic!("{other:?}"),
+        };
+        let mut parts = Vec::new();
+        for (id, name) in [("toolu_sub", "Agent"), ("t1", "Bash"), ("t2", "Bash")] {
+            fold_event_into_parts(
+                &mut parts,
+                &AgentEvent::ToolCall {
+                    id: id.into(),
+                    call: ToolCall::Unknown {
+                        name: name.into(),
+                        input: None,
+                    },
+                },
+            );
+        }
+        done(&mut parts);
+        let slot = SubagentEnd {
+            entry: None,
+            after_part: Some("t2".into()),
+        };
+        assert_eq!(end(&parts), Some(slot.clone()));
+        // A repeated terminal event must not move the slot.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t3".into(),
+                call: ToolCall::Unknown {
+                    name: "Bash".into(),
+                    input: None,
+                },
+            },
+        );
+        done(&mut parts);
+        assert_eq!(end(&parts), Some(slot));
+        // Reopening clears it; the next finish stamps afresh.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: None,
+                }),
+            },
+        );
+        assert_eq!(end(&parts), None);
+        done(&mut parts);
+        assert_eq!(
+            end(&parts).and_then(|slot| slot.after_part),
+            Some("t3".into())
+        );
     }
 
     #[test]

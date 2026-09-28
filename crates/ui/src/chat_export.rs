@@ -707,6 +707,7 @@ mod tests {
             subagent_ref: subagent_ref.map(str::to_owned),
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         }
     }
 

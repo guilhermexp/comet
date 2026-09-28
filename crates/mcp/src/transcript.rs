@@ -283,6 +283,7 @@ mod tests {
                         subagent_ref: None,
                         subagent_status: None,
                         subagent_tail: None,
+                        subagent_end: None,
                         execution: None,
                         file_preview: None,
                     },

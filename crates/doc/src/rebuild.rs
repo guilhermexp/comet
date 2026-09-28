@@ -197,6 +197,7 @@ mod tests {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    subagent_end: None,
                 },
             ],
             created_at: 5,
@@ -325,6 +326,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         }];
         source.push_message(&entry).unwrap();
 

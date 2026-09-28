@@ -138,6 +138,20 @@ async fn check_persistence(
             assert!(subagent_ref.is_none());
         }
     }
+    // Every settled chip records where in the timeline its subagent finished.
+    for part in parent.iter().flat_map(|e| &e.parts) {
+        if let MessagePart::Tool {
+            id,
+            call,
+            subagent_status: Some(SubagentStatus::Done | SubagentStatus::Failed),
+            subagent_end,
+            ..
+        } = part
+            && call.is_subagent_spawn()
+        {
+            assert!(subagent_end.is_some(), "{id} has no end slot");
+        }
+    }
     assert!(!text(&parent, MessageRole::Assistant).contains("alpha"));
     assert!(!text(&parent, MessageRole::Assistant).contains("beta"));
     let alpha = entries(&core, &alpha_doc);

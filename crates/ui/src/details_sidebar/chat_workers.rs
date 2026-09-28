@@ -552,6 +552,7 @@ mod tests {
             subagent_ref: Some(format!("chat--sub--{id}")),
             subagent_status: Some(status),
             subagent_tail: Some(tail.into()),
+            subagent_end: None,
         }
     }
 
@@ -700,6 +701,7 @@ mod tests {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    subagent_end: None,
                 },
             ],
             created_at: 1,
@@ -778,6 +780,7 @@ mod tests {
                 subagent_ref: Some("chat--sub--opaque-7f91".into()),
                 subagent_status: Some(SubagentStatus::Running),
                 subagent_tail: None,
+                subagent_end: None,
             }],
             created_at: 1,
             device_id: "device-1".into(),

@@ -380,6 +380,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    subagent_end: None,
                 },
             ],
             created_at: 2,

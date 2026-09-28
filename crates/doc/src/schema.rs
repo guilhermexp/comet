@@ -158,6 +158,9 @@ struct DocPartJson {
     /// One-line live tail of the subagent's output (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_tail: Option<String>,
+    /// Timeline slot of the subagent's terminal transition (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_end: Option<crate::parts::SubagentEnd>,
     /// Durable workflow activity snapshot (additive and non-rendered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task: Option<zeron_proto::WorkflowTaskUpdate>,
@@ -214,6 +217,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             subagent_ref,
             subagent_status,
             subagent_tail,
+            subagent_end,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -245,6 +249,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
                 .to_owned()
             }),
             subagent_tail: subagent_tail.clone(),
+            subagent_end: subagent_end.clone(),
             ..Default::default()
         },
         MessagePart::Input {
@@ -322,6 +327,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                     _ => None,
                 }),
                 subagent_tail: p.subagent_tail,
+                subagent_end: p.subagent_end,
             },
             None => MessagePart::Text {
                 id: p.id,
@@ -918,12 +924,17 @@ impl SessionDoc {
     /// chip's entry is usually already finished by the time the background
     /// subagent produces its lifecycle. Searched from the NEWEST entry back
     /// (the chip belongs to a recent turn). `None` fields are left as-is.
+    ///
+    /// `end` is the timeline slot of a terminal transition: stamped only
+    /// when `status` moves the chip from non-terminal to `done`/`failed`;
+    /// a `running` status clears any slot (the subagent was reopened).
     pub fn update_subagent_chip(
         &self,
         part_id: &str,
         subagent_ref: Option<&str>,
         status: Option<&str>,
         tail: Option<&str>,
+        end: Option<&crate::parts::SubagentEnd>,
     ) -> Result<bool, DocError> {
         let messages = self.doc.get_list("messages");
         for i in (0..messages.len()).rev() {
@@ -971,6 +982,23 @@ impl SessionDoc {
                         part.insert("subagentRef", r)?;
                     }
                     if let Some(s) = status {
+                        let was_terminal = matches!(
+                            part.get("subagentStatus"),
+                            Some(loro::ValueOrContainer::Value(LoroValue::String(prev)))
+                                if matches!(prev.as_str(), "done" | "failed")
+                        );
+                        let terminal = matches!(s, "done" | "failed");
+                        if s == "running" {
+                            part.delete("subagentEnd")?;
+                        } else if terminal
+                            && !was_terminal
+                            && let Some(end) = end
+                        {
+                            part.insert(
+                                "subagentEnd",
+                                loro_value_from_json(&serde_json::to_value(end)?),
+                            )?;
+                        }
                         part.insert("subagentStatus", s)?;
                     }
                     if let Some(t) = tail {
@@ -1114,6 +1142,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
+    }
+    if let Some(end) = &doc_part.subagent_end {
+        map.insert(
+            "subagentEnd",
+            loro_value_from_json(&serde_json::to_value(end)?),
+        )?;
     }
     if let Some(task) = &doc_part.task {
         map.insert("task", loro_value_from_json(&serde_json::to_value(task)?))?;
@@ -1421,6 +1455,7 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         });
     }
     if obj.get("kind").and_then(|x| x.as_str()) == Some("workflowTask")
@@ -1740,6 +1775,18 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
     }
+    // Unlike the other fields, the end slot is also CLEARED in place: a
+    // reopened subagent (steer) drops it until it finishes again.
+    match &doc_part.subagent_end {
+        Some(end) => {
+            map.insert(
+                "subagentEnd",
+                loro_value_from_json(&serde_json::to_value(end)?),
+            )?;
+        }
+        None if map.get("subagentEnd").is_some() => map.delete("subagentEnd")?,
+        None => {}
+    }
     if let Some(task) = &doc_part.task {
         map.insert("task", loro_value_from_json(&serde_json::to_value(task)?))?;
     }
@@ -1952,6 +1999,7 @@ mod tests {
                 _ => None,
             }),
             subagent_tail: None,
+            subagent_end: None,
         }
     }
 
@@ -2083,6 +2131,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         };
         w.sync(std::slice::from_ref(&part)).unwrap();
         if let MessagePart::Tool {
@@ -2133,6 +2182,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         };
         let parts = vec![
             tool(
@@ -2157,6 +2207,7 @@ mod tests {
                 Some("c1--sub--toolu_spawn"),
                 Some("running"),
                 None,
+                None,
             )
             .unwrap()
         );
@@ -2165,6 +2216,7 @@ mod tests {
                 "toolu_bash",
                 Some("c1--sub--toolu_bash"),
                 Some("done"),
+                None,
                 None,
             )
             .unwrap()
@@ -2184,6 +2236,71 @@ mod tests {
             panic!("tool expected")
         };
         assert_eq!(subagent_ref.as_deref(), Some("c1--sub--toolu_spawn"));
+
+        // Terminal transition stamps the slot once; running clears it.
+        let slot = crate::SubagentEnd {
+            entry: Some("entry-later".into()),
+            after_part: Some("toolu_bash".into()),
+        };
+        let end_of = |doc: &SessionDoc| {
+            let entries = doc.read_entries().unwrap();
+            match &entries[0].parts[1] {
+                MessagePart::Tool { subagent_end, .. } => subagent_end.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(
+            doc.update_subagent_chip("toolu_spawn", None, Some("done"), None, Some(&slot))
+                .unwrap()
+        );
+        assert_eq!(end_of(&doc), Some(slot.clone()));
+        let moved = crate::SubagentEnd {
+            entry: Some("entry-even-later".into()),
+            after_part: None,
+        };
+        doc.update_subagent_chip("toolu_spawn", None, Some("done"), None, Some(&moved))
+            .unwrap();
+        assert_eq!(end_of(&doc), Some(slot));
+        doc.update_subagent_chip("toolu_spawn", None, Some("running"), None, None)
+            .unwrap();
+        assert_eq!(end_of(&doc), None);
+    }
+
+    #[test]
+    fn segment_sync_writes_and_clears_the_subagent_end_slot() {
+        let doc = SessionDoc::init("c-end").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let mut parts = Vec::new();
+        crate::fold_event_into_parts(
+            &mut parts,
+            &zeron_proto::AgentEvent::ToolCall {
+                id: "toolu_spawn".into(),
+                call: ToolCall::Unknown {
+                    name: "Agent: scan".into(),
+                    input: None,
+                },
+            },
+        );
+        writer.sync(&parts).unwrap();
+        let slot = crate::SubagentEnd {
+            entry: None,
+            after_part: Some("toolu_spawn".into()),
+        };
+        let set_end = |parts: &mut Vec<MessagePart>, end: Option<crate::SubagentEnd>| {
+            if let MessagePart::Tool { subagent_end, .. } = &mut parts[0] {
+                *subagent_end = end;
+            }
+        };
+        let end_of = |doc: &SessionDoc| match &doc.read_entries().unwrap()[0].parts[0] {
+            MessagePart::Tool { subagent_end, .. } => subagent_end.clone(),
+            other => panic!("{other:?}"),
+        };
+        set_end(&mut parts, Some(slot.clone()));
+        writer.sync(&parts).unwrap();
+        assert_eq!(end_of(&doc), Some(slot));
+        set_end(&mut parts, None);
+        writer.sync(&parts).unwrap();
+        assert_eq!(end_of(&doc), None);
     }
 
     #[test]
@@ -2221,6 +2338,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         };
         writer.sync(std::slice::from_ref(&part)).unwrap();
         let MessagePart::Tool { file_preview, .. } = &mut part else {
@@ -2309,6 +2427,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                subagent_end: None,
             }],
             created_at: 1,
             device_id: "dev".into(),
@@ -2612,6 +2731,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                subagent_end: None,
             }],
             created_at: 1,
             device_id: "dev-a".into(),
@@ -2658,6 +2778,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                subagent_end: None,
             }],
             created_at: 1,
             device_id: "dev-a".into(),

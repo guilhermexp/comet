@@ -388,6 +388,7 @@ fn running_subagent_shows_a_spinner_after_its_spawn_resolves() {
         subagent_ref: Some("sub-1".into()),
         subagent_status: Some(status),
         subagent_tail: None,
+        subagent_end: None,
         execution: None,
         file_preview: None,
     };

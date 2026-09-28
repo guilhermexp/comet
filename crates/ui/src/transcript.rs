@@ -866,6 +866,191 @@ pub enum RowKind {
         source_chat_id: SharedString,
         source_title: SharedString,
     },
+    /// A subagent's "finished" timeline line (Codex-style lifecycle), placed
+    /// where its terminal status arrived ([`zeron_doc::SubagentEnd`]).
+    SubagentEnd(Arc<SubagentEndLine>),
+}
+
+/// What a subagent lifecycle line announces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubagentPhase {
+    Started { running: bool },
+    Finished,
+    Failed,
+}
+
+/// Inputs for [`Transcript::render_subagent_line`].
+struct SubagentLine {
+    doc_id: SharedString,
+    title: SharedString,
+    parent_tool_use_id: SharedString,
+    phase: SubagentPhase,
+}
+
+/// One subagent reaching a terminal status, as a timeline line.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SubagentEndLine {
+    /// The spawn chip's tool id (also the tab's parent tool-use id).
+    pub tool_id: SharedString,
+    pub doc_id: SharedString,
+    pub title: SharedString,
+    pub failed: bool,
+}
+
+/// Subagent end lines that cross entries: a chip whose subagent finished
+/// while a LATER parent entry was streaming draws its line in that entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct SubagentEndPlacement {
+    /// Lines owned by chips of earlier entries, with the part they follow
+    /// in this entry (`None` = ahead of its first part).
+    incoming: Vec<(Option<String>, SubagentEndLine)>,
+    /// Chips of this entry whose line lands in another existing entry.
+    departed: Vec<String>,
+}
+
+impl SubagentEndPlacement {
+    fn key(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        if self.incoming.is_empty() && self.departed.is_empty() {
+            return 0;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// The finished line a terminal spawn chip contributes, if any.
+fn subagent_end_line(
+    part: &MessagePart,
+) -> Option<(SubagentEndLine, Option<&zeron_doc::SubagentEnd>)> {
+    let MessagePart::Tool {
+        id,
+        call,
+        is_error,
+        subagent_ref: Some(doc_id),
+        subagent_status,
+        subagent_end,
+        ..
+    } = part
+    else {
+        return None;
+    };
+    if !is_agent_call(call)
+        || !matches!(
+            subagent_status,
+            Some(SubagentStatus::Done | SubagentStatus::Failed)
+        )
+    {
+        return None;
+    }
+    Some((
+        SubagentEndLine {
+            tool_id: id.clone().into(),
+            doc_id: doc_id.clone().into(),
+            title: subagent_tab_title(call),
+            failed: *is_error || *subagent_status == Some(SubagentStatus::Failed),
+        },
+        subagent_end.as_ref(),
+    ))
+}
+
+/// Cross-entry end-line placement for a whole transcript. Entries absent
+/// from the map need none (their chips place their own lines locally).
+pub(crate) fn subagent_end_placements(
+    entries: &[SessionMessageEntry],
+) -> HashMap<String, SubagentEndPlacement> {
+    let ids: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    let mut out: HashMap<String, SubagentEndPlacement> = HashMap::new();
+    for entry in entries {
+        for part in &entry.parts {
+            let Some((line, Some(end))) = subagent_end_line(part) else {
+                continue;
+            };
+            let Some(target) = end
+                .entry
+                .as_deref()
+                .filter(|target| *target != entry.id && ids.contains(target))
+            else {
+                continue;
+            };
+            out.entry(entry.id.clone())
+                .or_default()
+                .departed
+                .push(line.tool_id.to_string());
+            out.entry(target.to_owned())
+                .or_default()
+                .incoming
+                .push((end.after_part.clone(), line));
+        }
+    }
+    out
+}
+
+/// Insert the entry's subagent "finished" lines at their timeline slots.
+/// Local chips land after the part their slot names (never before their own
+/// chip); docs without a slot, or with one that no longer resolves, put the
+/// line right after the chip. Incoming lines follow `after_part` here.
+fn place_subagent_end_rows(
+    entry: &SessionMessageEntry,
+    entry_id: &SharedString,
+    placement: &SubagentEndPlacement,
+    rows: &mut Vec<ProjectedRow>,
+) {
+    let part_ix = |id: &str| entry.parts.iter().position(|part| part.id() == id);
+    let mut lines: Vec<(isize, SubagentEndLine)> = Vec::new();
+    for (ix, part) in entry.parts.iter().enumerate() {
+        let Some((line, end)) = subagent_end_line(part) else {
+            continue;
+        };
+        if placement
+            .departed
+            .iter()
+            .any(|id| id.as_str() == line.tool_id.as_ref())
+        {
+            continue;
+        }
+        let slot = end
+            .filter(|end| end.entry.as_deref().is_none_or(|target| target == entry.id))
+            .and_then(|end| end.after_part.as_deref())
+            .and_then(part_ix)
+            .unwrap_or(ix)
+            .max(ix);
+        lines.push((slot as isize, line));
+    }
+    for (after, line) in &placement.incoming {
+        let slot = match after.as_deref() {
+            None => -1,
+            Some(id) => part_ix(id).map_or(entry.parts.len() as isize - 1, |ix| ix as isize),
+        };
+        lines.push((slot, line.clone()));
+    }
+    lines.sort_by_key(|(slot, _)| *slot);
+    for (slot, line) in lines {
+        let at = rows
+            .iter()
+            .position(|row| row.source_start as isize > slot)
+            .unwrap_or(rows.len());
+        let source = slot.max(0) as usize;
+        rows.insert(
+            at,
+            ProjectedRow {
+                source_start: source,
+                source_end: source,
+                row: Row {
+                    id: format!("{}#end:{}", entry.id, line.tool_id).into(),
+                    version: fnv1a(
+                        format!("{}\0{}\0{}", line.title, line.doc_id, line.failed).as_bytes(),
+                    ),
+                    turn_start: false,
+                    kind: RowKind::SubagentEnd(Arc::new(line)),
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
+                    copy_text: None,
+                },
+            },
+        );
+    }
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1516,7 +1701,7 @@ pub fn rows_for_entry(
     pending: bool,
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
 ) -> Vec<Row> {
-    rows_for_entry_with_todo_history(entry, pending, &[], parse)
+    rows_for_entry_with_todo_history(entry, pending, &[], &SubagentEndPlacement::default(), parse)
 }
 
 #[cfg(test)]
@@ -1526,6 +1711,7 @@ fn rows_for_entry_with_todo_history(
     entry: &SessionMessageEntry,
     pending: bool,
     previous_todos: &[TodoItem],
+    subagent_ends: &SubagentEndPlacement,
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
 ) -> Vec<Row> {
     #[cfg(test)]
@@ -2175,6 +2361,7 @@ fn rows_for_entry_with_todo_history(
         group_first_part_ix,
         group_last_part_ix,
     );
+    place_subagent_end_rows(entry, &entry_id, subagent_ends, &mut rows);
 
     let mut seen_errors = HashSet::new();
     let mut seen_images = HashSet::new();
@@ -2358,6 +2545,7 @@ fn compact_entry_rows(entry: &SessionMessageEntry, rows: Vec<Row>) -> Vec<Row> {
                 | RowKind::ToolGroup { .. }
                 | RowKind::FileChange { .. }
                 | RowKind::TaskSnapshot { .. }
+                | RowKind::SubagentEnd(..)
         )
     };
     let stays_out = |row: &Row| {
@@ -3641,8 +3829,11 @@ impl TranscriptPreparation {
         let mut fully_historical = HashSet::new();
         let mut bytes = 0;
         let mut todo_history: Vec<TodoItem> = Vec::new();
+        let end_placements = subagent_end_placements(&self.entries);
         for entry in &self.entries {
-            let todo_context = todo_context_key(entry, &todo_history);
+            let placement = end_placements.get(&entry.id).cloned().unwrap_or_default();
+            let todo_context =
+                todo_context_key(entry, &todo_history) ^ placement.key().rotate_left(29);
             let cached = self
                 .cache
                 .get(&entry.id)
@@ -3658,6 +3849,7 @@ impl TranscriptPreparation {
                         entry,
                         false,
                         &todo_history,
+                        &placement,
                         &mut |key, text| {
                             parse_for_row(streaming, key, text, live_parsers, tree_cache).0
                         },
@@ -5656,17 +5848,20 @@ impl Transcript {
                 .as_ref()
                 .and_then(|id| state.prepared_transcripts.get(id));
             let mut todo_history = Vec::new();
+            let end_placements = subagent_end_placements(entries);
+            let no_placement = SubagentEndPlacement::default();
             for (ix, entry) in entries.iter().enumerate() {
                 if is_superseded_notice(entries, ix) {
                     continue;
                 }
+                let placement = end_placements.get(&entry.id).unwrap_or(&no_placement);
                 let entry_rows = if let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id)) {
                     if let Some(next) = last_todo_snapshot(entry) {
                         todo_history = next.to_vec();
                     }
                     rows.as_ref().clone()
                 } else {
-                    self.rows_for(entry, false, &mut todo_history)
+                    self.rows_for(entry, false, &mut todo_history, placement)
                 };
                 if self.compact_mode {
                     new_rows.extend(compact_entry_rows(entry, entry_rows));
@@ -5676,7 +5871,7 @@ impl Transcript {
             }
             if self.doc_override.is_none() {
                 for echo in state.pending_echoes() {
-                    new_rows.extend(self.rows_for(echo, true, &mut todo_history));
+                    new_rows.extend(self.rows_for(echo, true, &mut todo_history, &no_placement));
                 }
             }
             // Prepare navigation from the final row order, even while the
@@ -5946,6 +6141,7 @@ impl Transcript {
         entry: &SessionMessageEntry,
         pending: bool,
         todo_history: &mut Vec<TodoItem>,
+        subagent_ends: &SubagentEndPlacement,
     ) -> Vec<Row> {
         let streaming = entry.status == Some(MessageStatus::Streaming);
         let next_todos = last_todo_snapshot(entry).map(<[TodoItem]>::to_vec);
@@ -5959,6 +6155,7 @@ impl Transcript {
             append_todo_snapshot_bytes(&mut context, todo_history);
             fingerprint ^= fnv1a(&context).rotate_left(17);
         }
+        fingerprint ^= subagent_ends.key().rotate_left(29);
         if !streaming
             && let Some(cached) = self.row_cache.get(&entry.id)
             && cached.fingerprint == fingerprint
@@ -5976,7 +6173,13 @@ impl Transcript {
             // rows whose content hash changed are spliced — the reparsed tail).
             parse_for_row(streaming, key, text, live_parsers, tree_cache).0
         };
-        let rows = rows_for_entry_with_todo_history(entry, pending, todo_history, &mut parse);
+        let rows = rows_for_entry_with_todo_history(
+            entry,
+            pending,
+            todo_history,
+            subagent_ends,
+            &mut parse,
+        );
 
         if let Some(next_todos) = next_todos {
             *todo_history = next_todos;
@@ -7978,7 +8181,101 @@ impl Transcript {
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::Notice { text } => notice_divider(text.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::SubagentEnd(line) => self.render_subagent_line(
+                row.id.clone(),
+                SubagentLine {
+                    doc_id: line.doc_id.clone(),
+                    title: line.title.clone(),
+                    parent_tool_use_id: line.tool_id.clone(),
+                    phase: if line.failed {
+                        SubagentPhase::Failed
+                    } else {
+                        SubagentPhase::Finished
+                    },
+                },
+                &theme,
+                cx,
+            ),
         }
+    }
+
+    /// One Codex-style subagent lifecycle line: avatar, name, what happened.
+    /// The whole line opens the subagent's transcript, like the old chip.
+    fn render_subagent_line(
+        &self,
+        id: SharedString,
+        line: SubagentLine,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat_id = self
+            .journal_chat_id
+            .clone()
+            .or_else(|| self.chat_id.clone())
+            .unwrap_or_default();
+        let SubagentLine {
+            doc_id,
+            title,
+            parent_tool_use_id,
+            phase,
+        } = line;
+        let (verb, tone) = match phase {
+            SubagentPhase::Started { .. } => ("started working", theme.text_muted),
+            SubagentPhase::Finished => ("finished", theme.text_muted),
+            SubagentPhase::Failed => ("failed", theme.danger),
+        };
+        let frozen = !matches!(phase, SubagentPhase::Started { running: true });
+        let mut label = div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(div().min_w_0().truncate().child(format!("{title} {verb}")));
+        if let SubagentPhase::Started { running: true } = phase {
+            label = label.child(crate::loaders::mini_mono_spinner(
+                format!("{id}#spinner"),
+                2.0,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            ));
+        }
+        let open_title = title.clone();
+        div()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .min_h(px(CHIP_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .font_family(theme.font_sans.clone())
+            .text_size(px(render::MD_TEXT_SIZE))
+            .line_height(px(CHIP_HEIGHT))
+            .text_color(tone)
+            .cursor_pointer()
+            .hover(|style| style.text_color(theme.text))
+            .child(
+                img(
+                    crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path(
+                        &doc_id,
+                    ),
+                )
+                .size(px(18.0))
+                .flex_none()
+                .object_fit(ObjectFit::Contain),
+            )
+            .child(label)
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(TranscriptEvent::OpenSubagent {
+                    chat_id: chat_id.clone(),
+                    doc_id: doc_id.to_string(),
+                    parent_tool_use_id: parent_tool_use_id.to_string(),
+                    title: open_title.to_string(),
+                    frozen,
+                });
+            }))
+            .into_any_element()
     }
 
     fn render_file_change(
@@ -9577,113 +9874,46 @@ impl Transcript {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut row = div()
-            .w_full()
-            .min_w_0()
-            .min_h(px(32.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .font_family(theme.font_sans.clone())
-            .font_weight(gpui::FontWeight::NORMAL)
-            .text_size(px(render::MD_TEXT_SIZE))
-            .line_height(px(CHIP_HEIGHT));
+        // Codex-style: one "started working" line per subagent; each one's
+        // "finished" line lands later in the timeline (RowKind::SubagentEnd).
+        let mut column = div().w_full().min_w_0().flex().flex_col();
         for (ix, tool) in tools.iter().enumerate() {
-            let title = subagent_tab_title(&tool.call);
-            let doc_id = tool.subagent_ref.clone().expect("linked sibling");
-            let chat_id = self
-                .journal_chat_id
-                .clone()
-                .or_else(|| self.chat_id.clone())
-                .unwrap_or_default();
-            let parent_tool_use_id = tool.id.clone();
-            let frozen = matches!(
-                tool.subagent_status,
-                Some(SubagentStatus::Done | SubagentStatus::Failed)
-            );
-            let failed = tool.is_error || tool.subagent_status == Some(SubagentStatus::Failed);
-            row = row.child(
-                div()
-                    .id(SharedString::from(format!("{row_id}#s{ix}")))
-                    .min_w_0()
-                    .max_w_full()
-                    .flex_shrink(1.0)
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .bg(theme.composer_glass_bg())
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
-                    .text_color(if failed {
-                        theme.danger
-                    } else {
-                        theme.text_muted
-                    })
-                    .hover(|style| style.text_color(theme.text))
-                    .child(
-                        img(
-                            crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path(
-                                &doc_id,
-                            ),
-                        )
-                        .size(px(28.0))
-                        .flex_none()
-                        .object_fit(ObjectFit::Contain),
-                    )
-                    .child(div().min_w_0().truncate().child(title.clone()))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(TranscriptEvent::OpenSubagent {
-                            chat_id: chat_id.clone(),
-                            doc_id: doc_id.to_string(),
-                            parent_tool_use_id: parent_tool_use_id.to_string(),
-                            title: title.to_string(),
-                            frozen,
-                        });
-                    })),
-            );
-        }
-        let running = tools
-            .iter()
-            .any(|tool| tool.subagent_status == Some(SubagentStatus::Running));
-        let failed = tools
-            .iter()
-            .any(|tool| tool.is_error || tool.subagent_status == Some(SubagentStatus::Failed));
-        let completed = tools.iter().all(|tool| {
-            matches!(
-                tool.subagent_status,
-                Some(SubagentStatus::Done | SubagentStatus::Failed)
-            )
-        });
-        let status = match (running, failed, completed) {
-            (true, true, _) => "Working · some failed",
-            (true, false, _) => "Working",
-            (false, true, true) => "Completed with failures",
-            (false, false, true) => "Completed",
-            (false, true, false) => "Starting · some failed",
-            _ => "Starting",
-        };
-        let mut summary = div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .text_color(if failed {
-                theme.danger
-            } else {
-                theme.text_faint
-            })
-            .child(status);
-        if running {
-            summary = summary.child(crate::loaders::mini_mono_spinner(
-                format!("{row_id}#batch-spinner"),
-                2.0,
-                theme.text_muted,
-                cx.entity_id(),
+            column = column.child(self.render_subagent_start(
+                SharedString::from(format!("{row_id}#s{ix}")),
+                tool,
+                theme,
                 cx,
             ));
         }
-        row.child(summary).into_any_element()
+        column.into_any_element()
+    }
+
+    /// The "started working" line for one spawn chip (a spawn LINK).
+    fn render_subagent_start(
+        &self,
+        id: SharedString,
+        tool: &ToolItem,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let failed_to_start = tool.is_error && tool.subagent_status != Some(SubagentStatus::Done);
+        self.render_subagent_line(
+            id,
+            SubagentLine {
+                doc_id: tool.subagent_ref.clone().unwrap_or_default(),
+                title: subagent_tab_title(&tool.call),
+                parent_tool_use_id: tool.id.clone(),
+                phase: if failed_to_start && tool.subagent_status.is_none() {
+                    SubagentPhase::Failed
+                } else {
+                    SubagentPhase::Started {
+                        running: tool.subagent_status == Some(SubagentStatus::Running),
+                    }
+                },
+            },
+            theme,
+            cx,
+        )
     }
 
     /// Entrance progress per call of one tool row, renewing the frame lease
@@ -9989,32 +10219,11 @@ impl Transcript {
                 // Spawn chips are LINKS, not accordions: the click opens the
                 // subagent's transcript as a right-pane tab (the shell hosts
                 // the surface — the chip only announces which doc it indexes).
-                if let Some(doc_id) = tool.subagent_ref.clone().filter(|_| is_spawn_link(tool)) {
-                    let chat_id = self
-                        .journal_chat_id
-                        .clone()
-                        .or_else(|| self.chat_id.clone())
-                        .unwrap_or_default();
-                    let parent_tool_use_id = tool.id.clone();
-                    let title = subagent_tab_title(&tool.call);
-                    let frozen = matches!(
-                        tool.subagent_status,
-                        Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
-                    );
-                    return subagent_chip(
-                        tool,
+                if is_spawn_link(tool) {
+                    return self.render_subagent_start(
                         SharedString::from(format!("{row_id}#s{ix}")),
-                        cx.listener(move |_, _, _, cx| {
-                            cx.emit(TranscriptEvent::OpenSubagent {
-                                chat_id: chat_id.clone(),
-                                doc_id: doc_id.to_string(),
-                                parent_tool_use_id: parent_tool_use_id.to_string(),
-                                title: title.to_string(),
-                                frozen,
-                            });
-                        }),
+                        tool,
                         theme,
-                        cx.entity_id(),
                         cx,
                     );
                 }
@@ -10827,9 +11036,6 @@ fn detail_body(
 enum ChipTrail {
     /// Expand/collapse chevron — flipped while the detail body is open.
     Chevron { open: bool },
-    /// Top-right "opens elsewhere" arrow — the spawn chip's link to its
-    /// subagent tab.
-    OpenArrow,
 }
 
 /// The chip's content row: icon tile + label + detail line (+ trailing tile
@@ -11101,21 +11307,9 @@ fn chip_header_row(
         )
         .when_some(trail, |row, trail| {
             // Trailing tile matching the group header's: a chevron for the
-            // output/diff accordion, or the open-arrow for spawn chips.
-            let tile = div()
-                .size(px(18.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.text_muted.opacity(0.7));
+            // output/diff accordion.
             row.child(match trail {
                 ChipTrail::Chevron { open } => stream_disclosure(open, theme),
-                ChipTrail::OpenArrow => tile.child(
-                    crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
-                        .size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.8)),
-                ),
             })
         })
 }
@@ -11519,38 +11713,6 @@ fn tool_chip(
 /// "open the subagent tab" click (open-arrow in the trailing slot).
 /// No accordion — an inline body would only repeat the subagent's own
 /// transcript.
-fn subagent_chip(
-    tool: &ToolItem,
-    id: SharedString,
-    on_open: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-    theme: &Theme,
-    view: gpui::EntityId,
-    cx: &mut gpui::App,
-) -> AnyElement {
-    div()
-        .id(id)
-        .min_h(px(CHIP_HEIGHT))
-        .px(px(8.0))
-        .py(px(4.0))
-        .rounded(px(6.0))
-        .bg(theme.composer_glass_bg())
-        .max_w_full()
-        .self_start()
-        .flex_none()
-        .cursor_pointer()
-        .on_click(on_open)
-        .child(chip_header_row(
-            tool,
-            Some(ChipTrail::OpenArrow),
-            None,
-            None,
-            theme,
-            view,
-            cx,
-        ))
-        .into_any_element()
-}
-
 fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     let mut acc: Vec<u8> = Vec::with_capacity(entry.parts.len() * 8 + 16);
     acc.extend_from_slice(entry.id.as_bytes());
@@ -11579,6 +11741,7 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
             subagent_ref,
             subagent_status,
             subagent_tail,
+            subagent_end,
             ..
         } = part
         {
@@ -11598,6 +11761,13 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
             );
             if let Some(tail) = subagent_tail {
                 acc.extend_from_slice(tail.as_bytes());
+            }
+            if let Some(end) = subagent_end {
+                acc.push(0xE7);
+                for field in [&end.entry, &end.after_part] {
+                    acc.extend_from_slice(field.as_deref().unwrap_or("").as_bytes());
+                    acc.push(0);
+                }
             }
         }
         if let MessagePart::Image {
@@ -12006,8 +12176,13 @@ mod tests {
             .unwrap();
         let mut todo_history = Vec::new();
         for entry in &entries {
-            let expected =
-                rows_for_entry_with_todo_history(entry, false, &todo_history, &mut parse);
+            let expected = rows_for_entry_with_todo_history(
+                entry,
+                false,
+                &todo_history,
+                &SubagentEndPlacement::default(),
+                &mut parse,
+            );
             let actual = &prepared.rows[&entry.id];
             assert_eq!(expected.len(), actual.len());
             for (expected, actual) in expected.iter().zip(actual.iter()) {
@@ -13155,6 +13330,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         };
         let entry = assistant(
             "assistant-turn-projects",
@@ -13434,6 +13610,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         };
         let parts = vec![
             text_part("artifact", "Preview ![chart](artifacts/chart.png)"),
@@ -13508,6 +13685,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         }
     }
 
@@ -14177,7 +14355,166 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         }
+    }
+
+    fn spawn_part(id: &str, end: Option<zeron_doc::SubagentEnd>) -> MessagePart {
+        let mut part = tool_part(id, "");
+        if let MessagePart::Tool {
+            call,
+            subagent_ref,
+            subagent_status,
+            subagent_end,
+            ..
+        } = &mut part
+        {
+            *call = ToolCall::Unknown {
+                name: "Agent: scan".into(),
+                input: None,
+            };
+            *subagent_ref = Some(format!("c--sub--{id}"));
+            *subagent_status = Some(SubagentStatus::Done);
+            *subagent_end = end;
+        }
+        part
+    }
+
+    fn lifecycle_labels(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match &row.kind {
+                RowKind::ToolGroup { tools, .. } => tools
+                    .iter()
+                    .map(|tool| tool.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                RowKind::SubagentEnd(line) => format!("end:{}", line.tool_id),
+                _ => "other".into(),
+            })
+            .collect()
+    }
+
+    fn placed_rows(entries: &[SessionMessageEntry]) -> Vec<Vec<String>> {
+        let placements = subagent_end_placements(entries);
+        entries
+            .iter()
+            .map(|entry| {
+                lifecycle_labels(&rows_for_entry_with_todo_history(
+                    entry,
+                    false,
+                    &[],
+                    &placements.get(&entry.id).cloned().unwrap_or_default(),
+                    &mut parse,
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subagent_end_line_lands_after_the_part_it_finished_after() {
+        let slot = zeron_doc::SubagentEnd {
+            entry: None,
+            after_part: Some("t2".into()),
+        };
+        let entry = assistant(
+            "a",
+            MessageStatus::Streaming,
+            vec![
+                spawn_part("sp", Some(slot)),
+                tool_part("t1", "ls"),
+                tool_part("t2", "pwd"),
+                tool_part("t3", "date"),
+            ],
+        );
+        assert_eq!(
+            placed_rows(&[entry]),
+            vec![vec!["sp", "t1+t2+t3", "end:sp"]]
+        );
+    }
+
+    #[test]
+    fn subagent_end_line_splits_nothing_and_follows_the_group_holding_its_slot() {
+        let slot = zeron_doc::SubagentEnd {
+            entry: None,
+            after_part: Some("t1".into()),
+        };
+        let entry = assistant(
+            "a",
+            MessageStatus::Streaming,
+            vec![
+                spawn_part("sp", Some(slot)),
+                tool_part("t1", "ls"),
+                text_part("x", "Checking."),
+                tool_part("t2", "pwd"),
+            ],
+        );
+        assert_eq!(
+            placed_rows(&[entry]),
+            vec![vec!["sp", "t1", "end:sp", "other", "t2"]]
+        );
+    }
+
+    #[test]
+    fn subagent_end_without_a_slot_follows_its_start_line() {
+        let entry = assistant(
+            "a",
+            MessageStatus::Streaming,
+            vec![spawn_part("sp", None), tool_part("t1", "ls")],
+        );
+        assert_eq!(placed_rows(&[entry]), vec![vec!["sp", "end:sp", "t1"]]);
+    }
+
+    #[test]
+    fn subagent_end_crosses_into_the_entry_that_was_streaming() {
+        let slot = zeron_doc::SubagentEnd {
+            entry: Some("b".into()),
+            after_part: Some("t4".into()),
+        };
+        let a = assistant(
+            "a",
+            MessageStatus::Streaming,
+            vec![spawn_part("sp", Some(slot.clone()))],
+        );
+        let b = assistant(
+            "b",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("t4", "ls"),
+                text_part("x", "Next."),
+                tool_part("t5", "pwd"),
+            ],
+        );
+        assert_eq!(
+            placed_rows(&[a.clone(), b]),
+            vec![vec!["sp"], vec!["t4", "end:sp", "other", "t5"]]
+        );
+        // The target entry never materialized: the line stays by its chip.
+        assert_eq!(placed_rows(&[a]), vec![vec!["sp", "end:sp"]]);
+        // Ahead of the target's first part.
+        let ahead = zeron_doc::SubagentEnd {
+            entry: Some("b".into()),
+            after_part: None,
+        };
+        let a = assistant(
+            "a",
+            MessageStatus::Streaming,
+            vec![spawn_part("sp", Some(ahead))],
+        );
+        let b = assistant("b", MessageStatus::Streaming, vec![tool_part("t4", "ls")]);
+        assert_eq!(placed_rows(&[a, b]), vec![vec!["sp"], vec!["end:sp", "t4"]]);
+    }
+
+    #[test]
+    fn a_running_subagent_has_no_end_line() {
+        let mut part = spawn_part("sp", None);
+        if let MessagePart::Tool {
+            subagent_status, ..
+        } = &mut part
+        {
+            *subagent_status = Some(SubagentStatus::Running);
+        }
+        let entry = assistant("a", MessageStatus::Streaming, vec![part]);
+        assert_eq!(placed_rows(&[entry]), vec![vec!["sp"]]);
     }
 
     fn compact(entry: &SessionMessageEntry) -> Vec<Row> {
@@ -14509,6 +14846,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                subagent_end: None,
             }],
         );
 
@@ -14609,10 +14947,17 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                subagent_end: None,
             }],
         );
 
-        let rows = rows_for_entry_with_todo_history(&entry, false, &previous, &mut parse);
+        let rows = rows_for_entry_with_todo_history(
+            &entry,
+            false,
+            &previous,
+            &SubagentEndPlacement::default(),
+            &mut parse,
+        );
         assert!(matches!(
             &rows[0].kind,
             RowKind::TaskSnapshot { created: false, .. }
@@ -14651,10 +14996,17 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                subagent_end: None,
             }],
         );
 
-        let rows = rows_for_entry_with_todo_history(&entry, false, &previous, &mut parse);
+        let rows = rows_for_entry_with_todo_history(
+            &entry,
+            false,
+            &previous,
+            &SubagentEndPlacement::default(),
+            &mut parse,
+        );
         assert!(matches!(
             &rows[0].kind,
             RowKind::TaskSnapshot {
@@ -14809,6 +15161,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_end: None,
         };
         let entry = assistant(
             "read-media",
@@ -14996,6 +15349,7 @@ mod tests {
             subagent_ref: Some(format!("chat--sub--{id}")),
             subagent_status: Some(SubagentStatus::Running),
             subagent_tail: None,
+            subagent_end: None,
         }
     }
 
@@ -16872,6 +17226,7 @@ mod tests {
             &assistant("todo", MessageStatus::Streaming, vec![part]),
             false,
             &items,
+            &SubagentEndPlacement::default(),
             &mut parse,
         );
         assert!(rows.is_empty());
