@@ -27,8 +27,25 @@ const ICON_PX: u32 = 32;
 #[derive(Clone)]
 enum Entry {
     Pending,
-    Ready(Arc<Image>),
+    Ready(Icon),
     Missing,
+}
+
+/// A loaded favicon plus, for a monochrome mark, its inverted twin: a black
+/// GitHub mark vanishes on the dark transcript (and a white one on light),
+/// so the appearance it would disappear on draws the flipped copy instead.
+#[derive(Clone)]
+struct Icon {
+    image: Arc<Image>,
+    flipped: Option<Arc<Image>>,
+    /// `true`: the mark is dark (flip on dark themes); `false`: light.
+    flip_on_dark: bool,
+}
+
+/// Rasterized, classified icon ready for the UI thread.
+struct Prepared {
+    png: Vec<u8>,
+    flipped: Option<(Vec<u8>, bool)>,
 }
 
 thread_local! {
@@ -46,14 +63,26 @@ pub fn init(cx: &mut App) {
         while let Some(host) = rx.next().await {
             let download = cx.update(|cx| {
                 let host = host.clone();
-                gpui_tokio::Tokio::spawn(cx, async move { resolve(&host).await })
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    let (format, bytes) = resolve(&host).await?;
+                    prepare(format, &bytes)
+                })
             });
             cx.spawn(async move |cx| {
                 let icon = download.await.ok().flatten();
                 cx.update(|cx| {
                     let entry = match icon {
-                        Some((format, bytes)) => {
-                            Entry::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                        Some(prepared) => {
+                            let png = |bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
+                            let (flipped, flip_on_dark) = match prepared.flipped {
+                                Some((bytes, dark)) => (Some(png(bytes)), dark),
+                                None => (None, false),
+                            };
+                            Entry::Ready(Icon {
+                                image: png(prepared.png),
+                                flipped,
+                                flip_on_dark,
+                            })
                         }
                         None => Entry::Missing,
                     };
@@ -67,13 +96,19 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// The favicon for `url`'s site, if already loaded. A first miss schedules
-/// the fetch; `None` then means "draw the fallback".
-pub fn favicon_for(url: &str) -> Option<Arc<Image>> {
+/// The favicon for `url`'s site, if already loaded, in the variant that stays
+/// visible on the current appearance. A first miss schedules the fetch;
+/// `None` then means "draw the fallback".
+pub fn favicon_for(url: &str, dark: bool) -> Option<Arc<Image>> {
     let host = fetchable_host(url)?;
     let hit = CACHE.with(|cache| cache.borrow().get(&host).cloned());
     match hit {
-        Some(Entry::Ready(image)) => return Some(image),
+        Some(Entry::Ready(icon)) => {
+            return Some(match icon.flipped {
+                Some(flipped) if icon.flip_on_dark == dark => flipped,
+                _ => icon.image,
+            });
+        }
         Some(Entry::Pending | Entry::Missing) => return None,
         None => {}
     }
@@ -250,6 +285,100 @@ fn decode(bytes: &[u8]) -> Option<(ImageFormat, Vec<u8>)> {
     Some((ImageFormat::Png, png.into_inner()))
 }
 
+/// Rasterize (SVG) or decode to a 32px RGBA icon, then classify it: a mark
+/// whose visible pixels are all near-black or near-white and colourless gets
+/// an inverted twin for the appearance it would disappear on.
+fn prepare(format: ImageFormat, bytes: &[u8]) -> Option<Prepared> {
+    let rgba = match format {
+        ImageFormat::Svg => rasterize_svg(bytes)?,
+        _ => image::load_from_memory(bytes)
+            .ok()?
+            .thumbnail(ICON_PX, ICON_PX)
+            .to_rgba8(),
+    };
+    let flipped = monochrome_tone(&rgba).map(|dark| {
+        let mut inverted = rgba.clone();
+        for pixel in inverted.pixels_mut() {
+            let [r, g, b, a] = pixel.0;
+            pixel.0 = [255 - r, 255 - g, 255 - b, a];
+        }
+        (encode_png(&inverted), dark)
+    });
+    let flipped = match flipped {
+        Some((Some(bytes), dark)) => Some((bytes, dark)),
+        _ => None,
+    };
+    Some(Prepared {
+        png: encode_png(&rgba)?,
+        flipped,
+    })
+}
+
+fn rasterize_svg(bytes: &[u8]) -> Option<image::RgbaImage> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let scale = ICON_PX as f32 / size.width().max(size.height()).max(1.0);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(ICON_PX, ICON_PX)?;
+    let dx = (ICON_PX as f32 - size.width() * scale) / 2.0;
+    let dy = (ICON_PX as f32 - size.height() * scale) / 2.0;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, dx, dy),
+        &mut pixmap.as_mut(),
+    );
+    let mut rgba = Vec::with_capacity((ICON_PX * ICON_PX * 4) as usize);
+    for pixel in pixmap.pixels() {
+        let color = pixel.demultiply();
+        rgba.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
+    }
+    image::RgbaImage::from_raw(ICON_PX, ICON_PX, rgba)
+}
+
+fn encode_png(rgba: &image::RgbaImage) -> Option<Vec<u8>> {
+    let mut png = std::io::Cursor::new(Vec::new());
+    rgba.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some(png.into_inner())
+}
+
+/// `Some(true)` for a dark monochrome mark, `Some(false)` for a light one,
+/// `None` for anything with colour, mid-tones, or an opaque backdrop (an
+/// icon that paints its own tile is visible on every theme).
+fn monochrome_tone(rgba: &image::RgbaImage) -> Option<bool> {
+    let (mut visible, mut opaque_px, mut dark, mut light) = (0u32, 0u32, 0u32, 0u32);
+    for pixel in rgba.pixels() {
+        let [r, g, b, a] = pixel.0;
+        if a < 48 {
+            continue;
+        }
+        visible += 1;
+        if a > 240 {
+            opaque_px += 1;
+        }
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        if max - min > 40 {
+            return None;
+        }
+        let luma = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+        if luma < 90 {
+            dark += 1;
+        } else if luma > 200 {
+            light += 1;
+        }
+    }
+    let total = rgba.width() * rgba.height();
+    // Nothing to see, or the icon fills its square (its own background).
+    if visible == 0 || opaque_px * 10 > total * 9 {
+        return None;
+    }
+    if dark * 10 >= visible * 9 {
+        Some(true)
+    } else if light * 10 >= visible * 9 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// `href`s of `<link rel="…icon…">` tags, `icon` before `apple-touch-icon`.
 fn icon_links(html: &str) -> Vec<String> {
     let lower = html.to_ascii_lowercase();
@@ -355,6 +484,29 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(parent_domain("example.com"), None);
+    }
+
+    #[test]
+    fn monochrome_marks_get_a_flipped_twin_for_the_theme_they_vanish_on() {
+        let mark = |fill: [u8; 4]| {
+            let mut img = image::RgbaImage::new(ICON_PX, ICON_PX);
+            for (x, y, pixel) in img.enumerate_pixels_mut() {
+                if (8..24).contains(&x) && (8..24).contains(&y) {
+                    pixel.0 = fill;
+                }
+            }
+            img
+        };
+        assert_eq!(monochrome_tone(&mark([24, 23, 23, 255])), Some(true));
+        assert_eq!(monochrome_tone(&mark([250, 250, 250, 255])), Some(false));
+        assert_eq!(monochrome_tone(&mark([30, 200, 90, 255])), None);
+        // A full opaque tile carries its own background: leave it alone.
+        let tile = image::RgbaImage::from_pixel(ICON_PX, ICON_PX, image::Rgba([0, 0, 0, 255]));
+        assert_eq!(monochrome_tone(&tile), None);
+
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/></svg>"#;
+        let prepared = prepare(ImageFormat::Svg, svg).expect("svg rasterizes");
+        assert!(matches!(prepared.flipped, Some((_, true))));
     }
 
     #[test]

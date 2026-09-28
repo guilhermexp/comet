@@ -168,7 +168,7 @@ fn favicon(url: &str, line_height: f32, theme: &Theme) -> AnyElement {
         .flex()
         .items_center()
         .justify_center();
-    let slot = match crate::link_favicons::favicon_for(url) {
+    let slot = match crate::link_favicons::favicon_for(url, theme.appearance.is_dark()) {
         Some(image) => slot.child(gpui::img(image).size(px(14.0)).rounded(px(3.0))),
         None => slot.child(
             crate::icons::icon(crate::icons::GLOBE)

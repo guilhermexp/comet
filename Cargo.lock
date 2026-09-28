@@ -12658,6 +12658,7 @@ dependencies = [
  "pulldown-cmark",
  "raw-window-handle",
  "reqwest",
+ "resvg",
  "roxmltree 0.21.1",
  "rquickjs",
  "rust-embed",
