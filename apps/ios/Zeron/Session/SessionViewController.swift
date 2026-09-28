@@ -206,11 +206,69 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         })
     }
 
+    // MARK: Opening (loader, then the transcript)
+
+    /// Shown while a pushed session loads.
+    private let loader = StatusGlyph(.spinner)
+    /// The transcript waits for the push to land before showing: the soft
+    /// edge effect under the bar can't pick up content that appears mid-push
+    /// (it read crisp under the title, then the effect snapped on). The page
+    /// slides in with a loader; the transcript fades in once the push is
+    /// done and its rows are laid out.
+    private var holdingTranscript = false
+    private var landed = false
+
+    override func viewIsAppearing(_ animated: Bool) {
+        super.viewIsAppearing(animated)
+        // First appearance by an animated push (the new-session handoff and
+        // unanimated column swaps reveal their own way).
+        guard animated, !hasAppeared, transitionCoordinator != nil, list.alpha > 0 else { return }
+        holdingTranscript = true
+        list.alpha = 0
+        if loader.superview == nil {
+            loader.translatesAutoresizingMaskIntoConstraints = false
+            view.insertSubview(loader, aboveSubview: list)
+            NSLayoutConstraint.activate([
+                loader.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                loader.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor, constant: -40),
+                loader.widthAnchor.constraint(equalToConstant: 12),
+                loader.heightAnchor.constraint(equalToConstant: 12),
+            ])
+            loader.transform = CGAffineTransform(scaleX: 1.75, y: 1.75)
+        }
+        loader.alpha = 1
+        loader.accessibilityIdentifier = "session-loading"
+    }
+
+    /// Both conditions met (push landed, rows in): show the transcript.
+    private func showTranscriptIfReady() {
+        guard holdingTranscript, landed, reportedOpen else { return }
+        holdingTranscript = false
+        list.settleEdgeEffect()
+        let reveal = {
+            self.list.alpha = 1
+            self.loader.alpha = 0
+        }
+        if UIAccessibility.isReduceMotionEnabled { return reveal() }
+        UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseOut, .allowUserInteraction], animations: reveal)
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         hasAppeared = true
+        landed = true
         (splitViewController as? SplitRootController)?.sessionDidAppear(chatId)
         list.settleEdgeEffect()
+        showTranscriptIfReady()
+        if holdingTranscript {
+            // Nothing to lay out (an empty or unreachable session): stop
+            // holding eventually rather than spin forever.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                guard let self, self.holdingTranscript else { return }
+                self.reportedOpen = true
+                self.showTranscriptIfReady()
+            }
+        }
         (tabBarController as? MainTabController)?.syncAccessory()
     }
 
@@ -277,6 +335,13 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             v = view.superview
         }
         return true
+    }
+
+    /// Putting the composer away rides along with the transcript's own taps
+    /// (links, images). Tap recognizers are exclusive by default: this one
+    /// won and every link tap was dropped.
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        other.view.map { $0 === list || $0.isDescendant(of: list) } ?? false
     }
 
     private let bottomFade = EdgeFadeOverlay()
@@ -371,6 +436,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         list.apply(frame)
         if !reportedOpen, frame.rowCount() > 0 {
             reportedOpen = true
+            showTranscriptIfReady()
             // Open latency: push → first measured frame on screen.
             let ms = (CACurrentMediaTime() - openedAt) * 1000
             let json = String(format: "{\"openMs\":%.1f,\"rows\":%d,\"layoutPassMs\":%.2f}", ms, frame.rowCount(), Double(frame.buildMicros()) / 1000)

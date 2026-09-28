@@ -8,10 +8,10 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
 | | |
 |---|---|
-| Último commit do upstream mergeado | `433aa148` (v0.2.94 + follow-ups de iOS, 2026-09-27) |
-| Merge | `1065d252` em `sync/upstream-v0.2.94` |
+| Último commit do upstream mergeado | `9d3cc8b2` (v0.2.96, 2026-09-27) |
+| Merge | pendente de commit em `sync/upstream-v0.2.94` (mergeia `refs/upstream/zeron-main-no-595`: `9d3cc8b2` + o revert local `a65f309e` do #595) |
 | OpenSpec | `openspec/changes/sync-upstream-v0-2-94/` |
-| Próximo sync começa de | `433aa148`, merge-base natural, sem graft |
+| Próximo sync começa de | `9d3cc8b2`, merge-base natural, sem graft. O #595 já está recusado na história via `a65f309e`; não reaparece |
 
 ## Receita
 
@@ -78,6 +78,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Rodapé Subagents/Chats do Explorer (`files/sections.rs`) | #498 | v0.2.94 | Duplica Workers › Subagents |
 | Botão "descartar árvore inteira" no diff | #81 (UI) | v0.2.94 | O descarte fica no Changes do Files. **As proteções entraram** |
 | Windows: build ARM64, arrastar abas (sobe zui), cwd do ConPTY, lock de identidade | #545/#536/#528/#527 | v0.2.94 | Fork só roda em macOS |
+| Updates duráveis do app desktop (Check for Updates, download em background, instalar ao sair, instalador Windows, faixa de update) | #595 | v0.2.96 | Fork sem feed de release próprio. Revertido pelo commit local `a65f309e` em cima do upstream, antes do merge; o `UpdateStatus`/faixa da sidebar que ainda vinham junto também ficaram de fora |
 
 ## Aceito com adaptação
 
@@ -96,6 +97,8 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Escape em camadas nos Settings | #541 | v0.2.94 | `dismiss_settings_escape_surface` + `dismiss_on_escape` das páginas (Devices, Agents, Accounts, Appearance); só na página do Orchestrator — Settings dos Workers mantém o comportamento antigo |
 | App iOS | #570 | v0.2.94 | Reescrita do upstream aceita inteira. As adaptações antigas (OMP, streaming) precisam ser refeitas |
 | Parser de markdown em `crates/markdown` | #570 | v0.2.94 | A heurística de path do fork foi para `zeron_markdown::file_path` |
+| Monitor e controles de update das CLIs de agente (`harness_updates.rs`, leases de execução no registry, `WatchHarnessUpdates`/`CheckHarnessUpdates`/`ApplyHarnessUpdate`/…, política por agente no Providers, notificação) | #389/#596 | v0.2.96 | RPCs registrados no `method.rs` (forwardable; deadlines 4 min/20 min do upstream). A lease entra na estrutura do fork: título, recap e commit message pegam a lease uma vez e a passam para `discover_models_with_lease` e para o run (orçamento `with_retry_budget` mantido); o steer roteado usa `while_update_clear` dentro do loop `activity_reservation`. Convive com os advisories de runtime dos Workers (`workers-unpeel::maintenance`, aba Workers): OMP e Kimi ficam fora do coordenador (`monitored`), porque a manutenção de Workers já cuida de `omp`/`pi`; Claude/Codex/Cursor/etc. aparecem nos dois lugares, cada um com seu gate. Controles na página Agents (Providers) do fork; `agent_update_notifications` gravado por `apply_shell_settings` |
+| Banner "Star on GitHub" na sidebar | #586 | v0.2.96 | Acima do menu de conta, sem a faixa de update; dispensa gravada por `apply_shell_settings`. URL do upstream (`zeronsh/comet`) |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
 ## Armadilhas conhecidas
@@ -124,3 +127,4 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | 2026-09-17 | melhorias de setembro | `openspec/changes/archive/2026-09-17-integrate-upstream-september-updates/` | Cmd+K, fontes, appshots, imagens geradas |
 | 2026-09-22 | até v0.2.83 (`d721f301`) | `openspec/changes/sync-upstream-v0-2-83/` | Merge `55395013` via graft (upstream reassinado); v0.2.84 em `010e02d2` |
 | 2026-09-27 | até `433aa148` (v0.2.94+) | `openspec/changes/sync-upstream-v0-2-94/` | Merge `1065d252`; iOS reescrito; o fork segura o grant MCP |
+| 2026-09-27 | até `9d3cc8b2` (v0.2.96) | `openspec/changes/sync-upstream-v0-2-94/` | Segundo merge na mesma branch; #595 recusado via revert local `a65f309e`; entram #389/#596, #588, #586, #592 e iOS |

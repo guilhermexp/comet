@@ -922,7 +922,7 @@ impl DemoHost {
                     }
                 }
             }
-            m::SEND_QUEUED_MESSAGE_NOW => {
+            m::SEND_QUEUED_MESSAGE_NOW | m::STEER_QUEUED_MESSAGE_NOW => {
                 let taken = core.write(|doc| doc.take_queued(&id))?;
                 match taken {
                     Some(item) => {

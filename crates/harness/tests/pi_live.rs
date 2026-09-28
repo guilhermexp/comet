@@ -21,6 +21,7 @@ async fn real_pi_mock_lifecycle() {
         let controls = RunControls {
             chat_id: String::new(),
             generate_native_title: false,
+            execution_lease: None,
             steering,
             interrupt: token.clone(),
             request_input: Box::new(|_| {

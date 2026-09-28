@@ -344,6 +344,20 @@ rpc_methods! {
     UPSERT_PROJECT_ACTION / UpsertProjectAction = "UpsertProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     DELETE_PROJECT_ACTION / DeleteProjectAction = "DeleteProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     RUN_PROJECT_ACTION / RunProjectAction = "RunProjectAction" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    // Upstream v0.2.96 (#389/#596): device-local agent CLI update lifecycle,
+    // relay-forwardable so another device can inspect/apply this device's CLIs.
+    /// The stream emits the complete ordered status list initially and after
+    /// every transition.
+    WATCH_HARNESS_UPDATES / WatchHarnessUpdates = "WatchHarnessUpdates" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
+    /// A full fleet of enabled providers is checked two at a time; each
+    /// provider may need both a CLI probe and a network request.
+    CHECK_HARNESS_UPDATES / CheckHarnessUpdates = "CheckHarnessUpdates" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 240 },
+    /// Leaves headroom beyond the provider's 15-minute mutation timeout for
+    /// queueing, verification, and the relayed response itself.
+    APPLY_HARNESS_UPDATE / ApplyHarnessUpdate = "ApplyHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 1200 },
+    CANCEL_HARNESS_UPDATE / CancelHarnessUpdate = "CancelHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    DISMISS_HARNESS_UPDATE / DismissHarnessUpdate = "DismissHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SET_HARNESS_UPDATE_POLICY / SetHarnessUpdatePolicy = "SetHarnessUpdatePolicy" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
 }
 
 #[cfg(test)]

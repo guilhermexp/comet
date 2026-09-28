@@ -132,6 +132,7 @@ fn controls_with_answer(
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let answers = questions
@@ -161,6 +162,7 @@ fn controls_with_pending_answer() -> (
     let interrupt = CancellationToken::new();
     let held = Arc::new(Mutex::new(Vec::new()));
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(move |_questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             held.lock().unwrap().push(tx);
@@ -183,6 +185,7 @@ fn controls_declining() -> (
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let answers = questions

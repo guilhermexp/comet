@@ -257,6 +257,7 @@ impl TurnWire {
             controls: RunControls {
                 chat_id: String::new(),
                 generate_native_title: false,
+                execution_lease: None,
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     let (tx, rx) = tokio::sync::oneshot::channel();

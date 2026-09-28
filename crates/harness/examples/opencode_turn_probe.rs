@@ -68,6 +68,7 @@ async fn main() {
             RunControls {
                 chat_id: String::new(),
                 generate_native_title: false,
+                execution_lease: None,
                 request_input: Box::new(move |questions| {
                     assert!(
                         answer_yes,

@@ -22,6 +22,7 @@ async fn turn(
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -145,6 +146,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
@@ -260,6 +262,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -401,6 +404,7 @@ async fn history(harness: &CursorHarness, count: usize) {
     let controls = RunControls {
         chat_id: String::new(),
         generate_native_title: false,
+        execution_lease: None,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
