@@ -10,6 +10,9 @@ pub struct WorkedProject {
     pub id: String,
     pub name: String,
     pub path: String,
+    /// The worktree branch when this project is a Workers worktree: the
+    /// row then wears the branch mark instead of the folder.
+    pub branch: Option<String>,
 }
 pub const WORKED_PROJECTS_ROW_HEIGHT: f32 = 28.0;
 pub const WORKED_PROJECTS_VISIBLE_ROWS: usize = 5;
@@ -171,6 +174,16 @@ pub fn worked_projects(
             id: cand.project.id.clone(),
             name: cand.project.name.clone(),
             path: cand.project.path.clone(),
+            // Same worktree rule as the Workers sidebar/titlebar
+            // (`workers::presentation::workers_titlebar`).
+            branch: crate::workers::presentation::workers_titlebar(Some(cand.project), None)
+                .branch_is_worktree
+                .then(|| {
+                    cand.project
+                        .change_request_branch()
+                        .unwrap_or(cand.project.name.as_str())
+                        .to_owned()
+                }),
         })
         .collect()
 }
@@ -388,6 +401,30 @@ mod tests {
     }
 
     #[test]
+    fn worktree_projects_carry_their_branch_and_plain_folders_do_not() {
+        let own = Path::new("/Users/gui/.orchestrator");
+        let home = Path::new("/Users/gui");
+        let plain = make_project("p-main", "jk", "/Users/gui/jk");
+        let mut worktree = make_project("p-wt", "sec-nf-privada", "/Users/gui/wt/sec-nf-privada");
+        worktree.parent_project_id = Some("p-main".into());
+        worktree.worktree_branch = Some("sec/nf-privada".into());
+        let entry = assistant_entry(vec![
+            ToolCall::ReadFile {
+                path: "/Users/gui/jk/a.rs".to_string(),
+            },
+            ToolCall::ReadFile {
+                path: "/Users/gui/wt/sec-nf-privada/b.rs".to_string(),
+            },
+        ]);
+        let result = worked_projects(&[entry], &[plain, worktree], own, Some(home));
+        let branches: Vec<_> = result
+            .iter()
+            .map(|project| (project.id.as_str(), project.branch.is_some()))
+            .collect();
+        assert_eq!(branches, vec![("p-main", false), ("p-wt", true)]);
+    }
+
+    #[test]
     fn empty_transcript_or_projects_returns_empty() {
         let own = Path::new("/Users/gui/.orchestrator");
         let home = Path::new("/Users/gui");
@@ -434,11 +471,13 @@ mod tests {
                     id: "p-a".to_string(),
                     name: "Kanna".to_string(),
                     path: "/Users/gui/Projects/kanna".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "p-b".to_string(),
                     name: "Kanwas".to_string(),
                     path: "/Users/gui/Projects/kanwas".to_string(),
+                    branch: None,
                 },
             ]
         );
@@ -474,6 +513,7 @@ mod tests {
                 id: "app".to_string(),
                 name: "App".to_string(),
                 path: "/Users/gui/app".to_string(),
+                branch: None,
             }]
         );
     }
@@ -496,6 +536,7 @@ mod tests {
                 id: "p1".to_string(),
                 name: "Project".to_string(),
                 path: "/Users/gui/dev/project".to_string(),
+                branch: None,
             }]
         );
 
@@ -529,6 +570,7 @@ mod tests {
                 id: "p-kanwas".to_string(),
                 name: "Kanwas".to_string(),
                 path: "/Users/gui/kanwas".to_string(),
+                branch: None,
             }]
         );
     }
@@ -573,16 +615,19 @@ mod tests {
                     id: "b".to_string(),
                     name: "Beta".to_string(),
                     path: "/Users/gui/beta".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "c".to_string(),
                     name: "Gamma".to_string(),
                     path: "/Users/gui/gamma".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "a".to_string(),
                     name: "Alpha".to_string(),
                     path: "/Users/gui/alpha".to_string(),
+                    branch: None,
                 },
             ]
         );
@@ -609,11 +654,13 @@ mod tests {
                     id: "a".to_string(),
                     name: "Project A".to_string(),
                     path: "/Users/gui/proj-a".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "b".to_string(),
                     name: "Project B".to_string(),
                     path: "/Users/gui/proj-b".to_string(),
+                    branch: None,
                 },
             ]
         );
@@ -641,6 +688,7 @@ mod tests {
                 id: "p1".to_string(),
                 name: "Comet".to_string(),
                 path: "/a/comet".to_string(),
+                branch: None,
             }]
         );
     }
@@ -689,11 +737,13 @@ mod tests {
                     id: "p1".to_string(),
                     name: "Proj1".to_string(),
                     path: "/A/proj1".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "p2".to_string(),
                     name: "Proj2".to_string(),
                     path: "/B/proj2".to_string(),
+                    branch: None,
                 },
             ]
         );
@@ -716,11 +766,13 @@ mod tests {
                     id: "p1".to_string(),
                     name: "Proj1".to_string(),
                     path: "/A/proj1".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "p2".to_string(),
                     name: "Proj2".to_string(),
                     path: "/B/proj2".to_string(),
+                    branch: None,
                 },
             ]
         );
@@ -745,6 +797,7 @@ mod tests {
                 id: "app".to_string(),
                 name: "App (2)".to_string(),
                 path: "/Users/g/Docs/App (2)".to_string(),
+                branch: None,
             }]
         );
     }
@@ -782,21 +835,25 @@ mod tests {
                     id: "a".to_string(),
                     name: "Project A".to_string(),
                     path: "/Users/gui/proj-a".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "b".to_string(),
                     name: "Project B".to_string(),
                     path: "/Users/gui/proj-b".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "c".to_string(),
                     name: "Project C".to_string(),
                     path: "/Users/gui/proj-c".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "d".to_string(),
                     name: "Project D".to_string(),
                     path: "/Users/gui/proj-d".to_string(),
+                    branch: None,
                 },
             ]
         );
@@ -821,6 +878,7 @@ mod tests {
                 id: "p1".to_string(),
                 name: "PatchProj".to_string(),
                 path: "/Users/gui/patch-proj".to_string(),
+                branch: None,
             }]
         );
     }
@@ -893,11 +951,13 @@ mod tests {
                     id: "s".to_string(),
                     name: "SearchProj".to_string(),
                     path: "/Users/gui/search-proj".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "g".to_string(),
                     name: "GlobProj".to_string(),
                     path: "/Users/gui/glob-proj".to_string(),
+                    branch: None,
                 },
             ]
         );
@@ -937,11 +997,13 @@ mod tests {
                     id: "jk".to_string(),
                     name: "JK Checklist App".to_string(),
                     path: "/Users/gui/JK CLIENT/JK Checklist App".to_string(),
+                    branch: None,
                 },
                 WorkedProject {
                     id: "bk".to_string(),
                     name: "Backup (2)".to_string(),
                     path: "/Users/gui/Docs/Backup (2)".to_string(),
+                    branch: None,
                 },
             ]
         );

@@ -3683,11 +3683,17 @@ impl DetailsSidebar {
                                         model.reveal_project(path.clone(), cx);
                                     });
                                 }))
-                                .child(
+                                // A Workers worktree reads as a branch, the same
+                                // mark the Workers sidebar gives its sessions.
+                                .child(if project.branch.is_some() {
+                                    icons::icon(icons::WORKER_BRANCH)
+                                        .size(px(14.0))
+                                        .text_color(theme.success)
+                                } else {
                                     icons::icon(icons::FOLDER)
                                         .size(px(14.0))
-                                        .text_color(theme.text_muted),
-                                )
+                                        .text_color(theme.text_muted)
+                                })
                                 .child(
                                     div()
                                         .flex_1()
