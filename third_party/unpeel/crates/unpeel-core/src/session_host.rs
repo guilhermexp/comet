@@ -2428,6 +2428,65 @@ pub fn output_path(session_id: &str) -> PathBuf {
     session_dir(session_id).join("output.bin")
 }
 
+/// Append-only journal of the PTY grid across the output stream's lifetime.
+///
+/// One JSON line per size change: `offset` is the lifetime output offset of
+/// the first byte produced at `cols`x`rows`. A TUI's differential redraw
+/// (cursor-up N, rewrite only the changed cells) is only meaningful on the
+/// grid it drew for, so replaying `output.bin` at any other size interleaves
+/// stale cells into the rewritten rows. Replays follow these marks instead.
+pub fn pty_geometry_path(session_id: &str) -> PathBuf {
+    session_dir(session_id).join("pty-geometry.jsonl")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyGeometryMark {
+    pub offset: u64,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Best-effort: a missing mark degrades replay fidelity, never the session.
+pub fn record_pty_geometry(session_id: &str, mark: PtyGeometryMark) {
+    append_pty_geometry(&pty_geometry_path(session_id), mark);
+}
+
+fn append_pty_geometry(path: &Path, mark: PtyGeometryMark) {
+    let Ok(line) = serde_json::to_string(&mark) else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Marks in offset order. Empty for sessions recorded before the journal
+/// existed, or for an id that could escape the sessions directory.
+pub fn read_pty_geometry(session_id: &str) -> Vec<PtyGeometryMark> {
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+    {
+        return Vec::new();
+    }
+    read_pty_geometry_path(&pty_geometry_path(session_id))
+}
+
+fn read_pty_geometry_path(path: &Path) -> Vec<PtyGeometryMark> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut marks: Vec<PtyGeometryMark> = BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str(&line).ok())
+        .collect();
+    // A relaunch appends from its own journal start; keep the stream order.
+    marks.sort_by_key(|mark| mark.offset);
+    marks
+}
+
 pub fn output_retention_path(session_id: &str) -> PathBuf {
     session_dir(session_id).join(OUTPUT_RETENTION_FILE)
 }
@@ -4887,6 +4946,14 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             journal_start_offset,
             journal_start_offset > 0,
         );
+        record_pty_geometry(
+            &launch.session.id,
+            PtyGeometryMark {
+                offset: journal_start_offset,
+                cols: initial_cols,
+                rows: initial_rows,
+            },
+        );
         let viewport = Arc::new(Mutex::new(viewport_state));
         let running = Arc::new(AtomicBool::new(true));
         let broadcaster = Arc::new(Mutex::new(OutputBroadcaster::at_offset(
@@ -5399,6 +5466,32 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    #[test]
+    fn pty_geometry_journal_round_trips_in_stream_order() {
+        use super::{append_pty_geometry, read_pty_geometry_path, PtyGeometryMark};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pty-geometry.jsonl");
+        assert!(read_pty_geometry_path(&path).is_empty());
+        let later = PtyGeometryMark {
+            offset: 4096,
+            cols: 120,
+            rows: 48,
+        };
+        let start = PtyGeometryMark {
+            offset: 0,
+            cols: 80,
+            rows: 24,
+        };
+        append_pty_geometry(&path, later);
+        append_pty_geometry(&path, start);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"{torn\n"))
+            .unwrap();
+        assert_eq!(read_pty_geometry_path(&path), vec![start, later]);
+    }
+
     use super::{
         active_runtime_id, apply_manifest_auto_title, attach_ready_path, attach_ready_wait_snippet,
         build_startup_shell_script, cleanup_session_artifacts, compact_output_journal_path,
@@ -7469,7 +7562,22 @@ fn handle_client(
                     })
                     .map_err(|e| format!("Resize error: {e}"))?;
             }
-            viewport.lock().unwrap().resize(cols, rows);
+            {
+                // Mark under the viewport lock: no output can be fed between
+                // reading the offset and switching the parse grid.
+                let mut viewport = viewport.lock().unwrap();
+                if viewport.size() != (cols, rows) {
+                    record_pty_geometry(
+                        session_id,
+                        PtyGeometryMark {
+                            offset: viewport.output_offset(),
+                            cols,
+                            rows,
+                        },
+                    );
+                }
+                viewport.resize(cols, rows);
+            }
             SessionHostResponse {
                 ok: true,
                 error: None,

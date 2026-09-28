@@ -167,6 +167,9 @@ fn encode_base64(bytes: &[u8]) -> String {
 pub struct GridSnapshot {
     pub lines: Vec<Vec<CellSnapshot>>,
     pub cursor: Option<CursorSnapshot>,
+    /// Leftmost grid column in view. Nonzero only for a grid wider than the
+    /// panel: a stopped Worker keeps the width its TUI drew at.
+    pub first_col: usize,
 }
 
 /// Where the grid landed this frame, in window coordinates.
@@ -1067,6 +1070,7 @@ impl TerminalPanel {
         Some(GridSnapshot {
             lines: tab.emulator.lines(),
             cursor: tab.emulator.cursor(),
+            first_col: 0,
         })
     }
 

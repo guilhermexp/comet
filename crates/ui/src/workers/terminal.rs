@@ -6,7 +6,8 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, Pixels, Render, Task, Window, div, prelude::*, px,
 };
 use zeron_workers_unpeel::{
-    LocalWorkersClient, WorkersOutput, WorkersViewport, WorkersViewportInputModes,
+    LocalWorkersClient, WorkersGeometryMark, WorkersOutput, WorkersViewport,
+    WorkersViewportInputModes,
 };
 
 use crate::terminal::emulator::{Emulator, GridPoint, SelectionType, Side};
@@ -209,6 +210,43 @@ impl RemoteGridTracker {
     ) {
         self.grids
             .retain(|id, _| live_ids.contains(id) || active_id == Some(id.as_str()));
+    }
+}
+
+/// Feed `data`, which starts at lifetime output offset `start`, switching the
+/// grid at every recorded PTY size change.
+///
+/// A TUI's differential redraw — cursor up N rows, rewrite only the changed
+/// cells, skip unchanged ones with cursor-forward — is only valid on the grid
+/// it drew for. Decode a Claude Code log at 120x60 when it ran at 120x48 and
+/// the cursor-up lands on the wrong rows: new words fill in over stale ones
+/// and the spaces between them show the old text ("Exit:0,s25/25wtestes").
+fn feed_at_recorded_geometry(
+    emulator: &mut Emulator,
+    marks: &[WorkersGeometryMark],
+    start: u64,
+    data: &[u8],
+) {
+    let end = start.saturating_add(data.len() as u64);
+    let mut at = start;
+    while at < end {
+        let next = marks.partition_point(|mark| mark.offset <= at);
+        // Bytes before the first mark (a journal that began mid-stream) keep
+        // its size: the host records one at every launch.
+        let Some(mark) = next
+            .checked_sub(1)
+            .map(|ix| marks[ix])
+            .or(marks.first().copied())
+        else {
+            let _ = emulator.feed(&data[(at - start) as usize..]);
+            return;
+        };
+        if emulator.cols() != mark.cols as usize || emulator.rows() != mark.rows as usize {
+            emulator.resize(mark.cols, mark.rows);
+        }
+        let stop = marks.get(next).map_or(end, |mark| mark.offset.min(end));
+        let _ = emulator.feed(&data[(at - start) as usize..(stop - start) as usize]);
+        at = stop;
     }
 }
 
@@ -442,6 +480,11 @@ struct WorkersTerminalState {
     resize_failures: u32,
     tui_jump_suppressed: bool,
     mouse_protocol: MouseProtocol,
+    /// PTY sizes the history was drawn at. `None` = not read yet; empty =
+    /// a session older than the host's geometry journal.
+    geometry_marks: Option<Vec<WorkersGeometryMark>>,
+    /// Horizontal scroll of a grid wider than the panel, in pixels.
+    h_scroll_px: f32,
 }
 
 impl WorkersTerminalState {
@@ -465,7 +508,38 @@ impl WorkersTerminalState {
             resize_failures: 0,
             tui_jump_suppressed: false,
             mouse_protocol: MouseProtocol::Sgr,
+            geometry_marks: None,
+            h_scroll_px: 0.0,
         }
+    }
+
+    /// A stopped Worker's TUI cannot redraw, and reflowing its rows into a
+    /// narrower panel splits every line it laid out. Once history is
+    /// complete it keeps the width it was drawn at; only the height follows
+    /// the panel (a row count change never rewraps).
+    fn frozen_cols(&self) -> Option<u16> {
+        if !self.stopped || self.historical_replay.is_catching_up() {
+            return None;
+        }
+        self.geometry_marks.as_ref()?.last().map(|mark| mark.cols)
+    }
+
+    /// Leftmost visible column for a panel `panel_cols` wide.
+    fn first_col(&self, cell_w: f32, panel_cols: u16) -> usize {
+        let overflow = self.emulator.cols().saturating_sub(panel_cols as usize);
+        if overflow == 0 || cell_w <= 0.0 {
+            return 0;
+        }
+        ((self.h_scroll_px / cell_w).round() as usize).min(overflow)
+    }
+
+    /// Catch-up follows the recorded PTY sizes instead of the panel's grid.
+    fn replays_recorded_geometry(&self) -> bool {
+        self.historical_replay.is_catching_up()
+            && self
+                .geometry_marks
+                .as_ref()
+                .is_some_and(|marks| !marks.is_empty())
     }
 
     /// Este refresh precisa de um snapshot do host?
@@ -511,7 +585,10 @@ impl WorkersTerminalState {
                 .as_ref()
                 .map(|viewport| (viewport.cols, viewport.rows))
                 .unwrap_or((self.emulator.cols() as u16, self.emulator.rows() as u16));
-            let cols = if self.stopped && self.historical_replay.is_catching_up() {
+            let cols = if self.stopped
+                && self.historical_replay.is_catching_up()
+                && !self.replays_recorded_geometry()
+            {
                 300
             } else {
                 cols
@@ -521,7 +598,15 @@ impl WorkersTerminalState {
             self.modes_from_snapshot = true;
         }
         if had_data {
-            let _ = self.emulator.feed(&output.data);
+            match self.geometry_marks.as_deref() {
+                Some(marks) if self.replays_recorded_geometry() => {
+                    let start = output.next_offset.saturating_sub(output.data.len() as u64);
+                    feed_at_recorded_geometry(&mut self.emulator, marks, start, &output.data);
+                }
+                _ => {
+                    let _ = self.emulator.feed(&output.data);
+                }
+            }
             if !truncated {
                 self.mouse_protocol = emulator_mouse_protocol(&self.emulator);
             }
@@ -664,6 +749,8 @@ impl WorkersTerminal {
                     resize_epoch,
                     visible,
                     catching_up,
+                    load_marks,
+                    stopped,
                 )) = this.update(cx, |terminal, _| {
                     let state = terminal.active_state();
                     (
@@ -680,6 +767,11 @@ impl WorkersTerminal {
                         state.map_or(0, |state| state.resize_sync.epoch()),
                         is_visible(terminal.last_prepaint, Instant::now()),
                         state.is_some_and(|state| state.historical_replay.is_catching_up()),
+                        state.is_some_and(|state| {
+                            state.historical_replay.is_catching_up()
+                                && state.geometry_marks.is_none()
+                        }),
+                        state.is_some_and(|state| state.stopped),
                     )
                 })
                 else {
@@ -701,6 +793,22 @@ impl WorkersTerminal {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
+                        // Read before the output: every mark this backlog
+                        // needs was written before its bytes.
+                        let marks = load_marks.then(|| {
+                            let marks = client.read_pty_geometry(&request_session_id);
+                            if marks.is_empty() && stopped {
+                                // Recorded before the journal: a TUI log can
+                                // no longer redraw, so an estimate beats the
+                                // panel's grid.
+                                client
+                                    .estimate_legacy_geometry(&request_session_id)
+                                    .into_iter()
+                                    .collect()
+                            } else {
+                                marks
+                            }
+                        });
                         let wait_ms = if visible && !catching_up {
                             FOREGROUND_OUTPUT_WAIT_MS
                         } else {
@@ -723,13 +831,13 @@ impl WorkersTerminal {
                         } else {
                             None
                         };
-                        Ok::<_, zeron_workers_unpeel::WorkersError>((output, viewport))
+                        Ok::<_, zeron_workers_unpeel::WorkersError>((output, viewport, marks))
                     })
                     .await;
                 let failed = result.is_err();
                 let had_data = result
                     .as_ref()
-                    .is_ok_and(|(output, _)| !output.data.is_empty());
+                    .is_ok_and(|(output, _, _)| !output.data.is_empty());
                 if this
                     .update(cx, |terminal, cx| {
                         if terminal.generation != generation
@@ -744,7 +852,10 @@ impl WorkersTerminal {
                             return;
                         }
                         match result {
-                            Ok((output, viewport)) => {
+                            Ok((output, viewport, marks)) => {
+                                if let Some(marks) = marks {
+                                    state.geometry_marks = Some(marks);
+                                }
                                 let was_catching_up = state.historical_replay.is_catching_up();
                                 let had_data = state.apply_refresh(output, viewport);
                                 let catching_up = state.historical_replay.is_catching_up();
@@ -873,10 +984,19 @@ impl WorkersTerminal {
     pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
         self.last_prepaint = Some(Instant::now());
         self.client.remember_grid(geometry.cols, geometry.rows);
-        let dimensions_changed = self.geometry.is_none()
+        let previous = self.geometry;
+        let dimensions_changed = previous.is_none()
             || self.active_state().is_some_and(|state| {
-                state.emulator.cols() != geometry.cols as usize
-                    || state.emulator.rows() != geometry.rows as usize
+                // A journal replay holds the emulator at the recorded grid on
+                // purpose; only a panel change counts until it completes.
+                if state.replays_recorded_geometry() {
+                    previous.is_some_and(|previous| {
+                        previous.cols != geometry.cols || previous.rows != geometry.rows
+                    })
+                } else {
+                    state.emulator.cols() != geometry.cols as usize
+                        || state.emulator.rows() != geometry.rows as usize
+                }
             });
         self.geometry = Some(geometry);
         if let Some(state) = self.active_state_mut() {
@@ -890,13 +1010,23 @@ impl WorkersTerminal {
             // at the host's supported column ceiling, then reflow the completed
             // read-only grid into the panel. In particular, DEC ?7l must not
             // discard the right half of every historical line on a narrow open.
-            let cols = if state.stopped && state.historical_replay.is_catching_up() {
+            //
+            // With the host's geometry journal, catch-up decodes each stretch
+            // at the grid it was drawn for (see `feed_at_recorded_geometry`)
+            // and the panel's grid only applies once history is complete.
+            let cols = if let Some(cols) = state.frozen_cols() {
+                cols
+            } else if state.stopped && state.historical_replay.is_catching_up() {
                 300
             } else {
                 geometry.cols
             };
-            if state.emulator.cols() != cols as usize
-                || state.emulator.rows() != geometry.rows as usize
+            let overflow_px = state.emulator.cols().saturating_sub(geometry.cols as usize) as f32
+                * geometry.cell_w;
+            state.h_scroll_px = state.h_scroll_px.clamp(0.0, overflow_px.max(0.0));
+            if !state.replays_recorded_geometry()
+                && (state.emulator.cols() != cols as usize
+                    || state.emulator.rows() != geometry.rows as usize)
             {
                 state.emulator.resize(cols, geometry.rows);
             }
@@ -1011,9 +1141,13 @@ impl WorkersTerminal {
         if state.historical_replay.is_catching_up() {
             return None;
         }
+        let first_col = self.geometry.map_or(0, |geometry| {
+            state.first_col(geometry.cell_w, geometry.cols)
+        });
         Some(GridSnapshot {
             lines: state.emulator.lines(),
             cursor: state.emulator.cursor(),
+            first_col,
         })
     }
 
@@ -1343,12 +1477,23 @@ impl WorkersTerminal {
 
     fn cell_hit_at(&self, position: gpui::Point<Pixels>) -> Option<crate::terminal::view::CellHit> {
         let geometry = self.geometry?;
+        let (first_col, cols) = self
+            .active_state()
+            .map_or((0, geometry.cols as usize), |state| {
+                let first_col = state.first_col(geometry.cell_w, geometry.cols);
+                let cols = if first_col > 0 || state.emulator.cols() > geometry.cols as usize {
+                    state.emulator.cols()
+                } else {
+                    geometry.cols as usize
+                };
+                (first_col, cols)
+            });
         Some(cell_at(
-            f32::from(position.x - geometry.origin.x),
+            f32::from(position.x - geometry.origin.x) + first_col as f32 * geometry.cell_w,
             f32::from(position.y - geometry.origin.y),
             geometry.cell_w,
             geometry.line_h,
-            geometry.cols as usize,
+            cols,
             geometry.rows as usize,
         ))
     }
@@ -1525,6 +1670,9 @@ impl WorkersTerminal {
         let line_height = crate::theme::Theme::of(cx).terminal_font_size
             * super::super::terminal::view::TERM_LINE_HEIGHT
             / super::super::terminal::view::TERM_FONT_SIZE;
+        if self.scroll_horizontally(event, line_height, cx) {
+            return;
+        }
         let Some(hit) = self.cell_hit_at(event.position) else {
             return;
         };
@@ -1548,6 +1696,46 @@ impl WorkersTerminal {
             TerminalScrollAction::Write(bytes) => self.queue_input(&bytes, cx),
             TerminalScrollAction::Scrollback => self.scroll(steps, cx),
         }
+    }
+
+    /// Pan a grid wider than the panel. Horizontal-dominant gestures, or a
+    /// vertical wheel with Shift held, the usual convention for mice.
+    fn scroll_horizontally(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        line_height: f32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(geometry) = self.geometry else {
+            return false;
+        };
+        let Some(state) = self.active_state_mut() else {
+            return false;
+        };
+        let overflow = state.emulator.cols().saturating_sub(geometry.cols as usize);
+        if overflow == 0 {
+            return false;
+        }
+        let (dx, dy) = match event.delta {
+            gpui::ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y)),
+            gpui::ScrollDelta::Lines(delta) => {
+                (delta.x * geometry.cell_w * 3.0, delta.y * line_height * 3.0)
+            }
+        };
+        let dx = if event.modifiers.shift && dx == 0.0 {
+            dy
+        } else {
+            dx
+        };
+        if dx == 0.0 || (!event.modifiers.shift && dx.abs() <= dy.abs()) {
+            return false;
+        }
+        let before = state.first_col(geometry.cell_w, geometry.cols);
+        state.h_scroll_px = (state.h_scroll_px - dx).clamp(0.0, overflow as f32 * geometry.cell_w);
+        if state.first_col(geometry.cell_w, geometry.cols) != before {
+            cx.notify();
+        }
+        true
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1648,11 +1836,84 @@ mod tests {
     use crate::terminal::view::paste_bytes;
 
     use super::{
-        HistoricalReplay, MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync,
-        RetainedWorkerTerminals, TerminalRefresh, TerminalScrollAction, WorkersTerminalView,
-        is_expected_session_exit, mouse_report_bytes, scroll_action, should_paint,
-        terminal_refresh, viewport_has_tui_jump_hint,
+        Emulator, HistoricalReplay, MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync,
+        RetainedWorkerTerminals, TerminalRefresh, TerminalScrollAction, WorkersGeometryMark,
+        WorkersTerminalView, feed_at_recorded_geometry, is_expected_session_exit,
+        mouse_report_bytes, scroll_action, should_paint, terminal_refresh,
+        viewport_has_tui_jump_hint,
     };
+
+    fn screen(emulator: &Emulator) -> Vec<String> {
+        (0..emulator.rows())
+            .map(|row| emulator.row_text(row).trim_end().to_owned())
+            .collect()
+    }
+
+    /// Ink-style redraw: the app counts the rows its last frame took AT ITS
+    /// WIDTH, then walks up and erases that many before drawing again.
+    fn ink_frames() -> Vec<u8> {
+        let mut out = b"keep\r\n".to_vec();
+        out.extend_from_slice(&[b'A'; 25]); // two rows on a 20-column grid
+        out.extend_from_slice(b"\r\nold tail");
+        out.extend_from_slice(b"\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\rfresh");
+        out
+    }
+
+    #[test]
+    fn journal_replay_decodes_history_at_the_grid_it_was_drawn_for() {
+        let data = ink_frames();
+        let mut reference = Emulator::new(20, 6);
+        reference.feed(&data);
+        assert_eq!(screen(&reference)[0], "keep");
+
+        // The panel's own grid walks the redraw one row too far and erases
+        // a line that was never part of the frame.
+        let mut naive = Emulator::new(300, 6);
+        naive.feed(&data);
+        assert_ne!(screen(&naive)[0], "keep");
+
+        let marks = [WorkersGeometryMark {
+            offset: 0,
+            cols: 20,
+            rows: 6,
+        }];
+        let mut replay = Emulator::new(300, 6);
+        feed_at_recorded_geometry(&mut replay, &marks, 0, &data);
+        assert_eq!(screen(&replay), screen(&reference));
+    }
+
+    #[test]
+    fn journal_replay_switches_grid_at_the_mark_across_chunk_boundaries() {
+        let before = b"wide line one\r\nwide line two\r\n".to_vec();
+        let after = ink_frames();
+        let history_start = 1_000;
+        let resize_at = history_start + before.len() as u64;
+        let marks = [
+            WorkersGeometryMark {
+                offset: history_start,
+                cols: 30,
+                rows: 8,
+            },
+            WorkersGeometryMark {
+                offset: resize_at,
+                cols: 20,
+                rows: 6,
+            },
+        ];
+
+        let mut reference = Emulator::new(30, 8);
+        reference.feed(&before);
+        reference.resize(20, 6);
+        reference.feed(&after);
+
+        let stream = [before, after].concat();
+        let (first, second) = stream.split_at(7);
+        let mut replay = Emulator::new(80, 24);
+        feed_at_recorded_geometry(&mut replay, &marks, history_start, first);
+        feed_at_recorded_geometry(&mut replay, &marks, history_start + 7, second);
+        assert_eq!((replay.cols(), replay.rows()), (20, 6));
+        assert_eq!(screen(&replay), screen(&reference));
+    }
 
     #[test]
     fn a_finished_worker_is_not_reported_as_a_disconnect() {

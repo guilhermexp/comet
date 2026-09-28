@@ -415,6 +415,8 @@ pub struct TerminalPrepaint {
     lines: Vec<Vec<(usize, ShapedLine)>>,
     /// Grid cell advance, so paint can place segments by column.
     cell_w: Pixels,
+    /// Horizontal scroll, applied to glyph segments at paint time.
+    x_shift: Pixels,
     /// Grid row height, so paint places rows on the same baselines prepaint
     /// measured the grid with.
     line_h: Pixels,
@@ -531,6 +533,7 @@ impl gpui::Element for TerminalElement {
                 lines: Vec::new(),
                 cell_w,
                 line_h,
+                x_shift: px(0.0),
                 cursor: None,
             };
         };
@@ -538,6 +541,9 @@ impl gpui::Element for TerminalElement {
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
+        // Column 0 of the grid; left of the glyph origin when scrolled right.
+        // The content mask in paint clips what falls outside the body.
+        let origin = point(origin.x - cell_w * snapshot.first_col as f32, origin.y);
 
         for (row_ix, row) in snapshot.lines.iter().enumerate() {
             let y = origin.y + line_h * row_ix as f32;
@@ -613,6 +619,7 @@ impl gpui::Element for TerminalElement {
             lines,
             cell_w,
             line_h,
+            x_shift: cell_w * snapshot.first_col as f32,
             cursor,
         }
     }
@@ -629,7 +636,7 @@ impl gpui::Element for TerminalElement {
     ) {
         let line_h = prepaint.line_h;
         let origin = point(
-            bounds.left() + px(TERM_PADDING),
+            bounds.left() + px(TERM_PADDING) - prepaint.x_shift,
             bounds.top() + px(TERM_PADDING),
         );
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {

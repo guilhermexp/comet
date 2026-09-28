@@ -1,8 +1,8 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "c0e0d0ca0b2d6d0c4cf2042551f58c185990f3a2"
+vendored_tree = "32e113ae5cf56f687a1ef9f51692bb5f6675997c"
 vendored_from = "working-tree"
-local_modifications_count = 31
+local_modifications_count = 32
 local_deletions = ["apps/website"]
 local_patch_available = false
 license = "MIT"
@@ -23,7 +23,7 @@ base_revision_resolves_upstream = false
 #   crates/unpeel-core/src/controller_host.rs  (já tinha modificação local)
 #   crates/unpeel-core/src/worktrees.rs        (primeira modificação local:
 #                                               extraiu `pub fn is_managed`)
-# `local_modifications_count = 31` acima NÃO foi recalculado: não achamos a
+# `local_modifications_count = 32` acima NÃO foi recalculado: não achamos a
 # ferramenta que produziu esse número (não é a contagem de arquivos que diferem
 # de `216b61e8`, que hoje são 181), e chutar um valor aqui é pior que deixar o
 # antigo com esta nota. Quem retomar o sync recalcula pela ferramenta original.
@@ -73,3 +73,11 @@ base_revision_resolves_upstream = false
 # drop from 500/300 ms to 2 s until the next change (`scan_interval_ms`).
 # Finished Workers left at their prompt polled at full cadence for hours
 # (~2% CPU per host). Local change only; no upstream patch implied.
+
+# 2026-09-28 — session_host.rs + terminal_viewport.rs: PTY geometry journal.
+# The host appends `{offset, cols, rows}` to `pty-geometry.jsonl` at launch
+# and on every Resize that changes the grid (`record_pty_geometry`, under the
+# viewport lock). Differential TUIs (Claude Code, pi, codex) only replay
+# faithfully at the grid they drew for; the Comet Workers terminal follows
+# these marks instead of decoding `output.bin` at the panel's size.
+# Local change only; no upstream patch implied.

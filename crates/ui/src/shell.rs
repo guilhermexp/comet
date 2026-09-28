@@ -4934,6 +4934,15 @@ impl Shell {
             self.panels.show(&key);
             self.finish_right_transition(from, cx);
         }
+        // Same rule the Workers workspace applies: a stopped Worker's history
+        // is a read-only document and replays differently from a live one.
+        let stopped = self
+            .workers_model
+            .read(cx)
+            .sessions()
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| !session.is_live());
         let (surface, inserted) = register_worker_surface(
             &mut self.worker_terminal_tabs,
             &mut self.worker_terminal_seq,
@@ -4942,11 +4951,19 @@ impl Shell {
             || {
                 let terminal = cx.new(WorkersTerminal::new);
                 terminal.update(cx, |terminal, cx| {
-                    terminal.set_session(Some(session_id.clone()), cx)
+                    terminal.set_session(Some(session_id.clone()), cx);
+                    terminal.set_stopped(stopped, cx);
                 });
                 terminal
             },
         );
+        if !inserted
+            && let RightSurface::Worker(id) = surface
+            && let Some(tab) = self.worker_terminal_tabs.get(&id)
+        {
+            let terminal = tab.view.terminal().clone();
+            terminal.update(cx, |terminal, cx| terminal.set_stopped(stopped, cx));
+        }
         let key = self.panel_key(cx);
         if inserted {
             self.right_tabs.entry(key).or_default().push(surface);

@@ -1444,6 +1444,42 @@ pub struct WorkersOutput {
     pub truncated: bool,
 }
 
+/// Most common length of a `─` run of at least 40 cells, seen at least 3
+/// times. A shorter or rarer run is a box border, not the row-wide rule.
+fn dominant_rule_width(data: &[u8]) -> Option<u16> {
+    const RULE: &[u8] = "─".as_bytes();
+    let mut counts: std::collections::HashMap<usize, usize> = Default::default();
+    let mut at = 0;
+    while at < data.len() {
+        let mut run = 0;
+        while data[at..].starts_with(RULE) {
+            run += 1;
+            at += RULE.len();
+        }
+        if run >= 40 {
+            *counts.entry(run).or_default() += 1;
+        }
+        if run == 0 {
+            at += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|&(width, seen)| seen >= 3 && width <= 300)
+        .max_by_key(|&(width, seen)| (seen, width))
+        .map(|(width, _)| width as u16)
+}
+
+/// One PTY size change in a session's output stream: bytes from `offset` on
+/// were drawn for a `cols`x`rows` grid. See `unpeel_core::session_host::
+/// pty_geometry_path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkersGeometryMark {
+    pub offset: u64,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkersViewport {
     pub output_offset: u64,
@@ -2123,6 +2159,45 @@ impl LocalWorkersClient {
             rows: snapshot.rows,
             ansi,
             input_modes: viewport_input_modes(&snapshot),
+        })
+    }
+
+    /// The PTY sizes the session's output was produced at, in stream order.
+    /// Empty for sessions recorded before the host kept the journal.
+    pub fn read_pty_geometry(&self, session_id: &str) -> Vec<WorkersGeometryMark> {
+        unpeel_core::session_host::read_pty_geometry(session_id)
+            .into_iter()
+            .map(|mark| WorkersGeometryMark {
+                offset: mark.offset,
+                cols: mark.cols,
+                rows: mark.rows,
+            })
+            .collect()
+    }
+
+    /// Best guess at the grid of a session recorded before the geometry
+    /// journal: the width of the full-width rules TUIs draw (Claude Code,
+    /// pi, codex all rule the whole row with `─`), at 24 rows. Replaying a
+    /// differential TUI log on a grid shorter than it ran on stays faithful
+    /// (the frame scrolls into history); a taller one interleaves stale
+    /// cells. `None` when the log carries no such rule.
+    pub fn estimate_legacy_geometry(&self, session_id: &str) -> Option<WorkersGeometryMark> {
+        const TAIL: u64 = 4 << 20;
+        if session_id.contains('/') || session_id.contains("..") {
+            return None;
+        }
+        let path = unpeel_core::session_host::output_path(session_id);
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let start = len.saturating_sub(TAIL);
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).ok()?;
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut data).ok()?;
+        let cols = dominant_rule_width(&data)?;
+        Some(WorkersGeometryMark {
+            offset: unpeel_core::session_host::output_retained_from(session_id),
+            cols,
+            rows: 24,
         })
     }
 
@@ -5997,5 +6072,24 @@ mod upstream_error_message_tests {
         let extracted = extract_upstream_error_message(&body);
         assert!(extracted.ends_with("..."));
         assert!(extracted.chars().count() <= 303);
+    }
+}
+
+#[cfg(test)]
+mod legacy_geometry_tests {
+    use super::dominant_rule_width;
+
+    #[test]
+    fn the_row_wide_rule_wins_over_box_borders_and_one_offs() {
+        let rule = |cells: usize| "─".repeat(cells);
+        let mut log = String::new();
+        for _ in 0..4 {
+            log.push_str(&format!("\x1b[2m{}\x1b[0m\r\n", rule(120)));
+            log.push_str(&format!("╭{}╮\r\n", rule(30)));
+        }
+        log.push_str(&rule(90));
+        assert_eq!(dominant_rule_width(log.as_bytes()), Some(120));
+        assert_eq!(dominant_rule_width(rule(90).as_bytes()), None);
+        assert_eq!(dominant_rule_width(b"plain shell output"), None);
     }
 }

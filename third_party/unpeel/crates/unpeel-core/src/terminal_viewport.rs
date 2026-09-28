@@ -689,6 +689,11 @@ impl TerminalViewportState {
         self.term.resize(cols, rows);
     }
 
+    /// The grid the fed stream is being parsed at, `(cols, rows)`.
+    pub fn size(&self) -> (u16, u16) {
+        (self.term.cols, self.term.rows)
+    }
+
     pub fn snapshot(
         &mut self,
         scroll_offset_rows: u32,
