@@ -9474,6 +9474,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> MermaidSnapshot {
         let colors = crate::inline_media::MermaidColors::from_theme(theme);
+        let native_palette = crate::markdown::mermaid::Palette::from_theme(theme);
         let key = format!(
             "{}\0{source}",
             if theme.appearance.is_dark() {
@@ -9528,8 +9529,13 @@ impl Transcript {
             MERMAID_MAX_INFLIGHT,
             MERMAID_CACHE_MAX_TOTAL,
         ) {
+            // Admission is full, not failed: a finishing render notifies and
+            // this block is retried then. Showing the source meanwhile read as
+            // "Mermaid doesn't load" whenever a message held several diagrams.
             return if previously_ready {
                 MermaidSnapshot::Reloading
+            } else if inflight > 0 {
+                MermaidSnapshot::Loading
             } else {
                 MermaidSnapshot::Failed
             };
@@ -9542,7 +9548,14 @@ impl Transcript {
                 .background_executor()
                 .spawn(async move {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::inline_media::render_mermaid_svg(&render_source, &colors)
+                        // The QuickJS engine has no gantt/pie/mindmap/gitGraph;
+                        // the native renderer (Files preview) covers those.
+                        crate::inline_media::render_mermaid_svg(&render_source, &colors).or_else(
+                            |_| {
+                                crate::markdown::mermaid::render(&render_source, &native_palette)
+                                    .and_then(crate::inline_media::rendered_from_svg)
+                            },
+                        )
                     }))
                     .unwrap_or_else(|_| Err("diagram renderer failed".into()))
                 })

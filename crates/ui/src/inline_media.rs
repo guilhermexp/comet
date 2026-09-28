@@ -446,6 +446,16 @@ fn resolve_svg_vars(svg: &str, colors: &MermaidColors) -> String {
 }
 
 fn parse_svg_dimensions(svg: &str) -> (f32, f32) {
+    // Native renders often carry only a viewBox ("minX minY width height").
+    let view_box = svg.find("viewBox=\"").and_then(|pos| {
+        let start = pos + 9;
+        let end = svg[start..].find('"')?;
+        let parts: Vec<f32> = svg[start..start + end]
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        (parts.len() == 4).then(|| (parts[2], parts[3]))
+    });
     let width = svg
         .find("width=\"")
         .and_then(|pos| {
@@ -453,6 +463,7 @@ fn parse_svg_dimensions(svg: &str) -> (f32, f32) {
             let end = svg[start..].find('"')?;
             svg[start..start + end].parse::<f32>().ok()
         })
+        .or(view_box.map(|(width, _)| width))
         .unwrap_or(400.0);
     let height = svg
         .find("height=\"")
@@ -461,6 +472,7 @@ fn parse_svg_dimensions(svg: &str) -> (f32, f32) {
             let end = svg[start..].find('"')?;
             svg[start..start + end].parse::<f32>().ok()
         })
+        .or(view_box.map(|(_, height)| height))
         .unwrap_or(200.0);
     (width.max(1.0), height.max(1.0))
 }
@@ -513,7 +525,12 @@ pub fn render_mermaid_svg(source: &str, colors: &MermaidColors) -> Result<Render
         })
     })?;
 
-    let svg = resolve_svg_vars(&raw_svg, colors);
+    rendered_from_svg(resolve_svg_vars(&raw_svg, colors))
+}
+
+/// Package any renderer's SVG for the transcript (size cap, dimensions,
+/// decoded image). Shared by the QuickJS engine and the native fallback.
+pub fn rendered_from_svg(svg: String) -> Result<RenderedMermaid, String> {
     if svg.len() > MAX_MERMAID_SVG_BYTES {
         return Err("rendered diagram is too large".into());
     }
@@ -642,6 +659,26 @@ mod tests {
         let oversized = format!("flowchart LR\n{}", "A --> B\n".repeat(10_000));
         assert!(render_mermaid_svg(&oversized, &dark).is_err());
     }
+    #[test]
+    fn diagrams_the_quickjs_engine_lacks_render_through_the_native_fallback() {
+        let palette =
+            crate::markdown::mermaid::Palette::from_theme(&crate::theme::Theme::default());
+        for source in [
+            "gantt\n  title Plan\n  section A\n  Task :a1, 2026-09-01, 3d",
+            "pie title Mix\n  \"A\" : 40\n  \"B\" : 60",
+            "mindmap\n  root((Comet))\n    Engine\n    UI",
+        ] {
+            let colors = super::MermaidColors::dark();
+            assert!(render_mermaid_svg(source, &colors).is_err(), "{source}");
+            let rendered = crate::markdown::mermaid::render(source, &palette)
+                .and_then(super::rendered_from_svg)
+                .expect(source);
+            assert!(rendered.width > 1.0 && rendered.height > 1.0, "{source}");
+        }
+        let (w, h) = super::parse_svg_dimensions(r#"<svg viewBox="0 0 640 320"></svg>"#);
+        assert_eq!((w, h), (640.0, 320.0));
+    }
+
     #[test]
     fn mermaid_renderer_computes_diagram_dimensions() {
         let dark = super::MermaidColors::dark();
