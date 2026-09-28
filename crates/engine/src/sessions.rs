@@ -3026,6 +3026,24 @@ fn subagent_chip_update(event: &AgentEvent) -> Option<&'static str> {
     }
 }
 
+/// The timeline slot a subagent finishing now lands on: after the latest
+/// part of the parent segment streaming now, or — while that segment has no
+/// parts yet (parked, or a fresh id that may never be written) — after the
+/// newest entry already in the doc.
+fn subagent_end_slot(
+    doc: &SessionDoc,
+    entry_id: &str,
+    folded: &[MessagePart],
+) -> zeron_doc::SubagentEnd {
+    let (entry, after_part) = match folded.last() {
+        Some(part) => (Some(entry_id.to_owned()), Some(part.id().to_owned())),
+        None => doc
+            .last_entry_slot()
+            .map_or((None, None), |(entry, part)| (Some(entry), part)),
+    };
+    zeron_doc::SubagentEnd { entry, after_part }
+}
+
 /// Apply the render-parts privacy policy: strip heavy/sensitive tool inputs before doc
 /// entry. Full inputs live only in the local run journal.
 fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
@@ -3930,10 +3948,7 @@ async fn drive_run(
                     // content never rewrites the parent doc.
                     // The chip's turn is over: the end slot is the parent
                     // entry streaming now, after its latest part.
-                    let end = zeron_doc::SubagentEnd {
-                        entry: Some(entry_id.clone()),
-                        after_part: folded.last().map(|part| part.id().to_owned()),
-                    };
+                    let end = subagent_end_slot(doc_ref, &entry_id, &folded);
                     let _ = doc_ref.update_subagent_chip(
                         parent_tool_use_id,
                         None,
@@ -4435,10 +4450,7 @@ async fn drive_run(
     // parent process is gone, so nothing more can arrive on this stream.
     for (parent_id, sink) in subagents.drain() {
         let doc_id = sink.doc_id.clone();
-        let end = zeron_doc::SubagentEnd {
-            entry: Some(entry_id.clone()),
-            after_part: folded.last().map(|part| part.id().to_owned()),
-        };
+        let end = subagent_end_slot(doc_ref, &entry_id, &folded);
         let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None, Some(&end));
         if let Some(json) = sink.finish(&device_id, MessageStatus::Aborted)
             && let Some(host) = inner.doc_host()
@@ -4525,7 +4537,7 @@ mod tests {
         DocHost, HarnessRegistry, PendingInput, RunJournal, RuntimeConfig, SessionsEngine,
         SubagentSink, apply_context_usage_to_session, apply_run_error_to_session, finish_segment,
         resolve_pending_question, seed_persisted_generated_images, segment_duration_ms,
-        should_journal_event, subagent_doc_id, workflow_tasks_from_entries,
+        should_journal_event, subagent_doc_id, subagent_end_slot, workflow_tasks_from_entries,
     };
     use crate::doc_host::DocHostConfig;
     use crate::new_id;
@@ -4539,6 +4551,34 @@ mod tests {
         SessionStatus, ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate,
     };
     use zeron_sync::DocsStore;
+    #[test]
+    fn subagent_end_slot_anchors_to_the_written_transcript_while_parked() {
+        let doc = zeron_doc::SessionDoc::init("parked").unwrap();
+        let text = |id: &str| MessagePart::Text {
+            id: id.into(),
+            text: "x".into(),
+        };
+        doc.push_message(&SessionMessageEntry {
+            duration_ms: None,
+            id: "reply".into(),
+            role: MessageRole::Assistant,
+            parts: vec![text("chip"), text("final")],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+
+        let parked = subagent_end_slot(&doc, "never-written", &[]);
+        assert_eq!(parked.entry.as_deref(), Some("reply"));
+        assert_eq!(parked.after_part.as_deref(), Some("final"));
+
+        let streaming = subagent_end_slot(&doc, "live", &[text("live-part")]);
+        assert_eq!(streaming.entry.as_deref(), Some("live"));
+        assert_eq!(streaming.after_part.as_deref(), Some("live-part"));
+    }
+
     #[tokio::test]
     async fn generated_image_nested_intake_preserves_parent_scope_and_sanitizes_failures() {
         let dir = tempfile::tempdir().unwrap();

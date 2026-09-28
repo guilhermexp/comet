@@ -1012,6 +1012,36 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// The newest `messages` entry as a timeline slot: its rendered id (the
+    /// continuation root when it is a continuation segment) and the id of its
+    /// last part, `None` when it has none. Reads only that entry.
+    pub fn last_entry_slot(&self) -> Option<(String, Option<String>)> {
+        use loro::{Container, ValueOrContainer};
+        let messages = self.doc.get_list("messages");
+        let ValueOrContainer::Container(Container::Map(entry)) =
+            messages.get(messages.len().checked_sub(1)?)?
+        else {
+            return None;
+        };
+        let string = |value: Option<ValueOrContainer>| match value {
+            Some(ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        };
+        let id = string(entry.get("continuationOf")).or_else(|| string(entry.get("id")))?;
+        let last_part = match entry.get("parts") {
+            Some(ValueOrContainer::Container(Container::List(parts))) => parts
+                .len()
+                .checked_sub(1)
+                .and_then(|ix| parts.get(ix))
+                .and_then(|part| match part {
+                    ValueOrContainer::Container(Container::Map(part)) => string(part.get("id")),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        Some((id, last_part))
+    }
+
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
@@ -2160,6 +2190,41 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn last_entry_slot_names_the_newest_rendered_entry_and_its_last_part() {
+        let doc = SessionDoc::init("slot").unwrap();
+        assert_eq!(doc.last_entry_slot(), None);
+        let entry = |id: &str, continuation_of: Option<&str>, parts: &[&str]| SessionMessageEntry {
+            duration_ms: None,
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts: parts
+                .iter()
+                .map(|part| MessagePart::Text {
+                    id: (*part).into(),
+                    text: "x".into(),
+                })
+                .collect(),
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: continuation_of.map(Into::into),
+        };
+        doc.push_message(&entry("e1", None, &["p1", "p2"])).unwrap();
+        assert_eq!(
+            doc.last_entry_slot(),
+            Some(("e1".into(), Some("p2".into())))
+        );
+        doc.push_message(&entry("e1-c", Some("e1"), &["p3"]))
+            .unwrap();
+        assert_eq!(
+            doc.last_entry_slot(),
+            Some(("e1".into(), Some("p3".into())))
+        );
+        doc.push_message(&entry("e2", None, &[])).unwrap();
+        assert_eq!(doc.last_entry_slot(), Some(("e2".into(), None)));
     }
 
     #[test]

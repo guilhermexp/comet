@@ -4,17 +4,17 @@
     "postToolUse": [
       {
         "matcher": "Read|Grep|Glob|Search|Shell",
-        "command": "node \"/Users/guilhermevarela/Documents/Projetos/SelfHosting/comet/.cursor/hooks/graft-hooks.cjs\" cursor-post-tool"
+        "command": "node \"/Users/guilhermevarela/.no-mistakes/worktrees/6fec5bb7ba85/01M3KDATM5E8FDT8QGG2J372KE/.cursor/hooks/graft-hooks.cjs\" cursor-post-tool"
       }
     ],
     "afterMCPExecution": [
       {
-        "command": "node \"/Users/guilhermevarela/Documents/Projetos/SelfHosting/comet/.cursor/hooks/graft-hooks.cjs\" cursor-mcp"
+        "command": "node \"/Users/guilhermevarela/.no-mistakes/worktrees/6fec5bb7ba85/01M3KDATM5E8FDT8QGG2J372KE/.cursor/hooks/graft-hooks.cjs\" cursor-mcp"
       }
     ],
     "sessionEnd": [
       {
-        "command": "node \"/Users/guilhermevarela/Documents/Projetos/SelfHosting/comet/.cursor/hooks/graft-hooks.cjs\" cursor-session-end"
+        "command": "node \"/Users/guilhermevarela/.no-mistakes/worktrees/6fec5bb7ba85/01M3KDATM5E8FDT8QGG2J372KE/.cursor/hooks/graft-hooks.cjs\" cursor-session-end"
       }
     ]
   }
