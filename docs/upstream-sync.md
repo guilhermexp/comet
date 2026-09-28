@@ -128,3 +128,4 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | 2026-09-22 | até v0.2.83 (`d721f301`) | `openspec/changes/sync-upstream-v0-2-83/` | Merge `55395013` via graft (upstream reassinado); v0.2.84 em `010e02d2` |
 | 2026-09-27 | até `433aa148` (v0.2.94+) | `openspec/changes/sync-upstream-v0-2-94/` | Merge `1065d252`; iOS reescrito; o fork segura o grant MCP |
 | 2026-09-27 | até `9d3cc8b2` (v0.2.96) | `openspec/changes/sync-upstream-v0-2-94/` | Segundo merge na mesma branch; #595 recusado via revert local `a65f309e`; entram #389/#596, #588, #586, #592 e iOS |
+| 2026-09-28 | `e13b18de` (#599) | porte pontual | Cmd/Ctrl+C copia a seleção do transcript com o foco fora do composer; o próximo sync resolve para o lado do upstream |
