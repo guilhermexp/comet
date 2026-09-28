@@ -235,10 +235,19 @@ pub(super) fn render(
     for (range, is_chip) in segments(flat) {
         // RowVeil keys by element index, not row_key. Sharing index zero
         // rewrites the same fade baseline for every word on every frame.
-        let part_ix = super::render::nested_ix(ix, usize::MAX, range.start);
+        // The leading text segment keeps the paragraph's own identity, so its
+        // painted key stays `{row_key}:{ix}` as for a paragraph without chips.
+        let leading_text = !is_chip && range.start == 0;
+        let part_ix = if leading_text {
+            ix
+        } else {
+            super::render::nested_ix(ix, usize::MAX, range.start)
+        };
         let part = fragment(flat, range.clone());
         let mut part_opts = opts.clone();
-        part_opts.row_key = format!("{}-inline-{}", group, range.start).into();
+        if !leading_text {
+            part_opts.row_key = format!("{}-inline-{}", group, range.start).into();
+        }
         part_opts.selection_group = Some(group.clone());
         let lead = web_links(flat)
             .find(|(link, _)| link.start == range.start)
