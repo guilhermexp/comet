@@ -869,6 +869,72 @@ pub enum RowKind {
     /// A subagent's "finished" timeline line (Codex-style lifecycle), placed
     /// where its terminal status arrived ([`zeron_doc::SubagentEnd`]).
     SubagentEnd(Arc<SubagentEndLine>),
+    /// A Worker's `[worker-task-notification]` (a user-role entry the
+    /// Workers host writes into the parent chat) drawn as a lifecycle line.
+    WorkerNotice(Arc<WorkerNotice>),
+}
+
+/// What a `[worker-task-notification]` reports (format owned by
+/// `zeron_workers_unpeel::parent_notifications`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerNotice {
+    pub session_id: Option<SharedString>,
+    pub title: SharedString,
+    pub status: SharedString,
+}
+
+const WORKER_NOTICE_PREFIX: &str = "[worker-task-notification] Worker \"";
+
+/// Parse the notification header (`Worker "<title>" -> <status>.`) and the
+/// `- Session:` line. Anything else stays an ordinary user message.
+pub(crate) fn is_worker_notice(text: &str) -> bool {
+    parse_worker_notice(text).is_some()
+}
+
+fn parse_worker_notice(text: &str) -> Option<WorkerNotice> {
+    let rest = text.trim_start().strip_prefix(WORKER_NOTICE_PREFIX)?;
+    let header = rest.lines().next()?;
+    let (title, status) = header.rsplit_once("\" -> ")?;
+    let status = status.trim().trim_end_matches('.').trim();
+    if title.trim().is_empty() || status.is_empty() {
+        return None;
+    }
+    let session_id = rest.lines().find_map(|line| {
+        let id = line
+            .trim()
+            .strip_prefix("- Session: `")?
+            .strip_suffix('`')?;
+        (!id.trim().is_empty()).then(|| SharedString::from(id.trim().to_owned()))
+    });
+    Some(WorkerNotice {
+        session_id,
+        title: zeron_proto::view::single_line(title.trim()).into(),
+        status: status.to_owned().into(),
+    })
+}
+
+/// A `launch_worker` call of the Workers hub, with the name it was given.
+fn worker_launch_name(call: &ToolCall) -> Option<Option<String>> {
+    let ToolCall::Mcp {
+        server,
+        tool,
+        input: Some(input),
+    } = call
+    else {
+        return None;
+    };
+    if tool != "workers" && server != "comet-workers" {
+        return None;
+    }
+    let field = |key: &str| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    (field("action").as_deref() == Some("launch_worker")).then(|| field("name"))
 }
 
 /// What a subagent lifecycle line announces.
@@ -1752,6 +1818,20 @@ fn rows_for_entry_with_todo_history(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
+        // A Worker's completion notice is model-facing plumbing, not
+        // something the user typed: a Codex-style lifecycle line instead of
+        // a message bubble. The full notice stays in the doc for the agent.
+        if let Some(notice) = parse_worker_notice(&raw) {
+            return vec![Row {
+                id: entry.id.clone().into(),
+                version: (raw.len() as u64) << 1,
+                turn_start: false,
+                kind: RowKind::WorkerNotice(Arc::new(notice)),
+                entry_id,
+                timestamp: None,
+                copy_text: None,
+            }];
+        }
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
@@ -4539,6 +4619,12 @@ pub enum TranscriptEvent {
         parent_tool_use_id: String,
         title: String,
         frozen: bool,
+    },
+    /// A Worker lifecycle line was clicked: open that Worker's surface.
+    OpenWorker {
+        chat_id: String,
+        session_id: String,
+        title: String,
     },
 }
 
@@ -8189,6 +8275,23 @@ impl Transcript {
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::Notice { text } => notice_divider(text.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::WorkerNotice(notice) => {
+                let (verb, tone) = match notice.status.as_ref() {
+                    "completed" => ("finished".to_owned(), theme.text_muted),
+                    "exited" => ("stopped".to_owned(), theme.text_muted),
+                    "waiting_for_input" => ("needs input".to_owned(), theme.warning),
+                    other => (other.replace('_', " "), theme.text_muted),
+                };
+                self.render_worker_line(
+                    row.id.clone(),
+                    notice.session_id.clone(),
+                    notice.title.clone(),
+                    verb,
+                    tone,
+                    &theme,
+                    cx,
+                )
+            }
             RowKind::SubagentEnd(line) => self.render_subagent_line(
                 row.id.clone(),
                 SubagentLine {
@@ -8204,6 +8307,77 @@ impl Transcript {
                 &theme,
                 cx,
             ),
+        }
+    }
+
+    /// One Codex-style Worker lifecycle line: the Worker's harness mark, its
+    /// name, what happened. Opens the Worker when its session is known.
+    #[allow(clippy::too_many_arguments)]
+    fn render_worker_line(
+        &self,
+        id: SharedString,
+        session_id: Option<SharedString>,
+        title: SharedString,
+        verb: String,
+        tone: gpui::Hsla,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat_id = self
+            .journal_chat_id
+            .clone()
+            .or_else(|| self.chat_id.clone())
+            .unwrap_or_default();
+        let (icon, name) = {
+            let state = self.state.read(cx);
+            let label = session_id
+                .as_ref()
+                .and_then(|id| state.workers_tool_catalog.sessions.get(id.as_ref()));
+            (
+                label.map_or(crate::icons::BOT, |label| label.icon),
+                label
+                    .map(|label| label.name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map_or(title.clone(), |name| {
+                        SharedString::from(zeron_proto::view::single_line(name))
+                    }),
+            )
+        };
+        let line = div()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .min_h(px(CHIP_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .font_family(theme.font_sans.clone())
+            .text_size(px(render::MD_TEXT_SIZE))
+            .line_height(px(CHIP_HEIGHT))
+            .text_color(tone)
+            .child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(crate::icons::icon(icon).size(px(15.0)).text_color(tone)),
+            )
+            .child(div().min_w_0().truncate().child(format!("{name} {verb}")));
+        match session_id {
+            Some(session_id) => line
+                .cursor_pointer()
+                .hover(|style| style.text_color(theme.text))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(TranscriptEvent::OpenWorker {
+                        chat_id: chat_id.clone(),
+                        session_id: session_id.to_string(),
+                        title: name.to_string(),
+                    });
+                }))
+                .into_any_element(),
+            None => line.into_any_element(),
         }
     }
 
@@ -10238,6 +10412,40 @@ impl Transcript {
                     return self.render_subagent_start(
                         SharedString::from(format!("{row_id}#s{ix}")),
                         tool,
+                        theme,
+                        cx,
+                    );
+                }
+                // A Workers launch reads as "<worker> started working"; the
+                // Worker's completion notice later reads as its end line.
+                if !tool.is_error
+                    && let Some(name) = worker_launch_name(&tool.call)
+                {
+                    let preset = worker_chips[ix]
+                        .as_ref()
+                        .and_then(|chips| chips.identity.as_ref())
+                        .map(|label| label.name.clone());
+                    let session = name.as_ref().and_then(|name| {
+                        self.state
+                            .read(cx)
+                            .workers_tool_catalog
+                            .sessions
+                            .iter()
+                            .find(|(_, label)| label.name.trim() == name.as_str())
+                            .map(|(id, _)| SharedString::from(id.clone()))
+                    });
+                    let title = name.or(preset).unwrap_or_else(|| "Worker".to_owned());
+                    let verb = if tool.resolved {
+                        "started working"
+                    } else {
+                        "starting"
+                    };
+                    return self.render_worker_line(
+                        SharedString::from(format!("{row_id}#w{ix}")),
+                        session,
+                        title.into(),
+                        verb.to_owned(),
+                        theme.text_muted,
                         theme,
                         cx,
                     );
@@ -14423,6 +14631,85 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    fn worker_notice_text(kind: zeron_workers_unpeel::WorkerParentNotificationKind) -> String {
+        zeron_workers_unpeel::build_worker_parent_notification_prompt(
+            &zeron_workers_unpeel::WorkerParentNotification {
+                notification_id: "n1".into(),
+                event_id: "e1".into(),
+                superseded_event_ids: Vec::new(),
+                retained_latch_event_id: None,
+                worker_session_id: "worker-7".into(),
+                parent_chat_id: "chat".into(),
+                kind,
+                task_episode: 1,
+                runtime_generation: 1,
+                occurred_at_unix_ms: 0,
+                title: "WT-20260924-sanitizador — fechamento".into(),
+                command: "claude --session-id 'x'".into(),
+                project_name: "jk".into(),
+            },
+            "tail \"quoted\" -> not a header",
+        )
+    }
+
+    #[test]
+    fn worker_notices_parse_from_the_workers_host_format() {
+        use zeron_workers_unpeel::WorkerParentNotificationKind as Kind;
+        for (kind, status) in [
+            (Kind::Completed, "completed"),
+            (Kind::Exited, "exited"),
+            (Kind::WaitingForInput, "waiting_for_input"),
+        ] {
+            let notice = parse_worker_notice(&worker_notice_text(kind)).expect("notice parses");
+            assert_eq!(notice.status.as_ref(), status);
+            assert_eq!(
+                notice.title.as_ref(),
+                "WT-20260924-sanitizador — fechamento"
+            );
+            assert_eq!(notice.session_id.as_deref(), Some("worker-7"));
+        }
+        assert!(parse_worker_notice("[worker-task-notification] something else").is_none());
+        assert!(parse_worker_notice("Worker \"x\" -> completed.").is_none());
+    }
+
+    #[test]
+    fn a_worker_notice_entry_renders_as_a_lifecycle_line_not_a_bubble() {
+        let mut entry = assistant(
+            "notice",
+            MessageStatus::Complete,
+            vec![text_part(
+                "t",
+                &worker_notice_text(zeron_workers_unpeel::WorkerParentNotificationKind::Completed),
+            )],
+        );
+        entry.role = MessageRole::User;
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &rows[..],
+            [Row { kind: RowKind::WorkerNotice(notice), .. }] if notice.status.as_ref() == "completed"
+        ));
+        let ticks = crate::rail::rail_ticks(&[entry], &[]);
+        assert!(ticks.is_empty(), "a Worker notice is not a user prompt");
+    }
+
+    #[test]
+    fn only_workers_launches_read_as_start_lines() {
+        let call = |action: &str, name: Option<&str>| ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(serde_json::json!({ "action": action, "name": name })),
+        };
+        assert_eq!(
+            worker_launch_name(&call("launch_worker", Some("WT-1"))),
+            Some(Some("WT-1".into()))
+        );
+        assert_eq!(worker_launch_name(&call("launch_worker", None)), Some(None));
+        assert_eq!(
+            worker_launch_name(&call("wait_for_status", Some("WT-1"))),
+            None
+        );
     }
 
     #[test]

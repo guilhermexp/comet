@@ -2946,33 +2946,7 @@ impl Shell {
                     chat_id,
                     session_id,
                     title,
-                } => {
-                    let selected_chat = this.state.read(cx).selected_chat.clone();
-                    let session_available = if selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        this.workers_model
-                            .read(cx)
-                            .sessions_for_parent_chat(chat_id)
-                            .map(|sessions| {
-                                sessions.iter().any(|session| session.id == *session_id)
-                            })
-                            .map_err(|_| ())
-                    } else {
-                        Ok(false)
-                    };
-                    match chat_worker_open_decision(
-                        selected_chat.as_deref(),
-                        chat_id,
-                        session_available,
-                    ) {
-                        ChatWorkerOpenDecision::Open => {
-                            this.add_worker_surface(session_id, title, cx)
-                        }
-                        ChatWorkerOpenDecision::Refresh => {
-                            this.workers_model.update(cx, |model, cx| model.refresh(cx));
-                        }
-                        ChatWorkerOpenDecision::IgnoreStaleChat => {}
-                    }
-                }
+                } => this.open_chat_worker(chat_id, session_id, title, cx),
             },
         );
         let details_for_preview = details_sidebar.clone();
@@ -5022,6 +4996,11 @@ impl Shell {
                 relative_path.clone(),
                 cx,
             ),
+            TranscriptEvent::OpenWorker {
+                chat_id,
+                session_id,
+                title,
+            } => self.open_chat_worker(chat_id, session_id, title, cx),
             TranscriptEvent::OpenSubagent {
                 chat_id,
                 doc_id,
@@ -5038,6 +5017,35 @@ impl Shell {
                     cx,
                 );
             }
+        }
+    }
+
+    /// Open one of the selected chat's Workers (Details widget row or a
+    /// transcript lifecycle line). A session missing from the latest
+    /// snapshot refreshes the model instead of opening a dead surface.
+    fn open_chat_worker(
+        &mut self,
+        chat_id: &str,
+        session_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let selected_chat = self.state.read(cx).selected_chat.clone();
+        let session_available = if selected_chat.as_deref() == Some(chat_id) {
+            self.workers_model
+                .read(cx)
+                .sessions_for_parent_chat(chat_id)
+                .map(|sessions| sessions.iter().any(|session| session.id == session_id))
+                .map_err(|_| ())
+        } else {
+            Ok(false)
+        };
+        match chat_worker_open_decision(selected_chat.as_deref(), chat_id, session_available) {
+            ChatWorkerOpenDecision::Open => self.add_worker_surface(session_id, title, cx),
+            ChatWorkerOpenDecision::Refresh => {
+                self.workers_model.update(cx, |model, cx| model.refresh(cx));
+            }
+            ChatWorkerOpenDecision::IgnoreStaleChat => {}
         }
     }
 

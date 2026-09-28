@@ -119,7 +119,10 @@ pub fn rail_ticks(
     RAIL_PROJECTIONS.with(|count| count.set(count.get() + 1));
     let mut ticks: Vec<RailTick> = Vec::new();
     for (ix, entry) in entries.iter().enumerate() {
-        if entry.role != MessageRole::User {
+        // Worker completion notices ride user-role entries but are not the
+        // user's prompts: no navigation tick.
+        if entry.role != MessageRole::User || crate::transcript::is_worker_notice(&user_text(entry))
+        {
             continue;
         }
         ticks.push(RailTick {
