@@ -6,7 +6,7 @@ Mostrar, na linha do tempo do chat, quando cada subagente começou e quando term
 
 ### Requirement: O fim do subagente guarda sua posição na linha do tempo
 
-Quando o status de um chip de spawn transiciona para `done` ou `failed`, o chip SHALL receber `subagentEnd` apontando a entry do parent ativa naquele momento (omitida quando é a própria entry do chip) e o id da última part dessa entry, se houver. Um novo `running` (steer/reatribuição) SHALL limpar `subagentEnd`. Status terminal repetido SHALL NOT mover o anchor.
+Quando o status de um chip de spawn transiciona para `done` ou `failed`, o chip SHALL receber `subagentEnd` apontando a entry do parent ativa naquele momento (omitida quando é a própria entry do chip) e o id da última part dessa entry, se houver. Quando o segmento ativo ainda não tem parts (sessão estacionada), o anchor SHALL ser a entry mais nova já gravada no doc e sua última part. Um novo `running` (steer/reatribuição) SHALL limpar `subagentEnd`. Status terminal repetido SHALL NOT mover o anchor.
 
 #### Scenario: Subagente termina enquanto o orquestrador continua
 Test: unit — `parts.rs`, fold de `Subagent{Done}` após novas parts.
