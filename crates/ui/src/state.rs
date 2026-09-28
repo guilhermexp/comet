@@ -761,6 +761,8 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
+    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
+    pub update: Option<zeron_update::UpdateStatus>,
     /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
     /// standing stream may be backed by subprocess and network probes.
     pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
@@ -842,6 +844,7 @@ impl AppState {
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
+            update: None,
             harness_updates: Vec::new(),
             data_dir: None,
             engine: None,
@@ -1280,6 +1283,10 @@ impl AppState {
             .and_then(|d| sorted.iter().find(|s| s.device_id == d).copied())
             .or_else(|| sorted.first().copied())
             .map(|s| s.id.clone())
+    }
+
+    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
+        self.update = Some(status);
     }
 
     pub fn apply_harness_updates(&mut self, statuses: Vec<zeron_proto::HarnessUpdateStatus>) {
@@ -1947,6 +1954,7 @@ impl AppState {
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
+        self.update = None;
         cx.notify();
     }
 
@@ -2140,6 +2148,15 @@ impl AppState {
                 state.apply_auth_value(value);
                 true
             }),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::UPDATE_STATUS,
+                |state, value| {
+                    state.apply_update(value);
+                    true
+                },
+            ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
         if supports_harness_updates {
