@@ -43,15 +43,16 @@ impl Render for FilePathTooltip {
 ///
 /// The filename heuristic reads `.br` as an extension and resolves the host
 /// against the project root, so clicking opened a missing local file. Only
-/// unambiguous hosts qualify: a `www.` prefix or a generic label (`com`,
-/// `net`, `org`, `gov`, `edu`) after the first. `.md`, `.sh` and `.rs` are
-/// ccTLDs too, so a TLD alone never decides.
+/// unambiguous hosts qualify: a `www.` prefix, a generic label (`com`,
+/// `net`, `org`, `gov`, `edu`) before a ccTLD (`x.com.br`), or a generic
+/// TLD followed by a path (`site.com/loja`). `.md`, `.org` and `.com` are
+/// file extensions too, so a bare `name.tld` never decides.
 pub(super) fn web_host_url(text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() || text.contains(char::is_whitespace) || text.contains("://") {
         return None;
     }
-    let host = text.split('/').next()?;
+    let (host, path) = text.split_once('/').unwrap_or((text, ""));
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() < 2
         || labels.iter().any(|label| {
@@ -60,12 +61,16 @@ pub(super) fn web_host_url(text: &str) -> Option<String> {
     {
         return None;
     }
-    let generic = labels[1..].iter().any(|label| {
+    let generic = |label: &&str| {
         ["com", "net", "org", "gov", "edu"]
             .iter()
             .any(|tld| label.eq_ignore_ascii_case(tld))
-    });
-    (labels[0].eq_ignore_ascii_case("www") || generic).then(|| format!("https://{text}"))
+    };
+    let (last, middle) = labels[1..].split_last()?;
+    (labels[0].eq_ignore_ascii_case("www")
+        || middle.iter().any(generic)
+        || (generic(last) && !path.is_empty()))
+    .then(|| format!("https://{text}"))
 }
 
 /// Follow the reference's filename heuristic without interpreting commands.
@@ -408,6 +413,9 @@ mod tests {
         ] {
             assert_eq!(file_target(code), None);
         }
+        for file in ["notes.org", "COMMAND.COM"] {
+            assert_eq!(file_target(file), Some(file));
+        }
     }
 
     #[test]
@@ -425,6 +433,9 @@ mod tests {
             "script.sh",
             "src/main.rs",
             "AGENTS.md",
+            "README.org",
+            "COMMAND.COM",
+            "example.com",
             "www",
             "a..com",
         ] {

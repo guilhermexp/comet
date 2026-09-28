@@ -750,7 +750,7 @@ impl WorkersTerminal {
                     visible,
                     catching_up,
                     load_marks,
-                    stopped,
+                    estimate_marks,
                 )) = this.update(cx, |terminal, _| {
                     let state = terminal.active_state();
                     (
@@ -767,11 +767,8 @@ impl WorkersTerminal {
                         state.map_or(0, |state| state.resize_sync.epoch()),
                         is_visible(terminal.last_prepaint, Instant::now()),
                         state.is_some_and(|state| state.historical_replay.is_catching_up()),
-                        state.is_some_and(|state| {
-                            state.historical_replay.is_catching_up()
-                                && state.geometry_marks.is_none()
-                        }),
-                        state.is_some_and(|state| state.stopped),
+                        state.is_some_and(|state| state.historical_replay.is_catching_up()),
+                        state.is_some_and(|state| state.stopped && state.geometry_marks.is_none()),
                     )
                 })
                 else {
@@ -795,20 +792,25 @@ impl WorkersTerminal {
                     .spawn(async move {
                         // Read before the output: every mark this backlog
                         // needs was written before its bytes.
-                        let marks = load_marks.then(|| {
-                            let marks = client.read_pty_geometry(&request_session_id);
-                            if marks.is_empty() && stopped {
-                                // Recorded before the journal: a TUI log can
-                                // no longer redraw, so an estimate beats the
-                                // panel's grid.
-                                client
-                                    .estimate_legacy_geometry(&request_session_id)
-                                    .into_iter()
-                                    .collect()
-                            } else {
-                                marks
-                            }
-                        });
+                        let marks = load_marks
+                            .then(|| client.read_pty_geometry(&request_session_id))
+                            .and_then(|marks| {
+                                if !marks.is_empty() {
+                                    Some(marks)
+                                } else if estimate_marks {
+                                    // Recorded before the journal: a TUI log
+                                    // can no longer redraw, so an estimate
+                                    // beats the panel's grid.
+                                    Some(
+                                        client
+                                            .estimate_legacy_geometry(&request_session_id)
+                                            .into_iter()
+                                            .collect(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            });
                         let wait_ms = if visible && !catching_up {
                             FOREGROUND_OUTPUT_WAIT_MS
                         } else {
