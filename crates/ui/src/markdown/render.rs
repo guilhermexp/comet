@@ -985,6 +985,11 @@ fn render_table(
                         {
                             width += 18.0; // 14px icon + 4px gap.
                         }
+                        if part.links.is_empty()
+                            && super::inline_chips::web_host_url(&part.text).is_some()
+                        {
+                            width += super::inline_chips::FAVICON_ADVANCE;
+                        }
                     }
                     if leads_link {
                         width += super::inline_chips::FAVICON_ADVANCE;

@@ -39,9 +39,41 @@ impl Render for FilePathTooltip {
     }
 }
 
+/// A bare web address written as code (`www.site.com.br`, `site.com/loja`).
+///
+/// The filename heuristic reads `.br` as an extension and resolves the host
+/// against the project root, so clicking opened a missing local file. Only
+/// unambiguous hosts qualify: a `www.` prefix or a generic label (`com`,
+/// `net`, `org`, `gov`, `edu`) after the first. `.md`, `.sh` and `.rs` are
+/// ccTLDs too, so a TLD alone never decides.
+pub(super) fn web_host_url(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) || text.contains("://") {
+        return None;
+    }
+    let host = text.split('/').next()?;
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty() || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    {
+        return None;
+    }
+    let generic = labels[1..].iter().any(|label| {
+        ["com", "net", "org", "gov", "edu"]
+            .iter()
+            .any(|tld| label.eq_ignore_ascii_case(tld))
+    });
+    (labels[0].eq_ignore_ascii_case("www") || generic).then(|| format!("https://{text}"))
+}
+
 /// Follow the reference's filename heuristic without interpreting commands.
 pub(super) fn file_target(text: &str) -> Option<&str> {
     let text = text.trim();
+    if web_host_url(text).is_some() {
+        return None;
+    }
     if text.is_empty()
         || text.len() > 240
         || text.contains(char::is_whitespace)
@@ -222,8 +254,15 @@ pub(super) fn render(
             });
             continue;
         }
-        if let Some(icon) = lead {
-            flow = flow.child(icon);
+        let web_host = part
+            .links
+            .is_empty()
+            .then(|| web_host_url(&part.text))
+            .flatten();
+        match (lead, web_host.as_deref()) {
+            (Some(icon), _) => flow = flow.child(icon),
+            (None, Some(url)) => flow = flow.child(favicon(url, line_height, theme)),
+            (None, None) => {}
         }
         let target = match part.links.first() {
             Some((_, url)) => super::render::is_previewable_file_link(url).then(|| url.clone()),
@@ -309,6 +348,14 @@ pub(super) fn render(
         if target.is_some() {
             label.links.clear();
         }
+        if let Some(url) = web_host {
+            // Opens through the same link path as any prose web link.
+            label.links = vec![(0..label.text.len(), url)];
+            let blue = super::render::web_link_color(theme);
+            for run in &mut label.runs {
+                run.color = blue;
+            }
+        }
         for run in &mut label.runs {
             let active = can_open && flat.hovered_chip.get() == Some(range.start);
             if active {
@@ -356,8 +403,32 @@ mod tests {
             "foo()",
             "echo x;cat a.ts",
             "https://x.dev/a.ts",
+            "www.jkdistribuicao.com.br",
+            "example.com/loja",
         ] {
             assert_eq!(file_target(code), None);
+        }
+    }
+
+    #[test]
+    fn bare_hosts_in_code_open_as_web_links() {
+        assert_eq!(
+            web_host_url("www.jkdistribuicao.com.br").as_deref(),
+            Some("https://www.jkdistribuicao.com.br")
+        );
+        assert_eq!(
+            web_host_url("jkdistribuicao.com.br/contato").as_deref(),
+            Some("https://jkdistribuicao.com.br/contato")
+        );
+        for not_host in [
+            "brain.md",
+            "script.sh",
+            "src/main.rs",
+            "AGENTS.md",
+            "www",
+            "a..com",
+        ] {
+            assert_eq!(web_host_url(not_host), None, "{not_host}");
         }
     }
 
