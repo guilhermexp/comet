@@ -532,7 +532,6 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.files_word_wrap = shell.files_word_wrap;
     current.files_show_all = shell.files_show_all;
     current.settings_section = shell.settings_section;
-    current.github_star_banner_dismissed = shell.github_star_banner_dismissed;
 }
 
 fn schedule(policy: SavePolicy, cx: &mut App) {
@@ -760,9 +759,6 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
-    /// The sidebar's "Star on GitHub" banner was dismissed (its close button
-    /// or following the link). Device-local; never shown again once set.
-    pub github_star_banner_dismissed: bool,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -931,7 +927,6 @@ impl Default for UiSettings {
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
-            github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
             open_tabs: None,
@@ -2364,7 +2359,6 @@ mod tests {
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
-            github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
                 "space-1".into(),

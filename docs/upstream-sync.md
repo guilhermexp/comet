@@ -79,6 +79,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Botão "descartar árvore inteira" no diff | #81 (UI) | v0.2.94 | O descarte fica no Changes do Files. **As proteções entraram** |
 | Windows: build ARM64, arrastar abas (sobe zui), cwd do ConPTY, lock de identidade | #545/#536/#528/#527 | v0.2.94 | Fork só roda em macOS |
 | Updates duráveis do app desktop (Check for Updates, download em background, instalar ao sair, instalador Windows, faixa de update) | #595 | v0.2.96 | Fork sem feed de release próprio. Revertido pelo commit local `a65f309e` em cima do upstream, antes do merge; o `UpdateStatus`/faixa da sidebar que ainda vinham junto também ficaram de fora |
+| Banner "Star on GitHub" no rodapé da sidebar (e `github_star_banner_dismissed`) | #586 | pós-v0.2.96 | Removido a pedido: o fork não quer o convite na sidebar. No próximo sync, resolver para o lado do fork |
 
 ## Aceito com adaptação
 
@@ -98,7 +99,6 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | App iOS | #570 | v0.2.94 | Reescrita do upstream aceita inteira. As adaptações antigas (OMP, streaming) precisam ser refeitas |
 | Parser de markdown em `crates/markdown` | #570 | v0.2.94 | A heurística de path do fork foi para `zeron_markdown::file_path` |
 | Monitor e controles de update das CLIs de agente (`harness_updates.rs`, leases de execução no registry, `WatchHarnessUpdates`/`CheckHarnessUpdates`/`ApplyHarnessUpdate`/…, política por agente no Providers, notificação) | #389/#596 | v0.2.96 | RPCs registrados no `method.rs` (forwardable; deadlines 4 min/20 min do upstream). A lease entra na estrutura do fork: título, recap e commit message pegam a lease uma vez e a passam para `discover_models_with_lease` e para o run (orçamento `with_retry_budget` mantido); o steer roteado usa `while_update_clear` dentro do loop `activity_reservation`. Convive com os advisories de runtime dos Workers (`workers-unpeel::maintenance`, aba Workers): OMP e Kimi ficam fora do coordenador (`monitored`), porque a manutenção de Workers já cuida de `omp`/`pi`; Claude/Codex/Cursor/etc. aparecem nos dois lugares, cada um com seu gate. Controles na página Agents (Providers) do fork; `agent_update_notifications` gravado por `apply_shell_settings` |
-| Banner "Star on GitHub" na sidebar | #586 | v0.2.96 | Acima do menu de conta, sem a faixa de update; dispensa gravada por `apply_shell_settings`. URL do upstream (`zeronsh/comet`) |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
 ## Armadilhas conhecidas
