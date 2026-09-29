@@ -2,7 +2,7 @@
 
 ### Requirement: wait_for_status status is a validated, documented contract
 
-The Workers controller SHALL accept for `wait_for_status` only `completed` and the lifecycle values that `list_workers`/`inspect_worker` report for `state` and `activity`, compared case-insensitively. Any other value SHALL be rejected with an error that lists the accepted values, without waiting. The tool schema, the tool description and `action=help` SHALL name `completed` as the status for "the worker finished its task", and SHALL state that `idle` matches any pause (including a worker waiting on its own subagents) and `exited` matches only a dead process.
+The Workers controller SHALL accept for `wait_for_status` only `completed` and the lifecycle values that `list_workers`/`inspect_worker` report for `state` and `activity`, compared case-insensitively. Any other value SHALL be rejected with an error that lists the accepted values, without waiting. `completed` on a worker whose task episodes are not tracked (no parent chat binding, so completion can never be observed) SHALL be rejected immediately with an error saying so, instead of blocking until the timeout. The tool schema, the tool description and `action=help` SHALL name `completed` as the status for "the worker finished its task", and SHALL state that `idle` matches any pause (including a worker waiting on its own subagents) and `exited` matches only a dead process.
 
 #### Scenario: Unknown status is rejected without waiting
 - Test: integration — controller MCP integration test calling `wait_for_status` with an unknown status against a live worker and asserting an immediate error listing the accepted values.
@@ -18,6 +18,14 @@ The Workers controller SHALL accept for `wait_for_status` only `completed` and t
 - **WHEN** the tool schema, tool description and `action=help` are read
 - **THEN** each names `completed` as the status for a finished task
 - **AND** each states that `idle` and `exited` do not mean the task finished
+
+#### Scenario: Completed on an untracked worker is rejected without waiting
+- Test: integration — controller MCP integration test launching a worker from a controller without `COMET_WORKERS_PARENT_CHAT_ID` and calling `wait_for_status(completed)`.
+
+- **GIVEN** a live worker launched without a parent chat binding
+- **WHEN** the orchestrator calls `wait_for_status` with `status` `completed`
+- **THEN** the call returns an error stating that completion is not tracked for this worker
+- **AND** it returns without blocking for `timeout_seconds`
 
 ### Requirement: A lifecycle wait ends when the current episode completes
 
@@ -56,6 +64,14 @@ When a `[worker-task-notification]` is queued into a parent chat whose OMP turn 
 - **GIVEN** an OMP turn with a pending `wait_for_status`
 - **WHEN** a steer that is not a worker notification arrives
 - **THEN** the wait is not interrupted and the steer is delivered after the wait's own result
+
+#### Scenario: A natural result racing the notification is preserved
+- Test: integration — harness integration test in `omp_rpc` where the controller answers the pending `wait_for_status` (matched) at the same time a worker-notification steer arrives.
+
+- **GIVEN** an OMP turn with a pending `wait_for_status` whose controller result arrives together with a worker-notification steer
+- **WHEN** the harness delivers the tool result
+- **THEN** the controller's real result is delivered, not replaced by the interrupted marker
+- **AND** the steer is delivered once after it
 
 ### Requirement: Claude Workers expose no suggested prompt in their composer
 
