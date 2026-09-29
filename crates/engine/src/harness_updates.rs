@@ -77,6 +77,10 @@ enum UpdatePlan {
         args: &'static [&'static str],
     },
     CodexStandalone(CodexStandaloneInstall),
+    PackageManager {
+        program: PathBuf,
+        args: Vec<String>,
+    },
 }
 
 struct ReleaseAsset {
@@ -274,6 +278,11 @@ fn update_plan(harness: HarnessId, executable: &Path) -> Result<UpdatePlan, Stri
         && let Some(install) = codex_standalone_install(executable)
     {
         return Ok(UpdatePlan::CodexStandalone(install));
+    }
+    if harness == HarnessId::Codex
+        && let Some((program, args)) = codex_package_manager_update(executable)
+    {
+        return Ok(UpdatePlan::PackageManager { program, args });
     }
     Err("this provider requires a manual update".into())
 }
@@ -842,6 +851,15 @@ impl HarnessUpdateCoordinator {
             UpdatePlan::CodexStandalone(install) => {
                 self.install_codex_standalone(harness, &current, install, &cancel)
                     .await
+            }
+            UpdatePlan::PackageManager { program, args } => {
+                match self.begin_install(harness, &cancel) {
+                    Ok(()) => {
+                        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                        run_command(&program, &args, UPDATE_TIMEOUT).await
+                    }
+                    Err(error) => Err(error),
+                }
             }
         };
         if let Err(error) = applied {
@@ -1552,6 +1570,40 @@ fn codex_standalone_install(executable: &Path) -> Option<CodexStandaloneInstall>
 
 #[cfg(not(unix))]
 fn codex_standalone_install(_executable: &Path) -> Option<CodexStandaloneInstall> {
+    None
+}
+
+/// Fork: Codex installed through npm or the Homebrew cask updates through
+/// that same owner, ported from Workers maintenance. The package manager is
+/// resolved from the install itself (the npm prefix's own `bin/npm`, the
+/// `brew` beside the Caskroom), never from PATH, so the upgrade lands on the
+/// copy Zeron actually runs.
+fn codex_package_manager_update(executable: &Path) -> Option<(PathBuf, Vec<String>)> {
+    let canonical = std::fs::canonicalize(executable).ok()?;
+    let text = canonical.to_string_lossy().replace('\\', "/");
+    if let Some(index) = text.find("/lib/node_modules/@openai/codex/") {
+        let prefix = PathBuf::from(&text[..index]);
+        let npm = prefix.join("bin").join("npm");
+        if !npm.is_file() {
+            return None;
+        }
+        let args = vec![
+            "install".into(),
+            "-g".into(),
+            "--prefix".into(),
+            prefix.to_string_lossy().into_owned(),
+            "@openai/codex@latest".into(),
+        ];
+        return Some((npm, args));
+    }
+    if let Some(index) = text.find("/Caskroom/codex/") {
+        let brew = PathBuf::from(&text[..index]).join("bin").join("brew");
+        if !brew.is_file() {
+            return None;
+        }
+        let args = vec!["upgrade".into(), "--cask".into(), "codex".into()];
+        return Some((brew, args));
+    }
     None
 }
 
@@ -3068,5 +3120,56 @@ esac
                 .update_pending(HarnessId::ClaudeCode)
         );
         coordinator.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_updates_through_the_package_manager_that_owns_the_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let touch = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        };
+
+        let npm_prefix = root.join("npm");
+        let script = npm_prefix.join("lib/node_modules/@openai/codex/bin/codex.js");
+        touch(&script);
+        std::os::unix::fs::symlink(&script, npm_prefix.join("bin-codex")).unwrap();
+        // No npm beside the install: stay manual rather than guess from PATH.
+        assert!(!super::can_apply_update(
+            HarnessId::Codex,
+            &npm_prefix.join("bin-codex")
+        ));
+        touch(&npm_prefix.join("bin/npm"));
+        let (program, args) =
+            super::codex_package_manager_update(&npm_prefix.join("bin-codex")).unwrap();
+        assert_eq!(program, npm_prefix.join("bin/npm"));
+        assert_eq!(
+            args,
+            [
+                "install",
+                "-g",
+                "--prefix",
+                npm_prefix.to_str().unwrap(),
+                "@openai/codex@latest"
+            ]
+        );
+        assert!(super::can_apply_update(
+            HarnessId::Codex,
+            &npm_prefix.join("bin-codex")
+        ));
+
+        let brew_prefix = root.join("brew");
+        let cask = brew_prefix.join("Caskroom/codex/0.158.0/codex");
+        touch(&cask);
+        touch(&brew_prefix.join("bin/brew"));
+        let (program, args) = super::codex_package_manager_update(&cask).unwrap();
+        assert_eq!(program, brew_prefix.join("bin/brew"));
+        assert_eq!(args, ["upgrade", "--cask", "codex"]);
+
+        let loose = root.join("elsewhere/codex");
+        touch(&loose);
+        assert!(!super::can_apply_update(HarnessId::Codex, &loose));
     }
 }
