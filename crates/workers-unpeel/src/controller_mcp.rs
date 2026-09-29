@@ -210,6 +210,35 @@ pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
 /// waits are polling and burn a full model turn each.
 pub const WAIT_TIMED_OUT_NEXT: &str = "Worker still running. Either call wait_for_status again with a timeout_seconds sized to the remaining work (up to limits.wait_seconds), or end your turn: a [worker-task-notification] arrives in this chat when the worker finishes. Do not poll with short waits.";
 
+/// Closed set of status strings accepted by `wait_for_status`.
+pub const ACCEPTED_WAIT_STATUSES: &[&str] = &[
+    "completed",
+    "running",
+    "exited",
+    "starting",
+    "working",
+    "blocked",
+    "done",
+    "idle",
+];
+
+pub fn is_accepted_wait_status(status: &str) -> bool {
+    ACCEPTED_WAIT_STATUSES
+        .iter()
+        .any(|accepted| accepted.eq_ignore_ascii_case(status))
+}
+
+pub fn validate_wait_status(status: &str) -> Result<(), String> {
+    if is_accepted_wait_status(status) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unknown status '{status}'. Accepted values are: {}",
+            ACCEPTED_WAIT_STATUSES.join(", ")
+        ))
+    }
+}
+
 /// Requested creation details for an isolated Worker checkout. This is kept
 /// separate from `WorkersLaunchRequest`: that wire request can name only an
 /// already-registered checkout, while this value must be consumed by the
@@ -764,7 +793,12 @@ fn dispatch_action(
     match action.as_str() {
         "help" => Ok(json!({
             "actions": ACTIONS,
-            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker. For each independent slice, launch a separate Worker with new_worktree={branch, base_ref?}; leave worktree_path/worktree_branch unset. Omit all worktree selectors only when sharing the project checkout is intentional, or use the existing worktree_path/worktree_branch pair to target a known checkout. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
+            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status(status=completed)/read_output -> stop_worker/archive_worker. For each independent slice, launch a separate Worker with new_worktree={branch, base_ref?}; leave worktree_path/worktree_branch unset. Omit all worktree selectors only when sharing the project checkout is intentional, or use the existing worktree_path/worktree_branch pair to target a known checkout. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
+            "wait_for_status": {
+                "target": "Use status='completed' to wait until the worker finished its task.",
+                "lifecycle_distinction": "idle matches any pause (including a worker waiting on its own subagents) and exited matches only a dead process; neither idle nor exited means the task finished.",
+                "accepted_statuses": ACCEPTED_WAIT_STATUSES
+            },
             "launch_worker": {
                 "independent_slice": "Pass new_worktree with a unique branch and optional base_ref so each Worker receives its own checkout.",
                 "project_checkout": "Omit all worktree fields only when running in the project checkout is an explicit choice.",
@@ -1539,6 +1573,7 @@ fn wait_for_status(
 ) -> Result<Value, String> {
     let session_id = required_string(arguments, "session_id")?;
     let wanted = required_string(arguments, "status")?.to_ascii_lowercase();
+    validate_wait_status(&wanted)?;
     let timeout =
         clamp_wait_for_status_timeout(arguments.get("timeout_seconds").and_then(Value::as_u64));
     wait_until_matching(
@@ -1554,9 +1589,7 @@ fn wait_for_status(
                 .find(|session| session.id == session_id)
                 .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))
         },
-        |session| {
-            wanted.eq_ignore_ascii_case("completed") && crate::current_episode_completed(session)
-        },
+        |session| crate::current_episode_completed(session),
     )
 }
 
@@ -1581,14 +1614,37 @@ pub fn wait_until_matching(
     mut extra_match: impl FnMut(&WorkersSession) -> bool,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut initial_completion: Option<bool> = None;
     loop {
         let session = poll()?;
-        let matched = session.activity.eq_ignore_ascii_case(wanted)
-            || session.state.eq_ignore_ascii_case(wanted)
-            || extra_match(&session);
-        if matched {
-            return Ok(json!({ "matched": true, "worker": session_json(&session) }));
+        let is_completed = extra_match(&session);
+        if initial_completion.is_none() {
+            initial_completion = Some(is_completed);
         }
+
+        if wanted.eq_ignore_ascii_case("completed") {
+            let matched = session.activity.eq_ignore_ascii_case(wanted)
+                || session.state.eq_ignore_ascii_case(wanted)
+                || is_completed;
+            if matched {
+                return Ok(json!({ "matched": true, "worker": session_json(&session) }));
+            }
+        } else {
+            let matched = session.activity.eq_ignore_ascii_case(wanted)
+                || session.state.eq_ignore_ascii_case(wanted);
+            if matched {
+                return Ok(json!({ "matched": true, "worker": session_json(&session) }));
+            }
+            if !initial_completion.unwrap_or(false) && is_completed {
+                return Ok(json!({
+                    "matched": false,
+                    "completed": true,
+                    "episode_completed": true,
+                    "worker": session_json(&session)
+                }));
+            }
+        }
+
         if cancel.load(Ordering::SeqCst) {
             return Err("wait_for_status cancelled by the host".into());
         }
@@ -1678,10 +1734,13 @@ fn tool_definition() -> Value {
         started one level up runs every command, gate and relative path against \
         the wrong tree — then \
         `list_presets` to pick a preset, `launch_worker` with a self-contained \
-        briefing in `initial_text`, then either `wait_for_status` with a \
+        briefing in `initial_text`, then either `wait_for_status(status=\"completed\")` with a \
         `timeout_seconds` sized to the work (you decide, up to `limits.wait_seconds`) \
-        or end your turn — a `[worker-task-notification]` arrives in this chat when \
-        the worker finishes; never poll with short waits. `read_output` inspects \
+        to wait until the worker finishes its task (note: `completed` is the status for a \
+        finished task; `idle` matches any pause, including a worker waiting on its own \
+        subagents, and `exited` matches only a dead process — neither idle nor exited means \
+        the task finished) or end your turn — a `[worker-task-notification]` arrives in this \
+        chat when the worker finishes; never poll with short waits. `read_output` inspects \
         evidence, then `stop_worker` or `archive_worker`. A worker that is not \
         running — stopped, or hibernated by the idle policy — refuses input until \
         `restart_worker` brings it back with its conversation under a new \
@@ -1705,7 +1764,7 @@ fn tool_definition() -> Value {
                 "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },
                 "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64, "description": "send_keys: named keys — enter, escape, tab, backspace, the arrows, ctrl-c, or text:<literal>." },
                 "submit": { "type": "boolean", "description": "send_text: submit the text with a carriage return. Defaults to true." },
-                "status": { "type": "string", "description": "wait_for_status: the worker status to block on, as reported by list_workers and inspect_worker." },
+                "status": { "type": "string", "description": "wait_for_status: the status to block on. Use 'completed' when waiting for the worker to finish its task. 'idle' matches any pause (including a worker waiting on its own subagents) and 'exited' matches only a dead process, so neither idle nor exited means the task finished. Accepted values: completed, running, exited, starting, working, blocked, done, idle." },
                 "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: how long to block, chosen by you to fit the work (default 30, maximum 4h); expiration returns timed_out: true with a worker snapshot and a next hint as a normal read, not a failure. The wait is cancellable and does not block other actions." },
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
                 "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing delivered once at launch. OMP, Claude, Pi and Codex receive it through native startup. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },

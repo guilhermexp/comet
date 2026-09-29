@@ -27,7 +27,8 @@ pub use checkout_activity::{
     ActivityKind, CheckoutActivityReservation, PendingRelease, reserve_chat_run, reserve_terminal,
 };
 pub use controller_mcp::{
-    CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,
+    ACCEPTED_WAIT_STATUSES, CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
+    clamp_wait_for_status_timeout, is_accepted_wait_status, validate_wait_status,
     worker_output_text,
 };
 #[doc(hidden)]

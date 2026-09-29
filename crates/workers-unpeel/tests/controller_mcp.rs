@@ -1522,3 +1522,259 @@ fn wait_for_completed_matches_live_idle_worker_with_current_episode_evidence() {
         "wait must not consume the 1800s timeout"
     );
 }
+
+#[test]
+fn wait_for_status_rejects_unknown_status_immediately() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let path = home.path().join("app-state.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let session_dir = home.path().join("app-sessions").join("worker-live");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "session": {
+                "id": "worker-live",
+                "project_id": "project-1",
+                "label": "Worker Live",
+                "command": "claude",
+                "created_at": 1000
+            },
+            "cwd": "/tmp",
+            "state": "running",
+            "pid": 12345,
+            "exit_code": null,
+            "has_been_written_to": true,
+            "updated_at": 1000
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _guard = UnpeelHomeGuard::set(home.path());
+
+    let started = std::time::Instant::now();
+    let response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": {
+                "action": "wait_for_status",
+                "session_id": "worker-live",
+                "status": "nonexistent_status",
+                "timeout_seconds": 60
+            }
+        }
+    }))
+    .expect("tools/call responds");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "unknown status must return immediately without waiting, took {elapsed:?}"
+    );
+    assert_eq!(response["result"]["isError"], true);
+    let error_text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text in content");
+    assert!(
+        error_text.contains("Unknown status 'nonexistent_status'"),
+        "error must mention the unknown status: {error_text}"
+    );
+    for accepted in &[
+        "completed",
+        "running",
+        "exited",
+        "starting",
+        "working",
+        "blocked",
+        "done",
+        "idle",
+    ] {
+        assert!(
+            error_text.contains(accepted),
+            "error must list accepted status '{accepted}': {error_text}"
+        );
+    }
+}
+
+#[test]
+fn wait_for_status_schema_and_help_document_completed_and_lifecycle_targets() {
+    let tools = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    }))
+    .expect("tools/list responds");
+
+    let tool = &tools["result"]["tools"][0];
+    let tool_desc = tool["description"].as_str().expect("tool description");
+    let status_desc = tool["inputSchema"]["properties"]["status"]["description"]
+        .as_str()
+        .expect("status description");
+
+    let help_response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": { "action": "help" }
+        }
+    }))
+    .expect("help action responds");
+    let help_struct = &help_response["result"]["structuredContent"];
+    let help_text = serde_json::to_string(help_struct).expect("help json text");
+
+    for (target_name, text) in [
+        ("tool description", tool_desc),
+        ("status description", status_desc),
+        ("action=help", &help_text),
+    ] {
+        assert!(
+            text.contains("completed"),
+            "{target_name} must name 'completed': {text}"
+        );
+        assert!(
+            text.contains("idle") && text.contains("exited"),
+            "{target_name} must mention idle and exited: {text}"
+        );
+        assert!(
+            text.contains("finished") || text.contains("finish"),
+            "{target_name} must document finished/finish target: {text}"
+        );
+        assert!(
+            text.contains("subagent") || text.contains("dead process") || text.contains("pause"),
+            "{target_name} must explain idle/exited distinction: {text}"
+        );
+    }
+}
+
+#[test]
+fn wait_for_status_exited_returns_when_live_worker_episode_completes() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("app-state.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    let sessions_root = dir.path().join("sessions");
+
+    let cancel = AtomicBool::new(false);
+    let polls = AtomicU32::new(0);
+    let started = Instant::now();
+    let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+        30,
+        "exited",
+        &cancel,
+        || {
+            let n = polls.fetch_add(1, Ordering::SeqCst);
+            if n > 0 {
+                write_stop_hook(&sessions_root, "worker-1", 1);
+            }
+            Ok(worker_with_state("running"))
+        },
+        |session| {
+            current_episode_completed_with_evidence_at(
+                &path,
+                session,
+                &sessions_root,
+                WorkerCompletionEvidence::quiescent(),
+            )
+            .unwrap_or(false)
+        },
+    )
+    .expect("wait on exited must return when episode completes");
+
+    assert_eq!(result["matched"], false, "must not claim exited matched");
+    assert_eq!(
+        result["completed"], true,
+        "must mark that the episode completed"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "must return within one poll tick of completion becoming observable"
+    );
+}
+
+#[test]
+fn wait_for_status_prior_completion_does_not_end_new_lifecycle_wait() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("app-state.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    let sessions_root = dir.path().join("sessions");
+    write_stop_hook(&sessions_root, "worker-1", 1);
+
+    let cancel = AtomicBool::new(false);
+    let polls = AtomicU32::new(0);
+    let started = Instant::now();
+    let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+        1,
+        "working",
+        &cancel,
+        || {
+            polls.fetch_add(1, Ordering::SeqCst);
+            Ok(worker_with_state("running"))
+        },
+        |session| {
+            current_episode_completed_with_evidence_at(
+                &path,
+                session,
+                &sessions_root,
+                WorkerCompletionEvidence::quiescent(),
+            )
+            .unwrap_or(false)
+        },
+    )
+    .expect("wait should time out");
+
+    assert_eq!(result["matched"], false);
+    assert_eq!(
+        result["timed_out"], true,
+        "prior completion must not end a new wait on working; it must time out"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "must wait for the timeout instead of returning early"
+    );
+}

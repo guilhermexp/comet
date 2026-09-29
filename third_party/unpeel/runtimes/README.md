@@ -59,7 +59,9 @@ Important fields:
 - `detection`: conservative command/process aliases, package path signatures,
   and optional home-relative executable search paths.
 - `environment.strip_inherited`: provider identity/session variables that a
-  nested Unpeel Host must remove before opening a new terminal.
+  nested Unpeel Host must remove before opening a new terminal. Runtime-specific
+  launch controls (such as `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` for
+  Claude Code) are injected by the compiled adapter's `configure_host_command`.
 - `usage.stores`: optional bounded, home-relative session-file patterns used
   only to rank an existing user's agents during first-run preset seeding.
 - `lifecycle`: source, authority, fallback, reliability claims, and the
