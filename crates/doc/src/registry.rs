@@ -798,7 +798,40 @@ impl RegistryDoc {
         to_device: &str,
         space_ids: &[String],
     ) -> Result<Vec<String>, DocError> {
-        let hlc = self.next_hlc();
+        let chat_ids: Vec<String> = self
+            .read_chats()?
+            .into_iter()
+            .filter(|chat| {
+                chat.space_id
+                    .as_deref()
+                    .is_some_and(|space_id| space_ids.iter().any(|id| id == space_id))
+            })
+            .map(|chat| chat.id)
+            .collect();
+        // The owner's retirement must win every field it rewrites, even over
+        // a write the retiring device stamped later than this clock would.
+        let mut touched: Vec<RegistryRow> = Vec::new();
+        for id in space_ids {
+            touched.extend(self.overlay_row(KIND_SPACES, id));
+        }
+        for id in &chat_ids {
+            touched.extend(self.overlay_row(KIND_CHATS, id));
+            touched.extend(self.overlay_row(KIND_SESSIONS, id));
+        }
+        let newest = touched
+            .iter()
+            .filter_map(|row| row.max_clock().map(str::to_owned))
+            .max();
+        let mut hlc = self.next_hlc();
+        if let Some(newest) = newest.filter(|newest| newest.as_str() >= hlc.as_str())
+            && let Some(ms) = newest.get(..13).and_then(|ms| ms.parse::<i64>().ok())
+        {
+            self.clock = HlcClock {
+                last_ms: ms + 1,
+                counter: 0,
+            };
+            hlc = encode_hlc(ms + 1, 0, &self.device_id.clone());
+        }
         let op = |kind: &str, id: &str, op: OpKind, set: BTreeMap<String, Value>| RowOp {
             kind: kind.to_string(),
             id: id.to_string(),
@@ -824,16 +857,6 @@ impl RegistryDoc {
                 ]),
             ));
         }
-        let chat_ids: Vec<String> = self
-            .read_chats()?
-            .into_iter()
-            .filter(|chat| {
-                chat.space_id
-                    .as_deref()
-                    .is_some_and(|space_id| space_ids.iter().any(|id| id == space_id))
-            })
-            .map(|chat| chat.id)
-            .collect();
         for chat_id in &chat_ids {
             ops.push(op(
                 KIND_CHATS,
