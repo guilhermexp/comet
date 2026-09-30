@@ -119,45 +119,39 @@ A project owned by another device SHALL show its name, device, path, Git flag an
 - **WHEN** the user renames a remote project
 - **THEN** the chat MCP `list_projects` returns the new name
 
-### Requirement: A project lists its sessions
+### Requirement: A project lists its Worker sessions
 
-The detail of a project SHALL offer a Sessions tab listing, in one list ordered by most recent activity, the project's Orchestrator chats (active and archived) and, for a local project, every Worker session launched in any of its checkouts (active and archived). Each row SHALL show its kind (chat or Worker), title, runtime, status and last activity; a Worker row SHALL also show its checkout (branch or principal) and the chat that launched it when one is recorded. Activating a row SHALL open that session in a side panel next to the list, without leaving Settings → Projects: a Worker opens the same Worker surface (terminal and transcript) used when a Worker is opened from a chat; a chat opens its transcript with an action to go to the chat. A project owned by another device SHALL list only its chats.
+The detail of a local project SHALL offer a Sessions tab, laid out like Settings → Archived sessions, listing every Worker session launched in any of the project's checkouts (live and archived), most recent activity first. Each row SHALL show title, runtime, status, last activity and checkout (branch or principal), plus the Orchestrator chat that launched it when one is recorded. Opening a row SHALL show that session in a side panel next to the list, without leaving Settings → Projects, using the same Worker surface (terminal and transcript) used when a Worker is opened from a chat. The launching chat SHALL open read-only in the same panel. A project owned by another device SHALL show no Worker sessions.
 
-#### Scenario: Chats and Worker sessions in one list
-- Test: unit — session rows built from a project with chats, a principal and a linked worktree with Worker sessions, plus sessions of another project.
+#### Scenario: Worker sessions of principal and worktrees
+- Test: unit — session rows built from a project with a principal and a linked worktree with Worker sessions, plus sessions of another project.
 - **WHEN** the user opens the Sessions tab of a local project
-- **THEN** the project's chats and the Worker sessions of the principal and every linked checkout are listed together, most recent first, each Worker naming its checkout
-- **AND** chats and sessions of other projects are absent
+- **THEN** the Worker sessions of the principal and every linked checkout are listed, most recent first, each naming its checkout
+- **AND** sessions of other projects are absent
 
 #### Scenario: Opening a Worker session
 - Test: unit — row activation resolves to the Worker surface for that session id; none — native GPUI QA for the panel beside the list.
-- **WHEN** the user activates a running or idle Worker row
+- **WHEN** the user opens a running or idle Worker row
 - **THEN** a side panel opens next to the list with that Worker's terminal and transcript
 - **AND** Settings → Projects stays open with the row selected
 
-#### Scenario: Opening an archived Worker session
-- Test: unit — activation of an archived row resolves to a read-only replay; none — native GPUI QA for the replayed transcript.
-- **WHEN** the user activates an archived Worker row
+#### Scenario: Replaying a stopped or archived Worker session
+- Test: unit — activation of a stopped or archived row resolves to a read-only replay that never restarts; none — native GPUI QA for the replayed transcript.
+- **WHEN** the user replays a stopped or archived Worker row
 - **THEN** the side panel shows that session's recorded transcript without restarting it
 
-#### Scenario: Opening a chat
-- Test: unit — activation of a chat row resolves to that chat's transcript surface.
-- **WHEN** the user activates a chat row
-- **THEN** the side panel shows the chat's transcript
-- **AND** an action in the panel navigates to the chat
-
 #### Scenario: Session launched from an Orchestrator chat
-- Test: unit — row built from a Worker parent link.
+- Test: unit — row built from a Worker parent link and activation of its chat target.
 - **WHEN** a Worker session was launched by an Orchestrator chat
-- **THEN** its row names that chat and activating the chat name opens that chat in the side panel
+- **THEN** its row names that chat and opening it shows the chat's transcript read-only in the side panel
 
 #### Scenario: A checkout that disappeared
 - Test: unit — rows for sessions of a missing checkout.
 - **WHEN** a Worker session's checkout is no longer available
-- **THEN** the session is still listed and opens its recorded transcript
+- **THEN** the session is still listed and replays its recorded transcript
 - **AND** no restart is offered from the tab
 
 #### Scenario: A remote project
 - Test: unit — rows for a Space owned by another device.
 - **WHEN** the user opens the Sessions tab of a project owned by another device
-- **THEN** only its chats are listed
+- **THEN** no Worker sessions are listed

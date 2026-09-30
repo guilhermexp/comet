@@ -40,8 +40,8 @@
 
 ## 7. Sessions tab
 
-- [x] 7.1 Session rows for a project: chats + (local only) Worker sessions of principal and worktrees, live + archived, merged by last activity; parent chat; missing checkout; remote project lists chats only; verify unit tests for each Sessions scenario.
-- [ ] 7.2 Side panel beside the list reusing the chat-opened Worker surface and a read-only chat `Transcript` with "Go to chat"; archived Worker replays without restart; verify activation unit tests and a native QA screenshot of the panel open next to the list.
+- [x] 7.1 Session rows for a local project: Worker sessions of principal and worktrees, live + archived, by last activity; launching chat; missing checkout; remote project lists none; verify unit tests for each Sessions scenario.
+- [ ] 7.2 Side panel beside the list reusing the chat-opened Worker surface; stopped/archived Worker replays without restart; launching chat opens read-only; verify activation unit tests and a native QA screenshot of the panel open next to the list.
 
 ## 8. Integration proof
 
@@ -68,6 +68,4 @@
   `^[a-z][a-zA-Z0-9]{0,31}$`).
 - Owner decision (2026-09-30, mid-run): the Sessions tab follows Settings → Archived sessions
   and lists only the project's Worker sessions (principal and worktrees, live and archived);
-  chats are reachable from a Worker row's launching chat. `specs/projects-settings/spec.md`
-  ("A project lists its sessions") still describes chats + Workers and needs the Main's
-  update (outside this run's owned paths).
+  the launching chat opens read-only from a Worker row. Spec, proposal and design updated by the Main.
