@@ -6,7 +6,7 @@ O `@` do composer só alcança arquivos da checkout atual (`SearchFiles`). Proje
 
 - O popup do `@` ganha um nível raiz: uma entrada **Projects** no topo, hairline, e abaixo os resultados de arquivo de sempre.
 - Abrir Projects troca o popup pela lista completa de projetos (nome + path), filtrável pelo que se continua digitando depois do `@`. Escape volta ao nível raiz; do raiz, fecha o popup.
-- A lista vem do **ledger de projetos** (`project_ledger`) — a mesma fonte de Settings → Projects, lida direto do `app-state.json`, sem depender do daemon de Workers.
+- A lista vem do **registro único de projetos** (Spaces, change `unify-project-registry`) — a mesma fonte de Settings → Projects e do `list_projects` do chat MCP —, lida do snapshot que o app já observa (`AppState.spaces`), sem depender do daemon de Workers. Cada projeto mostra o device dono.
 - Escolher um projeto insere um chip no prompt, como já acontece com arquivos: o chip mostra o nome, o prompt carrega o path absoluto.
 - A menção é puramente textual: NÃO troca o cwd, o device nem o projeto-alvo do chat.
 
@@ -18,6 +18,6 @@ O `@` do composer só alcança arquivos da checkout atual (`SearchFiles`). Proje
 
 ## Impact
 
-- `crates/ui/src/composer.rs`: scheme `zeron-project:`, menu de dois níveis, leitura do ledger.
+- `crates/ui/src/composer.rs`: scheme `zeron-project:`, menu de dois níveis, leitura dos Spaces com device.
 - DOX: `crates/ui/AGENTS.md` (contrato do `@`).
 - Sem mudança em engine, RPC, CRDT ou edge.

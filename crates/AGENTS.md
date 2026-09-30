@@ -4,7 +4,7 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `preview` é consumida pela engine para HTTP/RTC; `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. A engine também usa `workers-unpeel` para o serviço comum de worktree, a atividade local e a autorização de Source Control de projetos Workers. `sessions-mcp` é fronteira lateral de stdio: depende só de `proto` e `rpc`, e o binário `zeron` a lança; a engine não linka essa crate. Nada abaixo depende de nada acima.
+As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `preview` é consumida pela engine para HTTP/RTC; `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. A engine também usa `workers-unpeel` para o serviço comum de worktree, a atividade local e a autorização de Source Control de checkouts Worker pelo link com o projeto (Space). `workers-unpeel` fala com a engine só pelo RPC (`zeron-proto`/`zeron-rpc`), para ler e criar projetos no registro único. `sessions-mcp` é fronteira lateral de stdio: depende só de `proto` e `rpc`, e o binário `zeron` a lança; a engine não linka essa crate. Nada abaixo depende de nada acima.
 
 ## Ownership
 

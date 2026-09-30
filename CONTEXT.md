@@ -83,20 +83,20 @@ _Avoid_: switch, move, checkout
 
 ## Projects
 
-**Logical Project**:
-A identidade local durável que reúne o checkout principal, worktrees e histórico de um repositório em Workers e Projects. Sua identidade independe da branch atual, de PR e da existência das pastas dos filhos. Um contêiner sem checkout principal cadastrado organiza os filhos, mas não é alvo de execução. Clones separados não se tornam o mesmo projeto apenas por compartilharem remote.
-_Avoid_: branch, cwd, Registered Project (quando se quer dizer o contêiner)
+**Project**:
+Um Space do registro único: id, Device dono, pasta e nome. É o que o chat MCP `list_projects`, o controller de Workers `list_projects`, Settings → Projects, a sidebar de Workers (projetos locais) e as menções `@` do composer listam — o mesmo id em todas. Todo "adicionar projeto" (paletas, "+" de Settings, `add_project` do controller) cria ou reusa o Space da pasta; nada cunha identidade de projeto fora dele. O repositório de um worktree linkado pertence ao Project da sua raiz.
+_Avoid_: Logical Project, Registered Project, workspace (para o registro); em copy de produto, Space
 
 **Worker Checkout**:
-O diretório de execução de Workers, vinculado a um Logical Project quando sua origem é comprovada. Disponibilidade, arquivamento e propriedade do diretório são fatos separados: reconhecer um worktree externo não autoriza apagá-lo. Arquivar preserva sessões; remover a pasta não elimina a identidade histórica.
-_Avoid_: novo repositório (quando se trata de worktree do mesmo repositório), main (quando se quer dizer checkout principal)
+O diretório de execução de Workers (`comet-*`), ligado a exatamente um Project deste device: o checkout principal é a pasta do Project, worktrees linkados do mesmo repositório são checkouts dele. Sem evidência (sem pasta nem repositório persistido) fica em "Association pending" e nunca vira projeto. Disponibilidade, arquivamento e propriedade do diretório são fatos separados: reconhecer um worktree externo não autoriza apagá-lo. Arquivar preserva sessões; remover a pasta não elimina a identidade histórica.
+_Avoid_: projeto (para o checkout), novo repositório (quando se trata de worktree do mesmo repositório), main (quando se quer dizer checkout principal)
 
-**Registered Project**:
-Uma pasta que o usuário cadastrou no working set de projetos (`WorkersProject`, o que `list_projects` retorna) — o universo fechado contra o qual qualquer derivação de projeto casa. Uma pasta que o agente tocou e não está cadastrada não é um Registered Project e não existe para a UI.
-_Avoid_: workspace, folder, repo (quando se quer dizer a row cadastrada)
+**Retired Device**:
+Um device duplicado ou abandonado aposentado em Settings → Devices: seus Projects cujas pastas existem aqui passam para este device com todos os chats (ids preservados) e ele some de toda lista de devices; reconectar não o traz de volta. Só um device que não é o local e não está online pode ser aposentado.
+_Avoid_: deletar device, remover device
 
 **Leaf Root**:
-O Registered Project que não é ancestral de nenhum outro Registered Project. Um projeto cadastrado que contém outros cadastrados é um contêiner e nunca participa de casamento por prefixo, senão engole todo caminho abaixo dele.
+O Worker Checkout cadastrado que não é ancestral de nenhum outro checkout cadastrado — o universo fechado contra o qual o casamento de Worked Projects roda. Um checkout que contém outros é um contêiner e nunca participa de casamento por prefixo, senão engole todo caminho abaixo dele.
 _Avoid_: parent project, container, root project
 
 **Worked Project**:

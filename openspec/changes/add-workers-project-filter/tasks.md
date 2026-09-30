@@ -44,6 +44,10 @@
 - [ ] 3.6 Unit: filtering to a project with no live session draws that
       project's row.
 
+- [x] 3.7 Unit: the filter keys roots by Space id and matches the project's
+      checkouts through their link (`unify-project-registry` 5.5) —
+      `project_filter_keys_projects_by_space_id`.
+
 ## 4. Closeout
 
 - [x] 4.1 Record the filter in `crates/ui/AGENTS.md`.

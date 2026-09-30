@@ -14,9 +14,13 @@ away.
 - The Workers sidebar gains the same trigger and dropdown, above its scroll
   region so the card floats without being clipped — the same reason the
   Orchestrator puts it there.
-- The rows come from `WorkersModel::projects()`, the same set the tree draws.
-  Only ROOT projects are listed: a worktree or a group is a child in the tree,
-  and filtering to one would hide the parent it belongs to.
+- The rows are the tree's ROOT projects — since `unify-project-registry`, the
+  registry's local projects (Spaces), named as in the registry, with their
+  checkouts nested. The filter stores the project's **Space id**, never a
+  Workers checkout id; a root row with no project (association pending,
+  legacy row) is keyed by its row id. Only roots are listed: a worktree or a
+  group is a child in the tree, and filtering to one would hide the parent it
+  belongs to.
 - Picking a project narrows the tree to that project **and its subtree**, so
   its worktrees and groups stay visible. "All projects" restores the full tree.
 - The filter persists like the Orchestrator's does. It lives on
@@ -35,8 +39,10 @@ away.
 
 ## What this does NOT change
 
-- No new data source. The Orchestrator's dropdown lists synced spaces with an
-  `@ device` tag; Workers projects are device-local, so the rows carry no tag.
+- No new data source: the rows are the Workers tree roots, which are this
+  device's projects of the single registry. The Orchestrator's dropdown lists
+  spaces from every device with an `@ device` tag; Workers only list local
+  projects, so the rows carry no tag.
 - Selection, launcher and session actions are untouched: the filter only
   decides which rows the tree draws.
 

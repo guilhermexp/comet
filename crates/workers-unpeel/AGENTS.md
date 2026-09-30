@@ -22,7 +22,9 @@ internal host modes (`__session_host__` et al.).
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
 | `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
-| `project_ledger.rs` | Historical project metadata, grouped Settings catalog and persistent Forget suppression |
+| `project_ledger.rs` | Historical checkout metadata, grouping of checkout history under the registry's projects (`group_rows_by_project`) and persistent Forget suppression |
+| `space_registry.rs` | The single project registry as Workers see it: `SpaceRegistry` (`list`, `ensure`), `SpaceRef`, the chat-MCP-equivalent join (`space_refs`) and `RpcSpaceRegistry` over the engine RPC surface (`COMET_WORKERS_ENGINE_ENDPOINT`) |
+| `space_links.rs` | Checkout ↔ project links: `project_folder`, `link_unlinked_at`, the one-time `migrate_at` (backup, reconcile, link, marker) and the read-only `linked_checkouts_at` Source Control authorizes through |
 | `checkout_lifecycle.rs` | Shared Chat/Workers worktree creation, guarded physical removal, stale registration pruning, archive/restore and action coordination |
 | `copy_ignored.rs` | Opt-in `.worktreeinclude` copy of Git-ignored files during shared checkout preparation, with reflink and no overwrite |
 | `branch_cleanup.rs` | Conservative local branch cleanup after a proven owned checkout is removed; integrated-only decision and old-OID compare-and-swap |
@@ -37,11 +39,41 @@ Hooks de remoção leem o `.config/wt.toml` do checkout removido; hooks de cria�
 | `maintenance.rs` | Worker CLI version detection (`--version`), npm/brew latest version querying with TTL cache, semver comparison, advisory generation, and safe update command execution |
 | `tests/` | Integration tests per surface |
 
-Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`) only.
-Consumed by: zeron-engine (ciclo de vida de worktree e atividade local),
-zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
+Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`), plus
+`zeron-proto`/`zeron-rpc` only for the project registry transport (neither
+depends on this crate: no cycle, checked with `cargo tree -i`).
+Consumed by: zeron-engine (ciclo de vida de worktree, atividade local e
+autorização de Source Control por link de projeto), zeron-ui (`workers/` e
+Settings), apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
+
+- **Um projeto é um Space; Workers só guardam checkouts.** O registro único é
+  o de Spaces da engine (o mesmo que o chat MCP `list_projects` devolve).
+  `CheckoutIdentity::space_id` (`spaceID` em `comet_project_identity`) liga
+  cada checkout ao projeto; `projects[]` e os ids `comet-*` não mudam, então
+  sessões, manifests, `session-order.json` e `session_sort_modes` seguem
+  válidos. Checkout Git pertence ao Space da raiz do repositório (worktree
+  linkado inclusive); pasta não-Git ao próprio Space; sem evidência fica
+  association-pending — nunca por nome, prefixo ou remote. Checkouts do mesmo
+  repositório herdam o link (`inherit_repository_space_links`) no registro e
+  no reconcile. Todo add (`add_project`, controller `add_project`, palettes,
+  Settings "+") chama `SpaceRegistry::ensure` antes de escrever: sem registro
+  alcançável falha nomeando-o e nada é gravado. `ensure` canonicaliza, porque
+  a engine deduplica por string exata de path.
+- **Controller MCP lê o registro pelo endpoint da engine.** O harness passa
+  `COMET_WORKERS_ENGINE_ENDPOINT` (endpoint IPC que a engine realmente abriu).
+  `list_projects` devolve os Spaces de todos os devices (id, nome, path,
+  device) com os checkouts locais aninhados e `association_pending` à parte;
+  `launch_worker` aceita id de projeto (principal, registrado sob demanda) ou
+  `checkout_id` (aquele checkout); projeto de outro device falha antes do
+  spawn nomeando o device.
+- **Migração única** (`space_links::migrate_at`, chamada pela UI depois que a
+  engine conecta e os Spaces sincronizam): copia `app-state.json` para
+  `app-state.space-migration-backup.json` (nunca sobrescreve uma cópia
+  anterior), roda o reconcile de identidade, liga/cria Spaces e grava
+  `comet_space_migration: {version, completed_at_unix_ms}` preservando chaves
+  desconhecidas. Marker presente → no-op sem backup.
 
 - `comet_project_identity` é aditivo e local: não troca IDs de Workers nem
   transforma contêineres/histórico em cwd executável. Common directory e seu
@@ -394,10 +426,11 @@ zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
 - **`wait_for_status(completed)` casa evidência do episódio atual, não o processo.** O Worker vivo fica `state=running` / `activity=idle` depois do Stop. ACK grava `acknowledged_completed_generation` da notificação; o latch só completa se a geração atual for essa, activity não for `blocked`/`working`, e o output estiver quiescente. Binding legado sem geração falha fechado. Idle sem evidência não é completed.
 
 - **`serve` despacha concorrente e cancelável.** `run_stdio` é casca sobre `serve(reader, writer, handler)`: uma thread por request, `stdout` atrás de `Mutex`, registro de ids em voo. `notifications/cancelled` flipa o flag do request (`wait_until` checa a cada tick de 250ms) e o request cancelado **não recebe resposta** (contrato MCP). EOF flipa só o flag de saída — waits pendentes morrem, respostas em voo ainda são escritas. `wait_until` é o núcleo puro do wait (poll injetado) para testar deadline, cancel e `next` sem host.
-- **An unlisted checkout is an unlaunchable one.** `launch_worker` takes a
-  `project_id` and `validate_launch_target` rejects any id absent from the live
-  project list, so the surface must also be able to *add* a project
-  (`add_project`, idempotent over the canonical path). Without it the caller's
+- **An unlisted checkout is an unlaunchable one.** `launch_worker` resolves a
+  project id to its principal checkout (or takes a `checkout_id`), and
+  `validate_launch_target` rejects any checkout absent from the live list, so
+  the surface must also be able to *add* a project (`add_project`, idempotent
+  over the canonical path, creating or reusing the folder's Space). Without it the caller's
   only working move for an unregistered repo is an ancestor project, and the
   worker runs every command against the wrong tree — observed 2026-08-26, two
   workers briefed on a client repo launched in `$HOME`.
@@ -463,7 +496,7 @@ zeron-ui (`workers/` e Settings), apps/zeron (host-mode dispatch at startup).
 
 - **Branch de contexto/PR**: `WorkersProject::change_request_branch` aceita checkout local e worktree, mas usa somente `git_branch` atual; exclui grupos, detached, arquivados e indisponíveis. A branch de criação não serve como fallback de PR. Valores vazios não viram branch. O consumidor limita subscriptions ao working set; não inferir que um checkout comum está na default branch ou não possui PR.
 
-- `registered_projects::RegisteredProjects` lê apenas raízes absolutas do working set persistido, excluindo grupos. Não inicia host, não usa ledger histórico e não grava estado. A engine consulta esse adaptador em `spawn_blocking` para autorizar Changes em Workers sem Chat/Space.
+- `space_links::linked_checkouts_at` lê só `(path, space_id)` dos checkouts ligados. Não inicia host nem grava estado. A engine consulta em `spawn_blocking` e autoriza Source Control num checkout Worker apenas quando o Space ligado é deste device — estar em `projects[]` não autoriza nada.
 
 ## Work Guidance
 
@@ -575,8 +608,9 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 |---|---|---|
 | `src/lib.rs` (criação/preparo Chat e Workers), `src/checkout_lifecycle.rs`, `src/checkout_activity.rs`, `src/worktree_ownership.rs`, `src/copy_ignored.rs`, `src/branch_cleanup.rs`, `src/worktrunk_{hooks,lifecycle,approvals}.rs`, `src/worktree_config.rs` (setup e retries) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/hook_migration.rs`, `src/activity_bridge.rs`, `src/resources.rs`, `src/session_event_journal.rs`, `src/project_ledger.rs`, `src/project_git.rs` | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `src/registered_projects.rs` (registro read-only, grupos, paths relativos e erro de parse) | unit | `cargo test -p zeron-workers-unpeel --lib registered_projects` |
-| `tests/controller_mcp.rs` — Comet-owned MCP surface, including `launch_worker.new_worktree` validation and recoverable launch failures | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `src/project_identity.rs` (link `space_id`, herança por repositório, round-trip com chaves desconhecidas) | unit | `cargo test -p zeron-workers-unpeel --lib project_identity` |
+| `tests/controller_mcp.rs` — Comet-owned MCP surface, including `launch_worker.new_worktree` validation, recoverable launch failures and the project registry (add/list/launch through a fake engine over WebSocket, `tests/support`) | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/space_migration.rs` — migração única: principal não registrado, Space existente, segunda rodada no-op, registro sem evidência, sessões preservadas | integration | `cargo test -p zeron-workers-unpeel --test space_migration` |
 | `tests/worker_initial_briefing.rs` (13) — OMP/Claude/Pi/Codex native delivery, literal input, spawn and ACK failures, no replay, existing interactive guards, managed Codex wrapper privacy and upstream launcher composition | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |

@@ -6,3 +6,4 @@
 - [x] 1.4 Um índice ativo por nível; Escape volta um nível antes de fechar; clique e teclado aceitam a mesma linha.
 - [x] 1.5 Testes: parse do link de projeto, filtro por nome e path, contagem/scroll por nível.
 - [x] 1.6 DOX pass: `crates/ui/AGENTS.md`.
+- [x] 1.7 Fonte das linhas passa a ser o registro único (Spaces × devices do `AppState`), com o device na linha — change `unify-project-registry` 5.5; teste `project_mentions_are_the_registry_projects_with_their_device`.

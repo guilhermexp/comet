@@ -24,7 +24,14 @@ Test: unit — `composer.rs`, aceitação da linha 0 no nível raiz.
 
 ### Requirement: A lista de projetos é a de Settings → Projects
 
-A lista SHALL vir do ledger de projetos (`project_ledger`) — todo projeto que o app já viu —, ordenada da atividade mais recente para a mais antiga, exibindo nome e path absoluto de cada um. Ela SHALL ser lida fora da thread de UI a cada abertura do `@`, e SHALL NOT depender do daemon de Workers. Falha de leitura SHALL resultar em lista vazia, nunca em popup quebrado.
+A lista SHALL vir do registro único de projetos — os Spaces de todos os devices, os mesmos ids que o `list_projects` do chat MCP devolve —, ordenada da atividade mais recente para a mais antiga, exibindo nome, path absoluto e o device dono de cada um. Ela SHALL ser relida do snapshot de Spaces que o app já observa a cada abertura do `@`, e SHALL NOT depender do daemon de Workers nem do ledger de checkouts. Sem snapshot, a lista SHALL ficar vazia, nunca um popup quebrado.
+
+#### Scenario: Os projetos oferecidos são os do registro, com device
+Test: unit — `composer.rs`, `project_mentions_are_the_registry_projects_with_their_device`.
+
+- **WHEN** o usuário abre Projects no `@`
+- **THEN** a lista contém os projetos do registro de todos os devices, mais recentes primeiro
+- **AND** cada linha mostra o nome do device dono
 
 #### Scenario: Query filtra por nome ou por path
 Test: unit — `composer.rs`, filtro de projetos.

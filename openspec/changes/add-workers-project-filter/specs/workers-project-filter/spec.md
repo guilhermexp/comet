@@ -3,9 +3,11 @@
 ### Requirement: The Workers tree can be filtered to one project
 
 The Workers sidebar SHALL offer a project filter above its scroll region,
-listing the root projects of `WorkersModel::projects()` plus an "All projects"
-row and a "New project…" action. Picking a project SHALL narrow the tree to
-that project and its subtree; "All projects" SHALL restore the full tree.
+listing the root projects of the Workers tree — the registry's local projects
+(Spaces) — plus an "All projects" row and a "New project…" action. The filter
+SHALL identify a project by its Space id. Picking a project SHALL narrow the
+tree to that project and its subtree; "All projects" SHALL restore the full
+tree.
 
 #### Scenario: A picked project keeps its subtree
 

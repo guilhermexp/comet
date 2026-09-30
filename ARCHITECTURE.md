@@ -27,7 +27,11 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
   device-local service in `crates/workers-unpeel`. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC
   whether the engine is in-process or a separate daemon. Organized around **spaces** —
-  (device, folder) pairs, local or synced according to the active profile. The sidebar is the
+  (device, folder) pairs, local or synced according to the active profile. A space IS the
+  project: it is the single project registry that the chat MCP, the Workers controller MCP,
+  Settings → Projects, the Workers sidebar and composer mentions all read and add into. Workers
+  keep only device-local execution checkouts (`comet-*` ids) linked to a space by id
+  (`comet_project_identity`), never a registry of their own. The sidebar is the
   Chat navigator: a searchable project filter plus configurable one-list/device grouping and
   updated/created sorting; numeric jump and cycle shortcuts consume the exact painted order. The
   titlebar names the selected Chat. In a new-Chat draft, device/project selectors sit above the
@@ -114,7 +118,7 @@ Two persistent doc kinds. When sync is enabled, session docs ride the chat2 row 
 
 2. **Workspace registry doc** (per profile) — the `registry1` snapshot stores spaces (id, deviceId, path, name?, gitDetected, checkoutId), the chats index (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt, lastMessagePreview/At, config), devices, session-status rows, and checkout-diff summary pointers. A space is a device+folder pair in the active profile; the owning device's `SpacesSync` stamps git presence so branch pickers and the diff sidebar can gate without another RPC. Local scope keeps the registry entirely in its profile store. Synced and development scopes join `/registry/{orgId}/ws`, backed by the private per-user room `reg1/{orgId}/{userId}`; rows are never visible to every member of an organization.
 
-   Writer discipline: each device writes its own device and session-status rows, rows for chats it hosts, and git stamps for spaces it owns. Creates, renames, archives, and seen marks are LWW sets accepted from any device. `deleteSpace` tombstones the space and every chat/session row in it in one commit. Presence uses ephemeral room frames rather than durable heartbeat writes.
+   Writer discipline: each device writes its own device and session-status rows, rows for chats it hosts, and git stamps for spaces it owns. Creates, renames, archives, and seen marks are LWW sets accepted from any device. `deleteSpace` tombstones the space and every chat/session row in it in one commit. `retireDevice` is the one owner change: after validating that the device is neither local nor online and that its folders exist here without a local space, one batch moves its spaces (same ids) and their chat/session rows to the local device and writes a `retiredDevices` tombstone that every device listing filters. Presence uses ephemeral room frames rather than durable heartbeat writes.
 
    *Why one registry and not N tiny docs:* the sidebar needs one subscription for the whole list (grouping, resort animations, unseen markers). Its rows contain indexes rather than transcripts, so one local snapshot and, when enabled, one room connection remain bounded and cheap.
 
