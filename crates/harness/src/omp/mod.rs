@@ -929,6 +929,8 @@ async fn run_session(
     let mut queued_steers: VecDeque<SteerMessage> = VecDeque::new();
     let mut in_flight_steers: Vec<(String, Option<String>)> = Vec::new();
     let mut delivering: HashSet<String> = HashSet::new();
+    let mut pending_wait_for_status: HashSet<String> = HashSet::new();
+    let mut interrupted_by_worker_notification: HashSet<String> = HashSet::new();
     let mut answered: HashSet<String> = HashSet::new();
     let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
     let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
@@ -1045,6 +1047,16 @@ async fn run_session(
                                 steer_failed_tx.clone(),
                             );
                         } else {
+                            if prompt.starts_with("[worker-task-notification]")
+                                && !pending_wait_for_status.is_empty()
+                            {
+                                for tool_id in &pending_wait_for_status {
+                                    interrupted_by_worker_notification.insert(tool_id.clone());
+                                    if let Some(workers) = workers.as_ref() {
+                                        workers.cancel_call(tool_id);
+                                    }
+                                }
+                            }
                             queued_steers.push_back(SteerMessage { prompt, message_id });
                         }
                     }
@@ -1060,6 +1072,9 @@ async fn run_session(
                 }
             }
             Some((tool_id, outcome)) = tool_rx.recv() => {
+                pending_wait_for_status.remove(&tool_id);
+                let was_interrupted_by_notice =
+                    interrupted_by_worker_notification.remove(&tool_id);
                 if answered.contains(&tool_id) {
                     delivering.remove(&tool_id);
                     if delivering.is_empty() {
@@ -1078,14 +1093,28 @@ async fn run_session(
                     continue;
                 }
                 answered.insert(tool_id.clone());
-                let result = outcome.unwrap_or_else(|| {
-                    json!({
+                let result = match outcome {
+                    Some(real_result) => real_result,
+                    None if was_interrupted_by_notice => json!({
+                        "type": "host_tool_result",
+                        "id": tool_id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": "wait_for_status was interrupted by a worker notification"
+                            }],
+                            "interrupted": true,
+                            "interrupted_by_notification": true
+                        },
+                        "isError": false
+                    }),
+                    None => json!({
                         "type": "host_tool_result",
                         "id": tool_id,
                         "result": { "content": [{ "type": "text", "text": "OMP host tool was cancelled" }] },
                         "isError": true
-                    })
-                });
+                    }),
+                };
                 if let Err(error) = process.send_control(result) {
                     let message = protocol::sanitize_diagnostic(&error.to_string());
                     let fallback = json!({
@@ -1158,6 +1187,9 @@ async fn run_session(
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
                         let tool = frame.get("toolName").and_then(Value::as_str).unwrap_or_default();
                         let arguments = frame.get("arguments").cloned().unwrap_or(Value::Null);
+                        let is_wait_for_status = (tool == "workers" || tool == "comet-workers")
+                            && arguments.get("action").and_then(Value::as_str) == Some("wait_for_status")
+                            || tool == "wait_for_status";
                         let bridge = match tool {
                             "sessions" => sessions.as_ref(),
                             _ if zeron.as_ref().is_some_and(|bridge| bridge.serves(tool)) => {
@@ -1169,6 +1201,9 @@ async fn run_session(
                             Some(workers) => match workers.begin_call(id, tool, arguments) {
                                 Ok(receiver) => {
                                     delivering.insert(id.to_owned());
+                                    if is_wait_for_status {
+                                        pending_wait_for_status.insert(id.to_owned());
+                                    }
                                     let tool_id = id.to_owned();
                                     let tool_tx = tool_tx.clone();
                                     tokio::spawn(async move {
@@ -1205,6 +1240,7 @@ async fn run_session(
                     Some("host_tool_cancel") => {
                         if let Some(target_id) = frame.get("targetId").and_then(Value::as_str)
                         {
+                            pending_wait_for_status.remove(target_id);
                             if let Some(workers) = &workers {
                                 workers.cancel_call(target_id);
                             }

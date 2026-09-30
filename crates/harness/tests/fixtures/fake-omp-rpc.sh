@@ -433,6 +433,57 @@ while IFS= read -r line; do
         else
           fail_stage workers_oversized 29
         fi
+      elif [ "$scenario" = "workers-notification-interrupts-wait" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"host_tool_call","id":"host-wait","toolCallId":"workers-wait","toolName":"workers","arguments":{"action":"wait_for_status","session_id":"w1","status":"completed","timeout_seconds":1800}}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"wait-pending"}}'
+        read -r host_result
+        if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-wait"'; then
+          if has "$host_result" 'interrupted by a worker notification'; then
+            emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"wait-interrupted-delivered"}}'
+          else
+            fail_stage wait_not_interrupted 40
+          fi
+        else
+          fail_stage host_wait 31
+        fi
+        read -r steer
+        if has "$steer" '"type":"steer"' && has "$steer" '[worker-task-notification]'; then
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"notice-steer-received"}}'
+          emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"[worker-task-notification] Worker \"worker-1\" -> completed."}]}}'
+          respond "$steer" '{}'
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after notice steer"}}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          fail_stage steer 32
+        fi
+      elif [ "$scenario" = "workers-notification-race-result" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"host_tool_call","id":"host-wait","toolCallId":"workers-wait","toolName":"workers","arguments":{"action":"wait_for_status","session_id":"race-worker","status":"completed","timeout_seconds":1800}}'
+        sleep 0.1
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"wait-pending"}}'
+        read -r host_result
+        if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-wait"'; then
+          if has "$host_result" 'interrupted by a worker notification'; then
+            fail_stage natural_result_replaced_by_interrupted 41
+          elif has "$host_result" 'matched'; then
+            emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"natural-result-delivered"}}'
+          else
+            fail_stage unexpected_host_result 42
+          fi
+        else
+          fail_stage host_wait 31
+        fi
+        read -r steer
+        if has "$steer" '"type":"steer"' && has "$steer" '[worker-task-notification]'; then
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"notice-steer-received"}}'
+          emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"[worker-task-notification] Worker \"race-worker\" -> completed."}]}}'
+          respond "$steer" '{}'
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after notice steer"}}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          fail_stage steer 32
+        fi
       elif [ "$scenario" = "workers-wait-steer" ]; then
         emit '{"type":"agent_start"}'
         emit "{\"type\":\"host_tool_call\",\"id\":\"host-slow\",\"toolCallId\":\"workers-slow\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${FAKE_OMP_HOLD_PATH}\"}}"

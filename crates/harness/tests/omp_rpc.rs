@@ -2316,6 +2316,161 @@ async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
 }
 
 #[tokio::test]
+async fn worker_notification_during_pending_wait_for_status_is_delivered_promptly() {
+    let env = fake_env("workers-notification-interrupts-wait");
+
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_workers_mcp_executable(fake_workers_controller_path())
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("wait-pending barrier")
+            .expect("stream")
+            .unwrap();
+        let pending = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "wait-pending"
+        );
+        events.push(event);
+        if pending {
+            steer
+                .send(SteerMessage {
+                    prompt: "[worker-task-notification] Worker \"worker-1\" -> completed.".into(),
+                    message_id: Some("m-notice".into()),
+                })
+                .await
+                .unwrap();
+            break;
+        }
+    }
+    let started = std::time::Instant::now();
+    events.extend(
+        tokio::time::timeout(Duration::from_secs(5), collect_until_done(&mut stream))
+            .await
+            .expect("pending wait should be interrupted and notice delivered promptly"),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "worker notification must end the wait promptly, took {:?}",
+        started.elapsed()
+    );
+
+    let interrupted = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "wait-interrupted-delivered"),
+    );
+    let steered = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }));
+    let after = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "after notice steer"),
+    );
+
+    assert!(
+        interrupted.is_some(),
+        "interrupted wait result delivered: {events:?}"
+    );
+    assert!(steered.is_some(), "steer consumed: {events:?}");
+    assert!(after.is_some(), "run continued after steer: {events:?}");
+    assert!(
+        interrupted.unwrap() < steered.unwrap(),
+        "tool result must be delivered before steer: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "steer processed exactly once: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn natural_result_racing_notification_is_preserved_and_steer_delivered_once() {
+    let env = fake_env("workers-notification-race-result");
+
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_workers_mcp_executable(fake_workers_controller_path())
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("wait-pending barrier")
+            .expect("stream")
+            .unwrap();
+        let pending = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "wait-pending"
+        );
+        events.push(event);
+        if pending {
+            steer
+                .send(SteerMessage {
+                    prompt: "[worker-task-notification] Worker \"race-worker\" -> completed."
+                        .into(),
+                    message_id: Some("m-notice-race".into()),
+                })
+                .await
+                .unwrap();
+            break;
+        }
+    }
+    events.extend(
+        tokio::time::timeout(Duration::from_secs(5), collect_until_done(&mut stream))
+            .await
+            .expect("natural result and notice steer must complete"),
+    );
+
+    let natural = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "natural-result-delivered"),
+    );
+    let steered = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }));
+    let after = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "after notice steer"),
+    );
+
+    assert!(
+        natural.is_some(),
+        "natural controller result must be delivered, not replaced: {events:?}"
+    );
+    assert!(steered.is_some(), "steer consumed: {events:?}");
+    assert!(after.is_some(), "run continued after steer: {events:?}");
+    assert!(
+        natural.unwrap() < steered.unwrap(),
+        "tool result must be delivered before steer: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "steer processed exactly once: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn duplicate_host_tool_id_delivers_one_result() {
     let harness = fake_harness("workers-duplicate-id");
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");

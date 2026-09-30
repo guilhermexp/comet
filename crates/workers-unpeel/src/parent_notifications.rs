@@ -263,6 +263,27 @@ pub fn worker_parent_links_at(path: &Path) -> Result<Vec<WorkerParentLink>, Stri
     parent_links_from_state(&state)
 }
 
+pub fn worker_has_parent_binding(session_id: &str) -> bool {
+    let Ok(state) = unpeel_core::app_state::load() else {
+        return false;
+    };
+    let Ok(bindings) = read_bindings(&state) else {
+        return false;
+    };
+    bindings.contains_key(session_id)
+}
+
+#[doc(hidden)]
+pub fn worker_has_parent_binding_at(path: &Path, session_id: &str) -> bool {
+    let Ok(state) = unpeel_core::app_state::load_for_edit_at(path) else {
+        return false;
+    };
+    let Ok(bindings) = read_bindings(&state) else {
+        return false;
+    };
+    bindings.contains_key(session_id)
+}
+
 fn write_binding(
     state: &mut Map<String, Value>,
     session_id: &str,

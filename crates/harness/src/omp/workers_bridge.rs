@@ -315,6 +315,7 @@ impl WorkersBridge {
                     request_timeout,
                 )
                 .await;
+            let is_success = outcome.is_ok();
             let outcome = Some(match outcome {
                 Ok(result) => {
                     let content = result.get("content").cloned().unwrap_or_else(|| json!([]));
@@ -338,7 +339,9 @@ impl WorkersBridge {
                 }
                 active
             };
-            if active && let Some(result) = outcome {
+            if (active || is_success)
+                && let Some(result) = outcome
+            {
                 let _ = resolved.send(result);
             }
         });

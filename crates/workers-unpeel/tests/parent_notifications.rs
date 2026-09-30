@@ -1,8 +1,8 @@
 use serde_json::json;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
-    WorkerCompletionEvidence, WorkerParentNotificationKind, WorkersSession,
-    WorkersSessionCapabilities, ack_worker_parent_notification_at,
+    WorkerCompletionEvidence, WorkerParentNotification, WorkerParentNotificationKind,
+    WorkersSession, WorkersSessionCapabilities, ack_worker_parent_notification_at,
     ack_worker_parent_notification_compacted_at, activate_worker_parent_task_at,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task_at, current_episode_completed_with_evidence_at,
@@ -951,5 +951,40 @@ fn current_episode_completed_rejects_working_even_when_quiescent() {
         )
         .unwrap(),
         "working must not complete on the ACK latch"
+    );
+}
+
+#[test]
+fn blocked_claude_worker_retains_permission_dialog_in_output_tail() {
+    let (_dir, path) = state_file();
+    register_worker_parent_at(&path, "worker-claude", "parent-chat-1", 900).unwrap();
+    let notification = WorkerParentNotification {
+        notification_id: "notif-1".into(),
+        event_id: "evt-1".into(),
+        superseded_event_ids: Vec::new(),
+        retained_latch_event_id: None,
+        worker_session_id: "worker-claude".into(),
+        parent_chat_id: "parent-chat-1".into(),
+        kind: WorkerParentNotificationKind::WaitingForInput,
+        task_episode: 1,
+        runtime_generation: 1,
+        occurred_at_unix_ms: 1000,
+        title: "Claude Worker".into(),
+        command: "claude".into(),
+        project_name: "my-project".into(),
+    };
+    let claude_dialog_viewport = "Claude needs your permission to run:\n\n  bash -c \"git diff\"\n\nAllow this action?\n  1. Yes\n  2. Always allow for this session\n  3. No\n";
+    let prompt = build_worker_parent_notification_prompt(&notification, claude_dialog_viewport);
+    assert!(
+        prompt.contains("Claude needs your permission to run"),
+        "permission prompt must be preserved in notification tail: {prompt}"
+    );
+    assert!(
+        prompt.contains("bash -c \"git diff\""),
+        "command must be preserved in notification tail: {prompt}"
+    );
+    assert!(
+        prompt.contains("Allow this action?"),
+        "prompt question must be preserved: {prompt}"
     );
 }

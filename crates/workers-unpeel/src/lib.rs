@@ -28,7 +28,8 @@ pub use checkout_activity::{
     ActivityKind, CheckoutActivityReservation, PendingRelease, reserve_chat_run, reserve_terminal,
 };
 pub use controller_mcp::{
-    CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,
+    ACCEPTED_WAIT_STATUSES, CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
+    clamp_wait_for_status_timeout, is_accepted_wait_status, validate_wait_status,
     worker_output_text,
 };
 #[doc(hidden)]
@@ -49,7 +50,8 @@ pub use parent_notifications::{
     pending_worker_parent_notifications, pending_worker_parent_notifications_at,
     pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
     prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
-    worker_parent_links, worker_parent_links_at,
+    worker_has_parent_binding, worker_has_parent_binding_at, worker_parent_links,
+    worker_parent_links_at,
 };
 pub use project_git::{AnchorCommit, ProjectGitStatus};
 pub use project_identity::{
