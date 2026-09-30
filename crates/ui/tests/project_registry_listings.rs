@@ -226,14 +226,22 @@ async fn chat_mcp_workers_controller_and_settings_list_the_same_projects() {
         )
         .await
         .unwrap();
-    let renamed = chat.call("list_projects", json!({})).await.unwrap();
-    let craft = renamed["projects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|project| project["id"] == "space-craft")
-        .cloned()
-        .unwrap();
+    // The Spaces watch republishes after the write lands, not in its reply.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let craft = loop {
+        let renamed = chat.call("list_projects", json!({})).await.unwrap();
+        let craft = renamed["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["id"] == "space-craft")
+            .cloned()
+            .unwrap();
+        if craft["name"] == "Craft (mini)" || tokio::time::Instant::now() >= deadline {
+            break craft;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!(craft["name"], "Craft (mini)");
     core.shutdown().await;
 }

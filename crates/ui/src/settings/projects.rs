@@ -33,9 +33,7 @@ use zeron_workers_unpeel::{
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::settings::project_catalog::{
-    self, ProjectEntry, SessionKind, SessionPanelTarget, SessionRow,
-};
+use crate::settings::project_catalog::{self, ProjectEntry, SessionPanelTarget, SessionRow};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::{Theme, ink};
@@ -446,6 +444,7 @@ pub struct ProjectsPage {
     selected: Option<String>,
     tab: DetailTab,
     selected_session: Option<String>,
+    sessions_page: usize,
     session_panel: Option<SessionPanel>,
     search: Entity<ComposerInput>,
     name_input: Entity<ComposerInput>,
@@ -526,6 +525,7 @@ impl ProjectsPage {
             selected: None,
             tab: DetailTab::General,
             selected_session: None,
+            sessions_page: 0,
             session_panel: None,
             search,
             name_input,
@@ -720,6 +720,7 @@ impl ProjectsPage {
         if self.selected_project.as_ref() != Some(&key) {
             self.close_session_panel(cx);
             self.selected_session = None;
+            self.sessions_page = 0;
         }
         self.selected_project = Some(key);
         self.selected = checkout;
@@ -1215,6 +1216,47 @@ fn icons_dir() -> Result<PathBuf, String> {
 
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Rows per page, as in Settings → Archived sessions.
+const SESSIONS_PAGE_SIZE: usize = 40;
+
+/// The bordered row action of Settings → Archived sessions ("Unarchive").
+fn session_row_action(
+    theme: &Theme,
+    id: (&'static str, usize),
+    icon: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(10.0))
+        .py(px(4.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(theme.border)
+        .text_size(crate::typography::ui_rems(12.0))
+        .text_color(theme.text_muted)
+        .opacity(0.8)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.surface_raised).text_color(theme.text))
+        .tab_index(0)
+        .role(gpui::Role::Button)
+        .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+        .on_click(on_click)
+        .child(
+            crate::icons::icon(icon)
+                .size(px(14.0))
+                .text_color(theme.text_muted),
+        )
+        .child(SharedString::from(label))
+        .into_any_element()
 }
 
 /// The Worker surface the shell opens from a chat (`add_worker_surface`):
@@ -1721,13 +1763,7 @@ impl ProjectsPage {
 
     fn session_rows(&self, entry: &ProjectEntry, cx: &gpui::App) -> Vec<SessionRow> {
         let state = self.state.read(cx);
-        project_catalog::session_rows(
-            entry,
-            &state.chats,
-            &state.sessions,
-            &self.workers,
-            &self.parent_links,
-        )
+        project_catalog::session_rows(entry, &state.chats, &self.workers, &self.parent_links)
     }
 
     /// Open `target` in the side panel beside the list. Nothing here launches
@@ -1781,46 +1817,135 @@ impl ProjectsPage {
         cx.notify();
     }
 
+    /// The Workers counterpart of Settings → Archived sessions: the same
+    /// header, rows and pagination, listing the project's Worker sessions;
+    /// "Open" shows one in the panel beside the list.
     fn render_sessions(
         &mut self,
         theme: &Theme,
         entry: &ProjectEntry,
-        now_ms: u64,
+        _now_ms: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rows = self.session_rows(entry, cx);
+        let count = rows.len();
+        let page = self
+            .sessions_page
+            .min(count.saturating_sub(1) / SESSIONS_PAGE_SIZE);
+        self.sessions_page = page;
         let items: Vec<AnyElement> = rows
             .iter()
-            .map(|row| self.render_session_row(theme, row, now_ms, cx))
+            .enumerate()
+            .skip(page * SESSIONS_PAGE_SIZE)
+            .take(SESSIONS_PAGE_SIZE)
+            .map(|(ix, row)| self.render_session_row(theme, ix, row, cx))
             .collect();
-        let empty = items.is_empty();
+        let body = if items.is_empty() {
+            div()
+                .mt(px(96.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .text_center()
+                .text_color(theme.text_muted)
+                .child(
+                    crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
+                        .size(px(28.0))
+                        .text_color(theme.text_muted.opacity(0.2)),
+                )
+                .child(
+                    div()
+                        .mt(px(12.0))
+                        .text_size(crate::typography::ui_rems(14.0))
+                        .child(SharedString::from("No Worker sessions")),
+                )
+                .child(
+                    div()
+                        .mt(px(4.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .child(SharedString::from(if entry.space.local {
+                            "Workers launched in this project or its worktrees show up here."
+                        } else {
+                            "Worker sessions live on the device that owns this project."
+                        })),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .mt(px(24.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(items)
+                .into_any_element()
+        };
+        let pagination = (count > SESSIONS_PAGE_SIZE).then(|| {
+            div()
+                .mt(px(16.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    widgets::ghost_action(theme)
+                        .id("project-sessions-previous")
+                        .role(gpui::Role::Button)
+                        .aria_label("Previous Worker sessions")
+                        .tab_index(0)
+                        .opacity(if page > 0 { 1.0 } else { 0.4 })
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.sessions_page = page.sessions_page.saturating_sub(1);
+                            cx.notify();
+                        }))
+                        .child("Previous"),
+                )
+                .child(format!(
+                    "{}–{} of {}",
+                    page * SESSIONS_PAGE_SIZE + 1,
+                    ((page + 1) * SESSIONS_PAGE_SIZE).min(count),
+                    count
+                ))
+                .child(
+                    widgets::ghost_action(theme)
+                        .id("project-sessions-next")
+                        .role(gpui::Role::Button)
+                        .aria_label("Next Worker sessions")
+                        .tab_index(0)
+                        .opacity(if (page + 1) * SESSIONS_PAGE_SIZE < count {
+                            1.0
+                        } else {
+                            0.4
+                        })
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.sessions_page += 1;
+                            cx.notify();
+                        }))
+                        .child("Next"),
+                )
+        });
         let list = div()
             .id(SharedString::from(format!(
                 "project-sessions-{}",
                 entry.space.id
             )))
             .flex_1()
-            .min_w(px(280.0))
+            .min_w(px(320.0))
             .h_full()
             .overflow_y_scroll()
             .child(
                 widgets::page_column()
                     .child(self.render_tabs(theme, cx))
+                    .child(widgets::page_header(
+                        theme,
+                        "Worker sessions",
+                        (count > 0).then_some(count),
+                    ))
+                    .child(widgets::page_subtitle(
+                        theme,
+                        "Every Worker of this project and its worktrees, live and archived.",
+                    ))
                     .child(self.render_messages(theme, None))
-                    .child(
-                        widgets::section_card(theme)
-                            .when(empty, |el| {
-                                el.child(widgets::card_row(theme, true).child(quiet(
-                                    theme,
-                                    if entry.space.local {
-                                        "No chats or Worker sessions in this project yet"
-                                    } else {
-                                        "No chats in this project yet"
-                                    },
-                                )))
-                            })
-                            .children(items),
-                    ),
+                    .child(body)
+                    .children(pagination),
             );
         div()
             .flex_1()
@@ -1835,63 +1960,102 @@ impl ProjectsPage {
             .into_any_element()
     }
 
+    /// Settings → Archived sessions row: status tile, medium title + time,
+    /// quiet meta line (checkout · runtime · status · launching chat), and
+    /// the row action on the right.
     fn render_session_row(
         &mut self,
         theme: &Theme,
+        ix: usize,
         row: &SessionRow,
-        now_ms: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (key, kind_label, detail, parent) = match &row.kind {
-            SessionKind::Chat { chat_id } => (chat_id.clone(), "Chat", None, None),
-            SessionKind::Worker {
-                session_id,
-                checkout,
-                parent_chat,
-                ..
-            } => (
-                session_id.clone(),
-                "Worker",
-                Some(checkout.clone()),
-                parent_chat.clone(),
-            ),
-        };
+        let worker = &row.kind;
+        let key = worker.session_id.clone();
         let selected = self.selected_session.as_deref() == Some(key.as_str());
         let target = project_catalog::activation(row);
+        let replay = matches!(target, SessionPanelTarget::WorkerReplay { .. });
         let title = row.title.clone();
-        let open_key = key.clone();
+        let time_ago: SharedString =
+            DateTime::<Utc>::from_timestamp_millis(row.last_activity_ms as i64)
+                .map(|at| crate::state::format_time_ago(at, Utc::now()))
+                .unwrap_or_default()
+                .into();
         let mut meta = vec![
-            kind_label.to_owned(),
+            worker.checkout.clone(),
             row.runtime.clone(),
             row.status.clone(),
         ];
-        if let Some(detail) = detail {
-            meta.push(detail);
+        if let Some((_, chat_title)) = &worker.parent_chat {
+            meta.push(format!("from {chat_title}"));
         }
-        meta.push(format_last_opened(row.last_activity_ms, now_ms));
-        widgets::card_row(theme, false)
-            .id(SharedString::from(format!("project-session-{key}")))
-            .cursor_pointer()
+        let parent = worker.parent_chat.clone();
+        let open_key = key.clone();
+        let open_title = title.clone();
+        div()
+            .id(("project-session-row", ix))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .rounded(px(8.0))
+            .px(px(12.0))
+            .py(px(8.0))
             .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
-            .hover(|s| s.bg(theme.glass_hover()))
-            .on_click(cx.listener(move |page, _, _, cx| {
-                page.open_session(open_key.clone(), target.clone(), title.clone(), cx)
-            }))
+            .hover(|s| s.bg(ink(0.03)))
             .child(
                 div()
+                    .flex_none()
+                    .size(px(32.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(if worker.archived {
+                            crate::icons::ARCHIVE_MINIMALISTIC
+                        } else {
+                            crate::icons::TERMINAL
+                        })
+                        .size(px(16.0))
+                        .text_color(theme.text_muted.opacity(0.6)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
-                    .min_w_0()
-                    .flex_1()
                     .child(
                         div()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(13.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(row.title.clone())),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(title)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(time_ago),
+                            ),
                     )
                     .child(
                         div()
+                            .mt(px(2.0))
+                            .min_w_0()
                             .truncate()
                             .text_size(crate::typography::ui_rems(11.0))
                             .text_color(theme.text_muted)
@@ -1899,14 +2063,14 @@ impl ProjectsPage {
                     ),
             )
             .when_some(parent, |el, (chat_id, chat_title)| {
-                let key = chat_id.clone();
-                el.child(action_button_with_id(
+                el.child(session_row_action(
                     theme,
-                    format!("session-parent-{key}"),
-                    &format!("From {chat_title}"),
+                    ("project-session-parent", ix),
+                    crate::icons::CHAT_ROUND_LINE,
+                    "Chat",
                     cx.listener(move |page, _, _, cx| {
                         page.open_session(
-                            key.clone(),
+                            chat_id.clone(),
                             SessionPanelTarget::Chat {
                                 chat_id: chat_id.clone(),
                             },
@@ -1916,6 +2080,15 @@ impl ProjectsPage {
                     }),
                 ))
             })
+            .child(session_row_action(
+                theme,
+                ("project-session-open", ix),
+                crate::icons::TERMINAL,
+                if replay { "Replay" } else { "Open" },
+                cx.listener(move |page, _, _, cx| {
+                    page.open_session(open_key.clone(), target.clone(), open_title.clone(), cx)
+                }),
+            ))
             .into_any_element()
     }
 

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use zeron_proto::{Chat, Device, Session, SessionStatus, Space};
+use zeron_proto::{Chat, Device, Space};
 use zeron_workers_unpeel::project_ledger::{self, CheckoutAvailability, ProjectGroup, ProjectRow};
 use zeron_workers_unpeel::space_registry::{SpaceRef, space_refs};
 use zeron_workers_unpeel::{WorkerParentLink, WorkersSession};
@@ -119,21 +119,17 @@ pub fn rename_project_params(space_id: &str, name: &str) -> serde_json::Value {
 
 // ── Sessions tab ────────────────────────────────────────────────────────────
 
+/// One Worker session of the project, from any of its checkouts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SessionKind {
-    Chat {
-        chat_id: String,
-    },
-    Worker {
-        session_id: String,
-        /// Branch, or "Principal" for the project's own folder.
-        checkout: String,
-        live: bool,
-        archived: bool,
-        checkout_available: bool,
-        /// `(chat id, title)` of the Orchestrator chat that launched it.
-        parent_chat: Option<(String, String)>,
-    },
+pub(crate) struct SessionKind {
+    pub session_id: String,
+    /// Branch, or "Principal" for the project's own folder.
+    pub checkout: String,
+    pub live: bool,
+    pub archived: bool,
+    pub checkout_available: bool,
+    /// `(chat id, title)` of the Orchestrator chat that launched it.
+    pub parent_chat: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,44 +154,16 @@ pub(crate) enum SessionPanelTarget {
 }
 
 pub(crate) fn activation(row: &SessionRow) -> SessionPanelTarget {
-    match &row.kind {
-        SessionKind::Chat { chat_id } => SessionPanelTarget::Chat {
-            chat_id: chat_id.clone(),
-        },
-        SessionKind::Worker {
-            session_id,
-            live,
-            archived,
-            checkout_available,
-            ..
-        } if *live && !*archived && *checkout_available => SessionPanelTarget::Worker {
-            session_id: session_id.clone(),
-        },
-        SessionKind::Worker { session_id, .. } => SessionPanelTarget::WorkerReplay {
-            session_id: session_id.clone(),
-        },
+    let worker = &row.kind;
+    if worker.live && !worker.archived && worker.checkout_available {
+        SessionPanelTarget::Worker {
+            session_id: worker.session_id.clone(),
+        }
+    } else {
+        SessionPanelTarget::WorkerReplay {
+            session_id: worker.session_id.clone(),
+        }
     }
-}
-
-fn chat_status(session: Option<&Session>, chat: &Chat) -> String {
-    if chat.archived {
-        return "Archived".into();
-    }
-    match session.map(|session| &session.status) {
-        Some(SessionStatus::Working) => "Working",
-        Some(SessionStatus::AwaitingInput) => "Awaiting input",
-        Some(SessionStatus::Errored) => "Errored",
-        Some(SessionStatus::Idle) | None => "Idle",
-    }
-    .into()
-}
-
-fn chat_runtime(chat: &Chat) -> String {
-    chat.config
-        .as_ref()
-        .and_then(|config| serde_json::to_value(config.harness).ok())
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "chat".into())
 }
 
 fn worker_runtime(session: &WorkersSession) -> String {
@@ -212,85 +180,67 @@ fn worker_runtime(session: &WorkersSession) -> String {
         .unwrap_or_else(|| "worker".into())
 }
 
-/// The Sessions tab of one project: its chats (active and archived) and, for
-/// a local project, every Worker session of any of its checkouts (live and
-/// archived), newest first. `workers` holds live and archived sessions.
+/// The Sessions tab of one project: every Worker session of any of its
+/// checkouts (principal and worktrees, live and archived), newest first —
+/// the Workers counterpart of Settings → Archived sessions. Worker sessions
+/// are device-local, so a project of another device has none here.
 pub(crate) fn session_rows(
     entry: &ProjectEntry,
     chats: &[Chat],
-    sessions: &[Session],
     workers: &[WorkersSession],
     links: &[WorkerParentLink],
 ) -> Vec<SessionRow> {
-    let mut rows: Vec<SessionRow> = chats
-        .iter()
-        .filter(|chat| chat.space_id.as_deref() == Some(entry.space.id.as_str()))
-        .map(|chat| SessionRow {
-            kind: SessionKind::Chat {
-                chat_id: chat.id.clone(),
-            },
-            title: chat.title.clone().unwrap_or_else(|| "Untitled chat".into()),
-            runtime: chat_runtime(chat),
-            status: chat_status(
-                sessions.iter().find(|session| session.chat_id == chat.id),
-                chat,
-            ),
-            last_activity_ms: chat
-                .last_message_at
-                .unwrap_or(chat.created_at)
-                .timestamp_millis()
-                .max(0) as u64,
-        })
-        .collect();
-    if entry.space.local {
-        for session in workers {
-            let Some(checkout) = entry.group.checkouts.iter().find(|row| {
-                row.project_id.as_deref() == Some(session.project_id.as_str())
-                    || row.checkout_id.as_deref() == Some(session.project_id.as_str())
-            }) else {
-                continue;
-            };
-            let principal = checkout.checkout_kind == Some(project_ledger::CheckoutKind::Primary);
-            let parent_chat = links
-                .iter()
-                .find(|link| link.worker_session_id == session.id)
-                .map(|link| {
-                    let title = chats
-                        .iter()
-                        .find(|chat| chat.id == link.parent_chat_id)
-                        .and_then(|chat| chat.title.clone())
-                        .unwrap_or_else(|| "Orchestrator chat".into());
-                    (link.parent_chat_id.clone(), title)
-                });
-            rows.push(SessionRow {
-                kind: SessionKind::Worker {
-                    session_id: session.id.clone(),
-                    checkout: if principal {
-                        "Principal".into()
-                    } else {
-                        checkout
-                            .display_branch()
-                            .unwrap_or(checkout.name.as_str())
-                            .to_owned()
-                    },
-                    live: session.is_live(),
-                    archived: session.archived,
-                    checkout_available: checkout.checkout_availability
-                        != Some(CheckoutAvailability::Missing),
-                    parent_chat,
-                },
-                title: session.title.clone(),
-                runtime: worker_runtime(session),
-                status: if session.archived {
-                    "Archived".into()
-                } else if session.is_live() {
-                    session.activity.clone()
-                } else {
-                    session.state.clone()
-                },
-                last_activity_ms: session.updated_at_unix_ms,
+    let mut rows = Vec::new();
+    if !entry.space.local {
+        return rows;
+    }
+    for session in workers {
+        let Some(checkout) = entry.group.checkouts.iter().find(|row| {
+            row.project_id.as_deref() == Some(session.project_id.as_str())
+                || row.checkout_id.as_deref() == Some(session.project_id.as_str())
+        }) else {
+            continue;
+        };
+        let principal = checkout.checkout_kind == Some(project_ledger::CheckoutKind::Primary);
+        let parent_chat = links
+            .iter()
+            .find(|link| link.worker_session_id == session.id)
+            .map(|link| {
+                let title = chats
+                    .iter()
+                    .find(|chat| chat.id == link.parent_chat_id)
+                    .and_then(|chat| chat.title.clone())
+                    .unwrap_or_else(|| "Orchestrator chat".into());
+                (link.parent_chat_id.clone(), title)
             });
-        }
+        rows.push(SessionRow {
+            kind: SessionKind {
+                session_id: session.id.clone(),
+                checkout: if principal {
+                    "Principal".into()
+                } else {
+                    checkout
+                        .display_branch()
+                        .unwrap_or(checkout.name.as_str())
+                        .to_owned()
+                },
+                live: session.is_live(),
+                archived: session.archived,
+                checkout_available: checkout.checkout_availability
+                    != Some(CheckoutAvailability::Missing),
+                parent_chat,
+            },
+            title: session.title.clone(),
+            runtime: worker_runtime(session),
+            status: if session.archived {
+                "Archived".into()
+            } else if session.is_live() {
+                session.activity.clone()
+            } else {
+                session.state.clone()
+            },
+            last_activity_ms: session.updated_at_unix_ms,
+        });
     }
     rows.sort_by(|left, right| {
         right
@@ -528,14 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn sessions_list_chats_and_every_checkout_worker_newest_first() {
+    fn sessions_list_every_checkout_worker_newest_first() {
         let (entries, _) = fixture();
         let jk = entries.iter().find(|e| e.space.id == "space-jk").unwrap();
-        let chats = vec![
-            chat("c-jk", "space-jk", 700, false),
-            chat("c-jk-old", "space-jk", 100, true),
-            chat("c-other", "space-orch", 999, false),
-        ];
+        let chats = vec![chat("c-jk", "space-jk", 700, false)];
         let workers = vec![
             worker("w-main", "comet-jk", "running", false, 800),
             worker("w-cron", "comet-sec-cron", "exited", true, 600),
@@ -547,37 +493,20 @@ mod tests {
             parent_chat_id: "c-jk".into(),
             registered_at_unix_ms: 1,
         }];
-        let rows = session_rows(jk, &chats, &[], &workers, &links);
+        let rows = session_rows(jk, &chats, &workers, &links);
         let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
         assert_eq!(
             titles,
-            vec![
-                "worker w-main",
-                "chat c-jk",
-                "worker w-cron",
-                "worker w-gone",
-                "chat c-jk-old"
-            ]
+            vec!["worker w-main", "worker w-cron", "worker w-gone"]
         );
-        let SessionKind::Worker {
-            checkout,
-            parent_chat,
-            ..
-        } = &rows[0].kind
-        else {
-            panic!("worker row");
-        };
-        assert_eq!(checkout, "Principal");
+        assert_eq!(rows[0].kind.checkout, "Principal");
         assert_eq!(
-            parent_chat,
-            &Some(("c-jk".to_owned(), "chat c-jk".to_owned()))
+            rows[0].kind.parent_chat,
+            Some(("c-jk".to_owned(), "chat c-jk".to_owned()))
         );
-        let SessionKind::Worker { checkout, .. } = &rows[2].kind else {
-            panic!("worker row");
-        };
-        assert_eq!(checkout, "sec/cron");
+        assert_eq!(rows[1].kind.checkout, "sec/cron");
+        assert_eq!(rows[1].status, "Archived");
         assert_eq!(rows[0].runtime, "omp");
-        assert_eq!(rows[4].status, "Archived");
     }
 
     #[test]
@@ -589,8 +518,7 @@ mod tests {
             worker("w-archived", "comet-sec-cron", "exited", true, 2),
             worker("w-missing", "comet-sec-old", "running", false, 1),
         ];
-        let chats = vec![chat("c-jk", "space-jk", 0, false)];
-        let rows = session_rows(jk, &chats, &[], &workers, &[]);
+        let rows = session_rows(jk, &[], &workers, &[]);
         let targets: Vec<SessionPanelTarget> = rows.iter().map(activation).collect();
         assert_eq!(
             targets,
@@ -605,24 +533,18 @@ mod tests {
                 SessionPanelTarget::WorkerReplay {
                     session_id: "w-missing".into()
                 },
-                SessionPanelTarget::Chat {
-                    chat_id: "c-jk".into()
-                },
             ]
         );
     }
 
     #[test]
-    fn a_remote_project_lists_only_its_chats() {
+    fn a_remote_project_has_no_worker_sessions_here() {
         let (entries, _) = fixture();
         let craft = entries
             .iter()
             .find(|e| e.space.id == "space-craft")
             .unwrap();
-        let chats = vec![chat("c-craft", "space-craft", 5, false)];
         let workers = vec![worker("w-main", "comet-jk", "running", false, 800)];
-        let rows = session_rows(craft, &chats, &[], &workers, &[]);
-        assert_eq!(rows.len(), 1);
-        assert!(matches!(rows[0].kind, SessionKind::Chat { .. }));
+        assert!(session_rows(craft, &[], &workers, &[]).is_empty());
     }
 }

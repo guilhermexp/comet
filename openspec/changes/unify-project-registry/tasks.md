@@ -66,3 +66,8 @@
   the Sessions tab needs native interaction. Evidence: `.tmp/verify/WT-20260929-…/run-1/item-*/`.
 - Deviation from D6 spelling: the tombstone kind is `retiredDevices` (the edge accepts only
   `^[a-z][a-zA-Z0-9]{0,31}$`).
+- Owner decision (2026-09-30, mid-run): the Sessions tab follows Settings → Archived sessions
+  and lists only the project's Worker sessions (principal and worktrees, live and archived);
+  chats are reachable from a Worker row's launching chat. `specs/projects-settings/spec.md`
+  ("A project lists its sessions") still describes chats + Workers and needs the Main's
+  update (outside this run's owned paths).

@@ -227,13 +227,17 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   remoto mostra só identidade/device e aceita renomear. O nome do projeto é o
   do Space (`Mutate renameSpace`); o nome de checkout só é editável em linha
   pendente. O "+" cria/reusa o Space local da pasta e registra o checkout
-  (`workers::registry::AppSpaceRegistry`). A aba Sessions lista chats (ativos
-  e arquivados) e, em projeto local, as sessões Worker de todos os checkouts
-  (vivas e arquivadas), mais recente primeiro (`project_catalog::session_rows`);
-  ativar abre um painel ao lado da lista, dentro da página: Worker usa o mesmo
-  `WorkersTerminal` do chat (parado/arquivado vira replay read-only, nunca
-  restart) e chat usa `Transcript::for_doc` read-only sobre o doc do chat, com
-  "Go to chat" (`ProjectsPageEvent::OpenChat` → `Shell::open_chat`). O
+  (`workers::registry::AppSpaceRegistry`). A aba Sessions é o gêmeo Workers
+  de Settings → Archived sessions (decisão do dono, 2026-09-30): mesmo header
+  com contagem, linhas com tile de 32px, título + tempo, meta
+  (checkout · runtime · status · chat de origem), ação à direita e paginação
+  de 40, listando só as sessões Worker de todos os checkouts do projeto
+  (vivas e arquivadas, `project_catalog::session_rows`); projeto remoto não
+  tem nenhuma aqui. "Open"/"Replay" abre um painel ao lado da lista, dentro
+  da página, com o mesmo `WorkersTerminal` do chat (parado/arquivado vira
+  replay read-only, nunca restart); "Chat" abre o chat de origem em
+  `Transcript::for_doc` read-only com "Go to chat"
+  (`ProjectsPageEvent::OpenChat` → `Shell::open_chat`). O
   "Forget" do Danger Zone apaga metadado e NAO toca em sessão. A lista e o
   detalhe rolam independentemente; rows da lista não encolhem.
 - **O verbo de remoção pergunta `is_group`, não `parent_project_id`.** Menu
