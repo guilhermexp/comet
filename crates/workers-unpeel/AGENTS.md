@@ -287,7 +287,10 @@ Settings), apps/zeron (host-mode dispatch at startup).
   exige `unpeel_core::resume::can_resume` do comando — é o mesmo teste que
   exclui sessões de terminal, cujo shell não tem receita de resume, e é o que
   impede jogar fora uma conversa irrecuperável. Hibernar `omp`/`prime-agent` só
-  ficou seguro depois da receita de resume da família pi, acima.
+  ficou seguro depois da receita de resume da família pi, acima. Worker em
+  `activity=blocked` (prompt de pergunta) continua fora da lista: a política
+  exige `idle` + `idle_confirmed_by_hook`, e atenção não é ocioso — hibernar
+  quem espera resposta perderia a pergunta. A política não muda.
 - **Hibernar exige evidência positiva; ausência de sinal protege.** `idle` no
   wire não basta e `can_resume` não basta. `hibernation_candidates` exige
   também `idle_confirmed_by_hook` e `resumable_conversation`, os dois
@@ -390,11 +393,46 @@ Settings), apps/zeron (host-mode dispatch at startup).
   não é exata sem um histórico de resize. O formatter continua sanitizando
   campos, controles e cercas de Markdown, mas recebe o texto já interpretado.
   Não é screenshot, OCR nem transcript estruturado do provider.
+- **Pergunta do Worker acorda o Orquestrador pelo mesmo canal de conclusão.**
+  `PermissionRequest` (incluindo `AskUserQuestion`) toma `HookState::Attention`
+  — a supressão latch-only saiu, porque no Worker lançado por Orquestrador o
+  sinal não é duplicado, é o único. Atenção de prompt explícito sobrevive a
+  crescimento de sinal (cursor/spinner/repaint) e termina em início de
+  turno, marker `controller-input-activity.json`, fim de turno, ou o teto
+  `HOOK_IDLE_TIMEOUT` — crescimento de tela não rearma esse prazo. Evento
+  latch-only não carimba `last_hook_at`. A extensão da família pi emite
+  `PermissionRequest` em `ui_prompt_start` e `UserPromptSubmit` em
+  `ui_prompt_end` (nunca `Stop` no fim do prompt).
+  `derive_activity` projeta isso como `blocked` sem `menu_prompt_active`.
+  `parent_notifications` emite `WaitingForInput` uma vez por episódio de
+  bloqueio, chaveado pela sequência do último `Start`/`UserPromptSubmit`,
+  não por cada `PermissionRequest`; `unread` no snapshot é overlay das
+  notificações pendentes, **substitui** o arquivo nativo `activity-state.json`
+  que o Comet nunca escreve. A montagem do prompt usa `worker_output_text` (item acima);
+  `safe_output_block`
+  descarta o `\r` final antes de escolher o segmento, senão uma linha
+  terminada em retorno de carro virava `none`. `omp` declara a capability
+  `transcript` e o adaptador em `runtimes/omp/adapter/transcript.rs` resolve
+  só o diretório gerenciado da sessão (stem exato, sem walk global nem
+  `starts_with` lexical); `read_transcript` do controller MCP passa a
+  resolver manifesto `omp`.
+- **`\r` no output tail é retorno de carro, não "mais um controle".** Um TUI
+  repinta a status line dezenas de vezes e o journal guarda cada repaint;
+  `clean_output` tira o ANSI mas mantém o `\r`, então mapeá-lo para espaço junto
+  com os outros concatenava todas as versões numa linha só. Fica o último paint,
+  que é o que um terminal mostraria. Uma linha **terminada** em `\r` não pode
+  reduzir ao segmento vazio depois do último retorno — o trim do CR final vem
+  antes do `rsplit`. Simplificação conhecida: o último segmento vence inteiro,
+  e um repaint mais curto que o anterior deixaria cauda visível num terminal de
+  verdade — status line redesenha do mesmo tamanho, então não paga um emulador
+  aqui.
 - **O prompt de notificação é markdown, e a quebra de linha do output tail é
   conteúdo.** `build_worker_parent_notification_prompt` monta título + bullets +
-  bloco de código cercado; `safe_prompt_field` continua achatando os campos de
-  uma linha (e troca crase por apóstrofo, pois eles entram em `code` inline),
-  mas o tail passa por `safe_output_block`, que **preserva `\n`**. Achatar o
+  bloco de código cercado; `safe_prompt_field` achata campos de uma linha
+  (crase vira apóstrofo; aspa dupla no título vira apóstrofo porque o header
+  é um span entre aspas) e o project fica em `code` inline. O tail passa por
+  `safe_output_block`, que **preserva `\n`**, troca U+2028/U+2029 por quebra
+  visível e remove formato invisível (Cf, bidi, tags, zero-width). Achatar o
   tail junto com os campos era o que entregava uma parede de texto de milhares
   de caracteres numa linha só — ilegível no overlay do chat e sem estrutura
   para o agente. A cerca vem de `code_fence_for`: crases dentro do tail
@@ -618,7 +656,7 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 | `tests/space_migration.rs` — migração única: principal não registrado, Space existente, segunda rodada no-op, registro sem evidência, sessões preservadas | integration | `cargo test -p zeron-workers-unpeel --test space_migration` |
 | `tests/worker_initial_briefing.rs` (13) — OMP/Claude/Pi/Codex native delivery, literal input, spawn and ACK failures, no replay, existing interactive guards, managed Codex wrapper privacy and upstream launcher composition | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
-| `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
+| `tests/parent_notifications.rs` (37) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (ownership, external/legacy checkouts, dirty removal and hook bypass), `tests/local_actions.rs`, `tests/session_actions.rs`, `tests/local_bootstrap.rs`, `tests/dev_demo_fixture.rs` — client actions over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |

@@ -48,11 +48,11 @@ pub use parent_notifications::{
     cancel_worker_parent_task, cancel_worker_parent_task_at, carry_worker_parent_binding,
     carry_worker_parent_binding_at, confirm_worker_parent_task_submission,
     current_episode_completed, current_episode_completed_with_evidence_at,
-    pending_worker_parent_notifications, pending_worker_parent_notifications_at,
-    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
-    prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
-    worker_has_parent_binding, worker_has_parent_binding_at, worker_parent_links,
-    worker_parent_links_at,
+    overlay_unread_from_parent_notifications, pending_worker_parent_notifications,
+    pending_worker_parent_notifications_at, pending_worker_parent_notifications_with_evidence_at,
+    prepare_worker_parent_task, prepare_worker_parent_task_at, register_worker_parent,
+    register_worker_parent_at, worker_has_parent_binding, worker_has_parent_binding_at,
+    worker_parent_links, worker_parent_links_at,
 };
 pub use project_git::{AnchorCommit, ProjectGitStatus};
 pub use project_identity::{
@@ -4636,6 +4636,21 @@ mod runtime_capability_tests {
         assert!(sessions[2].capabilities.notify_when_done);
         assert!(sessions[3].capabilities.notify_when_done);
         assert!(sessions[4].capabilities.notify_when_done);
+    }
+
+    #[test]
+    fn pi_family_declares_reliable_attention() {
+        let catalog = unpeel_core::runtime_catalog::builtin_runtime_catalog();
+        for slug in ["omp", "pi", "prime-agent"] {
+            let runtime = catalog
+                .by_slug(slug)
+                .or_else(|| catalog.by_legacy_slug(slug))
+                .unwrap_or_else(|| panic!("{slug} must be in the pinned catalog"));
+            assert!(
+                runtime.lifecycle.attention_reliable,
+                "{slug} ships the pi-family prompt listener and must declare attention_reliable"
+            );
+        }
     }
 }
 

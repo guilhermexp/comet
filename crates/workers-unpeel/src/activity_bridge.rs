@@ -100,7 +100,7 @@ impl ActivityBridge {
             .collect::<HashSet<_>>();
         engine.retain_sessions(&live_ids);
         let now = SystemTime::now();
-        for session in sessions {
+        for session in sessions.iter_mut() {
             let Some(manifest) = unpeel_core::session_host::load_manifest(&session.id) else {
                 continue;
             };
@@ -146,6 +146,10 @@ impl ActivityBridge {
                     merge_derived_activity(&session.activity, session.unread, derived).to_owned();
             }
         }
+        // Pending parent notifications own `unread`. The native activity-state
+        // file is never written here, so overlay replaces rather than ORs.
+        let pending = crate::pending_worker_parent_notifications(sessions).unwrap_or_default();
+        crate::overlay_unread_from_parent_notifications(sessions, &pending);
     }
 
     pub(crate) fn clear_attention(&self, session_id: &str) {
@@ -323,6 +327,9 @@ fn derive_activity(
         input.runtime_launched_at,
         input.runtime_launch_generation,
     );
+    if let Some(at) = read_controller_input_at(input.session_dir) {
+        engine.note_controller_input(input.session_id, at);
+    }
     engine.note_output_and_sweep(
         input.session_id,
         input.activity_signal,
@@ -342,6 +349,15 @@ fn derive_activity(
         HookState::Attention => "blocked",
         HookState::Idle => "idle",
     })
+}
+
+fn read_controller_input_at(session_dir: &Path) -> Option<SystemTime> {
+    let raw = std::fs::read_to_string(session_dir.join("controller-input-activity.json")).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    parsed
+        .get("at")
+        .and_then(|value| value.as_u64())
+        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms))
 }
 
 fn merge_derived_activity<'a>(wire_activity: &'a str, unread: bool, derived: &'a str) -> &'a str {
@@ -1537,6 +1553,31 @@ mod tests {
         let mut activity = input("s1", "pi", directory.path(), 1);
         activity.menu_prompt_active = true;
         assert_eq!(derive_activity(&mut engine, activity, now), Some("blocked"));
+    }
+
+    #[test]
+    fn pi_family_permission_request_blocks_without_menu_prompt() {
+        for command in ["pi", "omp", "prime-agent"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut engine = ActivityEngine::default();
+            let now = SystemTime::now();
+            assert_eq!(
+                derive_activity(
+                    &mut engine,
+                    input("session", command, directory.path(), 1),
+                    now,
+                ),
+                Some("idle"),
+            );
+            engine.apply_hook_event("session", "PermissionRequest", Some("AskUserQuestion"), now);
+            let mut activity = input("session", command, directory.path(), 2);
+            activity.menu_prompt_active = false;
+            assert_eq!(
+                derive_activity(&mut engine, activity, now),
+                Some("blocked"),
+                "{command} must report blocked from PermissionRequest without a viewport menu"
+            );
+        }
     }
 
     #[test]

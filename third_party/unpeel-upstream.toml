@@ -88,3 +88,13 @@ base_revision_resolves_upstream = false
 # writers no longer evict registrations by age at sixteen entries. Downstream
 # proofs live in zeron-workers-unpeel activity_bridge tests. Local patch only;
 # local_modifications_count remains the unrecomputed historical value above.
+
+# 2026-09-20 (merged 2026-09-30) — worker question channel: PermissionRequest/AskUserQuestion takes
+# attention in vendored activity.rs; pi-family lifecycle-extension emits
+# ui_prompt_start/end; omp declares transcript + adapter under pi-sessions.
+# Same-commit local form; no upstream patch (history rewritten, no common ancestor).
+
+# 2026-09-20 (merged 2026-09-30) — onda 2 do canal de pergunta: latch de atenção expira no teto
+# HOOK_IDLE_TIMEOUT sem rearmar por crescimento; last_hook_at não avança em
+# latch-only; transcript omp casa stem exato no diretório da sessão (sem walk
+# global nem starts_with lexical). Same-commit local form; no upstream patch.

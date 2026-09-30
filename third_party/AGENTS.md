@@ -85,7 +85,13 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   não tem hook de início para revogar a confirmação no turno seguinte. A limpeza de
   atenção pelo app (`clear_attention_unconfirmed`, patch local) leva a `Idle`
   sem gravar `stopped_at`, porque um clique não é o runtime dizendo que o
-  turno acabou. `ResumeAdapter::embedded_conversation_id` (patch local, um
+  turno acabou. `PermissionRequest` (incluindo prompt de pergunta ao usuário)
+  toma atenção: a regra latch-only para `AskUserQuestion` saiu. Atenção de
+  prompt explícito não é limpa por crescimento de sinal de tela; encerra em
+  Start/`UserPromptSubmit`, marker de input do controller, Stop, ou o teto
+  `HOOK_IDLE_TIMEOUT` (crescimento não rearma). Evento latch-only não avança
+  `last_hook_at`.
+  `ResumeAdapter::embedded_conversation_id` (patch local, um
   callback por runtime) expõe o id de conversa que o comando já fixa, para a
   sonda de retomada do Comet não depender de comparar receitas.
 - **Atividade e hibernação automática se encontram no Session Host.**
@@ -130,12 +136,17 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - **A extensão de lifecycle da família pi serve os três CLIs.** `pi`, `omp` e
   `prime-agent` recebem `--extension
   <unpeel_home>/hooks/pi-family-lifecycle-extension.js` e emitem `Start`/`Stop`
-  com id de conversa e transcript do provider. O append idempotente é
+  em `agent_start`/`agent_end` e `PermissionRequest`/`UserPromptSubmit` em
+  `ui_prompt_start`/`ui_prompt_end` (prompt bloqueante, com `tool_name`), com
+  id de conversa e transcript do provider. `attention_reliable = true` no
+  `runtime.toml` dos três descreve esse transporte. O append idempotente é
   `_shared/pi-family/adapter/setup.rs::with_lifecycle_extension`; cada runtime
   mantém o próprio gate de alias, porque `pi` tem resume/context próprios e não
   inclui o `mod.rs` compartilhado. `runtime.toml` com `source = "hooks"` exige
   a capability `lifecycle_hooks` (e `completion_reliable` exige
-  `notify_when_done`) — o catálogo valida os dois pares.
+  `notify_when_done`) — o catálogo valida os dois pares. `omp` também declara
+  `transcript`; o adaptador lê JSONL só no diretório gerenciado da sessão
+  sob `<unpeel_home>/pi-sessions` (stem exato, sem walk global).
 - **Asset gerenciado cria o diretório dele.** `hook_assets::write_file_atomic`
   faz `create_dir_all` do pai: um root apagado (reinstalação limpa de CLI,
   poda do root legado) fazia a instalação inteira morrer com `No such file or

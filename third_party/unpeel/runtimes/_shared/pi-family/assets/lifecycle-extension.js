@@ -16,11 +16,22 @@ function providerSessionMetadata(ctx) {
   };
 }
 
-function notify(hookEventName, ctx) {
+function promptToolName(event) {
+  const kind = typeof event?.kind === "string" ? event.kind.trim() : "";
+  if (!kind || kind === "custom") {
+    return "AskUserQuestion";
+  }
+  return kind;
+}
+
+function notify(hookEventName, ctx, toolName) {
   return new Promise((resolve) => {
     const payload = {
       hook_event_name: hookEventName,
       ...providerSessionMetadata(ctx),
+      ...(typeof toolName === "string" && toolName
+        ? { tool_name: toolName }
+        : {}),
     };
     const child = spawn(
       "bash",
@@ -38,5 +49,11 @@ export default function registerUnpeelLifecycle(extension) {
   });
   extension.on("agent_end", async (_event, ctx) => {
     await notify("Stop", ctx);
+  });
+  extension.on("ui_prompt_start", async (event, ctx) => {
+    await notify("PermissionRequest", ctx, promptToolName(event));
+  });
+  extension.on("ui_prompt_end", async (_event, ctx) => {
+    await notify("UserPromptSubmit", ctx);
   });
 }

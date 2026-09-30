@@ -383,6 +383,25 @@ fn worker_output_preserves_answer_when_repaints_depend_on_terminal_width() {
 }
 
 #[test]
+fn parent_notification_assembly_consumes_semantic_viewport_when_present() {
+    let raw = "stale paint\rAsk the user a question\r";
+    let tail =
+        controller_mcp_choose_semantic_output(raw, Some(vec!["Ask the user a question".into()]), 4 * 1024);
+    assert_eq!(tail, "Ask the user a question");
+    assert!(!tail.contains("stale paint"));
+}
+
+#[test]
+fn parent_notification_assembly_falls_back_to_raw_when_semantic_is_empty() {
+    let raw = "Ask the user a question\r";
+    let tail = controller_mcp_choose_semantic_output(raw, None, 4 * 1024);
+    assert!(
+        tail.contains("Ask the user a question"),
+        "raw fallback must keep the last paint when the grid is empty: {tail:?}"
+    );
+}
+
+#[test]
 fn known_startup_prompts_are_dismissed_before_submitting_the_brief() {
     assert_eq!(
         controller_mcp_startup_prompt_response(

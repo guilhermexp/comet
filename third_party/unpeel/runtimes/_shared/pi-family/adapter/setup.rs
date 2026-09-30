@@ -18,9 +18,9 @@ pub(crate) fn lifecycle_extension_path() -> PathBuf {
 /// Append `--extension <lifecycle extension>` exactly once.
 ///
 /// Every pi-family CLI (`pi`, `omp`, `prime-agent`) takes `-e/--extension` and
-/// runs the same extension API (`agent_start`/`agent_end`), so the Start/Stop
-/// transport is identical for all three; only the alias gate differs, and that
-/// stays with each runtime's own adapter.
+/// runs the same extension API (`agent_start`/`agent_end`/`ui_prompt_*`), so
+/// the Start/Stop/Attention transport is identical for all three; only the
+/// alias gate differs, and that stays with each runtime's own adapter.
 pub(crate) fn with_lifecycle_extension(command: &str) -> String {
     let trimmed = command.trim();
     let path = lifecycle_extension_path();
@@ -115,5 +115,60 @@ await handlers.get("agent_end")({{}}, context);
                 "provider_transcript_path": "/trusted/omp-provider-1.jsonl"
             })
         );
+    }
+
+    #[test]
+    fn ui_prompt_start_posts_permission_request_without_stop() {
+        let directory = tempfile::tempdir().expect("temporary extension harness");
+        let capture_path = directory.path().join("payload.json");
+        let notify_path = directory.path().join("notify.sh");
+        std::fs::write(
+            &notify_path,
+            "#!/bin/bash\nprintf '%s' \"$1\" > \"$CAPTURE_PATH\"\n",
+        )
+        .expect("write capture notifier");
+        let extension_path = directory.path().join("lifecycle-extension.mjs");
+        std::fs::write(
+            &extension_path,
+            render_lifecycle_extension(&notify_path).expect("render lifecycle extension"),
+        )
+        .expect("write lifecycle extension");
+        let harness_path = directory.path().join("harness.mjs");
+        std::fs::write(
+            &harness_path,
+            format!(
+                r#"import register from {};
+const handlers = new Map();
+register({{ on(name, handler) {{ handlers.set(name, handler); }} }});
+const context = {{ sessionManager: {{
+  getSessionId() {{ return "omp-provider-1"; }},
+  getSessionFile() {{ return "/trusted/omp-provider-1.jsonl"; }},
+}} }};
+await handlers.get("ui_prompt_start")({{ kind: "custom", reason: "ui_prompt" }}, context);
+"#,
+                serde_json::to_string(&extension_path.to_string_lossy()).unwrap()
+            ),
+        )
+        .expect("write extension harness");
+
+        let output = Command::new("bun")
+            .arg("run")
+            .arg(&harness_path)
+            .env("CAPTURE_PATH", &capture_path)
+            .output()
+            .expect("run lifecycle extension with bun");
+        assert!(
+            output.status.success(),
+            "bun failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(capture_path).expect("captured hook payload"),
+        )
+        .expect("valid captured hook JSON");
+        assert_eq!(payload["hook_event_name"], "PermissionRequest");
+        assert_eq!(payload["tool_name"], "AskUserQuestion");
+        assert_ne!(payload["hook_event_name"], "Stop");
+        assert_eq!(payload["session_id"], "omp-provider-1");
     }
 }

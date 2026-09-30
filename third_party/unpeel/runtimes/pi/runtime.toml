@@ -37,7 +37,7 @@ source = "hooks"
 authority = "partial"
 fallback = "none"
 completion_reliable = true
-attention_reliable = false
+attention_reliable = true
 
 [[usage.stores]]
 root = ".pi/agent/sessions"
