@@ -1574,6 +1574,18 @@ fn wait_for_status(
     let session_id = required_string(arguments, "session_id")?;
     let wanted = required_string(arguments, "status")?.to_ascii_lowercase();
     validate_wait_status(&wanted)?;
+    let session = client
+        .bootstrap()
+        .map_err(|error| error.to_string())?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))?;
+    if wanted.eq_ignore_ascii_case("completed") && !crate::worker_has_parent_binding(&session.id) {
+        return Err(format!(
+            "Completion is not tracked for worker '{session_id}' (no parent chat binding)."
+        ));
+    }
     let timeout =
         clamp_wait_for_status_timeout(arguments.get("timeout_seconds").and_then(Value::as_u64));
     wait_until_matching(

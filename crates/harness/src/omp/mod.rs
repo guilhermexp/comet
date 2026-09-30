@@ -1093,8 +1093,9 @@ async fn run_session(
                     continue;
                 }
                 answered.insert(tool_id.clone());
-                let result = if was_interrupted_by_notice {
-                    json!({
+                let result = match outcome {
+                    Some(real_result) => real_result,
+                    None if was_interrupted_by_notice => json!({
                         "type": "host_tool_result",
                         "id": tool_id,
                         "result": {
@@ -1106,16 +1107,13 @@ async fn run_session(
                             "interrupted_by_notification": true
                         },
                         "isError": false
-                    })
-                } else {
-                    outcome.unwrap_or_else(|| {
-                        json!({
-                            "type": "host_tool_result",
-                            "id": tool_id,
-                            "result": { "content": [{ "type": "text", "text": "OMP host tool was cancelled" }] },
-                            "isError": true
-                        })
-                    })
+                    }),
+                    None => json!({
+                        "type": "host_tool_result",
+                        "id": tool_id,
+                        "result": { "content": [{ "type": "text", "text": "OMP host tool was cancelled" }] },
+                        "isError": true
+                    }),
                 };
                 if let Err(error) = process.send_control(result) {
                     let message = protocol::sanitize_diagnostic(&error.to_string());

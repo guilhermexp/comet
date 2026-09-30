@@ -1611,6 +1611,79 @@ fn wait_for_status_rejects_unknown_status_immediately() {
 }
 
 #[test]
+fn wait_for_status_completed_on_untracked_worker_is_rejected_immediately() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let path = home.path().join("app-state.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let session_dir = home.path().join("app-sessions").join("worker-untracked");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "session": {
+                "id": "worker-untracked",
+                "project_id": "project-1",
+                "label": "Worker Untracked",
+                "command": "claude",
+                "created_at": 1000
+            },
+            "cwd": "/tmp",
+            "state": "running",
+            "pid": 12345,
+            "exit_code": null,
+            "has_been_written_to": true,
+            "updated_at": 1000
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _guard = UnpeelHomeGuard::set(home.path());
+
+    let started = std::time::Instant::now();
+    let response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": {
+                "action": "wait_for_status",
+                "session_id": "worker-untracked",
+                "status": "completed",
+                "timeout_seconds": 60
+            }
+        }
+    }))
+    .expect("tools/call responds");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "untracked worker completed wait must return immediately without waiting, took {elapsed:?}"
+    );
+    assert_eq!(response["result"]["isError"], true);
+    let error_text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text in content");
+    assert!(
+        error_text.contains("Completion is not tracked for worker 'worker-untracked'")
+            || error_text.contains("not tracked"),
+        "error must state completion is not tracked: {error_text}"
+    );
+}
+
+#[test]
 fn wait_for_status_schema_and_help_document_completed_and_lifecycle_targets() {
     let tools = controller_mcp_handle_request(json!({
         "jsonrpc": "2.0",

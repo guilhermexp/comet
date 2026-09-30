@@ -38,7 +38,14 @@ while IFS= read -r line; do
           emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"held\"}],\"isError\":false}}"
           ;;
         *'"action":"hang"'*) sleep 60 ;;
-        *'"action":"wait_for_status"'*) sleep 60 ;;
+        *'"action":"wait_for_status"'*)
+          case "$line" in
+            *'"session_id":"race-worker"'*)
+              emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"matched\\\":true,\\\"worker\\\":{\\\"id\\\":\\\"race-worker\\\",\\\"state\\\":\\\"running\\\",\\\"activity\\\":\\\"idle\\\"}}\"}],\"isError\":false}}"
+              ;;
+            *) sleep 60 ;;
+          esac
+          ;;
         *'"action":"oversized"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"' "$(rid "$line")"
           dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\000' x
