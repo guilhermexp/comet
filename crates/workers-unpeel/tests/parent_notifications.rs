@@ -5,9 +5,10 @@ use zeron_workers_unpeel::{
     WorkersSession, WorkersSessionCapabilities, ack_worker_parent_notification_at,
     ack_worker_parent_notification_compacted_at, activate_worker_parent_task_at,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
-    cancel_worker_parent_task_at, current_episode_completed_with_evidence_at,
-    pending_worker_parent_notifications_at, pending_worker_parent_notifications_with_evidence_at,
-    prepare_worker_parent_task_at, register_worker_parent_at,
+    cancel_worker_parent_task_at, carry_worker_parent_binding_at,
+    current_episode_completed_with_evidence_at, pending_worker_parent_notifications_at,
+    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task_at,
+    register_worker_parent_at, worker_has_parent_binding_at, worker_parent_links_at,
 };
 
 fn session(id: &str, generation: u64, activity: &str, state: &str) -> WorkersSession {
@@ -539,6 +540,47 @@ fn malformed_binding_state_fails_closed() {
     assert!(
         pending_worker_parent_notifications_at(&path, &[], &dir.path().join("sessions")).is_err()
     );
+    assert!(worker_has_parent_binding_at(&path, "worker-1").is_err());
+}
+
+#[test]
+fn a_restarted_worker_inherits_its_parent_binding_with_a_fresh_episode_history() {
+    let (_dir, path) = state_file();
+    register_worker_parent_at(&path, "worker-old", "chat-parent", 1_000).unwrap();
+    begin_worker_parent_task_at(&path, "worker-old", 1_100).unwrap();
+
+    assert!(carry_worker_parent_binding_at(&path, "worker-old", "worker-new", 2_000).unwrap());
+    assert!(worker_has_parent_binding_at(&path, "worker-new").unwrap());
+    let link = worker_parent_links_at(&path)
+        .unwrap()
+        .into_iter()
+        .find(|link| link.worker_session_id == "worker-new")
+        .unwrap();
+    assert_eq!(link.parent_chat_id, "chat-parent");
+    assert_eq!(link.registered_at_unix_ms, 2_000);
+    // Episodes restart at 1 on the replacement: the old history stays behind.
+    assert_eq!(
+        begin_worker_parent_task_at(&path, "worker-new", 2_100).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn carrying_a_binding_leaves_unbound_sources_and_bound_targets_alone() {
+    let (_dir, path) = state_file();
+    assert!(!carry_worker_parent_binding_at(&path, "manual-worker", "worker-new", 2_000).unwrap());
+    assert!(!worker_has_parent_binding_at(&path, "worker-new").unwrap());
+
+    register_worker_parent_at(&path, "worker-old", "chat-a", 1_000).unwrap();
+    register_worker_parent_at(&path, "worker-new", "chat-b", 1_500).unwrap();
+    assert!(!carry_worker_parent_binding_at(&path, "worker-old", "worker-new", 2_000).unwrap());
+    let link = worker_parent_links_at(&path)
+        .unwrap()
+        .into_iter()
+        .find(|link| link.worker_session_id == "worker-new")
+        .unwrap();
+    assert_eq!(link.parent_chat_id, "chat-b");
+    assert!(!carry_worker_parent_binding_at(&path, "worker-old", "worker-old", 2_000).unwrap());
 }
 
 /// O andaime do prompt e markdown, e markdown conta espaco.

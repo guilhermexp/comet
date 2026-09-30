@@ -1128,6 +1128,15 @@ fn dispatch_action(
             // with is gone: report the one it must address from now on.
             let session_id = replacement_session_id(&before, &worker_ids(client)?)
                 .unwrap_or_else(|| session.id.clone());
+            // Without the parent binding the replacement refuses tracked
+            // send_text and can never report completion or notify its parent.
+            crate::carry_worker_parent_binding(&session.id, &session_id, unix_time_ms())
+                .map_err(|error| {
+                    format!(
+                        "Worker {session_id} was restarted, but its parent chat binding could not be carried over from {}: {error}",
+                        session.id
+                    )
+                })?;
             Ok(json!({
                 "session_id": session_id,
                 "restarted": true,
@@ -1666,7 +1675,10 @@ fn wait_for_status(
         .into_iter()
         .find(|session| session.id == session_id)
         .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))?;
-    if wanted.eq_ignore_ascii_case("completed") && !crate::worker_has_parent_binding(&session.id) {
+    // Without a binding no episode can ever complete: `completed` fails now
+    // and lifecycle waits skip the per-tick app-state read.
+    let tracked = crate::worker_has_parent_binding(&session.id)?;
+    if wanted.eq_ignore_ascii_case("completed") && !tracked {
         return Err(format!(
             "Completion is not tracked for worker '{session_id}' (no parent chat binding)."
         ));
@@ -1686,7 +1698,7 @@ fn wait_for_status(
                 .find(|session| session.id == session_id)
                 .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))
         },
-        |session| crate::current_episode_completed(session),
+        |session| tracked && crate::current_episode_completed(session),
     )
 }
 

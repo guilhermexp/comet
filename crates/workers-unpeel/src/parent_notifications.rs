@@ -263,25 +263,17 @@ pub fn worker_parent_links_at(path: &Path) -> Result<Vec<WorkerParentLink>, Stri
     parent_links_from_state(&state)
 }
 
-pub fn worker_has_parent_binding(session_id: &str) -> bool {
-    let Ok(state) = unpeel_core::app_state::load() else {
-        return false;
-    };
-    let Ok(bindings) = read_bindings(&state) else {
-        return false;
-    };
-    bindings.contains_key(session_id)
+/// An unreadable app state is an error, not "no binding": callers must not
+/// report a read failure as an untracked worker.
+pub fn worker_has_parent_binding(session_id: &str) -> Result<bool, String> {
+    let state = unpeel_core::app_state::load()?;
+    Ok(read_bindings(&state)?.contains_key(session_id))
 }
 
 #[doc(hidden)]
-pub fn worker_has_parent_binding_at(path: &Path, session_id: &str) -> bool {
-    let Ok(state) = unpeel_core::app_state::load_for_edit_at(path) else {
-        return false;
-    };
-    let Ok(bindings) = read_bindings(&state) else {
-        return false;
-    };
-    bindings.contains_key(session_id)
+pub fn worker_has_parent_binding_at(path: &Path, session_id: &str) -> Result<bool, String> {
+    let state = unpeel_core::app_state::load_for_edit_at(path)?;
+    Ok(read_bindings(&state)?.contains_key(session_id))
 }
 
 fn write_binding(
@@ -534,6 +526,63 @@ pub fn register_worker_parent_at(
 ) -> Result<(), String> {
     unpeel_core::app_state::edit_at(path, |state| {
         register_in_state(state, session_id, parent_chat_id, registered_at_unix_ms)
+    })
+}
+
+/// A restart replaces the Session, so the replacement inherits the parent
+/// chat with a fresh episode history. Returns whether a binding was carried;
+/// an unbound source or an already-bound target is left as is.
+fn carry_in_state(
+    state: &mut Map<String, Value>,
+    from_session_id: &str,
+    to_session_id: &str,
+    registered_at_unix_ms: u64,
+) -> Result<bool, String> {
+    if from_session_id == to_session_id {
+        return Ok(false);
+    }
+    let Some(value) = state.get(BINDINGS_KEY) else {
+        return Ok(false);
+    };
+    let bindings = value
+        .as_object()
+        .ok_or_else(|| format!("{BINDINGS_KEY} must be an object"))?;
+    if bindings.contains_key(to_session_id) {
+        return Ok(false);
+    }
+    let Some(raw) = bindings.get(from_session_id).cloned() else {
+        return Ok(false);
+    };
+    let source: WorkerParentBinding =
+        serde_json::from_value(raw).map_err(|error| error.to_string())?;
+    register_in_state(
+        state,
+        to_session_id,
+        &source.parent_chat_id,
+        registered_at_unix_ms,
+    )?;
+    Ok(true)
+}
+
+pub fn carry_worker_parent_binding(
+    from_session_id: &str,
+    to_session_id: &str,
+    registered_at_unix_ms: u64,
+) -> Result<bool, String> {
+    unpeel_core::app_state::edit(|state| {
+        carry_in_state(state, from_session_id, to_session_id, registered_at_unix_ms)
+    })
+}
+
+#[doc(hidden)]
+pub fn carry_worker_parent_binding_at(
+    path: &Path,
+    from_session_id: &str,
+    to_session_id: &str,
+    registered_at_unix_ms: u64,
+) -> Result<bool, String> {
+    unpeel_core::app_state::edit_at(path, |state| {
+        carry_in_state(state, from_session_id, to_session_id, registered_at_unix_ms)
     })
 }
 
