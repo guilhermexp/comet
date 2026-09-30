@@ -21,7 +21,6 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(125);
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-const PORT_REGISTRY_CAP: usize = 16;
 
 pub struct HookEventMessage {
     pub session_id: String,
@@ -144,9 +143,6 @@ fn update_registry_at(path: &std::path::Path, port: u16, register: bool) {
         .collect();
     if register {
         ports.push(port);
-        if ports.len() > PORT_REGISTRY_CAP {
-            ports.drain(..ports.len() - PORT_REGISTRY_CAP);
-        }
     }
     write_registry_at(path, &ports);
     unsafe {
@@ -154,8 +150,8 @@ fn update_registry_at(path: &std::path::Path, port: u16, register: bool) {
     }
 }
 
-/// Same semantics as `HookServer.registerPort`: dedupe, append last (newest),
-/// cap at 16 by dropping oldest.
+/// Same semantics as `HookServer.registerPort`: dedupe and append without
+/// evicting another frontend merely because it registered earlier.
 fn register_port(port: u16) {
     update_registry_at(&registry_path(), port, true);
 }
@@ -511,6 +507,43 @@ pub fn start(hub: Arc<ApprovalHub>) -> Result<HookListener, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registering_seventeenth_listener_preserves_older_listeners() {
+        let dir = std::env::temp_dir().join(format!(
+            "unpeel-registry-seventeen-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app-ports");
+        let listeners = (0..17)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>();
+        let expected = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect::<Vec<_>>();
+        for port in &expected {
+            update_registry_at(&path, *port, true);
+        }
+        let ports = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<u16>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ports, expected,
+            "registration age must not evict a live frontend"
+        );
+        update_registry_at(&path, expected[16], false);
+        let ports = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<u16>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ports, expected[..16]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn concurrent_registry_updates_preserve_every_frontend() {

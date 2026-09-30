@@ -64,6 +64,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   sejam dependências binárias intencionais já documentadas.
 - Mudanças em `third_party/unpeel` precisam provar o consumidor real com
   `cargo test -p zeron-workers-unpeel`.
+- `unpeel-tui/src/activity.rs` also recovers newer durable hooks after latching, consuming each disk version once. Hook-port registry writers in the Comet bridge, Rust TUI and native Swift client must preserve older registrations beyond sixteen entries; registration age is not liveness evidence. The downstream activity/registry regression lives in `activity_bridge` (see its DOX).
 - O catálogo de criação distingue ID desconhecido (400) de projeto cadastrado
   bloqueado por identidade (409 com motivo). `checkout_identity_recovery`
   verifica esse contrato pelo adapter; `controller_` verifica o host vendorizado.

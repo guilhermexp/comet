@@ -55,6 +55,9 @@ struct Entry {
     /// Lets a hook from the new generation win a rescan race with the
     /// manifest generation update instead of being cleared as stale.
     last_hook_at: Option<SystemTime>,
+    /// Last disk version consumed, independently of live hooks and output
+    /// rearming. Replaying the same seed would undo those newer transitions.
+    last_seed_modified_at: Option<SystemTime>,
     /// Exact provenance for current hook assets. When present, this wins over
     /// wall-clock ordering across a manifest-commit race.
     last_hook_generation: Option<u64>,
@@ -388,9 +391,10 @@ impl ActivityEngine {
         }
     }
 
-    /// Re-latch from the durable seed each hook script writes
-    /// (`last-hook-event.json`). Only called when the in-memory latch is
-    /// missing (fresh TUI start). Timestamp anchoring mirrors
+    /// Recover new durable events each hook script writes
+    /// (`last-hook-event.json`), including broadcasts missed after latching.
+    /// Consume each disk version once so output rearm and live events are not
+    /// undone by an unchanged snapshot. Timestamp anchoring mirrors
     /// `UnpeelStore.seedHookActivity`: a turn-opening event is anchored at
     /// `max(seed mtime, output.bin mtime)` because long turns outlive the
     /// 5-minute timeout; everything else uses the seed's own mtime.
@@ -402,13 +406,27 @@ impl ActivityEngine {
         not_before_unix_ms: Option<u64>,
         current_generation: u64,
     ) {
-        if self.is_latched(session_id) {
-            return;
-        }
         let seed_path = session_dir.join("last-hook-event.json");
         let Ok(meta) = fs::metadata(&seed_path) else {
             return;
         };
+        let Ok(modified_at) = meta.modified() else {
+            return;
+        };
+        let entry = self.entries.entry(session_id.to_string()).or_default();
+        if entry
+            .last_seed_modified_at
+            .is_some_and(|seen| modified_at <= seen)
+        {
+            return;
+        }
+        // Preserve HTTP fallback if a new live event failed to persist: an
+        // older disk snapshot must not roll it back. Legacy hook payloads
+        // have no source sequence, so ambiguous delayed HTTP stays live-owned.
+        if entry.last_hook_at.is_some_and(|seen| modified_at <= seen) {
+            entry.last_seed_modified_at = Some(modified_at);
+            return;
+        }
         if let Some(not_before) = not_before_unix_ms {
             let seed_millis = meta
                 .modified()
@@ -439,7 +457,7 @@ impl ActivityEngine {
             .and_then(serde_json::Value::as_u64);
 
         let canonical = normalize_event_name(name);
-        let mut seed_at = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut seed_at = modified_at;
         let anchor = match canonical.as_str() {
             "UserPromptSubmit" => true,
             "Start" => anchor_start_to_output,
@@ -452,7 +470,7 @@ impl ActivityEngine {
                 }
             }
         }
-        self.apply_hook_event_for_runtime(
+        let applied = self.apply_hook_event_for_runtime(
             session_id,
             &canonical,
             tool_name.as_deref(),
@@ -461,6 +479,13 @@ impl ActivityEngine {
             current_generation,
             not_before_unix_ms,
         );
+        let entry = self.entries.get_mut(session_id).unwrap();
+        entry.last_seed_modified_at = Some(modified_at);
+        if applied {
+            // Output anchoring controls the timeout, not event ordering. A
+            // later Stop may be written before the trailing terminal repaint.
+            entry.last_hook_at = Some(modified_at);
+        }
     }
 
     pub fn remove_session(&mut self, session_id: &str) {
@@ -611,6 +636,140 @@ mod tests {
         assert!(engine.is_latched("s"));
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_seed_at(dir: &Path, event: &str, at: SystemTime, generation: u64) {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join("last-hook-event.json");
+        fs::write(
+            &path,
+            format!(r#"{{"hook_event_name":"{event}","unpeel_runtime_generation":{generation}}}"#),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(at))
+            .unwrap();
+    }
+
+    #[test]
+    fn missed_stop_is_recovered_from_disk_after_start() {
+        let dir = std::env::temp_dir().join(format!("unpeel-missed-stop-{}", std::process::id()));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut engine = ActivityEngine::default();
+        engine.apply_hook_event_for_runtime("s", "Start", None, t0, Some(1), 1, None);
+        write_seed_at(&dir, "Stop", t0 + Duration::from_secs(1), 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
+        assert!(engine.hook_confirmed_idle("s"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missed_start_is_recovered_after_disk_stop() {
+        let dir = std::env::temp_dir().join(format!("unpeel-missed-start-{}", std::process::id()));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut engine = ActivityEngine::default();
+        write_seed_at(&dir, "Stop", t0, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        write_seed_at(&dir, "Start", t0 + Duration::from_secs(1), 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
+        assert!(!engine.hook_confirmed_idle("s"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unchanged_stop_does_not_undo_a_live_start_or_output_rearm() {
+        let dir =
+            std::env::temp_dir().join(format!("unpeel-unchanged-stop-{}", std::process::id()));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut engine = ActivityEngine::default();
+        write_seed_at(&dir, "Stop", t0, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.note_output_and_sweep("s", 1, true, true, t0);
+        engine.note_output_and_sweep("s", 2, true, true, t0 + STOP_REARM_GRACE);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
+        assert!(!engine.hook_confirmed_idle("s"));
+        engine.apply_hook_event_for_runtime(
+            "s",
+            "Start",
+            None,
+            t0 + Duration::from_secs(10),
+            Some(1),
+            1,
+            None,
+        );
+        write_seed_at(&dir, "Stop", t0 - Duration::from_secs(1), 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unchanged_start_does_not_revive_a_swept_turn() {
+        let dir =
+            std::env::temp_dir().join(format!("unpeel-unchanged-start-{}", std::process::id()));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut engine = ActivityEngine::default();
+        write_seed_at(&dir, "Start", t0, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.note_output_and_sweep("s", 1, true, false, t0 + HOOK_IDLE_TIMEOUT);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
+        assert!(!engine.hook_confirmed_idle("s"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn older_unconsumed_stop_does_not_override_a_live_start() {
+        let dir = std::env::temp_dir().join(format!("unpeel-delayed-start-{}", std::process::id()));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut engine = ActivityEngine::default();
+        // A new Start may succeed over HTTP even if its disk write failed.
+        // Without a source sequence, the older snapshot is ambiguous.
+        engine.apply_hook_event_for_runtime(
+            "s",
+            "Start",
+            None,
+            t0 + Duration::from_secs(3),
+            Some(1),
+            1,
+            None,
+        );
+        write_seed_at(&dir, "Stop", t0 + Duration::from_secs(2), 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
+        assert!(!engine.hook_confirmed_idle("s"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trailing_output_anchor_does_not_hide_a_new_stop() {
+        let dir =
+            std::env::temp_dir().join(format!("unpeel-anchored-start-{}", std::process::id()));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut engine = ActivityEngine::default();
+        write_seed_at(&dir, "Start", t0, 1);
+        let output = dir.join("output.bin");
+        fs::write(&output, b"trailing render").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(output)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(t0 + Duration::from_secs(3)))
+            .unwrap();
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        write_seed_at(&dir, "Stop", t0 + Duration::from_secs(2), 1);
+        engine.seed_from_disk("s", &dir, true, None, 1);
+        assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
+        assert!(engine.hook_confirmed_idle("s"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

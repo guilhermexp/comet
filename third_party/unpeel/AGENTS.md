@@ -609,7 +609,11 @@ Busy/idle/attention lives in `SessionActivity.swift`. Hook-capable tools are
 hook-owned: the first hook event latches the session, and from then on raw
 output never flips busy/idle — only hooks and the 5-minute timeout. The latch
 survives app restarts via the durable `last-hook-event.json` seed each hook
-script writes. Non-hook sessions use output-growth heuristics. Agent-drawn
+script writes. The Rust activity engine (also included directly by Comet)
+checks for newer seeds after latching to recover missed live broadcasts;
+each disk version is consumed once, preserving live transitions and Codex
+output rearm. Older snapshots do not replace newer live events. Non-hook
+sessions use output-growth heuristics. Agent-drawn
 select menus fire **no** hooks — the host scans its parsed viewport
 (`menu_prompt_active` in the manifest, shared detector with iOS) and native
 surfaces it as attention. A generation-bound false → true edge emits one
@@ -634,6 +638,7 @@ Core behavior:
 - The native app starts a local hook HTTP server (`HookServer.swift`) and exposes its port to launched tools via env (set by the host when `hook_port` is present in the launch file).
 - Provider hooks/wrappers POST JSON events back to `http://127.0.0.1:<port>/hook/<session_id>`.
 - Hook scripts broadcast each event to every port in `~/.unpeel/app-ports`, because multiple Unpeel instances can run at once.
+- Registry writers preserve all registered ports, including beyond sixteen entries. Registration age does not prove death; only explicit owner unregistration removes its port.
 - The hook server answers `404` for session ids it has no manifest for, so foreign instances do not swallow events.
 - The app maps each accepted event into busy/idle/attention state.
 - Runtime hooks may attach provider conversation id/path as metadata distinct

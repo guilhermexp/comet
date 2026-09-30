@@ -612,17 +612,13 @@ final class HookServer: @unchecked Sendable {
         body()
     }
 
-    /// Dedupes this server's port, appends it last, and caps the registry at
-    /// 16 entries (oldest dropped).
+    /// Dedupes this server's port and appends it without evicting older
+    /// listeners. Registration age does not prove that a frontend died.
     private static func registerPort(_ port: UInt16) {
         withPortRegistryLock {
             var ports = readPortRegistry()
             ports.removeAll { $0 == port }
             ports.append(port)
-            let maxEntries = 16
-            if ports.count > maxEntries {
-                ports.removeFirst(ports.count - maxEntries)
-            }
             writePortRegistry(ports)
         }
     }

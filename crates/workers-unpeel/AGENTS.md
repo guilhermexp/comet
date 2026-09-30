@@ -554,6 +554,7 @@ Settings), apps/zeron (host-mode dispatch at startup).
 ## Verification
 
 Run all: `cargo test -p zeron-workers-unpeel` (part of the publish gate).
+Lost hook delivery: `scripts/cargo-verify.py -- cargo test -p zeron-workers-unpeel --lib activity_bridge` covers the real activity derivation, durable Stop recovery on the next poll, unchanged/stale seeds, generation isolation and registry register/unregister with seventeen live listeners. The bridge recovers a new durable event even after hooks latch; the five-minute sweep remains a fallback. A consumed disk version is never replayed over a live event or Codex output rearm. The shared registry has no age-based entry cap: only its owner unregisters a port.
 Regressão de saída: `cargo test -p zeron-workers-unpeel --test controller_mcp worker_output_preserves_answer_when_repaints_depend_on_terminal_width` preserva a resposta literal após repinturas que dependem da largura real.
 Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 

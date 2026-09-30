@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "32e113ae5cf56f687a1ef9f51692bb5f6675997c"
+vendored_tree = "93e3511f36724d74992c0025a4538b047ccdf238"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -81,3 +81,10 @@ base_revision_resolves_upstream = false
 # faithfully at the grid they drew for; the Comet Workers terminal follows
 # these marks instead of decoding `output.bin` at the panel's size.
 # Local change only; no upstream patch implied.
+
+# 2026-09-30 — Comet Worker spinner recovery: unpeel-tui/activity.rs consumes
+# newer durable lifecycle events after latching, once per disk version, with
+# generation/live-event guards. The Rust TUI and native HookServer registry
+# writers no longer evict registrations by age at sixteen entries. Downstream
+# proofs live in zeron-workers-unpeel activity_bridge tests. Local patch only;
+# local_modifications_count remains the unrecomputed historical value above.

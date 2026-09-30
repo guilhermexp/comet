@@ -26,7 +26,6 @@ use crate::WorkersSession;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-const PORT_REGISTRY_CAP: usize = 16;
 
 #[derive(Debug)]
 struct HookEvent {
@@ -358,7 +357,10 @@ fn registry_path() -> PathBuf {
 }
 
 fn update_registry(port: u16, register: bool) {
-    let path = registry_path();
+    update_registry_at(&registry_path(), port, register);
+}
+
+fn update_registry_at(path: &Path, port: u16, register: bool) {
     let Some(parent) = path.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
         return;
@@ -377,7 +379,7 @@ fn update_registry(port: u16, register: bool) {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return;
     }
-    let mut ports = std::fs::read_to_string(&path)
+    let mut ports = std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.trim().parse::<u16>().ok())
@@ -385,9 +387,8 @@ fn update_registry(port: u16, register: bool) {
         .collect::<Vec<_>>();
     if register {
         ports.push(port);
-        if ports.len() > PORT_REGISTRY_CAP {
-            ports.drain(..ports.len() - PORT_REGISTRY_CAP);
-        }
+        // Registration age is not evidence that another listener died.
+        // Preserve every frontend; its owner removes its port on shutdown.
     }
     if ports.is_empty() {
         let _ = std::fs::remove_file(&path);
@@ -646,6 +647,44 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registering_seventeenth_listener_preserves_older_listeners() {
+        let dir = std::env::temp_dir().join(format!(
+            "unpeel-registry-seventeen-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app-ports");
+        let listeners = (0..17)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>();
+        let expected = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect::<Vec<_>>();
+        for port in &expected {
+            update_registry_at(&path, *port, true);
+        }
+        let ports = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<u16>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ports, expected,
+            "registration age must not evict a live frontend"
+        );
+        update_registry_at(&path, expected[16], false);
+        let ports = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<u16>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ports, expected[..16]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use std::ffi::OsString;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -698,6 +737,47 @@ mod tests {
             activity_signal: signal,
             session_dir: dir,
         }
+    }
+
+    #[test]
+    fn persisted_stop_without_http_finishes_working_worker_on_next_poll() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = ActivityEngine::default();
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event_for_runtime("s1", "Start", None, start, Some(1), 1, None);
+        assert_eq!(
+            derive_activity(
+                &mut engine,
+                input("s1", "claude", directory.path(), 1),
+                start
+            ),
+            Some("working")
+        );
+
+        let stop = start + Duration::from_secs(1);
+        let seed = directory.path().join("last-hook-event.json");
+        std::fs::write(
+            &seed,
+            r#"{"hook_event_name":"Stop","unpeel_runtime_generation":1}"#,
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(seed)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stop))
+            .unwrap();
+        // There is deliberately no HTTP Stop: this is the production poll
+        // derivation the sidebar consumes, one second into the turn.
+        assert_eq!(
+            derive_activity(
+                &mut engine,
+                input("s1", "claude", directory.path(), 1),
+                stop
+            ),
+            Some("idle")
+        );
+        assert!(engine.hook_confirmed_idle("s1"));
     }
 
     #[test]
