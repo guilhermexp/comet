@@ -1569,3 +1569,152 @@ fn side_chat_origin_syncs_and_survives_updates_and_restart() {
         Some("main")
     );
 }
+
+// ── device retirement ───────────────────────────────────────────────────────
+
+fn chat_in(id: &str, device_id: &str, space_id: &str, archived: bool) -> Chat {
+    Chat {
+        space_id: Some(space_id.into()),
+        archived,
+        ..chat(id, device_id)
+    }
+}
+
+/// Tombstone + re-home in one batch: the device leaves every listing, its
+/// Space keeps id/name/path/creation date on the new owner, and every chat
+/// (active and archived) and session row of it follows; other rows stay.
+#[test]
+fn retiring_a_device_rehomes_its_spaces_and_chats_and_hides_it() {
+    let mut local = RegistryDoc::new("dev-local");
+    let mut legacy = RegistryDoc::new("dev-legacy");
+    local
+        .upsert_device(&device("dev-local", "MacBook"))
+        .unwrap();
+    legacy
+        .upsert_device(&device("dev-legacy", "MacBook"))
+        .unwrap();
+    let mut owned = space("space-orch", "dev-legacy", "/Users/me/.orchestrator");
+    owned.name = Some(".orchestrator".into());
+    owned.git_detected = true;
+    legacy.upsert_space(&owned).unwrap();
+    legacy
+        .upsert_space(&space("space-kept", "dev-legacy", "/elsewhere"))
+        .unwrap();
+    legacy
+        .upsert_chat(&chat_in("chat-live", "dev-legacy", "space-orch", false))
+        .unwrap();
+    legacy
+        .upsert_chat(&chat_in("chat-old", "dev-legacy", "space-orch", true))
+        .unwrap();
+    legacy
+        .upsert_chat(&chat_in("chat-other", "dev-legacy", "space-kept", false))
+        .unwrap();
+    legacy
+        .upsert_session(&session("chat-live", "dev-legacy", SessionStatus::Idle))
+        .unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut local, &mut legacy]);
+
+    let pending_before = local.pending_len();
+    let moved = local
+        .retire_device("dev-legacy", "dev-local", &["space-orch".to_owned()])
+        .unwrap();
+    assert_eq!(local.pending_len(), pending_before + 1, "one atomic batch");
+    let mut moved_sorted = moved.clone();
+    moved_sorted.sort();
+    assert_eq!(moved_sorted, vec!["chat-live", "chat-old"]);
+    server_round(&mut server, &mut seq, &mut [&mut local, &mut legacy]);
+
+    for doc in [&local, &legacy] {
+        let devices = doc.read_devices().unwrap();
+        assert_eq!(
+            devices.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            vec!["dev-local"]
+        );
+        let rehomed = doc.space("space-orch").unwrap().unwrap();
+        assert_eq!(rehomed.device_id, "dev-local");
+        assert_eq!(rehomed.name.as_deref(), Some(".orchestrator"));
+        assert_eq!(rehomed.path, "/Users/me/.orchestrator");
+        assert_eq!(rehomed.created_at, ts(1_500));
+        assert!(!rehomed.git_detected, "the new owner re-stamps Git");
+        assert_eq!(
+            doc.space("space-kept").unwrap().unwrap().device_id,
+            "dev-legacy"
+        );
+        let live = doc.chat("chat-live").unwrap().unwrap();
+        let old = doc.chat("chat-old").unwrap().unwrap();
+        assert_eq!(
+            (live.device_id.as_str(), live.archived),
+            ("dev-local", false)
+        );
+        assert_eq!((old.device_id.as_str(), old.archived), ("dev-local", true));
+        assert_eq!(old.title.as_deref(), Some("First chat"));
+        assert_eq!(
+            doc.chat("chat-other").unwrap().unwrap().device_id,
+            "dev-legacy"
+        );
+        let session = doc
+            .read_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.chat_id == "chat-live")
+            .unwrap();
+        assert_eq!(session.device_id, "dev-local");
+    }
+}
+
+/// A retired device that comes back — its own upsert, or its row arriving
+/// from the server — is still not listed, and its moved Space stays moved.
+#[test]
+fn a_retired_device_is_never_resurrected() {
+    let mut local = RegistryDoc::new("dev-local");
+    let mut legacy = RegistryDoc::new("dev-legacy");
+    local
+        .upsert_device(&device("dev-local", "MacBook"))
+        .unwrap();
+    legacy.upsert_device(&device("dev-legacy", "old")).unwrap();
+    legacy
+        .upsert_space(&space("space-1", "dev-legacy", "/p"))
+        .unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut local, &mut legacy]);
+    local
+        .retire_device("dev-legacy", "dev-local", &["space-1".to_owned()])
+        .unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut local, &mut legacy]);
+
+    // The legacy engine reconnects and re-announces itself: ignored locally
+    // by the new code, and filtered for readers either way.
+    legacy.upsert_device(&device("dev-legacy", "old")).unwrap();
+    local.upsert_device(&device("dev-legacy", "old")).unwrap();
+    let forged = RowOp {
+        kind: KIND_DEVICES.into(),
+        id: "dev-legacy".into(),
+        op: OpKind::Upsert,
+        set: Some(fields([
+            ("id", json!("dev-legacy")),
+            ("name", json!("old")),
+        ])),
+        hlc: hlc_by(9_999_999_999_999, "dev-legacy"),
+        clocks: None,
+    };
+    let (row, _) = apply_op(None, &forged);
+    let _ = local.apply_rows(seq + 1, vec![row.unwrap()]);
+    server_round(&mut server, &mut seq, &mut [&mut local, &mut legacy]);
+
+    for doc in [&local, &legacy] {
+        assert!(
+            doc.read_devices()
+                .unwrap()
+                .iter()
+                .all(|d| d.id != "dev-legacy")
+        );
+        assert_eq!(
+            doc.space("space-1").unwrap().unwrap().device_id,
+            "dev-local"
+        );
+        assert!(doc.is_device_retired("dev-legacy"));
+    }
+}

@@ -58,6 +58,17 @@ const DIAL_GATE_DARK_MS: i64 = 5 * 60_000;
 /// beats = offline). Also the "peer is reachable" signal that clears the
 /// peer-dial cooldown.
 const PRESENCE_FRESH_MS: i64 = 45_000;
+/// A device row stamped within this window counts as online — the same
+/// window Settings → Devices uses for its "Online" label.
+const RETIRE_ONLINE_WINDOW_MS: i64 = 70_000;
+
+/// What retiring a device moved onto this one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetiredDevice {
+    pub space_ids: Vec<String>,
+    pub chat_ids: Vec<String>,
+}
 /// Relay-status probe cadence. Presence heartbeats ride the registry room, so
 /// any registry pathology (or our own room connection being down) silently
 /// starves them — and every device looks offline while its relay works fine.
@@ -1113,6 +1124,88 @@ impl WorkspaceHost {
 
     pub fn read_spaces(&self) -> Result<Vec<Space>, EngineError> {
         Ok(self.read(|doc| doc.read_spaces())?)
+    }
+
+    /// Retire another, offline device: re-home each of its projects whose
+    /// folder exists here — same id, name and creation date — with every chat
+    /// of them onto this device, then tombstone the device so no listing
+    /// shows it again. Every check runs before the single registry batch; a
+    /// refusal changes nothing.
+    pub fn retire_device(&self, device_id: &str) -> Result<RetiredDevice, EngineError> {
+        let local = self.device_id().to_owned();
+        if device_id == local {
+            return Err(EngineError::Other(
+                "the local device cannot be retired".into(),
+            ));
+        }
+        let device = self
+            .read_devices()?
+            .into_iter()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| EngineError::Other(format!("unknown device {device_id}")))?;
+        let now = now_ms();
+        let row_online = device
+            .last_seen_at
+            .is_some_and(|at| now.saturating_sub(at.timestamp_millis()) <= RETIRE_ONLINE_WINDOW_MS);
+        let beating = lock(&self.inner.presence_seen)
+            .get(device_id)
+            .is_some_and(|ms| now.saturating_sub(*ms) < PRESENCE_FRESH_MS);
+        if row_online || beating {
+            return Err(EngineError::Other(format!(
+                "device {} is online; only an offline device can be retired",
+                device.name
+            )));
+        }
+        let spaces = self.read_spaces()?;
+        let canonical = |path: &str| std::fs::canonicalize(path).ok();
+        let mut moved = Vec::new();
+        let mut missing = Vec::new();
+        let mut conflicts = Vec::new();
+        for space in spaces.iter().filter(|space| space.device_id == device_id) {
+            let Some(folder) = canonical(&space.path) else {
+                missing.push(space.path.clone());
+                continue;
+            };
+            if let Some(existing) = spaces.iter().find(|other| {
+                other.device_id == local
+                    && (other.path == space.path
+                        || canonical(&other.path).as_ref() == Some(&folder))
+            }) {
+                conflicts.push(format!(
+                    "{} and local project {} ({})",
+                    space.display_name(),
+                    existing.display_name(),
+                    existing.path
+                ));
+                continue;
+            }
+            moved.push(space.id.clone());
+        }
+        if !missing.is_empty() || !conflicts.is_empty() {
+            let mut reasons = Vec::new();
+            if !missing.is_empty() {
+                reasons.push(format!(
+                    "folders missing on this device: {}",
+                    missing.join(", ")
+                ));
+            }
+            if !conflicts.is_empty() {
+                reasons.push(format!(
+                    "folders already registered here: {}",
+                    conflicts.join("; ")
+                ));
+            }
+            return Err(EngineError::Other(format!(
+                "cannot retire {}: {}",
+                device.name,
+                reasons.join("; ")
+            )));
+        }
+        let chat_ids = self.mutate(|doc| doc.retire_device(device_id, &local, &moved))?;
+        Ok(RetiredDevice {
+            space_ids: moved,
+            chat_ids,
+        })
     }
 
     pub fn rename_chat(&self, chat_id: &str, title: &str) -> Result<bool, EngineError> {

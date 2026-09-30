@@ -12380,6 +12380,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeron-doc",
  "zeron-harness",
+ "zeron-mcp",
  "zeron-preview",
  "zeron-proto",
  "zeron-rpc",
@@ -12685,6 +12686,7 @@ dependencies = [
  "zeron-engine",
  "zeron-harness",
  "zeron-markdown",
+ "zeron-mcp",
  "zeron-preview",
  "zeron-proto",
  "zeron-rpc",
@@ -12713,8 +12715,10 @@ dependencies = [
 name = "zeron-workers-unpeel"
 version = "0.2.18"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "dirs",
+ "futures",
  "ignore",
  "libc",
  "parking_lot",
@@ -12730,6 +12734,8 @@ dependencies = [
  "unicode-width",
  "unpeel-core",
  "uuid",
+ "zeron-proto",
+ "zeron-rpc",
 ]
 
 [[package]]

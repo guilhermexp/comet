@@ -83,7 +83,8 @@ pub use trajectory_store::TrajectoryStore;
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_files::WorkspaceFiles;
 pub use workspace_host::{
-    DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
+    DEFAULT_ORG_ID, DEFAULT_USER_ID, RetiredDevice, WORKSPACE_DOC_ID, WorkspaceHost,
+    WorkspaceHostConfig,
 };
 
 pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";

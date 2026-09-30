@@ -31,6 +31,10 @@ pub const KIND_SPACES: &str = "spaces";
 pub const KIND_CHATS: &str = "chats";
 pub const KIND_SESSIONS: &str = "sessions";
 pub const KIND_PREFERENCES: &str = "preferences";
+/// Tombstones of retired devices (camelCase: the edge accepts only
+/// `^[a-z][a-zA-Z0-9]{0,31}$` kinds). A retired id is filtered from every
+/// device listing and its row is never upserted again.
+pub const KIND_RETIRED_DEVICES: &str = "retiredDevices";
 
 /// Readiness only; membership and order live on individual pins.
 pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
@@ -712,7 +716,11 @@ impl RegistryDoc {
     // ── typed API (the WorkspaceDoc surface) ────────────────────────────────
 
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
+    /// A retired device is never listed again, so its upsert is ignored.
     pub fn upsert_device(&mut self, device: &Device) -> Result<(), DocError> {
+        if self.is_device_retired(&device.id) {
+            return Ok(());
+        }
         let set = fields([
             ("id", json!(device.id)),
             ("name", json!(device.name)),
@@ -769,9 +777,87 @@ impl RegistryDoc {
             .read_kind::<crate::workspace::RawDevice>(KIND_DEVICES)
             .into_iter()
             .map(Device::from)
+            .filter(|device| !self.is_device_retired(&device.id))
             .collect();
         devices.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(devices)
+    }
+
+    pub fn is_device_retired(&self, device_id: &str) -> bool {
+        self.row_exists(KIND_RETIRED_DEVICES, device_id)
+    }
+
+    /// Retire `device_id` in one batch: every Space in `space_ids` moves to
+    /// `to_device` keeping id, path, name and creation date (Git fields are
+    /// cleared for the new owner to re-stamp), every chat and session row of
+    /// those Spaces follows it, and the device is tombstoned. Validation is
+    /// the engine's; this is mechanism only. Returns the moved chat ids.
+    pub fn retire_device(
+        &mut self,
+        device_id: &str,
+        to_device: &str,
+        space_ids: &[String],
+    ) -> Result<Vec<String>, DocError> {
+        let hlc = self.next_hlc();
+        let op = |kind: &str, id: &str, op: OpKind, set: BTreeMap<String, Value>| RowOp {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            op,
+            set: Some(set),
+            hlc: hlc.clone(),
+            clocks: None,
+        };
+        let mut ops = Vec::new();
+        for space_id in space_ids {
+            if !self.row_exists(KIND_SPACES, space_id) {
+                continue;
+            }
+            ops.push(op(
+                KIND_SPACES,
+                space_id,
+                OpKind::Update,
+                fields([
+                    ("deviceId", json!(to_device)),
+                    ("gitDetected", json!(false)),
+                    ("gitCheckedAt", Value::Null),
+                    ("checkoutId", Value::Null),
+                ]),
+            ));
+        }
+        let chat_ids: Vec<String> = self
+            .read_chats()?
+            .into_iter()
+            .filter(|chat| {
+                chat.space_id
+                    .as_deref()
+                    .is_some_and(|space_id| space_ids.iter().any(|id| id == space_id))
+            })
+            .map(|chat| chat.id)
+            .collect();
+        for chat_id in &chat_ids {
+            ops.push(op(
+                KIND_CHATS,
+                chat_id,
+                OpKind::Update,
+                fields([("deviceId", json!(to_device))]),
+            ));
+            if self.row_exists(KIND_SESSIONS, chat_id) {
+                ops.push(op(
+                    KIND_SESSIONS,
+                    chat_id,
+                    OpKind::Update,
+                    fields([("deviceId", json!(to_device))]),
+                ));
+            }
+        }
+        ops.push(op(
+            KIND_RETIRED_DEVICES,
+            device_id,
+            OpKind::Upsert,
+            fields([("id", json!(device_id)), ("retiredInto", json!(to_device))]),
+        ));
+        self.enqueue_ops(ops);
+        Ok(chat_ids)
     }
 
     // ── spaces ──────────────────────────────────────────────────────────────

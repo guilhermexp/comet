@@ -111,7 +111,8 @@ impl Device {
 #[serde(rename_all = "camelCase")]
 pub struct Space {
     pub id: String,
-    /// Owning device — fixed at create, immutable.
+    /// Owning device — fixed at create; changed only by device retirement,
+    /// which re-homes the Space (same id) onto the retiring device's successor.
     pub device_id: String,
     /// Absolute folder path on the owning device.
     pub path: String,
