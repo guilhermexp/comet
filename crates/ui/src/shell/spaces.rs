@@ -5481,9 +5481,20 @@ impl Shell {
             return;
         }
         if flow.target == ProjectPickerTarget::Worker {
+            // A Workers project is the local Space for the folder: the same
+            // project the Orchestrator lists, with this folder as its checkout.
+            let Some(registry) =
+                crate::workers::registry::AppSpaceRegistry::from_state(self.state.read(cx))
+            else {
+                self.push_toast(
+                    crate::toast::Toast::error("Engine not connected: cannot add a project"),
+                    cx,
+                );
+                return;
+            };
             self.add_space = None;
             self.workers_model
-                .update(cx, |model, cx| model.add_project(path.into(), cx));
+                .update(cx, |model, cx| model.add_project(path.into(), registry, cx));
             cx.notify();
             return;
         }

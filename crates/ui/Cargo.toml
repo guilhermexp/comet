@@ -121,6 +121,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 zeron-preview.workspace = true
+# Registry listings test: the chat MCP read over the same engine.
+zeron-mcp.workspace = true
 mimalloc.workspace = true
 tracing-subscriber.workspace = true
 tokio-tungstenite.workspace = true

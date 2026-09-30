@@ -8,6 +8,7 @@ use gpui::{
     IntoElement, MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString,
     StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
 };
+use zeron_workers_unpeel::space_registry::SpaceRef;
 use zeron_workers_unpeel::{
     CheckoutKind, WorkersArtifact, WorkersLaunchRequest, WorkersPreset, WorkersProject,
     WorkersSession, WorkersSessionSort,
@@ -86,13 +87,12 @@ fn project_depth(project: &WorkersProject, projects: &[WorkersProject]) -> usize
     depth
 }
 
+/// A checkout linked to no project: it lists only under "Association
+/// pending", never as a project of its own. A record the identity pass has
+/// not observed yet (`checkout_kind == None`) keeps its legacy row until the
+/// next reconcile classifies it.
 pub fn is_association_pending_checkout(project: &WorkersProject) -> bool {
-    !project.is_group
-        && project.repository_id.is_none()
-        && matches!(
-            project.checkout_kind,
-            Some(CheckoutKind::Unresolved | CheckoutKind::Primary | CheckoutKind::Linked)
-        )
+    !project.is_group && project.space_id.is_none() && project.checkout_kind.is_some()
 }
 
 fn worktree_branch_slug(task_name: &str) -> String {
@@ -185,8 +185,12 @@ struct ProjectsMenu {
 /// Roots only. A worktree or a group is a child in the tree, so filtering to
 /// one would hide the parent it hangs from — the row would name a project and
 /// draw a fragment of another.
-pub fn projects_menu_rows(projects: &[WorkersProject], query: &str) -> Vec<ProjectsMenuRow> {
-    let projected = project_tree_projection(projects);
+pub fn projects_menu_rows(
+    projects: &[WorkersProject],
+    spaces: &[SpaceRef],
+    query: &str,
+) -> Vec<ProjectsMenuRow> {
+    let projected = project_tree_projection(projects, spaces);
     let roots: Vec<&WorkersProject> = projected
         .iter()
         .filter(|project| project.parent_project_id.is_none())
@@ -199,10 +203,28 @@ pub fn projects_menu_rows(projects: &[WorkersProject], query: &str) -> Vec<Proje
     rows.extend(
         popover::filter_indices(query, &names)
             .into_iter()
-            .map(|ix| ProjectsMenuRow::Project(roots[ix].id.clone())),
+            .map(|ix| ProjectsMenuRow::Project(filter_key(roots[ix]).to_owned())),
     );
     rows.push(ProjectsMenuRow::AddProject);
     rows
+}
+
+/// The value the project filter stores for a root row: its project (Space)
+/// id when it has one — the principal checkout row stands for its project —
+/// else the row id (legacy rows, "Association pending").
+pub fn filter_key(root: &WorkersProject) -> &str {
+    root.space_id.as_deref().unwrap_or(root.id.as_str())
+}
+
+/// The root row a filter value names in a projected tree.
+pub fn filter_root<'a>(
+    filter: &str,
+    projected: &'a [WorkersProject],
+) -> Option<&'a WorkersProject> {
+    projected
+        .iter()
+        .filter(|project| project.parent_project_id.is_none())
+        .find(|project| filter_key(project) == filter || project.id == filter)
 }
 
 /// The root of `project_id`'s chain — the project the filter names when this
@@ -213,15 +235,15 @@ pub fn root_project_id<'a>(project_id: &'a str, projects: &'a [WorkersProject]) 
         let Some(project) = projects.iter().find(|candidate| candidate.id == current) else {
             return current;
         };
-        if let Some(repository_id) = project.repository_id.as_deref() {
+        if let Some(space_id) = project.space_id.as_deref() {
             if let Some(primary) = projects.iter().find(|candidate| {
-                candidate.repository_id.as_deref() == Some(repository_id)
+                candidate.space_id.as_deref() == Some(space_id)
                     && candidate.checkout_kind == Some(CheckoutKind::Primary)
                     && !candidate.is_group
             }) {
                 return primary.id.as_str();
             }
-            return repository_id;
+            return space_id;
         }
         match project.parent_project_id.as_deref() {
             Some(parent) => current = parent,
@@ -233,99 +255,90 @@ pub fn root_project_id<'a>(project_id: &'a str, projects: &'a [WorkersProject]) 
 
 /// Build the presentation tree shared by Workers and the project filter.
 ///
-/// The host still returns execution records, one per exact checkout path. A
-/// repository identity is a separate durable relationship, so grouping must
-/// happen here without changing the IDs used by sessions or launch requests.
-/// An existing primary checkout is the executable root. If it is absent, a
-/// synthetic group row is created as a visual container; its empty path and
-/// group flag make it impossible to launch a Worker against the container.
-pub fn project_tree_projection(projects: &[WorkersProject]) -> Vec<WorkersProject> {
+/// Base projects are the registry's local projects (Spaces), named as in the
+/// registry, each with its linked checkouts nested under it. The host still
+/// returns execution records, one per exact checkout path, and their ids stay
+/// the launch/session ids. A project's registered principal checkout is its
+/// executable root row; without one, the project row is a container whose
+/// empty path and group flag keep it from being launched. Checkouts linked to
+/// no project live only under "Association pending".
+pub fn project_tree_projection(
+    projects: &[WorkersProject],
+    spaces: &[SpaceRef],
+) -> Vec<WorkersProject> {
     let mut projected = projects.to_vec();
     let mut roots = std::collections::BTreeMap::<String, String>::new();
+    let container = |id: &str, name: String, path: Option<String>| WorkersProject {
+        id: id.to_owned(),
+        name,
+        path: String::new(),
+        folder_id: None,
+        parent_project_id: None,
+        is_group: true,
+        worktree_branch: None,
+        git_branch: None,
+        archived_session_count: 0,
+        folder_color_id: None,
+        session_sort: WorkersSessionSort::Custom,
+        repository_id: None,
+        repository_name: None,
+        repository_path: path,
+        checkout_kind: None,
+        checkout_ownership: None,
+        checkout_availability: None,
+        checkout_archived: false,
+        checkout_detached: false,
+        space_id: Some(id.to_owned()),
+    };
 
-    let repository_ids: Vec<String> = projects
+    // Linked checkouts whose project is not (yet) in the registry snapshot
+    // keep their container, named from what the checkout knows.
+    let mut bases: Vec<(String, String, Option<String>)> = spaces
         .iter()
-        .filter_map(|project| project.repository_id.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
+        .filter(|space| space.local)
+        .map(|space| {
+            (
+                space.id.clone(),
+                space.name.clone(),
+                Some(space.path.clone()),
+            )
+        })
         .collect();
+    for project in projects.iter().filter(|project| !project.is_group) {
+        if let Some(space_id) = project.space_id.as_deref()
+            && !bases.iter().any(|(id, _, _)| id == space_id)
+        {
+            let name = project
+                .repository_name
+                .clone()
+                .unwrap_or_else(|| project.name.clone());
+            bases.push((space_id.to_owned(), name, project.repository_path.clone()));
+        }
+    }
 
-    for repository_id in repository_ids {
-        if let Some(primary) = projects.iter().find(|project| {
+    for (space_id, name, path) in bases {
+        let primary = projected.iter_mut().find(|project| {
             !project.is_group
-                && project.repository_id.as_deref() == Some(repository_id.as_str())
+                && project.space_id.as_deref() == Some(space_id.as_str())
                 && project.checkout_kind == Some(CheckoutKind::Primary)
-        }) {
-            roots.insert(repository_id, primary.id.clone());
+        });
+        if let Some(primary) = primary {
+            primary.name = name;
+            roots.insert(space_id, primary.id.clone());
             continue;
         }
-        let Some(first) = projects.iter().find(|project| {
-            !project.is_group && project.repository_id.as_deref() == Some(repository_id.as_str())
-        }) else {
-            continue;
-        };
-        let root_id = repository_id.clone();
-        let name = first
-            .repository_name
-            .clone()
-            .or_else(|| {
-                first
-                    .repository_path
-                    .as_deref()
-                    .and_then(|path| std::path::Path::new(path).file_name())
-                    .and_then(|name| name.to_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| first.name.clone());
-        projected.push(WorkersProject {
-            id: root_id.clone(),
-            name,
-            // A synthetic repository container is only a visual parent. Keep
-            // its path empty so every launch/reveal capability remains gated
-            // even if the identity registry knows the repository location.
-            path: String::new(),
-            folder_id: None,
-            parent_project_id: None,
-            is_group: true,
-            worktree_branch: None,
-            git_branch: None,
-            archived_session_count: 0,
-            folder_color_id: first.folder_color_id.clone(),
-            session_sort: first.session_sort,
-            repository_id: Some(repository_id.clone()),
-            repository_name: first.repository_name.clone(),
-            repository_path: first.repository_path.clone(),
-            checkout_kind: None,
-            checkout_ownership: None,
-            checkout_availability: None,
-            checkout_archived: false,
-            checkout_detached: false,
-        });
-        roots.insert(repository_id, root_id);
+        projected.push(container(&space_id, name, path));
+        roots.insert(space_id.clone(), space_id);
     }
 
     if projects.iter().any(is_association_pending_checkout) {
-        projected.push(WorkersProject {
-            id: ASSOCIATION_PENDING_PROJECT_ID.to_owned(),
-            name: "Association pending".to_owned(),
-            path: String::new(),
-            folder_id: None,
-            parent_project_id: None,
-            is_group: true,
-            worktree_branch: None,
-            git_branch: None,
-            archived_session_count: 0,
-            folder_color_id: None,
-            session_sort: WorkersSessionSort::Custom,
-            repository_id: None,
-            repository_name: None,
-            repository_path: None,
-            checkout_kind: None,
-            checkout_ownership: None,
-            checkout_availability: None,
-            checkout_archived: false,
-            checkout_detached: false,
-        });
+        let mut pending = container(
+            ASSOCIATION_PENDING_PROJECT_ID,
+            "Association pending".to_owned(),
+            None,
+        );
+        pending.space_id = None;
+        projected.push(pending);
         for project in projected
             .iter_mut()
             .filter(|project| is_association_pending_checkout(project))
@@ -335,10 +348,10 @@ pub fn project_tree_projection(projects: &[WorkersProject]) -> Vec<WorkersProjec
     }
 
     for project in projected.iter_mut().filter(|project| !project.is_group) {
-        let Some(repository_id) = project.repository_id.as_deref() else {
+        let Some(space_id) = project.space_id.as_deref() else {
             continue;
         };
-        let Some(root_id) = roots.get(repository_id) else {
+        let Some(root_id) = roots.get(space_id) else {
             continue;
         };
         if project.id != *root_id {
@@ -369,7 +382,7 @@ pub fn project_in_filter(
             return false;
         };
         if node.id == filter
-            || node.repository_id.as_deref() == Some(filter)
+            || node.space_id.as_deref() == Some(filter)
             || root_project_id(node.id.as_str(), projects) == filter
         {
             return true;
@@ -729,7 +742,8 @@ impl WorkersSidebar {
 
     fn projects_menu_rows(&self, cx: &App) -> Vec<ProjectsMenuRow> {
         let query = self.projects_menu_query(cx);
-        projects_menu_rows(self.model.read(cx).projects(), &query)
+        let model = self.model.read(cx);
+        projects_menu_rows(model.projects(), model.spaces(), &query)
     }
 
     fn open_projects_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -844,10 +858,10 @@ impl WorkersSidebar {
     fn render_projects_filter(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let label: SharedString = {
             let model = self.model.read(cx);
-            let projects = project_tree_projection(model.projects());
+            let projects = project_tree_projection(model.projects(), model.spaces());
             model
                 .project_filter()
-                .and_then(|id| projects.iter().find(|project| project.id == id))
+                .and_then(|id| filter_root(id, &projects))
                 .map(|project| SharedString::from(project.name.clone()))
                 .unwrap_or_else(|| SharedString::from("All projects"))
         };
@@ -937,15 +951,13 @@ impl WorkersSidebar {
         let filter = self.model.read(cx).project_filter().map(str::to_owned);
         let labels: Vec<(ProjectsMenuRow, SharedString)> = {
             let model = self.model.read(cx);
-            let projects = project_tree_projection(model.projects());
+            let projects = project_tree_projection(model.projects(), model.spaces());
             rows.iter()
                 .map(|row| {
                     let label = match row {
                         ProjectsMenuRow::All => SharedString::from("All projects"),
                         ProjectsMenuRow::AddProject => SharedString::from("New project…"),
-                        ProjectsMenuRow::Project(id) => projects
-                            .iter()
-                            .find(|project| &project.id == id)
+                        ProjectsMenuRow::Project(id) => filter_root(id, &projects)
                             .map(|project| SharedString::from(project.name.clone()))
                             .unwrap_or_else(|| SharedString::from("?")),
                     };
@@ -2056,7 +2068,7 @@ impl Render for WorkersSidebar {
                 model.selected_project_id.clone(),
                 model.launcher_project_id.clone(),
                 model.expanded_project_ids.clone(),
-                project_tree_projection(model.projects()),
+                project_tree_projection(model.projects(), model.spaces()),
                 model.projects().to_vec(),
                 model.sessions().to_vec(),
                 model.presets().to_vec(),
@@ -5080,12 +5092,14 @@ mod layout_tests {
 
 #[cfg(test)]
 mod ordering_tests {
+    use zeron_workers_unpeel::space_registry::SpaceRef;
+
     use super::{
         ProjectsMenuRow, SESSION_ROW_CAP, checkout_is_available, compare_sessions_by_activity,
-        project_activity, project_has_working_set, project_in_filter, project_session_row_plan,
-        project_sessions_sorted, project_tree_projection, project_visible, projects_menu_rows,
-        projects_ordered_by_activity, prune_revealed_projects, remove_project_confirm_label,
-        root_project_id, sidebar_row_projects,
+        filter_root, project_activity, project_has_working_set, project_in_filter,
+        project_session_row_plan, project_sessions_sorted, project_tree_projection,
+        project_visible, projects_menu_rows, projects_ordered_by_activity, prune_revealed_projects,
+        remove_project_confirm_label, root_project_id, sidebar_row_projects,
     };
     use zeron_workers_unpeel::{
         CheckoutAvailability, CheckoutKind, CheckoutOwnership, WorkersProject, WorkersSession,
@@ -5113,6 +5127,7 @@ mod ordering_tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         }
     }
 
@@ -5123,33 +5138,40 @@ mod ordering_tests {
         project
     }
 
-    fn repository_project(
-        id: &str,
-        repository: &str,
-        kind: CheckoutKind,
-        path: &str,
-    ) -> WorkersProject {
+    fn linked_project(id: &str, space: &str, kind: CheckoutKind, path: &str) -> WorkersProject {
         let mut project = project(id, None);
         project.path = path.to_owned();
-        project.repository_id = Some(repository.to_owned());
-        project.repository_name = Some("Comet".into());
-        project.repository_path = Some("/repos/comet".into());
+        project.repository_id = Some("repo-1".to_owned());
         project.checkout_kind = Some(kind);
         project.checkout_ownership = Some(CheckoutOwnership::External);
         project.checkout_availability = Some(CheckoutAvailability::Available);
+        project.space_id = Some(space.to_owned());
         project
     }
 
+    fn registry_space(id: &str, name: &str, path: &str, local: bool) -> SpaceRef {
+        SpaceRef {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            path: path.to_owned(),
+            device_id: if local { "dev-local" } else { "dev-mini" }.to_owned(),
+            device_name: None,
+            git: true,
+            local,
+        }
+    }
+
     #[test]
-    fn repository_projection_keeps_primary_as_root_and_nests_siblings() {
-        let primary = repository_project("main", "repo-1", CheckoutKind::Primary, "/repos/comet");
-        let branch = repository_project(
+    fn projection_keeps_the_principal_as_root_under_the_project_name() {
+        let primary = linked_project("main", "space-1", CheckoutKind::Primary, "/repos/comet");
+        let branch = linked_project(
             "feature",
-            "repo-1",
+            "space-1",
             CheckoutKind::Linked,
             "/repos/comet-feature",
         );
-        let projected = project_tree_projection(&[primary.clone(), branch]);
+        let spaces = [registry_space("space-1", "Comet", "/repos/comet", true)];
+        let projected = project_tree_projection(&[primary.clone(), branch], &spaces);
         let root = projected
             .iter()
             .find(|project| project.id == "main")
@@ -5159,43 +5181,90 @@ mod ordering_tests {
             .find(|project| project.id == "feature")
             .unwrap();
         assert!(root.parent_project_id.is_none());
+        assert_eq!(root.name, "Comet", "named as in the registry");
         assert_eq!(child.parent_project_id.as_deref(), Some("main"));
         assert_eq!(
             projected
                 .iter()
-                .filter(|project| project.id == "main")
+                .filter(|project| project.id == "main" || project.id == "space-1")
                 .count(),
             1
         );
     }
 
+    /// Scenario "Worktrees of an unregistered principal".
     #[test]
-    fn repository_projection_creates_non_launchable_container_without_primary() {
-        let branch = repository_project(
-            "feature",
-            "repo-1",
-            CheckoutKind::Linked,
-            "/repos/comet-feature",
-        );
-        let projected = project_tree_projection(&[branch]);
-        let root = projected.iter().find(|project| project.is_group).unwrap();
-        let child = projected
+    fn worktrees_of_an_unregistered_principal_hang_from_the_project() {
+        let worktrees: Vec<WorkersProject> = ["sec-cron", "sec-xss", "sec-export"]
             .iter()
-            .find(|project| project.id == "feature")
-            .unwrap();
-        assert_eq!(root.id, "repo-1");
-        assert!(root.path.is_empty());
-        assert_eq!(child.parent_project_id.as_deref(), Some("repo-1"));
-        assert!(root.is_group);
+            .map(|id| {
+                linked_project(
+                    id,
+                    "space-jk",
+                    CheckoutKind::Linked,
+                    &format!("/p/.worktrees-jk/{id}"),
+                )
+            })
+            .collect();
+        let spaces = [registry_space(
+            "space-jk",
+            "JK Distribuição",
+            "/p/JK Distribuição",
+            true,
+        )];
+        let projected = project_tree_projection(&worktrees, &spaces);
+        let root = projected
+            .iter()
+            .find(|project| project.id == "space-jk")
+            .expect("the project is the base row");
+        assert_eq!(root.name, "JK Distribuição");
+        assert!(
+            root.is_group && root.path.is_empty(),
+            "container, never launched"
+        );
         assert!(!checkout_is_available(root));
+        assert!(
+            projected
+                .iter()
+                .all(|project| project.name != "Principal not registered")
+        );
+        for id in ["sec-cron", "sec-xss", "sec-export"] {
+            let child = projected.iter().find(|project| project.id == id).unwrap();
+            assert_eq!(child.parent_project_id.as_deref(), Some("space-jk"));
+        }
+    }
+
+    /// Scenario "Projects of other devices".
+    #[test]
+    fn projects_of_other_devices_are_not_workers_base_projects() {
+        let spaces = [
+            registry_space(
+                "space-local",
+                "orchestrator",
+                "/Users/me/orchestrator",
+                true,
+            ),
+            registry_space(
+                "space-remote",
+                "craft-agents-oss",
+                "/Users/mini/craft",
+                false,
+            ),
+        ];
+        let projected = project_tree_projection(&[], &spaces);
+        let ids: Vec<&str> = projected
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["space-local"]);
     }
 
     #[test]
-    fn manually_unlinked_git_checkout_returns_to_pending_instead_of_a_new_root() {
+    fn a_checkout_without_a_project_returns_to_pending_instead_of_a_new_root() {
         let mut checkout = project("unlinked", None);
         checkout.checkout_kind = Some(CheckoutKind::Linked);
         checkout.checkout_availability = Some(CheckoutAvailability::Available);
-        let projected = project_tree_projection(&[checkout]);
+        let projected = project_tree_projection(&[checkout], &[]);
         let child = projected
             .iter()
             .find(|project| project.id == "unlinked")
@@ -5211,7 +5280,7 @@ mod ordering_tests {
         let mut pending = project("legacy", None);
         pending.checkout_kind = Some(CheckoutKind::Unresolved);
         pending.checkout_availability = Some(CheckoutAvailability::Missing);
-        let projected = project_tree_projection(&[pending]);
+        let projected = project_tree_projection(&[pending], &[]);
         let pending_root = projected
             .iter()
             .find(|project| project.id == super::ASSOCIATION_PENDING_PROJECT_ID)
@@ -5398,6 +5467,34 @@ mod ordering_tests {
     }
 
     #[test]
+    fn project_filter_keys_projects_by_space_id() {
+        use super::super::model::filter_after_snapshot;
+        let primary = linked_project("main", "space-1", CheckoutKind::Primary, "/repos/comet");
+        let branch = linked_project("feature", "space-1", CheckoutKind::Linked, "/repos/wt");
+        let other = linked_project("other", "space-2", CheckoutKind::Primary, "/repos/other");
+        let spaces = [
+            registry_space("space-1", "Comet", "/repos/comet", true),
+            registry_space("space-2", "Other", "/repos/other", true),
+        ];
+        let projects = vec![primary, branch, other];
+        let rows = projects_menu_rows(&projects, &spaces, "");
+        assert!(rows.contains(&ProjectsMenuRow::Project("space-1".into())));
+        assert!(rows.contains(&ProjectsMenuRow::Project("space-2".into())));
+        let projected = project_tree_projection(&projects, &spaces);
+        assert_eq!(
+            filter_root("space-1", &projected).map(|p| p.id.as_str()),
+            Some("main")
+        );
+        let feature = projects.iter().find(|p| p.id == "feature").unwrap();
+        assert!(project_in_filter(feature, &projected, Some("space-1")));
+        assert!(!project_in_filter(feature, &projected, Some("space-2")));
+        assert_eq!(
+            filter_after_snapshot(Some("space-1".into()), &projects).as_deref(),
+            Some("space-1")
+        );
+    }
+
+    #[test]
     fn project_filter_menu_rows_rank_roots_and_hide_all_while_searching() {
         let projects = vec![
             project("comet", None),
@@ -5407,7 +5504,7 @@ mod ordering_tests {
         ];
 
         assert_eq!(
-            projects_menu_rows(&projects, ""),
+            projects_menu_rows(&projects, &[], ""),
             vec![
                 ProjectsMenuRow::All,
                 ProjectsMenuRow::Project("comet".into()),
@@ -5418,7 +5515,7 @@ mod ordering_tests {
         );
 
         assert_eq!(
-            projects_menu_rows(&projects, "kan"),
+            projects_menu_rows(&projects, &[], "kan"),
             vec![
                 ProjectsMenuRow::Project("kanwas".into()),
                 ProjectsMenuRow::AddProject,
@@ -5794,6 +5891,7 @@ mod ordering_tests {
                 checkout_availability: None,
                 checkout_archived: false,
                 checkout_detached: false,
+                space_id: None,
             });
         }
         // At depth < MAX_PROJECT_DEPTH (e.g. depth 7 -> p7), visible if all ancestors expanded.
@@ -5823,6 +5921,7 @@ mod ordering_tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         };
         let cycle_b = WorkersProject {
             id: "cycle_b".into(),
@@ -5844,6 +5943,7 @@ mod ordering_tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         };
         expanded.insert("cycle_a".into());
         expanded.insert("cycle_b".into());

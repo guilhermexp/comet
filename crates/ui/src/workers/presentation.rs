@@ -590,6 +590,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         };
         let titlebar = workers_titlebar(Some(&project), None);
         assert_eq!(titlebar.segments, [".orchestrator"]);
@@ -623,6 +624,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         };
         let project = WorkersProject {
             id: "worktree".into(),
@@ -644,6 +646,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         };
         let titlebar = workers_titlebar(Some(&project), Some(&parent));
         assert_eq!(titlebar.segments, ["Comet"]);

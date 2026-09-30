@@ -564,6 +564,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         }
     }
 

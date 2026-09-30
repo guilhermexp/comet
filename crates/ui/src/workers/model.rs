@@ -474,7 +474,7 @@ pub fn filter_after_snapshot(
             && projects.iter().any(is_association_pending_checkout))
             || projects.iter().any(|project| {
                 &project.id == id
-                    || project.repository_id.as_deref() == Some(id.as_str())
+                    || project.space_id.as_deref() == Some(id.as_str())
                     || root_project_id(project.id.as_str(), projects) == id
             })
     })
@@ -492,7 +492,16 @@ fn selection_after_filter(
     selected_project_id: Option<&str>,
     projects: &[WorkersProject],
 ) -> Option<String> {
-    let root = filter?;
+    let filter = filter?;
+    // A project filter names the Space; its principal checkout is the row.
+    let root = projects
+        .iter()
+        .find(|project| {
+            !project.is_group
+                && project.space_id.as_deref() == Some(filter)
+                && project.checkout_kind == Some(zeron_workers_unpeel::CheckoutKind::Primary)
+        })
+        .map_or(filter, |principal| principal.id.as_str());
     let selected_root = selected_project_id.map(|selected| root_project_id(selected, projects));
     (selected_root != Some(root)).then(|| root.to_owned())
 }
@@ -506,6 +515,10 @@ fn notification_settings_for_snapshot(
 pub struct WorkersModel {
     state: Entity<AppState>,
     client: LocalWorkersClient,
+    /// The registry's projects joined with devices, refreshed from the
+    /// Spaces/devices watches. Local ones are the Workers base projects.
+    spaces: Vec<zeron_workers_unpeel::space_registry::SpaceRef>,
+    _spaces_observer: Option<gpui::Subscription>,
     pub snapshot: Option<WorkersBootstrap>,
     pub selected_project_id: Option<String>,
     pub selected_session_id: Option<String>,
@@ -562,6 +575,14 @@ pub struct WorkersModel {
     runtime_update_tasks: HashMap<String, Task<()>>,
 }
 
+fn registry_spaces(state: &AppState) -> Vec<zeron_workers_unpeel::space_registry::SpaceRef> {
+    zeron_workers_unpeel::space_registry::space_refs(
+        &state.spaces,
+        &state.devices,
+        state.local_device_id.as_deref().unwrap_or_default(),
+    )
+}
+
 impl WorkersModel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::build(state, true, cx)
@@ -604,9 +625,19 @@ impl WorkersModel {
                 }
             })
         };
+        let spaces_observer = cx.observe(&state, |model: &mut Self, state, cx| {
+            let next = registry_spaces(state.read(cx));
+            if next != model.spaces {
+                model.spaces = next;
+                cx.notify();
+            }
+        });
+        let spaces = registry_spaces(state.read(cx));
         let mut model = Self {
             state,
             client,
+            spaces,
+            _spaces_observer: Some(spaces_observer),
             snapshot: None,
             selected_project_id: None,
             selected_session_id: None,
@@ -669,6 +700,10 @@ impl WorkersModel {
 
     pub fn state(&self) -> &Entity<AppState> {
         &self.state
+    }
+
+    pub fn spaces(&self) -> &[zeron_workers_unpeel::space_registry::SpaceRef] {
+        &self.spaces
     }
 
     pub fn projects(&self) -> &[WorkersProject] {
@@ -1425,12 +1460,19 @@ impl WorkersModel {
         }));
     }
 
-    pub fn add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Add a folder: create or reuse its project in the registry and select
+    /// the checkout registered for it.
+    pub fn add_project(
+        &mut self,
+        path: PathBuf,
+        registry: crate::workers::registry::AppSpaceRegistry,
+        cx: &mut Context<Self>,
+    ) {
         self.run_action(
-            move |client| client.add_project(&path),
-            |model, project_id| {
+            move |client| client.add_project(&path, &registry),
+            |model, added| {
                 model.route = WorkersRoute::Workspace;
-                model.selected_project_id = Some(project_id);
+                model.selected_project_id = Some(added.checkout_id);
                 model.selected_session_id = None;
                 model.launcher_project_id = None;
             },
@@ -2550,6 +2592,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         }
     }
 

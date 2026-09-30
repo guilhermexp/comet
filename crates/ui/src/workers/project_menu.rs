@@ -11,7 +11,7 @@ pub const ASSOCIATION_PENDING_PROJECT_ID: &str = "comet-association-pending";
 pub fn is_presentation_container(project: &WorkersProject) -> bool {
     project.is_group
         && (project.id == ASSOCIATION_PENDING_PROJECT_ID
-            || (project.repository_id.is_some() && project.path.trim().is_empty()))
+            || (project.space_id.is_some() && project.path.trim().is_empty()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +173,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         }
     }
 
@@ -324,7 +325,7 @@ mod tests {
         container.id = "repo-1".into();
         container.is_group = true;
         container.path.clear();
-        container.repository_id = Some("repo-1".into());
+        container.space_id = Some("repo-1".into());
         assert!(project_menu_items(&container, &[]).is_empty());
     }
 }

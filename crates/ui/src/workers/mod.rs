@@ -8,6 +8,7 @@ pub mod notification_policy;
 pub mod presentation;
 pub mod project_menu;
 pub mod recent;
+pub mod registry;
 pub mod resource_monitor;
 pub mod session_gallery;
 pub mod session_menu;

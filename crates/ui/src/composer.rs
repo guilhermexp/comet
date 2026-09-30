@@ -5791,16 +5791,18 @@ struct SlashState {
     dismissed: Option<(Range<usize>, String)>,
 }
 
-/// One row of the popup's Projects section: a known project, referenced by
-/// name with its absolute path.
+/// One row of the popup's Projects section: a registry project (Space),
+/// referenced by name with its absolute path on its device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectMention {
     name: String,
     path: String,
+    /// Name of the device that owns the project.
+    device: Option<String>,
 }
 
 /// Projects matching the `@` query by name or path (case-insensitive); an
-/// empty query lists them all. Pure — filtering the ledger snapshot the
+/// empty query lists them all. Pure — filtering the registry snapshot the
 /// composer already holds, so no IO per keystroke.
 fn filter_project_mentions(projects: &[ProjectMention], query: &str) -> Vec<ProjectMention> {
     let needle = query.to_lowercase();
@@ -5815,25 +5817,40 @@ fn filter_project_mentions(projects: &[ProjectMention], query: &str) -> Vec<Proj
         .collect()
 }
 
-/// The project ledger — the same list Settings → Projects shows: every folder
-/// the app has ever seen, most recently active first. Read straight from
-/// `app-state.json` (no Workers daemon round-trip): mentioning a project must
-/// work whether or not the local Workers host is up.
-fn read_project_ledger() -> Vec<ProjectMention> {
-    let mut rows = match zeron_workers_unpeel::project_ledger::read() {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(%error, "project ledger read failed");
-            return Vec::new();
-        }
-    };
-    rows.sort_by(|a, b| b.last_seen_at_unix_ms.cmp(&a.last_seen_at_unix_ms));
-    rows.into_iter()
-        .map(|row| ProjectMention {
-            name: row.name,
-            path: row.path,
+/// The registry's projects — the same list Settings → Projects and the chat
+/// MCP `list_projects` show — each with its device, most recently active
+/// first (latest chat activity, else creation).
+fn project_mentions(
+    spaces: &[zeron_proto::Space],
+    devices: &[zeron_proto::Device],
+    chats: &[zeron_proto::Chat],
+) -> Vec<ProjectMention> {
+    let mut rows: Vec<(i64, ProjectMention)> = spaces
+        .iter()
+        .map(|space| {
+            let activity = chats
+                .iter()
+                .filter(|chat| chat.space_id.as_deref() == Some(space.id.as_str()))
+                .map(|chat| {
+                    chat.last_message_at
+                        .unwrap_or(chat.created_at)
+                        .timestamp_millis()
+                })
+                .max()
+                .unwrap_or_else(|| space.created_at.timestamp_millis());
+            let mention = ProjectMention {
+                name: space.display_name().to_owned(),
+                path: space.path.clone(),
+                device: devices
+                    .iter()
+                    .find(|device| device.id == space.device_id)
+                    .map(|device| device.name.clone()),
+            };
+            (activity, mention)
         })
-        .collect()
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    rows.into_iter().map(|(_, mention)| mention).collect()
 }
 
 /// Which level of the `@` menu is showing: the root (a Projects entry over the
@@ -6056,7 +6073,6 @@ pub struct Composer {
     /// Settings → Projects' ledger, snapshotted when the `@` menu opens; the
     /// Projects level filters this, never disk.
     project_ledger: Vec<ProjectMention>,
-    project_ledger_task: Option<Task<()>>,
     slash_task: Option<Task<()>>,
     slash: SlashState,
     /// Advertised invocations for the current device/harness/workspace.
@@ -6344,7 +6360,6 @@ impl Composer {
             mention_task: None,
             mention: FileMentionState::default(),
             project_ledger: Vec::new(),
-            project_ledger_task: None,
             slash_task: None,
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
@@ -7573,24 +7588,15 @@ impl Composer {
         cx.notify();
     }
 
-    /// Snapshot the project ledger off the UI thread. Cheap (one JSON read),
-    /// so it re-runs per `@` open instead of caching for the session.
+    /// Snapshot the registry's projects the window already watches. No IO:
+    /// re-read per `@` open instead of cached for the session.
     fn load_project_ledger(&mut self, cx: &mut Context<Self>) {
-        self.project_ledger_task = Some(cx.spawn(async move |this, cx| {
-            let projects = cx
-                .background_executor()
-                .spawn(async move { read_project_ledger() })
-                .await;
-            this.update(cx, |composer, cx| {
-                composer.project_ledger = projects;
-                if let Some(token) = composer.mention.token.clone() {
-                    composer.mention.projects =
-                        filter_project_mentions(&composer.project_ledger, &token.query);
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        let state = self.state.read(cx);
+        self.project_ledger = project_mentions(&state.spaces, &state.devices, &state.chats);
+        if let Some(token) = self.mention.token.clone() {
+            self.mention.projects = filter_project_mentions(&self.project_ledger, &token.query);
+        }
+        cx.notify();
     }
 
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -7863,7 +7869,16 @@ impl Composer {
                                     .text_size(px(12.5))
                                     .text_color(theme.text_muted)
                                     .child(project.path.clone()),
-                            ),
+                            )
+                            .when_some(project.device.clone(), |el, device| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted)
+                                        .child(device),
+                                )
+                            }),
                     )
                     .into_any_element(),
             );
@@ -14920,10 +14935,12 @@ mod tests {
             ProjectMention {
                 name: ".orchestrator".into(),
                 path: "/Users/x/.orchestrator".into(),
+                device: None,
             },
             ProjectMention {
                 name: "comet".into(),
                 path: "/Users/x/Projects/comet".into(),
+                device: None,
             },
         ];
         assert_eq!(filter_project_mentions(&ledger, "").len(), 2);
@@ -14940,12 +14957,71 @@ mod tests {
         assert!(filter_project_mentions(&ledger, "nothing").is_empty());
     }
 
+    /// Scenario "Mentioning a project": the offered projects are the
+    /// registry's projects with their device, newest activity first.
+    #[test]
+    fn project_mentions_are_the_registry_projects_with_their_device() {
+        use chrono::TimeZone;
+        let at = |ms: i64| chrono::Utc.timestamp_millis_opt(ms).unwrap();
+        let space = |id: &str, device: &str, path: &str, created: i64| zeron_proto::Space {
+            id: id.into(),
+            device_id: device.into(),
+            path: path.into(),
+            name: None,
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: at(created),
+        };
+        let device = |id: &str, name: &str| zeron_proto::Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
+        };
+        let spaces = vec![
+            space("s-orch", "dev-local", "/Users/x/orchestrator", 10),
+            space("s-craft", "dev-mini", "/Users/y/craft-agents-oss", 20),
+        ];
+        let devices = vec![
+            device("dev-local", "MacBook"),
+            device("dev-mini", "Mac mini"),
+        ];
+        let mut chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "c1", "deviceId": "dev-local", "archived": false,
+            "spaceId": "s-orch", "createdAt": "2026-09-29T00:00:00Z"
+        }))
+        .unwrap();
+        chat.last_message_at = Some(at(99_999));
+        let mentions = project_mentions(&spaces, &devices, &[chat]);
+        assert_eq!(
+            mentions,
+            vec![
+                ProjectMention {
+                    name: "orchestrator".into(),
+                    path: "/Users/x/orchestrator".into(),
+                    device: Some("MacBook".into()),
+                },
+                ProjectMention {
+                    name: "craft-agents-oss".into(),
+                    path: "/Users/y/craft-agents-oss".into(),
+                    device: Some("Mac mini".into()),
+                },
+            ]
+        );
+    }
+
     #[test]
     fn mention_menu_navigates_root_then_projects() {
         let mut state = FileMentionState {
             projects: vec![ProjectMention {
                 name: ".orchestrator".into(),
                 path: "/Users/x/.orchestrator".into(),
+                device: None,
             }],
             results: vec![
                 FileSearchMatch {

@@ -24,6 +24,7 @@ pub mod devices;
 pub mod files;
 pub mod harnesses;
 pub mod notifications;
+pub mod project_catalog;
 pub mod projects;
 pub mod shortcuts;
 pub mod thread_naming;

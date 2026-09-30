@@ -1,12 +1,14 @@
-//! Settings → Projects: a lista durável de tudo que o app já viu, e o detalhe
-//! do projeto selecionado.
+//! Settings → Projects: os projetos do registro único (Spaces de todos os
+//! devices, cada um rotulado com o device) e o detalhe do selecionado.
 //!
-//! A lista agrupa os checkouts pelo projeto lógico persistido; o detalhe
-//! seleciona o checkout exato para configuração e ações. Workers usa a mesma
-//! identidade, mas exibe o working set. Arquivar preserva sessões e arquivos;
-//! Forget suprime metadados históricos sem apagar diretórios ou sessões.
+//! Um projeto é um Space. Projetos locais mostram o histórico de checkouts
+//! deste device ligados a ele (principal e worktrees), com config, worktree,
+//! Auto Doc e Danger Zone por checkout; projetos de outro device mostram só
+//! identidade e device. Checkouts sem projeto ficam em "Association pending".
+//! A aba Sessions lista chats e sessões Worker do projeto e abre cada uma num
+//! painel lateral sem sair da página.
 //!
-//! Git é lido apenas para o projeto SELECIONADO: `status` e os dois commits
+//! Git é lido apenas para o checkout SELECIONADO: `status` e os dois commits
 //! âncora custam processos, e o reference faz igual — `getGitStatus` e
 //! `getCommitContext` são consultas por id, não parte da listagem.
 
@@ -21,16 +23,24 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use zeron_rpc::methods;
 use zeron_workers_unpeel::project_git::{self, ProjectGitStatus, Visibility};
 use zeron_workers_unpeel::project_ledger;
 use zeron_workers_unpeel::worktree_config::{self, ConfigTarget, WorktreeConfig};
 use zeron_workers_unpeel::{
-    AnchorCommit, LocalWorkersClient, ProjectRow, RepositoryIdentity, WorkersWorktrunkHooksSnapshot,
+    AnchorCommit, LocalWorkersClient, ProjectRow, RepositoryIdentity, WorkerParentLink,
+    WorkersSession, WorkersWorktrunkHooksSnapshot,
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::settings::project_catalog::{
+    self, ProjectEntry, SessionKind, SessionPanelTarget, SessionRow,
+};
 use crate::settings::widgets;
+use crate::state::AppState;
 use crate::theme::{Theme, ink};
+use crate::transcript::Transcript;
+use crate::workers::terminal::WorkersTerminal;
 
 /// Largura da coluna da lista. O reference deixa arrastar entre 200 e 400px;
 /// aqui é fixa — a página já vive dentro do painel de settings, que tem a
@@ -385,13 +395,58 @@ fn should_show_worktrunk_hooks(source_exists: bool, command_count: usize, has_er
     source_exists || command_count > 0 || has_error
 }
 
+/// The selected list row: a registry project, or a checkout pending
+/// association (keyed by path — a ledger-only row has no id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectKey {
+    Project(String),
+    Pending(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailTab {
+    General,
+    Sessions,
+}
+
+/// The session opened beside the Sessions list, reusing the surfaces the
+/// shell opens from a chat: the Worker terminal (live, or a read-only replay
+/// of a stopped/archived one) and the chat transcript.
+enum SessionPanel {
+    Worker {
+        title: SharedString,
+        terminal: Entity<WorkersTerminal>,
+    },
+    Chat {
+        chat_id: String,
+        title: SharedString,
+        transcript: Entity<Transcript>,
+    },
+}
+
+pub enum ProjectsPageEvent {
+    /// "Go to chat" from the chat panel: leave Settings for that chat.
+    OpenChat(String),
+}
+
+impl gpui::EventEmitter<ProjectsPageEvent> for ProjectsPage {}
+
 pub struct ProjectsPage {
+    state: Entity<AppState>,
     client: LocalWorkersClient,
     rows: Vec<ProjectRow>,
     repositories: Vec<RepositoryIdentity>,
-    /// Path canônico do selecionado — id não serve: uma linha só do ledger não
-    /// tem id.
+    /// Worker sessions (live and archived) and their parent chats, for the
+    /// Sessions tab.
+    workers: Vec<WorkersSession>,
+    parent_links: Vec<WorkerParentLink>,
+    selected_project: Option<ProjectKey>,
+    /// Path canônico do checkout selecionado — id não serve: uma linha só do
+    /// ledger não tem id.
     selected: Option<String>,
+    tab: DetailTab,
+    selected_session: Option<String>,
+    session_panel: Option<SessionPanel>,
     search: Entity<ComposerInput>,
     name_input: Entity<ComposerInput>,
     config_shared_input: Entity<ComposerInput>,
@@ -414,7 +469,7 @@ pub struct ProjectsPage {
 }
 
 impl ProjectsPage {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let search =
             cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
         let name_input = cx.new(|cx| ComposerInput::new("Project name", cx));
@@ -423,6 +478,8 @@ impl ProjectsPage {
         let config_unix_input = cx.new(|cx| ComposerInput::new("macOS / Linux commands", cx));
         let config_windows_input = cx.new(|cx| ComposerInput::new("Windows commands", cx));
         let events = vec![
+            // Projects, devices and chats come from the registry watches.
+            cx.observe(&state, |_, _, cx| cx.notify()),
             cx.subscribe(&search, |_, _, _: &ComposerInputEvent, cx| cx.notify()),
             // O `ComposerInput` nao emite blur e nao expoe o focus handle, e o
             // repo nao tem idiom de `on_blur`. As duas saidas reais do campo
@@ -459,10 +516,17 @@ impl ProjectsPage {
             ),
         ];
         let mut page = Self {
+            state,
             client: crate::workers::client::shared(),
             rows: Vec::new(),
             repositories: Vec::new(),
+            workers: Vec::new(),
+            parent_links: Vec::new(),
+            selected_project: None,
             selected: None,
+            tab: DetailTab::General,
+            selected_session: None,
+            session_panel: None,
             search,
             name_input,
             config_shared_input,
@@ -504,6 +568,22 @@ impl ProjectsPage {
                     let identity = client.project_identity_registry()?;
                     let rows = project_ledger::decorate_with_identity(rows, &identity);
                     let repositories = identity.repositories.clone();
+                    // Sessions tab: live sessions plus every checkout's
+                    // archived ones. Missing history is an empty tab, never an
+                    // error for the whole page.
+                    let mut workers = client
+                        .bootstrap()
+                        .map(|bootstrap| bootstrap.sessions)
+                        .unwrap_or_default();
+                    for project_id in rows.iter().filter_map(|row| row.project_id.as_deref()) {
+                        for session in client.archived_sessions(project_id).unwrap_or_default() {
+                            if !workers.iter().any(|known| known.id == session.id) {
+                                workers.push(session);
+                            }
+                        }
+                    }
+                    let parent_links =
+                        zeron_workers_unpeel::worker_parent_links().unwrap_or_default();
                     let icons = rows
                         .iter()
                         .filter_map(|row| {
@@ -516,25 +596,23 @@ impl ProjectsPage {
                         icons,
                         repositories,
                         reconciliation_error,
+                        workers,
+                        parent_links,
                     ))
                 })
                 .await;
             this.update(cx, |page, cx| {
                 page.loading = false;
                 match loaded {
-                    Ok((rows, icons, repositories, reconciliation_error)) => {
+                    Ok((rows, icons, repositories, reconciliation_error, workers, links)) => {
                         page.error =
                             reconciliation_error.map(|error| SharedString::from(error.to_string()));
-                        if page.selected.is_none()
-                            || page.selected.as_deref().is_some_and(|selected| {
-                                !rows.iter().any(|row| row.path == selected)
-                            })
-                        {
-                            page.selected = rows.first().map(|row| row.path.clone());
-                        }
                         page.icon_images = icons;
                         page.repositories = repositories;
                         page.rows = rows;
+                        page.workers = workers;
+                        page.parent_links = links;
+                        page.heal_selection(cx);
                         page.load_detail(cx);
                     }
                     Err(error) => page.error = Some(SharedString::from(error.to_string())),
@@ -545,16 +623,128 @@ impl ProjectsPage {
         }));
     }
 
+    /// The registry's projects joined with this device's checkout history,
+    /// and the checkouts linked to no project.
+    fn catalog(&self, cx: &gpui::App) -> (Vec<ProjectEntry>, Vec<ProjectRow>) {
+        let state = self.state.read(cx);
+        project_catalog::project_entries(
+            &state.spaces,
+            &state.devices,
+            state.local_device_id.as_deref(),
+            &state.chats,
+            &self.rows,
+        )
+    }
+
+    fn selected_entry(&self, cx: &gpui::App) -> Option<ProjectEntry> {
+        let Some(ProjectKey::Project(id)) = self.selected_project.as_ref() else {
+            return None;
+        };
+        self.catalog(cx)
+            .0
+            .into_iter()
+            .find(|entry| &entry.space.id == id)
+    }
+
     fn selected_row(&self) -> Option<&ProjectRow> {
         let path = self.selected.as_deref()?;
         self.rows.iter().find(|row| row.path == path)
     }
 
-    fn selected_group(&self) -> Option<project_ledger::ProjectGroup> {
-        let path = self.selected.as_deref()?;
-        project_ledger::group_rows(&self.rows)
-            .into_iter()
-            .find(|group| group.checkouts.iter().any(|row| row.path == path))
+    fn selected_group(&self, cx: &gpui::App) -> Option<project_ledger::ProjectGroup> {
+        self.selected_entry(cx)
+            .map(|entry| entry.group)
+            .filter(|group| !group.checkouts.is_empty())
+    }
+
+    /// Keep the selection on a row that still exists, else the first project.
+    fn heal_selection(&mut self, cx: &mut Context<Self>) {
+        let (entries, pending) = self.catalog(cx);
+        let still_there = match self.selected_project.as_ref() {
+            Some(ProjectKey::Project(id)) => entries.iter().any(|entry| &entry.space.id == id),
+            Some(ProjectKey::Pending(path)) => pending.iter().any(|row| &row.path == path),
+            None => false,
+        };
+        if still_there {
+            if let Some(entry) = self.selected_entry(cx)
+                && !entry
+                    .group
+                    .checkouts
+                    .iter()
+                    .any(|row| self.selected.as_deref() == Some(row.path.as_str()))
+            {
+                self.selected = entry.group.selected_checkout().map(|row| row.path.clone());
+            }
+            return;
+        }
+        let first = entries
+            .first()
+            .map(|entry| ProjectKey::Project(entry.space.id.clone()))
+            .or_else(|| {
+                pending
+                    .first()
+                    .map(|row| ProjectKey::Pending(row.path.clone()))
+            });
+        if let Some(key) = first {
+            self.apply_selection(key, None, cx);
+        }
+    }
+
+    fn apply_selection(
+        &mut self,
+        key: ProjectKey,
+        checkout: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (entries, _) = self.catalog(cx);
+        let (name, checkout) = match &key {
+            ProjectKey::Project(id) => {
+                let entry = entries.iter().find(|entry| &entry.space.id == id);
+                (
+                    entry.map(|entry| entry.space.name.clone()),
+                    checkout.or_else(|| {
+                        entry.and_then(|entry| {
+                            entry.group.selected_checkout().map(|row| row.path.clone())
+                        })
+                    }),
+                )
+            }
+            ProjectKey::Pending(path) => (
+                self.rows
+                    .iter()
+                    .find(|row| &row.path == path)
+                    .map(|row| row.name.clone()),
+                Some(path.clone()),
+            ),
+        };
+        if self.selected_project.as_ref() != Some(&key) {
+            self.close_session_panel(cx);
+            self.selected_session = None;
+        }
+        self.selected_project = Some(key);
+        self.selected = checkout;
+        self.name_input.update(cx, |input, cx| {
+            input.set_text(name.unwrap_or_default(), cx);
+        });
+        self.confirm_forget = false;
+    }
+
+    fn select_project(
+        &mut self,
+        key: ProjectKey,
+        checkout: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_project.as_ref() == Some(&key) && checkout.is_none() {
+            return;
+        }
+        // Sair da linha e uma das duas saidas do campo de nome.
+        self.commit_rename(cx);
+        self.save_config(cx);
+        self.apply_selection(key, checkout, cx);
+        self.detail = None;
+        self.load_detail(cx);
+        cx.notify();
     }
 
     fn load_detail(&mut self, cx: &mut Context<Self>) {
@@ -562,10 +752,6 @@ impl ProjectsPage {
             self.detail = None;
             return;
         };
-        self.name_input.update(cx, |input, cx| {
-            input.set_text(&row.name, cx);
-        });
-        self.confirm_forget = false;
         let added = row.added_at_unix_ms;
         let opened = row.last_opened_at_unix_ms;
         let selected_path = row.path.clone();
@@ -659,10 +845,22 @@ impl ProjectsPage {
     }
 
     fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let typed = self.name_input.read(cx).text().to_owned();
+        if let Some(entry) = self.selected_entry(cx) {
+            // The project's name is the Space's: renaming it renames the
+            // project on every device and in every listing.
+            let Some(next) = resolve_rename(&typed, &entry.space.name) else {
+                self.name_input.update(cx, |input, cx| {
+                    input.set_text(&entry.space.name, cx);
+                });
+                return;
+            };
+            self.rename_project(entry.space.id, next, cx);
+            return;
+        }
         let Some(row) = self.selected_row().cloned() else {
             return;
         };
-        let typed = self.name_input.read(cx).text().to_owned();
         let Some(next) = resolve_rename(&typed, &row.name) else {
             // Vazio ou inalterado: o campo volta ao valor salvo em vez de
             // gravar. É o que o reference faz no blur.
@@ -698,6 +896,34 @@ impl ProjectsPage {
             },
             "Project renamed",
         );
+    }
+
+    /// `Mutate renameSpace` — local and remote projects alike.
+    fn rename_project(&mut self, space_id: String, name: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some(SharedString::from("Engine not connected"));
+            cx.notify();
+            return;
+        };
+        self.notice = None;
+        self.error = None;
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::MUTATE,
+                    project_catalog::rename_project_params(&space_id, &name),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(_) => page.notice = Some(SharedString::from("Project renamed")),
+                    Err(error) => page.error = Some(SharedString::from(error.to_string())),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn edited_config(&self, cx: &gpui::App) -> WorktreeConfig {
@@ -853,6 +1079,17 @@ impl ProjectsPage {
             prompt: Some("Add Project".into()),
         });
         let client = self.client.clone();
+        // "+" adds the folder's project on this device (or reuses it) and
+        // registers its checkout — the same path the Workers palette takes.
+        let Some(registry) =
+            crate::workers::registry::AppSpaceRegistry::from_state(self.state.read(cx))
+        else {
+            self.error = Some(SharedString::from(
+                "Engine not connected: cannot add a project",
+            ));
+            cx.notify();
+            return;
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
                 return;
@@ -862,11 +1099,16 @@ impl ProjectsPage {
             };
             let added = cx
                 .background_executor()
-                .spawn(async move { client.add_project(&path) })
+                .spawn(async move { client.add_project(&path, &registry) })
                 .await;
             this.update(cx, |page, cx| {
-                if let Err(error) = added {
-                    page.error = Some(SharedString::from(error.to_string()));
+                match added {
+                    Ok(added) => page.apply_selection(
+                        ProjectKey::Project(added.space.id),
+                        Some(added.path),
+                        cx,
+                    ),
+                    Err(error) => page.error = Some(SharedString::from(error.to_string())),
                 }
                 page.reload(cx);
                 cx.notify();
@@ -975,14 +1217,42 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// The Worker surface the shell opens from a chat (`add_worker_surface`):
+/// a `WorkersTerminal` attached to one session, `stopped` for a read-only
+/// replay of its recorded output.
+fn worker_surface(
+    session_id: &str,
+    stopped: bool,
+    cx: &mut Context<ProjectsPage>,
+) -> Entity<WorkersTerminal> {
+    let terminal = cx.new(WorkersTerminal::new);
+    terminal.update(cx, |terminal, cx| {
+        terminal.set_session(Some(session_id.to_owned()), cx);
+        terminal.set_stopped(stopped, cx);
+    });
+    terminal
+}
+
 impl Render for ProjectsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
         let query = self.search.read(cx).text().to_owned();
-        let groups = project_ledger::group_rows(&self.rows);
-        let visible: Vec<project_ledger::ProjectGroup> = groups
+        if self.selected_project.is_none() {
+            self.heal_selection(cx);
+            self.load_detail(cx);
+        }
+        let (entries, pending) = self.catalog(cx);
+        let visible: Vec<(ProjectEntry, Option<String>)> = entries
             .into_iter()
-            .filter(|group| project_ledger::group_matches_query(group, &query).is_some())
+            .filter_map(|entry| {
+                let focus =
+                    project_catalog::entry_match(&entry, &query)?.map(|row| row.path.clone());
+                Some((entry, focus))
+            })
+            .collect();
+        let pending_visible: Vec<ProjectRow> = pending
+            .into_iter()
+            .filter(|row| matches_query(row, &query))
             .collect();
         let now_ms = Utc::now().timestamp_millis().max(0) as u64;
 
@@ -991,7 +1261,7 @@ impl Render for ProjectsPage {
             .flex_row()
             .size_full()
             .overflow_hidden()
-            .child(self.render_list(&theme, &visible, &query, now_ms, cx))
+            .child(self.render_list(&theme, &visible, &pending_visible, now_ms, cx))
             .child(self.render_detail(&theme, now_ms, cx))
     }
 }
@@ -1000,39 +1270,24 @@ impl ProjectsPage {
     fn render_list(
         &mut self,
         theme: &Theme,
-        visible: &[project_ledger::ProjectGroup],
-        query: &str,
+        visible: &[(ProjectEntry, Option<String>)],
+        pending: &[ProjectRow],
         now_ms: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let empty_all = self.rows.is_empty();
-        let (regular_groups, pending_groups): (Vec<_>, Vec<_>) =
-            visible.iter().partition(|group| !group.has_pending());
-        let render_group = |group: &project_ledger::ProjectGroup| {
-            let target = project_ledger::group_matches_query(group, query)
-                .or_else(|| group.selected_checkout());
-            let selected = group
-                .checkouts
-                .iter()
-                .any(|row| self.selected.as_deref() == Some(row.path.as_str()));
-            let path = target.map(|row| row.path.clone()).unwrap_or_default();
-            let project_icon = target
-                .and_then(|row| self.icon_images.get(&row.path).cloned())
-                .or_else(|| {
-                    group
-                        .icon_path
-                        .as_deref()
-                        .and_then(|path| self.icon_images.get(path).cloned())
-                });
-            let checkout_count = group.checkouts.len();
-            let subtitle = format!(
-                "{} checkout{} · Last opened {}",
-                checkout_count,
-                if checkout_count == 1 { "" } else { "s" },
-                format_last_opened(group.last_opened_at_unix_ms, now_ms)
-            );
+        let empty_all = self.state.read(cx).spaces.is_empty() && self.rows.is_empty();
+        let list_row = |id: SharedString,
+                        key: ProjectKey,
+                        focus: Option<String>,
+                        name: String,
+                        subtitle: String,
+                        icon: Option<Arc<Image>>,
+                        remote: bool,
+                        page: &Self,
+                        cx: &mut Context<Self>| {
+            let selected = page.selected_project.as_ref() == Some(&key);
             div()
-                .id(SharedString::from(format!("project-row-{}", group.id)))
+                .id(id)
                 .flex_none()
                 .flex()
                 .flex_row()
@@ -1044,18 +1299,24 @@ impl ProjectsPage {
                 .cursor_pointer()
                 .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
                 .hover(|s| s.bg(theme.glass_hover()))
-                .on_click(cx.listener(move |page, _, _, cx| page.select(path.clone(), cx)))
-                .child(match project_icon {
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    page.select_project(key.clone(), focus.clone(), cx)
+                }))
+                .child(match icon {
                     Some(image) => img(image)
                         .w(px(18.0))
                         .h(px(18.0))
                         .rounded(px(4.0))
                         .object_fit(ObjectFit::Cover)
                         .into_any_element(),
-                    None => crate::icons::icon(crate::icons::FOLDER)
-                        .size(px(16.0))
-                        .text_color(theme.text_muted)
-                        .into_any_element(),
+                    None => crate::icons::icon(if remote {
+                        crate::icons::GLOBE
+                    } else {
+                        crate::icons::FOLDER
+                    })
+                    .size(px(16.0))
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
                 })
                 .child(
                     div()
@@ -1072,7 +1333,7 @@ impl ProjectsPage {
                                 } else {
                                     theme.text_muted
                                 })
-                                .child(SharedString::from(group.name.clone())),
+                                .child(SharedString::from(name)),
                         )
                         .child(
                             div()
@@ -1084,14 +1345,48 @@ impl ProjectsPage {
                 )
                 .into_any_element()
         };
-        let rows: Vec<AnyElement> = regular_groups
+        let rows: Vec<AnyElement> = visible
             .iter()
-            .map(|group| render_group(group))
+            .map(|(entry, focus)| {
+                let icon = entry
+                    .group
+                    .icon_path
+                    .as_deref()
+                    .and_then(|_| entry.group.selected_checkout())
+                    .and_then(|row| self.icon_images.get(&row.path).cloned());
+                list_row(
+                    SharedString::from(format!("project-row-{}", entry.space.id)),
+                    ProjectKey::Project(entry.space.id.clone()),
+                    focus.clone(),
+                    entry.space.name.clone(),
+                    project_subtitle(entry, now_ms),
+                    icon,
+                    !entry.space.local,
+                    self,
+                    cx,
+                )
+            })
             .collect();
-        let pending_rows: Vec<AnyElement> = pending_groups
+        let pending_rows: Vec<AnyElement> = pending
             .iter()
-            .map(|group| render_group(group))
+            .map(|row| {
+                list_row(
+                    SharedString::from(format!("pending-row-{}", row.path)),
+                    ProjectKey::Pending(row.path.clone()),
+                    None,
+                    row.name.clone(),
+                    format!(
+                        "Checkout · Last opened {}",
+                        format_last_opened(row.last_opened_at_unix_ms, now_ms)
+                    ),
+                    self.icon_images.get(&row.path).cloned(),
+                    false,
+                    self,
+                    cx,
+                )
+            })
             .collect();
+        let nothing_visible = rows.is_empty() && pending_rows.is_empty();
 
         div()
             .flex_none()
@@ -1154,7 +1449,7 @@ impl ProjectsPage {
                         el.child(quiet(theme, "No projects"))
                             .child(quiet(theme, "Add one with the + above"))
                     })
-                    .when(!empty_all && visible.is_empty(), |el| {
+                    .when(!empty_all && nothing_visible, |el| {
                         el.child(quiet(theme, "No results found"))
                     })
                     .children(rows)
@@ -1171,77 +1466,530 @@ impl ProjectsPage {
     }
 }
 
+/// "{device} · N checkouts · Last opened X" — device first, since the same
+/// folder name can exist on two machines.
+fn project_subtitle(entry: &ProjectEntry, now_ms: u64) -> String {
+    let device = entry
+        .space
+        .device_name
+        .clone()
+        .unwrap_or_else(|| entry.space.device_id.chars().take(8).collect());
+    let checkouts = entry.group.checkouts.len();
+    let checkouts = if entry.space.local && checkouts > 0 {
+        format!(
+            " · {checkouts} checkout{}",
+            if checkouts == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    let opened = if entry.last_activity_ms == 0 {
+        "never".to_owned()
+    } else {
+        format_last_opened(entry.last_activity_ms, now_ms)
+    };
+    format!("{device}{checkouts} · Last opened {opened}")
+}
+
 impl ProjectsPage {
     fn render_detail(&mut self, theme: &Theme, now_ms: u64, cx: &mut Context<Self>) -> AnyElement {
-        let Some(row) = self.selected_row().cloned() else {
-            return div()
+        let entry = self.selected_entry(cx);
+        let placeholder = |text: &'static str| {
+            div()
                 .flex_1()
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(quiet(theme, "Select a project to view its settings"))
-                .into_any_element();
+                .child(quiet(theme, text))
+                .into_any_element()
         };
-        let detail = self.detail.clone().unwrap_or_default();
-        let filesystem_available = row.is_available() && detail.folder_exists;
-        let runnable = row.is_live() && filesystem_available && !row.archived;
-        let selected_group = self.selected_group();
-        let config_error = self
-            .config_writes
-            .error_for(&row.path)
-            .map(|error| SharedString::from(error.to_owned()));
+        let Some(entry) = entry else {
+            return match self.selected_row().cloned() {
+                Some(row) if matches!(self.selected_project, Some(ProjectKey::Pending(_))) => {
+                    let messages = self.render_messages(theme, Some(&row));
+                    let sections = self.render_checkout_sections(theme, &row, now_ms, true, cx);
+                    self.render_scroll(
+                        format!("projects-detail-pending-{}", row.path),
+                        widgets::page_column()
+                            .child(widgets::page_header(theme, "Association pending", None))
+                            .child(messages)
+                            .child(sections),
+                    )
+                }
+                _ => placeholder("Select a project to view its settings"),
+            };
+        };
+        if self.tab == DetailTab::Sessions {
+            return self.render_sessions(theme, &entry, now_ms, cx);
+        }
+        let row = self.selected_row().cloned().filter(|row| {
+            entry
+                .group
+                .checkouts
+                .iter()
+                .any(|known| known.path == row.path)
+        });
+        let selected_group = self.selected_group(cx);
+        let column = widgets::page_column()
+            .child(self.render_tabs(theme, cx))
+            .child(self.render_messages(theme, row.as_ref()))
+            .child(self.render_identity(theme, &entry, cx));
+        let column = if !entry.space.local {
+            column.child(quiet(
+                theme,
+                "This project lives on another device: its checkouts, config and Worker actions are managed there.",
+            ))
+        } else if let Some(row) = row {
+            column
+                .when_some(selected_group, |el, group| {
+                    el.child(self.render_checkout_picker(theme, &group, cx))
+                })
+                .child(self.render_checkout_sections(theme, &row, now_ms, false, cx))
+        } else {
+            column.child(quiet(
+                theme,
+                "No checkout of this project on this device yet. Add its folder with + or launch a Worker into it.",
+            ))
+        };
+        self.render_scroll(format!("projects-detail-{}", entry.space.id), column)
+    }
 
+    fn render_scroll(&self, id: String, column: gpui::Div) -> AnyElement {
         div()
-            .id(SharedString::from(format!(
-                "projects-detail-scroll-{}",
-                row.path
-            )))
+            .id(SharedString::from(id))
             .flex_1()
             .min_w_0()
             .min_h_0()
             .h_full()
             .overflow_y_scroll()
+            .child(column)
+            .into_any_element()
+    }
+
+    fn render_messages(&self, theme: &Theme, row: Option<&ProjectRow>) -> gpui::Div {
+        let config_error = row
+            .and_then(|row| self.config_writes.error_for(&row.path))
+            .map(|error| SharedString::from(error.to_owned()));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .when_some(self.error.clone().or(config_error), |el, message| {
+                el.child(widgets::error_strip(theme, message))
+            })
+            .when_some(self.notice.clone(), |el, message| {
+                el.child(widgets::page_subtitle(theme, message))
+            })
+    }
+
+    fn render_tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let tab = |label: &'static str, value: DetailTab, page: &Self, cx: &mut Context<Self>| {
+            let active = page.tab == value;
+            div()
+                .id(SharedString::from(format!("projects-tab-{label}")))
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .text_size(crate::typography::ui_rems(13.0))
+                .text_color(if active { theme.text } else { theme.text_muted })
+                .when(active, |el| el.bg(crate::theme::glass_selected_bg()))
+                .hover(|s| s.bg(theme.glass_hover()))
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    page.tab = value;
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(4.0))
+            .pt(px(Theme::TITLEBAR_HEIGHT))
+            .child(tab("General", DetailTab::General, self, cx))
+            .child(tab("Sessions", DetailTab::Sessions, self, cx))
+            .into_any_element()
+    }
+
+    /// Name (renames the Space), device, path, Git and creation date — what
+    /// every project shows, whichever device owns it.
+    fn render_identity(
+        &mut self,
+        theme: &Theme,
+        entry: &ProjectEntry,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let device = entry
+            .space
+            .device_name
+            .clone()
+            .unwrap_or_else(|| entry.space.device_id.clone());
+        let device = if entry.space.local {
+            format!("{device} (this device)")
+        } else {
+            device
+        };
+        let created = DateTime::<Utc>::from_timestamp_millis(entry.created_at_ms)
+            .map(|at| at.with_timezone(&Local).format("%b %-d, %Y").to_string())
+            .unwrap_or_default();
+        widgets::section_card(theme)
             .child(
-                widgets::page_column()
-                    .child(widgets::page_header(theme, "General", None))
-                    .when_some(self.error.clone().or(config_error), |el, message| {
-                        el.child(widgets::error_strip(theme, message))
-                    })
-                    .when_some(self.notice.clone(), |el, message| {
-                        el.child(widgets::page_subtitle(theme, message))
-                    })
-                    .when_some(selected_group, |el, group| {
-                        el.child(self.render_checkout_picker(theme, &group, cx))
-                    })
-                    .child(self.render_general(
+                widgets::card_row(theme, true)
+                    .child(label_block(theme, "Name", "Project name on every device"))
+                    .child(
+                        field_frame(self.name_input.clone().into_any_element())
+                            .flex_none()
+                            .w(px(280.0)),
+                    ),
+            )
+            .child(
+                widgets::card_row(theme, false)
+                    .child(label_block(
                         theme,
-                        &row,
-                        &detail,
-                        now_ms,
-                        filesystem_available,
-                        cx,
+                        "Device",
+                        "The machine that owns this project",
                     ))
-                    .when_some(self.render_association(theme, &row, cx), |el, card| {
-                        el.child(section_header(theme, "Association")).child(card)
-                    })
-                    .child(section_header(theme, "Config"))
-                    .child(self.render_config(theme, &detail, filesystem_available, cx))
-                    .child(section_header(theme, "Worktree"))
-                    .child(self.render_worktree(theme, &row, &detail, runnable, cx))
-                    .when_some(
-                        self.render_worktrunk_hooks(theme, &row, &detail, cx),
-                        |el, card| {
-                            el.child(section_header(theme, "Worktrunk Hooks"))
-                                .child(card)
+                    .child(quiet(theme, &device)),
+            )
+            .child(
+                widgets::card_row(theme, false)
+                    .child(label_block(theme, "Path", &entry.space.path))
+                    .child(quiet(
+                        theme,
+                        if entry.space.git {
+                            "Git repository"
+                        } else {
+                            "Folder"
                         },
-                    )
-                    .child(section_header(theme, "Auto Doc"))
-                    .child(self.render_auto_doc(theme, &row, &detail, runnable, cx))
-                    .child(section_header(theme, "Danger Zone"))
-                    .child(self.render_danger(theme, &row, cx)),
+                    )),
+            )
+            .child(
+                widgets::card_row(theme, false)
+                    .child(label_block(theme, "Created", "Added to the registry"))
+                    .child(quiet(theme, &created)),
             )
             .into_any_element()
+    }
+
+    /// The per-checkout cards (a local project's selected checkout, or a
+    /// checkout pending association).
+    fn render_checkout_sections(
+        &mut self,
+        theme: &Theme,
+        row: &ProjectRow,
+        now_ms: u64,
+        with_name: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let detail = self.detail.clone().unwrap_or_default();
+        let filesystem_available = row.is_available() && detail.folder_exists;
+        let runnable = row.is_live() && filesystem_available && !row.archived;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(self.render_general(
+                theme,
+                row,
+                &detail,
+                now_ms,
+                filesystem_available,
+                with_name,
+                cx,
+            ))
+            .when_some(self.render_association(theme, row, cx), |el, card| {
+                el.child(section_header(theme, "Association")).child(card)
+            })
+            .child(section_header(theme, "Config"))
+            .child(self.render_config(theme, &detail, filesystem_available, cx))
+            .child(section_header(theme, "Worktree"))
+            .child(self.render_worktree(theme, row, &detail, runnable, cx))
+            .when_some(
+                self.render_worktrunk_hooks(theme, row, &detail, cx),
+                |el, card| {
+                    el.child(section_header(theme, "Worktrunk Hooks"))
+                        .child(card)
+                },
+            )
+            .child(section_header(theme, "Auto Doc"))
+            .child(self.render_auto_doc(theme, row, &detail, runnable, cx))
+            .child(section_header(theme, "Danger Zone"))
+            .child(self.render_danger(theme, row, cx))
+            .into_any_element()
+    }
+
+    fn session_rows(&self, entry: &ProjectEntry, cx: &gpui::App) -> Vec<SessionRow> {
+        let state = self.state.read(cx);
+        project_catalog::session_rows(
+            entry,
+            &state.chats,
+            &state.sessions,
+            &self.workers,
+            &self.parent_links,
+        )
+    }
+
+    /// Open `target` in the side panel beside the list. Nothing here launches
+    /// or restarts a Worker: a stopped, archived or checkout-less session is
+    /// attached read-only and replays its recorded output.
+    fn open_session(
+        &mut self,
+        row_key: String,
+        target: SessionPanelTarget,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_session_panel(cx);
+        self.selected_session = Some(row_key);
+        let title = SharedString::from(title);
+        self.session_panel = Some(match target {
+            SessionPanelTarget::Worker { session_id } => {
+                let terminal = worker_surface(&session_id, false, cx);
+                SessionPanel::Worker { title, terminal }
+            }
+            SessionPanelTarget::WorkerReplay { session_id } => {
+                let terminal = worker_surface(&session_id, true, cx);
+                SessionPanel::Worker { title, terminal }
+            }
+            SessionPanelTarget::Chat { chat_id } => {
+                // The same read-only transcript the right pane uses for a
+                // doc: `WatchDocMessages` serves any chat doc.
+                self.state.update(cx, |state, cx| {
+                    state.watch_subagent_doc(chat_id.clone(), cx)
+                });
+                let state = self.state.clone();
+                let doc_id = chat_id.clone();
+                let transcript = cx.new(|cx| {
+                    Transcript::for_doc(state, doc_id.clone(), String::new(), doc_id, true, cx)
+                });
+                SessionPanel::Chat {
+                    chat_id,
+                    title,
+                    transcript,
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    fn close_session_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(SessionPanel::Chat { chat_id, .. }) = self.session_panel.take() {
+            self.state
+                .update(cx, |state, _| state.unwatch_subagent_doc(&chat_id));
+        }
+        cx.notify();
+    }
+
+    fn render_sessions(
+        &mut self,
+        theme: &Theme,
+        entry: &ProjectEntry,
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = self.session_rows(entry, cx);
+        let items: Vec<AnyElement> = rows
+            .iter()
+            .map(|row| self.render_session_row(theme, row, now_ms, cx))
+            .collect();
+        let empty = items.is_empty();
+        let list = div()
+            .id(SharedString::from(format!(
+                "project-sessions-{}",
+                entry.space.id
+            )))
+            .flex_1()
+            .min_w(px(280.0))
+            .h_full()
+            .overflow_y_scroll()
+            .child(
+                widgets::page_column()
+                    .child(self.render_tabs(theme, cx))
+                    .child(self.render_messages(theme, None))
+                    .child(
+                        widgets::section_card(theme)
+                            .when(empty, |el| {
+                                el.child(widgets::card_row(theme, true).child(quiet(
+                                    theme,
+                                    if entry.space.local {
+                                        "No chats or Worker sessions in this project yet"
+                                    } else {
+                                        "No chats in this project yet"
+                                    },
+                                )))
+                            })
+                            .children(items),
+                    ),
+            );
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_row()
+            .child(list)
+            .when_some(self.render_session_panel(theme, cx), |el, panel| {
+                el.child(panel)
+            })
+            .into_any_element()
+    }
+
+    fn render_session_row(
+        &mut self,
+        theme: &Theme,
+        row: &SessionRow,
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (key, kind_label, detail, parent) = match &row.kind {
+            SessionKind::Chat { chat_id } => (chat_id.clone(), "Chat", None, None),
+            SessionKind::Worker {
+                session_id,
+                checkout,
+                parent_chat,
+                ..
+            } => (
+                session_id.clone(),
+                "Worker",
+                Some(checkout.clone()),
+                parent_chat.clone(),
+            ),
+        };
+        let selected = self.selected_session.as_deref() == Some(key.as_str());
+        let target = project_catalog::activation(row);
+        let title = row.title.clone();
+        let open_key = key.clone();
+        let mut meta = vec![
+            kind_label.to_owned(),
+            row.runtime.clone(),
+            row.status.clone(),
+        ];
+        if let Some(detail) = detail {
+            meta.push(detail);
+        }
+        meta.push(format_last_opened(row.last_activity_ms, now_ms));
+        widgets::card_row(theme, false)
+            .id(SharedString::from(format!("project-session-{key}")))
+            .cursor_pointer()
+            .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
+            .hover(|s| s.bg(theme.glass_hover()))
+            .on_click(cx.listener(move |page, _, _, cx| {
+                page.open_session(open_key.clone(), target.clone(), title.clone(), cx)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(13.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from(row.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(meta.join(" · "))),
+                    ),
+            )
+            .when_some(parent, |el, (chat_id, chat_title)| {
+                let key = chat_id.clone();
+                el.child(action_button_with_id(
+                    theme,
+                    format!("session-parent-{key}"),
+                    &format!("From {chat_title}"),
+                    cx.listener(move |page, _, _, cx| {
+                        page.open_session(
+                            key.clone(),
+                            SessionPanelTarget::Chat {
+                                chat_id: chat_id.clone(),
+                            },
+                            chat_title.clone(),
+                            cx,
+                        )
+                    }),
+                ))
+            })
+            .into_any_element()
+    }
+
+    fn render_session_panel(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.session_panel.as_ref()?;
+        let (title, body, go_to_chat) = match panel {
+            SessionPanel::Worker {
+                title, terminal, ..
+            } => (title.clone(), terminal.clone().into_any_element(), None),
+            SessionPanel::Chat {
+                chat_id,
+                title,
+                transcript,
+            } => (
+                title.clone(),
+                transcript.clone().into_any_element(),
+                Some(chat_id.clone()),
+            ),
+        };
+        Some(
+            div()
+                .id("project-session-panel")
+                .flex_1()
+                .min_w(px(360.0))
+                .h_full()
+                .flex()
+                .flex_col()
+                .border_l_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(10.0))
+                        .pt(px(Theme::TITLEBAR_HEIGHT + 4.0))
+                        .pb(px(6.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(13.0))
+                                .text_color(theme.text)
+                                .child(title),
+                        )
+                        .when_some(go_to_chat, |el, chat_id| {
+                            el.child(action_button(
+                                theme,
+                                "Go to chat",
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.emit(ProjectsPageEvent::OpenChat(chat_id.clone()))
+                                }),
+                            ))
+                        })
+                        .child(action_button(
+                            theme,
+                            "Close",
+                            cx.listener(|page, _, _, cx| {
+                                page.selected_session = None;
+                                page.close_session_panel(cx);
+                            }),
+                        )),
+                )
+                .child(div().flex_1().min_h_0().child(body))
+                .into_any_element(),
+        )
     }
 
     fn render_checkout_picker(
@@ -1397,22 +2145,25 @@ impl ProjectsPage {
         detail: &Detail,
         now_ms: u64,
         available: bool,
+        with_name: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let reveal_path = row.path.clone();
         let project_icon = self.icon_images.get(&row.path).cloned();
         widgets::section_card(theme)
+            .when(with_name, |el| {
+                el.child(
+                    widgets::card_row(theme, true)
+                        .child(label_block(theme, "Name", "Display name for this checkout"))
+                        .child(
+                            field_frame(self.name_input.clone().into_any_element())
+                                .flex_none()
+                                .w(px(280.0)),
+                        ),
+                )
+            })
             .child(
-                widgets::card_row(theme, true)
-                    .child(label_block(theme, "Name", "Display name for this project"))
-                    .child(
-                        field_frame(self.name_input.clone().into_any_element())
-                            .flex_none()
-                            .w(px(280.0)),
-                    ),
-            )
-            .child(
-                widgets::card_row(theme, false)
+                widgets::card_row(theme, !with_name)
                     .child(label_block(theme, "Icon", "Project avatar in the list"))
                     .child(
                         div()
@@ -2400,6 +3151,7 @@ mod tests {
             last_known_branch: None,
             association: zeron_workers_unpeel::project_ledger::AssociationState::Pending,
             archived: !live,
+            space_id: None,
         }
     }
 
@@ -2481,13 +3233,17 @@ mod tests {
     #[test]
     fn settings_search_returns_one_logical_row_for_multiple_checkouts() {
         let mut primary = row("Comet", "/Users/me/comet", true);
-        primary.repository_id = Some("repo-1".to_owned());
+        primary.space_id = Some("space-1".to_owned());
         primary.checkout_kind = Some(project_ledger::CheckoutKind::Primary);
         let mut child = row("fix/projects-sidebar", "/tmp/comet-sidebar", true);
-        child.repository_id = Some("repo-1".to_owned());
+        child.space_id = Some("space-1".to_owned());
         child.checkout_kind = Some(project_ledger::CheckoutKind::Linked);
         child.current_branch = Some("fix/projects-sidebar".to_owned());
-        let groups = project_ledger::group_rows(&[primary, child]);
+        let (groups, pending) = project_ledger::group_rows_by_project(
+            &[("space-1".to_owned(), "Comet".to_owned())],
+            &[primary, child],
+        );
+        assert!(pending.is_empty());
         assert_eq!(groups.len(), 1);
         assert_eq!(
             project_ledger::group_matches_query(&groups[0], "sidebar").map(|row| row.path.as_str()),

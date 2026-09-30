@@ -5766,6 +5766,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         };
 
         let entry1 = SessionMessageEntry {
@@ -5843,6 +5844,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         });
         let _ = state.worked_projects(&ctx_one, &transcript_longer, &projects_modified, None);
         let key3 = state.worked_projects_cache_key().unwrap().clone();

@@ -1,6 +1,7 @@
 //! Settings → Devices (feature-inventory §1.5): the device registry — name,
 //! platform, last-seen, an Online/Offline badge, a "This device" badge, click-to-copy id,
-//! and a Rename dialog (Mutate renameDevice).
+//! a Rename dialog (Mutate renameDevice) and, for a stale device, Retire
+//! (Mutate retireDevice: its projects and their chats move to this device).
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -55,6 +56,52 @@ pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
     }
 }
 
+/// Only another device that is not online may be retired: retiring moves
+/// its projects here, which must never race a live owner. Pure.
+pub fn retire_eligible(
+    device_id: &str,
+    local_device_id: Option<&str>,
+    last_seen: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    local_device_id.is_some_and(|local| local != device_id) && !device_online(last_seen, now)
+}
+
+/// What the confirmation names: the device's project names and how many
+/// chats move with them. Pure.
+pub fn retire_summary(
+    device_id: &str,
+    spaces: &[zeron_proto::Space],
+    chats: &[zeron_proto::Chat],
+) -> (Vec<String>, usize) {
+    let owned: Vec<&zeron_proto::Space> = spaces
+        .iter()
+        .filter(|space| space.device_id == device_id)
+        .collect();
+    let chats = chats
+        .iter()
+        .filter(|chat| {
+            chat.space_id
+                .as_deref()
+                .is_some_and(|id| owned.iter().any(|space| space.id == id))
+        })
+        .count();
+    (
+        owned
+            .iter()
+            .map(|space| space.display_name().to_owned())
+            .collect(),
+        chats,
+    )
+}
+
+struct RetireDialog {
+    device_id: String,
+    name: String,
+    projects: Vec<String>,
+    chats: usize,
+}
+
 struct RenameDialog {
     device_id: String,
     input: Entity<ComposerInput>,
@@ -65,6 +112,7 @@ pub struct DevicesPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
     rename: Option<RenameDialog>,
+    retire: Option<RetireDialog>,
     /// Device id whose id-chip shows "Copied" right now.
     copied: Option<String>,
     error: Option<SharedString>,
@@ -80,6 +128,7 @@ impl DevicesPage {
             state,
             scroll: widgets::PageScroll::default(),
             rename: None,
+            retire: None,
             copied: None,
             error: None,
             task: None,
@@ -112,7 +161,7 @@ impl DevicesPage {
     /// Escape that reached Settings unclaimed closes the rename dialog first,
     /// so it never closes Settings under the dialog. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.rename.take().is_none() {
+        if self.rename.take().is_none() && self.retire.take().is_none() {
             return false;
         }
         cx.notify();
@@ -147,6 +196,115 @@ impl DevicesPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn open_retire(&mut self, device_id: String, name: String, cx: &mut Context<Self>) {
+        let (projects, chats) = {
+            let state = self.state.read(cx);
+            retire_summary(&device_id, &state.spaces, &state.chats)
+        };
+        self.retire = Some(RetireDialog {
+            device_id,
+            name,
+            projects,
+            chats,
+        });
+        cx.notify();
+    }
+
+    fn submit_retire(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.retire.take() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = serde_json::json!({ "op": "retireDevice", "deviceId": dialog.device_id });
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::MUTATE, params).await;
+            this.update(cx, |page, cx| {
+                if let Err(err) = result {
+                    page.error = Some(format!("Retire failed: {err}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn render_retire_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).for_popup();
+        let dialog = self.retire.as_ref()?;
+        let projects = if dialog.projects.is_empty() {
+            "It owns no projects.".to_owned()
+        } else {
+            format!(
+                "{} and {} chat{} move to this device: {}.",
+                if dialog.projects.len() == 1 {
+                    "1 project".to_owned()
+                } else {
+                    format!("{} projects", dialog.projects.len())
+                },
+                dialog.chats,
+                if dialog.chats == 1 { "" } else { "s" },
+                dialog.projects.join(", ")
+            )
+        };
+        let card = popover::dialog_card(&theme)
+            .id("retire-device-card")
+            .role(gpui::Role::Dialog)
+            .aria_label("Retire device")
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.retire = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(popover::dialog_title(&theme, &format!("Retire {}?", dialog.name)))
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!(
+                        "{projects} The device leaves every device list. Folders missing here, or already projects here, stop the retirement before anything changes."
+                    ))),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        widgets::text_action(&theme, widgets::ActionTone::Quiet, "Cancel")
+                            .id("retire-cancel")
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.retire = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        widgets::text_action(&theme, widgets::ActionTone::Solid, "Retire")
+                            .id("retire-confirm")
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_retire(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("retire-device-dialog", viewport, card))
     }
 
     fn copy_id(&mut self, device_id: String, cx: &mut Context<Self>) {
@@ -273,7 +431,9 @@ impl Render for DevicesPage {
             )
         };
         let copied = self.copied.clone();
-        let dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let dialog = self
+            .render_rename_dialog(window.viewport_size(), cx)
+            .or_else(|| self.render_retire_dialog(window.viewport_size(), cx));
         // Split into this device and the rest; each renders as rows in one
         // block, like every other settings page.
         let (local, others): (Vec<_>, Vec<_>) = devices
@@ -287,6 +447,10 @@ impl Render for DevicesPage {
             let copy_id = device.id.clone();
             let rename_id = device.id.clone();
             let rename_name = device.name.clone();
+            let retirable =
+                retire_eligible(&device.id, local_id.as_deref(), device.last_seen_at, now);
+            let retire_id = device.id.clone();
+            let retire_name = device.name.clone();
             let mut meta: Vec<AnyElement> = vec![
                 div()
                     .child(SharedString::from(
@@ -358,7 +522,24 @@ impl Render for DevicesPage {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_rename(rename_id.clone(), rename_name.clone(), cx);
                                 })),
-                        ),
+                        )
+                        .when(retirable, |el| {
+                            el.child(
+                                widgets::text_action(&theme, widgets::ActionTone::Quiet, "Retire")
+                                    .id(("device-retire", ix))
+                                    .tab_index(0)
+                                    .role(gpui::Role::Button)
+                                    .aria_label(format!("Retire {}", device.name))
+                                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_retire(
+                                            retire_id.clone(),
+                                            retire_name.clone(),
+                                            cx,
+                                        );
+                                    })),
+                            )
+                        }),
                 )
                 .into_any_element()
         };
@@ -485,6 +666,50 @@ mod tests {
             format_last_seen(Some(now - TimeDelta::days(2)), now),
             "2d ago"
         );
+    }
+
+    /// Scenario "The local or an online device": no retire action.
+    #[test]
+    fn only_another_offline_device_is_retirable() {
+        let now = Utc::now();
+        let stale = Some(now - TimeDelta::days(18));
+        assert!(retire_eligible("dev-legacy", Some("dev-local"), stale, now));
+        assert!(retire_eligible("dev-legacy", Some("dev-local"), None, now));
+        assert!(!retire_eligible("dev-local", Some("dev-local"), stale, now));
+        assert!(!retire_eligible(
+            "dev-legacy",
+            Some("dev-local"),
+            Some(now - TimeDelta::seconds(20)),
+            now
+        ));
+        assert!(
+            !retire_eligible("dev-legacy", None, stale, now),
+            "local unknown"
+        );
+    }
+
+    #[test]
+    fn the_retire_confirmation_names_projects_and_counts_their_chats() {
+        let space: zeron_proto::Space = serde_json::from_value(serde_json::json!({
+            "id": "s-orch", "deviceId": "dev-legacy", "path": "/Users/me/.orchestrator",
+            "createdAt": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        let chat = |id: &str, space: &str| -> zeron_proto::Chat {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "deviceId": "dev-legacy", "archived": false,
+                "spaceId": space, "createdAt": "2026-09-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let chats = vec![
+            chat("a", "s-orch"),
+            chat("b", "s-orch"),
+            chat("c", "s-other"),
+        ];
+        let (projects, count) = retire_summary("dev-legacy", &[space], &chats);
+        assert_eq!(projects, vec![".orchestrator"]);
+        assert_eq!(count, 2);
     }
 
     #[test]

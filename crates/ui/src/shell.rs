@@ -52,7 +52,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
-use crate::settings::projects::ProjectsPage;
+use crate::settings::projects::{ProjectsPage, ProjectsPageEvent};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX,
@@ -2414,6 +2414,8 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     projects_page: Option<Entity<ProjectsPage>>,
+    projects_page_sub: Option<Subscription>,
+    registry_migration_task: Option<Task<()>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
@@ -3124,6 +3126,8 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             projects_page: None,
+            projects_page_sub: None,
+            registry_migration_task: None,
             harnesses_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
@@ -3245,6 +3249,37 @@ impl Shell {
 
     // ---- splash ----
 
+    /// First engine attach with Spaces synced: link the Workers state to the
+    /// project registry once (backup, reconcile, link, marker), off the UI
+    /// thread. A failure is a visible error toast.
+    fn start_registry_migration(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let state = state.read(cx);
+        if !crate::workers::registry::begin_registry_migration(state) {
+            return;
+        }
+        let Some(registry) = crate::workers::registry::AppSpaceRegistry::from_state(state) else {
+            return;
+        };
+        self.registry_migration_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::workers::registry::run_registry_migration(registry) })
+                .await;
+            if let Err(error) = &result {
+                tracing::warn!(%error, "project registry migration failed");
+            }
+            this.update(cx, |shell, cx| {
+                if let Some(notice) = crate::workers::registry::migration_notice(&result) {
+                    shell.push_toast(crate::toast::Toast::error(notice), cx);
+                }
+                shell
+                    .workers_model
+                    .update(cx, |model, cx| model.refresh(cx));
+            })
+            .ok();
+        }));
+    }
+
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         self.prune_file_explorers(cx);
         self.refresh_harness_update_watch(cx);
@@ -3255,6 +3290,7 @@ impl Shell {
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.push_toast(crate::toast::Toast::error(notice), cx);
         }
+        self.start_registry_migration(state, cx);
         let next_sync_flow = {
             let state = state.read(cx);
             sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
@@ -6128,7 +6164,18 @@ impl Shell {
             }
             SettingsSection::Projects => {
                 if self.projects_page.is_none() {
-                    self.projects_page = Some(cx.new(ProjectsPage::new));
+                    let state = self.state.clone();
+                    let page = cx.new(|cx| ProjectsPage::new(state, cx));
+                    // "Go to chat" from the Sessions tab side panel.
+                    self.projects_page_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &ProjectsPageEvent, cx| match event {
+                            ProjectsPageEvent::OpenChat(chat_id) => {
+                                this.open_chat(chat_id.clone(), cx)
+                            }
+                        },
+                    ));
+                    self.projects_page = Some(page);
                 }
                 match &self.projects_page {
                     Some(page) => page.clone().into_any_element(),

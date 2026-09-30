@@ -257,6 +257,7 @@ mod tests {
                 checkout_availability: None,
                 checkout_archived: false,
                 checkout_detached: false,
+                space_id: None,
             }],
             presets: Vec::new(),
             sessions: vec![session("busy", "working"), session("idle", "idle")],
@@ -329,6 +330,7 @@ mod tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         };
         let snapshot = WorkersBootstrap {
             mac_name: "Mac".to_owned(),
