@@ -27,6 +27,33 @@ The Workers controller SHALL accept for `wait_for_status` only `completed` and t
 - **THEN** the call returns an error stating that completion is not tracked for this worker
 - **AND** it returns without blocking for `timeout_seconds`
 
+#### Scenario: Unreadable binding state is a read error, not an untracked worker
+- Test: unit — `parent_notifications` test with a malformed binding state asserting the binding lookup returns an error.
+
+- **GIVEN** an app state whose parent-binding section cannot be read
+- **WHEN** the orchestrator calls `wait_for_status` with `status` `completed`
+- **THEN** the call fails with the read error
+- **AND** it does not claim that completion is not tracked for the worker
+
+### Requirement: A restarted worker keeps its parent chat binding
+
+When `restart_worker` replaces a worker's Session with a new session id, the controller SHALL register the replacement under the same parent chat as the original, with a fresh task-episode history, before returning the new id. A source without a binding, or a replacement that is already bound, SHALL be left unchanged. If the binding cannot be carried, the call SHALL fail naming the new session id so the caller can still address the restarted worker.
+
+#### Scenario: Replacement session inherits the parent chat
+- Test: unit — `parent_notifications` test carrying a binding from an old to a new session id.
+
+- **GIVEN** a worker bound to a parent chat whose Session is replaced by `restart_worker`
+- **WHEN** the replacement session id is known
+- **THEN** the replacement is bound to the same parent chat
+- **AND** its first tracked task starts at episode 1
+
+#### Scenario: Unbound source and bound target are left alone
+- Test: unit — `parent_notifications` test carrying from an unbound source and onto an already-bound target.
+
+- **GIVEN** a source session without a binding, or a target session that already has one
+- **WHEN** the binding is carried
+- **THEN** no binding is created or overwritten
+
 ### Requirement: A lifecycle wait ends when the current episode completes
 
 A `wait_for_status` on any accepted status other than `completed` SHALL also return, within one poll tick of completion becoming observable, when the worker's current task episode transitions to completed during the wait. The result SHALL say the episode completed and SHALL NOT claim the requested status matched. A completion that already held when the wait started SHALL NOT end a wait on another status.
