@@ -104,6 +104,7 @@ fn launch_trust_resolves_preset_and_prefers_worktree_path() {
         checkout_availability: None,
         checkout_archived: false,
         checkout_detached: false,
+        space_id: None,
     }];
     let presets = vec![WorkersPreset {
         id: "claude-review".into(),
@@ -307,6 +308,7 @@ fn gemini_and_pi_presets_use_native_session_trust_without_store_writes() {
         checkout_availability: None,
         checkout_archived: false,
         checkout_detached: false,
+        space_id: None,
     }];
     let presets = vec![
         WorkersPreset {

@@ -1,3 +1,4 @@
+mod support;
 use std::ffi::OsString;
 use std::fs;
 use std::process::Command;
@@ -893,7 +894,7 @@ fn archiving_and_restoring_a_checkout_preserves_session_artifacts_and_ids()
     let repo = home.path().join("archive-repo");
     fixture_repo(&repo)?;
     let client = LocalWorkersClient::new();
-    let id = client.add_project(&repo)?;
+    let id = client.add_project(&repo, &support::registry())?.checkout_id;
     let session_dir = home.path().join("app-sessions").join("retained-worker");
     fs::create_dir_all(&session_dir)?;
     let manifest = serde_json::to_vec_pretty(&serde_json::json!({
@@ -938,7 +939,10 @@ fn archiving_and_restoring_a_checkout_preserves_session_artifacts_and_ids()
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
     assert_eq!(state["unknown_future_field"]["keep"], true);
-    assert_eq!(client.add_project(&repo)?, id);
+    assert_eq!(
+        client.add_project(&repo, &support::registry())?.checkout_id,
+        id
+    );
     Ok(())
 }
 
@@ -961,7 +965,9 @@ fn externally_registered_worktree_inside_managed_root_cannot_be_physically_remov
             .success()
     );
     let client = LocalWorkersClient::new();
-    let id = client.add_project(&checkout)?;
+    let id = client
+        .add_project(&checkout, &support::registry())?
+        .checkout_id;
     let project = client
         .bootstrap()?
         .projects
@@ -1008,7 +1014,9 @@ fn externally_registered_worktree_symlink_inside_managed_root_stays_external()
     std::os::unix::fs::symlink(&checkout, &managed_alias)?;
 
     let client = LocalWorkersClient::new();
-    let id = client.add_project(&managed_alias)?;
+    let id = client
+        .add_project(&managed_alias, &support::registry())?
+        .checkout_id;
     let project = client
         .bootstrap()?
         .projects
@@ -1040,7 +1048,7 @@ fn legacy_worker_app_managed_record_migrates_with_matching_git_evidence()
     let repo = home.path().join("legacy-worker-repo");
     fixture_repo(&repo)?;
     let client = LocalWorkersClient::new();
-    let parent_id = client.add_project(&repo)?;
+    let parent_id = client.add_project(&repo, &support::registry())?.checkout_id;
 
     // This location predates the canonical Comet worktree root. Ownership must
     // come from the old Workers marker plus matching current Git evidence.
@@ -1056,7 +1064,9 @@ fn legacy_worker_app_managed_record_migrates_with_matching_git_evidence()
             .status()?
             .success()
     );
-    let worker_id = client.add_project(&checkout)?;
+    let worker_id = client
+        .add_project(&checkout, &support::registry())?
+        .checkout_id;
 
     let mut state = read_state(home.path())?;
     let project = state["projects"]
@@ -1108,7 +1118,7 @@ fn forced_managed_removal_does_not_discard_untracked_work() -> Result<(), Box<dy
     let repo = home.path().join("dirty-repo");
     fixture_repo(&repo)?;
     let client = LocalWorkersClient::new();
-    let id = client.add_project(&repo)?;
+    let id = client.add_project(&repo, &support::registry())?.checkout_id;
     let child = client.create_worktree(WorkersCreateWorktreeRequest {
         project_id: id,
         branch: "feature/preserve".into(),
@@ -1146,7 +1156,7 @@ fn approved_pre_remove_hook_cleans_ignored_cache_before_final_cleanliness_check(
     commit_all(&repo, "configure pre-remove hook")?;
 
     let client = LocalWorkersClient::new();
-    let parent_id = client.add_project(&repo)?;
+    let parent_id = client.add_project(&repo, &support::registry())?.checkout_id;
     let child = client.create_worktree(WorkersCreateWorktreeRequest {
         project_id: parent_id,
         branch: "feature/pre-remove-cleanup".into(),
@@ -1185,7 +1195,7 @@ fn removal_hooks_come_from_the_principal_checkout_not_the_removed_branch()
     let repo = home.path().join("branch-hook-repo");
     fixture_repo(&repo)?;
     let client = LocalWorkersClient::new();
-    let parent_id = client.add_project(&repo)?;
+    let parent_id = client.add_project(&repo, &support::registry())?.checkout_id;
     let child = client.create_worktree(WorkersCreateWorktreeRequest {
         project_id: parent_id,
         branch: "feature/branch-only-hook".into(),
@@ -1216,7 +1226,7 @@ fn open_terminal_blocks_removal_until_it_closes() -> Result<(), Box<dyn std::err
     let repo = home.path().join("terminal-repo");
     fixture_repo(&repo)?;
     let client = LocalWorkersClient::new();
-    let parent_id = client.add_project(&repo)?;
+    let parent_id = client.add_project(&repo, &support::registry())?.checkout_id;
     let child = client.create_worktree(WorkersCreateWorktreeRequest {
         project_id: parent_id,
         branch: "feature/terminal-open".into(),
@@ -1265,7 +1275,7 @@ fn removing_without_hooks_still_rejects_ignored_files() -> Result<(), Box<dyn st
     commit_all(&repo, "configure hooks and ignored cache")?;
 
     let client = LocalWorkersClient::new();
-    let parent_id = client.add_project(&repo)?;
+    let parent_id = client.add_project(&repo, &support::registry())?.checkout_id;
     let child = client.create_worktree(WorkersCreateWorktreeRequest {
         project_id: parent_id,
         branch: "feature/skip-hooks-dirty".into(),
@@ -1310,7 +1320,7 @@ fn interrupted_removal_blocks_restart_until_explicit_clean_restore()
     let repo = home.path().join("interrupted-repo");
     fixture_repo(&repo)?;
     let client = LocalWorkersClient::new();
-    let id = client.add_project(&repo)?;
+    let id = client.add_project(&repo, &support::registry())?.checkout_id;
     let session_dir = home.path().join("app-sessions/interrupted-worker");
     fs::create_dir_all(&session_dir)?;
     let manifest = serde_json::to_vec(&serde_json::json!({

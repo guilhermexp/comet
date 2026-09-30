@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::space_registry::{ENGINE_ENDPOINT_ENV, RpcSpaceRegistry, SpaceRef, SpaceRegistry};
 use crate::{
     InitialTextSubmitMode, LocalWorkersClient, SessionAction, WorkersCreateWorktreeRequest,
     WorkersLaunchRequest, WorkersProject, WorkersSession, WorkersSessionCommand,
@@ -764,7 +765,7 @@ fn dispatch_action(
     match action.as_str() {
         "help" => Ok(json!({
             "actions": ACTIONS,
-            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker. For each independent slice, launch a separate Worker with new_worktree={branch, base_ref?}; leave worktree_path/worktree_branch unset. Omit all worktree selectors only when sharing the project checkout is intentional, or use the existing worktree_path/worktree_branch pair to target a known checkout. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
+            "workflow": "list_projects (add_project when the folder is not a listed project) -> list_presets -> launch_worker (project id = its principal checkout; checkout id = that exact checkout) -> wait_for_status/read_output -> stop_worker/archive_worker. For each independent slice, launch a separate Worker with new_worktree={branch, base_ref?}; leave worktree_path/worktree_branch unset. Omit all worktree selectors only when sharing the project checkout is intentional, or use the existing worktree_path/worktree_branch pair to target a known checkout. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
             "launch_worker": {
                 "independent_slice": "Pass new_worktree with a unique branch and optional base_ref so each Worker receives its own checkout.",
                 "project_checkout": "Omit all worktree fields only when running in the project checkout is an explicit choice.",
@@ -774,25 +775,8 @@ fn dispatch_action(
             "limits": { "wait_seconds": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
         })),
         "list_projects" => {
-            let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
-            Ok(json!({
-                "projects": bootstrap.projects.into_iter().map(|project| json!({
-                    "id": project.id,
-                    "name": project.name,
-                    "path": project.path,
-                    "is_group": project.is_group,
-                    "worktree_branch": project.worktree_branch,
-                    "git_branch": project.git_branch,
-                    "repository_id": project.repository_id,
-                    "repository_name": project.repository_name,
-                    "repository_path": project.repository_path,
-                    "checkout_kind": project.checkout_kind,
-                    "checkout_ownership": project.checkout_ownership,
-                    "checkout_availability": project.checkout_availability,
-                    "checkout_archived": project.checkout_archived,
-                    "checkout_detached": project.checkout_detached
-                })).collect::<Vec<_>>()
-            }))
+            let registry = controller_registry()?;
+            projects_listing(client, &registry)
         }
         "diagnose_project_identity" => {
             let report = client
@@ -810,28 +794,24 @@ fn dispatch_action(
             serde_json::to_value(report).map_err(|error| error.to_string())
         }
         "add_project" => {
-            // Registering the checkout is the only way to launch into it:
-            // `launch_worker` takes a project_id and validate_launch_target
-            // rejects anything absent from this list. Without this action the
-            // caller's only launchable option for an unlisted repo was an
-            // ancestor project — a worker in $HOME running every command
-            // against the wrong tree.
+            // A project is a registry Space: adding a folder creates or reuses
+            // its Space (a linked worktree resolves to its repository root)
+            // and registers the folder as a checkout of it. Without a
+            // reachable registry nothing is written.
             let path = required_string(arguments, "path")?;
-            let id = client
-                .add_project(std::path::Path::new(&path))
+            let registry = controller_registry()?;
+            let added = client
+                .add_project(std::path::Path::new(&path), &registry)
                 .map_err(|error| error.to_string())?;
-            let registered = client
-                .bootstrap()
-                .map_err(|error| error.to_string())?
-                .projects
-                .into_iter()
-                .find(|project| project.id == id);
             Ok(json!({
-                "project_id": id,
+                "project_id": added.space.id,
+                "name": added.space.name,
+                "device_id": added.space.device_id,
+                "checkout_id": added.checkout_id,
                 // The canonical path, which is what the worker will actually
                 // run in — it can differ from what was passed (symlink,
                 // trailing slash), and that difference is the whole bug class.
-                "path": registered.map(|project| project.path)
+                "path": added.path
             }))
         }
         "list_presets" => {
@@ -862,7 +842,8 @@ fn dispatch_action(
             }))
         }
         "launch_worker" => {
-            let plan = parse_launch_plan(arguments.clone())?;
+            let mut plan = parse_launch_plan(arguments.clone())?;
+            plan.launch.project_id = resolve_launch_checkout(client, &plan.launch.project_id)?;
             let project = validate_launch_target(client, &plan.launch)?;
             if plan.new_worktree.is_some() {
                 validate_git_checkout(std::path::Path::new(&project.path))?;
@@ -949,6 +930,7 @@ fn dispatch_action(
             }
             let mut response = json!({
                 "session_id": &session_id,
+                "checkout_id": &request.project_id,
                 "launched": true,
                 "briefing_submitted": briefing.is_some() && briefing_error.is_none()
             });
@@ -1495,6 +1477,109 @@ pub fn replacement_session_id(before: &[String], after: &[String]) -> Option<Str
     new_ids.next().is_none().then(|| replacement.clone())
 }
 
+/// The registry this controller lists and creates projects in: the engine
+/// endpoint the harness passed. Absent, every project read or write fails
+/// naming the unreachable registry instead of falling back to Workers state.
+fn controller_registry() -> Result<RpcSpaceRegistry, String> {
+    RpcSpaceRegistry::from_env().ok_or_else(|| {
+        format!(
+            "project registry unreachable: {ENGINE_ENDPOINT_ENV} is not set, so this Workers controller has no engine to read or create projects in"
+        )
+    })
+}
+
+/// Every registry project with the chat MCP's id, name, path and device, and
+/// for local projects the checkouts linked to it. A registration without a
+/// project is never a project: it is listed apart as association-pending.
+pub(crate) fn projects_listing(
+    client: &LocalWorkersClient,
+    registry: &dyn SpaceRegistry,
+) -> Result<Value, String> {
+    let spaces = registry.list()?;
+    let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
+    let checkouts: Vec<&WorkersProject> = bootstrap
+        .projects
+        .iter()
+        .filter(|project| !project.is_group)
+        .collect();
+    let linked = |space: &SpaceRef| -> Vec<Value> {
+        checkouts
+            .iter()
+            .filter(|project| space.local && project.space_id.as_deref() == Some(&space.id))
+            .map(|project| checkout_json(project, Some(space)))
+            .collect()
+    };
+    let known = |project: &WorkersProject| {
+        project.space_id.as_deref().is_some_and(|space_id| {
+            spaces
+                .iter()
+                .any(|space| space.local && space.id == space_id)
+        })
+    };
+    Ok(json!({
+        "projects": spaces.iter().map(|space| json!({
+            "id": space.id,
+            "name": space.name,
+            "path": space.path,
+            "device_id": space.device_id,
+            "device_name": space.device_name,
+            "git": space.git,
+            "local": space.local,
+            "checkouts": linked(space),
+        })).collect::<Vec<_>>(),
+        "association_pending": checkouts
+            .iter()
+            .filter(|project| !known(project))
+            .map(|project| checkout_json(project, None))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn checkout_json(project: &WorkersProject, space: Option<&SpaceRef>) -> Value {
+    let principal = space.is_some_and(|space| {
+        project.checkout_kind != Some(crate::project_identity::CheckoutKind::Linked)
+            && std::fs::canonicalize(&project.path).ok() == std::fs::canonicalize(&space.path).ok()
+    });
+    json!({
+        "checkout_id": project.id,
+        "name": project.name,
+        "path": project.path,
+        "principal": principal,
+        "branch": project.git_branch.as_ref().or(project.worktree_branch.as_ref()),
+        "kind": project.checkout_kind,
+        "ownership": project.checkout_ownership,
+        "availability": project.checkout_availability,
+        "archived": project.checkout_archived,
+        "detached": project.checkout_detached
+    })
+}
+
+/// A checkout id launches exactly there; a project id launches in that
+/// project's principal checkout, registered on demand. A project owned by
+/// another device fails here, before anything is spawned.
+fn resolve_launch_checkout(
+    client: &LocalWorkersClient,
+    project_id: &str,
+) -> Result<String, String> {
+    let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
+    if bootstrap
+        .projects
+        .iter()
+        .any(|project| project.id == project_id)
+    {
+        return Ok(project_id.to_owned());
+    }
+    let registry = controller_registry()?;
+    let space = registry
+        .list()?
+        .into_iter()
+        .find(|space| space.id == project_id)
+        .ok_or_else(|| format!("Unknown runnable project '{project_id}'."))?;
+    client
+        .principal_checkout(&space)
+        .map_err(|error| error.to_string())
+}
+
 fn validate_launch_target(
     client: &LocalWorkersClient,
     request: &WorkersLaunchRequest,
@@ -1698,8 +1783,8 @@ fn tool_definition() -> Value {
             "required": ["action"],
             "properties": {
                 "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
-                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter. diagnose_project_identity: optional scope for a registered checkout. recover_project_identity: the registered checkout whose diagnosed conflict is being repaired." },
-                "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
+                "project_id": { "type": "string", "description": "launch_worker: where the worker runs — a project id from list_projects/add_project (its principal checkout) or a checkout_id listed under a project (that exact checkout). list_presets: optional scope filter. diagnose_project_identity: optional scope for a registered checkout. recover_project_identity: the registered checkout whose diagnosed conflict is being repaired." },
+                "path": { "type": "string", "description": "add_project: absolute path of the folder to add. It becomes (or reuses) the project of its repository root and is registered as a checkout of it. Idempotent — an already-added folder returns the same project id." },
                 "preset_id": { "type": "string", "description": "launch_worker: required — which worker preset to launch, from list_presets, and the only launch mode here. Its rows carry `fallback_order` (1-based, the fallback order exactly as the Presets screen lists them) and `preferred` (the starred favorite). A preset launches exactly as the user configured it; if no enabled preset fits the work, ask the user instead of assembling a command." },
                 "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker, archive_worker and restart_worker." },
                 "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },

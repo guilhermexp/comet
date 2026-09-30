@@ -13,9 +13,10 @@ mod parent_notifications;
 pub mod project_git;
 pub mod project_identity;
 pub mod project_ledger;
-pub mod registered_projects;
 pub mod resources;
 mod session_event_journal;
+pub mod space_links;
+pub mod space_registry;
 pub mod workspace_trust;
 pub mod worktree_config;
 pub mod worktree_ownership;
@@ -755,6 +756,18 @@ pub struct WorkersProject {
     pub checkout_availability: Option<project_identity::CheckoutAvailability>,
     pub checkout_archived: bool,
     pub checkout_detached: bool,
+    /// The project (engine Space) this checkout belongs to; `None` while the
+    /// checkout is association-pending.
+    pub space_id: Option<String>,
+}
+
+/// What adding a folder produced: its project and the checkout that runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersProjectAdded {
+    pub space: space_registry::SpaceRef,
+    pub checkout_id: String,
+    /// Canonical folder the checkout runs in.
+    pub path: String,
 }
 
 impl WorkersProject {
@@ -2559,7 +2572,15 @@ impl LocalWorkersClient {
         .map_err(WorkersError::State)
     }
 
-    pub fn add_project(&self, path: &Path) -> Result<String, WorkersError> {
+    /// Add a folder as a project: create or reuse its project (Space) in the
+    /// registry, then register the folder as a checkout linked to it. A
+    /// linked worktree belongs to the project of its repository root. The
+    /// registry is asked first, so an unreachable registry writes nothing.
+    pub fn add_project(
+        &self,
+        path: &Path,
+        registry: &dyn space_registry::SpaceRegistry,
+    ) -> Result<WorkersProjectAdded, WorkersError> {
         let canonical =
             std::fs::canonicalize(path).map_err(|error| WorkersError::InvalidProject {
                 path: path.display().to_string(),
@@ -2571,6 +2592,68 @@ impl LocalWorkersClient {
                 message: "not a directory".into(),
             });
         }
+        let observation = project_identity::probe_checkout(&canonical);
+        let project_folder = match (observation.kind, observation.main_repo.as_deref()) {
+            (project_identity::CheckoutKind::Linked, Some(main_repo)) => PathBuf::from(main_repo),
+            _ => canonical.clone(),
+        };
+        let space = registry
+            .ensure(&project_folder, None)
+            .map_err(WorkersError::State)?;
+        if !space.local {
+            return Err(WorkersError::State(format!(
+                "project {} belongs to another device",
+                space.name
+            )));
+        }
+        let checkout_id = self.register_checkout(&canonical, observation, &space.id)?;
+        Ok(WorkersProjectAdded {
+            space,
+            checkout_id,
+            path: canonical.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// The principal checkout of a local project, registered on demand when
+    /// the project's folder has no execution registration yet.
+    pub fn principal_checkout(
+        &self,
+        space: &space_registry::SpaceRef,
+    ) -> Result<String, WorkersError> {
+        if !space.local {
+            return Err(WorkersError::State(format!(
+                "project {} is owned by device {}; Workers run only on this device",
+                space.name,
+                space.device_name.as_deref().unwrap_or(&space.device_id)
+            )));
+        }
+        let canonical =
+            space_registry::canonical_project_path(Path::new(&space.path)).map_err(|message| {
+                WorkersError::InvalidProject {
+                    path: space.path.clone(),
+                    message,
+                }
+            })?;
+        let registered = self.bootstrap()?.projects.into_iter().find(|project| {
+            !project.is_group
+                && project.space_id.as_deref() == Some(space.id.as_str())
+                && std::fs::canonicalize(&project.path).is_ok_and(|path| path == canonical)
+        });
+        if let Some(project) = registered {
+            return Ok(project.id);
+        }
+        let observation = project_identity::probe_checkout(&canonical);
+        self.register_checkout(&canonical, observation, &space.id)
+    }
+
+    /// Register `canonical` as an execution checkout (reusing its `comet-*`
+    /// id when already registered) linked to `space_id`, in one state edit.
+    fn register_checkout(
+        &self,
+        canonical: &Path,
+        mut observation: project_identity::CheckoutObservation,
+        space_id: &str,
+    ) -> Result<String, WorkersError> {
         let canonical_string = canonical.to_string_lossy().to_string();
         let name = canonical
             .file_name()
@@ -2578,8 +2661,7 @@ impl LocalWorkersClient {
             .filter(|value| !value.is_empty())
             .unwrap_or("Project")
             .to_owned();
-        let mut identity_observation = project_identity::probe_checkout(&canonical);
-        identity_observation.ownership = Some(project_identity::CheckoutOwnership::External);
+        observation.ownership = Some(project_identity::CheckoutOwnership::External);
         unpeel_core::app_state::edit(|state| {
             let projects_value = state
                 .entry("projects")
@@ -2610,12 +2692,9 @@ impl LocalWorkersClient {
                 }
             };
             record_in_ledger(state, &id, &canonical_string, &name)?;
-            project_identity::register_observation_in_state(
-                state,
-                &id,
-                identity_observation.clone(),
-            )
-            .map(|_| ())?;
+            project_identity::register_observation_in_state(state, &id, observation.clone())
+                .map(|_| ())?;
+            project_identity::link_spaces_in_state(state, &[(id.clone(), space_id.to_owned())])?;
             Ok(id)
         })
         .map_err(WorkersError::State)
@@ -3664,6 +3743,8 @@ impl From<ProjectWire> for WorkersProject {
             checkout_availability: value.checkout_availability,
             checkout_archived: value.checkout_archived,
             checkout_detached: value.checkout_detached,
+            // Comet-owned link, filled by `apply_project_organization_overlay`.
+            space_id: None,
         }
     }
 }
@@ -3833,7 +3914,16 @@ fn apply_project_organization_overlay(projects: &mut [WorkersProject]) {
     let colors = state
         .get(PROJECT_FOLDER_COLORS_KEY)
         .and_then(Value::as_object);
+    let identity = state
+        .get(project_identity::IDENTITY_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value::<project_identity::IdentityRegistry>(value).ok())
+        .unwrap_or_default();
     for project in projects {
+        project.space_id = identity
+            .checkout(&project.id)
+            .filter(|_| !project.is_group)
+            .and_then(|checkout| checkout.space_id.clone());
         project.folder_color_id = colors
             .and_then(|colors| colors.get(&project.id))
             .and_then(Value::as_str)
@@ -4817,6 +4907,7 @@ mod project_ledger_projection_tests {
             checkout_availability: None,
             checkout_archived: false,
             checkout_detached: false,
+            space_id: None,
         }
     }
 

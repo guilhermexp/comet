@@ -1,3 +1,4 @@
+mod support;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::ffi::OsString;
@@ -562,46 +563,6 @@ impl Drop for EnvironmentVariableGuard {
     }
 }
 
-#[test]
-fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = ENV_LOCK.lock();
-    let home = TempDir::new()?;
-    fs::write(
-        home.path().join("app-state.json"),
-        serde_json::to_vec(&json!({
-            "projects": [{
-                "id": "project-1",
-                "name": "Project One",
-                "path": "/tmp/project-one",
-                "sort_order": 0,
-                "is_folder": false
-            }],
-            "presets": [],
-            "active_tabs": {},
-            "pinned_sessions": {}
-        }))?,
-    )?;
-    let _guard = UnpeelHomeGuard::set(home.path());
-
-    let response = controller_mcp_handle_request(json!({
-        "jsonrpc": "2.0",
-        "id": 9,
-        "method": "tools/call",
-        "params": {
-            "name": "workers",
-            "arguments": { "action": "list_projects" }
-        }
-    }))
-    .expect("tools/call responds");
-
-    assert_eq!(response["result"]["isError"], false);
-    assert_eq!(
-        response["result"]["structuredContent"]["projects"][0]["id"],
-        "project-1"
-    );
-    Ok(())
-}
-
 /// Launch preparation is deliberately made to fail after each checkout is
 /// created. The controller must return its stable project id and path so the
 /// caller can recover both isolated worktrees; no Worker process is started.
@@ -992,106 +953,489 @@ fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
     Ok(())
 }
 
-/// `launch_worker` only accepts a project_id that is already in the list, so a
-/// checkout nobody registered is unlaunchable. Without this action the caller's
-/// only working move was an ancestor project — which is how two workers ended
-/// up running in $HOME instead of the repo they were briefed about.
-#[test]
-fn add_project_registers_an_unlisted_checkout_and_is_idempotent()
--> Result<(), Box<dyn std::error::Error>> {
-    let _lock = ENV_LOCK.lock();
-    let home = TempDir::new()?;
+// ── Project registry: a project is a Space ────────────────────────────────
+
+use support::engine::{FakeEngine, LOCAL_DEVICE};
+use zeron_workers_unpeel::space_registry::ENGINE_ENDPOINT_ENV;
+
+/// A committed Git repository at `path`, returned canonical.
+fn git_repo(path: &std::path::Path) -> std::path::PathBuf {
+    fs::create_dir_all(path).unwrap();
+    for args in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &["config", "user.email", "registry@example.test"],
+        &["config", "user.name", "Registry Test"],
+        &["config", "commit.gpgsign", "false"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::write(path.join("README.md"), "registry fixture\n").unwrap();
+    for args in [
+        &["add", "README.md"][..],
+        &["commit", "--quiet", "-m", "fixture"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::canonicalize(path).unwrap()
+}
+
+fn git_worktree(
+    repo: &std::path::Path,
+    path: &std::path::Path,
+    branch: &str,
+) -> std::path::PathBuf {
+    assert!(
+        Command::new("git")
+            .args(["worktree", "add", "--quiet", "-b", branch])
+            .arg(path)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::canonicalize(path).unwrap()
+}
+
+fn write_workers_state(home: &std::path::Path, projects: serde_json::Value) {
     fs::write(
-        home.path().join("app-state.json"),
+        home.join("app-state.json"),
         serde_json::to_vec(&json!({
-            "projects": [{
-                "id": "ancestor",
-                "name": "Home",
-                "path": "/tmp",
-                "sort_order": 0,
-                "is_folder": false
+            "projects": projects,
+            "presets": [{
+                "id": "test-shell",
+                "label": "Test shell",
+                "command": "sh -c 'pwd > worker-cwd.txt'",
+                "enabled": true,
+                "quick_launch": false
             }],
-            "presets": [],
             "active_tabs": {},
             "pinned_sessions": {}
-        }))?,
-    )?;
-    let _guard = UnpeelHomeGuard::set(home.path());
-
-    let checkout = TempDir::new()?;
-    let call = |arguments: serde_json::Value| {
-        controller_mcp_handle_request(json!({
-            "jsonrpc": "2.0",
-            "id": 11,
-            "method": "tools/call",
-            "params": { "name": "workers", "arguments": arguments }
         }))
-        .expect("tools/call responds")
-    };
+        .unwrap(),
+    )
+    .unwrap();
+}
 
-    // Advertised, not just dispatchable: dispatch matches the raw string, so an
-    // action missing from the enum is invisible to the caller that reads the
-    // schema — which is every caller.
-    let tools = controller_mcp_handle_request(json!({
-        "jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}
+fn workers(arguments: serde_json::Value) -> serde_json::Value {
+    controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 70,
+        "method": "tools/call",
+        "params": { "name": "workers", "arguments": arguments }
     }))
-    .expect("tools/list responds");
+    .expect("tools/call responds")["result"]
+        .clone()
+}
+
+fn ok(result: serde_json::Value) -> serde_json::Value {
+    assert_eq!(result["isError"], false, "{result}");
+    result["structuredContent"].clone()
+}
+
+fn space_paths(engine: &FakeEngine) -> Vec<String> {
+    engine
+        .spaces()
+        .iter()
+        .map(|space| space["path"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Scenario "Adding from Workers creates the Space".
+#[test]
+fn adding_from_workers_creates_the_space() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let engine = FakeEngine::start(&[]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let folder = git_repo(&home.path().join("fresh"));
+
+    let added = ok(workers(json!({ "action": "add_project", "path": folder })));
+
+    let spaces = engine.spaces();
+    assert_eq!(spaces.len(), 1, "one project for the folder");
+    assert_eq!(spaces[0]["deviceId"], LOCAL_DEVICE);
+    assert_eq!(spaces[0]["path"], folder.to_string_lossy().as_ref());
+    assert_eq!(
+        added["project_id"], spaces[0]["id"],
+        "the response names the Space id"
+    );
+    assert_eq!(added["path"], folder.to_string_lossy().as_ref());
+    assert!(added["checkout_id"].as_str().unwrap().starts_with("comet-"));
+}
+
+/// Scenario "Adding a folder twice from different entry points": the
+/// Orchestrator created the Space first; Workers reuses it, twice.
+#[test]
+fn adding_a_folder_twice_from_different_entry_points_reuses_the_project() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let engine = FakeEngine::start(&[]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let folder = git_repo(&home.path().join("shared"));
+    engine.add_space(
+        "space-from-orchestrator",
+        LOCAL_DEVICE,
+        &folder.to_string_lossy(),
+    );
+
+    let first = ok(workers(json!({ "action": "add_project", "path": folder })));
+    // Same folder through a non-canonical spelling: still one project.
+    let second = ok(workers(
+        json!({ "action": "add_project", "path": folder.join(".") }),
+    ));
+
+    assert_eq!(first["project_id"], "space-from-orchestrator");
+    assert_eq!(second["project_id"], "space-from-orchestrator");
+    assert_eq!(first["checkout_id"], second["checkout_id"]);
+    assert_eq!(engine.spaces().len(), 1);
+}
+
+/// Scenario "Adding a linked worktree": the root has a project, so no new one
+/// is created and the worktree becomes its checkout with its branch.
+#[test]
+fn adding_a_linked_worktree_joins_the_root_project() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let engine = FakeEngine::start(&[]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let root = git_repo(&home.path().join("root"));
+    let worktree = git_worktree(&root, &home.path().join("root-feature"), "feature/tree");
+    engine.add_space("space-root", LOCAL_DEVICE, &root.to_string_lossy());
+
+    let added = ok(workers(
+        json!({ "action": "add_project", "path": worktree }),
+    ));
+    assert_eq!(added["project_id"], "space-root");
+    assert_eq!(
+        engine.spaces().len(),
+        1,
+        "no project for the worktree folder"
+    );
+
+    let listed = ok(workers(json!({ "action": "list_projects" })));
+    let project = &listed["projects"][0];
+    assert_eq!(project["id"], "space-root");
+    let checkouts = project["checkouts"].as_array().unwrap();
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(checkouts[0]["checkout_id"], added["checkout_id"]);
+    assert_eq!(checkouts[0]["branch"], "feature/tree");
+    assert_eq!(checkouts[0]["principal"], false);
+}
+
+/// Scenario "Adding a linked worktree whose root has no Space".
+#[test]
+fn adding_a_linked_worktree_creates_the_project_of_its_root() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let engine = FakeEngine::start(&[]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let root = git_repo(&home.path().join("unregistered-root"));
+    let worktree = git_worktree(&root, &home.path().join("orphan-feature"), "feature/orphan");
+
+    let added = ok(workers(
+        json!({ "action": "add_project", "path": worktree }),
+    ));
+
+    assert_eq!(
+        space_paths(&engine),
+        vec![root.to_string_lossy().into_owned()]
+    );
+    assert_eq!(added["project_id"], engine.spaces()[0]["id"]);
+    let listed = ok(workers(json!({ "action": "list_projects" })));
+    assert_eq!(
+        listed["projects"][0]["checkouts"][0]["checkout_id"],
+        added["checkout_id"]
+    );
+    assert!(listed["association_pending"].as_array().unwrap().is_empty());
+}
+
+/// Scenario "The engine is unreachable": no endpoint, or an endpoint nobody
+/// answers — the add fails naming the registry and writes nothing.
+#[test]
+fn adding_without_a_reachable_registry_fails_and_writes_nothing() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let folder = git_repo(&home.path().join("offline"));
+    let before = fs::read(home.path().join("app-state.json")).unwrap();
+
+    let _unset = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, "");
+    let result = workers(json!({ "action": "add_project", "path": folder }));
+    assert_eq!(result["isError"], true, "{result}");
     assert!(
-        tools["result"]["tools"][0]["inputSchema"]["properties"]["action"]["enum"]
-            .as_array()
-            .expect("action enum")
-            .iter()
-            .any(|action| action == "add_project")
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("project registry unreachable"),
+        "{result}"
     );
 
-    let listed = call(json!({ "action": "list_projects" }));
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = format!("ws://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let _dead = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &dead);
+    let result = workers(json!({ "action": "add_project", "path": folder }));
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("project registry unreachable"),
+        "{result}"
+    );
     assert_eq!(
-        listed["result"]["structuredContent"]["projects"]
-            .as_array()
-            .map(Vec::len),
-        Some(1)
+        fs::read(home.path().join("app-state.json")).unwrap(),
+        before,
+        "no Workers-only registration is written"
     );
+}
 
-    let added = call(json!({
-        "action": "add_project",
-        "path": checkout.path().to_string_lossy()
-    }));
-    assert_eq!(added["result"]["isError"], false);
-    let id = added["result"]["structuredContent"]["project_id"]
-        .as_str()
-        .expect("add_project returns the id launch_worker needs")
-        .to_owned();
-    // The echoed path is the canonical one the worker will run in — on macOS a
-    // temp dir resolves through /private, and that gap is the whole bug class.
-    assert_eq!(
-        added["result"]["structuredContent"]["path"].as_str(),
-        Some(
-            std::fs::canonicalize(checkout.path())?
-                .to_string_lossy()
-                .as_ref()
-        )
+/// Scenarios "Listing mirrors the chat MCP" and "A Workers-only project cannot
+/// exist": registry projects from every device with their device fields; only
+/// the local one carries checkouts; an unlinked registration is pending.
+#[test]
+fn listing_mirrors_the_registry_with_local_checkouts_only() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    let stray = home.path().join("stray");
+    fs::create_dir_all(&stray).unwrap();
+    write_workers_state(
+        home.path(),
+        json!([{ "id": "comet-stray", "name": "stray", "path": stray, "sort_order": 0 }]),
     );
+    let engine = FakeEngine::start(&[("device-mini", "Mac mini")]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let root = git_repo(&home.path().join("local-repo"));
+    let worktree = git_worktree(&root, &home.path().join("local-feature"), "feature/listed");
+    engine.add_space("space-local", LOCAL_DEVICE, &root.to_string_lossy());
+    engine.add_space(
+        "space-remote",
+        "device-mini",
+        "/Users/other/craft-agents-oss",
+    );
+    ok(workers(json!({ "action": "add_project", "path": root })));
+    ok(workers(
+        json!({ "action": "add_project", "path": worktree }),
+    ));
 
-    let listed = call(json!({ "action": "list_projects" }));
-    let projects = listed["result"]["structuredContent"]["projects"]
-        .as_array()
-        .expect("projects");
+    let listed = ok(workers(json!({ "action": "list_projects" })));
+    let projects = listed["projects"].as_array().unwrap();
     assert_eq!(projects.len(), 2);
-    assert!(projects.iter().any(|project| project["id"] == id.as_str()));
-
-    let again = call(json!({
-        "action": "add_project",
-        "path": checkout.path().to_string_lossy()
-    }));
+    let local = projects.iter().find(|p| p["id"] == "space-local").unwrap();
+    let remote = projects.iter().find(|p| p["id"] == "space-remote").unwrap();
+    assert_eq!(local["device_id"], LOCAL_DEVICE);
+    assert_eq!(local["device_name"], "This Mac");
+    assert_eq!(local["name"], "local-repo");
+    assert_eq!(remote["device_id"], "device-mini");
+    assert_eq!(remote["device_name"], "Mac mini");
+    assert_eq!(remote["path"], "/Users/other/craft-agents-oss");
+    assert_eq!(remote["checkouts"], json!([]));
+    let branches: Vec<&str> = local["checkouts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|checkout| checkout["branch"].as_str().unwrap())
+        .collect();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains(&"main") && branches.contains(&"feature/listed"));
+    assert!(projects.iter().all(|p| p["id"] != "comet-stray"));
     assert_eq!(
-        again["result"]["structuredContent"]["project_id"].as_str(),
-        Some(id.as_str()),
-        "re-registering the same checkout must reuse its id, not fork a duplicate"
+        listed["association_pending"][0]["checkout_id"],
+        "comet-stray"
+    );
+}
+
+/// Scenario "A Workers-only project cannot exist": after migration over a
+/// state whose live registration has no evidence (folder gone, no Git), the
+/// registration is not a project — only an association-pending checkout.
+#[test]
+fn a_workers_only_registration_is_pending_after_migration() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    let gone = home.path().join("renamed-away");
+    write_workers_state(
+        home.path(),
+        json!([{ "id": "comet-gone", "name": "gone", "path": gone, "sort_order": 0 }]),
+    );
+    let engine = FakeEngine::start(&[]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let registry = zeron_workers_unpeel::space_registry::RpcSpaceRegistry::new(&engine.endpoint);
+
+    zeron_workers_unpeel::space_links::migrate_at(
+        &home.path().join("app-state.json"),
+        &registry,
+        1,
+    )
+    .unwrap();
+
+    assert!(engine.spaces().is_empty(), "no project was minted for it");
+    let listed = ok(workers(json!({ "action": "list_projects" })));
+    assert_eq!(listed["projects"], json!([]));
+    assert_eq!(
+        listed["association_pending"][0]["checkout_id"],
+        "comet-gone"
+    );
+}
+
+fn install_fake_host(home: &std::path::Path) -> EnvironmentVariableGuard {
+    use std::os::unix::fs::PermissionsExt;
+    let fake_host = home.join("fake-host.py");
+    fs::write(
+        &fake_host,
+        r#"#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+launch = json.loads(Path(sys.argv[1]).read_text())
+session = launch["session"]
+cwd = Path(launch["cwd"])
+completed = subprocess.run(session["command"], cwd=cwd, shell=True, check=False)
+session_dir = Path(os.environ["UNPEEL_HOME"]) / "app-sessions" / session["id"]
+session_dir.mkdir(parents=True, exist_ok=True)
+(session_dir / "manifest.json").write_text(json.dumps({
+    "session": session, "cwd": str(cwd), "state": "exited", "pid": None,
+    "exit_code": completed.returncode,
+}))
+sys.exit(completed.returncode)
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_host).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_host, permissions).unwrap();
+    EnvironmentVariableGuard::set("UNPEEL_HOST_CMD", &fake_host)
+}
+
+fn wait_released(path: &std::path::Path) {
+    let client = zeron_workers_unpeel::LocalWorkersClient::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while client.checkout_is_busy(path).unwrap() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Scenarios "Launching into a project" (principal registered on demand) and
+/// "Launching into an exact checkout".
+#[cfg(unix)]
+#[test]
+fn launching_by_project_runs_in_the_principal_and_by_checkout_runs_there() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let _host = install_fake_host(home.path());
+    let engine = FakeEngine::start(&[]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let root = git_repo(&home.path().join("jk"));
+    let worktree = git_worktree(&root, &home.path().join("jk-sec"), "sec/cron");
+    // Only the worktree is registered: its principal has no execution record.
+    let added = ok(workers(
+        json!({ "action": "add_project", "path": worktree }),
+    ));
+    let project_id = added["project_id"].as_str().unwrap().to_owned();
+
+    let launched = ok(workers(json!({
+        "action": "launch_worker", "project_id": project_id, "preset_id": "test-shell"
+    })));
+    wait_released(&root);
+    assert_eq!(
+        fs::read_to_string(root.join("worker-cwd.txt"))
+            .unwrap()
+            .trim(),
+        root.to_string_lossy()
+    );
+    let manifest =
+        unpeel_core::session_host::load_manifest(launched["session_id"].as_str().unwrap())
+            .expect("launched session manifest");
+    assert_eq!(manifest.session.project_id, launched["checkout_id"]);
+    let listed = ok(workers(json!({ "action": "list_projects" })));
+    let principal = listed["projects"][0]["checkouts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|checkout| checkout["principal"] == true)
+        .cloned()
+        .expect("the principal was registered on demand");
+    assert_eq!(principal["checkout_id"], launched["checkout_id"]);
+    assert_eq!(
+        engine.spaces().len(),
+        1,
+        "no second project for the principal"
     );
 
-    let rejected = call(json!({ "action": "add_project" }));
-    assert_eq!(rejected["result"]["isError"], true);
-    Ok(())
+    let exact = ok(workers(json!({
+        "action": "launch_worker", "project_id": added["checkout_id"], "preset_id": "test-shell"
+    })));
+    wait_released(&worktree);
+    assert_eq!(exact["checkout_id"], added["checkout_id"]);
+    assert_eq!(
+        fs::read_to_string(worktree.join("worker-cwd.txt"))
+            .unwrap()
+            .trim(),
+        worktree.to_string_lossy()
+    );
+}
+
+/// Scenario "Launching into a remote project": refused before spawn, naming
+/// the owning device; no session exists afterwards.
+#[cfg(unix)]
+#[test]
+fn launching_into_a_remote_project_fails_before_spawn() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let _host = install_fake_host(home.path());
+    let engine = FakeEngine::start(&[("device-mini", "Mac mini")]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    engine.add_space(
+        "space-remote",
+        "device-mini",
+        "/Users/other/craft-agents-oss",
+    );
+    let before = fs::read(home.path().join("app-state.json")).unwrap();
+
+    let result = workers(json!({
+        "action": "launch_worker", "project_id": "space-remote", "preset_id": "test-shell"
+    }));
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Mac mini"),
+        "{result}"
+    );
+    let workers_listed = ok(workers(json!({ "action": "list_workers" })));
+    assert_eq!(workers_listed["workers"], json!([]));
+    assert_eq!(
+        fs::read(home.path().join("app-state.json")).unwrap(),
+        before
+    );
 }
 
 #[test]

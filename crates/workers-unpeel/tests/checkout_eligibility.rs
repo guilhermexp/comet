@@ -1,3 +1,4 @@
+mod support;
 use std::{fs, process::Command};
 use zeron_workers_unpeel::{CheckoutAvailability, LocalWorkersClient};
 
@@ -18,7 +19,7 @@ fn recovery_and_unknown_identity_block_new_launches_and_live_ui_capabilities()
             .success()
     );
     let client = LocalWorkersClient::new();
-    let id = client.add_project(&repo)?;
+    let id = client.add_project(&repo, &support::registry())?.checkout_id;
     let state_path = home.path().join("app-state.json");
     let ready: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
     for reason in [

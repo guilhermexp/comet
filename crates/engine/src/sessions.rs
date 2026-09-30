@@ -388,6 +388,9 @@ impl SessionsEngine {
             return;
         }
         *lock(&self.inner.local_ipc) = Some(endpoint.to_owned());
+        // The Workers controller MCP lists and creates projects through the
+        // same endpoint.
+        zeron_harness::note_workers_engine_endpoint(endpoint);
     }
 
     /// Upstream compatibility shim. Upstream records the IPC port here so every

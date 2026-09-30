@@ -309,6 +309,7 @@ pub(crate) mod skills;
 #[cfg(windows)]
 pub mod windows_process;
 pub(crate) mod workers_mcp;
+pub use workers_mcp::note_workers_engine_endpoint;
 
 /// The crate's single binary resolver: PATH → login-shell PATH → `extra` →
 /// node-version-manager bins, platform-aware (PATHEXT variants, npm `.cmd`

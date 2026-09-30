@@ -1,3 +1,4 @@
+mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -189,7 +190,9 @@ fn adding_a_git_project_persists_a_stable_volume_identity() -> Result<(), Box<dy
     };
     let repo = fixture_repo(home.as_path())?;
 
-    LocalWorkersClient::new().add_project(&repo)?;
+    LocalWorkersClient::new()
+        .add_project(&repo, &support::registry())?
+        .checkout_id;
     let state: Value = serde_json::from_slice(&fs::read(home.as_path().join("app-state.json"))?)?;
     let repository = &state["comet_project_identity"]["repositories"][0];
     #[cfg(target_os = "macos")]

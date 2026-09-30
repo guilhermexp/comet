@@ -19,9 +19,15 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 toml_edit = "0.22"
 unpeel-core.workspace = true
+# Project registry (engine Spaces) over the engine RPC surface.
+zeron-proto.workspace = true
+zeron-rpc.workspace = true
 unicode-width = "0.2"
 uuid.workspace = true
 
 [dev-dependencies]
+# Fake engine for the project-registry integration tests.
+async-trait.workspace = true
+futures.workspace = true
 parking_lot.workspace = true
 tempfile.workspace = true

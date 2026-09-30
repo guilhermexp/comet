@@ -28,9 +28,6 @@ pub use super::project_identity::{CheckoutAvailability, CheckoutKind, CheckoutOw
 
 /// Chave de topo do ledger em `app-state.json`.
 pub const LEDGER_KEY: &str = "comet_projects";
-/// Display name used when a repository has linked checkouts but no registered
-/// primary checkout to serve as its logical project row.
-pub const UNREGISTERED_PRIMARY_NAME: &str = "Principal not registered";
 
 /// Uma entrada do ledger — so o que NAO da pra recalcular. Estado de git,
 /// commits ancora e contagem de sessoes sao lidos frescos a cada abertura,
@@ -97,6 +94,8 @@ pub struct ProjectRow {
     pub last_known_branch: Option<String>,
     pub association: AssociationState,
     pub archived: bool,
+    /// O projeto (Space) a que o checkout pertence; `None` = pendente.
+    pub space_id: Option<String>,
 }
 
 impl ProjectRow {
@@ -180,49 +179,52 @@ impl ProjectGroup {
     }
 }
 
-/// Agrupa somente registros com a mesma identidade persistida. Linhas legadas
-/// sem `repository_id` permanecem separadas, pois path/basename/remote nao sao
-/// evidencia suficiente para juntar clones ou branches antigas.
-pub fn group_rows(rows: &[ProjectRow]) -> Vec<ProjectGroup> {
-    let mut groups: Vec<ProjectGroup> = Vec::new();
-    let mut indexes: HashMap<String, usize> = HashMap::new();
-
+/// Agrupa o historico de checkouts sob os projetos do registro, na ordem de
+/// `projects` (`(space id, nome)`). Um projeto sem checkouts ainda ganha seu
+/// grupo; checkouts sem link para um desses projetos voltam a parte, como
+/// pendentes de associacao — nunca viram projeto por nome, path ou remote.
+pub fn group_rows_by_project(
+    projects: &[(String, String)],
+    rows: &[ProjectRow],
+) -> (Vec<ProjectGroup>, Vec<ProjectRow>) {
+    let mut groups: Vec<ProjectGroup> = projects
+        .iter()
+        .map(|(id, name)| ProjectGroup {
+            id: id.clone(),
+            name: name.clone(),
+            icon_path: None,
+            added_at_unix_ms: 0,
+            last_opened_at_unix_ms: 0,
+            checkouts: Vec::new(),
+        })
+        .collect();
+    let indexes: HashMap<&str, usize> = projects
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.as_str(), index))
+        .collect();
+    let mut pending = Vec::new();
     for row in rows {
-        let group_id = row
-            .repository_id
-            .clone()
-            .unwrap_or_else(|| format!("legacy:{}", key(&row.path)));
-        let index = if let Some(index) = indexes.get(&group_id).copied() {
-            index
-        } else {
-            let index = groups.len();
-            indexes.insert(group_id.clone(), index);
-            groups.push(ProjectGroup {
-                id: group_id,
-                name: row.name.clone(),
-                icon_path: row.icon_path.clone(),
-                added_at_unix_ms: row.added_at_unix_ms,
-                last_opened_at_unix_ms: row.last_opened_at_unix_ms,
-                checkouts: Vec::new(),
-            });
-            index
+        let Some(index) = row
+            .space_id
+            .as_deref()
+            .and_then(|space_id| indexes.get(space_id).copied())
+        else {
+            pending.push(row.clone());
+            continue;
         };
-
         let group = &mut groups[index];
-        group.added_at_unix_ms = group.added_at_unix_ms.min(row.added_at_unix_ms);
-        if row.last_opened_at_unix_ms > group.last_opened_at_unix_ms {
-            group.last_opened_at_unix_ms = row.last_opened_at_unix_ms;
-        }
-        if group.icon_path.is_none() {
-            group.icon_path = row.icon_path.clone();
-        }
-        if row.checkout_kind == Some(CheckoutKind::Primary) {
-            group.name = row.name.clone();
-            group.icon_path = row.icon_path.clone().or(group.icon_path.clone());
+        group.added_at_unix_ms = if group.checkouts.is_empty() {
+            row.added_at_unix_ms
+        } else {
+            group.added_at_unix_ms.min(row.added_at_unix_ms)
+        };
+        group.last_opened_at_unix_ms = group.last_opened_at_unix_ms.max(row.last_opened_at_unix_ms);
+        if group.icon_path.is_none() || row.checkout_kind == Some(CheckoutKind::Primary) {
+            group.icon_path = row.icon_path.clone().or(group.icon_path.take());
         }
         group.checkouts.push(row.clone());
     }
-
     for group in &mut groups {
         group.checkouts.sort_by(|left, right| {
             let left_primary = left.checkout_kind == Some(CheckoutKind::Primary);
@@ -236,31 +238,8 @@ pub fn group_rows(rows: &[ProjectRow]) -> Vec<ProjectGroup> {
                 })
                 .then_with(|| left.name.cmp(&right.name))
         });
-        if let Some(primary) = group
-            .checkouts
-            .iter()
-            .find(|row| row.checkout_kind == Some(CheckoutKind::Primary))
-        {
-            group.name = primary.name.clone();
-            if primary.icon_path.is_some() {
-                group.icon_path = primary.icon_path.clone();
-            }
-        } else if group
-            .checkouts
-            .iter()
-            .any(|row| row.repository_id.is_some())
-        {
-            group.name = UNREGISTERED_PRIMARY_NAME.to_owned();
-        }
     }
-
-    groups.sort_by(|left, right| {
-        right
-            .last_opened_at_unix_ms
-            .cmp(&left.last_opened_at_unix_ms)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    groups
+    (groups, pending)
 }
 
 /// Busca pelo nome do projeto ou por qualquer nome, branch ou path de seus
@@ -321,12 +300,13 @@ pub fn decorate_with_identity(
         row.last_known_branch = checkout.last_known_branch.clone();
         row.association = if checkout.conflict.is_some() {
             AssociationState::Conflict
-        } else if checkout.repository_id.is_some() {
+        } else if checkout.space_id.is_some() {
             AssociationState::Known
         } else {
             AssociationState::Pending
         };
         row.archived = checkout.archived;
+        row.space_id = checkout.space_id.clone();
     }
     rows
 }
@@ -418,6 +398,7 @@ pub fn reconcile(ledger: &[LedgerProject], live: &[LiveProject], now: u64) -> Re
             last_known_branch: None,
             association: AssociationState::Pending,
             archived: false,
+            space_id: None,
         });
         next.push(entry);
     }
@@ -441,6 +422,7 @@ pub fn reconcile(ledger: &[LedgerProject], live: &[LiveProject], now: u64) -> Re
             last_known_branch: None,
             association: AssociationState::Pending,
             archived: false,
+            space_id: None,
         });
         next.push(entry);
     }
@@ -907,7 +889,7 @@ mod tests {
     }
 
     fn checkout(
-        repository_id: Option<&str>,
+        space_id: Option<&str>,
         path: &str,
         name: &str,
         kind: CheckoutKind,
@@ -921,50 +903,66 @@ mod tests {
             added_at_unix_ms: 10,
             last_opened_at_unix_ms: 20,
             icon_path: None,
-            repository_id: repository_id.map(str::to_owned),
+            repository_id: space_id.map(|id| format!("repo-of-{id}")),
             checkout_id: Some(format!("checkout-{name}")),
             checkout_kind: Some(kind),
             checkout_ownership: Some(CheckoutOwnership::External),
             checkout_availability: Some(availability),
             current_branch: branch.map(str::to_owned),
             last_known_branch: None,
-            association: AssociationState::Known,
+            association: if space_id.is_some() {
+                AssociationState::Known
+            } else {
+                AssociationState::Pending
+            },
             archived: false,
+            space_id: space_id.map(str::to_owned),
         }
     }
 
-    #[test]
-    fn grouping_uses_persisted_repository_identity_and_keeps_children() {
-        let groups = group_rows(&[
-            checkout(
-                Some("repo-1"),
-                "/tmp/comet",
-                "comet",
-                CheckoutKind::Primary,
-                CheckoutAvailability::Available,
-                Some("main"),
-            ),
-            checkout(
-                Some("repo-1"),
-                "/tmp/comet-worktree",
-                "feature/login",
-                CheckoutKind::Linked,
-                CheckoutAvailability::Available,
-                Some("feature/login"),
-            ),
-            checkout(
-                Some("repo-2"),
-                "/tmp/other",
-                "comet",
-                CheckoutKind::Primary,
-                CheckoutAvailability::Available,
-                Some("main"),
-            ),
-        ]);
+    fn projects(ids: &[(&str, &str)]) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+            .collect()
+    }
 
+    #[test]
+    fn grouping_follows_the_project_link_and_keeps_children() {
+        let (groups, pending) = group_rows_by_project(
+            &projects(&[("space-1", "comet"), ("space-2", "other")]),
+            &[
+                checkout(
+                    Some("space-1"),
+                    "/tmp/comet",
+                    "comet",
+                    CheckoutKind::Primary,
+                    CheckoutAvailability::Available,
+                    Some("main"),
+                ),
+                checkout(
+                    Some("space-1"),
+                    "/tmp/comet-worktree",
+                    "feature/login",
+                    CheckoutKind::Linked,
+                    CheckoutAvailability::Available,
+                    Some("feature/login"),
+                ),
+                checkout(
+                    Some("space-2"),
+                    "/tmp/other",
+                    "comet",
+                    CheckoutKind::Primary,
+                    CheckoutAvailability::Available,
+                    Some("main"),
+                ),
+            ],
+        );
+
+        assert!(pending.is_empty());
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].checkouts.len(), 2);
         assert_eq!(groups[0].name, "comet");
+        assert_eq!(groups[1].name, "other");
         assert_eq!(
             group_matches_query(&groups[0], "LOGIN").map(|row| row.path.as_str()),
             Some("/tmp/comet-worktree")
@@ -972,39 +970,43 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rows_are_not_merged_by_name_or_path_shape() {
-        let groups = group_rows(&[
-            checkout(
-                None,
-                "/tmp/a/comet",
-                "comet",
-                CheckoutKind::Unresolved,
-                CheckoutAvailability::ProbeFailed,
-                None,
-            ),
-            checkout(
-                None,
-                "/tmp/b/comet",
-                "comet",
-                CheckoutKind::Unresolved,
-                CheckoutAvailability::ProbeFailed,
-                None,
-            ),
-        ]);
-        assert_eq!(groups.len(), 2);
+    fn unlinked_rows_are_pending_and_never_merged_by_name_or_path_shape() {
+        let (groups, pending) = group_rows_by_project(
+            &projects(&[("space-1", "comet")]),
+            &[
+                checkout(
+                    None,
+                    "/tmp/a/comet",
+                    "comet",
+                    CheckoutKind::Unresolved,
+                    CheckoutAvailability::ProbeFailed,
+                    None,
+                ),
+                checkout(
+                    None,
+                    "/tmp/b/comet",
+                    "comet",
+                    CheckoutKind::Unresolved,
+                    CheckoutAvailability::ProbeFailed,
+                    None,
+                ),
+            ],
+        );
+        assert!(groups[0].checkouts.is_empty());
+        assert_eq!(pending.len(), 2);
     }
 
     #[test]
     fn missing_checkout_stays_in_history_and_does_not_count_as_available() {
         let row = checkout(
-            Some("repo-1"),
+            Some("space-1"),
             "/tmp/removed",
             "feature/old",
             CheckoutKind::Linked,
             CheckoutAvailability::Missing,
             Some("feature/old"),
         );
-        let groups = group_rows(&[row]);
+        let (groups, _) = group_rows_by_project(&projects(&[("space-1", "repo")]), &[row]);
         assert_eq!(groups[0].available_checkouts().count(), 0);
         assert_eq!(groups[0].historical_checkouts().count(), 1);
         assert_eq!(groups[0].selected_checkout().unwrap().name, "feature/old");
@@ -1012,24 +1014,27 @@ mod tests {
 
     #[test]
     fn group_selection_prefers_an_available_child_when_primary_is_missing() {
-        let groups = group_rows(&[
-            checkout(
-                Some("repo-1"),
-                "/tmp/removed-main",
-                "comet",
-                CheckoutKind::Primary,
-                CheckoutAvailability::Missing,
-                Some("main"),
-            ),
-            checkout(
-                Some("repo-1"),
-                "/tmp/feature",
-                "feature/sidebar",
-                CheckoutKind::Linked,
-                CheckoutAvailability::Available,
-                Some("feature/sidebar"),
-            ),
-        ]);
+        let (groups, _) = group_rows_by_project(
+            &projects(&[("space-1", "comet")]),
+            &[
+                checkout(
+                    Some("space-1"),
+                    "/tmp/removed-main",
+                    "comet",
+                    CheckoutKind::Primary,
+                    CheckoutAvailability::Missing,
+                    Some("main"),
+                ),
+                checkout(
+                    Some("space-1"),
+                    "/tmp/feature",
+                    "feature/sidebar",
+                    CheckoutKind::Linked,
+                    CheckoutAvailability::Available,
+                    Some("feature/sidebar"),
+                ),
+            ],
+        );
         assert_eq!(
             groups[0].selected_checkout().map(|row| row.path.as_str()),
             Some("/tmp/feature")
@@ -1037,16 +1042,21 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_without_a_primary_uses_the_explicit_container_name() {
-        let groups = group_rows(&[checkout(
-            Some("repo-1"),
-            "/tmp/feature",
-            "feature/sidebar",
-            CheckoutKind::Linked,
-            CheckoutAvailability::Available,
-            Some("feature/sidebar"),
-        )]);
-        assert_eq!(groups[0].name, UNREGISTERED_PRIMARY_NAME);
+    fn a_project_without_a_primary_keeps_its_registry_name() {
+        let (groups, pending) = group_rows_by_project(
+            &projects(&[("space-jk", "JK Distribuição")]),
+            &[checkout(
+                Some("space-jk"),
+                "/tmp/feature",
+                "feature/sidebar",
+                CheckoutKind::Linked,
+                CheckoutAvailability::Available,
+                Some("feature/sidebar"),
+            )],
+        );
+        assert!(pending.is_empty());
+        assert_eq!(groups[0].name, "JK Distribuição");
+        assert_eq!(groups[0].checkouts.len(), 1);
     }
 
     #[test]
@@ -1091,11 +1101,13 @@ mod tests {
                 conflict: None,
                 last_observed_unix_ms: Some(30),
                 archived: false,
+                space_id: Some("space-1".to_owned()),
                 extra: Default::default(),
             }],
             ..Default::default()
         };
         let rows = decorate_with_identity(vec![row], &registry);
+        assert_eq!(rows[0].space_id.as_deref(), Some("space-1"));
         assert_eq!(rows[0].repository_id.as_deref(), Some("repo-1"));
         assert_eq!(rows[0].checkout_id.as_deref(), Some("checkout-feature"));
         assert_eq!(rows[0].display_branch(), Some("feature/login"));

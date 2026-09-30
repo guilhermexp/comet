@@ -1,3 +1,4 @@
+mod support;
 use std::ffi::OsString;
 use std::fs;
 use std::sync::Mutex;
@@ -430,9 +431,12 @@ fn add_project_normalizes_deduplicates_and_preserves_unknown_state()
     fs::create_dir_all(&project_dir)?;
     let client = LocalWorkersClient::new();
 
-    let first = client.add_project(&project_dir)?;
-    let second = client.add_project(&project_dir.join("."))?;
-    assert_eq!(first, second);
+    let registry = support::registry();
+    let first = client.add_project(&project_dir, &registry)?;
+    let second = client.add_project(&project_dir.join("."), &registry)?;
+    assert_eq!(first.checkout_id, second.checkout_id);
+    assert_eq!(first.space.id, second.space.id);
+    assert_eq!(registry.spaces().len(), 1);
 
     let raw: serde_json::Value =
         serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;

@@ -65,6 +65,7 @@ impl WorkersBridge {
             true,
             false,
             options.parent_chat_id.as_deref(),
+            workers_mcp::engine_endpoint().as_deref(),
         )
         .ok_or_else(|| {
             HarnessError::Protocol("Workers controller sidecar is unavailable".into())

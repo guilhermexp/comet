@@ -1139,6 +1139,7 @@ mod tests {
             request.enable_workers_mcp,
             false,
             request.workers_parent_chat_id.as_deref(),
+            None,
         )
         .expect("Workers config")
         .claude_config_json();
@@ -1166,6 +1167,7 @@ mod tests {
                 disabled.enable_workers_mcp,
                 false,
                 disabled.workers_parent_chat_id.as_deref(),
+                None,
             )
             .is_none()
         );

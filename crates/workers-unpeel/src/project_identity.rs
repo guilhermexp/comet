@@ -161,6 +161,15 @@ pub struct CheckoutIdentity {
     pub last_observed_unix_ms: Option<u64>,
     #[serde(default)]
     pub archived: bool,
+    /// The project (engine Space) this checkout belongs to. `None` means the
+    /// checkout is association-pending: it lists under no project.
+    #[serde(
+        default,
+        rename = "spaceID",
+        alias = "spaceId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub space_id: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -1126,6 +1135,7 @@ fn checkout_from_patch(
             Some(observation.observed_at_unix_ms)
         },
         archived: previous.map(|checkout| checkout.archived).unwrap_or(false),
+        space_id: previous.and_then(|checkout| checkout.space_id.clone()),
         extra: previous
             .map(|checkout| checkout.extra.clone())
             .unwrap_or_default(),
@@ -1196,6 +1206,7 @@ pub fn plan_reconciliation(
     registry
         .repositories
         .sort_by(|left, right| left.id.cmp(&right.id));
+    inherit_repository_space_links(&mut registry);
     ReconciliationPlan {
         base_state: state.clone(),
         patches,
@@ -1371,6 +1382,7 @@ pub fn register_observation_in_state(
     registry
         .repositories
         .sort_by(|left, right| left.id.cmp(&right.id));
+    inherit_repository_space_links(&mut registry);
     let identity_value = serde_json::to_value(&registry).map_err(|error| error.to_string())?;
     state.insert(IDENTITY_KEY.to_owned(), identity_value);
     let checkout = registry
@@ -1521,6 +1533,57 @@ fn observations_for_state(state: &Value) -> Vec<CheckoutObservation> {
             observation
         })
         .collect()
+}
+
+/// A repository belongs to one project: a checkout of a repository whose
+/// other checkouts are already linked takes the same project. Never
+/// overwrites a link and never links across repositories.
+pub fn inherit_repository_space_links(registry: &mut IdentityRegistry) {
+    let links: BTreeMap<String, String> = registry
+        .checkouts
+        .iter()
+        .filter_map(|checkout| Some((checkout.repository_id.clone()?, checkout.space_id.clone()?)))
+        .collect();
+    for checkout in &mut registry.checkouts {
+        if checkout.space_id.is_none()
+            && let Some(space_id) = checkout
+                .repository_id
+                .as_deref()
+                .and_then(|repository_id| links.get(repository_id))
+        {
+            checkout.space_id = Some(space_id.clone());
+        }
+    }
+}
+
+/// Write `(checkout project id, space id)` links into the identity namespace
+/// of an app-state being edited. Existing links win; returns the checkout ids
+/// actually linked.
+pub fn link_spaces_in_state(
+    state: &mut Map<String, Value>,
+    links: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let value = Value::Object(state.clone());
+    let mut registry = read_registry(&value).map_err(|error| error.to_string())?;
+    let mut written = Vec::new();
+    for (project_id, space_id) in links {
+        if let Some(checkout) = registry
+            .checkouts
+            .iter_mut()
+            .find(|checkout| &checkout.project_id == project_id && checkout.space_id.is_none())
+        {
+            checkout.space_id = Some(space_id.clone());
+            written.push(project_id.clone());
+        }
+    }
+    inherit_repository_space_links(&mut registry);
+    if !written.is_empty() {
+        state.insert(
+            IDENTITY_KEY.to_owned(),
+            serde_json::to_value(&registry).map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(written)
 }
 
 pub fn read_registry_at(path: &Path) -> Result<IdentityRegistry, String> {
@@ -2184,6 +2247,79 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    fn identity_state(checkouts: Value) -> Map<String, Value> {
+        serde_json::json!({
+            "projects": [],
+            "future_top_level": {"must": "survive"},
+            IDENTITY_KEY: {
+                "version": IDENTITY_SCHEMA_VERSION,
+                "repositories": [],
+                "checkouts": checkouts,
+                "futureRegistryKey": 7
+            }
+        })
+        .as_object()
+        .cloned()
+        .unwrap()
+    }
+
+    #[test]
+    fn space_link_round_trips_with_unknown_keys() {
+        let state = Value::Object(identity_state(serde_json::json!([{
+            "projectID": "comet-a",
+            "path": "/tmp/a",
+            "spaceID": "space-1",
+            "futureCheckoutKey": [1, 2]
+        }])));
+        let registry = read_registry(&state).unwrap();
+        assert_eq!(registry.checkouts[0].space_id.as_deref(), Some("space-1"));
+        let written = serde_json::to_value(&registry).unwrap();
+        assert_eq!(written["checkouts"][0]["spaceID"], "space-1");
+        assert_eq!(
+            written["checkouts"][0]["futureCheckoutKey"],
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(written["futureRegistryKey"], 7);
+        // An unlinked checkout serializes without the key (older binaries).
+        let unlinked = read_registry(&Value::Object(identity_state(
+            serde_json::json!([{ "projectID": "comet-b", "path": "/tmp/b" }]),
+        )))
+        .unwrap();
+        assert!(
+            serde_json::to_value(&unlinked).unwrap()["checkouts"][0]
+                .get("spaceID")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn links_never_overwrite_and_follow_the_repository() {
+        let mut state = identity_state(serde_json::json!([
+            { "projectID": "comet-main", "path": "/r", "repositoryID": "repo-1", "spaceID": "space-old" },
+            { "projectID": "comet-tree", "path": "/r-tree", "repositoryID": "repo-1" },
+            { "projectID": "comet-lone", "path": "/lone" }
+        ]));
+        let written = link_spaces_in_state(
+            &mut state,
+            &[
+                ("comet-main".into(), "space-new".into()),
+                ("comet-lone".into(), "space-lone".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(written, vec!["comet-lone".to_owned()]);
+        let registry = read_registry(&Value::Object(state.clone())).unwrap();
+        let space = |id: &str| registry.checkout(id).unwrap().space_id.clone();
+        assert_eq!(space("comet-main").as_deref(), Some("space-old"));
+        assert_eq!(
+            space("comet-tree").as_deref(),
+            Some("space-old"),
+            "same repository"
+        );
+        assert_eq!(space("comet-lone").as_deref(), Some("space-lone"));
+        assert_eq!(state["future_top_level"]["must"], "survive");
+    }
 
     fn git(path: &Path, args: &[&str]) {
         let status = Command::new("git")

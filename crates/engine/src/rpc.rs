@@ -687,7 +687,9 @@ enum MutateParams {
 }
 
 pub struct EngineRpc {
-    worker_projects: zeron_workers_unpeel::registered_projects::RegisteredProjects,
+    /// Workers state whose checkout ↔ project links authorize Source Control
+    /// in Worker checkouts (read-only; never starts a host).
+    worker_checkouts_state: std::path::PathBuf,
     sessions: SessionsEngine,
     doc_host: DocHost,
     workspace: WorkspaceHost,
@@ -736,7 +738,7 @@ impl EngineRpc {
             capabilities: zeron_proto::capabilities::current(),
         };
         Self {
-            worker_projects: Default::default(),
+            worker_checkouts_state: zeron_workers_unpeel::space_links::workers_state_path(),
             sessions,
             doc_host,
             workspace,
@@ -762,12 +764,9 @@ impl EngineRpc {
         }
     }
 
-    /// Use the Worker registry of a specific local profile.
-    pub fn with_worker_projects(
-        mut self,
-        projects: zeron_workers_unpeel::registered_projects::RegisteredProjects,
-    ) -> Self {
-        self.worker_projects = projects;
+    /// Use the Workers state of a specific local profile.
+    pub fn with_worker_checkouts(mut self, state_path: std::path::PathBuf) -> Self {
+        self.worker_checkouts_state = state_path;
         self
     }
 
@@ -1005,14 +1004,30 @@ impl EngineRpc {
         let root = match self.change_request_root(cwd).await {
             Ok(root) => root,
             Err(error) => {
-                let projects = self.worker_projects.clone();
+                // A Worker checkout is authorized because it belongs to a
+                // project of this device, never merely because the Workers
+                // state lists it.
+                let local_device = self.doc_host.device_id();
+                let local_projects: HashSet<String> = self
+                    .workspace
+                    .watch_spaces()
+                    .borrow()
+                    .iter()
+                    .filter(|space| space.device_id == local_device)
+                    .map(|space| space.id.clone())
+                    .collect();
+                let state = self.worker_checkouts_state.clone();
                 let requested = std::path::PathBuf::from(cwd);
                 let root = tokio::task::spawn_blocking(move || {
                     let requested = std::fs::canonicalize(requested).ok()?;
-                    projects.roots().ok()?.into_iter().find_map(|root| {
-                        let root = std::fs::canonicalize(root).ok()?;
-                        (root == requested).then_some(root)
-                    })
+                    zeron_workers_unpeel::space_links::linked_checkouts_at(&state)
+                        .ok()?
+                        .into_iter()
+                        .find_map(|(path, space_id)| {
+                            let path = std::fs::canonicalize(path).ok()?;
+                            (local_projects.contains(&space_id) && path == requested)
+                                .then_some(path)
+                        })
                 })
                 .await
                 .map_err(|error| RpcError::Failed(error.to_string()))?;

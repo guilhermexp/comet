@@ -15,6 +15,33 @@ pub(crate) struct WorkersMcpServer {
     pub timeout_secs: u64,
 }
 
+/// Environment entry carrying the engine endpoint to the controller MCP, which
+/// lists and creates projects (Spaces) through it. Mirrors
+/// `zeron_workers_unpeel::space_registry::ENGINE_ENDPOINT_ENV`.
+pub(crate) const ENGINE_ENDPOINT_ENV: &str = "COMET_WORKERS_ENGINE_ENDPOINT";
+
+/// The IPC endpoint this process's engine actually bound, recorded by the
+/// engine once IPC is served. One engine per process owns the Workers state.
+static ENGINE_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record the engine endpoint every controller MCP spawned from now on gets.
+pub fn note_workers_engine_endpoint(endpoint: &str) {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return;
+    }
+    *ENGINE_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint.to_owned());
+}
+
+pub(crate) fn engine_endpoint() -> Option<String> {
+    ENGINE_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Resolve the controller from the process environment: the descriptor is
 /// dropped entirely when Workers are off, when `ZERON_DISABLE_WORKERS_MCP=1`,
 /// or when the executable is not an absolute path (a child spawned by name
@@ -25,6 +52,7 @@ pub(crate) fn resolve_for(
     enabled: bool,
     disabled_by_environment: bool,
     parent_chat_id: Option<&str>,
+    engine_endpoint: Option<&str>,
 ) -> Option<WorkersMcpServer> {
     if !enabled || disabled_by_environment || !executable.is_absolute() {
         return None;
@@ -32,6 +60,9 @@ pub(crate) fn resolve_for(
     let mut env = vec![("COMET_WORKERS_CONTROLLER".to_owned(), "1".to_owned())];
     if let Some(id) = parent_chat_id.filter(|value| !value.trim().is_empty()) {
         env.push(("COMET_WORKERS_PARENT_CHAT_ID".to_owned(), id.to_owned()));
+    }
+    if let Some(endpoint) = engine_endpoint.filter(|value| !value.trim().is_empty()) {
+        env.push((ENGINE_ENDPOINT_ENV.to_owned(), endpoint.to_owned()));
     }
     Some(WorkersMcpServer {
         name: NAME,
@@ -137,6 +168,7 @@ pub(crate) fn servers_for(
         request.enable_workers_mcp,
         workers_disabled,
         request.workers_parent_chat_id.as_deref(),
+        engine_endpoint().as_deref(),
     ) {
         servers.push(server);
     }
@@ -238,14 +270,38 @@ mod tests {
     use std::path::Path;
 
     fn server() -> WorkersMcpServer {
-        resolve_for(Path::new("/opt/zeron"), true, false, Some("chat-1")).expect("enabled")
+        resolve_for(Path::new("/opt/zeron"), true, false, Some("chat-1"), None).expect("enabled")
+    }
+
+    #[test]
+    fn controller_env_carries_the_engine_endpoint_when_known() {
+        let with = resolve_for(
+            Path::new("/opt/zeron"),
+            true,
+            false,
+            Some("chat-1"),
+            Some("ws://127.0.0.1:27654"),
+        )
+        .expect("enabled");
+        assert!(with.env.contains(&(
+            ENGINE_ENDPOINT_ENV.to_owned(),
+            "ws://127.0.0.1:27654".to_owned()
+        )));
+        let without =
+            resolve_for(Path::new("/opt/zeron"), true, false, None, None).expect("enabled");
+        assert!(
+            without
+                .env
+                .iter()
+                .all(|(name, _)| name != ENGINE_ENDPOINT_ENV)
+        );
     }
 
     #[test]
     fn disabled_or_relative_executable_yields_none() {
-        assert!(resolve_for(Path::new("/opt/zeron"), false, false, None).is_none());
-        assert!(resolve_for(Path::new("/opt/zeron"), true, true, None).is_none());
-        assert!(resolve_for(Path::new("zeron"), true, false, None).is_none());
+        assert!(resolve_for(Path::new("/opt/zeron"), false, false, None, None).is_none());
+        assert!(resolve_for(Path::new("/opt/zeron"), true, true, None, None).is_none());
+        assert!(resolve_for(Path::new("zeron"), true, false, None, None).is_none());
     }
 
     #[test]

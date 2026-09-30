@@ -1,3 +1,4 @@
+mod support;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -216,7 +217,9 @@ fn external_checkout_keeps_identity_after_directory_disappears()
     )?;
     let _home = UnpeelHomeGuard::set(home.path());
     let client = LocalWorkersClient::new();
-    let feature_id = client.add_project(&checkout)?;
+    let feature_id = client
+        .add_project(&checkout, &support::registry())?
+        .checkout_id;
     let before = client.project_identity_registry()?;
     let before_checkout = before
         .checkout(&feature_id)
@@ -486,7 +489,9 @@ fn forgetting_a_checkout_stays_hidden_until_an_explicit_readd()
     )?;
     let _home = UnpeelHomeGuard::set(home.path());
     let client = LocalWorkersClient::new();
-    let checkout_id = client.add_project(&checkout)?;
+    let checkout_id = client
+        .add_project(&checkout, &support::registry())?
+        .checkout_id;
     let checkout_path = canonical_string(&checkout)?;
 
     let visible_before = client.projects_with_ledger()?;
@@ -516,7 +521,12 @@ fn forgetting_a_checkout_stays_hidden_until_an_explicit_readd()
 
     // Explicit registration is the user's opt-in restoration and clears the
     // suppression marker in the same atomic write as the project registration.
-    assert_eq!(reopened.add_project(&checkout)?, checkout_id);
+    assert_eq!(
+        reopened
+            .add_project(&checkout, &support::registry())?
+            .checkout_id,
+        checkout_id
+    );
     let visible_after_readd = reopened.projects_with_ledger()?;
     assert!(
         visible_after_readd
