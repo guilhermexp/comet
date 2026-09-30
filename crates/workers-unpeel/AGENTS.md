@@ -392,7 +392,10 @@ Settings), apps/zeron (host-mode dispatch at startup).
   Host indisponível mantém o replay limitado anterior; a geometria histórica
   não é exata sem um histórico de resize. O formatter continua sanitizando
   campos, controles e cercas de Markdown, mas recebe o texto já interpretado.
-  Não é screenshot, OCR nem transcript estruturado do provider.
+  Não é screenshot, OCR nem transcript estruturado do provider. No fallback
+  sem grade (`project_terminal_fallback`), `\r` só volta o cursor: a linha é
+  trocada quando algo é pintado por cima. Limpar no `\r` apagava toda linha
+  terminada em `\r\n` e o último paint terminado em `\r`.
 - **Pergunta do Worker acorda o Orquestrador pelo mesmo canal de conclusão.**
   `PermissionRequest` (incluindo `AskUserQuestion`) toma `HookState::Attention`
   — a supressão latch-only saiu, porque no Worker lançado por Orquestrador o

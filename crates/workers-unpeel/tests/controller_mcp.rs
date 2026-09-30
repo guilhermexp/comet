@@ -383,10 +383,21 @@ fn worker_output_preserves_answer_when_repaints_depend_on_terminal_width() {
 }
 
 #[test]
+fn semantic_fallback_keeps_crlf_lines_and_repaints_over_carriage_return() {
+    let raw = "first line\r\nsecond line\r\nold status\rnew status\r\n";
+    let semantic = controller_mcp_choose_semantic_output(raw, None, 64 * 1024);
+
+    assert_eq!(semantic, "first line\nsecond line\nnew status");
+}
+
+#[test]
 fn parent_notification_assembly_consumes_semantic_viewport_when_present() {
     let raw = "stale paint\rAsk the user a question\r";
-    let tail =
-        controller_mcp_choose_semantic_output(raw, Some(vec!["Ask the user a question".into()]), 4 * 1024);
+    let tail = controller_mcp_choose_semantic_output(
+        raw,
+        Some(vec!["Ask the user a question".into()]),
+        4 * 1024,
+    );
     assert_eq!(tail, "Ask the user a question");
     assert!(!tail.contains("stale paint"));
 }

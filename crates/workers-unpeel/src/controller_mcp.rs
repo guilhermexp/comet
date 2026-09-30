@@ -690,28 +690,41 @@ fn project_terminal_fallback(raw: &str, max_bytes: usize) -> String {
     let mut state = State::Text;
     let mut lines = Vec::new();
     let mut line = String::new();
+    // `\r` returns the cursor, it does not erase: the line is only replaced
+    // once something is painted over it. Clearing eagerly dropped every
+    // `\r\n`-terminated line and a final paint ending in `\r`.
+    let mut overwrite_pending = false;
     for character in raw.chars() {
         state = match state {
             State::Text => match character {
                 '\u{1b}' => State::Escape,
                 '\r' => {
-                    line.clear();
+                    overwrite_pending = true;
                     State::Text
                 }
                 '\n' => {
+                    overwrite_pending = false;
                     lines.push(std::mem::take(&mut line));
                     State::Text
                 }
                 '\u{8}' | '\u{7f}' => {
-                    line.pop();
+                    if !overwrite_pending {
+                        line.pop();
+                    }
                     State::Text
                 }
                 '\t' => {
+                    if std::mem::take(&mut overwrite_pending) {
+                        line.clear();
+                    }
                     line.push(' ');
                     State::Text
                 }
                 value if value.is_control() => State::Text,
                 value => {
+                    if std::mem::take(&mut overwrite_pending) {
+                        line.clear();
+                    }
                     line.push(value);
                     State::Text
                 }
@@ -725,9 +738,11 @@ fn project_terminal_fallback(raw: &str, max_bytes: usize) -> String {
                 if ('@'..='~').contains(&character) {
                     if matches!(character, 'H' | 'f' | 'G' | 'K') {
                         line.clear();
+                        overwrite_pending = false;
                     } else if character == 'J' {
                         lines.clear();
                         line.clear();
+                        overwrite_pending = false;
                     }
                     State::Text
                 } else {
