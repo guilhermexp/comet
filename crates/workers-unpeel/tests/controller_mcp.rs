@@ -1985,6 +1985,82 @@ fn wait_for_status_rejects_unknown_status_immediately() {
 }
 
 #[test]
+fn read_transcript_returns_the_conversation_of_a_managed_omp_worker() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    std::fs::write(
+        home.path().join("app-state.json"),
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let storage = home.path().join("pi-sessions").join("worker-omp");
+    std::fs::create_dir_all(&storage).unwrap();
+    let transcript = storage.join("20260930_omp-provider-1.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"briefing from the orchestrator"}]}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"report from the worker"}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let session_dir = home.path().join("app-sessions").join("worker-omp");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "session": {
+                "id": "worker-omp",
+                "project_id": "project-1",
+                "label": "Worker OMP",
+                "command": "omp",
+                "created_at": 1000
+            },
+            "cwd": "/tmp",
+            "state": "running",
+            "pid": 12345,
+            "exit_code": null,
+            "has_been_written_to": true,
+            "updated_at": 1000,
+            "managed_storage_path": storage.to_string_lossy(),
+            "provider_transcript_path": transcript.to_string_lossy()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _guard = UnpeelHomeGuard::set(home.path());
+
+    let response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": { "action": "read_transcript", "session_id": "worker-omp" }
+        }
+    }))
+    .expect("tools/call responds");
+
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let markdown = response["result"]["structuredContent"]["markdown"]
+        .as_str()
+        .unwrap_or_else(|| panic!("markdown in structured content: {response}"));
+    assert!(
+        markdown.contains("briefing from the orchestrator"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("report from the worker"), "{markdown}");
+}
+
+#[test]
 fn wait_for_status_completed_on_untracked_worker_is_rejected_immediately() {
     let _lock = ENV_LOCK.lock();
     let home = TempDir::new().unwrap();

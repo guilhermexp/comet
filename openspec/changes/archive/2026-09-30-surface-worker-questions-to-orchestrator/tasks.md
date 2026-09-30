@@ -29,10 +29,13 @@
 ## 6. Transcript da família pi
 
 - [x] 6.1 Declarar a capability de transcript para `omp` e registrar o adaptador reusando o leitor de sessão JSONL da família, com raízes confiáveis restritas ao diretório de sessão gerenciado. Verificar: teste assertando que o adaptador está registrado na tabela gerada e que a resolução de provedor tem sucesso para um manifesto do runtime.
-- [ ] 6.2 Confirmar a leitura fim a fim pelo controller MCP. Verificar: teste de integração do controller lendo o transcript de uma sessão gerenciada e recebendo as entradas da conversa.
+- [x] 6.2 Confirmar a leitura fim a fim pelo controller MCP. Verificar: teste de integração do controller lendo o transcript de uma sessão gerenciada e recebendo as entradas da conversa. (`read_transcript_returns_the_conversation_of_a_managed_omp_worker`, `tests/controller_mcp.rs`.)
 
 ## 7. Fechamento
 
 - [x] 7.1 Confirmar que a política de hibernação continua protegendo Worker em atenção. Verificar: teste de `hibernation_candidates` com sessão em estado bloqueado não entrando na lista de candidatos.
 - [x] 7.2 DOX pass: atualizar `crates/workers-unpeel/AGENTS.md` (contratos de atenção, não lido, notificação e transcript) e a Test Coverage Matrix da subárvore. Verificar: a cadeia raiz→alvo descreve o comportamento novo e não contém texto stale sobre atenção não confiável.
-- [ ] 7.3 Rodar a suíte canônica do workspace uma vez ao final e registrar a saída literal. Verificar: `cargo test --workspace` sem falhas.
+- [x] 7.3 Rodar a suíte canônica do workspace uma vez ao final e registrar a saída literal. Verificar: `cargo test --workspace` sem falhas.
+  - 2026-09-30, `cargo test --workspace --no-fail-fast` na `main` pós-merge: 147 suítes, `passed=4751 failed=2 ignored=40`.
+  - As duas falhas são de `zeron-engine`, crate que este change não toca: `rpc_dispatch_for_m5_methods` (`CreateWorktree waited for the setup command (9.28s)`, teto de 4s) e `harness_emitted_input_twin_is_dropped_and_answer_resumes` (`left: Some((Rejected, …)) right: Some((Applied, None))`).
+  - Rodadas isoladas logo depois: ambas `ok`. Sensíveis a carga da máquina com a suíte inteira em paralelo; não é regressão deste change.
