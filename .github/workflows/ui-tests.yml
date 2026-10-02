@@ -39,35 +39,50 @@ jobs:
     permissions:
       pull-requests: read
     outputs:
-      ios: ${{ steps.filter.outputs.result }}
+      ios: ${{ steps.filter.outputs.ios }}
+      native: ${{ steps.filter.outputs.native }}
+      session_sync: ${{ steps.filter.outputs.session_sync }}
     steps:
       - uses: actions/github-script@v8
         id: filter
         with:
           script: |
-            // Preserve iOS coverage for main pushes and manual runs.
-            if (context.eventName !== 'pull_request') return true;
+            const lanes = ['ios', 'native', 'session_sync'];
+            const all = value => lanes.forEach(lane => core.setOutput(lane, value));
+            // Preserve full coverage for main pushes and manual runs.
+            if (context.eventName !== 'pull_request') return all(true);
             const files = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: context.payload.pull_request.number,
               per_page: 100,
             });
             // Run conservatively if the API did not return the full diff.
-            if (files.length < context.payload.pull_request.changed_files) return true;
+            if (files.length < context.payload.pull_request.changed_files) return all(true);
+            const shared = path => ['Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
+              '.github/workflows/ui-tests.yml'].includes(path);
+            const under = (path, prefixes) => prefixes.some(prefix => path?.startsWith(prefix));
             // The app links the Rust mobile core and everything it depends on.
-            const mobileCore = ['crates/mobile/', 'crates/client/', 'crates/text/', 'crates/markdown/',
-              'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/', 'crates/syntax/',
-              'scripts/ios/'];
-            const affectsIOS = path => path?.startsWith('apps/ios/')
-              || mobileCore.some(prefix => path?.startsWith(prefix))
-              || path === 'Cargo.lock'
-              || path === 'Cargo.toml'
-              || path === 'rust-toolchain.toml'
-              || path === '.github/workflows/ui-tests.yml';
-            return files.some(file => affectsIOS(file.filename)
-              || affectsIOS(file.previous_filename));
+            const mobileCore = ['apps/ios/', 'crates/mobile/', 'crates/client/', 'crates/text/',
+              'crates/markdown/', 'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/',
+              'crates/syntax/', 'scripts/ios/'];
+            // Native macOS/Linux fixtures: browser, preview, notifications,
+            // diff font geometry and the vendored GPUI frame source.
+            const nativeSurfaces = ['crates/ui/src/browser/', 'crates/ui/src/file_preview/',
+              'crates/ui/src/notify.rs', 'crates/ui/src/changes.rs', 'crates/ui/examples/',
+              'crates/ui/Cargo.toml', 'crates/preview/', 'third_party/zui/', 'edge/', 'dist/macos/',
+              'scripts/run-macos-browser-fixture.sh', 'scripts/test-linux-browser.sh'];
+            const sessionSync = ['crates/harness/', 'crates/sync/', 'crates/update/',
+              'crates/engine/', 'crates/doc/', 'crates/proto/', 'crates/rpc/'];
+            const touches = prefixes => files.some(file =>
+              [file.filename, file.previous_filename].some(path =>
+                shared(path) || under(path, prefixes)));
+            core.setOutput('ios', touches(mobileCore));
+            core.setOutput('native', touches(nativeSurfaces));
+            core.setOutput('session_sync', touches(sessionSync));
 
   session-sync-regressions:
+    needs: changes
+    if: needs.changes.outputs.session_sync == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -106,6 +121,8 @@ jobs:
         run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
 
   macos-frame-recovery:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -215,6 +232,8 @@ jobs:
           if-no-files-found: ignore
 
   linux-browser:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

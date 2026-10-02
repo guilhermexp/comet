@@ -12,6 +12,11 @@ Este arquivo é fino de propósito. O contrato do repo está em [`AGENTS.md`](AG
 
 `cargo build` · `cargo test --workspace` · `cargo test -p <crate>` · `cargo fmt --all` · `scripts/dev-demo.sh` · `scripts/e2e-smoke.sh` · `npm -C edge run test|typecheck`
 
+## Fluxo de merge
+
+- **Mudança pequena/localizada vai direto pra `main`** (decisão do dono, 2026-10-02): `cargo fmt --all`, testes só dos crates tocados (`cargo test -p <crate>`), commit e `git push origin HEAD:main`. Sem gate.
+- **O gate `no-mistakes` é só para mudança grande** (vários subsistemas, contrato de wire, migração) ou quando o dono pedir. Ele roda revisão + suíte inteira + CI completo e leva 1–2h.
+
 ## Lessons Learned
 
 - **`cargo fmt --all` antes de merge do upstream.** O upstream lança várias versões por semana; sem fmt do nosso lado, o merge conflita em ruído de formatação.
