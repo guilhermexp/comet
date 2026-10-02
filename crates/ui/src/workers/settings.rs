@@ -785,7 +785,7 @@ impl WorkersSettingsView {
                             .map(|error| ((*cli_id).to_owned(), error.to_owned()))
                     })
                     .collect::<HashMap<_, _>>(),
-                model.agent_updates.clone(),
+                model.preset_agent_updates(),
                 model.agent_update_error.clone(),
             )
         };
@@ -1011,13 +1011,8 @@ impl WorkersSettingsView {
                 ));
             }
 
-            let cli_key = preset.cli_id.as_deref().unwrap_or_else(|| {
-                preset
-                    .command
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(&preset.command)
-            });
+            let cli_key =
+                crate::workers::model::preset_cli_key(preset.cli_id.as_deref(), &preset.command);
             let agent_update =
                 crate::workers::model::harness_for_cli(cli_key).and_then(|harness| {
                     agent_updates

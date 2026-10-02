@@ -831,14 +831,6 @@ impl WorkersModel {
         }));
     }
 
-    /// The upstream update row for a preset's CLI, if the engine tracks it.
-    pub fn agent_update_for_cli(&self, cli_key: &str) -> Option<&zeron_proto::HarnessUpdateStatus> {
-        let harness = harness_for_cli(cli_key)?;
-        self.agent_updates
-            .iter()
-            .find(|status| status.harness == harness)
-    }
-
     pub fn apply_agent_update(&mut self, harness: zeron_proto::HarnessId, cx: &mut Context<Self>) {
         self.call_agent_updates(
             methods::APPLY_HARNESS_UPDATE,
@@ -847,9 +839,24 @@ impl WorkersModel {
         );
     }
 
+    /// Updater rows for the harnesses the configured Workers presets run.
+    pub fn preset_agent_updates(&self) -> Vec<zeron_proto::HarnessUpdateStatus> {
+        let presets = self
+            .settings
+            .as_ref()
+            .map(|settings| settings.presets.as_slice())
+            .unwrap_or_default();
+        updates_for_preset_clis(
+            presets
+                .iter()
+                .map(|preset| preset_cli_key(preset.cli_id.as_deref(), &preset.command)),
+            &self.agent_updates,
+        )
+    }
+
     pub fn update_all_agents(&mut self, cx: &mut Context<Self>) {
         let targets: Vec<_> = self
-            .agent_updates
+            .preset_agent_updates()
             .iter()
             .filter(|status| {
                 status.phase == zeron_proto::HarnessUpdatePhase::Available && status.can_apply
@@ -2468,6 +2475,22 @@ pub(crate) fn harness_for_cli(cli_key: &str) -> Option<zeron_proto::HarnessId> {
     })
 }
 
+pub(crate) fn preset_cli_key<'a>(cli_id: Option<&'a str>, command: &'a str) -> &'a str {
+    cli_id.unwrap_or_else(|| command.split_whitespace().next().unwrap_or(command))
+}
+
+fn updates_for_preset_clis<'a>(
+    cli_keys: impl IntoIterator<Item = &'a str>,
+    updates: &[zeron_proto::HarnessUpdateStatus],
+) -> Vec<zeron_proto::HarnessUpdateStatus> {
+    let harnesses: HashSet<_> = cli_keys.into_iter().filter_map(harness_for_cli).collect();
+    updates
+        .iter()
+        .filter(|status| harnesses.contains(&status.harness))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -2503,6 +2526,42 @@ mod tests {
         assert_eq!(super::harness_for_cli("omp"), Some(HarnessId::Omp));
         // The Antigravity CLI is a Workers runtime, not an engine harness.
         assert_eq!(super::harness_for_cli("agy"), None);
+    }
+
+    #[test]
+    fn preset_updates_cover_only_harnesses_with_a_preset() {
+        use zeron_proto::{HarnessId, HarnessUpdatePhase, HarnessUpdateStatus};
+        let status = |harness| HarnessUpdateStatus {
+            harness,
+            installed_version: None,
+            latest_version: None,
+            channel: None,
+            source: Default::default(),
+            policy: Default::default(),
+            phase: HarnessUpdatePhase::Available,
+            progress: None,
+            checked_at: None,
+            error: None,
+            can_apply: true,
+            manual_command: None,
+        };
+        let updates = vec![
+            status(HarnessId::Codex),
+            status(HarnessId::Grok),
+            status(HarnessId::Pi),
+            status(HarnessId::Omp),
+        ];
+        let keys = [
+            super::preset_cli_key(Some("codex"), "codex --yolo"),
+            super::preset_cli_key(None, "omp --model x"),
+            super::preset_cli_key(None, "agy"),
+        ];
+        let harnesses: Vec<_> = super::updates_for_preset_clis(keys, &updates)
+            .into_iter()
+            .map(|status| status.harness)
+            .collect();
+        assert_eq!(harnesses, vec![HarnessId::Codex, HarnessId::Omp]);
+        assert!(super::updates_for_preset_clis([], &updates).is_empty());
     }
 
     #[test]
