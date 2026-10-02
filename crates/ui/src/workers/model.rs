@@ -849,7 +849,7 @@ impl WorkersModel {
         updates_for_preset_clis(
             presets
                 .iter()
-                .map(|preset| preset_cli_key(preset.cli_id.as_deref(), &preset.command)),
+                .map(|preset| cli_head(preset.cli_id.as_deref(), &preset.command)),
             &self.agent_updates,
         )
     }
@@ -2475,8 +2475,11 @@ pub(crate) fn harness_for_cli(cli_key: &str) -> Option<zeron_proto::HarnessId> {
     })
 }
 
-pub(crate) fn preset_cli_key<'a>(cli_id: Option<&'a str>, command: &'a str) -> &'a str {
-    cli_id.unwrap_or_else(|| command.split_whitespace().next().unwrap_or(command))
+/// The bare CLI binary a preset runs, so presets sharing a CLI share one
+/// model-label lookup and one updater row.
+pub(crate) fn cli_head<'a>(cli_id: Option<&'a str>, command: &'a str) -> &'a str {
+    let raw = cli_id.unwrap_or(command);
+    raw.split_whitespace().next().unwrap_or(raw)
 }
 
 fn updates_for_preset_clis<'a>(
@@ -2552,9 +2555,9 @@ mod tests {
             status(HarnessId::Omp),
         ];
         let keys = [
-            super::preset_cli_key(Some("codex"), "codex --yolo"),
-            super::preset_cli_key(None, "omp --model x"),
-            super::preset_cli_key(None, "agy"),
+            super::cli_head(Some("codex"), "codex --yolo"),
+            super::cli_head(None, "omp --model x"),
+            super::cli_head(None, "agy"),
         ];
         let harnesses: Vec<_> = super::updates_for_preset_clis(keys, &updates)
             .into_iter()

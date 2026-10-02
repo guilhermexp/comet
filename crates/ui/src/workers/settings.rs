@@ -12,7 +12,7 @@ use zeron_workers_unpeel::{
     PresetPatch, WorkersNotificationSettings, WorkersResourceSettings, WorkersTranscriptSettings,
 };
 
-use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
+use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab, cli_head};
 use super::presentation::{runtime_icon_path, spinner_frame};
 use super::resource_monitor::{WorkersResourceGlobal, WorkersResourceMonitor};
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -387,13 +387,6 @@ pub fn format_model_label(raw: &str) -> String {
         })
         .collect();
     capitalized.join(" ")
-}
-
-/// Cache key for a preset: the bare CLI binary, so presets sharing a CLI share
-/// one lookup.
-fn cli_head<'a>(cli_id: Option<&'a str>, command: &'a str) -> &'a str {
-    let raw = cli_id.unwrap_or(command);
-    raw.split_whitespace().next().unwrap_or(raw)
 }
 
 pub fn detect_cli_default_model(cli_or_cmd: &str) -> (String, String) {
@@ -1011,8 +1004,7 @@ impl WorkersSettingsView {
                 ));
             }
 
-            let cli_key =
-                crate::workers::model::preset_cli_key(preset.cli_id.as_deref(), &preset.command);
+            let cli_key = cli_head(preset.cli_id.as_deref(), &preset.command);
             let agent_update =
                 crate::workers::model::harness_for_cli(cli_key).and_then(|harness| {
                     agent_updates
