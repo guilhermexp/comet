@@ -56,9 +56,10 @@ impl SpaceRegistry for MemoryRegistry {
 }
 
 /// A fake engine speaking the RPC surface the project registry uses
-/// (`LocalDevice`, `WatchSpaces`, `WatchDevices`, `Mutate createSpace`),
-/// served over a loopback WebSocket like the real one. `createSpace` dedupes
-/// on the exact `(deviceId, path)` string, as the engine does.
+/// (`LocalDevice`, `WatchSpaces`, `WatchDevices`, `WatchChats`,
+/// `Mutate createSpace`), served over a loopback WebSocket like the real one.
+/// `createSpace` dedupes on the exact `(deviceId, path)` string, as the
+/// engine does.
 pub mod engine {
     use std::sync::{Arc, Mutex};
 
@@ -73,6 +74,7 @@ pub mod engine {
     pub struct State {
         pub spaces: Vec<Value>,
         pub devices: Vec<Value>,
+        pub chats: Vec<Value>,
     }
 
     pub struct FakeEngine {
@@ -111,6 +113,9 @@ pub mod engine {
                 methods::WATCH_SPACES => watch_stream(self.spaces_tx.subscribe()),
                 methods::WATCH_DEVICES => {
                     stream(Value::Array(self.state.lock().unwrap().devices.clone()))
+                }
+                methods::WATCH_CHATS => {
+                    stream(Value::Array(self.state.lock().unwrap().chats.clone()))
                 }
                 methods::MUTATE if params["op"] == "createSpace" => {
                     let spaces = {
@@ -157,6 +162,7 @@ pub mod engine {
             let state = Arc::new(Mutex::new(State {
                 spaces: Vec::new(),
                 devices,
+                chats: Vec::new(),
             }));
             let spaces_tx = Arc::new(tokio::sync::watch::channel(Vec::new()).0);
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -188,6 +194,23 @@ pub mod engine {
                 "gitDetected": true, "createdAt": "2026-09-29T00:00:00Z"
             }));
             self.spaces_tx.send_replace(state.spaces.clone());
+        }
+
+        /// A chat of `space_id` whose last message is `last_message_at`
+        /// (RFC 3339).
+        pub fn add_chat(
+            &self,
+            id: &str,
+            space_id: &str,
+            title: &str,
+            archived: bool,
+            last_message_at: &str,
+        ) {
+            self.state.lock().unwrap().chats.push(json!({
+                "id": id, "deviceId": LOCAL_DEVICE, "title": title, "archived": archived,
+                "spaceId": space_id, "lastMessageAt": last_message_at,
+                "createdAt": "2026-09-01T00:00:00Z"
+            }));
         }
 
         pub fn spaces(&self) -> Vec<Value> {

@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 base64 = "0.22"
+# Ticket creation time (`project_tickets`); already in the graph via zeron-proto.
+chrono.workspace = true
 dirs = "6"
 ignore.workspace = true
 libc.workspace = true

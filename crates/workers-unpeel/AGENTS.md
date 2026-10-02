@@ -23,7 +23,9 @@ internal host modes (`__session_host__` et al.).
 | `workspace_trust.rs` | Workspace trust decisions |
 | `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
 | `project_ledger.rs` | Historical checkout metadata, grouping of checkout history under the registry's projects (`group_rows_by_project`) and persistent Forget suppression |
-| `space_registry.rs` | The single project registry as Workers see it: `SpaceRegistry` (`list`, `ensure`), `SpaceRef`, the chat-MCP-equivalent join (`space_refs`) and `RpcSpaceRegistry` over the engine RPC surface (`COMET_WORKERS_ENGINE_ENDPOINT`) |
+| `project_activity.rs` | What Settings → Projects shows per project, UI-free and shared with the controller: `ProjectEntry`/`project_entries` (Spaces × devices × decorated checkout history `checkout_rows`), the project's Worker sessions (`with_archived_sessions`, `project_sessions`, `worker_provider`) and chats (`project_chats`, `chat_title`, `launched_workers`) |
+| `project_tickets.rs` | Harness tickets of the Orchestrator workspace (`$ORCH_WORKSPACE`, else `~/orchestrator`): frontmatter parser, `read_tickets` (no git), `load_tickets` (plus OpenSpec links via git, Settings only), and matching by checkout `cwd` or harness folder name (`tickets_for_project`). Read-only |
+| `space_registry.rs` | The single project registry as Workers see it: `SpaceRegistry` (`list`, `ensure`), `SpaceRef`, the chat-MCP-equivalent join (`space_refs`) and `RpcSpaceRegistry` over the engine RPC surface (`COMET_WORKERS_ENGINE_ENDPOINT`), including `read_with_chats` for the controller's project activity |
 | `space_links.rs` | Checkout ↔ project links: `project_folder`, `link_unlinked_at`, the one-time `migrate_at` (backup, reconcile, link, marker) and the read-only `linked_checkouts_at` Source Control authorizes through |
 | `checkout_lifecycle.rs` | Shared Chat/Workers worktree creation, guarded physical removal, stale registration pruning, archive/restore and action coordination |
 | `copy_ignored.rs` | Opt-in `.worktreeinclude` copy of Git-ignored files during shared checkout preparation, with reflink and no overwrite |
@@ -41,10 +43,13 @@ Hooks de remoção leem o `.config/wt.toml` do checkout removido; hooks de cria�
 
 Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`), plus
 `zeron-proto`/`zeron-rpc` only for the project registry transport (neither
-depends on this crate: no cycle, checked with `cargo tree -i`).
+depends on this crate: no cycle, checked with `cargo tree -i`) and `chrono`
+for ticket times. Nunca depende de gpui nem de `zeron-ui`: os leitores de
+Settings → Projects moram aqui para o controller também poder usá-los.
 Consumed by: zeron-engine (ciclo de vida de worktree, atividade local e
 autorização de Source Control por link de projeto), zeron-ui (`workers/` e
-Settings), apps/zeron (host-mode dispatch at startup).
+Settings, incluindo os leitores `project_activity`/`project_tickets`),
+apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
 
@@ -68,6 +73,17 @@ Settings), apps/zeron (host-mode dispatch at startup).
   `launch_worker` aceita id de projeto (principal, registrado sob demanda) ou
   `checkout_id` (aquele checkout); projeto de outro device falha antes do
   spawn nomeando o device.
+- **`list_projects` carrega a atividade que Settings → Projects mostra, pelos
+  mesmos leitores.** Cada projeto traz `general`, `tickets`,
+  `worker_sessions` e `orchestrator_sessions`, montados com
+  `project_activity` e `project_tickets` — os módulos que a UI renderiza,
+  então os ids batem com as abas. Não duplique parser nem casamento na UI ou
+  no controller. A listagem lê tickets com `read_tickets` (sem git; o
+  `load_tickets` com specs custa ~1,4 s em 143 tickets e é só da página);
+  chats vêm de `WatchChats` no mesmo endpoint. Fonte ilegível (workspace do
+  Orquestrador, histórico de checkouts, chats) deixa a seção vazia com
+  `error` nomeando-a; a listagem não falha. Projeto de outro device tem
+  `worker_sessions` vazio sem erro.
 - **Migração única** (`space_links::migrate_at`, chamada pela UI depois que a
   engine conecta e os Spaces sincronizam): copia `app-state.json` para
   `app-state.space-migration-backup.json` (nunca sobrescreve uma cópia
@@ -655,7 +671,8 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 | `src/lib.rs` (criação/preparo Chat e Workers), `src/checkout_lifecycle.rs`, `src/checkout_activity.rs`, `src/worktree_ownership.rs`, `src/copy_ignored.rs`, `src/branch_cleanup.rs`, `src/worktrunk_{hooks,lifecycle,approvals}.rs`, `src/worktree_config.rs` (setup e retries) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/hook_migration.rs`, `src/activity_bridge.rs`, `src/resources.rs`, `src/session_event_journal.rs`, `src/project_ledger.rs`, `src/project_git.rs` | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/project_identity.rs` (link `space_id`, herança por repositório, round-trip com chaves desconhecidas) | unit | `cargo test -p zeron-workers-unpeel --lib project_identity` |
-| `tests/controller_mcp.rs` — Comet-owned MCP surface, including `launch_worker.new_worktree` validation, recoverable launch failures and the project registry (add/list/launch through a fake engine over WebSocket, `tests/support`) | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/controller_mcp.rs` — Comet-owned MCP surface, including `launch_worker.new_worktree` validation, recoverable launch failures, the project registry (add/list/launch through a fake engine over WebSocket with `WatchChats`, `tests/support`) and each project's activity in `list_projects` (tickets, Worker sessions, chats, unreadable workspace, remote project, ids equal to the Settings readers) | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `src/project_tickets.rs` (frontmatter, carga por pasta, erro de workspace ilegível, links OpenSpec, casamento por checkout e por nome) | unit | `cargo test -p zeron-workers-unpeel --lib project_tickets` |
 | `tests/space_migration.rs` — migração única: principal não registrado, Space existente, segunda rodada no-op, registro sem evidência, sessões preservadas | integration | `cargo test -p zeron-workers-unpeel --test space_migration` |
 | `tests/worker_initial_briefing.rs` (13) — OMP/Claude/Pi/Codex native delivery, literal input, spawn and ACK failures, no replay, existing interactive guards, managed Codex wrapper privacy and upstream launcher composition | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
