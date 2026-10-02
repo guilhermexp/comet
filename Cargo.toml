@@ -3,6 +3,7 @@ resolver = "2"
 default-members = ["apps/zeron"]
 members = [
     "crates/syntax",
+    "crates/voice",
     "crates/theme",
     "crates/proto",
     "crates/preview",

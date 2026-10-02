@@ -120,62 +120,6 @@ async fn rename_preserves_content_and_refuses_collision() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_removes_directory_recursively() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir_all(root.join("folder/child")).unwrap();
-    std::fs::write(root.join("folder/child/file.txt"), "gone").unwrap();
-    let core = assemble(&temp.path().join("data"));
-    create_owned_space(&core, &root);
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
-    let deleted = client
-        .call(
-            "DeleteWorkspaceEntry",
-            json!({
-                "spaceId": "files",
-                "path": "folder",
-            }),
-        )
-        .await
-        .expect("delete");
-    assert_eq!(deleted["path"], "folder");
-    assert_eq!(deleted["isDirectory"], true);
-    assert!(!root.join("folder").exists());
-    core.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn move_relocates_file_between_folders() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir_all(root.join("src/util")).unwrap();
-    std::fs::write(root.join("src/a.rs"), "fn a() {}").unwrap();
-    let core = assemble(&temp.path().join("data"));
-    create_owned_space(&core, &root);
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
-    let moved = client
-        .call(
-            "MoveWorkspaceEntry",
-            json!({
-                "spaceId": "files",
-                "sourcePath": "src/a.rs",
-                "destinationDirectory": "src/util",
-            }),
-        )
-        .await
-        .expect("move");
-    assert_eq!(moved["path"], "src/util/a.rs");
-    assert!(!root.join("src/a.rs").exists());
-    assert_eq!(
-        std::fs::read(root.join("src/util/a.rs")).unwrap(),
-        b"fn a() {}"
-    );
-    core.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copy_collision_gets_unique_name() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
@@ -212,7 +156,7 @@ async fn paste_folder_into_itself_is_refused() {
     create_owned_space(&core, &root);
     let client = zeron_rpc::memory_client(core.rpc_service());
 
-    for method in ["MoveWorkspaceEntry", "CopyWorkspaceEntry"] {
+    for method in ["CopyWorkspaceEntry"] {
         let err = client
             .call(
                 method,

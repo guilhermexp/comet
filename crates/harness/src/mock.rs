@@ -31,6 +31,8 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "Event-driven fold with coalesced commits".into(),
                 "Hybrid: event-driven with a polling fallback".into(),
             ],
+            prefill: None,
+            multiline: false,
             multi_select: false,
         },
         UserInputQuestion {
@@ -42,6 +44,8 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "End-to-end (two-device)".into(),
                 "Golden screenshots".into(),
             ],
+            prefill: None,
+            multiline: false,
             multi_select: true,
         },
     ]

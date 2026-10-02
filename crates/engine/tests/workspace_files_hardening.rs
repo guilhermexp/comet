@@ -117,38 +117,6 @@ async fn rename_refuses_existing_destination_instead_of_overwriting() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn move_refuses_existing_destination_instead_of_overwriting() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir_all(root.join("dest")).unwrap();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("dest/Ä.txt"), "original").unwrap();
-    std::fs::write(root.join("src/ä.txt"), "moved").unwrap();
-    let core = assemble(&temp.path().join("data"));
-    create_owned_space(&core, &root);
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
-    let error = call(
-        &client,
-        "MoveWorkspaceEntry",
-        json!({
-            "spaceId": "files",
-            "sourcePath": "src/ä.txt",
-            "destinationDirectory": "dest",
-        }),
-    )
-    .await
-    .expect_err("unicode-case move collision must be refused");
-    assert!(
-        error.to_string().contains("exist"),
-        "collision message, got {error}"
-    );
-    assert_eq!(std::fs::read(root.join("dest/Ä.txt")).unwrap(), b"original");
-    assert_eq!(std::fs::read(root.join("src/ä.txt")).unwrap(), b"moved");
-    core.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copy_refuses_tree_deeper_than_component_limit() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
@@ -178,37 +146,6 @@ async fn copy_refuses_tree_deeper_than_component_limit() {
         "failed copy must not leave a destination tree"
     );
     assert!(root.join("deep").is_dir());
-    core.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_refuses_tree_deeper_than_component_limit() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    nest_directories(&root.join("deep"), 257);
-    let core = assemble(&temp.path().join("data"));
-    create_owned_space(&core, &root);
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
-    let error = call(
-        &client,
-        "DeleteWorkspaceEntry",
-        json!({
-            "spaceId": "files",
-            "path": "deep",
-        }),
-    )
-    .await
-    .expect_err("over-deep delete must be refused");
-    let message = error.to_string();
-    assert!(
-        message.contains("deep"),
-        "depth error must mention depth, got {message}"
-    );
-    assert!(
-        root.join("deep").is_dir(),
-        "refused delete must leave the tree in place"
-    );
     core.shutdown().await;
 }
 

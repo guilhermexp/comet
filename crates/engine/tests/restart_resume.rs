@@ -1317,6 +1317,8 @@ async fn orphaned_question_on_a_streaming_entry_is_answerable() {
                     question: "A or B?".into(),
                     options: vec!["a".into(), "b".into()],
                     multi_select: false,
+                    multiline: false,
+                    prefill: None,
                 }],
                 resolved: false,
             }],

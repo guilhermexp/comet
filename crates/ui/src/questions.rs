@@ -217,6 +217,8 @@ mod tests {
             question: text.into(),
             options: vec![],
             multi_select: false,
+            multiline: false,
+            prefill: None,
         }
     }
     fn tool() -> MessagePart {

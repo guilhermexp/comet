@@ -619,6 +619,13 @@ impl Shell {
                             this.run_project_action(&run_key, run_action.clone(), cx)
                         }))
                 })
+                // Without its label the segment is a bare glyph.
+                .when(!show_label, |el| {
+                    el.tooltip(crate::settings::widgets::text_tooltip(format!(
+                        "Run {}",
+                        action.name
+                    )))
+                })
                 .child(
                     icon(action_icon(action.icon))
                         .size(px(13.0))
@@ -1144,6 +1151,7 @@ fn action_chevron(
                     cx.stop_propagation();
                     on_click(event, window, cx)
                 })
+                .tooltip(crate::settings::widgets::text_tooltip("Project actions"))
         })
         .child(
             icon(icons::ALT_ARROW_DOWN)

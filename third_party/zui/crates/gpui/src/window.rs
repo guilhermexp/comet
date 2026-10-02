@@ -704,6 +704,11 @@ pub struct EdgeFade {
     pub band_top: Option<Pixels>,
     /// Per-edge override of [`Self::band`] for the bottom edge.
     pub band_bottom: Option<Pixels>,
+    /// Per-edge override of [`Self::band`] for the left edge. A scroll strip
+    /// can grow each side's ramp with the content hidden past it.
+    pub band_left: Option<Pixels>,
+    /// Per-edge override of [`Self::band`] for the right edge.
+    pub band_right: Option<Pixels>,
     /// Fade primitives approaching the region's top edge.
     pub top: bool,
     /// Fade primitives approaching the region's bottom edge.
@@ -721,6 +726,14 @@ impl EdgeFade {
 
     fn bottom_band(&self) -> f32 {
         self.band_bottom.unwrap_or(self.band).0.max(1.0)
+    }
+
+    fn left_band(&self) -> f32 {
+        self.band_left.unwrap_or(self.band).0.max(1.0)
+    }
+
+    fn right_band(&self) -> f32 {
+        self.band_right.unwrap_or(self.band).0.max(1.0)
     }
 }
 
@@ -3515,9 +3528,9 @@ impl Window {
     /// Executes the provided function with a vertical [`EdgeFade`] applied:
     /// every primitive painted inside is additionally faded by its vertical
     /// position — full alpha in the region's body, ramping to zero across
-    /// `fade.band` at each active edge. Granularity is per-primitive (each
-    /// quad/glyph/sprite takes the ramp value at its own position), which
-    /// reads as a smooth gradient for text and small marks.
+    /// `fade.band` at each active edge. Quads, text glyphs, and images evaluate
+    /// the ramp per fragment, so even a glyph crossing an edge fades smoothly.
+    /// Paths, decorations, and SVG icons retain conservative primitive opacity.
     pub fn with_edge_fade<R>(
         &mut self,
         fade: Option<EdgeFade>,
@@ -3643,7 +3656,6 @@ impl Window {
         let Some(fade) = &self.edge_fade else {
             return opacity;
         };
-        let band = fade.band.0.max(1.0);
         let mut ramp: f32 = 1.0;
         if fade.top {
             ramp = ramp.min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
@@ -3653,10 +3665,12 @@ impl Window {
                 .min(((fade.bounds.bottom().0 - center.y.0) / fade.bottom_band()).clamp(0.0, 1.0));
         }
         if fade.left {
-            ramp = ramp.min(((center.x.0 - fade.bounds.left().0) / band).clamp(0.0, 1.0));
+            ramp =
+                ramp.min(((center.x.0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
         }
         if fade.right {
-            ramp = ramp.min(((fade.bounds.right().0 - center.x.0) / band).clamp(0.0, 1.0));
+            ramp = ramp
+                .min(((fade.bounds.right().0 - center.x.0) / fade.right_band()).clamp(0.0, 1.0));
         }
         // Quadratic ease-in: a linear ramp reads weak over a wide band —
         // content sliding under glass chrome stayed half-visible for most of
@@ -3677,7 +3691,6 @@ impl Window {
         let Some(fade) = &self.edge_fade else {
             return opacity;
         };
-        let band = fade.band.0.max(1.0);
         let mut ramp: f32 = 1.0;
         if fade.top {
             ramp = ramp
@@ -3689,10 +3702,13 @@ impl Window {
             );
         }
         if fade.left {
-            ramp = ramp.min(((bounds.left().0 - fade.bounds.left().0) / band).clamp(0.0, 1.0));
+            ramp = ramp
+                .min(((bounds.left().0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
         }
         if fade.right {
-            ramp = ramp.min(((fade.bounds.right().0 - bounds.right().0) / band).clamp(0.0, 1.0));
+            ramp = ramp.min(
+                ((fade.bounds.right().0 - bounds.right().0) / fade.right_band()).clamp(0.0, 1.0),
+            );
         }
         // Quadratic ease-in — see element_opacity_at.
         opacity * ramp * ramp
@@ -3711,7 +3727,6 @@ impl Window {
             return Default::default();
         }
         let scale = self.scale_factor();
-        let band = fade.band.0.max(1.0);
         crate::EdgeFadeParams {
             top_y: fade.bounds.top().0 * scale,
             bottom_y: fade.bounds.bottom().0 * scale,
@@ -3727,8 +3742,16 @@ impl Window {
             },
             left_x: fade.bounds.left().0 * scale,
             right_x: fade.bounds.right().0 * scale,
-            band_left: if fade.left { band * scale } else { 0.0 },
-            band_right: if fade.right { band * scale } else { 0.0 },
+            band_left: if fade.left {
+                fade.left_band() * scale
+            } else {
+                0.0
+            },
+            band_right: if fade.right {
+                fade.right_band() * scale
+            } else {
+                0.0
+            },
         }
     }
 
@@ -4309,10 +4332,7 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let element_opacity = self.element_opacity_for_bounds(&Bounds {
-            origin,
-            size: size(font_size * 0.6, font_size),
-        });
+        let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
 
@@ -4364,6 +4384,7 @@ impl Window {
                     color: color.opacity(element_opacity),
                     tile,
                     transformation: TransformationMatrix::unit(),
+                    fade: self.scaled_edge_fade(),
                 });
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -4374,6 +4395,7 @@ impl Window {
                     color: color.opacity(element_opacity),
                     tile,
                     transformation: TransformationMatrix::unit(),
+                    fade: self.scaled_edge_fade(),
                 });
             }
         }
@@ -4477,7 +4499,12 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let element_opacity = self.element_opacity_for_bounds(&bounds);
+        // Icons fade per pixel in the fragment shader, like quads: a uniform
+        // per-sprite opacity snapped a whole icon to near-zero the moment its
+        // leading edge entered the band. The ramp is 0 at the region edge, so
+        // a clipped icon still never shows a cut.
+        let element_opacity = self.element_opacity();
+        let fade = self.scaled_edge_fade();
         let bounds = self.snap_bounds(bounds);
 
         let params = RenderSvgParams {
@@ -4523,6 +4550,7 @@ impl Window {
             color: color.opacity(element_opacity),
             tile,
             transformation,
+            fade,
         });
 
         Ok(())

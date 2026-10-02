@@ -58,6 +58,32 @@ fn main() {
         PathBuf::from(env::var("OUT_DIR").unwrap()).join("blobatar_subagent_avatar_assets.rs");
     fs::write(avatar_output, avatar_source).expect("write Blobatar subagent avatar asset table");
 
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=src/dictation/permission.m");
+        let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        let object = out.join("voice-permission.o");
+        assert!(
+            Command::new("clang")
+                .args(["-fobjc-arc", "-c", "src/dictation/permission.m", "-o"])
+                .arg(&object)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("ar")
+                .arg("crus")
+                .arg(out.join("libvoice-permission.a"))
+                .arg(object)
+                .status()
+                .unwrap()
+                .success()
+        );
+        println!("cargo:rustc-link-search=native={}", out.display());
+        println!("cargo:rustc-link-lib=static=voice-permission");
+        println!("cargo:rustc-link-lib=framework=AVFoundation");
+    }
+
     build_linux_browser_helper();
 }
 

@@ -11,6 +11,10 @@
 //! `zeron_proto` (`TerminalSession`, `TerminalEvent`) — the same contract the
 //! engine serves (feature-inventory §2.1).
 
+// Upstream footer-terminal geometry (#620). The fork keeps the terminal in the
+// right panel, so this stays dormant; kept so later syncs merge cleanly.
+#[allow(dead_code)]
+pub(crate) mod dock;
 pub mod emulator;
 pub mod panel;
 pub mod scroll;

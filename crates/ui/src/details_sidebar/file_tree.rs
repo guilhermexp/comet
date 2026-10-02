@@ -917,10 +917,13 @@ mod tests {
                     modified_at: None,
                     ignored: false,
                     read_only: false,
+                    mutation_revision: None,
                 })
                 .collect(),
             next_cursor: None,
             truncated: false,
+            checkout_id: None,
+            mutation_capabilities: None,
         };
         let mut cache = DirectoryCache::default();
         cache.apply(page("", &["src", "docs"]), false);
@@ -1102,10 +1105,13 @@ mod directory_cache_tests {
                     modified_at: None,
                     ignored: true,
                     read_only: false,
+                    mutation_revision: None,
                 })
                 .collect(),
             next_cursor: more.then(|| "next".into()),
             truncated: false,
+            checkout_id: None,
+            mutation_capabilities: None,
         }
     }
     #[test]

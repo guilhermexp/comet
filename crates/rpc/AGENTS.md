@@ -22,7 +22,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
 
-- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `RenameWorkspaceEntry`, `DeleteWorkspaceEntry`, `MoveWorkspaceEntry` e `CopyWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Copy/move usam deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash).
+- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `RenameWorkspaceEntry`, `DeleteWorkspaceEntry`, `MoveWorkspaceEntry` e `CopyWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Copy/move usam deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash). Desde o sync v0.2.102, `MoveWorkspaceEntry`/`DeleteWorkspaceEntry` usam o modelo do upstream #514 (`operationId`, `expectedCheckoutId`, `expectedSourceRevision`, `expectedKind`, `destinationPath`, `recursive`; reply `WorkspaceMutationOutcome`). Create/Rename/Copy continuam do fork, com reply `WorkspaceEntryMutation`.
 
 - `SpawnChat` é `local_only`: params `parentChatId`, `prompt`, `spaceId?`; reply `chatId`, `spaceId?`, `deviceId`. Não é relay-forwardable.
 

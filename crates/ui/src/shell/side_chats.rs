@@ -327,7 +327,7 @@ impl Shell {
                     cx,
                 ))
         });
-        div()
+        self.chat_dropzone(("side-chat-dropzone", id), composer.clone(), cx)
             .size_full()
             .flex()
             .flex_col()
@@ -348,6 +348,7 @@ impl Shell {
                     .children(pill),
             )
             .child(div().flex_none().child(composer))
+            .child(Self::attachment_drop_overlay(Theme::of(cx)))
             .into_any_element()
     }
 }

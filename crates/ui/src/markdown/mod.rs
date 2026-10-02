@@ -15,6 +15,7 @@
 //!   completion.
 
 pub(crate) mod inline_chips;
+pub(crate) mod inline_code_links;
 mod link_destination;
 mod link_interaction;
 mod link_presentation;

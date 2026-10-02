@@ -10,7 +10,10 @@ PROFILE=debug scripts/package-linux.sh   # fast smoke package
 Produces `target/package/zeron-<version>-linux-<arch>.tar.gz` containing:
 
 - `zeron` — the binary (headed by default; `zeron headless` runs the engine alone)
-- `zeron.desktop` — XDG desktop entry
+- `zeron.desktop` — XDG desktop entry template (`Exec=zeron` for packagers;
+  the installers rewrite `Exec`, `TryExec`, and `Icon` to absolute paths under
+  `~/.zeron/app/current`, since `~/.local/bin` is often not on a desktop
+  session's `PATH`)
 - `zeron.png` — 1024×1024 Zeron app icon
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
 

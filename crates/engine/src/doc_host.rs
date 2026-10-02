@@ -31,8 +31,8 @@ use tokio_util::task::TaskTracker;
 use zeron_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
     MessagePart, MessageRole, MessageStatus, QueueDeliveryGate, QueuedMessage, SessionCommandEntry,
-    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
-    join_continuation_entries,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
+    evaluate_command, join_continuation_entries,
 };
 use zeron_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
 use zeron_sync::DocsStore;
@@ -857,14 +857,38 @@ impl ChatDocHandle {
         })
     }
 
-    /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
-    /// `note` as a visible error part so the transcript says WHY the turn
-    /// ended (zeron folded "Run interrupted by backend restart" the same
-    /// way). Returns the stamped entries' `(id, created_at)` — recovery uses
-    /// them for the resume-freshness check.
+    /// Recovery sweep: stamp this device's abandoned `streaming` entries
+    /// `aborted`, appending `note` as a visible error part so the transcript
+    /// says WHY the turn ended (zeron folded "Run interrupted by backend
+    /// restart" the same way), then settle this device's running subagent
+    /// chips `failed` (including chips in completed parent turns). Returns
+    /// the stamped entries' `(id, created_at)` — recovery uses them for the
+    /// resume-freshness check.
     pub fn mark_abandoned_streams(&self, note: &str) -> Result<Vec<(String, i64)>, DocError> {
+        Ok(self.recover_abandoned(note)?.stamped)
+    }
+
+    /// [`Self::mark_abandoned_streams`], also reporting which spawn chips the
+    /// sweep moved off `running` — boot recovery settles those chips'
+    /// subagent docs in step (a background subagent's chip lives in an entry
+    /// that already completed, so the stamped list alone misses it).
+    pub(crate) fn recover_abandoned(&self, note: &str) -> Result<AbandonedRecovery, DocError> {
         let mut stamped = Vec::new();
+        let mut running_chips = Vec::new();
         for entry in self.doc.read_entries()? {
+            if entry.role != MessageRole::Assistant || entry.device_id != self.device_id {
+                continue;
+            }
+            for part in &entry.parts {
+                if let MessagePart::Tool {
+                    id,
+                    subagent_status: Some(SubagentStatus::Running),
+                    ..
+                } = part
+                {
+                    running_chips.push(id.clone());
+                }
+            }
             if is_abandoned_stream(&entry, &self.device_id)
                 && self
                     .doc
@@ -889,10 +913,28 @@ impl ChatDocHandle {
                 stamped.push((entry.id.clone(), entry.created_at));
             }
         }
-        if !stamped.is_empty() {
+        // Chips settle after the entries so their end slot lands on the
+        // transcript's newest part (the recovery note when one was written).
+        let end = self
+            .doc
+            .last_entry_slot()
+            .map(|(entry, after_part)| zeron_doc::SubagentEnd {
+                entry: Some(entry),
+                after_part,
+            });
+        let mut chips_changed = false;
+        for id in &running_chips {
+            chips_changed |=
+                self.doc
+                    .update_subagent_chip(id, None, Some("failed"), None, end.as_ref())?;
+        }
+        if chips_changed || !stamped.is_empty() {
             self.publish_messages();
         }
-        Ok(stamped)
+        Ok(AbandonedRecovery {
+            stamped,
+            failed_chips: running_chips,
+        })
     }
 
     fn publish_messages(&self) {
@@ -951,6 +993,14 @@ impl ChatDocHandle {
             .max(self.persistence.as_ref().map_or(0, |p| p.snapshot_bytes()));
         (bytes * RESIDENT_BYTES_PER_SNAPSHOT_BYTE).max(DOC_RESIDENT_FLOOR_BYTES)
     }
+}
+
+/// What one [`ChatDocHandle::recover_abandoned`] pass settled.
+pub(crate) struct AbandonedRecovery {
+    /// Entries stamped `aborted`, as `(id, created_at)`.
+    pub stamped: Vec<(String, i64)>,
+    /// This device's spawn chips that were `running` and are now `failed`.
+    pub failed_chips: Vec<String>,
 }
 
 /// This device's assistant entry is still `streaming` — boot recovery must

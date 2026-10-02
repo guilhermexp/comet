@@ -162,6 +162,7 @@ zeron/
     rpc/            zeron-rpc             # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                           # tungstenite) + in-memory transport; local WatchTrajectory/
                                           # RevealTrajectoryRaw; device-room virtual sockets ({s,k,to,from} frames)
+    voice/          zeron-voice           # desktop-local optional Parakeet model, capture and inference; no RPC/sync
     syntax/         zeron-syntax          # syntax definitions, grammars and tree-sitter highlighting
     theme/          zeron-theme           # base theme models, palettes, and styling primitives
     update/         zeron-update          # binary update checking, download verification, and restart routines

@@ -3669,6 +3669,24 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&file)
             }
+            methods::DELETE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::DeleteWorkspaceEntryRequest = parse_params(params)?;
+                let outcome = self
+                    .workspace_files
+                    .delete_entry(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
+            }
+            methods::MOVE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::MoveWorkspaceEntryRequest = parse_params(params)?;
+                let outcome = self
+                    .workspace_files
+                    .move_entry(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
+            }
             methods::WRITE_WORKSPACE_FILE => {
                 let request: zeron_proto::WriteWorkspaceFileRequest = parse_params(params)?;
                 let outcome = tokio::time::timeout(
@@ -3713,28 +3731,6 @@ impl RpcService for EngineRpc {
                 )
                 .await
                 .map_err(|_| RpcError::Failed("workspace rename timed out".into()))?
-                .map_err(RpcError::from)?;
-                RpcReply::value(&result)
-            }
-            methods::DELETE_WORKSPACE_ENTRY => {
-                let request: zeron_proto::DeleteWorkspaceEntryRequest = parse_params(params)?;
-                let result = tokio::time::timeout(
-                    crate::workspace_files::WORKSPACE_FILE_MUTATION_TIMEOUT,
-                    self.workspace_files.delete_entry(request),
-                )
-                .await
-                .map_err(|_| RpcError::Failed("workspace delete timed out".into()))?
-                .map_err(RpcError::from)?;
-                RpcReply::value(&result)
-            }
-            methods::MOVE_WORKSPACE_ENTRY => {
-                let request: zeron_proto::MoveWorkspaceEntryRequest = parse_params(params)?;
-                let result = tokio::time::timeout(
-                    crate::workspace_files::WORKSPACE_FILE_COPY_MOVE_TIMEOUT,
-                    self.workspace_files.move_entry(request),
-                )
-                .await
-                .map_err(|_| RpcError::Failed("workspace move timed out".into()))?
                 .map_err(RpcError::from)?;
                 RpcReply::value(&result)
             }
@@ -4777,6 +4773,8 @@ mod tests {
         assert!(is_forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(is_forwardable(methods::READ_WORKSPACE_FILE));
         assert!(is_forwardable(methods::READ_WORKSPACE_IMAGE));
+        assert!(is_forwardable(methods::DELETE_WORKSPACE_ENTRY));
+        assert!(is_forwardable(methods::MOVE_WORKSPACE_ENTRY));
         assert!(is_forwardable(methods::WRITE_WORKSPACE_FILE));
         assert!(is_forwardable(methods::WATCH_WORKSPACE_FILES));
         assert!(is_forwardable(methods::WATCH_WORKSPACE_GIT_STATUS));

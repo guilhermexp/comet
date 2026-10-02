@@ -567,6 +567,8 @@ pub struct Theme {
     pub family_id: SharedString,
     /// Whether the base theme or a user preset owns interactive identity.
     pub accent_selection: AccentSelection,
+    /// Effective wallpaper overlay; manual theme/accent selections remain intact.
+    pub wallpaper_color: Option<zeron_theme::Color>,
     /// The persisted policy that resolved [`Self::surface_treatment`].
     pub surface_preference: SurfacePreference,
     /// The effective treatment after applying [`Self::surface_preference`] to
@@ -1125,6 +1127,7 @@ impl Theme {
             variant_id: "zeron-dark".into(),
             family_id: "zeron".into(),
             accent_selection: AccentSelection::Preset(accent_color),
+            wallpaper_color: None,
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
             accent_color,
@@ -1208,6 +1211,7 @@ impl Theme {
             variant_id: "zeron-light".into(),
             family_id: "zeron".into(),
             accent_selection: AccentSelection::Preset(accent_color),
+            wallpaper_color: None,
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
             accent_color,
@@ -1312,6 +1316,22 @@ impl Theme {
         accent_selection: AccentSelection,
         surface_preference: SurfacePreference,
     ) -> Self {
+        Self::for_selection_with_wallpaper(
+            appearance,
+            variant_id,
+            accent_selection,
+            surface_preference,
+            None,
+        )
+    }
+
+    fn for_selection_with_wallpaper(
+        appearance: Appearance,
+        variant_id: &str,
+        accent_selection: AccentSelection,
+        surface_preference: SurfacePreference,
+        wallpaper_color: Option<zeron_theme::Color>,
+    ) -> Self {
         let registry = ThemeRegistry::active();
         let fallback_id = match appearance {
             Appearance::Dark => "zeron-dark",
@@ -1322,7 +1342,24 @@ impl Theme {
             .filter(|variant| variant.appearance == appearance)
             .or_else(|| registry.variant(fallback_id))
             .expect("the built-in registry contains both Zeron appearances");
-        Self::from_variant(variant, accent_selection, surface_preference)
+        if let Some(color) = wallpaper_color {
+            let mut variant = variant.clone();
+            crate::settings::wallpaper_colors::tint_variant(&mut variant, color);
+            let mut theme =
+                Self::from_variant(&variant, AccentSelection::ThemeDefault, surface_preference);
+            theme.accent_selection = accent_selection;
+            theme.wallpaper_color = Some(color);
+            if theme.surface_treatment == SurfaceTreatment::Frosted {
+                // Glass interactions lift toward white rather than laying a
+                // dark wallpaper accent over the translucent surface.
+                theme.element_hover = gpui::white().opacity(0.09);
+                theme.element_active = gpui::white().opacity(0.15);
+                theme.band = theme.element_hover;
+            }
+            theme
+        } else {
+            Self::from_variant(variant, accent_selection, surface_preference)
+        }
     }
 
     pub(crate) fn from_variant(
@@ -1513,14 +1550,20 @@ impl Theme {
         force_generation: bool,
         cx: &mut App,
     ) {
-        let next =
-            Self::for_selection(appearance, variant_id, accent_selection, surface_preference)
-                .with_code_typography(cx);
+        let next = Self::for_selection_with_wallpaper(
+            appearance,
+            variant_id,
+            accent_selection,
+            surface_preference,
+            crate::settings::wallpaper_colors::active(cx),
+        )
+        .with_code_typography(cx);
         let changed = cx.try_global::<Theme>().is_some_and(|theme| {
             theme.variant_id != next.variant_id
                 || theme.accent_selection != next.accent_selection
                 || theme.surface_preference != next.surface_preference
                 || theme.appearance != next.appearance
+                || theme.wallpaper_color != next.wallpaper_color
         });
         set_current_appearance(appearance);
         set_declared_frost_blur(next.frost_blur_radius);
@@ -2044,6 +2087,61 @@ mod tests {
         assert_eq!(light.busy, light.accent);
         assert_eq!(light.glyph.mid, light.accent);
         assert_eq!(light.caret, light.accent);
+    }
+
+    #[test]
+    fn wallpaper_glass_interactions_lift_toward_white_in_both_appearances() {
+        for (appearance, id) in [
+            (Appearance::Dark, "zeron-dark"),
+            (Appearance::Light, "zeron-light"),
+        ] {
+            let theme = Theme::for_selection_with_wallpaper(
+                appearance,
+                id,
+                AccentSelection::ThemeDefault,
+                SurfacePreference::Frosted,
+                Some(ModelColor::rgb(20, 60, 140)),
+            );
+            for wash in [theme.element_hover, theme.element_active] {
+                assert_eq!(wash.l, 1.0);
+                assert_eq!(wash.s, 0.0);
+                assert!(wash.a > 0.0 && wash.a < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn wallpaper_colours_keep_text_readable_in_light_and_dark_modes() {
+        for (appearance, id) in [
+            (Appearance::Dark, "zeron-dark"),
+            (Appearance::Light, "zeron-light"),
+        ] {
+            for color in [
+                ModelColor::BLACK,
+                ModelColor::WHITE,
+                ModelColor::rgb(255, 220, 20),
+                ModelColor::rgb(10, 40, 240),
+            ] {
+                let theme = Theme::for_selection_with_wallpaper(
+                    appearance,
+                    id,
+                    AccentSelection::ThemeDefault,
+                    SurfacePreference::Opaque,
+                    Some(color),
+                );
+                for background in [
+                    theme.bg,
+                    theme.surface,
+                    theme.surface_raised,
+                    theme.surface_card,
+                    theme.surface_dialog,
+                    theme.input_bg,
+                ] {
+                    assert!(contrast_ratio(theme.text, background) >= 4.49);
+                    assert!(contrast_ratio(theme.text_muted, background) >= 4.49);
+                }
+            }
+        }
     }
 
     #[test]

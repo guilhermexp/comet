@@ -28,12 +28,15 @@ pub mod composer;
 mod composer_dock;
 mod composer_markdown;
 pub mod details_sidebar;
+mod dictation;
 pub mod edge_fade;
 pub mod file_change;
 pub mod file_icons;
 pub mod file_preview;
 pub mod files;
 pub mod frost;
+mod glass;
+mod haptics;
 pub mod history;
 pub mod icons;
 pub(crate) mod image_media;
@@ -199,6 +202,11 @@ pub fn run_app(config: UiConfig) {
             ui_settings.git_history_column_widths,
             ui_settings.git_history_column_order,
             ui_settings.git_history_author_display,
+            cx,
+        );
+        motion::init(
+            ui_settings.reduce_motion,
+            ui_settings.pause_animations_in_background,
             cx,
         );
         composer::init(cx, ui_settings.composer_send_behavior);

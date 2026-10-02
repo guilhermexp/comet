@@ -1498,6 +1498,8 @@ mod tests {
                         question: "Private question?".into(),
                         options: vec!["a".into(), "b".into()],
                         multi_select: false,
+                        multiline: false,
+                        prefill: None,
                     }]);
                     tokio::pin!(answers);
                     tokio::select! {

@@ -1866,6 +1866,8 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                             .into(),
                     })
                     .collect(),
+                prefill: None,
+                multiline: false,
                 multi_select: ["multiSelect", "multi_select"]
                     .iter()
                     .find_map(|k| q.get(*k).and_then(Value::as_bool))
@@ -1919,6 +1921,8 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
         header,
         question,
         options: vec!["Yes".into(), "No".into()],
+        prefill: None,
+        multiline: false,
         multi_select: false,
     }
 }

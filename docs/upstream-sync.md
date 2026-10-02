@@ -8,10 +8,10 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
 | | |
 |---|---|
-| Último commit do upstream mergeado | `9d3cc8b2` (v0.2.96, 2026-09-27) |
-| Merge | pendente de commit em `sync/upstream-v0.2.94` (mergeia `refs/upstream/zeron-main-no-595`: `9d3cc8b2` + o revert local `a65f309e` do #595) |
-| OpenSpec | `openspec/changes/sync-upstream-v0-2-94/` |
-| Próximo sync começa de | `9d3cc8b2`, merge-base natural, sem graft. O #595 já está recusado na história via `a65f309e`; não reaparece |
+| Último commit do upstream mergeado | `64ad6f6e` (v0.2.102, 2026-10-02) |
+| Merge | branch `sync/upstream-v0.2.102` (worktree `~/.zeron/worktrees/comet/sync-v0-2-102`) |
+| OpenSpec | `openspec/changes/sync-upstream-v0-2-102/` |
+| Próximo sync começa de | `64ad6f6e`, merge-base natural |
 
 ## Receita
 
@@ -80,6 +80,9 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Windows: build ARM64, arrastar abas (sobe zui), cwd do ConPTY, lock de identidade | #545/#536/#528/#527 | v0.2.94 | Fork só roda em macOS |
 | Updates duráveis do app desktop (Check for Updates, download em background, instalar ao sair, instalador Windows, faixa de update) | #595 | v0.2.96 | Fork sem feed de release próprio. Revertido pelo commit local `a65f309e` em cima do upstream, antes do merge; o `UpdateStatus`/faixa da sidebar que ainda vinham junto também ficaram de fora |
 | Banner "Star on GitHub" no rodapé da sidebar (e `github_star_banner_dismissed`) | #586 | pós-v0.2.96 | Removido a pedido: o fork não quer o convite na sidebar. No próximo sync, resolver para o lado do fork |
+| Terminal de rodapé e sua geometria (`terminal/dock.rs`, `reserve_terminal`, abas/rail no `terminal/panel.rs`) | #620/#628 | v0.2.102 | O terminal vive no painel direito. `dock.rs` entrou dormente (`allow(dead_code)`) só para os próximos merges não conflitarem |
+| Explorer: subagentes rodando primeiro | #638 | v0.2.102 | Mexe no `files/sections.rs`, que o fork não tem |
+| Instalador Linux com updater em `~/.zeron/app` | #627 | v0.2.102 | Fork sem feed próprio. Entraram só as licenças das fontes e do Parakeet |
 
 ## Aceito com adaptação
 
@@ -99,6 +102,13 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | App iOS | #570 | v0.2.94 | Reescrita do upstream aceita inteira. As adaptações antigas (OMP, streaming) precisam ser refeitas |
 | Parser de markdown em `crates/markdown` | #570 | v0.2.94 | A heurística de path do fork foi para `zeron_markdown::file_path` |
 | Monitor e controles de update das CLIs de agente (`harness_updates.rs`, leases de execução no registry, `WatchHarnessUpdates`/`CheckHarnessUpdates`/`ApplyHarnessUpdate`/…, política por agente no Providers, notificação) | #389/#596 | v0.2.96 | RPCs registrados no `method.rs` (forwardable; deadlines 4 min/20 min do upstream). A lease entra na estrutura do fork: título, recap e commit message pegam a lease uma vez e a passam para `discover_models_with_lease` e para o run (orçamento `with_retry_budget` mantido); o steer roteado usa `while_update_clear` dentro do loop `activity_reservation`. É o único updater desde `unify-agent-cli-updates` (a manutenção de Workers foi apagada). Deltas do fork a preservar em merges: Pi com `update --all` (pi + pacotes), OMP monitorado (só Kimi fora de `monitored`), `UpdatePlan::PackageManager` para Codex via npm/cask (`codex_package_manager_update`), **Update all** na ilha (`update_all_targets`) e os Presets de Workers lendo `AppState::harness_updates`. Controles na página Agents (Providers) do fork; `agent_update_notifications` gravado por `apply_shell_settings` |
+| Pi via RPC nativo | #630 | v0.2.102 | O grant MCP do fork (`comet-workers`/`comet-sessions`/`zeron`) vai por uma extensão-ponte por servidor (`pi/mcp.rs`) |
+| Move/Delete na árvore de arquivos | #514 | v0.2.102 | Ficou o modelo do upstream (revisão + `WorkspaceMutationOutcome`). O Details do fork lê a revisão da listagem antes de chamar; symlink não move nem apaga por lá. Create/Rename/Copy continuam do fork |
+| Updates de CLI via Homebrew e Antigravity | #661/#617 | v0.2.102 | Um mecanismo só, `UpdatePlan::PackageManager { program, args, env }`: brew primeiro, depois o npm prefix/Caskroom do fork. Antigravity entrou no monitor |
+| Ditado local no composer | #591 | v0.2.102 | Convive com o Live Voice: botões separados, atalho `mod-d` |
+| Seletor compacto de modelo/effort | #471 | v0.2.102 | Opt-in, padrão desligado (o upstream liga por padrão) |
+| `core-tests` (um nextest) no lugar de `session-sync-regressions` | CI | v0.2.102 | Mantido o gate por path do fork, agora incluindo `crates/preview/` e `scripts/ci/` |
+| Inline code com nome de arquivo real vira link | #606/#633 | v0.2.102 | Substitui o chip do fork só nesses spans; os demais seguem chip |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
 ## Armadilhas conhecidas
@@ -112,10 +122,13 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
   Crates novos do upstream (`client`, `mobile`) e testes não compilam até completar esses campos. Um script que acha literais `RunRequest {` sem esses campos poupa horas.
 - **`serde_json` `preserve_order`** só é ativado no `cargo test --workspace` (unificação de features). Fixtures que comparam JSON como string passam em `-p` e falham no workspace. As fixtures precisam aceitar as duas ordens.
+- **`cargo test` paralelo vs nextest.** O upstream roda nextest (um processo por teste). Testes que dividem estado global no mesmo processo podem falhar só no nosso `cargo test --workspace`: `executable::tests::version_probe_bounds_hangs_and_rejects_nonzero` perde a corrida pelo lock de `VERSION_CACHE` para o probe lento de `opencode::tests::cold_first_version_probe_still_injects_mcp`. Passa sozinho e em `--test-threads=1`.
 - **Testes WebRTC do `zeron-preview`** (`peer::tests::*`, `tests/leak.rs`) falham às vezes nesta máquina, igual no `origin/main`. Antes de culpar o merge, compare rodando no `origin/main` puro.
 - **Settings do fork** gravam pelo `apply_shell_settings`. Campo novo do upstream em `UiSettings` precisa entrar ali, senão nunca é salvo.
 - **Testes do upstream que usam `Shell::new`** passam a usar `shell::test_shell` (o fork tem o `WorkersModel`).
 - **`crates/ui` com markdown:** o parser mora no crate compartilhado. Qualquer referência a `crate::file_preview` dentro dele quebra.
+- **zui vendorizado fica atrás do pin do upstream.** O upstream sobe o rev do `zui` no `Cargo.toml`, e o fork ignora o pin. Código novo do upstream que usa API nova do gpui não compila (`EdgeFade { band_left }` no v0.2.102). Aplicar como patch em `third_party/zui` os commits do zui entre o `base_revision` do `zui-upstream.toml` e o novo pin, e registrar lá.
+- **Testes do fork que o upstream reescreveu por cima.** Quando o upstream acrescenta testes num arquivo que o fork reescreveu (ex.: `engine/tests/workspace_files.rs`), os helpers dele não existem do nosso lado. Mover os testes novos para um arquivo próprio (`workspace_entry_mutations.rs`) com o cabeçalho de helpers do upstream.
 - **Resolver com agentes:** eles podem apagar código "morto" que outro arquivo ainda usa (por exemplo `motion::fast_tier`). A etapa de compilação precisa reconciliar isso.
 
 ## Histórico
@@ -129,3 +142,4 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | 2026-09-27 | até `433aa148` (v0.2.94+) | `openspec/changes/sync-upstream-v0-2-94/` | Merge `1065d252`; iOS reescrito; o fork segura o grant MCP |
 | 2026-09-27 | até `9d3cc8b2` (v0.2.96) | `openspec/changes/sync-upstream-v0-2-94/` | Segundo merge na mesma branch; #595 recusado via revert local `a65f309e`; entram #389/#596, #588, #586, #592 e iOS |
 | 2026-09-28 | `e13b18de` (#599) | porte pontual | Cmd/Ctrl+C copia a seleção do transcript com o foco fora do composer; o próximo sync resolve para o lado do upstream |
+| 2026-10-02 | até `64ad6f6e` (v0.2.102) | `openspec/changes/sync-upstream-v0-2-102/` | 56 commits; Pi nativo, ditado, seletor compacto opt-in, file tree actions; zui recebe 3 commits por patch |

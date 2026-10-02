@@ -9,9 +9,7 @@
 //! statuses are snake_case).
 
 use serde_json::Value;
-use zeron_proto::{
-    AgentEvent, ContextUsage, SlashCommand, TodoItem, ToolCall, ToolDiff, ToolExecutionMeta,
-};
+use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff, ToolExecutionMeta};
 
 use crate::partial_tool_input::{PARTIAL_REFRESH_BYTES, bounded_file_tool_preview};
 
@@ -53,14 +51,6 @@ fn content_block_text(block: &Value) -> Option<&str> {
 pub(crate) fn chunk_text(update: &Value) -> Option<String> {
     let text = content_block_text(update.get("content")?)?;
     (!text.is_empty()).then(|| text.to_owned())
-}
-
-/// pi-acp's rendering of an extension `ctx.ui.notify(message, "error")`.
-fn is_error_notify(update: &Value) -> bool {
-    update
-        .pointer("/_meta/piAcp/notify/level")
-        .and_then(Value::as_str)
-        == Some("error")
 }
 
 /// Joined text of a tool call's `content` array, capped; `None` when empty.
@@ -560,11 +550,6 @@ fn map_update_frame(update: &Value) -> Vec<AgentEvent> {
         .and_then(Value::as_str)
         .unwrap_or("");
     match kind {
-        // Zeron's Pi extension reports provider failures as error notifies;
-        // pi-acp itself still ends that turn with a plain end_turn.
-        "agent_message_chunk" if is_error_notify(update) => chunk_text(update)
-            .map(|message| vec![AgentEvent::Error { message }])
-            .unwrap_or_default(),
         "agent_message_chunk" => chunk_text(update)
             .map(|text| vec![AgentEvent::TextDelta { text }])
             .unwrap_or_default(),
@@ -642,29 +627,22 @@ fn map_update_frame(update: &Value) -> Vec<AgentEvent> {
             vec![AgentEvent::AvailableCommands { commands }]
         }
         "usage_update" => {
+            // Context occupancy has a dedicated event: it never counts as turn
+            // usage and the engine folds it without reopening a settled turn.
             let tokens = update
                 .get("used")
                 .or_else(|| update.get("tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
+                .and_then(Value::as_u64);
             // Agents disagree on the window key; take the first positive one.
-            let context_window = ["size", "contextWindow", "context_window", "max", "limit"]
+            let window = ["size", "contextWindow", "context_window", "max", "limit"]
                 .iter()
                 .find_map(|key| update.get(*key).and_then(Value::as_u64))
-                .filter(|n| *n > 0)
-                .unwrap_or_default();
-            (context_window > 0)
-                .then(|| AgentEvent::Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    context_usage: Some(ContextUsage {
-                        tokens,
-                        context_window,
-                        tokens_reported: None,
-                    }),
-                })
-                .into_iter()
-                .collect()
+                .filter(|n| *n > 0);
+            if tokens.is_some() || window.is_some() {
+                vec![AgentEvent::ContextUsage { tokens, window }]
+            } else {
+                Vec::new()
+            }
         }
         "current_mode_update" | "config_option_update" | "session_info_update" => Vec::new(),
         _ => Vec::new(),
@@ -747,25 +725,6 @@ mod tests {
             })
         );
         assert_eq!(execution_meta(&json!({"rawOutput": {"text": "ok"}})), None);
-    }
-
-    #[test]
-    fn pi_error_notify_maps_to_error_and_other_notifies_stay_text() {
-        let notify = |level: &str| {
-            json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": { "type": "text", "text": "Codex error: unsupported model" },
-                "_meta": { "piAcp": { "notify": { "level": level } } },
-            })
-        };
-        assert!(matches!(
-            map_update(&notify("error")).as_slice(),
-            [AgentEvent::Error { message }] if message == "Codex error: unsupported model"
-        ));
-        assert!(matches!(
-            map_update(&notify("warning")).as_slice(),
-            [AgentEvent::TextDelta { .. }]
-        ));
     }
 
     #[test]

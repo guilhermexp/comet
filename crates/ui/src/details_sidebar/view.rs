@@ -2200,6 +2200,8 @@ impl DetailsSidebar {
                         entries: Vec::new(),
                         next_cursor: None,
                         truncated: false,
+                        checkout_id: None,
+                        mutation_capabilities: None,
                     };
                     loop {
                         let request = zeron_proto::ListWorkspaceDirectoryRequest {
@@ -5576,26 +5578,51 @@ async fn rpc_file_mutation(
             })
             .unwrap(),
         ),
-        FileMutation::Delete { path } => (
-            zeron_rpc::methods::DELETE_WORKSPACE_ENTRY,
-            serde_json::to_value(zeron_proto::DeleteWorkspaceEntryRequest {
-                target: target.clone(),
+        FileMutation::Delete { path } => {
+            let (checkout, revision, kind) =
+                workspace_entry_identity(engine, &target, &device, path).await?;
+            let mut params = serde_json::to_value(zeron_proto::DeleteWorkspaceEntryRequest {
+                target,
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                expected_checkout_id: checkout,
                 path: path.clone(),
+                expected_source_revision: revision,
+                expected_kind: kind,
+                // The Details tree already asked the user to confirm.
+                recursive: kind == zeron_proto::WorkspaceEntryKind::Directory,
             })
-            .unwrap(),
-        ),
+            .unwrap();
+            params["targetDeviceId"] = device.into();
+            let outcome: zeron_proto::WorkspaceMutationOutcome = engine
+                .client()
+                .call_as(zeron_rpc::methods::DELETE_WORKSPACE_ENTRY, params)
+                .await?;
+            return workspace_mutation_path(outcome);
+        }
         FileMutation::Move {
             source,
             destination_directory,
-        } => (
-            zeron_rpc::methods::MOVE_WORKSPACE_ENTRY,
-            serde_json::to_value(zeron_proto::MoveWorkspaceEntryRequest {
-                target: target.clone(),
+        } => {
+            let (checkout, revision, kind) =
+                workspace_entry_identity(engine, &target, &device, source).await?;
+            let name = source.rsplit('/').next().unwrap_or(source.as_str());
+            let mut params = serde_json::to_value(zeron_proto::MoveWorkspaceEntryRequest {
+                target,
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                expected_checkout_id: checkout,
                 source_path: source.clone(),
-                destination_directory: destination_directory.clone(),
+                destination_path: zeron_proto::join_workspace_relative(destination_directory, name),
+                expected_source_revision: revision,
+                expected_kind: kind,
             })
-            .unwrap(),
-        ),
+            .unwrap();
+            params["targetDeviceId"] = device.into();
+            let outcome: zeron_proto::WorkspaceMutationOutcome = engine
+                .client()
+                .call_as(zeron_rpc::methods::MOVE_WORKSPACE_ENTRY, params)
+                .await?;
+            return workspace_mutation_path(outcome);
+        }
         FileMutation::Copy {
             source,
             destination_directory,
@@ -5613,6 +5640,67 @@ async fn rpc_file_mutation(
     let reply: zeron_proto::WorkspaceEntryMutation =
         engine.client().call_as(method, params).await?;
     Ok(reply.path)
+}
+
+/// Upstream's Move/Delete compare-and-swap against the entry's listed
+/// revision and checkout. The Details tree keeps neither, so read them from
+/// the parent directory listing right before the mutation: a change in
+/// between still rejects instead of clobbering.
+async fn workspace_entry_identity(
+    engine: &crate::state::EngineHandle,
+    target: &zeron_proto::WorkspaceTarget,
+    device: &str,
+    path: &str,
+) -> Result<(String, String, zeron_proto::WorkspaceEntryKind), zeron_rpc::RpcError> {
+    let directory = path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_owned())
+        .unwrap_or_default();
+    let mut cursor = None;
+    loop {
+        let mut params = serde_json::to_value(zeron_proto::ListWorkspaceDirectoryRequest {
+            target: target.clone(),
+            directory: directory.clone(),
+            include_ignored: true,
+            cursor: cursor.take(),
+        })
+        .unwrap();
+        params["targetDeviceId"] = device.into();
+        let page: zeron_proto::WorkspaceDirectoryPage = engine
+            .client()
+            .call_as(zeron_rpc::methods::LIST_WORKSPACE_DIRECTORY, params)
+            .await?;
+        if let Some(entry) = page.entries.iter().find(|entry| entry.path == path) {
+            let checkout = page.checkout_id.clone().ok_or_else(|| {
+                zeron_rpc::RpcError::Failed(
+                    "This device's engine cannot move or delete files yet".into(),
+                )
+            })?;
+            let revision = entry.mutation_revision.clone().ok_or_else(|| {
+                zeron_rpc::RpcError::Failed("Symlinks cannot be moved or deleted here".into())
+            })?;
+            return Ok((checkout, revision, entry.kind));
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => {
+                return Err(zeron_rpc::RpcError::Failed(format!(
+                    "{path} no longer exists"
+                )));
+            }
+        }
+    }
+}
+
+fn workspace_mutation_path(
+    outcome: zeron_proto::WorkspaceMutationOutcome,
+) -> Result<String, zeron_rpc::RpcError> {
+    match outcome {
+        zeron_proto::WorkspaceMutationOutcome::Applied { change, .. } => Ok(change.path),
+        zeron_proto::WorkspaceMutationOutcome::Rejected { message, .. } => {
+            Err(zeron_rpc::RpcError::Failed(message))
+        }
+    }
 }
 
 #[cfg(test)]

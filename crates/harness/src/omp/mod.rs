@@ -1590,6 +1590,8 @@ fn interactive_question(
         question: truncate_text(question_text, 4_096),
         options,
         multi_select: false,
+        multiline: false,
+        prefill: None,
     };
     Ok((id.to_owned(), kind, question, timeout))
 }

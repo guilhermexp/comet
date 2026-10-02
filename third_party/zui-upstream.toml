@@ -27,3 +27,10 @@ license = "Apache-2.0"
 #   keyboard-layout query. On macOS 27 `TISCopyCurrentKeyboardLayoutInputSource`
 #   aborts (SIGABRT in HIToolbox) off the main thread, which killed the
 #   parallel zeron-ui test binary whenever a test shaped text natively.
+
+# Local patch (sync/upstream-v0.2.102, 2026-10-02): upstream zui commits
+#   c6076032..667d0aaf applied as one patch, matching the zui pin upstream
+#   Zeron uses at v0.2.102:
+#   1561532 Implement per pixel text edge fades (#12)
+#   18a89af Raise the drag promotion threshold on Windows (#13)
+#   667d0aa Fade SVG icons per pixel and allow per-edge horizontal fade bands

@@ -203,6 +203,16 @@ pub(crate) fn claude_config_json(servers: &[WorkersMcpServer]) -> Option<String>
 }
 
 impl WorkersMcpServer {
+    /// Generic MCP server shape, for harnesses that take `zeron_proto::McpServer`.
+    pub(crate) fn proto(&self) -> zeron_proto::McpServer {
+        zeron_proto::McpServer {
+            name: self.name.to_owned(),
+            command: self.command.to_string_lossy().into_owned(),
+            args: self.args.clone(),
+            env: self.env.iter().cloned().collect(),
+        }
+    }
+
     /// ACP `mcpServers` entry: env as a list of `{name, value}` rows.
     pub(crate) fn acp_value(&self) -> Value {
         json!({

@@ -700,31 +700,22 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
-    // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
-    // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
-    // pi's thinking ladder minus its "off" tier.
+    // Native Pi RPC. Thinking levels are discovered per model.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
             name: "Pi".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ],
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
             installed: true,
             can_install: false,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::pi().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::PiHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::PiHarness::new()) as Arc<dyn Harness>)),
     );
-    // Oh My Pi is a separate native runtime from Pi/`pi-acp`. It speaks the
+    // Oh My Pi is a separate native runtime from Pi's RPC harness. It speaks the
     // installed `omp` CLI's rpc-ui wire directly and therefore supports
     // step-boundary steering plus its live provider/model catalog.
     registry.register_lazy(
@@ -936,17 +927,7 @@ mod tests {
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
         assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
-        assert_eq!(
-            pi.reasoning_levels(),
-            &[
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max
-            ]
-        );
+        assert!(pi.reasoning_levels().is_empty());
         let omp = registry.resolve(HarnessId::Omp).unwrap();
         assert_eq!(omp.id(), HarnessId::Omp);
         assert_eq!(omp.display_name(), "OMP");
