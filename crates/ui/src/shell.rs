@@ -2698,53 +2698,6 @@ impl Shell {
                 }
             },
         );
-        let startup_workers_model = workers_model.clone();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(500))
-                .await;
-            let advisories = cx
-                .background_executor()
-                .spawn(async { zeron_workers_unpeel::get_all_advisories_blocking() })
-                .await;
-            let behind: Vec<_> = advisories
-                .iter()
-                .filter(|a| a.status == zeron_workers_unpeel::RuntimeUpdateStatus::BehindLatest)
-                .cloned()
-                .collect();
-
-            let _ = startup_workers_model.update(cx, |model, cx| {
-                model.advisories = advisories;
-                cx.notify();
-            });
-
-            if !behind.is_empty() {
-                static SHOWN_THIS_SESSION: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !SHOWN_THIS_SESSION.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    let count = behind.len();
-                    let updatable_count = behind.iter().filter(|a| a.can_update).count();
-                    let clis: Vec<String> = behind
-                        .iter()
-                        .map(|a| match a.cli_id.as_str() {
-                            "pi" => "Pi".to_string(),
-                            "omp" => "OMP".to_string(),
-                            "claude" | "claude-code" => "Claude Code".to_string(),
-                            "codex" => "Codex".to_string(),
-                            "opencode" => "OpenCode".to_string(),
-                            "agy" => "Antigravity CLI".to_string(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-
-                    let toast = crate::toast::Toast::provider_updates(count, clis, updatable_count);
-                    let _ = this.update(cx, |shell, cx| {
-                        shell.push_toast(toast, cx);
-                    });
-                }
-            }
-        })
-        .detach();
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -6549,100 +6502,6 @@ impl Shell {
     pub fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         self.toasts.retain(|t| t.id != id);
         cx.notify();
-    }
-
-    pub fn handle_toast_action(
-        &mut self,
-        action: crate::toast::ToastAction,
-        _window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        match action {
-            crate::toast::ToastAction::ReviewWorkerUpdates => {
-                self.sidebar_mode = SidebarMode::Workers;
-                self.workers_model.update(cx, |model, cx| {
-                    model.open_settings(crate::workers::model::WorkersSettingsTab::Presets, cx);
-                });
-                self.toasts
-                    .retain(|t| !matches!(t.kind, crate::toast::ToastKind::ProviderUpdate { .. }));
-                cx.notify();
-            }
-            crate::toast::ToastAction::UpdateAllWorkerClis => {
-                self.run_update_all_worker_clis(cx);
-            }
-        }
-    }
-
-    pub fn run_update_all_worker_clis(&mut self, cx: &mut Context<Self>) {
-        let updatable: Vec<(String, String)> = self
-            .workers_model
-            .read(cx)
-            .advisories
-            .iter()
-            .filter(|adv| {
-                adv.can_update
-                    && adv.status == zeron_workers_unpeel::RuntimeUpdateStatus::BehindLatest
-            })
-            .map(|adv| (adv.cli_id.clone(), adv.binary_name.clone()))
-            .collect();
-
-        if updatable.is_empty() {
-            self.toasts
-                .retain(|t| !matches!(t.kind, crate::toast::ToastKind::ProviderUpdate { .. }));
-            cx.notify();
-            return;
-        }
-
-        let total = updatable.len();
-        let (_, first_name) = updatable[0].clone();
-
-        self.toasts
-            .retain(|t| !matches!(t.kind, crate::toast::ToastKind::ProviderUpdate { .. }));
-        let progress_toast = crate::toast::Toast::updating_progress(1, total, &first_name);
-        let progress_id = progress_toast.id;
-        self.toasts.push(progress_toast);
-        cx.notify();
-
-        let workers_model = self.workers_model.clone();
-        cx.spawn(async move |this, cx| {
-            let mut succeeded = 0;
-            let mut failed = 0;
-
-            for (idx, (cli_id, cli_name)) in updatable.into_iter().enumerate() {
-                let _ = this.update(cx, |shell, cx| {
-                    if let Some(t) = shell.toasts.iter_mut().find(|t| t.id == progress_id) {
-                        t.title = format!("Updating {}/{} ({})…", idx + 1, total, cli_name).into();
-                    }
-                    cx.notify();
-                });
-
-                let result = cx
-                    .background_executor()
-                    .spawn({
-                        let cli_id = cli_id.clone();
-                        async move { zeron_workers_unpeel::run_runtime_update_blocking(&cli_id) }
-                    })
-                    .await;
-                if result.status == zeron_workers_unpeel::UpdateOutcomeStatus::Succeeded {
-                    succeeded += 1;
-                } else {
-                    failed += 1;
-                }
-            }
-
-            let _ = workers_model.update(cx, |model, cx| {
-                model.refresh_advisories(cx);
-                model.refresh_settings(cx);
-                cx.notify();
-            });
-
-            let _ = this.update(cx, |shell, cx| {
-                shell.toasts.retain(|t| t.id != progress_id);
-                let completion_toast = crate::toast::Toast::update_complete(succeeded, failed);
-                shell.push_toast(completion_toast, cx);
-            });
-        })
-        .detach();
     }
 
     /// Second, unconditional way out of `AppState::compacting`.
@@ -11485,9 +11344,6 @@ impl Shell {
         if let Some(toast_overlay) = crate::toast::render_toast_overlay(
             &self.toasts,
             &theme,
-            |shell, action, window, cx| {
-                shell.handle_toast_action(action, window, cx);
-            },
             |shell, id, _, cx| {
                 shell.dismiss_toast(id, cx);
             },

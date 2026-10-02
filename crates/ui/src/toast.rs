@@ -1,7 +1,7 @@
 //! Floating toast notification system anchored in the bottom-right of the window.
 //!
-//! Provides transient, floating notification cards with customizable titles,
-//! descriptions, action buttons, progress states, and auto-dismissal timers.
+//! Provides transient, floating notification cards with titles, optional
+//! descriptions and auto-dismissal timers.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -23,22 +23,6 @@ pub enum ToastKind {
     Success,
     Warning,
     Error,
-    ProviderUpdate {
-        count: usize,
-        clis: Vec<String>,
-        updatable_count: usize,
-    },
-    UpdatingProgress {
-        current: usize,
-        total: usize,
-        cli_name: String,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToastAction {
-    ReviewWorkerUpdates,
-    UpdateAllWorkerClis,
 }
 
 #[derive(Clone, Debug)]
@@ -47,8 +31,6 @@ pub struct Toast {
     pub kind: ToastKind,
     pub title: SharedString,
     pub description: Option<SharedString>,
-    pub primary_action: Option<(SharedString, ToastAction)>,
-    pub secondary_action: Option<(SharedString, ToastAction)>,
     pub created_at: Instant,
     pub duration: Option<Duration>,
 }
@@ -60,8 +42,6 @@ impl Toast {
             kind: ToastKind::Info,
             title: title.into(),
             description: None,
-            primary_action: None,
-            secondary_action: None,
             created_at: Instant::now(),
             duration: Some(Duration::from_secs(5)),
         }
@@ -75,97 +55,12 @@ impl Toast {
         }
     }
 
-    pub fn provider_updates(count: usize, clis: Vec<String>, updatable_count: usize) -> Self {
-        let title = if count == 1 {
-            "1 provider update available".into()
-        } else {
-            format!("{count} provider updates available").into()
-        };
-
-        let description = if clis.is_empty() {
-            None
-        } else if clis.len() <= 2 {
-            Some(clis.join(", ").into())
-        } else {
-            Some(format!("{}, {} +{} more", clis[0], clis[1], clis.len() - 2).into())
-        };
-
-        Self {
-            id: next_toast_id(),
-            kind: ToastKind::ProviderUpdate {
-                count,
-                clis,
-                updatable_count,
-            },
-            title,
-            description,
-            primary_action: (updatable_count > 0)
-                .then(|| ("Update all".into(), ToastAction::UpdateAllWorkerClis)),
-            secondary_action: Some(("Review".into(), ToastAction::ReviewWorkerUpdates)),
-            created_at: Instant::now(),
-            duration: Some(Duration::from_secs(10)),
-        }
-    }
-
-    pub fn updating_progress(current: usize, total: usize, cli_name: &str) -> Self {
-        Self {
-            id: next_toast_id(),
-            kind: ToastKind::UpdatingProgress {
-                current,
-                total,
-                cli_name: cli_name.to_owned(),
-            },
-            title: format!("Updating {current}/{total} ({cli_name})…").into(),
-            description: None,
-            primary_action: None,
-            secondary_action: None,
-            created_at: Instant::now(),
-            duration: None, // persistent during update progress
-        }
-    }
-
-    pub fn update_complete(succeeded: usize, failed: usize) -> Self {
-        let title = if failed == 0 {
-            if succeeded == 1 {
-                "Updated 1 provider CLI".into()
-            } else {
-                format!("Updated {succeeded} provider CLIs").into()
-            }
-        } else {
-            format!("Updated {succeeded} · {failed} failed").into()
-        };
-
-        let description = if failed > 0 {
-            Some("Open Settings › Presets to update manually".into())
-        } else {
-            None
-        };
-
-        Self {
-            id: next_toast_id(),
-            kind: if failed == 0 {
-                ToastKind::Success
-            } else {
-                ToastKind::Warning
-            },
-            title,
-            description,
-            primary_action: (failed > 0)
-                .then(|| ("Review".into(), ToastAction::ReviewWorkerUpdates)),
-            secondary_action: None,
-            created_at: Instant::now(),
-            duration: Some(Duration::from_secs(6)),
-        }
-    }
-
     pub fn success(title: impl Into<SharedString>) -> Self {
         Self {
             id: next_toast_id(),
             kind: ToastKind::Success,
             title: title.into(),
             description: None,
-            primary_action: None,
-            secondary_action: None,
             created_at: Instant::now(),
             duration: Some(Duration::from_secs(4)),
         }
@@ -177,8 +72,6 @@ impl Toast {
             kind: ToastKind::Error,
             title: title.into(),
             description: None,
-            primary_action: None,
-            secondary_action: None,
             created_at: Instant::now(),
             duration: Some(Duration::from_secs(5)),
         }
@@ -190,8 +83,6 @@ impl Toast {
             kind: ToastKind::Info,
             title: title.into(),
             description: None,
-            primary_action: None,
-            secondary_action: None,
             created_at: Instant::now(),
             duration: Some(Duration::from_secs(4)),
         }
@@ -207,12 +98,10 @@ pub(crate) fn toast_card_background(theme: &Theme) -> gpui::Hsla {
 pub fn render_toast_card<S: 'static>(
     toast: &Toast,
     theme: &Theme,
-    on_action: impl Fn(&mut S, ToastAction, &mut gpui::Window, &mut Context<S>) + 'static + Copy,
     on_dismiss: impl Fn(&mut S, u64, &mut gpui::Window, &mut Context<S>) + 'static + Copy,
     cx: &mut Context<S>,
 ) -> AnyElement {
     let toast_id = toast.id;
-    let is_progress = matches!(toast.kind, ToastKind::UpdatingProgress { .. });
 
     let leading_icon = match toast.kind {
         ToastKind::Error => Some((icons::CLOSE_CIRCLE, theme.danger)),
@@ -241,16 +130,7 @@ pub fn render_toast_card<S: 'static>(
     let mut header = div().flex().items_start().justify_between().gap(px(8.0));
 
     let mut title_content = div().flex().items_center().gap(px(6.0));
-    if is_progress {
-        title_content =
-            title_content.child(div().flex_none().child(crate::loaders::mini_mono_spinner(
-                format!("toast-progress-{}", toast.id),
-                2.0,
-                theme.text_muted,
-                cx.entity_id(),
-                cx,
-            )));
-    } else if let Some((ico, color)) = leading_icon {
+    if let Some((ico, color)) = leading_icon {
         title_content =
             title_content.child(crate::icons::icon(ico).size(px(13.0)).text_color(color));
     }
@@ -264,7 +144,7 @@ pub fn render_toast_card<S: 'static>(
 
     header = header.child(title_content);
 
-    if !is_progress {
+    {
         let dismiss_btn = div()
             .id(("toast-dismiss", toast_id))
             .size(px(18.0))
@@ -298,59 +178,6 @@ pub fn render_toast_card<S: 'static>(
         );
     }
 
-    // Action buttons row (Review / Update all)
-    if toast.primary_action.is_some() || toast.secondary_action.is_some() {
-        let mut actions = div().mt(px(4.0)).flex().items_center().gap(px(8.0));
-
-        if let Some((label, action)) = &toast.secondary_action {
-            let action = *action;
-            let sec_btn = div()
-                .id(("toast-secondary-action", toast_id))
-                .h(px(26.0))
-                .px(px(10.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.0))
-                .bg(crate::theme::wash(0.06))
-                .cursor_pointer()
-                .hover(|el| el.bg(crate::theme::wash(0.12)))
-                .text_size(px(11.5))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    on_action(this, action, window, cx);
-                }))
-                .child(label.clone());
-            actions = actions.child(sec_btn);
-        }
-
-        if let Some((label, action)) = &toast.primary_action {
-            let action = *action;
-            let prim_btn = div()
-                .id(("toast-primary-action", toast_id))
-                .h(px(26.0))
-                .px(px(12.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.0))
-                .bg(theme.solid)
-                .cursor_pointer()
-                .hover(|el| el.opacity(0.9))
-                .text_size(px(11.5))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.on_solid)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    on_action(this, action, window, cx);
-                }))
-                .child(label.clone());
-            actions = actions.child(prim_btn);
-        }
-
-        card = card.child(actions);
-    }
-
     crate::frost::frosted(10.0, 16.0, card).into_any_element()
 }
 
@@ -358,7 +185,6 @@ pub fn render_toast_card<S: 'static>(
 pub fn render_toast_overlay<S: 'static>(
     toasts: &[Toast],
     theme: &Theme,
-    on_action: impl Fn(&mut S, ToastAction, &mut gpui::Window, &mut Context<S>) + 'static + Copy,
     on_dismiss: impl Fn(&mut S, u64, &mut gpui::Window, &mut Context<S>) + 'static + Copy,
     cx: &mut Context<S>,
 ) -> Option<AnyElement> {
@@ -377,7 +203,7 @@ pub fn render_toast_overlay<S: 'static>(
         .occlude();
 
     for toast in toasts {
-        container = container.child(render_toast_card(toast, theme, on_action, on_dismiss, cx));
+        container = container.child(render_toast_card(toast, theme, on_dismiss, cx));
     }
 
     Some(container.into_any_element())
@@ -392,38 +218,6 @@ mod tests {
         let toast = Toast::new("Test");
         assert!(!toast.is_expired(Instant::now()));
         assert!(toast.is_expired(Instant::now() + Duration::from_secs(6)));
-    }
-
-    #[test]
-    fn provider_updates_formatting() {
-        let single = Toast::provider_updates(1, vec!["Pi".into()], 1);
-        assert_eq!(single.title.as_ref(), "1 provider update available");
-        assert_eq!(single.description.as_deref(), Some("Pi"));
-        assert!(single.primary_action.is_some());
-        assert!(single.secondary_action.is_some());
-
-        let multi = Toast::provider_updates(3, vec!["Pi".into(), "Codex".into(), "OMP".into()], 2);
-        assert_eq!(multi.title.as_ref(), "3 provider updates available");
-        assert_eq!(multi.description.as_deref(), Some("Pi, Codex +1 more"));
-    }
-
-    #[test]
-    fn updating_progress_and_completion() {
-        let progress = Toast::updating_progress(1, 2, "Pi");
-        assert_eq!(progress.title.as_ref(), "Updating 1/2 (Pi)…");
-        assert!(progress.duration.is_none());
-
-        let complete_success = Toast::update_complete(2, 0);
-        assert_eq!(complete_success.title.as_ref(), "Updated 2 provider CLIs");
-        assert_eq!(complete_success.kind, ToastKind::Success);
-
-        let complete_with_failures = Toast::update_complete(1, 1);
-        assert_eq!(
-            complete_with_failures.title.as_ref(),
-            "Updated 1 · 1 failed"
-        );
-        assert_eq!(complete_with_failures.kind, ToastKind::Warning);
-        assert!(complete_with_failures.primary_action.is_some());
     }
 
     #[test]

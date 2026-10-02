@@ -129,6 +129,17 @@ fn action(status: &HarnessUpdateStatus) -> Option<(&'static str, Option<&'static
     }
 }
 
+/// Fork: rows the summary's "Update all" installs — the same rows whose own
+/// action is "Update".
+fn update_all_targets(rows: &[UpdateRow]) -> Vec<(String, HarnessId)> {
+    rows.iter()
+        .filter(|row| row.connected && row.status.phase == Phase::Available && row.status.can_apply)
+        .map(|row| (row.device_id.clone(), row.status.harness))
+        .collect()
+}
+
+const UPDATE_ALL_LABEL: &str = "Update all";
+
 fn right_inset(has_button: bool) -> f32 {
     if has_button { 5.0 } else { 12.0 }
 }
@@ -351,6 +362,58 @@ impl Shell {
         )
     }
 
+    fn render_update_all_action(
+        &mut self,
+        targets: Vec<(String, HarnessId)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).for_settings_surface();
+        let run = move |this: &mut Self, cx: &mut Context<Self>| {
+            for (device, harness) in &targets {
+                this.run_harness_update_action(
+                    device.clone(),
+                    methods::APPLY_HARNESS_UPDATE,
+                    *harness,
+                    cx,
+                );
+            }
+        };
+        let key_run = run.clone();
+        div()
+            .id("harness-update-all")
+            .h(px(26.0))
+            .px(px(9.0))
+            .flex_none()
+            .rounded_full()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(crate::typography::ui_rems(11.5))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .bg(theme.text)
+            .text_color(theme.on_solid)
+            .role(gpui::Role::Button)
+            .aria_label("Update all agents")
+            .tab_index(0)
+            .focus_visible(move |el| el.border_color(theme.accent))
+            .cursor_pointer()
+            .hover(|el| el.opacity(0.85))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                run(this, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    key_run(this, cx);
+                }
+            }))
+            .child(UPDATE_ALL_LABEL)
+            .into_any_element()
+    }
+
     /// One surface, anchored by the Home mount. The bottom edge never moves;
     /// width, height, corner radius and row reveal share the shell resize clock.
     pub(super) fn render_harness_update_card(
@@ -465,6 +528,14 @@ impl Shell {
         } else {
             self.render_harness_update_action(row, true, cx)
         };
+        let update_all_targets = update_all_targets(statuses);
+        let update_all = (multiple && update_all_targets.len() > 1)
+            .then(|| self.render_update_all_action(update_all_targets, cx));
+        let update_all_width = if update_all.is_some() {
+            text_width(UPDATE_ALL_LABEL, 11.5, window, &theme) + 20.0 + 8.0
+        } else {
+            0.0
+        };
         let trailing = if multiple {
             8.0
         } else {
@@ -473,7 +544,7 @@ impl Shell {
         let marks_width =
             MARK_SIZE + MARK_STEP * marks.len().min(MAX_MARKS).saturating_sub(1) as f32;
         let controls_width = if multiple {
-            24.0 + 8.0
+            24.0 + 8.0 + update_all_width
         } else {
             action_label
                 .map(|label| text_width(label, 11.5, window, &theme) + 20.0 + 8.0)
@@ -566,6 +637,9 @@ impl Shell {
                 el.child(div().flex_none().ml(px(8.0)).child(activity))
             })
             .when_some(compact_action, |el, action| {
+                el.child(div().flex_none().ml(px(8.0)).child(action))
+            })
+            .when_some(update_all, |el, action| {
                 el.child(div().flex_none().ml(px(8.0)).child(action))
             })
             .when(multiple, |el| {
@@ -944,6 +1018,48 @@ mod tests {
             statuses: vec![status(phase)],
             watch: None,
         }
+    }
+
+    #[test]
+    fn update_all_installs_only_connected_applicable_rows() {
+        let mut manual = status(Phase::Available);
+        manual.harness = HarnessId::ClaudeCode;
+        manual.can_apply = false;
+        let mut omp = status(Phase::Available);
+        omp.harness = HarnessId::Omp;
+        let devices = BTreeMap::from([
+            (
+                "desktop".into(),
+                DeviceUpdates {
+                    online: true,
+                    connected: true,
+                    statuses: vec![
+                        status(Phase::Available),
+                        manual,
+                        omp,
+                        status(Phase::Installing),
+                    ],
+                    watch: None,
+                },
+            ),
+            (
+                "laptop".into(),
+                DeviceUpdates {
+                    online: false,
+                    connected: false,
+                    statuses: vec![status(Phase::Available)],
+                    watch: None,
+                },
+            ),
+        ]);
+        let rows = visible_rows(&devices, str::to_owned);
+        assert_eq!(
+            update_all_targets(&rows),
+            [
+                ("desktop".to_string(), HarnessId::Codex),
+                ("desktop".to_string(), HarnessId::Omp)
+            ]
+        );
     }
 
     #[test]

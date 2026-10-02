@@ -5,12 +5,11 @@ use gpui::{
     AnyElement, AppContext as _, Context, Entity, IntoElement, Render, SharedString, Subscription,
     Task, Window, div, prelude::*, px,
 };
-use zeron_proto::HarnessId;
+use zeron_proto::{HarnessId, HarnessUpdatePhase, HarnessUpdateStatus};
 use zeron_rpc::methods;
 use zeron_workers_unpeel::resources::WorkersSessionResource;
 use zeron_workers_unpeel::{
-    PresetPatch, RuntimeUpdateStatus, WorkersNotificationSettings, WorkersResourceSettings,
-    WorkersTranscriptSettings,
+    PresetPatch, WorkersNotificationSettings, WorkersResourceSettings, WorkersTranscriptSettings,
 };
 
 use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
@@ -618,11 +617,6 @@ impl WorkersSettingsView {
         resource_monitor.update(cx, |monitor, cx| {
             monitor.set_details_requested(details_requested, cx)
         });
-        model.update(cx, |model, cx| {
-            if model.advisories.is_empty() && !model.advisories_loading {
-                model.refresh_advisories(cx);
-            }
-        });
         Self {
             model,
             resource_monitor,
@@ -758,9 +752,8 @@ impl WorkersSettingsView {
             error,
             installing,
             install_errors,
-            advisories,
-            updating_runtimes,
-            update_all_in_progress,
+            agent_updates,
+            agent_update_error,
         ) = {
             let model = self.model.read(cx);
             let runtime_ids = model
@@ -792,19 +785,24 @@ impl WorkersSettingsView {
                             .map(|error| ((*cli_id).to_owned(), error.to_owned()))
                     })
                     .collect::<HashMap<_, _>>(),
-                model.advisories.clone(),
-                model.updating_runtimes.clone(),
-                model.update_all_in_progress,
+                model.agent_updates.clone(),
+                model.agent_update_error.clone(),
             )
         };
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let update_count = advisories
+        let update_count = agent_updates
             .iter()
-            .filter(|a| a.status == RuntimeUpdateStatus::BehindLatest)
+            .filter(|status| status.phase == HarnessUpdatePhase::Available)
             .count();
+        let updatable_count = agent_updates
+            .iter()
+            .filter(|status| status.phase == HarnessUpdatePhase::Available && status.can_apply)
+            .count();
+        let update_all_in_progress = agent_updates.iter().any(agent_update_active);
+        let error = error.or(agent_update_error);
         let presets = settings
             .as_ref()
             .map(|settings| settings.presets.clone())
@@ -1020,76 +1018,55 @@ impl WorkersSettingsView {
                     .next()
                     .unwrap_or(&preset.command)
             });
-            let advisory = advisories
-                .iter()
-                .find(|adv| adv.cli_id == cli_key || adv.binary_name == cli_key);
-            let is_updating = updating_runtimes.contains(cli_key) || update_all_in_progress;
-            let cli_key_owned = cli_key.to_string();
+            let agent_update =
+                crate::workers::model::harness_for_cli(cli_key).and_then(|harness| {
+                    agent_updates
+                        .iter()
+                        .find(|status| status.harness == harness)
+                        .cloned()
+                });
 
-            let version_affordance = if let Some(adv) = advisory {
-                match adv.status {
-                    RuntimeUpdateStatus::BehindLatest => {
-                        let curr = adv.current_version.as_deref().unwrap_or("?");
-                        let lat = adv.latest_version.as_deref().unwrap_or("?");
-                        let can_update = adv.can_update;
-                        let update_cmd = adv.update_command.clone();
-                        let target_cli = cli_key_owned.clone();
+            let version_affordance = if let Some(status) = agent_update {
+                let installed = status.installed_version.clone().unwrap_or_default();
+                let harness = status.harness;
+                if agent_update_active(&status) {
+                    Some(
+                        div()
+                            .id(("workers-preset-updating", index))
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted)
+                            .child(format!("{} Updating…", spinner_frame(now_ms)))
+                            .into_any_element(),
+                    )
+                } else {
+                    match status.phase {
+                        HarnessUpdatePhase::Available => {
+                            let lat = status.latest_version.as_deref().unwrap_or("?");
+                            let curr = if installed.is_empty() {
+                                "?"
+                            } else {
+                                installed.as_str()
+                            };
 
-                        let mut el = div()
-                            .id(("workers-preset-version-delta", index))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_family("monospace")
-                                    .text_color(theme.text_muted)
-                                    .child(format!("v{curr} → v{lat}")),
-                            );
-
-                        if can_update {
-                            el = el.child(
-                                div()
-                                    .id(("workers-preset-update", index))
-                                    .h(px(24.0))
-                                    .px(px(8.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(5.0))
-                                    .bg(crate::theme::ink(0.08))
-                                    .cursor_pointer()
-                                    .hover(|el| el.bg(crate::theme::ink(0.14)))
-                                    .text_size(px(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if !is_updating {
-                                            this.model.update(cx, |model, cx| {
-                                                model.update_runtime(target_cli.clone(), cx);
-                                            });
-                                        }
-                                    }))
-                                    .child(if is_updating {
-                                        format!("{} Updating…", spinner_frame(now_ms))
-                                    } else {
-                                        "Update".to_string()
-                                    }),
-                            );
-                        } else if let Some(cmd) = update_cmd {
-                            el = el
+                            let mut el = div()
+                                .id(("workers-preset-version-delta", index))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
                                 .child(
                                     div()
-                                        .text_size(px(10.5))
+                                        .text_size(px(11.0))
+                                        .font_family("monospace")
                                         .text_color(theme.text_muted)
-                                        .child("Manual update"),
-                                )
-                                .child(
+                                        .child(format!("v{curr} → v{lat}")),
+                                );
+
+                            if status.can_apply {
+                                el = el.child(
                                     div()
-                                        .id(("workers-preset-copy-cmd", index))
+                                        .id(("workers-preset-update", index))
                                         .h(px(24.0))
-                                        .px(px(6.0))
+                                        .px(px(8.0))
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -1098,38 +1075,66 @@ impl WorkersSettingsView {
                                         .cursor_pointer()
                                         .hover(|el| el.bg(crate::theme::ink(0.14)))
                                         .text_size(px(10.5))
-                                        .text_color(theme.text_muted)
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                cmd.clone(),
-                                            ));
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.model.update(cx, |model, cx| {
+                                                model.apply_agent_update(harness, cx);
+                                            });
                                         }))
-                                        .child(
-                                            icon(icons::COPY)
-                                                .size(px(11.0))
-                                                .text_color(theme.text_muted),
-                                        ),
+                                        .child("Update"),
                                 );
+                            } else if let Some(cmd) = status.manual_command.clone() {
+                                el = el
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(theme.text_muted)
+                                            .child("Manual update"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("workers-preset-copy-cmd", index))
+                                            .h(px(24.0))
+                                            .px(px(6.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(5.0))
+                                            .bg(crate::theme::ink(0.08))
+                                            .cursor_pointer()
+                                            .hover(|el| el.bg(crate::theme::ink(0.14)))
+                                            .text_size(px(10.5))
+                                            .text_color(theme.text_muted)
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.write_to_clipboard(
+                                                    gpui::ClipboardItem::new_string(cmd.clone()),
+                                                );
+                                            }))
+                                            .child(
+                                                icon(icons::COPY)
+                                                    .size(px(11.0))
+                                                    .text_color(theme.text_muted),
+                                            ),
+                                    );
+                            }
+                            Some(el.into_any_element())
                         }
-                        Some(el.into_any_element())
-                    }
-                    RuntimeUpdateStatus::Current => {
-                        let curr = adv.current_version.as_deref().unwrap_or("");
-                        Some(
+                        HarnessUpdatePhase::Current | HarnessUpdatePhase::Updated => Some(
                             div()
                                 .id(("workers-preset-version-current", index))
                                 .text_size(px(11.0))
                                 .font_family("monospace")
                                 .text_color(theme.text_muted)
-                                .child(if curr.is_empty() {
+                                .child(if installed.is_empty() {
                                     "Current".to_string()
                                 } else {
-                                    format!("Current v{curr}")
+                                    format!("Current v{installed}")
                                 })
                                 .into_any_element(),
-                        )
+                        ),
+                        _ => None,
                     }
-                    RuntimeUpdateStatus::Unknown => None,
                 }
             } else {
                 None
@@ -1421,7 +1426,9 @@ impl WorkersSettingsView {
                                     if update_count == 1 { "" } else { "s" }
                                 )),
                         )
-                        .child(
+                    })
+                    .when(updatable_count > 0 || update_all_in_progress, |el| {
+                        el.child(
                             div()
                                 .id("workers-update-all")
                                 .h(px(30.0))
@@ -1436,7 +1443,7 @@ impl WorkersSettingsView {
                                 .text_size(px(11.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.model.update(cx, |model, cx| model.update_all_runtimes(cx));
+                                    this.model.update(cx, |model, cx| model.update_all_agents(cx));
                                 }))
                                 .child(if update_all_in_progress {
                                     format!("{} Updating…", spinner_frame(now_ms))
@@ -1460,7 +1467,7 @@ impl WorkersSettingsView {
                             .text_color(theme.text_muted)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.model.update(cx, |model, cx| {
-                                    model.refresh_advisories(cx);
+                                    model.check_agent_updates(cx);
                                     model.refresh_settings(cx);
                                 });
                             }))
@@ -2337,6 +2344,18 @@ impl Render for WorkersSettingsView {
             WorkersSettingsTab::Resources => self.render_resources(&theme, cx),
         }
     }
+}
+
+/// An install the upstream updater is running for this agent.
+fn agent_update_active(status: &HarnessUpdateStatus) -> bool {
+    matches!(
+        status.phase,
+        HarnessUpdatePhase::WaitingForIdle
+            | HarnessUpdatePhase::Preparing
+            | HarnessUpdatePhase::Downloading
+            | HarnessUpdatePhase::Installing
+            | HarnessUpdatePhase::Verifying
+    )
 }
 
 #[cfg(test)]

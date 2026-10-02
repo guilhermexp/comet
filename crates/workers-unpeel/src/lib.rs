@@ -8,7 +8,6 @@ mod controller_mcp;
 mod copy_ignored;
 mod git_command;
 mod hook_migration;
-pub mod maintenance;
 mod parent_notifications;
 pub mod project_git;
 pub mod project_identity;
@@ -34,11 +33,6 @@ pub use controller_mcp::{
 };
 #[doc(hidden)]
 pub use hook_migration::remove_legacy_hook_root_at;
-pub use maintenance::{
-    RuntimeInstallSource, RuntimeUpdateResult, RuntimeUpdateStatus, RuntimeVersionAdvisory,
-    UpdateOutcomeStatus, get_all_advisories, get_all_advisories_blocking, run_runtime_update,
-    run_runtime_update_blocking,
-};
 pub use parent_notifications::{
     WorkerCompletionEvidence, WorkerParentLink, WorkerParentNotification,
     WorkerParentNotificationKind, ack_worker_parent_notification,

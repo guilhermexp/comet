@@ -6,16 +6,15 @@ use gpui::{App, Context, Entity, Task};
 use zeron_doc::SessionCommandPayload;
 use zeron_rpc::methods;
 use zeron_workers_unpeel::{
-    LocalWorkersClient, PresetPatch, RuntimeUpdateStatus, RuntimeVersionAdvisory, SessionAction,
-    SessionOrganizationPatch, WorkerParentLink, WorkerParentNotification,
-    WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap, WorkersCreateGroupRequest,
-    WorkersCreateWorktreeRequest, WorkersLaunchRequest, WorkersNotificationSettings, WorkersPreset,
-    WorkersProject, WorkersProjectOrganizationPatch, WorkersResourceSettings, WorkersSession,
-    WorkersSessionCommand, WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
-    WorkersWorktreeResult, ack_worker_parent_notification, build_worker_parent_notification_prompt,
-    get_all_advisories_blocking, hibernate_confirmed_candidates, hibernation_candidates,
-    pending_worker_parent_notifications, run_runtime_update_blocking, worker_output_text,
-    worker_parent_links,
+    LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch, WorkerParentLink,
+    WorkerParentNotification, WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap,
+    WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
+    WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
+    WorkersResourceSettings, WorkersSession, WorkersSessionCommand, WorkersSessionSort,
+    WorkersSettingsSnapshot, WorkersTranscriptSettings, WorkersWorktreeResult,
+    ack_worker_parent_notification, build_worker_parent_notification_prompt,
+    hibernate_confirmed_candidates, hibernation_candidates, pending_worker_parent_notifications,
+    worker_output_text, worker_parent_links,
 };
 
 use crate::change_requests::workers_change_request_targets;
@@ -567,12 +566,10 @@ pub struct WorkersModel {
     parent_notification_in_flight: HashSet<String>,
     parent_notification_failures: HashMap<String, ParentNotificationRetry>,
     _poll_task: Task<()>,
-    pub advisories: Vec<RuntimeVersionAdvisory>,
-    pub advisories_loading: bool,
-    pub updating_runtimes: HashSet<String>,
-    pub update_all_in_progress: bool,
-    advisories_task: Option<Task<()>>,
-    runtime_update_tasks: HashMap<String, Task<()>>,
+    /// Local-device agent CLI update rows, mirrored from
+    /// `AppState::harness_updates` (the upstream updater) for the Presets.
+    pub agent_updates: Vec<zeron_proto::HarnessUpdateStatus>,
+    pub agent_update_error: Option<String>,
 }
 
 fn registry_spaces(state: &AppState) -> Vec<zeron_workers_unpeel::space_registry::SpaceRef> {
@@ -631,7 +628,12 @@ impl WorkersModel {
                 model.spaces = next;
                 cx.notify();
             }
+            if state.read(cx).harness_updates != model.agent_updates {
+                model.agent_updates = state.read(cx).harness_updates.clone();
+                cx.notify();
+            }
         });
+        let agent_updates = state.read(cx).harness_updates.clone();
         let spaces = registry_spaces(state.read(cx));
         let mut model = Self {
             state,
@@ -685,12 +687,8 @@ impl WorkersModel {
             parent_notification_in_flight: HashSet::new(),
             parent_notification_failures: HashMap::new(),
             _poll_task: poll_task,
-            advisories: Vec::new(),
-            advisories_loading: false,
-            updating_runtimes: HashSet::new(),
-            update_all_in_progress: false,
-            advisories_task: None,
-            runtime_update_tasks: HashMap::new(),
+            agent_updates,
+            agent_update_error: None,
         };
         if live {
             model.refresh(cx);
@@ -833,114 +831,62 @@ impl WorkersModel {
         }));
     }
 
-    pub fn refresh_advisories(&mut self, cx: &mut Context<Self>) {
-        if self.advisories_task.is_some() {
-            return;
-        }
-        self.advisories_loading = true;
-        cx.notify();
-
-        self.advisories_task = Some(cx.spawn(async move |this, cx| {
-            let advisories = cx
-                .background_executor()
-                .spawn(async { get_all_advisories_blocking() })
-                .await;
-            this.update(cx, |model, cx| {
-                model.advisories = advisories;
-                model.advisories_loading = false;
-                model.advisories_task = None;
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    pub fn advisory_for_cli(&self, cli_id: &str) -> Option<&RuntimeVersionAdvisory> {
-        self.advisories
+    /// The upstream update row for a preset's CLI, if the engine tracks it.
+    pub fn agent_update_for_cli(&self, cli_key: &str) -> Option<&zeron_proto::HarnessUpdateStatus> {
+        let harness = harness_for_cli(cli_key)?;
+        self.agent_updates
             .iter()
-            .find(|adv| adv.cli_id == cli_id || adv.binary_name == cli_id)
+            .find(|status| status.harness == harness)
     }
 
-    pub fn is_runtime_updating(&self, cli_id: &str) -> bool {
-        self.updating_runtimes.contains(cli_id)
+    pub fn apply_agent_update(&mut self, harness: zeron_proto::HarnessId, cx: &mut Context<Self>) {
+        self.call_agent_updates(
+            methods::APPLY_HARNESS_UPDATE,
+            serde_json::json!({ "harness": harness }),
+            cx,
+        );
     }
 
-    pub fn update_runtime(&mut self, cli_id: String, cx: &mut Context<Self>) {
-        if self.updating_runtimes.contains(&cli_id) {
-            return;
-        }
-        self.updating_runtimes.insert(cli_id.clone());
-        cx.notify();
-
-        let target_cli = cli_id.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let target_cli = target_cli.clone();
-                    async move { run_runtime_update_blocking(&target_cli) }
-                })
-                .await;
-            this.update(cx, |model, cx| {
-                model.updating_runtimes.remove(&target_cli);
-                model.runtime_update_tasks.remove(&target_cli);
-                if let Some(adv) = result.advisory {
-                    if let Some(pos) = model.advisories.iter().position(|a| a.cli_id == adv.cli_id)
-                    {
-                        model.advisories[pos] = adv;
-                    } else {
-                        model.advisories.push(adv);
-                    }
-                }
-                model.refresh_settings(cx);
-                cx.notify();
-            })
-            .ok();
-        });
-
-        self.runtime_update_tasks.insert(cli_id, task);
-    }
-
-    pub fn update_all_runtimes(&mut self, cx: &mut Context<Self>) {
-        if self.update_all_in_progress {
-            return;
-        }
-        let updatable: Vec<String> = self
-            .advisories
+    pub fn update_all_agents(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<_> = self
+            .agent_updates
             .iter()
-            .filter(|adv| adv.can_update && adv.status == RuntimeUpdateStatus::BehindLatest)
-            .map(|adv| adv.cli_id.clone())
+            .filter(|status| {
+                status.phase == zeron_proto::HarnessUpdatePhase::Available && status.can_apply
+            })
+            .map(|status| status.harness)
             .collect();
+        for harness in targets {
+            self.apply_agent_update(harness, cx);
+        }
+    }
 
-        if updatable.is_empty() {
+    pub fn check_agent_updates(&mut self, cx: &mut Context<Self>) {
+        self.call_agent_updates(methods::CHECK_HARNESS_UPDATES, serde_json::json!({}), cx);
+    }
+
+    /// Progress arrives through the `WATCH_HARNESS_UPDATES` mirror; only a
+    /// failed request is surfaced here.
+    fn call_agent_updates(
+        &mut self,
+        method: &'static str,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
-        }
-
-        self.update_all_in_progress = true;
-        for cli in &updatable {
-            self.updating_runtimes.insert(cli.clone());
-        }
-        cx.notify();
-
+        };
+        self.agent_update_error = None;
         cx.spawn(async move |this, cx| {
-            for cli in updatable {
-                let _ = cx
-                    .background_executor()
-                    .spawn({
-                        let cli = cli.clone();
-                        async move { run_runtime_update_blocking(&cli) }
-                    })
-                    .await;
-                let _ = this.update(cx, |model, cx| {
-                    model.updating_runtimes.remove(&cli);
-                    cx.notify();
-                });
-            }
+            let result = engine.client().call(method, params).await;
             this.update(cx, |model, cx| {
-                model.update_all_in_progress = false;
-                model.refresh_advisories(cx);
-                model.refresh_settings(cx);
-                cx.notify();
+                if let Err(error) = result
+                    && !matches!(&error, zeron_rpc::RpcError::Failed(message)
+                        if message == "update cancelled")
+                {
+                    model.agent_update_error = Some(error.to_string());
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -2503,6 +2449,25 @@ impl WorkersModel {
     }
 }
 
+/// Workers presets name their runtime by CLI id or binary; the upstream
+/// updater keys rows by harness. `agy` (the Antigravity CLI) is not an
+/// engine harness and has no updater row.
+pub(crate) fn harness_for_cli(cli_key: &str) -> Option<zeron_proto::HarnessId> {
+    use zeron_proto::HarnessId;
+    Some(match cli_key {
+        "claude" | "claude-code" => HarnessId::ClaudeCode,
+        "codex" => HarnessId::Codex,
+        "cursor" | "cursor-agent" => HarnessId::Cursor,
+        "grok" => HarnessId::Grok,
+        "hermes" => HarnessId::Hermes,
+        "pi" => HarnessId::Pi,
+        "omp" => HarnessId::Omp,
+        "opencode" => HarnessId::Opencode,
+        "devin" => HarnessId::Devin,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -2522,6 +2487,23 @@ mod tests {
         selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
         toggle_expanded, worktree_hook_warning_message, worktree_setup_failure_message,
     };
+
+    #[test]
+    fn presets_map_their_cli_to_the_upstream_updater_row() {
+        use zeron_proto::HarnessId;
+        assert_eq!(
+            super::harness_for_cli("claude"),
+            Some(HarnessId::ClaudeCode)
+        );
+        assert_eq!(
+            super::harness_for_cli("claude-code"),
+            Some(HarnessId::ClaudeCode)
+        );
+        assert_eq!(super::harness_for_cli("codex"), Some(HarnessId::Codex));
+        assert_eq!(super::harness_for_cli("omp"), Some(HarnessId::Omp));
+        // The Antigravity CLI is a Workers runtime, not an engine harness.
+        assert_eq!(super::harness_for_cli("agy"), None);
+    }
 
     #[test]
     fn empty_projects_are_not_selected_implicitly_after_refresh() {

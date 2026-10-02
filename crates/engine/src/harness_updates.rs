@@ -183,12 +183,11 @@ impl Drop for CodexStageCleanup {
     }
 }
 
-/// Whether this coordinator tracks the harness's CLI at all. The fork's OMP
-/// and Kimi harnesses stay out: their runtimes are maintained by the Workers
-/// runtime maintenance (`zeron_workers_unpeel::maintenance`), which already
-/// probes and updates `omp`/`pi`, so a second updater would race it.
+/// Whether this coordinator tracks the harness's CLI at all. It is the only
+/// agent CLI updater (the fork's Workers maintenance was folded into it);
+/// the fork's Kimi harness has no update source yet and stays out.
 fn monitored(id: HarnessId) -> bool {
-    !matches!(id, HarnessId::Mock | HarnessId::Omp | HarnessId::Kimi)
+    !matches!(id, HarnessId::Mock | HarnessId::Kimi)
 }
 
 fn provider(id: HarnessId) -> ProviderSpec {
@@ -232,8 +231,10 @@ fn provider(id: HarnessId) -> ProviderSpec {
         HarnessId::Pi => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Npm("@earendil-works/pi-coding-agent"),
-            update_args: Some(&["update", "--self"]),
-            manual_command: "pi update --self",
+            // Fork: `--all` is pi plus its installed packages; `--self`
+            // leaves extensions behind.
+            update_args: Some(&["update", "--all"]),
+            manual_command: "pi update --all",
         },
         HarnessId::Opencode => ProviderSpec {
             version_args: &["--version"],
@@ -255,7 +256,15 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: None,
             manual_command: "Update Zeron or replace the configured Antigravity ACP server",
         },
-        HarnessId::Mock | HarnessId::Omp | HarnessId::Kimi => ProviderSpec {
+        // Fork: OMP publishes to npm and updates itself. `--no-extensions`
+        // keeps the version probe from loading user extensions.
+        HarnessId::Omp => ProviderSpec {
+            version_args: &["--no-extensions", "--version"],
+            latest: LatestSource::Npm("@oh-my-pi/pi-coding-agent"),
+            update_args: Some(&["update"]),
+            manual_command: "omp update",
+        },
+        HarnessId::Mock | HarnessId::Kimi => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Manual,
             update_args: None,
@@ -549,7 +558,7 @@ impl HarnessUpdateCoordinator {
 
     async fn check_one_inner(&self, harness: HarnessId) -> Result<(), String> {
         if !monitored(harness) {
-            return Err("this agent's CLI updates are managed by Workers maintenance".into());
+            return Err("this agent's CLI has no update source".into());
         }
         // Checks and activation refreshes must never overwrite a live
         // mutation phase (especially Installing, which is non-interruptible).
@@ -755,7 +764,7 @@ impl HarnessUpdateCoordinator {
 
     async fn apply_inner(&self, harness: HarnessId) -> Result<String, String> {
         if !monitored(harness) {
-            return Err("this agent's CLI updates are managed by Workers maintenance".into());
+            return Err("this agent's CLI has no update source".into());
         }
         // A provider probe and mutation must never overlap: a late check
         // result could otherwise overwrite Installing/Verifying state or
@@ -3171,5 +3180,15 @@ esac
         let loose = root.join("elsewhere/codex");
         touch(&loose);
         assert!(!super::can_apply_update(HarnessId::Codex, &loose));
+    }
+
+    #[test]
+    fn omp_is_tracked_and_updates_itself() {
+        assert!(super::monitored(HarnessId::Omp));
+        assert!(!super::monitored(HarnessId::Kimi));
+        assert!(super::can_apply_update(
+            HarnessId::Omp,
+            std::path::Path::new("/opt/homebrew/bin/omp")
+        ));
     }
 }
