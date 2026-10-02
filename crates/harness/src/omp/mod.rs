@@ -325,6 +325,10 @@ impl Harness for OmpHarness {
         self.resolve_executable().is_some()
     }
 
+    fn executable_path(&self) -> Option<PathBuf> {
+        self.resolve_executable()
+    }
+
     fn deterministic_turn_end(&self) -> bool {
         true
     }
@@ -1786,6 +1790,19 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// O updater (`engine/src/harness_updates.rs`) acha o binario via
+    /// `Harness::executable_path()`; sem o override o OMP aparecia instalado
+    /// mas o check falhava com "agent CLI executable is unavailable".
+    #[test]
+    fn the_updater_sees_the_resolved_omp_binary() {
+        let harness: Box<dyn Harness> =
+            Box::new(OmpHarness::new().with_executable("/opt/homebrew/bin/omp"));
+        assert_eq!(
+            harness.executable_path(),
+            Some(PathBuf::from("/opt/homebrew/bin/omp"))
+        );
+    }
 
     /// Producao constroi `OmpHarness::new()` puro (`engine/src/registry.rs`),
     /// entao o default E o valor de producao: `with_timeouts` so os testes
