@@ -561,21 +561,34 @@ fn project_key(name: &str) -> String {
         .collect()
 }
 
+/// Whether the ticket ran in the project: its `cwd` is the project folder or
+/// one of its checkouts (principal or worktree), or lies inside one.
+fn ran_in(entry: &ProjectEntry, ticket: &Ticket) -> bool {
+    within(&ticket.cwd, &entry.space.path)
+        || entry
+            .group
+            .checkouts
+            .iter()
+            .any(|checkout| within(&ticket.cwd, &checkout.path))
+}
+
 /// The project's tickets, newest first: those whose `cwd` is one of its
-/// checkouts (principal or worktree), else those filed under a harness
-/// project of the same name.
-pub fn tickets_for_project<'a>(entry: &ProjectEntry, tickets: &'a [Ticket]) -> Vec<&'a Ticket> {
+/// checkouts (principal or worktree). A ticket whose `cwd` is in none of the
+/// registered `projects` falls back to its harness folder: it belongs to the
+/// project of the same name. A ticket filed in project A's folder but run in
+/// project B belongs only to B.
+pub fn tickets_for_project<'a>(
+    entry: &ProjectEntry,
+    projects: &[ProjectEntry],
+    tickets: &'a [Ticket],
+) -> Vec<&'a Ticket> {
     let name = project_key(&entry.space.name);
     let mut rows: Vec<&Ticket> = tickets
         .iter()
         .filter(|ticket| {
-            entry
-                .group
-                .checkouts
-                .iter()
-                .any(|checkout| within(&ticket.cwd, &checkout.path))
-                || within(&ticket.cwd, &entry.space.path)
-                || project_key(&ticket.brain_project) == name
+            ran_in(entry, ticket)
+                || (project_key(&ticket.brain_project) == name
+                    && !projects.iter().any(|project| ran_in(project, ticket)))
         })
         .collect();
     rows.sort_by(|left, right| {

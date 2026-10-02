@@ -99,22 +99,50 @@ pub fn checkout_rows(
     ))
 }
 
+/// A checkout whose archived Worker sessions could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveFailure {
+    /// The checkout's Workers project id.
+    pub project_id: String,
+    pub error: String,
+}
+
 /// The bootstrap's sessions plus every checkout's archived ones: the
 /// bootstrap only carries a short preview of the archived. A checkout whose
-/// archive cannot be read contributes none.
+/// archive cannot be read contributes none and is returned as a failure;
+/// the sessions read are kept.
 pub fn with_archived_sessions(
     client: &LocalWorkersClient,
+    sessions: Vec<WorkersSession>,
+    rows: &[ProjectRow],
+) -> (Vec<WorkersSession>, Vec<ArchiveFailure>) {
+    merge_archived_sessions(sessions, rows, |project_id| {
+        client.archived_sessions(project_id)
+    })
+}
+
+pub(crate) fn merge_archived_sessions(
     mut sessions: Vec<WorkersSession>,
     rows: &[ProjectRow],
-) -> Vec<WorkersSession> {
+    archived: impl Fn(&str) -> Result<Vec<WorkersSession>, WorkersError>,
+) -> (Vec<WorkersSession>, Vec<ArchiveFailure>) {
+    let mut failures = Vec::new();
     for project_id in rows.iter().filter_map(|row| row.project_id.as_deref()) {
-        for session in client.archived_sessions(project_id).unwrap_or_default() {
-            if !sessions.iter().any(|known| known.id == session.id) {
-                sessions.push(session);
+        match archived(project_id) {
+            Ok(found) => {
+                for session in found {
+                    if !sessions.iter().any(|known| known.id == session.id) {
+                        sessions.push(session);
+                    }
+                }
             }
+            Err(error) => failures.push(ArchiveFailure {
+                project_id: project_id.to_owned(),
+                error: error.to_string(),
+            }),
         }
     }
-    sessions
+    (sessions, failures)
 }
 
 /// The project's Worker sessions with the checkout each ran in (principal or

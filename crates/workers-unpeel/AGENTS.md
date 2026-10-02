@@ -23,8 +23,8 @@ internal host modes (`__session_host__` et al.).
 | `workspace_trust.rs` | Workspace trust decisions |
 | `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
 | `project_ledger.rs` | Historical checkout metadata, grouping of checkout history under the registry's projects (`group_rows_by_project`) and persistent Forget suppression |
-| `project_activity.rs` | What Settings → Projects shows per project, UI-free and shared with the controller: `ProjectEntry`/`project_entries` (Spaces × devices × decorated checkout history `checkout_rows`), the project's Worker sessions (`with_archived_sessions`, `project_sessions`, `worker_provider`) and chats (`project_chats`, `chat_title`, `launched_workers`) |
-| `project_tickets.rs` | Harness tickets of the Orchestrator workspace (`$ORCH_WORKSPACE`, else `~/orchestrator`): frontmatter parser, `read_tickets` (no git), `load_tickets` (plus OpenSpec links via git, Settings only), and matching by checkout `cwd` or harness folder name (`tickets_for_project`). Read-only |
+| `project_activity.rs` | What Settings → Projects shows per project, UI-free and shared with the controller: `ProjectEntry`/`project_entries` (Spaces × devices × decorated checkout history `checkout_rows`), the project's Worker sessions (`with_archived_sessions` — sessions read plus each `ArchiveFailure` —, `project_sessions`, `worker_provider`) and chats (`project_chats`, `chat_title`, `launched_workers`) |
+| `project_tickets.rs` | Harness tickets of the Orchestrator workspace (`$ORCH_WORKSPACE`, else `~/orchestrator`): frontmatter parser, `read_tickets` (no git), `load_tickets` (plus OpenSpec links via git, Settings only), and matching by checkout `cwd`, else harness folder name only when the `cwd` is in no registered project (`tickets_for_project`). Read-only |
 | `space_registry.rs` | The single project registry as Workers see it: `SpaceRegistry` (`list`, `ensure`), `SpaceRef`, the chat-MCP-equivalent join (`space_refs`) and `RpcSpaceRegistry` over the engine RPC surface (`COMET_WORKERS_ENGINE_ENDPOINT`), including `read_with_chats` for the controller's project activity |
 | `space_links.rs` | Checkout ↔ project links: `project_folder`, `link_unlinked_at`, the one-time `migrate_at` (backup, reconcile, link, marker) and the read-only `linked_checkouts_at` Source Control authorizes through |
 | `checkout_lifecycle.rs` | Shared Chat/Workers worktree creation, guarded physical removal, stale registration pruning, archive/restore and action coordination |
@@ -80,10 +80,17 @@ apps/zeron (host-mode dispatch at startup).
   então os ids batem com as abas. Não duplique parser nem casamento na UI ou
   no controller. A listagem lê tickets com `read_tickets` (sem git; o
   `load_tickets` com specs custa ~1,4 s em 143 tickets e é só da página);
-  chats vêm de `WatchChats` no mesmo endpoint. Fonte ilegível (workspace do
-  Orquestrador, histórico de checkouts, chats) deixa a seção vazia com
-  `error` nomeando-a; a listagem não falha. Projeto de outro device tem
+  chats vêm de `WatchChats` no mesmo endpoint. Só o registro (Spaces) falha
+  a chamada. Fonte ilegível (workspace do Orquestrador, estado Workers,
+  histórico de checkouts, chats) deixa a seção vazia com `error` nomeando-a;
+  estado Workers ilegível lista todos os projetos sem checkouts, com o erro
+  em `worker_sessions`. Fonte lida em parte (archive de um checkout) mantém o
+  que leu e soma o `error` — `with_archived_sessions` devolve as falhas, nunca
+  as engole; a UI as ignora no call site. Projeto de outro device tem
   `worker_sessions` vazio sem erro.
+- **Ticket pertence ao projeto do seu `cwd`.** Pasta do harness com o nome do
+  projeto é só fallback para `cwd` fora de todo projeto registrado: ticket
+  arquivado na pasta de A mas rodado em B é só de B, na listagem e na aba.
 - **Migração única** (`space_links::migrate_at`, chamada pela UI depois que a
   engine conecta e os Spaces sincronizam): copia `app-state.json` para
   `app-state.space-migration-backup.json` (nunca sobrescreve uma cópia

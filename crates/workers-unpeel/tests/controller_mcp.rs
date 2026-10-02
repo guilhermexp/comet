@@ -1619,16 +1619,18 @@ fn settings_tab_ids(
         .iter()
         .find(|entry| entry.space.id == space_id)
         .unwrap();
-    let workers = project_activity::with_archived_sessions(
+    let (workers, archive_failures) = project_activity::with_archived_sessions(
         &client,
         client.bootstrap().unwrap().sessions,
         &rows,
     );
+    assert_eq!(archive_failures, Vec::new());
     let tickets = project_tickets::load_tickets(workspace).unwrap();
-    let mut ticket_ids: Vec<String> = project_tickets::tickets_for_project(entry, &tickets)
-        .iter()
-        .map(|ticket| ticket.id.clone())
-        .collect();
+    let mut ticket_ids: Vec<String> =
+        project_tickets::tickets_for_project(entry, &entries, &tickets)
+            .iter()
+            .map(|ticket| ticket.id.clone())
+            .collect();
     ticket_ids.sort();
     let mut session_ids: Vec<String> = project_activity::project_sessions(entry, &workers)
         .iter()
@@ -1722,6 +1724,109 @@ fn a_ticket_matches_only_its_own_project() {
         vec!["WT-20261001-beta"]
     );
     assert_eq!(beta["tickets"]["open"], json!([]));
+}
+
+/// A ticket run in project B but filed under project A's harness folder
+/// belongs only to B: the folder name is a fallback for a `cwd` that lies in
+/// no registered project.
+#[test]
+fn a_ticket_filed_under_another_projects_folder_belongs_to_its_cwd() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let engine = FakeEngine::start(&[]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let alpha = git_repo(&home.path().join("alpha"));
+    let beta = git_repo(&home.path().join("beta"));
+    engine.add_space("space-alpha", LOCAL_DEVICE, &alpha.to_string_lossy());
+    engine.add_space("space-beta", LOCAL_DEVICE, &beta.to_string_lossy());
+    ok(workers(json!({ "action": "add_project", "path": alpha })));
+    ok(workers(json!({ "action": "add_project", "path": beta })));
+    let workspace = home.path().join("orchestrator");
+    let _orch = EnvironmentVariableGuard::set("ORCH_WORKSPACE", &workspace);
+    write_ticket(
+        &workspace,
+        "alpha",
+        "WT-20261001-run-in-beta",
+        "open",
+        "2026-10-01T10:00:00",
+        &beta.join("src").to_string_lossy(),
+    );
+    write_ticket(
+        &workspace,
+        "alpha",
+        "WT-20261001-no-checkout",
+        "open",
+        "2026-10-01T11:00:00",
+        "/elsewhere/gone",
+    );
+
+    let listed = ok(workers(json!({ "action": "list_projects" })));
+
+    let alpha = listed_project(&listed, "space-alpha");
+    assert_eq!(
+        ids(&alpha["tickets"]["open"], "id"),
+        vec!["WT-20261001-no-checkout"],
+        "{alpha}"
+    );
+    let beta = listed_project(&listed, "space-beta");
+    assert_eq!(
+        ids(&beta["tickets"]["open"], "id"),
+        vec!["WT-20261001-run-in-beta"],
+        "{beta}"
+    );
+}
+
+/// Unreadable Workers state never fails the listing: every project is
+/// listed with no checkouts, and `worker_sessions` names the Workers state.
+#[test]
+fn unreadable_workers_state_lists_every_project_and_names_it() {
+    let _lock = ENV_LOCK.lock();
+    let home = TempDir::new().unwrap();
+    let _home = UnpeelHomeGuard::set(home.path());
+    write_workers_state(home.path(), json!([]));
+    let engine = FakeEngine::start(&[("device-mini", "Mac mini")]);
+    let _endpoint = EnvironmentVariableGuard::set(ENGINE_ENDPOINT_ENV, &engine.endpoint);
+    let local = git_repo(&home.path().join("local-repo"));
+    engine.add_space("space-local", LOCAL_DEVICE, &local.to_string_lossy());
+    engine.add_space("space-remote", "device-mini", "/Users/other/remote-repo");
+    ok(workers(json!({ "action": "add_project", "path": local })));
+    let workspace = home.path().join("orchestrator");
+    let _orch = EnvironmentVariableGuard::set("ORCH_WORKSPACE", &workspace);
+    write_ticket(
+        &workspace,
+        "harness",
+        "WT-20261001-local",
+        "open",
+        "2026-10-01T10:00:00",
+        &local.to_string_lossy(),
+    );
+    fs::write(home.path().join("app-state.json"), "{ not json").unwrap();
+
+    let listed = ok(workers(json!({ "action": "list_projects" })));
+
+    let projects = listed["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 2, "{listed}");
+    assert_eq!(listed["association_pending"], json!([]));
+    let local = listed_project(&listed, "space-local");
+    assert_eq!(local["checkouts"], json!([]), "{local}");
+    let sessions = &local["worker_sessions"];
+    assert_eq!(
+        sessions["counts"],
+        json!({ "live": 0, "stopped": 0, "archived": 0 }),
+        "{sessions}"
+    );
+    let error = sessions["error"]
+        .as_str()
+        .expect("the section names its error");
+    assert!(error.starts_with("Workers state:"), "{error}");
+    // The other sources still answer.
+    assert_eq!(
+        ids(&local["tickets"]["open"], "id"),
+        vec!["WT-20261001-local"]
+    );
+    assert!(local["orchestrator_sessions"].get("error").is_none());
 }
 
 /// Scenario "The Orchestrator workspace is missing": every project is still
