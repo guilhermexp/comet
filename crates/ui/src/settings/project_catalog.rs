@@ -1,93 +1,14 @@
-//! Settings → Projects data, UI-free: the registry's projects (Spaces from
-//! every device) joined with this device's checkout history, the search
-//! predicate, and the Sessions tab rows. A project is a Space; a Workers
+//! Settings → Projects presentation over the shared project readers: the
+//! search predicate, the rename mutation and the Sessions tab rows. Which
+//! projects exist, which checkouts, Worker sessions and chats belong to each
+//! live in `zeron_workers_unpeel::project_activity`, which the Workers
+//! controller's `list_projects` also reads. A project is a Space; a Workers
 //! checkout without a project is only ever association-pending.
 
-use std::collections::HashMap;
-
-use zeron_proto::{Chat, Device, Space};
-use zeron_workers_unpeel::project_ledger::{self, CheckoutAvailability, ProjectGroup, ProjectRow};
-use zeron_workers_unpeel::space_registry::{SpaceRef, space_refs};
+use zeron_proto::Chat;
+use zeron_workers_unpeel::project_activity::{self, ProjectEntry};
+use zeron_workers_unpeel::project_ledger::{self, CheckoutAvailability, ProjectRow};
 use zeron_workers_unpeel::{WorkerParentLink, WorkersSession};
-
-/// One row of the project list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectEntry {
-    pub space: SpaceRef,
-    pub created_at_ms: i64,
-    /// This device's checkout history linked to the project (empty for a
-    /// project of another device).
-    pub group: ProjectGroup,
-    /// Latest real activity of its chats and checkouts, epoch ms.
-    pub last_activity_ms: u64,
-}
-
-/// Every registry project with its local checkouts, most recent first, and
-/// the checkout records linked to no project.
-pub fn project_entries(
-    spaces: &[Space],
-    devices: &[Device],
-    local_device_id: Option<&str>,
-    chats: &[Chat],
-    rows: &[ProjectRow],
-) -> (Vec<ProjectEntry>, Vec<ProjectRow>) {
-    let refs = space_refs(spaces, devices, local_device_id.unwrap_or_default());
-    let local_projects: Vec<(String, String)> = refs
-        .iter()
-        .filter(|space| space.local)
-        .map(|space| (space.id.clone(), space.name.clone()))
-        .collect();
-    let (groups, pending) = project_ledger::group_rows_by_project(&local_projects, rows);
-    let mut groups: HashMap<String, ProjectGroup> = groups
-        .into_iter()
-        .map(|group| (group.id.clone(), group))
-        .collect();
-    let mut chat_activity: HashMap<&str, i64> = HashMap::new();
-    for chat in chats {
-        let Some(space_id) = chat.space_id.as_deref() else {
-            continue;
-        };
-        let at = chat
-            .last_message_at
-            .unwrap_or(chat.created_at)
-            .timestamp_millis();
-        let entry = chat_activity.entry(space_id).or_insert(at);
-        *entry = (*entry).max(at);
-    }
-    let mut entries: Vec<ProjectEntry> = refs
-        .into_iter()
-        .zip(spaces)
-        .map(|(space, raw)| {
-            let group = groups.remove(&space.id).unwrap_or_else(|| ProjectGroup {
-                id: space.id.clone(),
-                name: space.name.clone(),
-                icon_path: None,
-                added_at_unix_ms: 0,
-                last_opened_at_unix_ms: 0,
-                checkouts: Vec::new(),
-            });
-            let chats = chat_activity
-                .get(space.id.as_str())
-                .copied()
-                .unwrap_or(0)
-                .max(0) as u64;
-            ProjectEntry {
-                last_activity_ms: chats.max(group.last_opened_at_unix_ms),
-                created_at_ms: raw.created_at.timestamp_millis(),
-                space,
-                group,
-            }
-        })
-        .collect();
-    entries.sort_by(|left, right| {
-        right
-            .last_activity_ms
-            .cmp(&left.last_activity_ms)
-            .then_with(|| left.space.name.cmp(&right.space.name))
-            .then_with(|| left.space.id.cmp(&right.space.id))
-    });
-    (entries, pending)
-}
 
 /// Search over the project name, its device name and path, and every
 /// checkout's name, branch or path. `Some(None)`: the project itself matched;
@@ -137,11 +58,17 @@ pub(crate) struct SessionRow {
     pub kind: SessionKind,
     pub title: String,
     pub runtime: String,
+    /// The agent's mark (Claude, OMP, Codex…), as in the Workers sidebar.
+    pub runtime_icon: &'static str,
+    /// The model the Worker ran on: the active one, else the first reported.
+    pub model: Option<String>,
     pub status: String,
     pub last_activity_ms: u64,
 }
 
-/// What activating a row opens in the side panel. Nothing here restarts a
+/// What activating a row opens in the side panel. A Worker row opens that
+/// Worker's own terminal, never the Orchestrator chat that launched it;
+/// chats open from the Orchestrator sessions tab. Nothing here restarts a
 /// Worker: stopped, archived or checkout-less sessions replay read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionPanelTarget {
@@ -149,8 +76,38 @@ pub(crate) enum SessionPanelTarget {
     Worker { session_id: String },
     /// The same surface over the session's recorded output, never restarted.
     WorkerReplay { session_id: String },
-    /// The chat transcript, read-only, with a way to the chat itself.
+    /// An Orchestrator chat transcript, read-only, with a way to the chat.
     Chat { chat_id: String },
+}
+
+/// One Orchestrator chat of the project, for the Orchestrator sessions tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatSessionRow {
+    pub chat_id: String,
+    pub title: String,
+    pub archived: bool,
+    /// Worker sessions this chat launched.
+    pub workers: usize,
+    pub last_activity_ms: u64,
+}
+
+/// The Orchestrator sessions tab of one project: every chat of its Space,
+/// live and archived, newest first.
+pub(crate) fn chat_rows(
+    entry: &ProjectEntry,
+    chats: &[Chat],
+    links: &[WorkerParentLink],
+) -> Vec<ChatSessionRow> {
+    project_activity::project_chats(entry, chats)
+        .into_iter()
+        .map(|chat| ChatSessionRow {
+            chat_id: chat.id.clone(),
+            title: project_activity::chat_title(chat),
+            archived: chat.archived,
+            workers: project_activity::launched_workers(&chat.id, links),
+            last_activity_ms: project_activity::chat_last_activity_ms(chat),
+        })
+        .collect()
 }
 
 pub(crate) fn activation(row: &SessionRow) -> SessionPanelTarget {
@@ -166,20 +123,6 @@ pub(crate) fn activation(row: &SessionRow) -> SessionPanelTarget {
     }
 }
 
-fn worker_runtime(session: &WorkersSession) -> String {
-    session
-        .provider_id
-        .clone()
-        .or_else(|| {
-            session
-                .command
-                .split_whitespace()
-                .next()
-                .map(|command| command.rsplit('/').next().unwrap_or(command).to_owned())
-        })
-        .unwrap_or_else(|| "worker".into())
-}
-
 /// The Sessions tab of one project: every Worker session of any of its
 /// checkouts (principal and worktrees, live and archived), newest first —
 /// the Workers counterpart of Settings → Archived sessions. Worker sessions
@@ -190,71 +133,69 @@ pub(crate) fn session_rows(
     workers: &[WorkersSession],
     links: &[WorkerParentLink],
 ) -> Vec<SessionRow> {
-    let mut rows = Vec::new();
-    if !entry.space.local {
-        return rows;
-    }
-    for session in workers {
-        let Some(checkout) = entry.group.checkouts.iter().find(|row| {
-            row.project_id.as_deref() == Some(session.project_id.as_str())
-                || row.checkout_id.as_deref() == Some(session.project_id.as_str())
-        }) else {
-            continue;
-        };
-        let principal = checkout.checkout_kind == Some(project_ledger::CheckoutKind::Primary);
-        let parent_chat = links
-            .iter()
-            .find(|link| link.worker_session_id == session.id)
-            .map(|link| {
-                let title = chats
-                    .iter()
-                    .find(|chat| chat.id == link.parent_chat_id)
-                    .and_then(|chat| chat.title.clone())
-                    .unwrap_or_else(|| "Orchestrator chat".into());
-                (link.parent_chat_id.clone(), title)
-            });
-        rows.push(SessionRow {
-            kind: SessionKind {
-                session_id: session.id.clone(),
-                checkout: if principal {
-                    "Principal".into()
-                } else {
-                    checkout
-                        .display_branch()
-                        .unwrap_or(checkout.name.as_str())
-                        .to_owned()
+    project_activity::project_sessions(entry, workers)
+        .into_iter()
+        .map(|(session, checkout)| {
+            let principal = checkout.checkout_kind == Some(project_ledger::CheckoutKind::Primary);
+            let parent_chat = links
+                .iter()
+                .find(|link| link.worker_session_id == session.id)
+                .map(|link| {
+                    let title = chats
+                        .iter()
+                        .find(|chat| chat.id == link.parent_chat_id)
+                        .and_then(|chat| chat.title.clone())
+                        .unwrap_or_else(|| "Orchestrator chat".into());
+                    (link.parent_chat_id.clone(), title)
+                });
+            SessionRow {
+                kind: SessionKind {
+                    session_id: session.id.clone(),
+                    checkout: if principal {
+                        "Principal".into()
+                    } else {
+                        checkout
+                            .display_branch()
+                            .unwrap_or(checkout.name.as_str())
+                            .to_owned()
+                    },
+                    live: session.is_live(),
+                    archived: session.archived,
+                    checkout_available: checkout.checkout_availability
+                        != Some(CheckoutAvailability::Missing),
+                    parent_chat,
                 },
-                live: session.is_live(),
-                archived: session.archived,
-                checkout_available: checkout.checkout_availability
-                    != Some(CheckoutAvailability::Missing),
-                parent_chat,
-            },
-            title: session.title.clone(),
-            runtime: worker_runtime(session),
-            status: if session.archived {
-                "Archived".into()
-            } else if session.is_live() {
-                session.activity.clone()
-            } else {
-                session.state.clone()
-            },
-            last_activity_ms: session.updated_at_unix_ms,
-        });
-    }
-    rows.sort_by(|left, right| {
-        right
-            .last_activity_ms
-            .cmp(&left.last_activity_ms)
-            .then_with(|| left.title.cmp(&right.title))
-    });
-    rows
+                title: session.title.clone(),
+                runtime: project_activity::worker_provider(session),
+                runtime_icon: crate::workers::presentation::runtime_icon_path(
+                    session.provider_id.as_deref(),
+                    Some(session.command.as_str()),
+                ),
+                model: session
+                    .model_usage
+                    .iter()
+                    .find(|usage| usage.active)
+                    .or_else(|| session.model_usage.first())
+                    .map(|usage| usage.model.clone()),
+                status: if session.archived {
+                    "Archived".into()
+                } else if session.is_live() {
+                    session.activity.clone()
+                } else {
+                    session.state.clone()
+                },
+                last_activity_ms: session.updated_at_unix_ms,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use zeron_proto::{Device, Space};
+    use zeron_workers_unpeel::project_activity::project_entries;
     use zeron_workers_unpeel::project_ledger::{AssociationState, CheckoutKind, CheckoutOwnership};
 
     fn space(id: &str, device: &str, path: &str, created_ms: i64) -> Space {
@@ -507,6 +448,52 @@ mod tests {
         assert_eq!(rows[1].kind.checkout, "sec/cron");
         assert_eq!(rows[1].status, "Archived");
         assert_eq!(rows[0].runtime, "omp");
+        assert_eq!(rows[0].runtime_icon, crate::icons::WORKER_OMP);
+        assert_eq!(rows[0].model, None);
+    }
+
+    #[test]
+    fn orchestrator_rows_list_the_project_chats_with_their_workers() {
+        let (entries, _) = fixture();
+        let jk = entries.iter().find(|e| e.space.id == "space-jk").unwrap();
+        let chats = vec![
+            chat("c-old", "space-jk", 100, true),
+            chat("c-new", "space-jk", 900, false),
+            chat("c-other", "space-other", 950, false),
+        ];
+        let links = vec![WorkerParentLink {
+            worker_session_id: "w-main".into(),
+            parent_chat_id: "c-new".into(),
+            registered_at_unix_ms: 1,
+        }];
+        let rows = chat_rows(jk, &chats, &links);
+        let ids: Vec<&str> = rows.iter().map(|row| row.chat_id.as_str()).collect();
+        assert_eq!(ids, vec!["c-new", "c-old"]);
+        assert_eq!(rows[0].workers, 1);
+        assert!(rows[1].archived);
+    }
+
+    #[test]
+    fn session_rows_carry_the_agent_mark_and_the_active_model() {
+        let (entries, _) = fixture();
+        let jk = entries.iter().find(|e| e.space.id == "space-jk").unwrap();
+        let mut claude = worker("w-claude", "comet-jk", "running", false, 800);
+        claude.command = "claude --resume abc".into();
+        claude.model_usage = vec![
+            zeron_workers_unpeel::WorkersModelTokenUsage {
+                model: "claude-sonnet".into(),
+                total_tokens: 10,
+                active: false,
+            },
+            zeron_workers_unpeel::WorkersModelTokenUsage {
+                model: "claude-opus".into(),
+                total_tokens: 20,
+                active: true,
+            },
+        ];
+        let rows = session_rows(jk, &[], &[claude], &[]);
+        assert_eq!(rows[0].runtime_icon, crate::icons::WORKER_CLAUDE);
+        assert_eq!(rows[0].model.as_deref(), Some("claude-opus"));
     }
 
     #[test]

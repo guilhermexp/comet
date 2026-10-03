@@ -121,7 +121,7 @@ A project owned by another device SHALL show its name, device, path, Git flag an
 
 ### Requirement: A project lists its Worker sessions
 
-The detail of a local project SHALL offer a Sessions tab, laid out like Settings → Archived sessions, listing every Worker session launched in any of the project's checkouts (live and archived), most recent activity first. Each row SHALL show title, runtime, status, last activity and checkout (branch or principal), plus the Orchestrator chat that launched it when one is recorded. Opening a row SHALL show that session in a side panel next to the list, without leaving Settings → Projects, using the same Worker surface (terminal and transcript) used when a Worker is opened from a chat. The launching chat SHALL open read-only in the same panel. A project owned by another device SHALL show no Worker sessions.
+The detail of a local project SHALL offer a Worker sessions tab, laid out like Settings → Archived sessions, listing every Worker session launched in any of the project's checkouts (live and archived), most recent activity first. Each row SHALL show the Worker's agent mark (the runtime icon the Workers sidebar uses), title, runtime, the model it ran on when reported, status, last activity and checkout (branch or principal), plus the name of the Orchestrator chat that launched it when one is recorded. Opening a row SHALL show that Worker's own session in a side panel next to the list, without leaving Settings → Projects, using the same Worker surface (terminal and transcript) used when a Worker is opened from a chat. This tab SHALL NOT open the Orchestrator chat's transcript: the launching chat is named in the row and opens from the Orchestrator sessions tab. A project owned by another device SHALL show no Worker sessions.
 
 #### Scenario: Worker sessions of principal and worktrees
 - Test: unit — session rows built from a project with a principal and a linked worktree with Worker sessions, plus sessions of another project.
@@ -141,9 +141,16 @@ The detail of a local project SHALL offer a Sessions tab, laid out like Settings
 - **THEN** the side panel shows that session's recorded transcript without restarting it
 
 #### Scenario: Session launched from an Orchestrator chat
-- Test: unit — row built from a Worker parent link and activation of its chat target.
+- Test: unit — row built from a Worker parent link; activation resolves only to Worker targets.
 - **WHEN** a Worker session was launched by an Orchestrator chat
-- **THEN** its row names that chat and opening it shows the chat's transcript read-only in the side panel
+- **THEN** its row names that chat
+- **AND** opening the row shows the Worker's own terminal, never the chat's transcript
+
+#### Scenario: A row identifies the Worker that did the work
+- Test: unit — rows for a Claude and an OMP Worker carry their runtime icon and the active model.
+- **WHEN** the user opens the Sessions tab
+- **THEN** each row shows its Worker's agent icon instead of a generic terminal
+- **AND** its description names the runtime and, when reported, the model
 
 #### Scenario: A checkout that disappeared
 - Test: unit — rows for sessions of a missing checkout.
@@ -155,3 +162,39 @@ The detail of a local project SHALL offer a Sessions tab, laid out like Settings
 - Test: unit — rows for a Space owned by another device.
 - **WHEN** the user opens the Sessions tab of a project owned by another device
 - **THEN** no Worker sessions are listed
+
+### Requirement: A project lists its Orchestrator sessions
+
+The detail of a project SHALL offer an Orchestrator sessions tab beside the Worker sessions tab, laid out the same way, listing every Orchestrator chat of the project's Space (live and archived), most recent activity first. Each row SHALL show title, last activity, whether the chat is archived and how many Worker sessions it launched. Opening a row SHALL show that chat's transcript read-only in the side panel next to the list, with a way to go to the chat itself, without leaving Settings → Projects.
+
+#### Scenario: Chats of the project
+- Test: unit — chat rows built from chats of the project's Space and of another Space, with a Worker parent link.
+- **WHEN** the user opens the Orchestrator sessions tab of a project
+- **THEN** the project's chats are listed, most recent first, each with its Worker count
+- **AND** chats of other projects are absent
+
+#### Scenario: Opening an Orchestrator session
+- Test: none — native GPUI QA for the read-only transcript panel beside the list.
+- **WHEN** the user opens a chat row
+- **THEN** the side panel shows that chat's transcript read-only with a way to go to the chat
+
+### Requirement: A project lists its harness tickets
+
+The detail of a project SHALL offer a Tickets tab beside the session tabs, listing, newest first, the harness work tickets that target the project, read without modification from the Orchestrator workspace (`$ORCH_WORKSPACE`, else `~/orchestrator`, under `brain-source/projects/*/tickets/*.md`). A ticket SHALL belong to the project when its `cwd` is one of the project's checkouts or lies inside one, or, only when its `cwd` lies in no registered project, when its harness project folder names the project (case, common accents and separators ignored). Each row SHALL show the status as a colored mark, the title, where the ticket stands (next step, else the first claim still not proven, else its linked changes), its age and how many OpenSpec changes are linked. Opening a row SHALL show, beside a narrowed list, the ticket's title, a proof checklist (proven and resolved claims checked, open claims unchecked) and its markdown body rendered as in chat, plus a properties rail with status, creation time, checkout, Workers, the three proof axes, the gate and the linked OpenSpec changes. A change SHALL be linked only by evidence on disk — the ticket's recorded commit range touched it, the Worker brief lists it in `refs:`, the ticket names its path, one of its files cites the ticket id, or its name is the ticket id's slug — and each link SHALL name its evidence; the harness records no explicit link, so a ticket without such evidence SHALL show none rather than a guess. Each linked change SHALL show whether it is active or archived, its task progress, its capabilities and the first paragraph of its proposal's Why, and SHALL reveal its folder when clicked. Loading and linking SHALL run off the page load, so the rest of Settings → Projects never waits for tickets. A missing workspace or unreadable ticket SHALL yield no rows, never an error for the page. Tickets are not moved or rewritten by this tab.
+
+#### Scenario: Tickets of the project
+- Test: unit — ticket frontmatter parsing, loading from harness project folders, path-boundary checkout matching and display-name matching.
+- **WHEN** the user opens the Tickets tab of a project with tickets in the Orchestrator workspace
+- **THEN** the tickets whose `cwd` is one of its checkouts, or whose `cwd` is in no registered project and whose harness folder names it, are listed newest first
+- **AND** tickets of other projects are absent
+
+#### Scenario: Opening a ticket
+- Test: unit — resolved-claim and creation-time helpers; none — native GPUI QA for the detail, rendered body and properties rail.
+- **WHEN** the user opens a ticket row
+- **THEN** the detail shows its proof checklist and rendered body, and the rail shows status, creation, checkout, Workers, proof axes, gate and linked specs
+
+#### Scenario: Specs linked by evidence only
+- Test: unit — a change listed in the brief, a change citing the ticket id and a change named after the slug are linked with their evidence and progress; an unrelated change is not.
+- **WHEN** a ticket's commits, brief, text, a change's citation or its slug tie it to OpenSpec changes
+- **THEN** exactly those changes are listed, each naming its evidence, state, task progress and capabilities
+- **AND** a ticket with no such evidence lists no change

@@ -24,8 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use zeron_rpc::methods;
+use zeron_workers_unpeel::project_activity::{self, ProjectEntry};
 use zeron_workers_unpeel::project_git::{self, ProjectGitStatus, Visibility};
 use zeron_workers_unpeel::project_ledger;
+use zeron_workers_unpeel::project_tickets::{self, Ticket};
 use zeron_workers_unpeel::worktree_config::{self, ConfigTarget, WorktreeConfig};
 use zeron_workers_unpeel::{
     AnchorCommit, LocalWorkersClient, ProjectRow, RepositoryIdentity, WorkerParentLink,
@@ -33,7 +35,7 @@ use zeron_workers_unpeel::{
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::settings::project_catalog::{self, ProjectEntry, SessionPanelTarget, SessionRow};
+use crate::settings::project_catalog::{self, ChatSessionRow, SessionPanelTarget, SessionRow};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::{Theme, ink};
@@ -404,7 +406,13 @@ enum ProjectKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailTab {
     General,
+    /// Worker sessions of every checkout: their own terminals only.
     Sessions,
+    /// The project's Orchestrator chats, opened read-only beside the list.
+    Orchestrator,
+    /// Harness tickets that target the project, read from the Orchestrator
+    /// workspace (`project_tickets`).
+    Tickets,
 }
 
 /// The session opened beside the Sessions list, reusing the surfaces the
@@ -419,6 +427,12 @@ enum SessionPanel {
         chat_id: String,
         title: SharedString,
         transcript: Entity<Transcript>,
+    },
+    /// A harness ticket, read-only: its fields, spec links and markdown body,
+    /// parsed once when opened.
+    Ticket {
+        ticket: Box<Ticket>,
+        body: crate::markdown::BlockTree,
     },
 }
 
@@ -438,6 +452,10 @@ pub struct ProjectsPage {
     /// Sessions tab.
     workers: Vec<WorkersSession>,
     parent_links: Vec<WorkerParentLink>,
+    /// Harness tickets of every project, for the Tickets tab.
+    tickets: Vec<Ticket>,
+    tickets_loaded: bool,
+    tickets_task: Option<Task<()>>,
     selected_project: Option<ProjectKey>,
     /// Path canônico do checkout selecionado — id não serve: uma linha só do
     /// ledger não tem id.
@@ -521,6 +539,9 @@ impl ProjectsPage {
             repositories: Vec::new(),
             workers: Vec::new(),
             parent_links: Vec::new(),
+            tickets: Vec::new(),
+            tickets_loaded: false,
+            tickets_task: None,
             selected_project: None,
             selected: None,
             tab: DetailTab::General,
@@ -552,6 +573,7 @@ impl ProjectsPage {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.load_tickets(cx);
         self.loading = true;
         let client = self.client.clone();
         self.load_task = Some(cx.spawn(async move |this, cx| {
@@ -564,24 +586,20 @@ impl ProjectsPage {
                     // failed probe remains visible as a row; it never erases
                     // the ledger or changes the selected cwd.
                     let reconciliation_error = client.reconcile_project_identity().err();
-                    let rows = client.projects_with_ledger()?;
-                    let identity = client.project_identity_registry()?;
-                    let rows = project_ledger::decorate_with_identity(rows, &identity);
+                    let (rows, identity) = project_activity::checkout_rows(&client)?;
                     let repositories = identity.repositories.clone();
                     // Sessions tab: live sessions plus every checkout's
                     // archived ones. Missing history is an empty tab, never an
-                    // error for the whole page.
-                    let mut workers = client
-                        .bootstrap()
-                        .map(|bootstrap| bootstrap.sessions)
-                        .unwrap_or_default();
-                    for project_id in rows.iter().filter_map(|row| row.project_id.as_deref()) {
-                        for session in client.archived_sessions(project_id).unwrap_or_default() {
-                            if !workers.iter().any(|known| known.id == session.id) {
-                                workers.push(session);
-                            }
-                        }
-                    }
+                    // error for the whole page; a checkout whose archive
+                    // cannot be read adds no archived sessions.
+                    let (workers, _) = project_activity::with_archived_sessions(
+                        &client,
+                        client
+                            .bootstrap()
+                            .map(|bootstrap| bootstrap.sessions)
+                            .unwrap_or_default(),
+                        &rows,
+                    );
                     let parent_links =
                         zeron_workers_unpeel::worker_parent_links().unwrap_or_default();
                     let icons = rows
@@ -623,11 +641,33 @@ impl ProjectsPage {
         }));
     }
 
+    /// Tickets tab: read apart from the page load — linking their specs runs
+    /// git and reads every OpenSpec tree, and the rest of the page must not
+    /// wait for it. A missing Orchestrator workspace is an empty tab.
+    fn load_tickets(&mut self, cx: &mut Context<Self>) {
+        self.tickets_task = Some(cx.spawn(async move |this, cx| {
+            let tickets = cx
+                .background_executor()
+                .spawn(async move {
+                    project_tickets::orchestrator_workspace()
+                        .and_then(|workspace| project_tickets::load_tickets(&workspace).ok())
+                        .unwrap_or_default()
+                })
+                .await;
+            this.update(cx, |page, cx| {
+                page.tickets = tickets;
+                page.tickets_loaded = true;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// The registry's projects joined with this device's checkout history,
     /// and the checkouts linked to no project.
     fn catalog(&self, cx: &gpui::App) -> (Vec<ProjectEntry>, Vec<ProjectRow>) {
         let state = self.state.read(cx);
-        project_catalog::project_entries(
+        project_activity::project_entries(
             &state.spaces,
             &state.devices,
             state.local_device_id.as_deref(),
@@ -1218,6 +1258,27 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// A ticket's status as mark, color and label: open waits, closed-out is
+/// delivered and awaits acceptance, accepted and rejected are final.
+fn ticket_status(theme: &Theme, status: &str) -> (&'static str, gpui::Hsla, &'static str) {
+    match status {
+        "open" => (crate::icons::CLOCK_CIRCLE, theme.warning, "Open"),
+        "closed-out" => (crate::icons::QUEUE_CHECK, theme.accent, "Closed out"),
+        "accepted" => (crate::icons::CHECK, theme.success, "Accepted"),
+        "rejected" => (crate::icons::CLOSE_CIRCLE, theme.danger, "Rejected"),
+        _ => (crate::icons::DOCUMENT, theme.text_muted, "Unknown"),
+    }
+}
+
+/// Small muted heading of a ticket section.
+fn section_label(theme: &Theme, text: &'static str) -> gpui::Div {
+    div()
+        .text_size(crate::typography::ui_rems(11.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.text_muted)
+        .child(text)
+}
+
 /// Rows per page, as in Settings → Archived sessions.
 const SESSIONS_PAGE_SIZE: usize = 40;
 
@@ -1276,7 +1337,7 @@ fn worker_surface(
 }
 
 impl Render for ProjectsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
         let query = self.search.read(cx).text().to_owned();
         if self.selected_project.is_none() {
@@ -1304,7 +1365,7 @@ impl Render for ProjectsPage {
             .size_full()
             .overflow_hidden()
             .child(self.render_list(&theme, &visible, &pending_visible, now_ms, cx))
-            .child(self.render_detail(&theme, now_ms, cx))
+            .child(self.render_detail(&theme, now_ms, window, cx))
     }
 }
 
@@ -1534,7 +1595,13 @@ fn project_subtitle(entry: &ProjectEntry, now_ms: u64) -> String {
 }
 
 impl ProjectsPage {
-    fn render_detail(&mut self, theme: &Theme, now_ms: u64, cx: &mut Context<Self>) -> AnyElement {
+    fn render_detail(
+        &mut self,
+        theme: &Theme,
+        now_ms: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let entry = self.selected_entry(cx);
         let placeholder = |text: &'static str| {
             div()
@@ -1562,8 +1629,8 @@ impl ProjectsPage {
                 _ => placeholder("Select a project to view its settings"),
             };
         };
-        if self.tab == DetailTab::Sessions {
-            return self.render_sessions(theme, &entry, now_ms, cx);
+        if self.tab != DetailTab::General {
+            return self.render_sessions(theme, &entry, now_ms, window, cx);
         }
         let row = self.selected_row().cloned().filter(|row| {
             entry
@@ -1639,7 +1706,12 @@ impl ProjectsPage {
                 .when(active, |el| el.bg(crate::theme::glass_selected_bg()))
                 .hover(|s| s.bg(theme.glass_hover()))
                 .on_click(cx.listener(move |page, _, _, cx| {
-                    page.tab = value;
+                    if page.tab != value {
+                        page.tab = value;
+                        page.sessions_page = 0;
+                        page.selected_session = None;
+                        page.close_session_panel(cx);
+                    }
                     cx.notify();
                 }))
                 .child(label)
@@ -1650,7 +1722,14 @@ impl ProjectsPage {
             .gap(px(4.0))
             .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(tab("General", DetailTab::General, self, cx))
-            .child(tab("Sessions", DetailTab::Sessions, self, cx))
+            .child(tab("Worker sessions", DetailTab::Sessions, self, cx))
+            .child(tab(
+                "Orchestrator sessions",
+                DetailTab::Orchestrator,
+                self,
+                cx,
+            ))
+            .child(tab("Tickets", DetailTab::Tickets, self, cx))
             .into_any_element()
     }
 
@@ -1766,6 +1845,11 @@ impl ProjectsPage {
         project_catalog::session_rows(entry, &state.chats, &self.workers, &self.parent_links)
     }
 
+    fn chat_rows(&self, entry: &ProjectEntry, cx: &gpui::App) -> Vec<ChatSessionRow> {
+        let state = self.state.read(cx);
+        project_catalog::chat_rows(entry, &state.chats, &self.parent_links)
+    }
+
     /// Open `target` in the side panel beside the list. Nothing here launches
     /// or restarts a Worker: a stopped, archived or checkout-less session is
     /// attached read-only and replays its recorded output.
@@ -1817,29 +1901,99 @@ impl ProjectsPage {
         cx.notify();
     }
 
-    /// The Workers counterpart of Settings → Archived sessions: the same
-    /// header, rows and pagination, listing the project's Worker sessions;
-    /// "Open" shows one in the panel beside the list.
+    /// The Workers and Orchestrator counterparts of Settings → Archived
+    /// sessions: the same header, rows and pagination, listing either the
+    /// project's Worker sessions or its Orchestrator chats; "Open" shows one
+    /// in the panel beside the list.
     fn render_sessions(
         &mut self,
         theme: &Theme,
         entry: &ProjectEntry,
         _now_ms: u64,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows = self.session_rows(entry, cx);
-        let count = rows.len();
+        let tab = self.tab;
+        let worker_rows = if tab == DetailTab::Sessions {
+            self.session_rows(entry, cx)
+        } else {
+            Vec::new()
+        };
+        let chat_rows = if tab == DetailTab::Orchestrator {
+            self.chat_rows(entry, cx)
+        } else {
+            Vec::new()
+        };
+        let ticket_rows: Vec<Ticket> = if tab == DetailTab::Tickets {
+            project_tickets::tickets_for_project(entry, &self.catalog(cx).0, &self.tickets)
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let count = match tab {
+            DetailTab::Orchestrator => chat_rows.len(),
+            DetailTab::Tickets => ticket_rows.len(),
+            _ => worker_rows.len(),
+        };
         let page = self
             .sessions_page
             .min(count.saturating_sub(1) / SESSIONS_PAGE_SIZE);
         self.sessions_page = page;
-        let items: Vec<AnyElement> = rows
-            .iter()
-            .enumerate()
-            .skip(page * SESSIONS_PAGE_SIZE)
-            .take(SESSIONS_PAGE_SIZE)
-            .map(|(ix, row)| self.render_session_row(theme, ix, row, cx))
-            .collect();
+        let items: Vec<AnyElement> = match tab {
+            DetailTab::Orchestrator => chat_rows
+                .iter()
+                .enumerate()
+                .skip(page * SESSIONS_PAGE_SIZE)
+                .take(SESSIONS_PAGE_SIZE)
+                .map(|(ix, row)| self.render_chat_row(theme, ix, row, cx))
+                .collect(),
+            DetailTab::Tickets => ticket_rows
+                .iter()
+                .enumerate()
+                .skip(page * SESSIONS_PAGE_SIZE)
+                .take(SESSIONS_PAGE_SIZE)
+                .map(|(ix, row)| self.render_ticket_row(theme, ix, row, cx))
+                .collect(),
+            _ => worker_rows
+                .iter()
+                .enumerate()
+                .skip(page * SESSIONS_PAGE_SIZE)
+                .take(SESSIONS_PAGE_SIZE)
+                .map(|(ix, row)| self.render_session_row(theme, ix, row, cx))
+                .collect(),
+        };
+        let (heading, subtitle, empty, empty_hint) = if tab == DetailTab::Orchestrator {
+            (
+                "Orchestrator sessions",
+                "Every Orchestrator chat of this project, live and archived.",
+                "No Orchestrator sessions",
+                "Chats opened in this project show up here.",
+            )
+        } else if tab == DetailTab::Tickets {
+            (
+                "Tickets",
+                "Harness tickets that target this project, read from the Orchestrator workspace.",
+                if self.tickets_loaded {
+                    "No tickets"
+                } else {
+                    "Loading tickets…"
+                },
+                "Tickets created by work-ticket for this project show up here.",
+            )
+        } else {
+            (
+                "Worker sessions",
+                "Every Worker of this project and its worktrees, live and archived.",
+                "No Worker sessions",
+                if entry.space.local {
+                    "Workers launched in this project or its worktrees show up here."
+                } else {
+                    "Worker sessions live on the device that owns this project."
+                },
+            )
+        };
         let body = if items.is_empty() {
             div()
                 .mt(px(96.0))
@@ -1857,17 +2011,13 @@ impl ProjectsPage {
                     div()
                         .mt(px(12.0))
                         .text_size(crate::typography::ui_rems(14.0))
-                        .child(SharedString::from("No Worker sessions")),
+                        .child(SharedString::from(empty)),
                 )
                 .child(
                     div()
                         .mt(px(4.0))
                         .text_size(crate::typography::ui_rems(12.0))
-                        .child(SharedString::from(if entry.space.local {
-                            "Workers launched in this project or its worktrees show up here."
-                        } else {
-                            "Worker sessions live on the device that owns this project."
-                        })),
+                        .child(SharedString::from(empty_hint)),
                 )
                 .into_any_element()
         } else {
@@ -1922,12 +2072,16 @@ impl ProjectsPage {
                         .child("Next"),
                 )
         });
+        // An open ticket takes the room of a detail view plus its rail; the
+        // list narrows to an index beside it.
+        let ticket_open = matches!(self.session_panel, Some(SessionPanel::Ticket { .. }));
         let list = div()
             .id(SharedString::from(format!(
                 "project-sessions-{}",
                 entry.space.id
             )))
-            .flex_1()
+            .when(ticket_open, |el| el.flex_none().w(px(380.0)))
+            .when(!ticket_open, |el| el.flex_1())
             .min_w(px(320.0))
             .h_full()
             .overflow_y_scroll()
@@ -1936,13 +2090,10 @@ impl ProjectsPage {
                     .child(self.render_tabs(theme, cx))
                     .child(widgets::page_header(
                         theme,
-                        "Worker sessions",
+                        heading,
                         (count > 0).then_some(count),
                     ))
-                    .child(widgets::page_subtitle(
-                        theme,
-                        "Every Worker of this project and its worktrees, live and archived.",
-                    ))
+                    .child(widgets::page_subtitle(theme, subtitle))
                     .child(self.render_messages(theme, None))
                     .child(body)
                     .children(pagination),
@@ -1954,15 +2105,16 @@ impl ProjectsPage {
             .flex()
             .flex_row()
             .child(list)
-            .when_some(self.render_session_panel(theme, cx), |el, panel| {
+            .when_some(self.render_session_panel(theme, window, cx), |el, panel| {
                 el.child(panel)
             })
             .into_any_element()
     }
 
-    /// Settings → Archived sessions row: status tile, medium title + time,
-    /// quiet meta line (checkout · runtime · status · launching chat), and
-    /// the row action on the right.
+    /// Settings → Archived sessions row: the Worker's agent mark, medium
+    /// title + time, quiet meta line (agent · model · checkout · status ·
+    /// launching chat), and the Worker action on the right. The launching
+    /// chat is only named here; it opens from the Orchestrator sessions tab.
     fn render_session_row(
         &mut self,
         theme: &Theme,
@@ -1981,15 +2133,13 @@ impl ProjectsPage {
                 .map(|at| crate::state::format_time_ago(at, Utc::now()))
                 .unwrap_or_default()
                 .into();
-        let mut meta = vec![
-            worker.checkout.clone(),
-            row.runtime.clone(),
-            row.status.clone(),
-        ];
+        let mut meta = vec![row.runtime.clone()];
+        meta.extend(row.model.clone());
+        meta.push(worker.checkout.clone());
+        meta.push(row.status.clone());
         if let Some((_, chat_title)) = &worker.parent_chat {
             meta.push(format!("from {chat_title}"));
         }
-        let parent = worker.parent_chat.clone();
         let open_key = key.clone();
         let open_title = title.clone();
         div()
@@ -2014,13 +2164,9 @@ impl ProjectsPage {
                     .items_center()
                     .justify_center()
                     .child(
-                        crate::icons::icon(if worker.archived {
-                            crate::icons::ARCHIVE_MINIMALISTIC
-                        } else {
-                            crate::icons::TERMINAL
-                        })
-                        .size(px(16.0))
-                        .text_color(theme.text_muted.opacity(0.6)),
+                        crate::icons::icon(row.runtime_icon)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
                     ),
             )
             .child(
@@ -2062,24 +2208,6 @@ impl ProjectsPage {
                             .child(SharedString::from(meta.join(" · "))),
                     ),
             )
-            .when_some(parent, |el, (chat_id, chat_title)| {
-                el.child(session_row_action(
-                    theme,
-                    ("project-session-parent", ix),
-                    crate::icons::CHAT_ROUND_LINE,
-                    "Chat",
-                    cx.listener(move |page, _, _, cx| {
-                        page.open_session(
-                            chat_id.clone(),
-                            SessionPanelTarget::Chat {
-                                chat_id: chat_id.clone(),
-                            },
-                            chat_title.clone(),
-                            cx,
-                        )
-                    }),
-                ))
-            })
             .child(session_row_action(
                 theme,
                 ("project-session-open", ix),
@@ -2092,16 +2220,654 @@ impl ProjectsPage {
             .into_any_element()
     }
 
+    /// Orchestrator sessions row: chat mark, title + time, quiet meta line
+    /// (status · Workers launched), and "Open" showing the transcript
+    /// read-only beside the list.
+    fn render_chat_row(
+        &mut self,
+        theme: &Theme,
+        ix: usize,
+        row: &ChatSessionRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.selected_session.as_deref() == Some(row.chat_id.as_str());
+        let time_ago: SharedString =
+            DateTime::<Utc>::from_timestamp_millis(row.last_activity_ms as i64)
+                .map(|at| crate::state::format_time_ago(at, Utc::now()))
+                .unwrap_or_default()
+                .into();
+        let mut meta = vec![if row.archived { "Archived" } else { "Active" }.to_owned()];
+        match row.workers {
+            0 => {}
+            1 => meta.push("1 Worker".into()),
+            workers => meta.push(format!("{workers} Workers")),
+        }
+        let chat_id = row.chat_id.clone();
+        let title = row.title.clone();
+        div()
+            .id(("project-chat-row", ix))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .rounded(px(8.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
+            .hover(|s| s.bg(ink(0.03)))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(32.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(row.title.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(time_ago),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(meta.join(" · "))),
+                    ),
+            )
+            .child(session_row_action(
+                theme,
+                ("project-chat-open", ix),
+                crate::icons::CHAT_ROUND_LINE,
+                "Open",
+                cx.listener(move |page, _, _, cx| {
+                    page.open_session(
+                        chat_id.clone(),
+                        SessionPanelTarget::Chat {
+                            chat_id: chat_id.clone(),
+                        },
+                        title.clone(),
+                        cx,
+                    )
+                }),
+            ))
+            .into_any_element()
+    }
+
+    /// Tickets row, as an issue index: status mark in its color, title, the
+    /// line that says where the ticket stands (next step, first open claim,
+    /// or its specs), and its age. The whole row opens the ticket.
+    fn render_ticket_row(
+        &mut self,
+        theme: &Theme,
+        ix: usize,
+        ticket: &Ticket,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.selected_session.as_deref() == Some(ticket.id.as_str());
+        let (icon, color, _) = ticket_status(theme, &ticket.status);
+        let open_claims: Vec<&String> = ticket
+            .not_proven
+            .iter()
+            .filter(|claim| !ticket.claim_resolved(claim))
+            .collect();
+        let context = if let Some(next) = &ticket.next {
+            format!("Next: {next}")
+        } else if let Some(claim) = open_claims.first() {
+            format!("Not proven: {claim}")
+        } else if !ticket.specs.is_empty() {
+            ticket
+                .specs
+                .iter()
+                .map(|link| link.change.as_str())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        } else {
+            ticket.id.clone()
+        };
+        let age: SharedString = ticket
+            .created_at()
+            .map(|at| crate::state::format_time_ago(at, Utc::now()))
+            .unwrap_or_default()
+            .into();
+        let open = ticket.clone();
+        div()
+            .id(("project-ticket-row", ix))
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(10.0))
+            .rounded(px(8.0))
+            .px(px(10.0))
+            .py(px(8.0))
+            .cursor_pointer()
+            .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
+            .hover(|s| s.bg(ink(0.03)))
+            .on_click(cx.listener(move |page, _, _, cx| {
+                page.close_session_panel(cx);
+                page.selected_session = Some(open.id.clone());
+                page.session_panel = Some(SessionPanel::Ticket {
+                    body: crate::markdown::parse_full(&open.body),
+                    ticket: Box::new(open.clone()),
+                });
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .pt(px(2.0))
+                    .child(crate::icons::icon(icon).size(px(15.0)).text_color(color)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(if ticket.status == "rejected" {
+                                theme.text_muted
+                            } else {
+                                theme.text
+                            })
+                            .child(SharedString::from(ticket.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(context)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(4.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child(age)
+                    .when(!ticket.specs.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(3.0))
+                                .child(
+                                    crate::icons::icon(crate::icons::CHECKLIST)
+                                        .size(px(11.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from(ticket.specs.len().to_string())),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The ticket's centre column: title, proof checklist and the markdown
+    /// body the harness wrote, rendered like a chat reply.
+    fn render_ticket_main(
+        theme: &Theme,
+        ticket: &Ticket,
+        body: &crate::markdown::BlockTree,
+        window: &Window,
+    ) -> AnyElement {
+        let mut claims: Vec<(bool, String, bool)> = ticket
+            .proven
+            .iter()
+            .map(|claim| (true, claim.clone(), false))
+            .collect();
+        claims.extend(ticket.not_proven.iter().map(|claim| {
+            let resolved = ticket.claim_resolved(claim);
+            (resolved, claim.clone(), resolved)
+        }));
+        let checklist = (!claims.is_empty()).then(|| {
+            div()
+                .mt(px(18.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(section_label(theme, "Proof"))
+                .children(claims.into_iter().map(|(done, claim, resolved)| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .mt(px(2.0))
+                                .size(px(14.0))
+                                .rounded(px(4.0))
+                                .border_1()
+                                .border_color(if done { theme.success } else { theme.border })
+                                .when(done, |el| el.bg(theme.success.opacity(0.18)))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(done, |el| {
+                                    el.child(
+                                        crate::icons::icon(crate::icons::CHECK)
+                                            .size(px(10.0))
+                                            .text_color(theme.success),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(crate::typography::ui_rems(12.5))
+                                .text_color(if done { theme.text } else { theme.text_muted })
+                                .child(SharedString::from(if resolved {
+                                    format!("{claim} (resolved)")
+                                } else {
+                                    claim
+                                })),
+                        )
+                }))
+        });
+        let opts = crate::markdown::render::RenderOptions::settled(SharedString::from(format!(
+            "ticket-{}",
+            ticket.id
+        )));
+        div()
+            .id("project-ticket-main")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_y_scroll()
+            .px(px(24.0))
+            .py(px(18.0))
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(20.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from(ticket.title.clone())),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(ticket.id.clone())),
+            )
+            .children(checklist)
+            .child(
+                div()
+                    .mt(px(20.0))
+                    .pt(px(16.0))
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(crate::markdown::render::render_tree(
+                        body,
+                        &opts,
+                        theme,
+                        window,
+                        &|_| None,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// The ticket's properties rail: state, where it runs, who worked it,
+    /// its proof axes and gate, and the OpenSpec changes linked by evidence.
+    fn render_ticket_rail(theme: &Theme, ticket: &Ticket, cx: &mut Context<Self>) -> AnyElement {
+        let (icon, color, label) = ticket_status(theme, &ticket.status);
+        let row = |icon: &'static str, color: gpui::Hsla, text: String| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .min_w_0()
+                .text_size(crate::typography::ui_rems(12.5))
+                .text_color(theme.text)
+                .child(
+                    crate::icons::icon(icon)
+                        .flex_none()
+                        .size(px(14.0))
+                        .text_color(color),
+                )
+                .child(div().min_w_0().truncate().child(SharedString::from(text)))
+        };
+        let checkout = Path::new(&ticket.cwd)
+            .components()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let created = ticket
+            .created_at()
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| ticket.created.clone());
+        let axes = ["code", "review", "reality"].map(|axis| {
+            let tool = ticket.axes.iter().find_map(|entry| {
+                let (name, rest) = entry.split_once(':')?;
+                (name == axis).then(|| rest.split('=').next().unwrap_or(rest).to_owned())
+            });
+            (axis, tool)
+        });
+        let specs: Vec<AnyElement> = ticket
+            .specs
+            .iter()
+            .enumerate()
+            .map(|(ix, link)| Self::render_spec_card(theme, ix, link, cx))
+            .collect();
+        div()
+            .id("project-ticket-rail")
+            .flex_none()
+            .w(px(280.0))
+            .h_full()
+            .overflow_y_scroll()
+            .border_l_1()
+            .border_color(theme.border)
+            .px(px(16.0))
+            .py(px(18.0))
+            .flex()
+            .flex_col()
+            .gap(px(18.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(section_label(theme, "Properties"))
+                    .child(row(icon, color, label.to_owned()))
+                    .child(row(crate::icons::CLOCK_CIRCLE, theme.text_muted, created))
+                    .child(row(crate::icons::FOLDER, theme.text_muted, checkout)),
+            )
+            .when(!ticket.workers.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(section_label(theme, "Workers"))
+                        .children(ticket.workers.iter().map(|worker| {
+                            row(
+                                crate::icons::WORKER_GENERIC_AGENT,
+                                theme.text_muted,
+                                worker.clone(),
+                            )
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(section_label(theme, "Proof axes"))
+                    .children(axes.into_iter().map(|(axis, tool)| match tool {
+                        Some(tool) => row(crate::icons::CHECK, theme.success, format!("{axis} · {tool}")),
+                        None => row(crate::icons::CLOCK_CIRCLE, theme.text_muted, format!("{axis} · pending")),
+                    })),
+            )
+            .when(!ticket.gate.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(section_label(theme, "Gate"))
+                        .child(
+                            div()
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .p(px(8.0))
+                                .font_family(theme.font_mono.clone())
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(ticket.gate.clone())),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(section_label(theme, "Specs"))
+                    .when(specs.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(
+                                    "No OpenSpec change linked. The harness records none for this ticket, and no commit, brief or citation ties one to it.",
+                                ),
+                        )
+                    })
+                    .children(specs),
+            )
+            .into_any_element()
+    }
+
+    /// One linked change: name, active/archived, task progress, the
+    /// capabilities it specifies, why it exists, and the evidence that links
+    /// it. Clicking reveals the change folder.
+    fn render_spec_card(
+        theme: &Theme,
+        ix: usize,
+        link: &project_tickets::SpecLink,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = link.path.clone();
+        let progress = if link.tasks_total == 0 {
+            0.0
+        } else {
+            link.tasks_done as f32 / link.tasks_total as f32
+        };
+        let complete = link.tasks_total > 0 && link.tasks_done == link.tasks_total;
+        let sources = link
+            .sources
+            .iter()
+            .map(|source| source.label())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        div()
+            .id(("project-ticket-spec", ix))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.border)
+            .p(px(10.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(ink(0.03)))
+            .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&path)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        crate::icons::icon(crate::icons::CHECKLIST)
+                            .flex_none()
+                            .size(px(13.0))
+                            .text_color(if complete {
+                                theme.success
+                            } else {
+                                theme.accent
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(link.change.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(6.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(crate::typography::ui_rems(10.0))
+                            .text_color(theme.text_muted)
+                            .child(if link.archived { "Archived" } else { "Active" }),
+                    ),
+            )
+            .when(link.tasks_total > 0, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(4.0))
+                                .rounded(px(2.0))
+                                .bg(ink(0.08))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded(px(2.0))
+                                        .w(gpui::relative(progress))
+                                        .bg(if complete {
+                                            theme.success
+                                        } else {
+                                            theme.accent
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(format!(
+                                    "{}/{} tasks",
+                                    link.tasks_done, link.tasks_total
+                                ))),
+                        ),
+                )
+            })
+            .when(!link.capabilities.is_empty(), |el| {
+                el.child(div().flex().flex_row().flex_wrap().gap(px(4.0)).children(
+                    link.capabilities.iter().map(|capability| {
+                        div()
+                            .px(px(6.0))
+                            .rounded(px(10.0))
+                            .bg(ink(0.05))
+                            .text_size(crate::typography::ui_rems(10.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(capability.clone()))
+                    }),
+                ))
+            })
+            .children(link.why.clone().map(|why| {
+                div()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(why))
+            }))
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(10.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(SharedString::from(format!("via {sources}"))),
+            )
+            .into_any_element()
+    }
+
     fn render_session_panel(
         &mut self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let panel = self.session_panel.as_ref()?;
+        let mut ticket_file = None;
         let (title, body, go_to_chat) = match panel {
             SessionPanel::Worker {
                 title, terminal, ..
             } => (title.clone(), terminal.clone().into_any_element(), None),
+            SessionPanel::Ticket { ticket, body } => {
+                ticket_file = Some(ticket.path.clone());
+                let ticket = ticket.clone();
+                let main = Self::render_ticket_main(theme, &ticket, body, window);
+                let rail = Self::render_ticket_rail(theme, &ticket, cx);
+                (
+                    SharedString::from(ticket.id.clone()),
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .child(main)
+                        .child(rail)
+                        .into_any_element(),
+                    None,
+                )
+            }
             SessionPanel::Chat {
                 chat_id,
                 title,
@@ -2142,6 +2908,13 @@ impl ProjectsPage {
                                 .text_color(theme.text)
                                 .child(title),
                         )
+                        .when_some(ticket_file, |el, path| {
+                            el.child(action_button(
+                                theme,
+                                "Show file",
+                                cx.listener(move |_, _, _, cx| cx.reveal_path(&path)),
+                            ))
+                        })
                         .when_some(go_to_chat, |el, chat_id| {
                             el.child(action_button(
                                 theme,

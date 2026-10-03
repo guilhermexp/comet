@@ -110,7 +110,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - **Histórico de Worker é decodificado no grid em que foi desenhado.** Com o diário `pty-geometry.jsonl` do host (ou a estimativa legada pela régua `─`), o catch-up segue as marcas em `feed_at_recorded_geometry`: redraw diferencial (Claude Code, pi, codex) só é fiel no grid original, e o grid do painel só vale depois do histórico. Worker parado com marcas mantém a largura gravada (`frozen_cols`); painel mais estreito rola na horizontal (`first_col`), sem refluir. Contrato em `openspec/changes/replay-worker-history-at-recorded-geometry/`.
 - **Histórico de Worker encerrado é uma projeção de leitura.** Sem marcas, durante a recuperação, decodificar com o teto de 300 colunas do host evita cortar texto de TUIs com autowrap desligado na primeira abertura estreita. Ao completar, promover a tela alternativa visível para uma grade primária com scrollback e reflow; só então ajustar à largura do painel. Não alterar modos de Workers vivos nem expor a grade intermediária. Quebras e bordas desenhadas explicitamente pela TUI continuam sendo conteúdo histórico, sem recomposição semântica.
 - **A primeira grade do Worker só é publicada depois do histórico de abertura.** `HistoricalReplay` termina no `output_offset` capturado na abertura; tempo, quantidade de chunks e erro de transporte não liberam uma grade parcial. `active_grid_snapshot` retorna `None` durante a recuperação: cobrir o terminal não basta, pois o fundo Glass é translúcido. O elemento continua montado para medir a geometria, mas grade, scrollbar e jump ficam indisponíveis até completar. Leituras com backlog não usam espera de live nem pausa de background; leitura vazia e falha mantêm cadência/backoff sem busy loop, e falha pede novo snapshot com erro visível. Histórico, cursor de bytes e posição de terminais já carregados continuam retidos.
-- O `NSStatusItem` da menu bar (`workers/menu_bar.rs`, ObjC via `msg_send!`, fora da janela gpui) mostra **spinner + contagem de agentes rodando** nos dois estados `Working`. A contagem é **anotação, não segundo símbolo**: 11pt contra os 15pt do spinner, separada por espaço fino, e **na mesma cor dele**. O tamanho é a única pista de hierarquia — sem tint nenhum atributo de cor é aplicado, então os dois herdam a cor adaptativa do botão, inclusive a inversão quando o popover realça o item. Um `secondaryLabelColor` na contagem já foi tentado e reprovado na tela: cinza demais para ler na menu bar, e cor cravada ainda desliga aquela inversão. Por isso `activity_menu::spinner_parts` devolve glifo e contagem **separados**: o range em UTF-16 sai daí, não de fatiar string pronta. A contagem viaja dentro da variante `Working { blocked, running }` de propósito: um contador paralelo sobreviveria ao estado que o justifica e pintaria número numa menu bar parada. `running` é `jobs.len()`, **não** o total de sessões — bloqueado e não-lido aparecem no popover mas não estão rodando. `Blocked`/`Unread` seguem com marcador fixo sem contagem, e as linhas do popover seguem com frame puro (cada uma é uma sessão só).
+- O `NSStatusItem` da menu bar (`workers/menu_bar.rs`, ObjC via `msg_send!`, fora da janela gpui) mostra **spinner + contagem de agentes rodando** nos dois estados `Working`. A contagem é **anotação, não segundo símbolo**: 11pt contra os 15pt do spinner, separada por espaço fino, e **na mesma cor dele**. O tamanho é a única pista de hierarquia — sem tint nenhum atributo de cor é aplicado, então os dois herdam a cor adaptativa do botão, inclusive a inversão quando o popover realça o item. Um `secondaryLabelColor` na contagem já foi tentado e reprovado na tela: cinza demais para ler na menu bar, e cor cravada ainda desliga aquela inversão. Por isso `activity_menu::spinner_parts` devolve glifo e contagem **separados**: o range em UTF-16 sai daí, não de fatiar string pronta. A contagem viaja dentro da variante `Working { blocked, running }` de propósito: um contador paralelo sobreviveria ao estado que o justifica e pintaria número numa menu bar parada. `running` é `jobs.len()`, **não** o total de sessões — bloqueado e não-lido aparecem no popover mas não estão rodando. `Blocked`/`Unread` seguem com marcador fixo sem contagem, e as linhas do popover seguem com frame puro (cada uma é uma sessão só). Abrir/fechar o popover (`post_popover_op`) roda na main queue via `dispatch_async_f`, nunca dentro do `update` do loop de intents: a troca de janela-chave faz o AppKit pedir frame à janela principal **sincronamente**, e dentro do borrow isso era o par de `RefCell already borrowed` (`gpui::window`) ao escolher uma sessão pela menu bar.
 - Resize de terminal de worker **desiste depois de `MAX_RESIZE_RETRIES` falhas no mesmo tamanho**. O ciclo era fechado — falha → `resize_retry_blocked` → timer de 500ms → desbloqueia + `notify` → repaint → prepaint → `on_grid_metrics` → falha — e contra `409: session has exited` nunca converge: o log enchia a ~520ms por volta enquanto a aba estivesse visível. O teto conta por **tamanho**, não pela vida do terminal: `dimensions_changed` zera a contagem, senão uma sessão morta calaria o resize daquela sessão para sempre.
 - **`session has exited` não é falha de transporte, e não vai pro banner.** O host responde `409: session has exited` a QUALQUER request contra sessão morta (write, resize, poll), então o encerramento normal de um Worker pintava `Worker terminal disconnected: …` em vermelho sobre a grade — segundo aviso, em tom de erro, de um fato que o rodapé da própria surface já dá. `is_expected_session_exit` classifica e o filtro mora no render, num seam só, porque `error` e `resize_error` chegam de produtores diferentes. Host fora, socket recusado, status não-409: continuam aparecendo. Isso não mexe no teto de retry de resize (bullet acima) nem no log.
 - **Toda mutação de sessão entra numa fila; nenhuma é descartada.** `WorkersModel::run_action` tinha `if self.action_task.is_some() { return; }` — um mutex de um slot que engolia o comando **sem erro, sem log**. E selecionar sessão não-lida dispara `mark_read` sozinho, então a sequência real (clicar na linha do dot azul e mandar arquivar/parar/renomear) perdia o segundo comando. Agora é `ActionQueue` FIFO: enfileira quando há ação em voo, **continua drenando depois de falha** (comando do usuário não morre porque o anterior falhou) e coalesce um `refresh` só no fim da drenagem. A fila específica de remoção (`pending_remove`, `dispatch_or_queue_remove`) existia só pra contornar aquela guarda e foi **removida** — ela também sobrescrevia o pedido anterior quando duas remoções chegavam juntas. Não reintroduzir guarda de slot único: se precisar serializar por sessão, serialize por chave, não descartando.
@@ -218,10 +218,15 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - **Worked Projects no card Workspace é uma projeção pura do transcript**: `details_sidebar/worked_projects.rs` deriva somente de `&[SessionMessageEntry]`, `&[WorkersProject]`, do checkout do chat e de `home_dir`. Casamento filtra grupos organizacionais (`!is_group`), calcula Leaf Roots sobre todos os projetos registrados antes de excluir o own checkout, ignora caminhos relativos, expande `~/` com home dir e respeita fronteira de componente (`/a/kanna` não casa raiz `/a/kanwas`). O bloco só aparece em `DetailsMode::Orchestrator` com contagem > 0, empilha sem gap vertical e o resultado é memoizado em `DetailsSidebarState` por (context key, transcript length, total de parts, fingerprint de projetos). O total de parts não é redundante: `TranscriptFrame::Delta` faz upsert da MESMA entry por id, então `transcript.len()` não muda enquanto uma nova part `ReadFile`/`Exec` entra — sem essa dimensão o card congela pelo turno inteiro.
 - **Chat Trajectory Preview (`trajectory/`) é surface de inspeção analítica e técnica no pane direito**: `TrajectoryView` é dona do próprio watch task (`subscribe_checked`) e retoma histórico/live por watermark (`TrajectoryCursor`); estados terminais (`ChatDeleted`, `StoreUnavailable`) selam o stream e impedem reabertura. `AppState` apenas expõe o handle da engine para emissão de RPCs (`WatchTrajectory`, `RevealTrajectoryRaw`) e nunca retém estado de surface fechada. Raw Reveal (`RevealState`) é estritamente efêmero no dispositivo local e nunca persiste nem sincroniza; troca de seleção ou fechamento limpa o estado. `ROW_HEIGHT` no ledger é fixo (`px(26.0)`) e nenhum estado altera a altura da linha. Dado ausente renderiza como `Unavailable` ou `Unsettled`, nunca como zero ou vazio fabricado.
 - **Settings → Projects mostra o registro único de projetos (Spaces).** A
-  lista é `project_catalog::project_entries`: os Spaces de todos os devices
+  lista é `zeron_workers_unpeel::project_activity::project_entries`: os Spaces de todos os devices
   (os mesmos ids do chat MCP `list_projects`), cada um com o nome do device,
   ordenados pela atividade mais recente de chats e checkouts; checkouts
-  Workers sem link de projeto ficam só em "Association pending". Projeto
+  Workers sem link de projeto ficam só em "Association pending". Os leitores
+  (projetos, sessões Worker, chats e tickets por projeto) moram em
+  `zeron-workers-unpeel` (`project_activity`, `project_tickets`) porque o
+  controller Workers devolve o mesmo em `list_projects`; aqui fica só a
+  apresentação (`project_catalog`: busca, rename, linhas e ativação). Não
+  reimplemente casamento nem parser na UI. Projeto
   local traz o histórico de checkouts deste device ligado a ele (ledger +
   identidade, sobrevive à poda do working set) com seletor de checkout e os
   cards General/Config/Worktree/Auto Doc/Danger Zone por checkout; projeto
@@ -230,15 +235,37 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   pendente. O "+" cria/reusa o Space local da pasta e registra o checkout
   (`workers::registry::AppSpaceRegistry`). A aba Sessions é o gêmeo Workers
   de Settings → Archived sessions (decisão do dono, 2026-09-30): mesmo header
-  com contagem, linhas com tile de 32px, título + tempo, meta
-  (checkout · runtime · status · chat de origem), ação à direita e paginação
+  com contagem, linhas com tile de 32px com o ícone do agente
+  (`runtime_icon_path`, o mesmo da sidebar de Workers), título + tempo, meta
+  (runtime · modelo · checkout · status · chat de origem), ação à direita e paginação
   de 40, listando só as sessões Worker de todos os checkouts do projeto
-  (vivas e arquivadas, `project_catalog::session_rows`); projeto remoto não
+  (vivas e arquivadas, `project_catalog::session_rows` sobre `project_activity::project_sessions`); projeto remoto não
   tem nenhuma aqui. "Open"/"Replay" abre um painel ao lado da lista, dentro
   da página, com o mesmo `WorkersTerminal` do chat (parado/arquivado vira
-  replay read-only, nunca restart); "Chat" abre o chat de origem em
+  replay read-only, nunca restart). Na aba Worker o chat de origem só é
+  NOMEADO na linha; transcript do Orquestrador abre na aba irmã
+  "Orchestrator sessions" (`project_catalog::chat_rows` sobre `project_activity::project_chats`: chats do Space,
+  vivos e arquivados, com contagem de Workers lançados), em
   `Transcript::for_doc` read-only com "Go to chat"
-  (`ProjectsPageEvent::OpenChat` → `Shell::open_chat`). O
+  (`ProjectsPageEvent::OpenChat` → `Shell::open_chat`). Correção do dono,
+  2026-09-30: o antigo botão "Chat" da linha Worker mostrava o Orquestrador
+  numa aba de sessões Worker. A aba "Tickets" lista os tickets do harness
+  que miram o projeto, lidos SEM escrita de
+  `$ORCH_WORKSPACE|~/orchestrator/brain-source/projects/*/tickets/*.md`
+  (`zeron_workers_unpeel::project_tickets`, carga no `reload` em background, nunca no
+  render): casa por `cwd` dentro de um checkout do projeto; só quando o `cwd`
+  não cai em nenhum projeto registrado, pelo nome da pasta do harness
+  normalizado (`JK Distribuição` = `jk-distribuicao`).
+  Os tickets continuam morando no workspace do Orquestrador; migrar para o
+  projeto é mudança do harness, não desta aba. Ticket aberto estreita a
+  lista e abre detalhe (checklist de prova + corpo em `markdown::render_tree`,
+  parseado uma vez ao abrir) e trilho de propriedades com as changes OpenSpec
+  ligadas SÓ por evidência em disco: range de commits do `record`, `refs:`
+  do brief (`<workspace>/.tmp/briefs/<id>.md`), path no próprio ticket,
+  change que cita o id, ou nome igual ao slug — cada link diz a fonte. O
+  harness não grava o vínculo; ticket sem evidência mostra nenhum, nunca um
+  palpite. Carga e vínculo rodam em task própria (`load_tickets`,
+  `RepoIndex` lê cada árvore OpenSpec uma vez), fora do reload da página. O
   "Forget" do Danger Zone apaga metadado e NAO toca em sessão. A lista e o
   detalhe rolam independentemente; rows da lista não encolhem.
 - **O verbo de remoção pergunta `is_group`, não `parent_project_id`.** Menu
@@ -307,6 +334,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - **Testes de Shell usam `shell::test_shell`**, que monta `WorkersModel::detached` sob `cfg(test)` (sem poll do daemon real); os fixtures em `examples/` usam o modelo vivo. Métrica nativa de texto em teste passa por `file_preview::loader::PREVIEW_TEXT_SYSTEM` — uma segunda plataforma nativa concorrente aborta no HIToolbox (macOS 27).
 
 - **Projeto vazio não é seleção automática de Workers**: `apply_snapshot` nunca escolhe o primeiro registro como fallback. Ao desaparecer a última sessão do projeto selecionado, a seleção implícita é limpa (inclui archive/remove local e refresh de alteração externa). Projeto vazio selecionado explicitamente ou com launch pendente continua acessível; o ledger e os arquivos não são removidos.
+- **Quit drena a engine in-process antes do `cx.quit()`.** O GPUI dá 200ms (`SHUTDOWN_TIMEOUT`, zui vendorizado) aos handlers de `on_app_quit`; o shutdown da engine leva segundos e os flushes do fim (snapshots, trajectory) nunca rodavam (`timed out waiting on app_will_quit`). `app_menus::quit_after_save` chama `drain_engine_then_quit` (`lib.rs`): esconde o app, roda `EngineHandle::shutdown` no Tokio com teto de 8s e só então `finish_quit`. Segundo ⌘Q durante a drenagem é absorvido; o `on_app_quit` vira no-op depois dela e segue como fallback de caminhos que não passam pelo gate. Engine remota sai na hora.
 
 ## Work Guidance
 
@@ -377,7 +405,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/mermaid_preview.rs` (fit, slack de pan, fatores de gesto) | unit — matemática pura; a lightbox em si é visual | `cargo test -p zeron-ui --lib mermaid_preview` · `ZERON_MOCK_MEDIA=1 scripts/dev-demo.sh` |
 | `src/settings/accounts.rs` (ordem de provedores, ausência de add em managed, thresholds e format_reset; toggle de Usage é visual) | unit | `cargo test -p zeron-ui accounts` |
 | `src/settings/projects.rs` (filtro, git remoto, editor/config, hooks Worktrunk: texto, estado de aprovação e visibilidade do card) | unit nas projeções; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
-| `src/settings/project_catalog.rs` (projetos do registro × devices × histórico de checkouts, busca, linhas e ativação da aba Sessions) | unit | `cargo test -p zeron-ui project_catalog` |
+| `src/settings/project_catalog.rs` (busca, rename e linhas/ativação das abas Worker/Orchestrator sessions sobre `zeron_workers_unpeel::project_activity`; os testes daqui também cobrem o join projetos × devices × histórico daquele módulo; o parser de tickets é testado em `zeron-workers-unpeel --lib project_tickets`) | unit | `cargo test -p zeron-ui project_catalog` |
 | `tests/project_registry_listings.rs` (chat MCP × controller Workers × row builder de Settings sobre uma engine real; rename de projeto remoto) | integration | `cargo test -p zeron-ui --test project_registry_listings` |
 | `src/workers/registry.rs` (registro app-process: reuso/criação via Mutate, gate da migração, aviso de falha) | unit | `cargo test -p zeron-ui workers::registry` |
 | `src/settings/devices.rs` (elegibilidade de Retire, resumo da confirmação) | unit; diálogo é QA nativo | `cargo test -p zeron-ui settings::devices` |

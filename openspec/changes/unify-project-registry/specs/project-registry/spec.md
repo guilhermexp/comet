@@ -92,6 +92,32 @@ The Workers controller MCP `list_projects` SHALL return every project of the reg
 - **THEN** both projects are returned with the chat MCP's ids and device fields
 - **AND** only the local project carries checkouts, including the worktree with its branch
 
+### Requirement: The Workers controller exposes each project's activity
+
+The Workers controller MCP `list_projects` SHALL carry, for every project, the information Settings → Projects shows in its General, Tickets, Worker sessions and Orchestrator sessions tabs, read from the same sources and matching rules those tabs use, so an Orchestrator can decide without opening Settings. Each project SHALL carry: `general` (added and last-opened time, repository remote and default branch when the project is local and they are known); `tickets` (count per status, every `open` ticket and the five most recent others, each with id, title, status, created time, checkout `cwd` and `next`); `worker_sessions` (live and archived counts, every live session and the five most recent archived ones, each with session id, title, checkout id, provider, state, activity and last update); `orchestrator_sessions` (live and archived counts and the five most recent chats, each with chat id, title, archived flag, Workers launched and last activity). Only an unreadable registry SHALL fail the listing. Any other unreadable source, the Workers state included, SHALL leave its section empty with an `error` naming the source; a source read in part SHALL keep what it read and add the `error`. A remote project SHALL carry `worker_sessions` empty, because Worker sessions are device-local.
+
+#### Scenario: A local project with tickets and sessions
+- Test: integration — Workers controller `list_projects` against a fixture registry, a fixture Orchestrator workspace (`ORCH_WORKSPACE`) holding tickets for the project's checkout `cwd` and for its harness folder name, Worker sessions on the principal and a worktree, and project chats.
+- **WHEN** the project has open and closed tickets, live and archived Worker sessions and chats
+- **THEN** its entry carries the ticket counts per status with every open ticket, the Worker session counts with every live session, and the chat counts with the most recent chats
+- **AND** the ticket ids, session ids and chat ids are the ones the Settings → Projects tabs list for the same project
+
+#### Scenario: A ticket matches only its own project
+- Test: integration — two fixture projects, tickets targeting each by `cwd`.
+- **WHEN** tickets target different projects
+- **THEN** each project's `tickets` contains only its own tickets
+
+#### Scenario: The Orchestrator workspace is missing
+- Test: integration — `ORCH_WORKSPACE` pointing to a missing folder.
+- **WHEN** the ticket source cannot be read
+- **THEN** `list_projects` still returns every project
+- **AND** each `tickets` section is empty and names the unreadable source
+
+#### Scenario: A remote project's activity
+- Test: integration — fixture registry with a remote project that has chats.
+- **WHEN** the project belongs to another device
+- **THEN** its `worker_sessions` is empty and its `orchestrator_sessions` lists its chats
+
 ### Requirement: Existing Workers records migrate into the registry
 
 On first start after upgrade, Comet SHALL link every Workers registration and ledger record to a project, once and idempotently, after writing a backup of the Workers state. A record SHALL be linked to the local project whose folder is its repository root, or to the local project of its own folder when it is not in a Git repository; when that project does not exist it SHALL be created. A record with no filesystem and no persisted Git evidence SHALL stay association-pending and SHALL NOT be linked by name, path prefix or remote.

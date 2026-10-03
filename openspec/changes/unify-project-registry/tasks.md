@@ -17,6 +17,7 @@
 - [x] 3.2 Controller `list_projects` returns Spaces with device fields and nested local checkouts; verify "Listing mirrors the chat MCP" and "Every project listing agrees" (chat MCP side via `zeron-mcp` over the same fixture).
 - [x] 3.3 `launch_worker` accepts Space id (principal, on-demand principal registration) or checkout id; remote Space fails pre-spawn naming the device; verify the three launch scenarios plus existing `checkout_identity_recovery` blocker tests still pass.
 - [x] 3.4 Update `crates/workers-unpeel/AGENTS.md` (registry ownership, link, transports, verification commands); verify the commands listed run as written.
+- [x] 3.5 Controller `list_projects` carries each project's `general`, `tickets`, `worker_sessions` and `orchestrator_sessions` per the requirement "The Workers controller exposes each project's activity", reusing the Settings → Projects readers (`settings/project_tickets.rs` parser/matching, `project_catalog` session and chat rows) from a place both `zeron-ui` and `zeron-workers-unpeel` can depend on — no second parser, no dependency cycle (`cargo tree`); update `crates/workers-unpeel/AGENTS.md` and the `list_projects` tool description; verify the four scenarios as integration tests in `crates/workers-unpeel/tests/controller_mcp.rs` and the existing Settings tests still pass. Owner request 2026-10-02.
 
 ## 4. Migration
 
@@ -41,7 +42,9 @@
 ## 7. Sessions tab
 
 - [x] 7.1 Session rows for a local project: Worker sessions of principal and worktrees, live + archived, by last activity; launching chat; missing checkout; remote project lists none; verify unit tests for each Sessions scenario.
-- [ ] 7.2 Side panel beside the list reusing the chat-opened Worker surface; stopped/archived Worker replays without restart; launching chat opens read-only; verify activation unit tests and a native QA screenshot of the panel open next to the list.
+- [ ] 7.2 Side panel beside the list reusing the chat-opened Worker surface; stopped/archived Worker replays without restart; the launching chat is named only in the Worker tab (owner correction 2026-09-30); rows show the Worker's agent icon and model; a separate Orchestrator sessions tab lists the project's chats and opens their transcript read-only; verify activation unit tests and a native QA screenshot of the panel open next to the list.
+
+- [ ] 7.3 Tickets tab: harness tickets of the project read from the Orchestrator workspace (`settings/project_tickets.rs`), matched by checkout `cwd` or harness folder name; issue-style list, detail with proof checklist and rendered body, properties rail with OpenSpec changes linked by evidence only (commit range, brief refs, ticket text, citation, slug), loaded off the page path; verify parser/loader/matching/linking unit tests and a native QA screenshot. Measured on the owner's workspace (2026-09-30): 143 tickets, 28 with linked specs, 1.4 s to load and link in the background. Owner direction (2026-09-30): tickets still live in the Orchestrator workspace; moving them into the project is a later harness change — this tab only shows them.
 
 ## 8. Integration proof
 
@@ -69,3 +72,7 @@
 - Owner decision (2026-09-30, mid-run): the Sessions tab follows Settings → Archived sessions
   and lists only the project's Worker sessions (principal and worktrees, live and archived);
   the launching chat opens read-only from a Worker row. Spec, proposal and design updated by the Main.
+- Owner correction (2026-09-30, after QA): the "Chat" action showed the Orchestrator transcript in a
+  tab meant for Worker sessions. The Worker tab now opens only the Worker's own terminal and names
+  the launching chat; Orchestrator transcripts moved to a new Orchestrator sessions tab beside it.
+  Worker rows gained the agent icon and model.
