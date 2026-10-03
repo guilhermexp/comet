@@ -20,7 +20,12 @@ pub(crate) struct ChatPersistence {
     urgent: AtomicBool,
     write: Mutex<()>,
     wake: Option<mpsc::Sender<()>>,
-    pub(crate) initial_cursor_verified: bool,
+    /// Whether the stored cursor is an honest contiguous prefix. Starts from
+    /// the store's marker and becomes true after the first verified write
+    /// (the constructor already discarded an unverified cursor), so a
+    /// re-admitted client on this warm handle does not repeat the legacy
+    /// cursor repair on every scheduler rotation.
+    cursor_verified: AtomicBool,
     #[cfg(test)]
     writes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -50,7 +55,7 @@ impl ChatPersistence {
             urgent: AtomicBool::new(false),
             write: Mutex::new(()),
             wake: runtime.as_ref().map(|_| tx),
-            initial_cursor_verified: verified,
+            cursor_verified: AtomicBool::new(verified),
             #[cfg(test)]
             writes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -64,6 +69,10 @@ impl ChatPersistence {
 
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cursor_verified(&self) -> bool {
+        self.cursor_verified.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_clean(&self) -> bool {
@@ -175,6 +184,7 @@ impl ChatPersistence {
                     #[cfg(test)]
                     self.writes.fetch_add(1, Ordering::Relaxed);
                     self.saved.store(generation, Ordering::Release);
+                    self.cursor_verified.store(true, Ordering::Release);
                 }
                 Err(error) => {
                     tracing::warn!(chat = %self.chat_id, %error, "chat snapshot failed; retrying")
@@ -289,6 +299,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(persistence.writes.load(Ordering::Relaxed), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_verified_write_certifies_the_warm_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let doc = Arc::new(SessionDoc::init("born").unwrap());
+        // A born-on-chat2 row is stored unverified (doc_host cold open).
+        store
+            .save_snapshot_with_cursor("born", &doc.export_snapshot().unwrap(), 0, 2)
+            .unwrap();
+        let persistence = ChatPersistence::new(&doc, store.clone(), "born".into(), 0);
+        assert!(!persistence.cursor_verified());
+        persistence.applied(7, true);
+        persistence.flush_sync();
+        // Re-admitted clients share this persistence: they must now see a
+        // verified cursor instead of repeating the legacy repair.
+        assert!(persistence.cursor_verified());
+        assert!(store.snapshot_cursor_verified("born").unwrap());
+        assert_eq!(persistence.cursor(), 7);
     }
 
     #[tokio::test]

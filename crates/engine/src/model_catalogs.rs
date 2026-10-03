@@ -181,7 +181,20 @@ async fn list_inner(
             }
         }
         result => {
-            tracing::warn!(error = ?result, binary_path = %context.binary_path.display(), binary_version = ?context.binary_version, "Model discovery unavailable");
+            // The common case is not a failure: with a disk catalog the live
+            // refresh gets 100ms before disk is served, and it keeps running
+            // (a background failure is logged above as "Model discovery failed").
+            let reason = match &result {
+                None => "live refresh still running; serving disk catalog".to_string(),
+                Some(Ok(Ok(_))) => "harness returned an empty catalog".to_string(),
+                Some(Ok(Err(error))) => error.to_string(),
+                Some(Err(join)) => format!("refresh task failed: {join}"),
+            };
+            if result.is_none() {
+                tracing::debug!(%reason, binary_path = %context.binary_path.display(), binary_version = ?context.binary_version, "Model discovery deferred");
+            } else {
+                tracing::warn!(%reason, binary_path = %context.binary_path.display(), binary_version = ?context.binary_version, "Model discovery unavailable");
+            }
             match disk {
                 Some(models) => ModelCatalog {
                     models,

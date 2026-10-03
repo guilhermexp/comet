@@ -18,6 +18,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 - Presença é efêmera por design — substitui escrita de heartbeat a cada 15s. Não persistir presença no doc.
 - Chat row import distingue operações aplicadas de dependências causais pendentes. Row pendente segura o cursor e força checkpoint mesmo com frontier aparentemente contida; HTTP e WebSocket usam a mesma regra. Reparo inclui rows próprias e uma geração impede que catch-up antigo limpe um gap mais novo. `CaughtUp` não é emitido enquanto faltar história causal.
 - Publicação de Chat é um outbox SQLite (`chat_outbox`) com `batch_id` estável: o cliente só envia depois de persistir, só remove após ACK persistido e recarrega pendências ao reabrir. Rejeições permanentes ficam marcadas para um checkpoint posterior; a fila em memória nunca substitui o registro durável.
+- Rejeição `quota` loga **um** `warn` por episódio bloqueado (`chat2: push quota exceeded`); a rajada em voo e as sondas da cabeça da fila que repetem o veredito ficam em `debug`. A drenagem (um batch por grant) não muda.
 
 ## Work Guidance
 

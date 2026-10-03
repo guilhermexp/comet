@@ -340,6 +340,7 @@ fn cache(edge_url: &str) -> Arc<LinkCache> {
     let mut config = LinkCacheConfig::new(edge_url, Arc::new(StaticToken("test-user".into())));
     config.cooldown_base = Duration::from_millis(100);
     config.cooldown_max = Duration::from_millis(400);
+    config.offline_cooldown = Duration::from_millis(100);
     config.probe_timeout = Duration::from_millis(1_500);
     LinkCache::new(config)
 }
@@ -640,7 +641,7 @@ async fn host_offline_fails_fast_and_cools_down() {
     let Err(err) = links.client("dev-a").await else {
         panic!("must fail fast while cooling")
     };
-    assert!(err.to_string().contains("backing off"), "got: {err}");
+    assert!(err.to_string().contains("device is offline"), "got: {err}");
 
     // After the cooldown a host is up — dial succeeds and clears the slate.
     let service = TestService::new("host-a");
@@ -655,6 +656,39 @@ async fn host_offline_fails_fast_and_cools_down() {
             .expect("echo")["host"],
         "host-a"
     );
+}
+
+/// A relay `host_offline` verdict parks dials for the offline cooldown, and a
+/// network-recovery broadcast (which every successful handshake emits — the
+/// bounced peer dial included) must not reset it into a dial loop.
+#[tokio::test]
+async fn host_offline_cooldown_survives_online_broadcasts() {
+    let relay = FakeRelay::start().await;
+    let mut config =
+        LinkCacheConfig::new(relay.edge_url(), Arc::new(StaticToken("test-user".into())));
+    config.cooldown_base = Duration::from_millis(100);
+    config.cooldown_max = Duration::from_millis(100);
+    config.offline_cooldown = Duration::from_secs(120);
+    config.probe_timeout = Duration::from_millis(1_500);
+    let links = LinkCache::new(config);
+
+    assert!(links.client("dev-a").await.is_err(), "no host: dial fails");
+    zeron_sync::wake::notify_online();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let Err(err) = links.client("dev-a").await else {
+        panic!("offline cooldown must hold across an online broadcast")
+    };
+    assert!(err.to_string().contains("device is offline"), "got: {err}");
+
+    // Fresh presence remains the early lift.
+    let service = TestService::new("host-a");
+    let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
+    relay.wait_host_connected().await;
+    links.reset_cooldown("dev-a");
+    links
+        .client("dev-a")
+        .await
+        .expect("dials after presence reset");
 }
 
 /// The data-driven cooldown reset (fresh workspace presence → peer is alive):
@@ -676,7 +710,7 @@ async fn presence_reset_clears_cooldown_immediately() {
     let Err(err) = links.client("dev-a").await else {
         panic!("must fail fast while cooling")
     };
-    assert!(err.to_string().contains("backing off"), "got: {err}");
+    assert!(err.to_string().contains("device is offline"), "got: {err}");
 
     // Host comes up and its presence heartbeat clears the backoff — the next
     // call dials immediately.

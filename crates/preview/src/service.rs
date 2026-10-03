@@ -229,6 +229,7 @@ impl PreviewService {
                                 l.address.port() != zeron_proto::PREVIEW_PROXY_PORT
                                     && l.pid != std::process::id()
                                     && !l.is_authentication_command()
+                                    && !l.is_zeron_engine()
                             })
                             .filter_map(|listener| {
                                 roots
@@ -332,6 +333,14 @@ mod tests {
             address: ([127, 0, 0, 1], port).into(),
             zeron_owned: false,
         }
+    }
+
+    #[test]
+    fn other_zeron_engines_are_not_preview_candidates() {
+        let mut engine = listener(42, 27654);
+        engine.args = vec!["/Users/me/comet/target/debug/Zeron.app/Contents/MacOS/zeron".into()];
+        assert!(engine.is_zeron_engine());
+        assert!(!listener(43, 5173).is_zeron_engine());
     }
 
     #[test]

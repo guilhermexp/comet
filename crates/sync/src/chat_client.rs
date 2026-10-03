@@ -1879,8 +1879,22 @@ impl Actor {
                     // the batch queued and head-probe on a short clock.
                     "quota" => {
                         let mut shared = lock(&self.shared);
-                        shared.quota_blocked = true;
+                        let already_blocked = std::mem::replace(&mut shared.quota_blocked, true);
                         shared.retry_at = Some(tokio::time::Instant::now() + QUOTA_RETRY);
+                        let pending = shared.pending.len();
+                        drop(shared);
+                        // One warning per blocked episode: the in-flight burst
+                        // and every head-probe retry repeat the same verdict.
+                        if already_blocked {
+                            tracing::debug!(pending, "chat2: push still over quota");
+                        } else {
+                            tracing::warn!(
+                                pending,
+                                message,
+                                "chat2: push quota exceeded; draining one batch per grant"
+                            );
+                        }
+                        return true;
                     }
                     _ => {}
                 }

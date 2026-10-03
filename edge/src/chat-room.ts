@@ -44,10 +44,13 @@ export const MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024;
 /** Presence beats older than this are swept before relay/stats. */
 const PRESENCE_TTL_MS = 30_000;
 /** Per-device push quota, rolling window (in-memory; resets on hibernation —
- * it exists to contain a runaway client loop, not to meter honest traffic). */
+ * it exists to contain a runaway client loop, not to meter honest traffic).
+ * Sized for a reconnect flush of a streaming Chat's durable outbox: rows are
+ * capped at ~1 MiB each, and honest tool-heavy sessions were rejected at the
+ * old 8 MiB/300-push ceiling for minutes at a time. */
 const QUOTA_WINDOW_MS = 60_000;
-const QUOTA_MAX_PUSHES = 300;
-const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
+const QUOTA_MAX_PUSHES = 1_200;
+const QUOTA_MAX_BYTES = 48 * 1024 * 1024;
 
 interface SocketState {
   userId: string;
@@ -511,9 +514,14 @@ export class ChatRoom implements DurableObject {
       window = { since: now, pushes: 0, bytes: 0 };
       this.quotas.set(key, window);
     }
+    // Only admitted pushes consume the window: a rejected burst (or the
+    // client's head-probe retries) must not keep the device over budget.
+    if (window.pushes + 1 > QUOTA_MAX_PUSHES || window.bytes + bytes > QUOTA_MAX_BYTES) {
+      return false;
+    }
     window.pushes += 1;
     window.bytes += bytes;
-    return window.pushes <= QUOTA_MAX_PUSHES && window.bytes <= QUOTA_MAX_BYTES;
+    return true;
   }
 
   private recordPush(device: string, ok: boolean): void {

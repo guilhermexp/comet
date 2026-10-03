@@ -618,6 +618,26 @@ impl ProbeError {
             | ProbeError::UntrustedEndpoint => Duration::from_secs(10 * 60),
         }
     }
+
+    /// [`Self::backoff`] escalated by the run of consecutive failures. Only
+    /// transient classes (rate limit, outage, network) double: a provider
+    /// answering `429 Retry-After: 0` to every poll otherwise got probed on
+    /// every UI refresh for hours. A longer server Retry-After still wins.
+    fn backoff_after(&self, failures: u32) -> Duration {
+        const MAX_TRANSIENT: Duration = Duration::from_secs(30 * 60);
+        let base = self.backoff();
+        match self {
+            ProbeError::RateLimited { .. }
+            | ProbeError::Network { .. }
+            | ProbeError::Http { status: 500.., .. } => {
+                let doublings = failures.saturating_sub(1).min(10);
+                base.saturating_mul(1 << doublings)
+                    .min(MAX_TRANSIENT)
+                    .max(base)
+            }
+            _ => base,
+        }
+    }
 }
 
 /// Per-account usage state, persisted to `agent-accounts/usage-cache.json`
@@ -644,6 +664,14 @@ struct UsageEntry {
     /// Fingerprint of the credentials the last failure was against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credentials: Option<String>,
+    /// Consecutive failed probes; reset by a success. Drives the
+    /// exponential part of the backoff.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    failures: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl UsageEntry {
@@ -677,13 +705,66 @@ impl UsageEntry {
                 self.error = None;
                 self.retry_at = None;
                 self.credentials = None;
+                self.failures = 0;
             }
             Err(error) => {
-                self.retry_at = Some(now + error.backoff().as_millis() as i64);
+                self.failures = self.failures.saturating_add(1);
+                self.retry_at = Some(now + error.backoff_after(self.failures).as_millis() as i64);
                 self.error = Some(error);
                 self.credentials = Some(credentials);
             }
         }
+    }
+}
+
+/// One line per account outcome: a warning on the first failure or a class
+/// change, debug while the same failure repeats under backoff, info on
+/// recovery. `backoff_s` is the escalated wait actually scheduled.
+fn log_usage_outcome(
+    entry: &UsageEntry,
+    previous: Option<&'static str>,
+    harness: HarnessId,
+    slot: &str,
+    active: bool,
+    now: i64,
+) {
+    let Some(error) = &entry.error else {
+        if previous.is_some() {
+            tracing::info!(
+                provider = harness_slug(harness),
+                slot,
+                "agent usage recovered"
+            );
+        }
+        return;
+    };
+    // Expected, quiet outcome (API-key logins have no windows).
+    if matches!(error, ProbeError::NoCredentials { .. }) {
+        return;
+    }
+    let backoff_s = (entry.retry_at.unwrap_or(now) - now).max(0) / 1000;
+    if previous == Some(error.class()) {
+        tracing::debug!(
+            provider = harness_slug(harness),
+            slot,
+            active,
+            class = error.class(),
+            status = ?error.status(),
+            failures = entry.failures,
+            backoff_s,
+            "agent usage still unavailable"
+        );
+    } else {
+        tracing::warn!(
+            provider = harness_slug(harness),
+            slot,
+            active,
+            class = error.class(),
+            status = ?error.status(),
+            failures = entry.failures,
+            backoff_s,
+            "agent usage unavailable"
+        );
     }
 }
 
@@ -2920,7 +3001,7 @@ impl AgentAccounts {
                 claimed.push(key.clone());
                 probes.push(async move {
                     let result = self.probe_usage(harness, slot, active).await;
-                    (key, credentials, result)
+                    (key, credentials, result, harness, slot.id.clone(), active)
                 });
             }
         }
@@ -2934,11 +3015,11 @@ impl AgentAccounts {
         let results = futures::future::join_all(probes).await;
         let now = now_ms();
         let mut usage = lock(&self.inner.usage);
-        for (key, credentials, result) in results {
-            usage
-                .entry(key)
-                .or_default()
-                .record(result, credentials, now);
+        for (key, credentials, result, harness, slot_id, active) in results {
+            let entry = usage.entry(key).or_default();
+            let previous = entry.error.as_ref().map(ProbeError::class);
+            entry.record(result, credentials, now);
+            log_usage_outcome(entry, previous, harness, &slot_id, active, now);
         }
         // Drop entries for accounts that no longer have a slot (forgotten).
         let live: std::collections::HashSet<String> = targets
@@ -2969,7 +3050,7 @@ impl AgentAccounts {
         slot: &Slot,
         is_active: bool,
     ) -> Result<UsageSnapshot, ProbeError> {
-        let result = match harness {
+        match harness {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
             HarnessId::Codex => self.codex_usage(slot).await,
             HarnessId::Cursor => self.cursor_usage(slot).await,
@@ -2980,22 +3061,7 @@ impl AgentAccounts {
             _ => Err(ProbeError::NoCredentials {
                 why: NoCredentials::Missing,
             }),
-        };
-        if let Err(error) = &result {
-            // Expected, quiet outcomes (API-key logins have no windows).
-            if !matches!(error, ProbeError::NoCredentials { .. }) {
-                tracing::warn!(
-                    provider = harness_slug(harness),
-                    slot = %slot.id,
-                    active = is_active,
-                    class = error.class(),
-                    status = ?error.status(),
-                    backoff_s = error.backoff().as_secs(),
-                    "agent usage unavailable"
-                );
-            }
         }
-        result
     }
 
     async fn claude_usage(
@@ -3798,7 +3864,7 @@ async fn probe_json(
             let error = ProbeError::Network {
                 timeout: err.is_timeout(),
             };
-            tracing::warn!(
+            tracing::debug!(
                 provider,
                 step,
                 class = error.class(),
@@ -3812,7 +3878,7 @@ async fn probe_json(
     if !status.is_success() {
         let retry_after_secs = retry_after_secs(response.headers(), Utc::now());
         let error = classify_status(status.as_u16(), retry_after_secs);
-        tracing::warn!(
+        tracing::debug!(
             provider,
             step,
             status = status.as_u16(),
@@ -5483,6 +5549,49 @@ mod probe_tests {
         assert_eq!(limited(Some(0)).backoff(), Duration::from_secs(30));
         assert_eq!(limited(Some(86_400)).backoff(), Duration::from_secs(3600));
         assert_eq!(limited(None).backoff(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn transient_failures_escalate_and_credential_failures_do_not() {
+        let zero = ProbeError::RateLimited {
+            retry_after_secs: Some(0),
+        };
+        let ladder: Vec<u64> = (1..=8).map(|n| zero.backoff_after(n).as_secs()).collect();
+        assert_eq!(ladder, [30, 60, 120, 240, 480, 960, 1800, 1800]);
+        // A longer server Retry-After still wins over the escalation cap.
+        let long = ProbeError::RateLimited {
+            retry_after_secs: Some(3600),
+        };
+        assert_eq!(long.backoff_after(9), Duration::from_secs(3600));
+        let timeout = ProbeError::Network { timeout: true };
+        assert_eq!(timeout.backoff_after(3), Duration::from_secs(120));
+        let rejected = ProbeError::Unauthorized { status: 401 };
+        assert_eq!(rejected.backoff_after(5), rejected.backoff());
+    }
+
+    #[test]
+    fn repeated_rate_limits_space_out_probes_until_a_success() {
+        let mut entry = UsageEntry::default();
+        let zero = || {
+            Err(ProbeError::RateLimited {
+                retry_after_secs: Some(0),
+            })
+        };
+        let mut now = 1_000;
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            entry.record(zero(), "creds".into(), now);
+            let wait = entry.retry_at.unwrap() - now;
+            waits.push(wait / 1000);
+            now += wait;
+        }
+        assert_eq!(waits, [30, 60, 120, 240]);
+        assert_eq!(entry.failures, 4);
+        entry.record(Ok(snapshot()), "creds".into(), now);
+        assert_eq!(entry.failures, 0);
+        assert_eq!(entry.retry_at, None);
+        entry.record(zero(), "creds".into(), now + 60_000);
+        assert_eq!(entry.retry_at, Some(now + 60_000 + 30_000));
     }
 
     #[test]

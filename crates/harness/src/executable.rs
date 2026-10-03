@@ -119,12 +119,24 @@ fn runnable(path: &Path) -> bool {
     }
 }
 
+/// Per-session wrapper directories a terminal multiplexer prepends to PATH
+/// (cmux: `$TMPDIR/cmux-cli-shims/<session-uuid>/`). They forward to the real
+/// install, change path every terminal session (churning path-keyed caches)
+/// and vanish with it, so they must not outrank a stable install.
+fn session_shim(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "cmux-cli-shims")
+}
+
 fn newest_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     let mut seen = std::collections::HashSet::new();
-    let candidates: Vec<_> = candidates
+    let mut candidates: Vec<_> = candidates
         .into_iter()
         .filter(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())))
         .collect();
+    // Stable partition: shims only win when nothing else exists (or when
+    // strictly newer, by the version comparison below).
+    candidates.sort_by_key(|path| session_shim(path));
     let mut best = candidates.first()?.clone();
     if candidates.len() > 1 {
         let mut version = binary_version(&best);
@@ -638,6 +650,27 @@ mod tests {
         }
         assert_eq!(binary_version(&first).unwrap().to_string(), "1.0.0+aaa");
         assert_eq!(newest_candidate(vec![first.clone(), second]), Some(first));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_session_shims_do_not_outrank_a_stable_install() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("cmux-cli-shims/ABC/codex");
+        let stable = dir.path().join("bin/codex");
+        for path in [&shim, &stable] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\necho codex-cli 0.159.2\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // PATH order puts the shim first; equal versions keep the stable one.
+        assert_eq!(
+            newest_candidate(vec![shim.clone(), stable.clone()]),
+            Some(stable)
+        );
+        // A lone shim is still usable.
+        assert_eq!(newest_candidate(vec![shim.clone()]), Some(shim));
     }
 
     #[cfg(unix)]

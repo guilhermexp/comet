@@ -129,6 +129,58 @@ impl UiConfig {
 
 /// What a dock-icon reopen needs to rebuild the main window after ⌘W closed it
 /// (macOS keeps the process alive with just the menu bar, like zed).
+const DRAIN_IDLE: u8 = 0;
+const DRAIN_RUNNING: u8 = 1;
+const DRAIN_DONE: u8 = 2;
+static ENGINE_DRAIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(DRAIN_IDLE);
+/// Live runs get a bounded grace (harness interrupts take up to ~5s); past
+/// this the process exits anyway, as before.
+const QUIT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Shut an in-process engine down before asking GPUI to quit, with the
+/// windows already hidden. Returns `true` when the quit is now owned by the
+/// drain (it calls `finish_quit` itself), `false` to quit immediately.
+pub(crate) fn drain_engine_then_quit(cx: &mut gpui::App) -> bool {
+    use std::sync::atomic::Ordering;
+    let handle = cx
+        .try_global::<ReopenState>()
+        .and_then(|reopen| reopen.state.read(cx).engine().cloned())
+        .filter(|handle| matches!(handle.mode(), state::EngineMode::InProcess));
+    let Some(handle) = handle else {
+        return false;
+    };
+    match ENGINE_DRAIN.compare_exchange(
+        DRAIN_IDLE,
+        DRAIN_RUNNING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        // A second ⌘Q while draining is already being honored.
+        Err(DRAIN_RUNNING) => return true,
+        Err(_) => return false,
+    }
+    cx.hide();
+    let drain = gpui_tokio::Tokio::spawn(cx, async move {
+        if tokio::time::timeout(QUIT_DRAIN_BUDGET, handle.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                budget_s = QUIT_DRAIN_BUDGET.as_secs(),
+                "engine drain exceeded its quit budget; exiting anyway"
+            );
+        }
+    });
+    cx.spawn(async move |cx| {
+        let _ = drain.await;
+        ENGINE_DRAIN.store(DRAIN_DONE, Ordering::Release);
+        let _ = cx.update(app_menus::finish_quit);
+    })
+    .detach();
+    true
+}
+
 struct ReopenState {
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
@@ -262,22 +314,29 @@ pub fn run_app(config: UiConfig) {
 
         // Graceful teardown: an in-process engine drains live runs and flushes
         // doc snapshots before the process exits (remote engines outlive us).
+        // App-owned quits drain BEFORE `cx.quit()` (see `drain_engine_then_quit`):
+        // GPUI grants quit handlers only 200ms, far less than the drain, so this
+        // handler is the fallback for quit paths that bypass that gate.
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
-            let task = quit_state.read(cx).engine().cloned().map(|handle| {
-                let executor = cx.background_executor().clone();
-                gpui_tokio::Tokio::spawn(cx, async move {
-                    let _ = attachments::call_with_timeout(
-                        &handle,
-                        &executor,
-                        zeron_rpc::methods::STOP_LIVE_VOICE,
-                        serde_json::Value::Null,
-                        std::time::Duration::from_secs(2),
-                    )
-                    .await;
-                    handle.shutdown().await;
-                })
-            });
+            let drained = ENGINE_DRAIN.load(std::sync::atomic::Ordering::Acquire) == DRAIN_DONE;
+            let task = (!drained)
+                .then(|| quit_state.read(cx).engine().cloned())
+                .flatten()
+                .map(|handle| {
+                    let executor = cx.background_executor().clone();
+                    gpui_tokio::Tokio::spawn(cx, async move {
+                        let _ = attachments::call_with_timeout(
+                            &handle,
+                            &executor,
+                            zeron_rpc::methods::STOP_LIVE_VOICE,
+                            serde_json::Value::Null,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .await;
+                        handle.shutdown().await;
+                    })
+                });
             async move {
                 if let Some(task) = task {
                     let _ = task.await;

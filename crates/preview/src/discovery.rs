@@ -49,6 +49,19 @@ impl Listener {
                 )
             })
     }
+
+    /// Another Zeron app/engine (e.g. `cargo run` from a project checkout
+    /// beside the installed app). Its IPC port speaks WebSocket only; an
+    /// HTTP probe there is never a preview and logs a handshake warning in
+    /// that process on every scan.
+    pub fn is_zeron_engine(&self) -> bool {
+        self.args.first().is_some_and(|program| {
+            Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("zeron"))
+        })
+    }
 }
 
 /// Preserve a useful framework label without advertising process arguments,

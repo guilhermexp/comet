@@ -26,6 +26,7 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 - Auth: nunca logar fingerprint, prefixo ou qualquer derivado de refresh token (`auth-routes.ts` já teve finding disso).
 - `edge/dist/` é build gerado e ignorado — não confundir com a `dist/` da raiz, que é asset-fonte de packaging.
 - **Push na `main` que toque `edge/` dispara deploy do Worker** via `.github/workflows/deploy.yml`. Mudança aqui é publicação, não só código.
+- Quota de push do ChatRoom (`admitQuota`) conta só pushes **admitidos** — rejeição não estende a janela — e é dimensionada para o flush de reconexão de um Chat em streaming (1.200 pushes / 48 MiB por minuto, por device e room). Existe para conter loop descontrolado, não para medir tráfego honesto.
 
 ## Work Guidance
 

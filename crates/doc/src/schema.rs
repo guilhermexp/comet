@@ -592,11 +592,25 @@ impl SessionDoc {
         let raw: Vec<serde_json::Value> = serde_json::from_value(commands)?;
         Ok(raw
             .into_iter()
-            .filter_map(|v| match serde_json::from_value(v) {
-                Ok(entry) => Some(entry),
-                Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed command entry");
-                    None
+            .filter_map(|v| {
+                // An identified entry without its payload is a peer's write
+                // that this import has not completed yet, not corruption.
+                let in_flight = v.get("id").is_some() && v.get("payload").is_none();
+                let id = v
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match serde_json::from_value(v) {
+                    Ok(entry) => Some(entry),
+                    Err(err) if in_flight => {
+                        tracing::debug!(id, error = %err, "skipping in-flight command entry");
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!(id, error = %err, "skipping malformed command entry");
+                        None
+                    }
                 }
             })
             .collect())
@@ -605,7 +619,12 @@ impl SessionDoc {
     /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
         let commands = self.doc.get_list("commands");
-        let map = commands.push_container(LoroMap::new())?;
+        // Fill a DETACHED map and attach it whole: pushing an empty container
+        // first made `{id, kind}` visible to concurrent readers (and to a
+        // concurrent commit splitting the change) before the slow payload
+        // serialization finished — the drain then logged "skipping malformed
+        // command entry: missing field `payload`".
+        let map = LoroMap::new();
         map.insert("id", entry.id.as_str())?;
         map.insert(
             "kind",
@@ -634,6 +653,7 @@ impl SessionDoc {
                 .as_str()
                 .ok_or_else(|| DocError::Schema("status not a string".into()))?,
         )?;
+        commands.push_container(map)?;
         self.doc.commit();
         Ok(())
     }

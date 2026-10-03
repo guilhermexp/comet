@@ -17,7 +17,7 @@ Catálogo, descoberta de listeners/processos, proxy HTTP/WebSocket, multiplexaç
 - O patch licenciado de `rtc-sctp` mantém SCTP + DTLS + UDP/IPv6 dentro de 1280 bytes para não travar em VPN; ver `third_party/rust/PATCHES.md`.
 - RTC transporta bytes HTTP/HMR; PreviewRoom transporta apenas catálogo e sinalização autenticados. Não há fallback TURN.
 - Descoberta roda fora da thread de UI; start é idempotente, stop cancela o serviço e shutdown aguarda tarefas. Novo runtime usa nova instância.
-- Descoberta mantém verdict de HTTP por `(pid, started_at, address)`: listeners confirmados não recebem novo probe a cada ciclo; listeners não-HTTP usam backoff e uma troca de processo/porta invalida o cache. O proxy valida somente o PID e o horário de início antes de conectar. Pairing é refeito a cada 10s enquanto aguarda e um `connect` com nova sessão substitui o peer zumbi.
+- Descoberta mantém verdict de HTTP por `(pid, started_at, address)`: listeners confirmados não recebem novo probe a cada ciclo; listeners não-HTTP usam backoff e uma troca de processo/porta invalida o cache. O proxy valida somente o PID e o horário de início antes de conectar. Pairing é refeito a cada 10s enquanto aguarda e um `connect` com nova sessão substitui o peer zumbi. Listener cujo programa é `zeron` (outra instância do app/engine, ex. `cargo run` do checkout) não é candidato: a porta IPC dele só fala WebSocket, e o `HEAD /` gerava warning de handshake naquele processo a cada varredura.
 
 ## Work Guidance
 

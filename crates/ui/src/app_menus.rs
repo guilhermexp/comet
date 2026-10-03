@@ -94,6 +94,13 @@ fn prepare_quit(cx: &mut App) {
 }
 
 pub(crate) fn quit_after_save(cx: &mut App) {
+    if crate::drain_engine_then_quit(cx) {
+        return;
+    }
+    finish_quit(cx);
+}
+
+pub(crate) fn finish_quit(cx: &mut App) {
     #[cfg(target_os = "macos")]
     native_quit::allow();
     cx.quit();
