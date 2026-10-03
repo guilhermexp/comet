@@ -2,7 +2,7 @@
 
 ### Requirement: Upstream v0.2.102 behavior is available without regressing fork contracts
 
-The fork SHALL include upstream behavior through `64ad6f6e` while keeping OMP and Kimi, Workers, Run/Steer steering, Live Voice, the fork MCP grant model, accounts/usage presentation, fork visual design and fork release policy intact.
+The fork SHALL include upstream behavior through `9e1a1115` while keeping OMP and Kimi, Workers, Run/Steer steering, Live Voice, the fork MCP grant model, accounts/usage presentation, fork visual design and fork release policy intact.
 
 #### Scenario: Workspace builds and tests after the merge
 

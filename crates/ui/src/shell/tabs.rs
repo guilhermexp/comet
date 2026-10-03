@@ -82,7 +82,7 @@ impl Shell {
             || self.sync_flow.has_visible_overlay()
             || self.delete_confirm.is_some()
             || self.delete_space_confirm.is_some()
-            || self.rename_dialog.is_some()
+            || self.chat_rename.is_some()
             || self.rename_space_dialog.is_some()
             || self.chat_menu.get().is_some()
             || self.space_menu.get().is_some()
@@ -189,7 +189,10 @@ impl Shell {
     /// A new chat always starts with the terminal hidden: when the drawer is
     /// open it just hides (detach, not close — the source chat's tabs and
     /// PTYs survive for the return trip).
-    pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `project` (the per-project `+` on a sidebar group header) homes the
+    /// canvas on that project and wins over the sidebar filter.
+    pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         self.command_palette = None;
         if self.sidebar_mode == SidebarMode::Workers {
             self.workers_model.update(cx, |model, cx| {
@@ -221,9 +224,8 @@ impl Shell {
         self.focus_composer(cx);
         let target = {
             let state = self.state.read(cx);
-            self.settings
-                .space_filter
-                .clone()
+            project
+                .or_else(|| self.settings.space_filter.clone())
                 .filter(|id| state.space_row(id).is_some())
         };
         let defaults = crate::settings::composer::ComposerDefaults::load(&self.data_dir);

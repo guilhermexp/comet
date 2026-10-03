@@ -28,3 +28,7 @@ pub mod veil;
 pub use parser::{Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full};
 
 pub mod mermaid;
+// Upstream #760 chat Mermaid cache. The fork draws chat Mermaid with its own
+// engine (transcript), so this stays dormant; kept so later syncs merge cleanly.
+#[allow(dead_code)]
+pub(crate) mod mermaid_cache;

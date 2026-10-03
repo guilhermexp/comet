@@ -8,10 +8,10 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
 | | |
 |---|---|
-| Último commit do upstream mergeado | `64ad6f6e` (v0.2.102, 2026-10-02) |
+| Último commit do upstream mergeado | `9e1a1115` (pós-v0.2.102, 2026-10-02) |
 | Merge | branch `sync/upstream-v0.2.102` (worktree `~/.zeron/worktrees/comet/sync-v0-2-102`) |
 | OpenSpec | `openspec/changes/sync-upstream-v0-2-102/` |
-| Próximo sync começa de | `64ad6f6e`, merge-base natural |
+| Próximo sync começa de | `9e1a1115`, merge-base natural |
 
 ## Receita
 
@@ -82,6 +82,10 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Banner "Star on GitHub" no rodapé da sidebar (e `github_star_banner_dismissed`) | #586 | pós-v0.2.96 | Removido a pedido: o fork não quer o convite na sidebar. No próximo sync, resolver para o lado do fork |
 | Terminal de rodapé e sua geometria (`terminal/dock.rs`, `reserve_terminal`, abas/rail no `terminal/panel.rs`) | #620/#628 | v0.2.102 | O terminal vive no painel direito. `dock.rs` entrou dormente (`allow(dead_code)`) só para os próximos merges não conflitarem |
 | Explorer: subagentes rodando primeiro | #638 | v0.2.102 | Mexe no `files/sections.rs`, que o fork não tem |
+| Mermaid no chat do upstream (`markdown/mermaid_cache.rs`) | #760 | v0.2.102 | O fork já desenha Mermaid no chat com engine própria (QuickJS). Entraram só as partes fora do chat; o cache ficou dormente (`allow(dead_code)`) |
+| Rótulo de branch no rodapé do composer | #744 | v0.2.102 | O fork tirou a branch do rodapé (vai no Details, `01920115`) |
+| Caminhos de drive Windows no seletor de pasta | #727 | v0.2.102 | Fork só roda em macOS; revertido dentro do merge |
+| Workflow macOS separado, pins de action por SHA, Dependabot | CI | v0.2.102 | O fork mantém os próprios workflows (gate por path). `macos.yml`, `dependabot.yml`, `run-macos-fixture.sh`, `cursor-sdk-update.yml` e `testflight.yml` ficam fora |
 | Instalador Linux com updater em `~/.zeron/app` | #627 | v0.2.102 | Fork sem feed próprio. Entraram só as licenças das fontes e do Parakeet |
 
 ## Aceito com adaptação
@@ -108,6 +112,9 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Ditado local no composer | #591 | v0.2.102 | Convive com o Live Voice: botões separados, atalho `mod-d` |
 | Seletor compacto de modelo/effort | #471 | v0.2.102 | Opt-in, padrão desligado (o upstream liga por padrão) |
 | `core-tests` (um nextest) no lugar de `session-sync-regressions` | CI | v0.2.102 | Mantido o gate por path do fork, agora incluindo `crates/preview/` e `scripts/ci/` |
+| Renomear chat inline em vez de diálogo | c78bb1c1 | v0.2.102 | Na sidebar como no upstream. Side chat do fork só existe como aba: o rename inline acontece na aba (duplo clique ou menu); com a aba fechada, a sidebar pede para abri-la |
+| Painel de checklist do agente (`TodoStatus`, `inProgress`) | #707 | v0.2.102 | O OMP também mapeia `in_progress` das fases para `InProgress` |
+| Anexos BMP → PNG em background | #739 | v0.2.102 | A classificação de drop do fork (imagem, menção de projeto, arquivo externo) continua síncrona; só o staging lento vai para o background |
 | Inline code com nome de arquivo real vira link | #606/#633 | v0.2.102 | Substitui o chip do fork só nesses spans; os demais seguem chip |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
@@ -142,4 +149,4 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | 2026-09-27 | até `433aa148` (v0.2.94+) | `openspec/changes/sync-upstream-v0-2-94/` | Merge `1065d252`; iOS reescrito; o fork segura o grant MCP |
 | 2026-09-27 | até `9d3cc8b2` (v0.2.96) | `openspec/changes/sync-upstream-v0-2-94/` | Segundo merge na mesma branch; #595 recusado via revert local `a65f309e`; entram #389/#596, #588, #586, #592 e iOS |
 | 2026-09-28 | `e13b18de` (#599) | porte pontual | Cmd/Ctrl+C copia a seleção do transcript com o foco fora do composer; o próximo sync resolve para o lado do upstream |
-| 2026-10-02 | até `64ad6f6e` (v0.2.102) | `openspec/changes/sync-upstream-v0-2-102/` | 56 commits; Pi nativo, ditado, seletor compacto opt-in, file tree actions; zui recebe 3 commits por patch |
+| 2026-10-02 | até `9e1a1115` (v0.2.102 + 21) | `openspec/changes/sync-upstream-v0-2-102/` | 56 commits; Pi nativo, ditado, seletor compacto opt-in, file tree actions; zui recebe 3 commits por patch |

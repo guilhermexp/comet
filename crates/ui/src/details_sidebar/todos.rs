@@ -93,6 +93,7 @@ mod tests {
                         .map(|(text, done)| TodoItem {
                             text: (*text).into(),
                             done: *done,
+                            status: None,
                         })
                         .collect(),
                 },

@@ -663,7 +663,14 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
         ToolCall::WebSearch { query } => query.clone(),
         ToolCall::Todo { items } => items
             .iter()
-            .map(|i| format!("{} {}", if i.done { "[x]" } else { "[ ]" }, i.text))
+            .map(|i| {
+                let mark = match i.status() {
+                    zeron_proto::TodoStatus::Completed => "[x]",
+                    zeron_proto::TodoStatus::InProgress => "[~]",
+                    zeron_proto::TodoStatus::Pending => "[ ]",
+                };
+                format!("{mark} {}", i.text)
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         ToolCall::Mcp {
@@ -12472,6 +12479,7 @@ mod tests {
         let item = |text: &str, done: bool| TodoItem {
             text: text.into(),
             done,
+            status: None,
         };
         let entries = vec![
             assistant(
@@ -13913,6 +13921,7 @@ mod tests {
                 items: vec![TodoItem {
                     text: "Inspect".into(),
                     done: true,
+                    status: None,
                 }],
             },
             is_error: false,
@@ -15242,10 +15251,12 @@ mod tests {
                         zeron_proto::TodoItem {
                             text: "Inspect state".into(),
                             done: false,
+                            status: None,
                         },
                         zeron_proto::TodoItem {
                             text: "Run gates".into(),
                             done: false,
+                            status: None,
                         },
                     ],
                 },
@@ -15288,10 +15299,12 @@ mod tests {
             zeron_proto::TodoItem {
                 text: "Inspect state".into(),
                 done: false,
+                status: None,
             },
             zeron_proto::TodoItem {
                 text: "Run gates".into(),
                 done: false,
+                status: None,
             },
         ];
         let created_pending = task_snapshot_items(&[], &pending, true);
@@ -15313,10 +15326,12 @@ mod tests {
             zeron_proto::TodoItem {
                 text: "Inspect state".into(),
                 done: true,
+                status: None,
             },
             zeron_proto::TodoItem {
                 text: "Run gates".into(),
                 done: false,
+                status: None,
             },
         ];
         let update_rows = task_snapshot_items(&pending, &updated, false);
@@ -15335,6 +15350,7 @@ mod tests {
         let previous = vec![zeron_proto::TodoItem {
             text: "Inspect state".into(),
             done: false,
+            status: None,
         }];
         let entry = assistant(
             "todo-append-entry",
@@ -15347,6 +15363,7 @@ mod tests {
                         zeron_proto::TodoItem {
                             text: "Run gates".into(),
                             done: false,
+                            status: None,
                         },
                     ],
                 },
@@ -15387,6 +15404,7 @@ mod tests {
                 .map(|index| zeron_proto::TodoItem {
                     text: format!("Task {index}"),
                     done: index <= completed,
+                    status: None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -15444,15 +15462,18 @@ mod tests {
             zeron_proto::TodoItem {
                 text: "a".into(),
                 done: false,
+                status: None,
             },
             zeron_proto::TodoItem {
                 text: "b".into(),
                 done: false,
+                status: None,
             },
         ];
         let joined = vec![zeron_proto::TodoItem {
             text: "a\0b".into(),
             done: false,
+            status: None,
         }];
         assert_ne!(
             todo_snapshot_version(&[], &split, true, false, false),
@@ -17294,14 +17315,8 @@ mod tests {
         );
         let todo = ToolCall::Todo {
             items: vec![
-                zeron_proto::TodoItem {
-                    text: "a".into(),
-                    done: true,
-                },
-                zeron_proto::TodoItem {
-                    text: "b".into(),
-                    done: false,
-                },
+                zeron_proto::TodoItem::new("a", zeron_proto::TodoStatus::Completed),
+                zeron_proto::TodoItem::new("b", zeron_proto::TodoStatus::Pending),
             ],
         };
         assert_eq!(tool_chip_content(&todo), ("Todo", "1/2 done".to_string()));
@@ -17378,21 +17393,16 @@ mod tests {
         // Todos list one item per line with checkbox state.
         let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {
             items: vec![
-                zeron_proto::TodoItem {
-                    text: "a".into(),
-                    done: true,
-                },
-                zeron_proto::TodoItem {
-                    text: "b".into(),
-                    done: false,
-                },
+                zeron_proto::TodoItem::new("a", zeron_proto::TodoStatus::Completed),
+                zeron_proto::TodoItem::new("b", zeron_proto::TodoStatus::InProgress),
+                zeron_proto::TodoItem::new("c", zeron_proto::TodoStatus::Pending),
             ],
         }) else {
             panic!("expected an output block")
         };
         assert_eq!(
             lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
-            vec!["[x] a", "[ ] b"]
+            vec!["[x] a", "[~] b", "[ ] c"]
         );
 
         // Blank invocation → no block; the chip stays a plain card.
@@ -17598,6 +17608,7 @@ mod tests {
                 items: vec![TodoItem {
                     text: "task".into(),
                     done: false,
+                    status: None,
                 }],
             },
         ] {
@@ -17631,6 +17642,7 @@ mod tests {
         let items = vec![TodoItem {
             text: "task".into(),
             done: false,
+            status: None,
         }];
         let mut part = tool_part("todo", "test");
         if let MessagePart::Tool { call, .. } = &mut part {
@@ -17654,10 +17666,12 @@ mod tests {
             TodoItem {
                 text: "verify".into(),
                 done: true,
+                status: None,
             },
             TodoItem {
                 text: "verify".into(),
                 done: false,
+                status: None,
             },
         ];
         assert!(task_snapshot_items(&previous, &previous, false).is_empty());
@@ -17747,6 +17761,7 @@ mod tests {
         let items = vec![TodoItem {
             text: "keep".into(),
             done: false,
+            status: None,
         }];
         let mut good = tool_part("good", "test");
         let mut bad = tool_part("bad", "test");

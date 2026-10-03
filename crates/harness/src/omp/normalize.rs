@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, SlashCommand, TodoItem, ToolCall, ToolDiff,
+    AgentEvent, DoneStatus, HarnessId, SlashCommand, TodoItem, TodoStatus, ToolCall, ToolDiff,
     ToolExecutionMeta, WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
 };
 
@@ -854,10 +854,7 @@ fn todo_items_from_input(input: &Value) -> Option<Vec<TodoItem>> {
     Some(
         items
             .into_iter()
-            .map(|text| TodoItem {
-                text: text.to_owned(),
-                done: false,
-            })
+            .map(|text| TodoItem::new(text, TodoStatus::Pending))
             .collect(),
     )
 }
@@ -871,14 +868,12 @@ fn todo_items_from_phases(phases: &Value) -> Option<Vec<TodoItem>> {
             .flatten()
             .filter_map(|task| {
                 let text = task.get("content").and_then(Value::as_str)?;
-                let done = matches!(
-                    task.get("status").and_then(Value::as_str),
-                    Some("completed" | "abandoned")
-                );
-                Some(TodoItem {
-                    text: text.to_owned(),
-                    done,
-                })
+                let status = match task.get("status").and_then(Value::as_str) {
+                    Some("completed" | "abandoned") => TodoStatus::Completed,
+                    Some("in_progress" | "inProgress" | "in-progress") => TodoStatus::InProgress,
+                    _ => TodoStatus::Pending,
+                };
+                Some(TodoItem::new(text, status))
             })
             .collect(),
     )

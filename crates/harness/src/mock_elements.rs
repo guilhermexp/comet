@@ -132,11 +132,11 @@ pub(super) fn script() -> Vec<AgentEvent> {
                     TodoItem {
                         text: "Inspect output".into(),
                         done: true,
-                    },
+                     status: None, },
                     TodoItem {
                         text: "Review layout".into(),
                         done: false,
-                    },
+                     status: None, },
                 ],
             },
             false,
@@ -148,11 +148,11 @@ pub(super) fn script() -> Vec<AgentEvent> {
                     TodoItem {
                         text: "Inspect output".into(),
                         done: true,
-                    },
+                     status: None, },
                     TodoItem {
                         text: "Review layout".into(),
                         done: false,
-                    },
+                     status: None, },
                 ],
             },
             false,
