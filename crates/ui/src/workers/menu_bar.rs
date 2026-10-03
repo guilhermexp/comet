@@ -135,7 +135,7 @@ impl Global for WorkersMenuBarGlobal {}
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::ffi::CString;
+    use std::ffi::{CString, c_void};
     use std::sync::mpsc::Sender;
     use std::sync::{Mutex, OnceLock};
 
@@ -233,6 +233,58 @@ mod platform {
             let target: *mut Object = msg_send![class, new];
             target as usize
         }) as *mut Object
+    }
+
+    unsafe extern "C" {
+        #[link_name = "_dispatch_main_q"]
+        static DISPATCH_MAIN_QUEUE: c_void;
+        fn dispatch_async_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+
+    /// A popover show (`button` set) or close (`button` null), retained for
+    /// the hop to the main queue.
+    struct PopoverOp {
+        popover: *mut Object,
+        button: *mut Object,
+    }
+
+    /// Showing or closing the popover moves key-window status, and AppKit
+    /// answers that synchronously by asking the main GPUI window for a frame.
+    /// Called from inside an entity update (the intent loop), that re-entered
+    /// the borrowed App: "RefCell already borrowed" (twice) on every session
+    /// picked from the menu bar. Run the AppKit side after the update instead.
+    unsafe fn post_popover_op(popover: *mut Object, button: *mut Object) {
+        unsafe {
+            let _: *mut Object = msg_send![popover, retain];
+            if !button.is_null() {
+                let _: *mut Object = msg_send![button, retain];
+            }
+            dispatch_async_f(
+                std::ptr::addr_of!(DISPATCH_MAIN_QUEUE).cast_mut(),
+                Box::into_raw(Box::new(PopoverOp { popover, button })).cast::<c_void>(),
+                run_popover_op,
+            );
+        }
+    }
+
+    extern "C" fn run_popover_op(context: *mut c_void) {
+        let op = unsafe { Box::from_raw(context.cast::<PopoverOp>()) };
+        unsafe {
+            if op.button.is_null() {
+                let _: () = msg_send![op.popover, performClose: std::ptr::null_mut::<Object>()];
+            } else {
+                let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+                let _: () = msg_send![app, activateIgnoringOtherApps: true];
+                let bounds: NSRect = msg_send![op.button, bounds];
+                let _: () = msg_send![op.popover, showRelativeToRect: bounds ofView: op.button preferredEdge: 1_u64];
+                let _: () = msg_send![op.button, release];
+            }
+            let _: () = msg_send![op.popover, release];
+        }
     }
 
     pub struct NativeMenuBar {
@@ -356,18 +408,13 @@ mod platform {
                     self.close();
                     return;
                 }
-                let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
-                let _: () = msg_send![app, activateIgnoringOtherApps: true];
                 let button: *mut Object = msg_send![self.status_item, button];
-                let bounds: NSRect = msg_send![button, bounds];
-                let _: () = msg_send![self.popover, showRelativeToRect: bounds ofView: button preferredEdge: 1_u64];
+                post_popover_op(self.popover, button);
             }
         }
 
         pub fn close(&mut self) {
-            unsafe {
-                let _: () = msg_send![self.popover, performClose: std::ptr::null_mut::<Object>()];
-            }
+            unsafe { post_popover_op(self.popover, std::ptr::null_mut()) };
         }
 
         pub fn tick_spinner(&mut self) {

@@ -5,7 +5,19 @@ Workers, and native session menus did not reproduce the historical GPUI borrow
 error. No speculative callback mutation was made; these tasks remain open until
 a failing callback can be observed.
 
-- [ ] 1.1 Re-read concurrent UI diffs, identify candidate nested window/entity updates, and add scoped callback identity to the native diagnostic path.
+2026-10-01 log evidence: two `gpui::window` borrow errors 1 ms apart, ~1 s before
+diff-sync started watching a Chat in another project. Two errors on a clean
+window match one re-entered `on_request_frame` (`window.rs` thermal-state and
+`complete_frame` updates), which AppKit drives synchronously from
+`windowDidBecomeKey`. Candidate: the Workers menu-bar intent loop closed/showed
+the `NSPopover` inside an entity update (`SelectSession` → `performClose:` hands
+key status back to the main window). Candidate fix applied: popover show/close
+now run on the main queue after the update (`post_popover_op`). Confirmation
+still requires the headed check in 1.2 (pick a session in another project from
+the menu-bar popover; check the errors' `line` fields are 1540/1626 before the
+fix and absent after).
+
+- [x] 1.1 Re-read concurrent UI diffs, identify candidate nested window/entity updates, and add scoped callback identity to the native diagnostic path.
 - [ ] 1.2 Reproduce `RefCell already borrowed` through a real headed interaction and record the exact callback without changing behavior.
 - [ ] 1.3 Add the smallest failing state-transition regression available for the confirmed callback.
 - [ ] 1.4 Remove the confirmed nested mutation or defer it to the correct GPUI boundary, then prove the focused regression and repeated headed smoke are clean.
