@@ -12,11 +12,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::project_activity::{self, ArchiveFailure, ProjectEntry};
+use crate::project_tickets::{self, Ticket};
 use crate::space_registry::{ENGINE_ENDPOINT_ENV, RpcSpaceRegistry, SpaceRef, SpaceRegistry};
 use crate::{
-    InitialTextSubmitMode, LocalWorkersClient, SessionAction, WorkersCreateWorktreeRequest,
-    WorkersLaunchRequest, WorkersProject, WorkersSession, WorkersSessionCommand,
-    WorkersWorktreeLaunchResult,
+    InitialTextSubmitMode, LocalWorkersClient, SessionAction, WorkerParentLink,
+    WorkersCreateWorktreeRequest, WorkersLaunchRequest, WorkersProject, WorkersSession,
+    WorkersSessionCommand, WorkersWorktreeLaunchResult,
 };
 
 #[cfg(test)]
@@ -810,6 +812,11 @@ fn dispatch_action(
         "help" => Ok(json!({
             "actions": ACTIONS,
             "workflow": "list_projects (add_project when the folder is not a listed project) -> list_presets -> launch_worker (project id = its principal checkout; checkout id = that exact checkout) -> wait_for_status(status=completed)/read_output -> stop_worker/archive_worker. For each independent slice, launch a separate Worker with new_worktree={branch, base_ref?}; leave worktree_path/worktree_branch unset. Omit all worktree selectors only when sharing the project checkout is intentional, or use the existing worktree_path/worktree_branch pair to target a known checkout. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
+            "list_projects": {
+                "projects": "Every registry project (id, name, path, device_id, device_name, git, local) with its local checkouts; registrations without a project are listed apart under association_pending.",
+                "activity": "Each project also carries what Settings → Projects shows: general (added_at_unix_ms, last_opened_at_unix_ms, and for a local project remote_url and default_branch), tickets (harness tickets of the Orchestrator workspace matched by checkout cwd, or by harness folder name only when the cwd is in no registered project: counts per status, every open ticket and the 5 most recent others, each with id, title, status, created, cwd, next), worker_sessions (counts live/stopped/archived, every live session and the 5 most recent stopped and archived, each with session_id, title, checkout_id, provider, state, activity, updated_at_unix_ms; always empty for a project of another device) and orchestrator_sessions (the project's chats: counts live/archived and the 5 most recent with chat_id, title, archived, workers_launched, last_activity_unix_ms).",
+                "unreadable_source": "Only an unreadable registry fails the call. Any other source that cannot be read leaves its section empty with an error naming it, and the listing still answers: unreadable Workers state lists every project with no checkouts and the error in worker_sessions. A source read in part keeps what it read and adds the error."
+            },
             "wait_for_status": {
                 "target": "Use status='completed' to wait until the worker finished its task.",
                 "lifecycle_distinction": "idle matches any pause (including a worker waiting on its own subagents) and exited matches only a dead process; neither idle nor exited means the task finished.",
@@ -1549,17 +1556,58 @@ fn controller_registry() -> Result<RpcSpaceRegistry, String> {
 /// Every registry project with the chat MCP's id, name, path and device, and
 /// for local projects the checkouts linked to it. A registration without a
 /// project is never a project: it is listed apart as association-pending.
+///
+/// Each project also carries what Settings → Projects shows in its General,
+/// Tickets, Worker sessions and Orchestrator sessions tabs, through the same
+/// readers ([`project_activity`], [`project_tickets`]). Only the registry
+/// fails the call. Any other source that cannot be read leaves its section
+/// empty with an `error`: unreadable Workers state lists every project with
+/// no checkouts and names the state in `worker_sessions`. A source read in
+/// part keeps what it read and adds the `error`.
 pub(crate) fn projects_listing(
     client: &LocalWorkersClient,
-    registry: &dyn SpaceRegistry,
+    registry: &RpcSpaceRegistry,
 ) -> Result<Value, String> {
-    let spaces = registry.list()?;
-    let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
+    let registry = registry.read_with_chats()?;
+    let bootstrap = client
+        .bootstrap()
+        .map_err(|error| format!("Workers state: {error}"));
     let checkouts: Vec<&WorkersProject> = bootstrap
-        .projects
-        .iter()
-        .filter(|project| !project.is_group)
-        .collect();
+        .as_ref()
+        .map(|bootstrap| {
+            bootstrap
+                .projects
+                .iter()
+                .filter(|project| !project.is_group)
+                .collect()
+        })
+        .unwrap_or_default();
+    let chats = registry.chats.as_deref().unwrap_or_default();
+    let rows = project_activity::checkout_rows(client)
+        .map(|(rows, _)| rows)
+        .map_err(|error| format!("Workers checkout history: {error}"));
+    let (entries, _) = project_activity::project_entries(
+        &registry.spaces,
+        &registry.devices,
+        Some(&registry.local_device_id),
+        chats,
+        rows.as_deref().unwrap_or_default(),
+    );
+    let workers = match (&bootstrap, &rows) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error.clone()),
+        (Ok(bootstrap), Ok(rows)) => Ok(project_activity::with_archived_sessions(
+            client,
+            bootstrap.sessions.clone(),
+            rows,
+        )),
+    };
+    let links = crate::worker_parent_links().unwrap_or_default();
+    // The listing needs no spec links: `read_tickets` runs no git.
+    let tickets = project_tickets::orchestrator_workspace()
+        .ok_or_else(|| {
+            "Orchestrator workspace unknown: neither ORCH_WORKSPACE nor HOME is set".to_owned()
+        })
+        .and_then(|workspace| project_tickets::read_tickets(&workspace));
     let linked = |space: &SpaceRef| -> Vec<Value> {
         checkouts
             .iter()
@@ -1569,28 +1617,213 @@ pub(crate) fn projects_listing(
     };
     let known = |project: &WorkersProject| {
         project.space_id.as_deref().is_some_and(|space_id| {
-            spaces
+            entries
                 .iter()
-                .any(|space| space.local && space.id == space_id)
+                .any(|entry| entry.space.local && entry.space.id == space_id)
         })
     };
     Ok(json!({
-        "projects": spaces.iter().map(|space| json!({
-            "id": space.id,
-            "name": space.name,
-            "path": space.path,
-            "device_id": space.device_id,
-            "device_name": space.device_name,
-            "git": space.git,
-            "local": space.local,
-            "checkouts": linked(space),
-        })).collect::<Vec<_>>(),
+        "projects": entries.iter().map(|entry| {
+            let space = &entry.space;
+            json!({
+                "id": space.id,
+                "name": space.name,
+                "path": space.path,
+                "device_id": space.device_id,
+                "device_name": space.device_name,
+                "git": space.git,
+                "local": space.local,
+                "checkouts": linked(space),
+                "general": general_json(entry),
+                "tickets": tickets_json(entry, &entries, &tickets),
+                "worker_sessions": worker_sessions_json(entry, &workers, &links),
+                "orchestrator_sessions": orchestrator_sessions_json(entry, &registry.chats, &links),
+            })
+        }).collect::<Vec<_>>(),
         "association_pending": checkouts
             .iter()
             .filter(|project| !known(project))
             .map(|project| checkout_json(project, None))
             .collect::<Vec<_>>(),
     }))
+}
+
+/// Older entries past this many are only counted.
+const ACTIVITY_RECENT: usize = 5;
+
+/// General tab: when the project was added to the registry and last opened,
+/// and, for a local project, its repository's remote and default branch.
+fn general_json(entry: &ProjectEntry) -> Value {
+    let (remote_url, default_branch) = if entry.space.local {
+        let path = std::path::Path::new(&entry.space.path);
+        (
+            crate::project_git::status(path).remote_url,
+            crate::branch_cleanup::default_branch_name(path)
+                .ok()
+                .flatten(),
+        )
+    } else {
+        (None, None)
+    };
+    json!({
+        "added_at_unix_ms": entry.created_at_ms,
+        "last_opened_at_unix_ms": (entry.last_activity_ms > 0).then_some(entry.last_activity_ms),
+        "remote_url": remote_url,
+        "default_branch": default_branch,
+    })
+}
+
+/// Tickets tab: count per status, every open ticket and the most recent
+/// others, newest first.
+fn tickets_json(
+    entry: &ProjectEntry,
+    projects: &[ProjectEntry],
+    tickets: &Result<Vec<Ticket>, String>,
+) -> Value {
+    let tickets = match tickets {
+        Ok(tickets) => project_tickets::tickets_for_project(entry, projects, tickets),
+        Err(error) => {
+            return json!({ "counts": {}, "open": [], "recent": [], "error": error });
+        }
+    };
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for ticket in &tickets {
+        *counts.entry(ticket.status.as_str()).or_default() += 1;
+    }
+    let row = |ticket: &&Ticket| {
+        json!({
+            "id": ticket.id,
+            "title": ticket.title,
+            "status": ticket.status,
+            "created": ticket.created,
+            "cwd": ticket.cwd,
+            "next": ticket.next,
+        })
+    };
+    json!({
+        "counts": counts,
+        "open": tickets.iter().filter(|ticket| ticket.status == "open").map(row).collect::<Vec<_>>(),
+        "recent": tickets
+            .iter()
+            .filter(|ticket| ticket.status != "open")
+            .take(ACTIVITY_RECENT)
+            .map(row)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Worker sessions tab: every live session and the most recent stopped and
+/// archived ones. Worker sessions are device-local: a project of another
+/// device has none. A checkout of the project whose archive could not be
+/// read is named in `error`, beside the sessions that were read.
+fn worker_sessions_json(
+    entry: &ProjectEntry,
+    workers: &Result<(Vec<WorkersSession>, Vec<ArchiveFailure>), String>,
+    links: &[WorkerParentLink],
+) -> Value {
+    let empty = |error: Option<&str>| {
+        let mut section = json!({
+            "counts": { "live": 0, "stopped": 0, "archived": 0 },
+            "live": [], "stopped": [], "archived": [],
+        });
+        if let Some(error) = error {
+            section["error"] = json!(error);
+        }
+        section
+    };
+    if !entry.space.local {
+        return empty(None);
+    }
+    let (workers, failures) = match workers {
+        Ok(workers) => workers,
+        Err(error) => return empty(Some(error)),
+    };
+    let archive_errors: Vec<String> = failures
+        .iter()
+        .filter(|failure| {
+            entry
+                .group
+                .checkouts
+                .iter()
+                .any(|row| row.project_id.as_deref() == Some(failure.project_id.as_str()))
+        })
+        .map(|failure| {
+            format!(
+                "Workers archive of checkout {}: {}",
+                failure.project_id, failure.error
+            )
+        })
+        .collect();
+    let sessions = project_activity::project_sessions(entry, workers);
+    let row = |session: &WorkersSession| {
+        json!({
+            "session_id": session.id,
+            "title": session.title,
+            "checkout_id": session.project_id,
+            "provider": project_activity::worker_provider(session),
+            "state": session.state,
+            "activity": session.activity,
+            "archived": session.archived,
+            "updated_at_unix_ms": session.updated_at_unix_ms,
+            "parent_chat_id": links
+                .iter()
+                .find(|link| link.worker_session_id == session.id)
+                .map(|link| link.parent_chat_id.as_str()),
+        })
+    };
+    let live: Vec<&WorkersSession> = sessions
+        .iter()
+        .map(|(session, _)| *session)
+        .filter(|session| session.is_live() && !session.archived)
+        .collect();
+    let archived: Vec<&WorkersSession> = sessions
+        .iter()
+        .map(|(session, _)| *session)
+        .filter(|session| session.archived)
+        .collect();
+    let stopped: Vec<&WorkersSession> = sessions
+        .iter()
+        .map(|(session, _)| *session)
+        .filter(|session| !session.is_live() && !session.archived)
+        .collect();
+    let mut section = json!({
+        "counts": { "live": live.len(), "stopped": stopped.len(), "archived": archived.len() },
+        "live": live.iter().map(|session| row(session)).collect::<Vec<_>>(),
+        "stopped": stopped.iter().take(ACTIVITY_RECENT).map(|session| row(session)).collect::<Vec<_>>(),
+        "archived": archived.iter().take(ACTIVITY_RECENT).map(|session| row(session)).collect::<Vec<_>>(),
+    });
+    if !archive_errors.is_empty() {
+        section["error"] = json!(archive_errors.join("; "));
+    }
+    section
+}
+
+/// Orchestrator sessions tab: the project's chats, counted live and
+/// archived, the most recent first.
+fn orchestrator_sessions_json(
+    entry: &ProjectEntry,
+    chats: &Result<Vec<zeron_proto::Chat>, String>,
+    links: &[WorkerParentLink],
+) -> Value {
+    let chats = match chats {
+        Ok(chats) => project_activity::project_chats(entry, chats),
+        Err(error) => {
+            return json!({
+                "counts": { "live": 0, "archived": 0 }, "recent": [], "error": error,
+            });
+        }
+    };
+    let archived = chats.iter().filter(|chat| chat.archived).count();
+    json!({
+        "counts": { "live": chats.len() - archived, "archived": archived },
+        "recent": chats.iter().take(ACTIVITY_RECENT).map(|chat| json!({
+            "chat_id": chat.id,
+            "title": project_activity::chat_title(chat),
+            "archived": chat.archived,
+            "workers_launched": project_activity::launched_workers(&chat.id, links),
+            "last_activity_unix_ms": project_activity::chat_last_activity_ms(chat),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn checkout_json(project: &WorkersProject, space: Option<&SpaceRef>) -> Value {
@@ -1852,7 +2085,9 @@ fn tool_definition() -> Value {
         maintenance — stays in the orchestrator session; complex, large, or \
         isolation-requiring work goes through a worker. `task` \
         subagents stay inside the caller's session for read-only research and never \
-        write to a project. Loop: `list_projects` to resolve the project — when no \
+        write to a project. Loop: `list_projects` to resolve the project (each one \
+        also carries its tickets, Worker sessions and Orchestrator chats, as Settings \
+        → Projects shows them) — when no \
         listed project's path IS the target checkout, `add_project` it and launch \
         into the id that comes back, never into an ancestor project: a worker \
         started one level up runs every command, gate and relative path against \
@@ -1941,4 +2176,123 @@ fn tool_success(id: Value, value: Value) -> Value {
             "isError": false
         }),
     )
+}
+
+#[cfg(test)]
+mod project_activity_tests {
+    use super::*;
+    use crate::project_ledger::{AssociationState, ProjectGroup, ProjectRow};
+    use crate::{WorkersError, WorkersSessionCapabilities};
+
+    fn checkout(project_id: &str) -> ProjectRow {
+        ProjectRow {
+            project_id: Some(project_id.to_owned()),
+            path: format!("/p/{project_id}"),
+            name: project_id.to_owned(),
+            added_at_unix_ms: 0,
+            last_opened_at_unix_ms: 0,
+            icon_path: None,
+            repository_id: None,
+            checkout_id: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            current_branch: None,
+            last_known_branch: None,
+            association: AssociationState::Known,
+            archived: false,
+            space_id: Some("space-a".to_owned()),
+        }
+    }
+
+    fn project(id: &str, checkouts: Vec<ProjectRow>) -> ProjectEntry {
+        ProjectEntry {
+            space: SpaceRef {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                path: format!("/p/{id}"),
+                device_id: "device-local".to_owned(),
+                device_name: None,
+                git: true,
+                local: true,
+            },
+            created_at_ms: 0,
+            group: ProjectGroup {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                icon_path: None,
+                added_at_unix_ms: 0,
+                last_opened_at_unix_ms: 0,
+                checkouts,
+            },
+            last_activity_ms: 0,
+        }
+    }
+
+    fn session(id: &str, project_id: &str, archived: bool) -> WorkersSession {
+        WorkersSession {
+            id: id.to_owned(),
+            project_id: project_id.to_owned(),
+            title: id.to_owned(),
+            command: "claude".to_owned(),
+            state: if archived { "exited" } else { "running" }.to_owned(),
+            activity: "idle".to_owned(),
+            unread: false,
+            pinned: false,
+            archived,
+            provider_id: None,
+            active_runtime_id: None,
+            runtime_launch_pending: false,
+            runtime_generation: 0,
+            notify_when_done: false,
+            terminal_background_hex: None,
+            worktree_branch: None,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
+            total_tokens: None,
+            model_usage: Vec::new(),
+            capabilities: WorkersSessionCapabilities::default(),
+        }
+    }
+
+    /// A checkout whose archive cannot be read keeps the sessions read and
+    /// names that checkout in its project's `worker_sessions.error` only.
+    #[test]
+    fn an_unreadable_archive_keeps_the_sessions_read_and_names_the_checkout() {
+        let rows = vec![checkout("comet-a"), checkout("comet-b")];
+        let merged = project_activity::merge_archived_sessions(
+            vec![session("w-live", "comet-a", false)],
+            &rows,
+            |project_id| match project_id {
+                "comet-a" => Ok(vec![session("w-old", "comet-a", true)]),
+                _ => Err(WorkersError::Upstream {
+                    status: 500,
+                    message: "archive context unavailable".to_owned(),
+                }),
+            },
+        );
+        let workers = Ok(merged);
+
+        let owner = worker_sessions_json(&project("space-a", rows.clone()), &workers, &[]);
+        assert_eq!(
+            owner["counts"],
+            json!({ "live": 1, "stopped": 0, "archived": 1 }),
+            "{owner}"
+        );
+        assert_eq!(owner["archived"][0]["session_id"], "w-old");
+        assert_eq!(
+            owner["error"],
+            "Workers archive of checkout comet-b: Unpeel request failed with status 500: archive context unavailable"
+        );
+
+        let other = worker_sessions_json(
+            &project("space-c", vec![checkout("comet-c")]),
+            &workers,
+            &[],
+        );
+        assert!(other.get("error").is_none(), "{other}");
+    }
 }

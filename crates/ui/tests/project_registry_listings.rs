@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_proto::{Chat, Device, Space};
 use zeron_rpc::methods;
-use zeron_ui::settings::project_catalog::{project_entries, rename_project_params};
+use zeron_ui::settings::project_catalog::rename_project_params;
 use zeron_workers_unpeel::LocalWorkersClient;
-use zeron_workers_unpeel::project_ledger;
+use zeron_workers_unpeel::project_activity::{checkout_rows, project_entries};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
@@ -183,13 +183,9 @@ async fn chat_mcp_workers_controller_and_settings_list_the_same_projects() {
     let devices: Vec<Device> = snapshot(&client, methods::WATCH_DEVICES).await;
     let chats: Vec<Chat> = snapshot(&client, methods::WATCH_CHATS).await;
     let workers_client = LocalWorkersClient::new();
-    let rows = tokio::task::spawn_blocking(move || {
-        let rows = workers_client.projects_with_ledger().unwrap();
-        let identity = workers_client.project_identity_registry().unwrap();
-        project_ledger::decorate_with_identity(rows, &identity)
-    })
-    .await
-    .unwrap();
+    let rows = tokio::task::spawn_blocking(move || checkout_rows(&workers_client).unwrap().0)
+        .await
+        .unwrap();
     let (entries, pending) = project_entries(&spaces, &devices, Some(&local), &chats, &rows);
     let settings_listing: Listing = entries
         .iter()

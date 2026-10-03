@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use zeron_proto::{Device, Space};
+use zeron_proto::{Chat, Device, Space};
 
 /// Environment entry naming the engine endpoint for the controller MCP child.
 pub const ENGINE_ENDPOINT_ENV: &str = "COMET_WORKERS_ENGINE_ENDPOINT";
@@ -140,6 +140,32 @@ impl RpcSpaceRegistry {
         .map_err(|_| format!("project registry thread for {label} panicked"))?
         .map_err(|error| format!("project registry unreachable (engine at {label}): {error}"))
     }
+
+    /// The registry as the project activity needs it: Spaces with their
+    /// creation time, devices, the local device and the chats. The chats are
+    /// read apart, so an unreadable chat list leaves the projects readable.
+    pub fn read_with_chats(&self) -> Result<RegistrySnapshot, String> {
+        self.exchange(|client| async move {
+            let local_device_id = local_device(&client).await?;
+            let spaces = snapshot(&client, zeron_rpc::methods::WATCH_SPACES).await?;
+            let devices = snapshot(&client, zeron_rpc::methods::WATCH_DEVICES).await?;
+            let chats = snapshot(&client, zeron_rpc::methods::WATCH_CHATS).await;
+            Ok(RegistrySnapshot {
+                local_device_id,
+                spaces,
+                devices,
+                chats,
+            })
+        })
+    }
+}
+
+/// One read of the registry with the chats ([`RpcSpaceRegistry::read_with_chats`]).
+pub struct RegistrySnapshot {
+    pub local_device_id: String,
+    pub spaces: Vec<Space>,
+    pub devices: Vec<Device>,
+    pub chats: Result<Vec<Chat>, String>,
 }
 
 async fn snapshot<T: serde::de::DeserializeOwned>(
