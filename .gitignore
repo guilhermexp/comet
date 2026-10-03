@@ -19,6 +19,6 @@ progress.md
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
-.agents
-.claude
-CLAUDE.md
+
+# Orchestrator chat uploads written into the workspace at runtime
+.orchestrator/

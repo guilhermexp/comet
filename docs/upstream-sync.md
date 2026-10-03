@@ -85,6 +85,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Mermaid no chat do upstream (`markdown/mermaid_cache.rs`) | #760 | v0.2.102 | O fork já desenha Mermaid no chat com engine própria (QuickJS). Entraram só as partes fora do chat; o cache ficou dormente (`allow(dead_code)`) |
 | Rótulo de branch no rodapé do composer | #744 | v0.2.102 | O fork tirou a branch do rodapé (vai no Details, `01920115`) |
 | Caminhos de drive Windows no seletor de pasta | #727 | v0.2.102 | Fork só roda em macOS; revertido dentro do merge |
+| Ignorar `.agents`, `.claude` e `CLAUDE.md` no `.gitignore` | 7d454cfe | v0.2.102 | O fork versiona os três (skills, comandos OpenSpec, CLAUDE.md); a regra escondia arquivos novos ali |
 | Workflow macOS separado, pins de action por SHA, Dependabot | CI | v0.2.102 | O fork mantém os próprios workflows (gate por path). `macos.yml`, `dependabot.yml`, `run-macos-fixture.sh`, `cursor-sdk-update.yml` e `testflight.yml` ficam fora |
 | Instalador Linux com updater em `~/.zeron/app` | #627 | v0.2.102 | Fork sem feed próprio. Entraram só as licenças das fontes e do Parakeet |
 
