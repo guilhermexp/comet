@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Dictate into your draft using on-device Parakeet transcription.</string>
+  <string>Zeron uses the microphone for on-device dictation and realtime voice conversations with your coding agent.</string>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>

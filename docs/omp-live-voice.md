@@ -522,7 +522,7 @@ The app bundle declares:
 
 ```xml
 <key>NSMicrophoneUsageDescription</key>
-<string>Comet uses the microphone for realtime voice conversations with your coding agent.</string>
+<string>Zeron uses the microphone for on-device dictation and realtime voice conversations with your coding agent.</string>
 ```
 
 Source: [`dist/macos/Info.plist`](../dist/macos/Info.plist).
@@ -534,7 +534,7 @@ CODESIGN_IDENTITY="Apple Development: …" scripts/package-macos.sh
 codesign --verify --deep --strict --verbose=2 target/package/Zeron.app
 ```
 
-Artifacts:
+Outside CI the script also replaces `/Applications/Zeron.app` with this bundle and launches it (`ZERON_PACKAGE_INSTALL=0` skips that). Artifacts:
 
 ```text
 target/package/Zeron.app

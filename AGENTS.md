@@ -30,7 +30,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Demo local offline (harness mock, seeded) | `scripts/dev-demo.sh` (`--slow` pra ver streaming) |
 | Smoke e2e | `scripts/e2e-smoke.sh` |
 | Edge | `npm -C edge run dev\|test\|typecheck\|deploy` |
-| Packaging | `scripts/package-linux.sh` · `scripts/package-macos.sh` |
+| Packaging | `scripts/package-linux.sh` · `scripts/package-macos.sh` (local: também instala em `/Applications/Zeron.app` e abre) |
 
 O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes executáveis da extensão lifecycle pi-family do Unpeel vendorizado.
 
