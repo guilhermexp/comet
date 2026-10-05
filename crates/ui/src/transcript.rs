@@ -8386,6 +8386,7 @@ impl Transcript {
                     notice.title.clone(),
                     verb,
                     tone,
+                    None,
                     &theme,
                     cx,
                 )
@@ -8409,7 +8410,9 @@ impl Transcript {
     }
 
     /// One Codex-style Worker lifecycle line: the Worker's harness mark, its
-    /// name, what happened. Opens the Worker when its session is known.
+    /// name, what happened. Opens the Worker when its session is known. The
+    /// known session's mark wins; `fallback_icon` (the launch preset's) covers
+    /// a session the catalog cannot resolve, before the generic bot.
     #[allow(clippy::too_many_arguments)]
     fn render_worker_line(
         &self,
@@ -8418,6 +8421,7 @@ impl Transcript {
         title: SharedString,
         verb: String,
         tone: gpui::Hsla,
+        fallback_icon: Option<&'static str>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -8432,7 +8436,10 @@ impl Transcript {
                 .as_ref()
                 .and_then(|id| state.workers_tool_catalog.sessions.get(id.as_ref()));
             (
-                label.map_or(crate::icons::BOT, |label| label.icon),
+                label
+                    .map(|label| label.icon)
+                    .or(fallback_icon)
+                    .unwrap_or(crate::icons::BOT),
                 label
                     .map(|label| label.name.trim())
                     .filter(|name| !name.is_empty())
@@ -10521,8 +10528,9 @@ impl Transcript {
                 {
                     let preset = worker_chips[ix]
                         .as_ref()
-                        .and_then(|chips| chips.identity.as_ref())
-                        .map(|label| label.name.clone());
+                        .and_then(|chips| chips.identity.as_ref());
+                    let preset_icon = preset.map(|label| label.icon);
+                    let preset = preset.map(|label| label.name.clone());
                     let session = name.as_ref().and_then(|name| {
                         self.state
                             .read(cx)
@@ -10544,6 +10552,7 @@ impl Transcript {
                         title.into(),
                         verb.to_owned(),
                         theme.text_muted,
+                        preset_icon,
                         theme,
                         cx,
                     );
