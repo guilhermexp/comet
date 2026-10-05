@@ -3957,6 +3957,64 @@ mod tests {
         assert_eq!(&*calls.borrow(), &["knip.json"]);
     }
 
+    /// A resolved file link inside an inline-chip flow box reserves its open
+    /// glyph slot at paint; the box's intrinsic width must count that slot,
+    /// or the link's trailing punctuation wraps onto a second line.
+    #[gpui::test]
+    fn file_link_in_chip_flow_keeps_trailing_punctuation_on_its_line(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        struct Fixture;
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let mut opts = RenderOptions::settled("glyph-flow".into());
+                opts.workspace_root = Some("/repo".into());
+                opts.link = Some(LinkUi {
+                    source_session: Some("chat".into()),
+                    source_local: true,
+                    file_roots: Some(Rc::new(vec![crate::workspace_links::FileLinkRoot {
+                        chat: Some("chat".into()),
+                        root: "/repo".into(),
+                        local: true,
+                    }])),
+                    handler: Rc::new(|_, _, _| LinkOutcome::Rejected),
+                });
+                let tree = super::super::parser::parse_full(
+                    "Registrei em [src/lib.rs](src/lib.rs). Veja `knip.json` agora.",
+                );
+                div()
+                    .w(px(4000.0))
+                    .child(selection_frame_reset())
+                    .child(render_tree(&tree, &opts, Theme::of(cx), window, &|_| None))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Fixture);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let wrapped = REGISTRY.with(|registry| {
+                registry
+                    .borrow()
+                    .iter()
+                    .find(|entry| entry.text.contains("lib.rs"))
+                    .map(|entry| entry.layout.wrapped_text())
+                    .expect("file link segment painted")
+            });
+            assert!(
+                !wrapped.contains('\n'),
+                "file link segment wrapped: {wrapped:?}"
+            );
+        });
+    }
+
     #[gpui::test]
     fn markdown_link_opens_without_a_frame_between_press_and_release(
         cx: &mut gpui::TestAppContext,
