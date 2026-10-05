@@ -7,6 +7,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'third_party/zui/**'
       - '.github/actions/linux-ci/**'
       - 'scripts/ci/**'
       - 'scripts/*cursor-sdk*'
@@ -23,6 +24,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'third_party/zui/**'
       - '.github/actions/linux-ci/**'
       - 'scripts/ci/**'
       - 'scripts/*cursor-sdk*'
@@ -189,6 +191,9 @@ jobs:
       - name: Native frame-source recovery regression
         working-directory: third_party/zui
         run: cargo test --release --locked -p gpui_macos --test frame_source_recovery
+      - name: Native window glass backing regression
+        working-directory: third_party/zui
+        run: cargo test --release --locked -p gpui_macos --test window_glass_backing
 
   ios-tests:
     needs: changes
