@@ -9,6 +9,11 @@ Tracks local/private fork changes against upstream.
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
 
+## 2026-10-05 — Remoção da Chat Trajectory
+
+- A Trajectory saiu inteira do fork: surface `crates/ui/src/trajectory/` e o botão no painel direito, os RPCs `WatchTrajectory`/`RevealTrajectoryRaw`, `TrajectoryStore` com captura/retenção na engine, a leitura de Raw Reveal no Run Journal e `zeron_proto::trajectory`.
+- A engine apaga `trajectory.sqlite3` (e os arquivos `-wal`/`-shm`) do store do perfil no boot. A change `repair-trajectory-observability-fidelity` foi descartada e os ADRs 0004/0005 ficaram marcados como superseded. Change: `openspec/changes/remove-chat-trajectory/`.
+
 ## 2026-09-22 — Sync de ancestralidade com upstream v0.2.83 (`d721f301`)
 
 - Merge real de `zeronsh/zeron@d721f301` em `sync/upstream-v0.2.83`, base `87123b50` (v0.2.29) via graft temporário: o upstream reassinou o histórico (só GPG; árvores idênticas). 138 arquivos / 1.339 hunks resolvidos.

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded
 ---
 # Trajectory uses a separate local read model
 
@@ -12,3 +12,7 @@ Reading the Run Journal directly was rejected because it couples product UI to a
 ## Consequences
 
 A Chat shows the complete Trajectory captured on the current device, separated by run boundaries; runs executed elsewhere are unavailable locally. New runs can provide exact duration and timing, while legacy journals degrade honestly to sequence order. The Chat Transcript and its exports remain unchanged.
+
+## Superseded
+
+Superseded on 2026-10-05 by the removal of the Chat Trajectory capability (`openspec/changes/remove-chat-trajectory/`). The feature, its store and its RPCs no longer exist; this record stays as history.

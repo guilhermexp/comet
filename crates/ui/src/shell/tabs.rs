@@ -369,11 +369,6 @@ impl Shell {
         let files_open = self.files_panel_open(cx);
         let files_now = self.files_visible_width(cx);
         let changes_trailing: Option<gpui::AnyElement> = if changes_active && !on_canvas {
-            let capabilities = titlebar_capabilities(
-                SidebarMode::Orchestrator,
-                !self.active_chat.is_empty(),
-                false,
-            );
             Some(
                 div()
                     .flex_none()
@@ -381,9 +376,6 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .when(capabilities.trajectory, |el| {
-                        el.child(self.render_orchestrator_trajectory_button(&theme, cx))
-                    })
                     .when(!files_open, |el| {
                         el.child(self.render_files_panel_toggle(&theme, cx))
                     })
@@ -397,19 +389,11 @@ impl Shell {
                     .into_any_element(),
             )
         } else {
-            let capabilities = titlebar_capabilities(
-                SidebarMode::Orchestrator,
-                !self.active_chat.is_empty(),
-                false,
-            );
             Some(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .when(capabilities.trajectory, |el| {
-                        el.child(self.render_orchestrator_trajectory_button(&theme, cx))
-                    })
                     .when(!on_canvas && !files_open, |el| {
                         el.child(self.render_files_panel_toggle(&theme, cx))
                     })

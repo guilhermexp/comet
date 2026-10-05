@@ -876,7 +876,7 @@ async fn zombie_relay_path_trips_the_echo_deadline() {
 }
 
 #[tokio::test]
-async fn relay_ingress_rejects_local_only_trajectory_methods() {
+async fn relay_ingress_rejects_local_only_methods() {
     let relay = FakeRelay::start().await;
     let service = TestService::new("host-a");
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
@@ -888,38 +888,36 @@ async fn relay_ingress_rejects_local_only_trajectory_methods() {
         .await
         .expect("connects to host-a over relay");
 
-    // Attempting to call RevealTrajectoryRaw without targetDeviceId over peer relay must be rejected:
-    let raw_err = client
+    // Attempting to call GenerateChatRecap without targetDeviceId over peer relay must be rejected:
+    let recap_err = client
         .call(
-            methods::REVEAL_TRAJECTORY_RAW,
-            serde_json::json!({
-                "chatId": "chat-secret",
-                "sourceSeq": 1,
-                "field": "payload"
-            }),
-        )
-        .await
-        .expect_err("RevealTrajectoryRaw must be rejected on relay ingress");
-    let raw_msg = raw_err.to_string();
-    assert!(
-        raw_msg.contains("local-only"),
-        "expected local-only error, got: {raw_msg}"
-    );
-
-    // Attempting to call WatchTrajectory without targetDeviceId over peer relay must be rejected:
-    let watch_err = client
-        .call(
-            methods::WATCH_TRAJECTORY,
+            methods::GENERATE_CHAT_RECAP,
             serde_json::json!({
                 "chatId": "chat-secret"
             }),
         )
         .await
-        .expect_err("WatchTrajectory must be rejected on relay ingress");
-    let watch_msg = watch_err.to_string();
+        .expect_err("GenerateChatRecap must be rejected on relay ingress");
+    let recap_msg = recap_err.to_string();
     assert!(
-        watch_msg.contains("local-only"),
-        "expected local-only error, got: {watch_msg}"
+        recap_msg.contains("local-only"),
+        "expected local-only error, got: {recap_msg}"
+    );
+
+    // Attempting to call ProbeLiveVoice without targetDeviceId over peer relay must be rejected:
+    let voice_err = client
+        .call(
+            methods::PROBE_LIVE_VOICE,
+            serde_json::json!({
+                "chatId": "chat-secret"
+            }),
+        )
+        .await
+        .expect_err("ProbeLiveVoice must be rejected on relay ingress");
+    let voice_msg = voice_err.to_string();
+    assert!(
+        voice_msg.contains("local-only"),
+        "expected local-only error, got: {voice_msg}"
     );
 }
 

@@ -306,12 +306,6 @@ rpc_methods! {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     APPLY_UPDATE / ApplyUpdate = "ApplyUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
-    // Trajectory (device-local read model & explicit raw reveal; strictly
-    // IPC-only, rejected at relay ingress, never forwarded).
-    /// Stream of bounded Trajectory snapshot frames and ordered live deltas.
-    WATCH_TRAJECTORY / WatchTrajectory = "WatchTrajectory" { params: crate::WatchTrajectoryParams, reply: crate::TrajectoryWatchItem, local_only: true },
-    /// Device-local unary lookup to reveal one raw field from Run Journal.
-    REVEAL_TRAJECTORY_RAW / RevealTrajectoryRaw = "RevealTrajectoryRaw" { params: crate::RevealTrajectoryRawParams, reply: crate::TrajectoryRawRevealResult, local_only: true },
     /// Generate a one-line idle session recap for the chat. Strictly device-local,
     /// rejected at relay ingress, never forwarded — so a `deadline_secs` here
     /// would be dead config: `MethodInfo::deadline` is only read when the engine
@@ -390,8 +384,6 @@ mod tests {
                 );
             }
         }
-        assert!(methods::is_local_only(methods::WATCH_TRAJECTORY));
-        assert!(methods::is_local_only(methods::REVEAL_TRAJECTORY_RAW));
         assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
         assert!(methods::is_local_only(methods::GENERATE_CHAT_RECAP));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));

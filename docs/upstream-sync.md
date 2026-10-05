@@ -46,7 +46,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
 ## Contratos do fork que sempre vencem
 
-- **Workers e harnesses:** Workers (`crates/workers-unpeel`, `WorkflowTask`, aba Workers), os harnesses OMP e Kimi, Live Voice, trajectory.
+- **Workers e harnesses:** Workers (`crates/workers-unpeel`, `WorkflowTask`, aba Workers), os harnesses OMP e Kimi, Live Voice. A Trajectory foi removida do fork em 2026-10-05 (`openspec/changes/remove-chat-trajectory/`); merges antigos que a citem não a restauram.
 - **Steering:** Enter com run ativo faz steer. A fila do upstream coexiste, mas não substitui (v0.2.83 D3).
 - **Modelo de grant MCP:**
   - `comet-workers` vai para quem pode lançar Workers.

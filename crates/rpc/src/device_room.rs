@@ -445,7 +445,7 @@ struct VirtualConn {
 ///
 /// Rejects any device-local method ([`crate::methods::is_local_only`]) before
 /// reaching the inner dispatch loop, ensuring remote peers cannot invoke local-only
-/// Trajectory or Live Voice methods over the relay regardless of param shape.
+/// Live Voice or recap methods over the relay regardless of param shape.
 struct RelayPeerService {
     inner: Arc<dyn RpcService>,
 }

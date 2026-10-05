@@ -67,7 +67,6 @@ use crate::state::{
 };
 use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, ToggleTerminal};
 use crate::theme::Theme;
-use crate::trajectory::TrajectoryView;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workers::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
@@ -837,9 +836,7 @@ fn sidebar_mode_switch_catalog(
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct TitlebarCapabilities {
     right_pane: bool,
-    trajectory: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkersPanelContext {
     key: String,
@@ -858,7 +855,6 @@ fn titlebar_capabilities(
     };
     TitlebarCapabilities {
         right_pane: available,
-        trajectory: matches!(mode, SidebarMode::Orchestrator) && has_orchestrator_chat,
     }
 }
 
@@ -959,8 +955,6 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
-    /// A Chat's technical trajectory preview. The handle keys [`Shell::trajectory_tabs`].
-    Trajectory(u64),
     /// A side chat forked from the conversation (`shell/side_chats.rs`). The
     /// handle keys [`Shell::side_chats`].
     SideChat(u64),
@@ -977,55 +971,6 @@ fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface
 
 fn workspace_file_title(path: &str) -> SharedString {
     path.rsplit('/').next().unwrap_or(path).to_string().into()
-}
-
-struct TrajectoryTab<T = Entity<TrajectoryView>> {
-    chat_id: String,
-    title: SharedString,
-    view: T,
-}
-
-fn register_trajectory_surface<T>(
-    surfaces: &mut std::collections::HashMap<u64, TrajectoryTab<T>>,
-    sequence: &mut u64,
-    chat_id: &str,
-    title: &str,
-    create_view: impl FnOnce() -> T,
-) -> (RightSurface, bool) {
-    if let Some((id, _)) = surfaces.iter().find(|(_, tab)| tab.chat_id == chat_id) {
-        return (RightSurface::Trajectory(*id), false);
-    }
-    *sequence = sequence.wrapping_add(1);
-    let id = *sequence;
-    surfaces.insert(
-        id,
-        TrajectoryTab {
-            chat_id: chat_id.to_string(),
-            title: title.to_string().into(),
-            view: create_view(),
-        },
-    );
-    (RightSurface::Trajectory(id), true)
-}
-
-fn remove_chat_trajectory_surfaces<T>(
-    surfaces: &mut std::collections::HashMap<u64, TrajectoryTab<T>>,
-    right_tabs: &mut std::collections::HashMap<String, Vec<RightSurface>>,
-    chat_id: &str,
-) -> Vec<u64> {
-    let matching_ids: Vec<u64> = surfaces
-        .iter()
-        .filter(|(_, tab)| tab.chat_id == chat_id)
-        .map(|(&id, _)| id)
-        .collect();
-    for id in &matching_ids {
-        surfaces.remove(id);
-        let surface = RightSurface::Trajectory(*id);
-        if let Some(tabs) = right_tabs.get_mut(chat_id) {
-            remove_right_surface(tabs, surface);
-        }
-    }
-    matching_ids
 }
 
 struct WorkerTerminalTab<T = Entity<WorkersTerminal>> {
@@ -2446,8 +2391,6 @@ pub struct Shell {
     /// session id. A session gets at most one entity while its tab is open.
     worker_terminal_tabs: std::collections::HashMap<u64, WorkerTerminalTab>,
     worker_terminal_seq: u64,
-    trajectory_tabs: std::collections::HashMap<u64, TrajectoryTab>,
-    trajectory_seq: u64,
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
     side_chat_creating: bool,
@@ -3130,8 +3073,6 @@ impl Shell {
             subagent_seq: 0,
             worker_terminal_tabs: std::collections::HashMap::new(),
             worker_terminal_seq: 0,
-            trajectory_tabs: std::collections::HashMap::new(),
-            trajectory_seq: 0,
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
             side_chat_creating: false,
@@ -3739,11 +3680,6 @@ impl Shell {
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
-            if let RightSurface::Trajectory(id) = self.resolved_right_active(cx)
-                && let Some(tab) = self.trajectory_tabs.get(&id)
-            {
-                tab.view.update(cx, |view, cx| view.ensure_watch(cx));
-            }
         }
         match state.read(cx).connection {
             ConnectionStatus::Ready => {
@@ -4233,10 +4169,6 @@ impl Shell {
                     .worker_terminal_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone(), false, None)),
-                RightSurface::Trajectory(id) => self
-                    .trajectory_tabs
-                    .get(id)
-                    .map(|tab| (*surface, tab.title.clone(), false, None)),
                 RightSurface::Browser(id) => self.browsers.get(id).map(|browser| {
                     let browser = browser.read(cx);
                     (
@@ -4298,8 +4230,7 @@ impl Shell {
             | RightSurface::Subagent(_)
             | RightSurface::Browser(_)
             | RightSurface::Preview(_)
-            | RightSurface::Worker(_)
-            | RightSurface::Trajectory(_) => {
+            | RightSurface::Worker(_) => {
                 return None;
             }
         };
@@ -4440,11 +4371,6 @@ impl Shell {
                     tab.view
                         .terminal()
                         .update(cx, |terminal, cx| terminal.focus(cx));
-                }
-            }
-            RightSurface::Trajectory(id) => {
-                if let Some(tab) = self.trajectory_tabs.get(&id) {
-                    tab.view.update(cx, |view, cx| view.ensure_watch(cx));
                 }
             }
             RightSurface::Picker => {}
@@ -5329,41 +5255,6 @@ impl Shell {
         self.set_right_active(RightSurface::Subagent(id), cx);
     }
 
-    pub(super) fn open_trajectory_surface(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        if !self.right_pane_open(cx) {
-            let from = self.right_target(cx);
-            let key = self.panel_key(cx);
-            self.panels.show(&key);
-            self.finish_right_transition(from, cx);
-        }
-        let state = self.state.clone();
-        let cid = chat_id.clone();
-        let (surface, inserted) = register_trajectory_surface(
-            &mut self.trajectory_tabs,
-            &mut self.trajectory_seq,
-            &chat_id,
-            "Trajectory",
-            || {
-                let fixture = crate::capture::trajectory_capture_fixture();
-                cx.new(move |cx| {
-                    let mut view = TrajectoryView::new(state, cid);
-                    match fixture {
-                        Some(fixture) => {
-                            crate::capture::seed_trajectory_fixture(&mut view, fixture, cx)
-                        }
-                        None => view.ensure_watch(cx),
-                    }
-                    view
-                })
-            },
-        );
-        if inserted {
-            let key = self.panel_key(cx);
-            self.right_tabs.entry(key).or_default().push(surface);
-        }
-        self.set_right_active(surface, cx);
-    }
-
     /// Fetch a finished subagent's frozen transcript blob
     /// (`{chat_id}/{doc_id}`); on ANY failure fall back to watching the doc
     /// — the blob upload is best-effort engine-side.
@@ -5543,9 +5434,6 @@ impl Shell {
                 if let Some(tab) = self.worker_terminal_tabs.remove(&id) {
                     tab.view.detach();
                 }
-            }
-            RightSurface::Trajectory(id) => {
-                self.trajectory_tabs.remove(&id);
             }
             RightSurface::Picker => {}
         }
@@ -7314,7 +7202,6 @@ impl Shell {
         }
         self.composer
             .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
-        remove_chat_trajectory_surfaces(&mut self.trajectory_tabs, &mut self.right_tabs, &chat_id);
         self.mutate(
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
@@ -8335,29 +8222,6 @@ impl Shell {
                     .into_any_element()
             }
         }
-    }
-
-    fn render_orchestrator_trajectory_button(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let active = self.right_pane_open(cx)
-            && matches!(self.resolved_right_active(cx), RightSurface::Trajectory(_));
-        header_icon_button(
-            "orchestrator-trajectory",
-            icons::CLOCK_CIRCLE,
-            "Trajectory",
-            active,
-            theme,
-            cx.listener(|this, _, _, cx| {
-                let chat_id = this.active_chat.clone();
-                if !chat_id.is_empty() {
-                    this.open_trajectory_surface(chat_id, cx);
-                }
-            }),
-        )
-        .into_any_element()
     }
 
     fn render_workers_session_gallery_button(
@@ -12656,14 +12520,6 @@ impl Shell {
                 .terminal()
                 .clone()
                 .into_any_element(),
-            RightSurface::Trajectory(id) => self
-                .trajectory_tabs
-                .get(&id)
-                .map(|tab| {
-                    tab.view.update(cx, |view, cx| view.ensure_watch(cx));
-                    tab.view.clone().into_any_element()
-                })
-                .unwrap_or_else(|| gpui::Empty.into_any_element()),
             // No tabs: the column is closed, so nothing to host.
             RightSurface::Picker => gpui::Empty.into_any_element(),
         };
@@ -12960,10 +12816,6 @@ impl Shell {
                     .size(px(12.0))
                     .text_color(theme.text_muted)
                     .into_any_element(),
-                RightSurface::Trajectory(_) => icon(icons::CLOCK_CIRCLE)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
                 RightSurface::Browser(id) => self
                     .browsers
                     .get(&id)
@@ -13160,7 +13012,7 @@ impl Shell {
                 }))
                 .child(
                     // Leading slot: the surface's icon (fork icon set: Material
-                    // file icons, doc-keyed subagent avatars, Worker/Trajectory).
+                    // file icons, doc-keyed subagent avatars, Worker).
                     div()
                         .flex_none()
                         .size(px(18.0))
@@ -16320,10 +16172,7 @@ mod tests {
     fn cross_mode_titlebar_capabilities_require_the_active_mode_context() {
         assert_eq!(
             titlebar_capabilities(SidebarMode::Orchestrator, true, false),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: true,
-            }
+            TitlebarCapabilities { right_pane: true }
         );
         assert_eq!(
             titlebar_capabilities(SidebarMode::Orchestrator, false, false),
@@ -16331,187 +16180,12 @@ mod tests {
         );
         assert_eq!(
             titlebar_capabilities(SidebarMode::Workers, false, true),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: false,
-            }
+            TitlebarCapabilities { right_pane: true }
         );
         assert_eq!(
             titlebar_capabilities(SidebarMode::Workers, true, false),
             TitlebarCapabilities::default()
         );
-    }
-
-    #[test]
-    fn test_trajectory_shell_titlebar_capabilities_orchestrator_and_workers() {
-        // Main chat selected in Orchestrator -> trajectory capability is present
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Orchestrator, true, false),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: true,
-            }
-        );
-        // No main chat selected in Orchestrator -> trajectory capability is absent
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Orchestrator, false, false),
-            TitlebarCapabilities::default()
-        );
-        // Workers mode (even with active worker context) -> trajectory capability is NEVER shown
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Workers, false, true),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: false,
-            }
-        );
-        // Workers mode without worker context
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Workers, false, false),
-            TitlebarCapabilities::default()
-        );
-    }
-
-    #[test]
-    fn test_trajectory_shell_dedup_one_surface_per_chat() {
-        let mut sequence = 0;
-        let mut surfaces: std::collections::HashMap<u64, TrajectoryTab<()>> =
-            std::collections::HashMap::new();
-
-        // First registration creates new surface
-        let (first, inserted) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-1",
-            "Trajectory",
-            || (),
-        );
-        assert!(inserted);
-        assert_eq!(first, RightSurface::Trajectory(1));
-
-        // Second registration for same chat deduplicates to the existing surface
-        let (second, inserted) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-1",
-            "Trajectory",
-            || panic!("must not create duplicate view"),
-        );
-        assert!(!inserted);
-        assert_eq!(second, RightSurface::Trajectory(1));
-
-        // Registration for another chat creates a distinct surface
-        let (third, inserted) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-2",
-            "Trajectory",
-            || (),
-        );
-        assert!(inserted);
-        assert_eq!(third, RightSurface::Trajectory(2));
-    }
-
-    #[test]
-    fn test_trajectory_shell_state_isolation_between_chats() {
-        let mut panels = SessionPanels::default();
-        panels.update("chat-a", |p| {
-            p.right_active = RightSurface::Trajectory(1);
-        });
-        panels.update("chat-b", |p| {
-            p.right_active = RightSurface::Diff(2);
-        });
-
-        assert_eq!(
-            panels.get("chat-a").right_active,
-            RightSurface::Trajectory(1)
-        );
-        assert_eq!(panels.get("chat-b").right_active, RightSurface::Diff(2));
-        // Independent chats maintain separate active picks
-        assert_eq!(panels.get("chat-c").right_active, RightSurface::Picker);
-    }
-
-    #[test]
-    fn test_trajectory_shell_deletion_closes_surface_and_removes_tabs() {
-        let mut sequence = 0;
-        let mut surfaces: std::collections::HashMap<u64, TrajectoryTab<()>> =
-            std::collections::HashMap::new();
-        let mut right_tabs: std::collections::HashMap<String, Vec<RightSurface>> =
-            std::collections::HashMap::new();
-
-        let (surface_a, _) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-a",
-            "Trajectory",
-            || (),
-        );
-        let (surface_b, _) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-b",
-            "Trajectory",
-            || (),
-        );
-
-        right_tabs.insert(
-            "chat-a".to_string(),
-            vec![surface_a, RightSurface::Diff(10)],
-        );
-        right_tabs.insert("chat-b".to_string(), vec![surface_b]);
-
-        // Deleting chat-a removes its trajectory surface and strips it from right_tabs
-        let removed = remove_chat_trajectory_surfaces(&mut surfaces, &mut right_tabs, "chat-a");
-        assert_eq!(removed, vec![1]);
-        assert!(!surfaces.contains_key(&1));
-        assert!(surfaces.contains_key(&2));
-
-        assert_eq!(right_tabs.get("chat-a").unwrap(), &[RightSurface::Diff(10)]);
-        assert_eq!(
-            right_tabs.get("chat-b").unwrap(),
-            &[RightSurface::Trajectory(2)]
-        );
-    }
-
-    #[test]
-    fn test_trajectory_shell_archive_retains_surface() {
-        let mut sequence = 0;
-        let mut surfaces: std::collections::HashMap<u64, TrajectoryTab<()>> =
-            std::collections::HashMap::new();
-        let mut right_tabs: std::collections::HashMap<String, Vec<RightSurface>> =
-            std::collections::HashMap::new();
-
-        let (surface_archived, _) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-archived",
-            "Trajectory",
-            || (),
-        );
-        right_tabs.insert(
-            "chat-archived".to_string(),
-            vec![surface_archived, RightSurface::Terminal(5)],
-        );
-
-        // Archiving does not call remove_chat_trajectory_surfaces, so the tab and surface remain intact
-        assert!(surfaces.contains_key(&1));
-        assert_eq!(
-            right_tabs.get("chat-archived").unwrap(),
-            &[RightSurface::Trajectory(1), RightSurface::Terminal(5)]
-        );
-    }
-
-    #[test]
-    fn test_trajectory_shell_close_surface_teardown() {
-        let terminal = RightSurface::Terminal(1);
-        let trajectory = RightSurface::Trajectory(2);
-        let diff = RightSurface::Diff(3);
-        let mut tabs = vec![terminal, trajectory, diff];
-
-        // Closing trajectory surface selects its previous neighbor
-        let next = remove_right_surface(&mut tabs, trajectory);
-        assert_eq!(next, terminal);
-        assert_eq!(tabs, vec![terminal, diff]);
     }
 
     #[test]

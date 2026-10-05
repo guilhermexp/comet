@@ -48,7 +48,6 @@ pub mod source_control;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
-pub mod trajectory_store;
 mod transcript_history;
 pub mod uploads;
 pub mod workspace_files;
@@ -79,7 +78,6 @@ pub use source_control::{
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
-pub use trajectory_store::TrajectoryStore;
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_files::WorkspaceFiles;
 pub use workspace_host::{
@@ -103,8 +101,6 @@ pub enum EngineError {
     Harness(#[from] zeron_harness::HarnessError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("trajectory: {0}")]
-    Trajectory(#[from] crate::trajectory_store::TrajectoryStoreError),
     #[error("{0}")]
     Other(String),
 }
@@ -154,7 +150,6 @@ pub struct EngineCore {
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
-    pub trajectory: Arc<TrajectoryStore>,
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
     pub device_id: String,
@@ -239,15 +234,8 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(journal_root.clone())?);
-        let trajectory = Arc::new(match TrajectoryStore::open(profile.store_root()) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to open trajectory store; running in degraded mode");
-                TrajectoryStore::degraded(profile.store_root(), err.to_string())
-            }
-        });
+        cleanup_removed_trajectory_store(profile.store_root());
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
-        sessions.set_trajectory_store(trajectory.clone());
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -267,7 +255,6 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         )?;
-        workspace.set_trajectory_store(trajectory.clone());
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
@@ -366,7 +353,6 @@ impl EngineCore {
             diff_sync,
             spaces_sync,
             uploads,
-            trajectory,
             agent_accounts,
             harness_updates,
             device_id,
@@ -508,7 +494,6 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_auth(self.auth())
-        .with_trajectory_store(self.trajectory.clone())
         .with_run_journal(self.sessions.run_journal())
         .with_previews(self.previews.clone())
         .with_harness_updates(self.harness_updates.clone());
@@ -576,9 +561,6 @@ impl EngineCore {
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
-        if let Err(err) = self.trajectory.sync_flush() {
-            tracing::warn!(error = %err, "trajectory writer flush failed during shutdown");
-        }
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
@@ -1529,29 +1511,46 @@ fn replace_empty_device_id(temp_path: &Path, path: &Path) -> std::io::Result<()>
     }
 }
 
+/// Deletes the removed Trajectory store's leftovers.
+fn cleanup_removed_trajectory_store(store_root: &Path) {
+    for name in [
+        "trajectory.sqlite3",
+        "trajectory.sqlite3-wal",
+        "trajectory.sqlite3-shm",
+    ] {
+        let path = store_root.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "failed to remove legacy trajectory file");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_trajectory_engine_startup_corrupt_store_fails_open() {
+    async fn test_boot_cleanup_removes_trajectory_store_leftovers() {
         let temp = TempDir::new().unwrap();
         let profile = EngineProfile::development(temp.path(), "dev_org", "dev_user");
-
-        // Pre-create a corrupted trajectory.sqlite3 that causes open/migration to fail
         let store_root = profile.store_root();
         std::fs::create_dir_all(store_root).unwrap();
-        std::fs::write(
-            store_root.join("trajectory.sqlite3"),
-            b"CORRUPTED_NON_SQLITE_HEADER",
-        )
-        .unwrap();
 
+        let db = store_root.join("trajectory.sqlite3");
+        let wal = store_root.join("trajectory.sqlite3-wal");
+        let shm = store_root.join("trajectory.sqlite3-shm");
+
+        std::fs::write(&db, b"leftover db").unwrap();
+        std::fs::write(&wal, b"leftover wal").unwrap();
+        std::fs::write(&shm, b"leftover shm").unwrap();
         let lock = InstanceLock::acquire(profile.device_root()).unwrap();
         let registry = Arc::new(HarnessRegistry::new());
 
-        // Engine assembly MUST NOT fail even if TrajectoryStore fails to open/migrate
         let engine = EngineCore::assemble_with_profile_locked(
             profile,
             registry,
@@ -1559,84 +1558,10 @@ mod tests {
             None,
             lock,
         );
-        assert!(
-            engine.is_ok(),
-            "Engine assembly must succeed fail-open when trajectory store fails"
-        );
-        let engine = engine.unwrap();
+        assert!(engine.is_ok(), "Engine assembly must succeed");
 
-        // Publishing events still succeeds seamlessly
-        let seq = engine.sessions.publish(
-            "chat-deg",
-            &zeron_proto::AgentEvent::UserMessage {
-                text: "Hello despite corrupted store".into(),
-            },
-        );
-        assert!(seq > 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_trajectory_shutdown_flushes_queued_records() {
-        let temp = TempDir::new().unwrap();
-        let profile = EngineProfile::development(temp.path(), "dev_org", "dev_user");
-        let store_root = profile.store_root().to_path_buf();
-        let lock = InstanceLock::acquire(profile.device_root()).unwrap();
-        let engine = Arc::new(
-            EngineCore::assemble_with_profile_locked(
-                profile,
-                Arc::new(HarnessRegistry::new()),
-                HarnessId::Mock,
-                None,
-                lock,
-            )
-            .unwrap(),
-        );
-
-        let db_path = store_root.join("trajectory.sqlite3");
-        let lock_conn = rusqlite::Connection::open(&db_path).unwrap();
-        lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        engine
-            .trajectory
-            .try_enqueue(zeron_proto::trajectory::TrajectoryRecord {
-                id: zeron_proto::trajectory::TrajectoryRecordId::new("run", 1, 0),
-                chat_id: "chat-shutdown".into(),
-                run_id: "run".into(),
-                source_seq: 1,
-                sub_seq: 0,
-                lane: zeron_proto::trajectory::TrajectoryLane::Input,
-                kind: zeron_proto::trajectory::TrajectoryRecordKind::UserMessage,
-                status: zeron_proto::trajectory::TrajectoryStatus::Completed,
-                is_partial: false,
-                title: "Prompt".into(),
-                summary: "Persist me".into(),
-                turn_id: None,
-                step_id: None,
-                call_id: None,
-                parent_tool_use_id: None,
-                timing: None,
-                usage: None,
-                payload: None,
-                result: None,
-                error_message: None,
-                is_degraded: false,
-            })
-            .unwrap();
-
-        let shutdown = tokio::spawn({
-            let engine = engine.clone();
-            async move { engine.shutdown().await }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            !shutdown.is_finished(),
-            "shutdown must wait for the trajectory writer queue"
-        );
-
-        lock_conn.execute_batch("COMMIT").unwrap();
-        shutdown.await.unwrap();
-        drop(engine);
-
-        let reopened = TrajectoryStore::open(&store_root).unwrap();
-        assert_eq!(reopened.list_all_records("chat-shutdown").unwrap().len(), 1);
+        assert!(!db.exists(), "trajectory.sqlite3 must be removed");
+        assert!(!wal.exists(), "trajectory.sqlite3-wal must be removed");
+        assert!(!shm.exists(), "trajectory.sqlite3-shm must be removed");
     }
 }

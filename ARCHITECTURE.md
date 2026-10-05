@@ -155,13 +155,13 @@ zeron/
                                           # codex (app-server JSON-RPC), opencode, omp, mock; steering mailbox,
                                           # requestInput, models/reasoning/options catalogs
     engine/         zeron-engine          # sessions engine (pub/sub, run journal, recovery, idle
-                                          # reaper), trajectory store (SQLite WAL), doc host + command executor, repos/worktrees,
+                                          # reaper), doc host + command executor, repos/worktrees,
                                           # checkout-diff sync, terminals (portable-pty), uploads,
                                           # agent accounts (cred swap), auth (WorkOS via edge),
                                           # device-room host/peers, identity
     rpc/            zeron-rpc             # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
-                                          # tungstenite) + in-memory transport; local WatchTrajectory/
-                                          # RevealTrajectoryRaw; device-room virtual sockets ({s,k,to,from} frames)
+                                          # tungstenite) + in-memory transport; device-room virtual
+                                          # sockets ({s,k,to,from} frames)
     voice/          zeron-voice           # desktop-local optional Parakeet model, capture and inference; no RPC/sync
     syntax/         zeron-syntax          # syntax definitions, grammars and tree-sitter highlighting
     theme/          zeron-theme           # base theme models, palettes, and styling primitives
@@ -169,7 +169,7 @@ zeron/
     workers-unpeel/ zeron-workers-unpeel  # local worker runtime adapter, activity bridge, controller MCP,
                                           # project git/ledger, hibernation/resource reaper
     ui/             zeron-ui              # gpui app: Orchestrator/Workers shell, chat/composer,
-                                          # Trajectory preview, Terminal/Git/file-preview surface host, Details/Files,
+                                          # Terminal/Git/file-preview surface host, Details/Files,
                                           # settings, animation kit
   apps/
     zeron/                                # the binary (headed default, `headless` subcommand)
@@ -216,12 +216,10 @@ feature spec `docs/research/feature-inventory.md` §1.
   toggle) as gpui popovers with `menu-in` scale/fade. `@` file completion uses the engine's
   checkout index; `@` and `/` menus span the pill, scroll internally, and keep keyboard selection
   visible. Double-click selects the complete field value.
-- **Right-side surfaces**: one tab host owns Trajectory preview, Terminal, Git diff/history, native Browser tabs, and file-preview
+- **Right-side surfaces**: one tab host owns Terminal, Git diff/history, native Browser tabs, and file-preview
   surfaces while a separate `Details / Files` column owns workspace metadata and
   the checkout tree. Both columns are available in Orchestrator and Workers;
   their normal responsive layout preserves a minimum conversation width. The
-  Trajectory surface provides analytical timeline inspection, virtualized execution ledger, 5-tab inspector,
-  and device-local Raw Reveal (`crates/ui/src/trajectory/`). The
   detailed contracts are specified in
   [`docs/plans/2026-08-20-details-files-sidebar-design.md`](docs/plans/2026-08-20-details-files-sidebar-design.md)
   and [`docs/plans/2026-08-20-file-preview-parity-design.md`](docs/plans/2026-08-20-file-preview-parity-design.md).
@@ -249,9 +247,7 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
 - **Sessions engine**: per-session broadcast hub; on-disk run journal (resumable `seq` replay,
   crash auto-resume); persistent steerable sessions (steering mailbox at step/turn boundary; idle
   reaper, 30min `SESSION_IDLE`; the 10min stall watchdog was deliberately not ported — see the
-  module doc in `crates/engine/src/sessions.rs`); recovery stamps `aborted`. Trajectory store (`crates/engine/src/trajectory_store.rs`)
-  persists sanitized timeline records into device-local SQLite WAL with bounded background writer, exposed via
-  `WatchTrajectory` and `RevealTrajectoryRaw` RPCs (`crates/rpc/src/method.rs`).
+  module doc in `crates/engine/src/sessions.rs`); recovery stamps `aborted`.
 - **Doc host**: per-chat handle (join room, VV backfill, write user entries + stream assistant
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite

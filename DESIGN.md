@@ -221,7 +221,6 @@ Tabela consolidada com os componentes fundamentais de `crates/ui`:
 | **Worker Indicator** | `workers/presentation.rs` | Marcador circular de status na linha de sessão do Worker CLI | Busy, Attention, Unread, Idle, Exited | Blue tint (unread), accent (busy), amber (attention) |
 | **Menu Bar Status** | `workers/menu_bar.rs` | Item nativo do sistema com spinner monoespaçado (15pt) e contagem (11pt) | Running, idle | Cor herdada nativa do NSButton |
 | **Avatares Blobatar** | `icons.rs`, `details_sidebar/` | Conjunto de 28 avatares lúdicos com hash determinístico por subagente | Rendered, loading | Fill adaptado aos tons do tema |
-| **Trajectory Surface** | `trajectory/` | Timeline analítica de 3 lanes, ledger virtualizado (26px) e inspector de 5 abas | Live stream, paused, inspect, raw reveal | `accent_wash`, `border`, `text_dim`, `surface_card` |
 
 ### Subseções de Componentes
 
@@ -357,16 +356,6 @@ Identidade visual determinística para agentes especializados:
 - **Anatomia**: biblioteca de 28 ilustrações embutidas (`icons/subagents/blobatar/00.svg` a `27.svg`), selecionadas por hash do ID estável do subagente.
 - **Dimensões**: renderizado em tiles de `22.0 px` com imagem de `18.0 px` no transcript (`crates/ui/src/transcript.rs:8409-8422`).
 - **Roles**: Fills e contornos adaptados à variante de tema.
-
-#### Superfície de Trajetória (`crates/ui/src/trajectory/`)
-Painel técnico e analítico de auditoria da execução do agente no Chat ativo (`crates/ui/src/trajectory/AGENTS.md`).
-- **Anatomia**:
-  - Timeline com 3 lanes fixas (`Input`, `Model`, `Tools`).
-  - Ledger hierárquico com altura de linha estritamente fixa (`ROW_HEIGHT = 26.0 px`, `crates/ui/src/trajectory/AGENTS.md:19`).
-  - Inspector de 5 abas (`Summary`, `Payload`, `Result`, `Schema`, `Timing`, `crates/ui/src/trajectory/inspector.rs:46-52`).
-  - Raw Reveal efêmero local: revela dados sanitizados em memória sob demanda, sem persistência nem sincronização remota.
-- **Estados**: Live streaming, Pausado (após rolagem para trás), Filtrado por busca (com dimming contextual sem ocultar linhas), Split horizontal ($\ge 600\text{ px}$) e Narrow ($< 600\text{ px}$).
-- **Roles**: `accent_wash`, `border`, `text_dim`, `surface_card`.
 
 ---
 
@@ -507,7 +496,6 @@ Para habilitar rotas, diálogos e cenários específicos sem interação manual 
 - `ZERON_OPEN_PICKER`: inicia o app com um seletor aberto.
 - `ZERON_FORCE_GATE`: força a exibição de telas de bloqueio de autenticação/organização.
 - `ZERON_DEMO_UPLOAD`: injeta estado simulado de upload.
-- `ZERON_DEMO_TRAJECTORY`: injeta fixtures visuais da Trajectory (`multi-run`, `error`, `narrow`, etc.).
 - Proibido ler variáveis de ambiente de captura diretamente com `std::env::var`: o acesso deve passar unicamente por `capture::knob` para evitar estados retidos no terminal do desenvolvedor (`crates/ui/AGENTS.md:18`).
 
 ### Cenas de verificação (`VisualFixture`)
@@ -533,7 +521,7 @@ Diretrizes rígidas que não admitem exceções na construção de interfaces do
 1. **Dependências GPL do Zed são proibidas**: não importar as crates `markdown`, `ui`, `theme` ou `editor` do Zed. O ecossistema de markdown, tema e componentes do Comet é de autoria própria sob MIT/Apache-2.0 (`crates/ui/AGENTS.md:15`).
 2. **Proibido cor fora de role**: nenhuma cor literal (`rgb`, `hsl`, `hex`) deve ser declarada inline em componentes; todo elemento deve usar os tokens providos por `Theme`.
 3. **Proibido animação alterar layout**: animações são puramente camada de pintura (`paint`). É proibido usar transições que modifiquem padding, flex-basis ou dimensões que desloquem elementos adjacentes (`crates/ui/AGENTS.md:22`).
-4. **Proibido altura dinâmica em listas virtualizadas**: em listas baseadas em `uniform_list` (como o ledger da Trajectory com `ROW_HEIGHT = 26.0 px`), nenhuma variação de conteúdo ou estado de dobra pode alterar a altura física das linhas (`crates/ui/src/trajectory/AGENTS.md:19`).
+4. **Proibido altura dinâmica em listas virtualizadas**: em listas baseadas em `uniform_list`, nenhuma variação de conteúdo ou estado de dobra pode alterar a altura física das linhas.
 5. **Proibido `std::env::var` direto para knobs**: todas as chaves de teste ou captura devem consultar exclusivamente `capture::knob` sob a proteção da chave-mestre `ZERON_UI_CAPTURE` (`crates/ui/AGENTS.md:18`).
 6. **Proibido ícone sem cor própria**: chamadas a `icons::icon(...)` devem receber `.text_color(...)` no próprio nó SVG; a cor do container pai não cascateia no GPUI (`crates/ui/AGENTS.md:105`).
 7. **Proibido segundo dono de painel/tabs**: o painel lateral direito possui um único dono registrado (`right_tabs` / `right_active`). É vedado introduzir gerenciadores de abas concorrentes (`crates/ui/AGENTS.md:53`).

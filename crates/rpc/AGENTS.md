@@ -33,7 +33,6 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - Handler é async e não bloqueia: enumerar path, ler arquivo e afins vão pra `spawn_blocking`.
 - No IPC local, `ProtocolError::HandshakeIncomplete` significa que o peer TCP saiu antes do upgrade e fica em debug; handshakes completos inválidos, `Origin` de browser e demais falhas continuam em warning.
 - `LinkCache::new` instala o watcher de credenciais antes de retornar; sign-out não pode perder a primeira versão do `watch` nem manter sockets autenticados em cache.
-- `WatchTrajectory` e `RevealTrajectoryRaw` são métodos estritamente device-local (IPC local apenas; nunca relay-forwarded — rejeitados no ingresso de conexões virtuais de peer relay pelo wrapper de transporte `RelayPeerService` antes do dispatch, além do gate de `targetDeviceId` no engine como defesa em profundidade). `TrajectoryCursor` é `(source_seq, sub_seq, rev)`: a tupla de posição desambigua o terminal Interrupted legado que compartilha `source_seq` com o prefixo em `sub_seq = u32::MAX`, e `rev` é a revisão de commit do store — sem ela, resume por posição perde a substituição in-place de partial→final. `rev` é `#[serde(default)]` e `0` significa "sem conhecimento de revisão"; `Ord` continua position-first, com `rev` só como desempate.
 
 - `GetTitleSettings` and `SetTitleSettings` are device-forwardable registry methods; title preferences are device-local and not CRDT data.
 - `LinkCache` trata `host_offline` do relay como evidência, não blip: a sequência que termina nele estaciona dials daquele device por `offline_cooldown` (5 min). Esse cooldown sobrevive ao broadcast "online" (que todo handshake emite — inclusive o dial rejeitado — e zerava o próprio backoff, gerando o loop 1.5s/3s/6s) e ao refresh de token; só `reset_cooldown` (presença fresca) ou sign-out o limpam. Falhas comuns seguem a curva 5s→60s. O motivo do link-down pode chegar logo depois da falha do probe; o dial espera até 250ms por ele.
@@ -49,7 +48,6 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/**` (envelopes, transporte) | unit | `cargo test -p zeron-rpc` |
-| `src/lib.rs` (Trajectory wire contracts, cursor ordering, params/items serde) | unit | `cargo test -p zeron-rpc trajectory` |
 | `src/method.rs` (registro de métodos) | unit | `cargo test -p zeron-rpc method::tests::every_method_has_info_and_stream_implies_forwardable -- --exact` |
 | `src/server.rs` (classificação do handshake IPC) | unit | `cargo test -p zeron-rpc server::tests::only_an_incomplete_websocket_handshake_is_benign -- --exact` |
 | `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p zeron-rpc` |
