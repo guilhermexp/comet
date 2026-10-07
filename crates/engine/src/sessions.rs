@@ -67,6 +67,18 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
+const WORKER_NOTIFICATION_ID_PREFIX: &str = "worker-notify-message:";
+const WORKER_NOTIFICATION_PROMPT_PREFIX: &str = "[worker-task-notification]";
+
+pub(crate) fn is_worker_notification(prompt: &str, message_id: Option<&str>) -> bool {
+    message_id.is_some_and(is_worker_notification_id)
+        && prompt.starts_with(WORKER_NOTIFICATION_PROMPT_PREFIX)
+}
+
+pub(crate) fn is_worker_notification_id(id: &str) -> bool {
+    id.starts_with(WORKER_NOTIFICATION_ID_PREFIX)
+}
+
 struct PendingInput {
     question_ids: Vec<String>,
     resolver: oneshot::Sender<Vec<UserInputAnswer>>,
@@ -1380,6 +1392,7 @@ impl SessionsEngine {
         message_id: Option<String>,
         issued_at: i64,
     ) -> Result<SteerOutcome, EngineError> {
+        let worker_notification = is_worker_notification(prompt, message_id.as_deref());
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
@@ -1413,11 +1426,9 @@ impl SessionsEngine {
         let Ok(permit) = steer_tx.reserve().await else {
             return Ok(SteerOutcome::NotSteerable);
         };
-        let accepted = self.inner.registry.while_update_clear(harness_id, || {
+        let enqueue = || {
             // Serialize mailbox acceptance with confirmation and Done-time
             // inspection: a fast consumer must never outrun its ledger entry.
-            // The update marker is checked in the same critical section, so an
-            // accepted update releases the reserved slot instead.
             let mut pending = lock(&ledger);
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),
@@ -1425,7 +1436,16 @@ impl SessionsEngine {
                 fork_history: bootstrap.is_some(),
             });
             permit.send(message);
-        });
+        };
+        // Genuine Worker notices must reach the parent run so it can finish
+        // and release an update waiting for that run. Ordinary user steers
+        // remain ordered behind the accepted update. The running process still
+        // holds its execution lease until it exits, keeping installation safe.
+        let accepted = if worker_notification {
+            Some(enqueue())
+        } else {
+            self.inner.registry.while_update_clear(harness_id, enqueue)
+        };
         if accepted.is_none() {
             return Ok(SteerOutcome::DeferredByUpdate);
         }
@@ -1805,8 +1825,13 @@ impl SessionsEngine {
             tracing::warn!(error = %err, "Live Voice shutdown failed");
         }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
-        for chat_id in chats {
-            if let Err(err) = self.interrupt(&chat_id).await {
+        let results = futures::future::join_all(chats.into_iter().map(|chat_id| async move {
+            let result = self.interrupt(&chat_id).await;
+            (chat_id, result)
+        }))
+        .await;
+        for (chat_id, result) in results {
+            if let Err(err) = result {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
@@ -4207,7 +4232,7 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -4219,7 +4244,7 @@ mod tests {
     use crate::doc_host::DocHostConfig;
     use crate::new_id;
     use chrono::Utc;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     use zeron_proto::{
         AgentEvent, ContextUsage, DoneStatus, HarnessId, RunRequest, SandboxLevel, Session,
@@ -5106,7 +5131,9 @@ mod tests {
     }
 
     struct BarrierHarness {
-        release_rx: Mutex<Option<oneshot::Receiver<()>>>,
+        release_rx: Mutex<VecDeque<oneshot::Receiver<()>>>,
+        started_tx: Option<mpsc::UnboundedSender<CancellationToken>>,
+        settle_after_interrupt: bool,
     }
 
     #[async_trait::async_trait]
@@ -5132,13 +5159,18 @@ mod tests {
         async fn run(
             &self,
             _request: RunRequest,
-            _controls: zeron_harness::RunControls,
+            controls: zeron_harness::RunControls,
         ) -> Result<
             futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
             zeron_harness::HarnessError,
         > {
             use futures::StreamExt as _;
-            let release_rx = self.release_rx.lock().unwrap().take();
+            let release_rx = self.release_rx.lock().unwrap().pop_front();
+            if let Some(started_tx) = &self.started_tx {
+                let _ = started_tx.send(controls.interrupt.clone());
+            }
+            let interrupt = controls.interrupt;
+            let settle_after_interrupt = self.settle_after_interrupt;
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 let _ = tx
@@ -5149,9 +5181,17 @@ mod tests {
                 if let Some(rx) = release_rx {
                     let _ = rx.await;
                 }
+                if settle_after_interrupt {
+                    interrupt.cancelled().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
                 let _ = tx
                     .send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Completed,
+                        status: if settle_after_interrupt {
+                            DoneStatus::Interrupted
+                        } else {
+                            DoneStatus::Completed
+                        },
                         result: None,
                         error: None,
                         session_id: None,
@@ -5171,7 +5211,9 @@ mod tests {
         let (release_tx, release_rx) = oneshot::channel();
         let registry = Arc::new(HarnessRegistry::new());
         registry.register(Arc::new(BarrierHarness {
-            release_rx: Mutex::new(Some(release_rx)),
+            release_rx: Mutex::new(VecDeque::from([release_rx])),
+            started_tx: None,
+            settle_after_interrupt: false,
         }));
         let core = crate::EngineCore::assemble(temp.path(), registry, HarnessId::Mock, None)
             .expect("engine core assembles");
@@ -5226,6 +5268,54 @@ mod tests {
 
         // Release stream barrier so run completes cleanly:
         let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_independent_runs_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let (release_one_tx, release_one_rx) = oneshot::channel();
+        let (release_two_tx, release_two_rx) = oneshot::channel();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(BarrierHarness {
+            release_rx: Mutex::new(VecDeque::from([release_one_rx, release_two_rx])),
+            started_tx: Some(started_tx),
+            settle_after_interrupt: true,
+        }));
+        let core = crate::EngineCore::assemble(temp.path(), registry, HarnessId::Mock, None)
+            .expect("engine core assembles");
+        let engine = core.sessions.clone();
+
+        let first = engine
+            .dispatch("shutdown-chat-one", HarnessId::Mock, request(), None)
+            .await
+            .expect("first run dispatches");
+        let second = engine
+            .dispatch("shutdown-chat-two", HarnessId::Mock, request(), None)
+            .await
+            .expect("second run dispatches");
+        assert_ne!(first, second);
+
+        let first_interrupt = started_rx.recv().await.expect("first harness starts");
+        let second_interrupt = started_rx.recv().await.expect("second harness starts");
+        assert!(engine.has_live_run("shutdown-chat-one"));
+        assert!(engine.has_live_run("shutdown-chat-two"));
+
+        // Both streams reach their barriers before shutdown. Each harness then
+        // takes three seconds after its interrupt to report Done(Interrupted).
+        let _ = release_one_tx.send(());
+        let _ = release_two_tx.send(());
+        let started_at = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("shutdown multiplied the per-run settlement budget");
+        let elapsed = started_at.elapsed();
+
+        assert!(first_interrupt.is_cancelled());
+        assert!(second_interrupt.is_cancelled());
+        assert!(elapsed < std::time::Duration::from_secs(5));
+        assert!(!engine.has_live_run("shutdown-chat-one"));
+        assert!(!engine.has_live_run("shutdown-chat-two"));
     }
 
     #[test]

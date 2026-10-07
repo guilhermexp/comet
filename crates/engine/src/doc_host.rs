@@ -41,7 +41,9 @@ use crate::http_error::describe_http_error;
 use crate::project_actions::{
     ProjectActionSetupHandoff, ProjectActionsStore, launch_project_setup_action,
 };
-use crate::sessions::{SessionsEngine, SteerOutcome};
+use crate::sessions::{
+    SessionsEngine, SteerOutcome, is_worker_notification, is_worker_notification_id,
+};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, Terminals, new_id, now_ms};
 
@@ -4206,12 +4208,17 @@ impl DocHost {
                 "queued message is blocked for editing or review".into(),
             ));
         }
-        if self
-            .sessions()
-            .is_some_and(|sessions| sessions.defers_to_turn_end(chat_id, None))
-        {
-            // Send next: lead the ordinary rows; the drain delivers it the
-            // moment the current turn ends.
+        let worker_notification =
+            is_worker_notification(&candidate.text, Some(candidate.id.as_str()));
+        let waits_for_live_mailbox = self.sessions().is_some_and(|sessions| {
+            (worker_notification
+                && sessions.turn_in_flight(chat_id)
+                && !sessions.live_run_steerable(chat_id))
+                || (!worker_notification && sessions.defers_to_turn_end(chat_id, None))
+        });
+        if waits_for_live_mailbox {
+            // Keep the row durable until the current run exits; the drain
+            // delivers it as a new turn after the existing mailbox is gone.
             let Some(item) = handle.doc.take_queued(id)? else {
                 return Ok(false);
             };
@@ -5813,18 +5820,20 @@ impl DocHost {
         issued_at: i64,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
-        // Explicit steering uses the run mailbox when the agent reads it
+        // Explicit user steering uses the run mailbox when the agent reads it
         // mid-turn. A turn-boundary agent would read it only after the turn,
-        // so it waits in the queue, ahead of ordinary rows, and reaches the
-        // transcript when it is actually delivered. Never interrupt to hurry
-        // steering.
+        // so ordinary prompts wait in the queue. App-owned Worker notices use
+        // the mailbox directly so the parent can react and release a pending
+        // update. Never interrupt to hurry steering.
         let prompt = self.resolve_prompt_attachments(prompt);
         // A live turn without a mailbox can't take it either: the fresh
         // dispatch below would interrupt it.
         let unsteerable_turn =
             sessions.turn_in_flight(chat_id) && !sessions.live_run_steerable(chat_id);
+        let worker_notification = is_worker_notification(&prompt, message_id.as_deref());
         if !prompt.trim().is_empty()
-            && (unsteerable_turn || sessions.defers_to_turn_end(chat_id, None))
+            && (unsteerable_turn
+                || (!worker_notification && sessions.defers_to_turn_end(chat_id, None)))
         {
             let id = message_id.unwrap_or_else(new_id);
             self.hold_until_turn_end(handle, &id, &prompt, issued_at, true)?;
@@ -5836,7 +5845,7 @@ impl DocHost {
         // The transcript shows the send while mailbox backpressure holds it.
         // A pending agent update instead holds it in the queue below, where a
         // transcript copy would duplicate it until the update finishes.
-        if !sessions.live_run_update_pending(chat_id)
+        if (!sessions.live_run_update_pending(chat_id) || worker_notification)
             && let Some(message_id) = message_id.as_deref()
             && let Err(err) =
                 handle.write_user_message(message_id, &prompt, issued_at.min(now_ms()))
@@ -6331,14 +6340,6 @@ fn rewrite_attachment_reference(prompt: &str, source: &str, target: &str) -> Str
             &format!("image=\"{}\"", attribute(target)),
         )
         .replace(source, target)
-}
-
-/// Message ids of app-owned Worker parent notifications
-/// (`crates/ui/src/workers/model.rs::parent_notification_rpc_params`).
-const WORKER_NOTIFICATION_ID_PREFIX: &str = "worker-notify-message:";
-
-fn is_worker_notification_id(id: &str) -> bool {
-    id.starts_with(WORKER_NOTIFICATION_ID_PREFIX)
 }
 
 #[cfg(test)]

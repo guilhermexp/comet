@@ -16,7 +16,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use zeron_doc::{
-    MessagePart, MessageRole, QueueDeliveryGate, SessionCommandPayload, SessionMessageEntry,
+    MessagePart, MessageRole, QueueDeliveryGate, QueuedMessage, SessionCommandPayload,
+    SessionMessageEntry,
 };
 use zeron_engine::doc_host::{
     BeginQueueEditOutcome, FinishQueueEditAction, FinishQueueEditOutcome,
@@ -34,6 +35,7 @@ const CHAT: &str = "chat-queue";
 /// a state the test controls rather than races.
 struct HeldHarness {
     id: HarnessId,
+    steerable: bool,
     steering: SteeringMode,
     finish: tokio::sync::broadcast::Sender<()>,
     prompts: Arc<Mutex<Vec<String>>>,
@@ -62,11 +64,25 @@ impl HeldHarness {
         steering: SteeringMode,
         asks: bool,
     ) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+        Self::build_with_steering(id, steering, asks, true)
+    }
+
+    fn unsteerable(steering: SteeringMode) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+        Self::build_with_steering(HarnessId::Mock, steering, false, false)
+    }
+
+    fn build_with_steering(
+        id: HarnessId,
+        steering: SteeringMode,
+        asks: bool,
+        steerable: bool,
+    ) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
         let (finish, _) = tokio::sync::broadcast::channel(16);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {
                 id,
+                steerable,
                 steering,
                 finish,
                 prompts: prompts.clone(),
@@ -88,7 +104,7 @@ impl Harness for HeldHarness {
         "Held"
     }
     fn supports_steering(&self) -> bool {
-        true
+        self.steerable
     }
     fn steering_mode(&self) -> SteeringMode {
         self.steering
@@ -247,14 +263,27 @@ async fn setup_asking(
 async fn setup_with(
     built: (Arc<HeldHarness>, Arc<Mutex<Vec<String>>>),
 ) -> (EngineCore, Arc<HeldHarness>, Arc<Mutex<Vec<String>>>) {
+    let (core, harness, prompts, _registry) = setup_with_registry(built).await;
+    (core, harness, prompts)
+}
+
+async fn setup_with_registry(
+    built: (Arc<HeldHarness>, Arc<Mutex<Vec<String>>>),
+) -> (
+    EngineCore,
+    Arc<HeldHarness>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<HarnessRegistry>,
+) {
     let tmp = tempfile::tempdir().unwrap();
-    // Leak the tempdir guard: the engine outlives this helper and the test only
-    // cares that the path is unique per run.
     let path = tmp.keep();
     let (harness, prompts) = built;
-    let core = assemble_at(&path.join("data"), harness.clone());
+    let registry = Arc::new(HarnessRegistry::new());
+    registry.register(harness.clone());
+    let core = EngineCore::assemble(&path.join("data"), registry.clone(), HarnessId::Mock, None)
+        .expect("engine core assembles");
     create_chat(&core).await;
-    (core, harness, prompts)
+    (core, harness, prompts, registry)
 }
 
 fn assemble_at(path: &std::path::Path, harness: Arc<HeldHarness>) -> EngineCore {
@@ -2038,5 +2067,376 @@ async fn a_send_during_a_mid_turn_steerable_turn_steers_it_immediately() {
     assert_eq!(user_messages(&core), vec!["opening", "steer me"]);
     assert_eq!(harness.requests.lock().unwrap().len(), 1);
     let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+const WORKER_NOTICE: &str = "[worker-task-notification] Worker finished.";
+const WORKER_NOTICE_ID: &str = "worker-notify-message:worker-1:event-1";
+
+fn worker_notice_payload(prompt: &str, message_id: &str) -> SessionCommandPayload {
+    SessionCommandPayload::Steer {
+        prompt: prompt.into(),
+        message_id: Some(message_id.into()),
+    }
+}
+
+/// App-owned Worker lifecycle messages reach a live mailbox even while a CLI
+/// update is pending. Ordinary steers remain queued until that run and update
+/// finish, and the update lease stays exclusive against the running process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_notice_bypasses_update_gate_but_ordinary_steers_wait() {
+    let (core, harness, prompts, registry) =
+        setup_with_registry(HeldHarness::new(SteeringMode::StepBoundary)).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+
+    registry.begin_update(HarnessId::Mock);
+    let command_id = "worker-notify:worker-1:event-1";
+    let payload = worker_notice_payload(WORKER_NOTICE, WORKER_NOTICE_ID);
+    assert_eq!(
+        core.doc_host
+            .queue_worker_notification(CHAT, command_id.into(), payload.clone())
+            .expect("queue Worker notification"),
+        command_id
+    );
+    // Retrying an acknowledged Worker event keeps the same durable command.
+    assert_eq!(
+        core.doc_host
+            .queue_worker_notification(CHAT, command_id.into(), payload)
+            .expect("retry Worker notification"),
+        command_id
+    );
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == WORKER_NOTICE),
+        "Worker notification to reach the live mailbox",
+    )
+    .await;
+    assert_eq!(
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == WORKER_NOTICE)
+            .count(),
+        1,
+        "a retried Worker event is delivered once"
+    );
+    assert!(
+        queue_texts(&core).is_empty(),
+        "the Worker notice never enters the composer queue"
+    );
+    assert!(core.sessions.turn_in_flight(CHAT));
+
+    // Neither half of the Worker marker is sufficient to get the bypass.
+    let prefix_only = "[worker-task-notification] ordinary prompt";
+    core.doc_host
+        .queue_command(
+            CHAT,
+            worker_notice_payload(prefix_only, "ordinary-message-id"),
+        )
+        .expect("queue ordinary prompt with Worker-like prefix");
+    wait_for(
+        || queue_texts(&core).iter().any(|p| p == prefix_only),
+        "prefix-only prompt to remain queued",
+    )
+    .await;
+    let id_only = "ordinary prompt with Worker-like id";
+    core.doc_host
+        .queue_command(
+            CHAT,
+            worker_notice_payload(id_only, "worker-notify-message:worker-1:ordinary-id-only"),
+        )
+        .expect("queue ordinary prompt with Worker-like id");
+    wait_for(
+        || queue_texts(&core).iter().any(|p| p == id_only),
+        "id-only prompt to remain queued",
+    )
+    .await;
+    assert!(
+        !prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == prefix_only || p == id_only)
+    );
+    let ordinary_prompts = queue_texts(&core);
+    assert!(ordinary_prompts.iter().any(|p| p == prefix_only));
+    assert!(ordinary_prompts.iter().any(|p| p == id_only));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            registry.update_lease(HarnessId::Mock)
+        )
+        .await
+        .is_err(),
+        "the installer lease must wait for the active run"
+    );
+
+    let _ = harness.finish.send(());
+    let update = tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.update_lease(HarnessId::Mock),
+    )
+    .await
+    .expect("installer lease becomes available after the run");
+    drop(update);
+    registry.end_update(HarnessId::Mock);
+
+    // Held steers can be inserted at the send-now slot, so follow the
+    // observed queue order rather than assuming which append is at the head.
+    for expected in ordinary_prompts {
+        wait_for(
+            || prompts.lock().unwrap().iter().any(|p| p == &expected),
+            "ordinary prompt to run after the update",
+        )
+        .await;
+        let _ = harness.finish.send(());
+        wait_for(
+            || !core.sessions.turn_in_flight(CHAT),
+            "queued run to finish",
+        )
+        .await;
+    }
+    core.shutdown().await;
+}
+
+/// Even an agent that only accepts input at a turn boundary receives the
+/// app-owned notification immediately through its existing mailbox.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_notice_bypasses_turn_boundary_queue() {
+    let (core, harness, prompts, _registry) =
+        setup_with_registry(HeldHarness::new(SteeringMode::TurnBoundary)).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+
+    core.doc_host
+        .queue_worker_notification(
+            CHAT,
+            "worker-notify:worker-1:event-2".into(),
+            worker_notice_payload(
+                "[worker-task-notification] Another worker finished.",
+                "worker-notify-message:worker-1:event-2",
+            ),
+        )
+        .expect("queue Worker notification");
+    let notice = "[worker-task-notification] Another worker finished.";
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == notice),
+        "TurnBoundary mailbox to receive the Worker notification",
+    )
+    .await;
+    assert!(queue_texts(&core).is_empty());
+    assert!(core.sessions.turn_in_flight(CHAT));
+    let _ = harness.finish.send(());
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "TurnBoundary run to finish",
+    )
+    .await;
+    core.shutdown().await;
+}
+
+/// A Worker notice left in the queue by an older run can be explicitly
+/// steered into a live TurnBoundary mailbox while an update is pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicitly_steering_a_held_worker_notice_bypasses_update_and_turn_boundary() {
+    let (core, harness, prompts, registry) =
+        setup_with_registry(HeldHarness::new(SteeringMode::TurnBoundary)).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+
+    let handle = core.doc_host.open(CHAT).expect("open parent chat");
+    let mut held = QueuedMessage::new(
+        "worker-notify-message:worker-1:held-event",
+        "[worker-task-notification] A previously held worker finished.",
+        "worker-device",
+    );
+    held.hold_for_turn_end = true;
+    handle
+        .doc()
+        .push_queued(&held)
+        .expect("seed previously held Worker notice");
+    registry.begin_update(HarnessId::Mock);
+
+    assert!(
+        core.doc_host
+            .steer_queued_now(CHAT, &held.id)
+            .await
+            .expect("explicitly steer held Worker notice")
+    );
+    wait_for(
+        || {
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == held.text.as_str())
+        },
+        "held Worker notice to reach the live mailbox",
+    )
+    .await;
+    assert!(handle.doc().read_queue().unwrap().is_empty());
+    assert!(core.sessions.turn_in_flight(CHAT));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            registry.update_lease(HarnessId::Mock)
+        )
+        .await
+        .is_err(),
+        "the existing run keeps the installer lease blocked"
+    );
+
+    let _ = harness.finish.send(());
+    let update = tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.update_lease(HarnessId::Mock),
+    )
+    .await
+    .expect("installer lease becomes available after the run");
+    drop(update);
+    registry.end_update(HarnessId::Mock);
+    core.shutdown().await;
+}
+
+/// Explicit promotion of a held Worker row waits for an active run that has no
+/// steerable mailbox, then falls back to a fresh turn after it ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicitly_steering_a_held_worker_notice_waits_for_unsteerable_run() {
+    let (core, harness, prompts, registry) =
+        setup_with_registry(HeldHarness::unsteerable(SteeringMode::TurnBoundary)).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+
+    let handle = core.doc_host.open(CHAT).expect("open parent chat");
+    let notice = "[worker-task-notification] Worker finished during an unsteerable run.";
+    let mut held = QueuedMessage::new(
+        "worker-notify-message:worker-1:unsteerable-event",
+        notice,
+        "worker-device",
+    );
+    held.hold_for_turn_end = true;
+    handle
+        .doc()
+        .push_queued(&held)
+        .expect("seed previously held Worker notice");
+    registry.begin_update(HarnessId::Mock);
+
+    assert!(!core.sessions.live_run_steerable(CHAT));
+    assert!(
+        core.doc_host
+            .steer_queued_now(CHAT, &held.id)
+            .await
+            .expect("promote held Worker notice")
+    );
+    assert_eq!(queue_texts(&core), vec![notice.to_owned()]);
+    assert!(core.sessions.turn_in_flight(CHAT));
+    assert!(!prompts.lock().unwrap().iter().any(|p| p == notice));
+
+    let _ = harness.finish.send(());
+    let update = tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.update_lease(HarnessId::Mock),
+    )
+    .await
+    .expect("installer lease becomes available after the run");
+    drop(update);
+    registry.end_update(HarnessId::Mock);
+
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == notice),
+        "Worker notice to start after the parent run and update",
+    )
+    .await;
+    assert!(queue_texts(&core).is_empty());
+    let _ = harness.finish.send(());
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "Worker notice fallback turn to finish",
+    )
+    .await;
+    core.shutdown().await;
+}
+
+/// If there is no live mailbox, a Worker event still becomes a durable new
+/// turn instead of disappearing with the bypass path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_notice_without_live_mailbox_starts_a_durable_turn() {
+    let (core, harness, prompts, _registry) =
+        setup_with_registry(HeldHarness::new(SteeringMode::StepBoundary)).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+    let _ = harness.finish.send(());
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "opening turn to finish",
+    )
+    .await;
+
+    let command_id = "worker-notify:worker-1:event-3";
+    let payload = worker_notice_payload(
+        "[worker-task-notification] Worker finished while parent was idle.",
+        "worker-notify-message:worker-1:event-3",
+    );
+    core.doc_host
+        .queue_worker_notification(CHAT, command_id.into(), payload.clone())
+        .expect("queue Worker notification without a live mailbox");
+    core.doc_host
+        .queue_worker_notification(CHAT, command_id.into(), payload)
+        .expect("retry Worker notification without a live mailbox");
+    let notice = "[worker-task-notification] Worker finished while parent was idle.";
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == notice),
+        "Worker notification to start as a new turn",
+    )
+    .await;
+    assert_eq!(
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == notice)
+            .count(),
+        1,
+        "a retried Worker event is delivered once without a live mailbox"
+    );
+    assert!(core.sessions.turn_in_flight(CHAT));
+    assert!(queue_texts(&core).is_empty());
+    let _ = harness.finish.send(());
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "Worker notification turn to finish",
+    )
+    .await;
     core.shutdown().await;
 }

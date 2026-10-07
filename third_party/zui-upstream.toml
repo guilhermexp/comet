@@ -1,6 +1,6 @@
 repository = "https://github.com/zeronsh/zui"
 base_revision = "c6076032f0566e631d6c2707f89bd0dd87ab55b4"
-vendored_tree = "37123559dda41271fb4984992f79b644b3d681ba"
+vendored_tree = "3bd78bedca4d38ce3b6c6235d5d2e3b39da27c01"
 vendored_from = "working-tree"
 license = "Apache-2.0"
 
@@ -34,3 +34,11 @@ license = "Apache-2.0"
 #   1561532 Implement per pixel text edge fades (#12)
 #   18a89af Raise the drag promotion threshold on Windows (#13)
 #   667d0aa Fade SVG icons per pixel and allow per-edge horizontal fade bands
+
+# Local glass stabilization (2026-10-05): reconstructed separate source
+# from the exact tracked pre-change snapshot tree
+# 025faaaa331757932d0a7975b75e593b27766a5c. All prior patches preserved.
+# Source patch commit: 8962c7825322881bcb0b76bfc5e6321e17a17358
+# WindowServer blur now retains one standard NSVisualEffectView at 1% alpha
+# behind content; native regression covers reuse, cleanup, resize and lifetime.
+# vendored_tree is the actual Git tree above, not the historical source head.

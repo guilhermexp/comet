@@ -3413,28 +3413,6 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&result)
             }
-            methods::RENAME_WORKSPACE_ENTRY => {
-                let request: zeron_proto::RenameWorkspaceEntryRequest = parse_params(params)?;
-                let result = tokio::time::timeout(
-                    crate::workspace_files::WORKSPACE_FILE_MUTATION_TIMEOUT,
-                    self.workspace_files.rename_entry(request),
-                )
-                .await
-                .map_err(|_| RpcError::Failed("workspace rename timed out".into()))?
-                .map_err(RpcError::from)?;
-                RpcReply::value(&result)
-            }
-            methods::COPY_WORKSPACE_ENTRY => {
-                let request: zeron_proto::CopyWorkspaceEntryRequest = parse_params(params)?;
-                let result = tokio::time::timeout(
-                    crate::workspace_files::WORKSPACE_FILE_COPY_MOVE_TIMEOUT,
-                    self.workspace_files.copy_entry(request),
-                )
-                .await
-                .map_err(|_| RpcError::Failed("workspace copy timed out".into()))?
-                .map_err(RpcError::from)?;
-                RpcReply::value(&result)
-            }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
                 let setup_space = match p.space_id.as_deref() {

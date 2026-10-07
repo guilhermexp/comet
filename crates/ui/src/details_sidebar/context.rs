@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
 use zeron_proto::{Chat, Space};
 use zeron_workers_unpeel::{WorkersProject, WorkersSession};
 
@@ -8,15 +7,6 @@ use zeron_workers_unpeel::{WorkersProject, WorkersSession};
 pub enum DetailsMode {
     Orchestrator,
     Workers,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DetailsTab {
-    #[default]
-    Details,
-    Files,
-    SourceControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

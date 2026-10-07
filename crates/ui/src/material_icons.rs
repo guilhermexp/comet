@@ -1,9 +1,7 @@
-use std::{collections::HashMap, sync::OnceLock};
+use std::{collections::HashMap, sync::LazyLock};
 
 use gpui::SharedString;
 use serde::Deserialize;
-
-use crate::details_sidebar::file_tree::FileNode;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,16 +15,13 @@ struct MaterialIconManifest {
     default_folder_open_icon: String,
 }
 
-fn manifest() -> &'static MaterialIconManifest {
-    static MANIFEST: OnceLock<MaterialIconManifest> = OnceLock::new();
-    MANIFEST.get_or_init(|| {
-        serde_json::from_str(include_str!("../../assets/file-icons/manifest.json"))
-            .expect("bundled Material Icon Theme manifest is valid")
-    })
-}
+static MANIFEST: LazyLock<MaterialIconManifest> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../assets/file-icons/manifest.json"))
+        .expect("bundled Material Icon Theme manifest is valid")
+});
 
 pub fn material_icon_name(file_name: &str, is_directory: bool, is_open: bool) -> &'static str {
-    let manifest = manifest();
+    let manifest = &*MANIFEST;
     if is_directory {
         let name = file_name.to_lowercase();
         let resolved = if is_open {
@@ -72,10 +67,6 @@ pub fn material_icon_path(file_name: &str, is_directory: bool, is_open: bool) ->
         material_icon_name(file_name, is_directory, is_open)
     )
     .into()
-}
-
-pub fn file_glyph(node: &FileNode, expanded: bool) -> SharedString {
-    material_icon_path(&node.name, node.is_dir, expanded)
 }
 
 #[cfg(test)]

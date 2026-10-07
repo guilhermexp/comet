@@ -15,16 +15,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeron_proto::{
-    CopyWorkspaceEntryRequest, CreateWorkspaceEntryRequest, ListWorkspaceDirectoryRequest,
-    ReadWorkspaceFileRequest, RenameWorkspaceEntryRequest, SearchWorkspaceFilesRequest,
-    WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceEntryMutation, WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges,
-    WorkspaceFileConflictReason, WorkspaceFileSearchMatch, WorkspaceFileText,
-    WorkspaceFileWriteResult, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
-    WorkspaceTextEncoding, WorkspaceWritableEncoding, WorkspaceWritableLineEnding,
-    WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest, join_workspace_relative,
-    sibling_name_taken, unique_copy_name, validate_workspace_component,
-    validate_workspace_create_name,
+    CreateWorkspaceEntryRequest, ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest,
+    SearchWorkspaceFilesRequest, WatchWorkspaceFilesRequest, WorkspaceDirectoryPage,
+    WorkspaceEntry, WorkspaceEntryKind, WorkspaceEntryMutation, WorkspaceFileChange,
+    WorkspaceFileChangeKind, WorkspaceFileChanges, WorkspaceFileConflictReason,
+    WorkspaceFileSearchMatch, WorkspaceFileText, WorkspaceFileWriteResult, WorkspaceLineEnding,
+    WorkspaceReadOnlyReason, WorkspaceTarget, WorkspaceTextEncoding, WorkspaceWritableEncoding,
+    WorkspaceWritableLineEnding, WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
+    join_workspace_relative, sibling_name_taken, validate_workspace_create_name,
 };
 use zeron_rpc::RpcError;
 
@@ -41,7 +39,6 @@ pub const MAX_SEARCH_QUERY_CHARS: usize = 256;
 pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const WORKSPACE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 pub const WORKSPACE_FILE_MUTATION_TIMEOUT: Duration = Duration::from_secs(6);
-pub const WORKSPACE_FILE_COPY_MOVE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_EDITABLE_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_PREVIEW_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const WATCH_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -672,28 +669,6 @@ impl WorkspaceFiles {
         let workspace = self.resolve_target(&request.target).await?;
         self.spawn_mutation(workspace.checkout_id, "create", move |cancel| {
             create_entry_blocking(&workspace.root, request, cancel)
-        })
-        .await
-    }
-
-    pub async fn rename_entry(
-        &self,
-        request: RenameWorkspaceEntryRequest,
-    ) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
-        let workspace = self.resolve_target(&request.target).await?;
-        self.spawn_mutation(workspace.checkout_id, "rename", move |cancel| {
-            rename_entry_blocking(&workspace.root, request, cancel)
-        })
-        .await
-    }
-
-    pub async fn copy_entry(
-        &self,
-        request: CopyWorkspaceEntryRequest,
-    ) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
-        let workspace = self.resolve_target(&request.target).await?;
-        self.spawn_mutation(workspace.checkout_id, "copy", move |cancel| {
-            copy_entry_blocking(&workspace.root, request, cancel)
         })
         .await
     }
@@ -2357,11 +2332,6 @@ fn name_error(error: zeron_proto::WorkspaceNameError) -> WorkspaceFilesError {
 fn collision_error() -> WorkspaceFilesError {
     WorkspaceFilesError::BadParams("an entry with that name already exists".into())
 }
-
-fn descendant_error() -> WorkspaceFilesError {
-    WorkspaceFilesError::BadParams("cannot paste a folder into itself".into())
-}
-
 fn io_error(error: std::io::Error) -> WorkspaceFilesError {
     WorkspaceFilesError::Io(error.to_string())
 }
@@ -2369,11 +2339,6 @@ fn io_error(error: std::io::Error) -> WorkspaceFilesError {
 fn cancelled_error(label: &str) -> WorkspaceFilesError {
     WorkspaceFilesError::Io(format!("workspace {label} cancelled"))
 }
-
-fn too_deep_error() -> WorkspaceFilesError {
-    WorkspaceFilesError::Unsupported("path is too deep".into())
-}
-
 fn check_cancel(cancel: &AtomicBool, label: &str) -> Result<(), WorkspaceFilesError> {
     if cancel.load(Ordering::Relaxed) {
         Err(cancelled_error(label))
@@ -2381,86 +2346,6 @@ fn check_cancel(cancel: &AtomicBool, label: &str) -> Result<(), WorkspaceFilesEr
         Ok(())
     }
 }
-
-fn same_file_entry(left: &Path, right: &Path) -> bool {
-    let Ok(left_meta) = std::fs::symlink_metadata(left) else {
-        return false;
-    };
-    let Ok(right_meta) = std::fs::symlink_metadata(right) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino()
-    }
-    #[cfg(not(unix))]
-    {
-        left == right
-    }
-}
-
-fn path_c_string(path: &Path) -> Result<std::ffi::CString, WorkspaceFilesError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| bad_path("path contains NUL"))
-    }
-    #[cfg(not(unix))]
-    {
-        std::ffi::CString::new(path.to_string_lossy().as_bytes())
-            .map_err(|_| bad_path("path contains NUL"))
-    }
-}
-
-fn rename_exclusive(source: &Path, dest: &Path) -> Result<(), WorkspaceFilesError> {
-    if same_file_entry(source, dest) {
-        return std::fs::rename(source, dest).map_err(io_error);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let from = path_c_string(source)?;
-        let to = path_c_string(dest)?;
-        let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(collision_error());
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let from = path_c_string(source)?;
-        let to = path_c_string(dest)?;
-        let rc = unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(collision_error());
-        }
-    }
-    match std::fs::symlink_metadata(dest) {
-        Ok(_) => Err(collision_error()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::rename(source, dest).map_err(io_error)
-        }
-        Err(error) => Err(io_error(error)),
-    }
-}
-
 fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceFilesError> {
     let canonical = std::fs::canonicalize(root).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -2473,69 +2358,6 @@ fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceFilesError> {
         return Err(bad_path("workspace root is not absolute"));
     }
     Ok(canonical)
-}
-
-fn resolve_existing(
-    root: &Path,
-    relative: &WorkspaceRelativePath,
-) -> Result<(PathBuf, PathBuf, std::fs::Metadata), WorkspaceFilesError> {
-    let root = canonical_root(root)?;
-    if relative.as_path().as_os_str().is_empty() {
-        return Err(bad_path("path must not be empty"));
-    }
-    let mut current = root.clone();
-    let components: Vec<_> = relative.as_path().components().collect();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            return Err(bad_path("invalid file component"));
-        };
-        current.push(name);
-        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                WorkspaceFilesError::NotFound("entry not found".into())
-            } else {
-                WorkspaceFilesError::Io(error.to_string())
-            }
-        })?;
-        if metadata.file_type().is_symlink() {
-            let message = if index + 1 == components.len() {
-                "path is a symlink"
-            } else {
-                "path traverses a symlink"
-            };
-            return Err(WorkspaceFilesError::Unsupported(message.into()));
-        }
-        if index + 1 < components.len() && !metadata.is_dir() {
-            return Err(WorkspaceFilesError::Unsupported(
-                "file parent is not a directory".into(),
-            ));
-        }
-    }
-    if current == root || !current.starts_with(&root) {
-        return Err(WorkspaceFilesError::Authorization(
-            "file escaped workspace".into(),
-        ));
-    }
-    let metadata = std::fs::symlink_metadata(&current)
-        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
-    Ok((root, current, metadata))
-}
-
-fn resolve_directory(
-    root: &Path,
-    relative: &WorkspaceRelativePath,
-) -> Result<(PathBuf, PathBuf), WorkspaceFilesError> {
-    let root = canonical_root(root)?;
-    if relative.as_path().as_os_str().is_empty() {
-        return Ok((root.clone(), root));
-    }
-    let (root, path, metadata) = resolve_existing(&root, relative)?;
-    if !metadata.is_dir() {
-        return Err(WorkspaceFilesError::Unsupported(
-            "destination is not a directory".into(),
-        ));
-    }
-    Ok((root, path))
 }
 
 fn resolve_planned(
@@ -2688,166 +2510,6 @@ fn create_entry_blocking(
             }
         })?;
     mutation_result(&root, &dest, false)
-}
-
-fn rename_entry_blocking(
-    root: &Path,
-    request: RenameWorkspaceEntryRequest,
-    cancel: &AtomicBool,
-) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
-    check_cancel(cancel, "rename")?;
-    validate_workspace_component(&request.new_name).map_err(name_error)?;
-    let source = WorkspaceRelativePath::file(&request.path)?;
-    let (root, source_path, metadata) = resolve_existing(root, &source)?;
-    let current_name = source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| bad_path("path must be UTF-8"))?;
-    if current_name == request.new_name {
-        return mutation_result(&root, &source_path, metadata.is_dir());
-    }
-    let parent = source_path
-        .parent()
-        .ok_or_else(|| WorkspaceFilesError::Authorization("file escaped workspace".into()))?;
-    if sibling_collision(parent, &request.new_name, Some(&source_path))? {
-        return Err(collision_error());
-    }
-    let dest = parent.join(&request.new_name);
-    rename_exclusive(&source_path, &dest)?;
-    mutation_result(&root, &dest, metadata.is_dir())
-}
-
-fn copy_entry_blocking(
-    root: &Path,
-    request: CopyWorkspaceEntryRequest,
-    cancel: &AtomicBool,
-) -> Result<WorkspaceEntryMutation, WorkspaceFilesError> {
-    check_cancel(cancel, "copy")?;
-    let source = WorkspaceRelativePath::file(&request.source_path)?;
-    let destination = WorkspaceRelativePath::directory(&request.destination_directory)?;
-    let (root, source_path, metadata) = resolve_existing(root, &source)?;
-    let (_, dest_dir) = resolve_directory(&root, &destination)?;
-    if metadata.is_dir() && dest_dir.starts_with(&source_path) {
-        return Err(descendant_error());
-    }
-    let original = source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| bad_path("path must be UTF-8"))?;
-    let names = directory_names(&dest_dir)?;
-    let unique = unique_copy_name(
-        original,
-        metadata.is_dir(),
-        names.iter().map(String::as_str),
-    );
-    let dest = dest_dir.join(&unique);
-    copy_tree(&source_path, &dest, cancel)?;
-    mutation_result(&root, &dest, metadata.is_dir())
-}
-
-struct CopyJob {
-    source: PathBuf,
-    dest: PathBuf,
-    depth: usize,
-}
-
-fn copy_tree(source: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(), WorkspaceFilesError> {
-    let mut jobs = vec![CopyJob {
-        source: source.to_path_buf(),
-        dest: dest.to_path_buf(),
-        depth: 1,
-    }];
-    let mut owned = Vec::new();
-    let result = (|| {
-        while let Some(job) = jobs.pop() {
-            check_cancel(cancel, "copy")?;
-            if job.depth > MAX_RELATIVE_PATH_COMPONENTS {
-                return Err(too_deep_error());
-            }
-            copy_one(&job, &mut jobs, &mut owned)?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        for path in owned.into_iter().rev() {
-            let is_dir = std::fs::symlink_metadata(&path)
-                .map(|metadata| metadata.is_dir())
-                .unwrap_or(false);
-            if is_dir {
-                let _ = std::fs::remove_dir_all(&path);
-            } else {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    result
-}
-
-fn copy_one(
-    job: &CopyJob,
-    jobs: &mut Vec<CopyJob>,
-    owned: &mut Vec<PathBuf>,
-) -> Result<(), WorkspaceFilesError> {
-    let metadata = std::fs::symlink_metadata(&job.source).map_err(io_error)?;
-    if metadata.file_type().is_symlink() {
-        #[cfg(unix)]
-        {
-            let target = std::fs::read_link(&job.source).map_err(io_error)?;
-            std::os::unix::fs::symlink(&target, &job.dest).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    collision_error()
-                } else {
-                    io_error(error)
-                }
-            })?;
-            owned.push(job.dest.clone());
-            return Ok(());
-        }
-        #[cfg(not(unix))]
-        {
-            return Err(WorkspaceFilesError::Unsupported(
-                "symlink copy is unavailable on this platform".into(),
-            ));
-        }
-    }
-    if metadata.is_dir() {
-        match std::fs::create_dir(&job.dest) {
-            Ok(()) => owned.push(job.dest.clone()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(collision_error());
-            }
-            Err(error) => return Err(io_error(error)),
-        }
-        for entry in std::fs::read_dir(&job.source).map_err(io_error)? {
-            let entry = entry.map_err(io_error)?;
-            jobs.push(CopyJob {
-                source: entry.path(),
-                dest: job.dest.join(entry.file_name()),
-                depth: job.depth + 1,
-            });
-        }
-        return Ok(());
-    }
-    if metadata.is_file() {
-        let mut dest_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&job.dest)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    collision_error()
-                } else {
-                    io_error(error)
-                }
-            })?;
-        owned.push(job.dest.clone());
-        let mut source_file = std::fs::File::open(&job.source).map_err(io_error)?;
-        std::io::copy(&mut source_file, &mut dest_file).map_err(io_error)?;
-        return Ok(());
-    }
-    Err(WorkspaceFilesError::Unsupported(
-        "path is not a regular file or directory".into(),
-    ))
 }
 
 #[cfg(test)]
@@ -3022,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn create_rename_and_copy_change_the_disk() {
+    fn create_changes_the_disk() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let target = WorkspaceTarget {
@@ -3044,45 +2706,6 @@ mod tests {
         .unwrap();
         assert_eq!(created.path, "docs/adr/0001.md");
         assert_eq!(std::fs::read(root.join("docs/adr/0001.md")).unwrap(), b"");
-
-        std::fs::write(root.join("a.txt"), b"hello").unwrap();
-        let renamed = rename_entry_blocking(
-            &root,
-            RenameWorkspaceEntryRequest {
-                target: target.clone(),
-                path: "a.txt".into(),
-                new_name: "b.txt".into(),
-            },
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(renamed.path, "b.txt");
-        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"hello");
-
-        std::fs::write(root.join("c.txt"), b"keep").unwrap();
-        let collision = rename_entry_blocking(
-            &root,
-            RenameWorkspaceEntryRequest {
-                target: target.clone(),
-                path: "b.txt".into(),
-                new_name: "c.txt".into(),
-            },
-            &cancel,
-        )
-        .unwrap_err();
-        assert!(collision.to_string().contains("exist"), "{collision}");
-
-        let copied = copy_entry_blocking(
-            &root,
-            CopyWorkspaceEntryRequest {
-                target: target.clone(),
-                source_path: "c.txt".into(),
-                destination_directory: String::new(),
-            },
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(copied.path, "c copy.txt");
     }
 
     #[test]

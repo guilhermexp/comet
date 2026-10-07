@@ -1,15 +1,15 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use super::context::{DetailsContext, DetailsTab};
+use super::context::DetailsContext;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct DetailsSidebarPreferences {
-    pub active_tab: DetailsTab,
+    /// Per-context collapse markers (`:`-prefixed keys, e.g.
+    /// `:projects_worked:collapsed`).
     pub expanded: HashMap<String, Vec<String>>,
-    pub hidden: HashMap<String, bool>,
     pub idle_recaps: HashMap<String, super::idle_recap::IdleRecapEntry>,
     pub idle_recap_enabled: bool,
     pub idle_recap_delay_seconds: u64,
@@ -19,9 +19,7 @@ pub struct DetailsSidebarPreferences {
 impl Default for DetailsSidebarPreferences {
     fn default() -> Self {
         Self {
-            active_tab: DetailsTab::Details,
             expanded: HashMap::new(),
-            hidden: HashMap::new(),
             idle_recaps: HashMap::new(),
             idle_recap_enabled: true,
             idle_recap_delay_seconds: super::idle_recap::IDLE_RECAP_DEFAULT_SECONDS,
@@ -89,6 +87,13 @@ impl DetailsSidebarState {
             .unwrap_or_default()
             .as_millis() as u64;
         super::idle_recap::prune_idle_recaps(&mut preferences.idle_recaps, now);
+        // Builds that had a Files tree also stored its expanded file paths here.
+        for markers in preferences.expanded.values_mut() {
+            markers.retain(|marker| marker.starts_with(':'));
+        }
+        preferences
+            .expanded
+            .retain(|_, markers| !markers.is_empty());
         Self {
             context: None,
             preferences,
@@ -107,33 +112,6 @@ impl DetailsSidebarState {
             self.context = context;
         }
         self.load_generation
-    }
-
-    pub fn tab(&self) -> DetailsTab {
-        // Changes moved into the Files explorer's Changes tab; a persisted
-        // legacy value opens on Details instead of a tab that no longer exists.
-        match self.preferences.active_tab {
-            DetailsTab::SourceControl => DetailsTab::Details,
-            tab => tab,
-        }
-    }
-
-    pub fn set_tab(&mut self, tab: DetailsTab) {
-        self.preferences.active_tab = tab;
-    }
-
-    pub fn expanded_paths(&self) -> HashSet<String> {
-        let Some(context) = &self.context else {
-            return HashSet::new();
-        };
-        self.preferences
-            .expanded
-            .get(&context.key)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|p| !p.starts_with(':'))
-            .collect()
     }
 
     pub fn projects_worked_collapsed(&self) -> bool {
@@ -186,47 +164,6 @@ impl DetailsSidebarState {
         self.preferences.idle_recaps.remove(context_key);
     }
 
-    pub fn toggle_expanded(&mut self, relative_path: &str) {
-        let Some(context) = &self.context else {
-            return;
-        };
-        let paths = self
-            .preferences
-            .expanded
-            .entry(context.key.clone())
-            .or_default();
-        if let Some(index) = paths.iter().position(|path| path == relative_path) {
-            paths.remove(index);
-        } else {
-            paths.push(relative_path.to_string());
-            paths.sort();
-        }
-    }
-
-    pub fn show_hidden(&self) -> bool {
-        self.context
-            .as_ref()
-            .and_then(|context| self.preferences.hidden.get(&context.key))
-            .copied()
-            .unwrap_or(false)
-    }
-
-    pub fn toggle_hidden(&mut self) {
-        let Some(context) = &self.context else {
-            return;
-        };
-        let current = self
-            .preferences
-            .hidden
-            .get(&context.key)
-            .copied()
-            .unwrap_or(false);
-        self.preferences
-            .hidden
-            .insert(context.key.clone(), !current);
-        self.load_generation = self.load_generation.wrapping_add(1);
-    }
-
     pub fn widget_hidden(&self, widget_id: &str) -> bool {
         self.preferences.hidden_widgets.contains(widget_id)
     }
@@ -247,7 +184,7 @@ impl DetailsSidebarState {
         self.load_generation
     }
 
-    pub fn accept_file_load(&self, generation: u64, context_key: &str) -> bool {
+    pub fn accept_load(&self, generation: u64, context_key: &str) -> bool {
         self.load_generation == generation
             && self.context.as_ref().map(|context| context.key.as_str()) == Some(context_key)
     }
@@ -283,9 +220,8 @@ impl DetailsSidebarState {
 }
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Render,
-    SharedString, Subscription, Task, div, img, prelude::*, px,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Image, IntoElement, ObjectFit,
+    Render, SharedString, Subscription, Task, div, img, prelude::*, px,
 };
 use zeron_proto::{
     AgentAccountsSnapshot, CheckoutFilesRequest, CheckoutOpRequest, CheckoutStatus,
@@ -307,21 +243,6 @@ use crate::{
             project_chat_workers, snapshot_is_active, worker_compact_metadata,
         },
         context::detect_git_branch,
-        file_actions::{
-            DeletePrompt, FileClipboard, FileClipboardMode, FileMutation, InlineCreateKind,
-            InlineEditState, create_parent_path, path_is_within, retarget_path,
-        },
-        file_menu::{
-            FileActionTooltip, FileCheckoutAccess, FileClipboardPresence, FileMenuItem,
-            FileMenuKind, file_menu_items,
-        },
-        file_tree::{
-            FileActionError, FileNode, VisibleFileRow, copy_entry, create_entry, delete_entry,
-            flatten_visible_rows, inline_create_insert_index, is_denied_relative, move_entry,
-            rename_entry, scan_checkout,
-        },
-        files_view::{file_glyph, material_icon_path},
-        recency::{FileRecency, RECENCY_TICK, RecencyLevel},
         source_control,
         subagent_avatars::blobatar_subagent_avatar_path,
         todos::{latest_todos, todo_status_layout, todo_viewport_height_px},
@@ -330,8 +251,8 @@ use crate::{
             usage_provider_icon,
         },
         widgets::{
-            CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState, TabActivity,
-            chat_workers_viewport_height_px, widget_card, worker_expansion_key,
+            ActionTooltip, CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
+            TabActivity, chat_workers_viewport_height_px, widget_card, worker_expansion_key,
             workers_tab_presence,
         },
     },
@@ -346,12 +267,6 @@ use crate::{
     },
 };
 
-const FILE_SCAN_LIMIT: usize = 5_000;
-const RENDERED_FILE_ROW_LIMIT: usize = 800;
-/// Debounce between a filesystem event and the silent rescan it triggers. The
-/// rescan keeps the current tree on screen: flipping to `Loading` on every
-/// save flashed the pane empty.
-const RECENCY_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 const USAGE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 const USAGE_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -360,14 +275,6 @@ enum ContextFileAccess {
     Local,
     Remote,
     WaitingForDevice,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileMenuTarget {
-    path: String,
-    is_dir: bool,
-    is_root: bool,
-    position: gpui::Point<gpui::Pixels>,
 }
 
 fn context_file_access(
@@ -407,10 +314,6 @@ pub enum DetailsSidebarEvent {
         root: std::path::PathBuf,
         relative_path: String,
         remote_target: Option<(zeron_proto::WorkspaceTarget, String)>,
-    },
-    CloseFile {
-        context_key: String,
-        relative_path: String,
     },
     OpenSubagent {
         chat_id: String,
@@ -498,26 +401,10 @@ pub struct DetailsSidebar {
     composer: Entity<Composer>,
     sidebar: DetailsSidebarState,
     chat_workers: ChatWorkersWidgetState,
-    files: LoadState<Vec<FileNode>>,
-    directory_cache: super::file_tree::DirectoryCache,
-    workspace_watch: Option<Task<()>>,
-    workspace_watch_key: Option<String>,
     usage: LoadState<Vec<ProviderUsageRow>>,
     usage_snapshot: Option<AgentAccountsSnapshot>,
     usage_fetched_at: Option<std::time::Instant>,
-    search: Entity<ComposerInput>,
-    search_visible: bool,
     widgets_menu: popover::Popup<()>,
-    file_menu: popover::Popup<FileMenuTarget>,
-    files_focus: FocusHandle,
-    file_clipboard: Option<FileClipboard>,
-    inline_edit: Option<InlineEditState>,
-    inline_input: Option<Entity<ComposerInput>>,
-    inline_events: Option<Subscription>,
-    delete_prompt: Option<DeletePrompt>,
-    file_mutation_task: Option<Task<()>>,
-    file_mutation_error: Option<SharedString>,
-    active_file: Option<String>,
     usage_expanded: std::collections::HashSet<String>,
     material_icons: std::collections::HashMap<SharedString, std::sync::Arc<Image>>,
     resolved_branch: Option<String>,
@@ -526,14 +413,7 @@ pub struct DetailsSidebar {
     /// ponytail: a `git init` under an unchanged context is not noticed until
     /// the sidebar switches context; add an fs watch if that ever matters.
     has_git_dir: Option<(std::path::PathBuf, bool)>,
-    file_task: Option<Task<()>>,
     branch_task: Option<Task<()>>,
-    recency: FileRecency,
-    recency_root: Option<std::path::PathBuf>,
-    recency_watch: Option<Task<()>>,
-    recency_tick: Option<Task<()>>,
-    recency_ticking: bool,
-    recency_refresh: Option<Task<()>>,
     usage_task: Option<Task<()>>,
     usage_tick: Option<Task<()>>,
     recap_task: Option<Task<()>>,
@@ -543,7 +423,6 @@ pub struct DetailsSidebar {
     _workers_observe: Subscription,
     _pickers_observe: Subscription,
     _composer_observe: Subscription,
-    _search_events: Subscription,
     checkout_status: Option<CheckoutStatus>,
     checkout_not_git: bool,
     checkout_status_error: Option<SharedString>,
@@ -579,12 +458,6 @@ impl DetailsSidebar {
         composer: Entity<Composer>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search = cx.new(|cx| ComposerInput::with_context("Search files…", "PaletteSearch", cx));
-        let search_events = cx.subscribe(&search, |this, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Edited) {
-                this.reload_files(cx);
-            }
-        });
         let commit_input = cx.new(|cx| {
             ComposerInput::new("Message (Enter to commit)", cx).with_text_metrics(12.0, 18.0)
         });
@@ -598,20 +471,9 @@ impl DetailsSidebar {
             }
         });
         let state_observe = cx.observe(&app_state, |this, state, cx| {
-            let (engine_connected, local_device_id) = {
-                let state = state.read(cx);
-                (state.engine().is_some(), state.local_device_id.clone())
-            };
+            let engine_connected = state.read(cx).engine().is_some();
             if engine_connected && matches!(this.usage, LoadState::Idle | LoadState::Error(_)) {
                 this.load_usage(cx);
-            }
-            let local_files_became_available = matches!(this.files, LoadState::Error(_))
-                && this.sidebar.context().is_some_and(|context| {
-                    context_file_access(context, local_device_id.as_deref())
-                        == ContextFileAccess::Local
-                });
-            if local_files_became_available {
-                this.reload_files(cx);
             }
             this.sync_idle_recap(cx);
             this.ensure_source_control_watch(cx);
@@ -629,7 +491,6 @@ impl DetailsSidebar {
                 if let Some(branch) = &target.branch {
                     if this.resolved_branch.as_ref() != Some(branch) {
                         this.resolved_branch = Some(branch.clone());
-                        this.reload_files(cx);
                     }
                 }
             }
@@ -642,26 +503,10 @@ impl DetailsSidebar {
             composer,
             sidebar: DetailsSidebarState::new(preferences),
             chat_workers: ChatWorkersWidgetState::default(),
-            files: LoadState::Idle,
-            directory_cache: super::file_tree::DirectoryCache::default(),
-            workspace_watch: None,
-            workspace_watch_key: None,
             usage: LoadState::Idle,
             usage_snapshot: None,
             usage_fetched_at: None,
-            search,
-            search_visible: false,
             widgets_menu: popover::Popup::default(),
-            file_menu: popover::Popup::default(),
-            files_focus: cx.focus_handle(),
-            file_clipboard: None,
-            inline_edit: None,
-            inline_input: None,
-            inline_events: None,
-            delete_prompt: None,
-            file_mutation_task: None,
-            file_mutation_error: None,
-            active_file: None,
             usage_expanded: std::collections::HashSet::new(),
             material_icons: std::collections::HashMap::new(),
             resolved_branch: None,
@@ -690,16 +535,9 @@ impl DetailsSidebar {
             context_sources_expanded: false,
             context_sources_scroll: gpui::UniformListScrollHandle::new(),
             turn_stats_collapsed: true,
-            file_task: None,
             branch_task: None,
             usage_task: None,
             usage_tick: None,
-            recency: FileRecency::default(),
-            recency_root: None,
-            recency_watch: None,
-            recency_tick: None,
-            recency_ticking: false,
-            recency_refresh: None,
             recap_task: None,
             recap_armed_epoch: None,
             failed_epochs: std::collections::HashMap::new(),
@@ -707,38 +545,18 @@ impl DetailsSidebar {
             _workers_observe: workers_observe,
             _pickers_observe: pickers_observe,
             _composer_observe: composer_observe,
-            _search_events: search_events,
         };
         sidebar.load_usage(cx);
         sidebar.ensure_usage_tick(cx);
         sidebar
     }
 
-    pub fn set_active_file(&mut self, relative_path: Option<String>, cx: &mut Context<Self>) {
-        if self.active_file != relative_path {
-            self.active_file = relative_path;
-            cx.notify();
-        }
-    }
-
     pub fn set_context(&mut self, context: Option<DetailsContext>, cx: &mut Context<Self>) {
         let before = self.sidebar.load_generation();
         let after = self.sidebar.set_context(context);
         if before != after {
-            self.stop_recency_watch();
-            self.directory_cache = super::file_tree::DirectoryCache::default();
-            self.workspace_watch = None;
-            self.workspace_watch_key = None;
-            self.file_task = None;
-            self.files = LoadState::Idle;
             self.chat_workers
                 .sync_context(self.sidebar.context().map(|context| context.key.as_str()));
-            self.active_file = None;
-            self.file_clipboard = None;
-            self.delete_prompt = None;
-            self.inline_edit = None;
-            self.inline_input = None;
-            self.file_mutation_error = None;
             self.source_control_watch = None;
             self.source_control_watch_key = None;
             self.source_control_fetch = None;
@@ -758,7 +576,6 @@ impl DetailsSidebar {
                 .sidebar
                 .context()
                 .and_then(|value| value.branch.clone());
-            self.reload_files(cx);
             self.load_branch(cx);
             self.ensure_source_control_watch(cx);
             cx.notify();
@@ -866,16 +683,6 @@ impl DetailsSidebar {
             .child(popover::menu_heading(theme, "Widgets"))
             .children(rows)
             .into_any_element()
-    }
-
-    fn set_tab(&mut self, tab: DetailsTab, cx: &mut Context<Self>) {
-        if self.sidebar.tab() == tab {
-            return;
-        }
-        self.sidebar.set_tab(tab);
-        self.emit_preferences(cx);
-        self.ensure_source_control_watch(cx);
-        cx.notify();
     }
 
     fn source_control_cwd(&self) -> Option<(String, Option<String>)> {
@@ -1324,7 +1131,7 @@ impl DetailsSidebar {
             .role(gpui::Role::Button)
             .aria_label("Generate commit message")
             .tooltip(|_, cx| {
-                cx.new(|_| FileActionTooltip {
+                cx.new(|_| ActionTooltip {
                     label: "Generate commit message".into(),
                 })
                 .into()
@@ -1648,7 +1455,11 @@ impl DetailsSidebar {
                 Some(old) => format!("{old} → {}", row.path).into(),
                 None => row.path.clone().into(),
             };
-            let glyph = self.material_icon(material_icon_path(name, path.ends_with('/'), false));
+            let glyph = self.material_icon(crate::material_icons::material_icon_path(
+                name,
+                path.ends_with('/'),
+                false,
+            ));
             let group: SharedString = format!("source-control-{tag}-{index}").into();
             let status_color = match row.letter {
                 'M' => theme.warning,
@@ -1727,7 +1538,7 @@ impl DetailsSidebar {
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.element_hover))
                 .tooltip(move |_, cx| {
-                    cx.new(|_| FileActionTooltip {
+                    cx.new(|_| ActionTooltip {
                         label: tooltip.clone(),
                     })
                     .into()
@@ -1830,10 +1641,6 @@ impl DetailsSidebar {
             viewport,
             card,
         ))
-    }
-
-    fn reload_files(&mut self, cx: &mut Context<Self>) {
-        self.load_files(false, cx);
     }
 
     /// Cached `<cwd>/.git` probe — see the `has_git_dir` field.
@@ -2013,70 +1820,6 @@ impl DetailsSidebar {
         }
     }
 
-    /// Rescan without flipping to `Loading`, so a watcher-driven refresh keeps
-    /// the current rows (and their recency tint) visible while it runs.
-    fn refresh_files(&mut self, cx: &mut Context<Self>) {
-        self.load_files(true, cx);
-    }
-
-    fn load_files(&mut self, silent: bool, cx: &mut Context<Self>) {
-        if self.workspace_file_source(cx).is_some() {
-            self.load_workspace_files(silent, None, None, cx);
-            return;
-        }
-        let Some(context) = self.sidebar.context().cloned() else {
-            self.files = LoadState::Idle;
-            return;
-        };
-        let generation = self.sidebar.load_generation();
-        let context_key = context.key.clone();
-        let local_device_id = self.app_state.read(cx).local_device_id.clone();
-        match context_file_access(&context, local_device_id.as_deref()) {
-            ContextFileAccess::Local => {}
-            ContextFileAccess::Remote => {
-                self.files = LoadState::Error(
-                    "Files are unavailable for projects hosted on another device.".into(),
-                );
-                self.file_task = None;
-                self.stop_recency_watch();
-                cx.notify();
-                return;
-            }
-            ContextFileAccess::WaitingForDevice => {
-                self.files = LoadState::Error("Waiting for the project device connection…".into());
-                self.file_task = None;
-                self.stop_recency_watch();
-                cx.notify();
-                return;
-            }
-        }
-        self.ensure_recency_watch(context.cwd.clone(), cx);
-        let show_hidden = self.sidebar.show_hidden();
-        let query = self.search.read(cx).text().to_string();
-        if !silent {
-            self.files = LoadState::Loading;
-        }
-        self.file_task = Some(cx.spawn(async move |this, cx| {
-            let result =
-                cx.background_executor()
-                    .spawn(async move {
-                        scan_checkout(&context.cwd, show_hidden, &query, FILE_SCAN_LIMIT)
-                    })
-                    .await;
-            let _ = this.update(cx, |this, cx| {
-                if !this.sidebar.accept_file_load(generation, &context_key) {
-                    return;
-                }
-                this.files = match result {
-                    Ok(files) => LoadState::Ready(files),
-                    Err(error) => LoadState::Error(format!("{error:?}").into()),
-                };
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
     fn workspace_file_source(
         &self,
         cx: &gpui::App,
@@ -2116,407 +1859,6 @@ impl DetailsSidebar {
             }
         };
         Some((engine, target, device))
-    }
-
-    fn load_workspace_files(
-        &mut self,
-        silent: bool,
-        only: Option<Vec<String>>,
-        append: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((engine, target, device)) = self.workspace_file_source(cx) else {
-            return;
-        };
-        let Some(context) = self.sidebar.context().cloned() else {
-            return;
-        };
-        self.ensure_workspace_watch(
-            context.key.clone(),
-            engine.clone(),
-            target.clone(),
-            device.clone(),
-            cx,
-        );
-        if self.recency_root.is_some() {
-            self.stop_recency_watch();
-        }
-        let generation = self.sidebar.load_generation();
-        let context_key = context.key;
-        let show_hidden = self.sidebar.show_hidden();
-        let query = self.search.read(cx).text().trim().to_string();
-        let mut cache = self.directory_cache.clone();
-        let mut directories = only.unwrap_or_else(|| {
-            let mut dirs = cache.loaded_directories();
-            dirs.push(String::new());
-            dirs
-        });
-        if !cache.contains("") {
-            directories.push(String::new());
-        }
-        // A rapid second expansion can cancel the previous fetch; include all
-        // still-missing expanded directories so neither click gets lost.
-        directories.extend(
-            self.sidebar
-                .expanded_paths()
-                .into_iter()
-                .filter(|path| !cache.contains(path)),
-        );
-        directories.sort();
-        directories.dedup();
-        if !silent && !matches!(self.files, LoadState::Ready(_)) {
-            self.files = LoadState::Loading;
-        }
-        self.file_task = Some(cx.spawn(async move |this, cx| {
-            let result: Result<Vec<FileNode>, zeron_rpc::RpcError> = async {
-                if !query.is_empty() {
-                    let request = zeron_proto::SearchWorkspaceFilesRequest {
-                        target: target.clone(),
-                        query: query.clone(),
-                        include_ignored: true,
-                        limit: Some(200),
-                    };
-                    let mut params = serde_json::to_value(request).unwrap();
-                    params["targetDeviceId"] = device.clone().into();
-                    let matches: Vec<zeron_proto::WorkspaceFileSearchMatch> = engine
-                        .client()
-                        .call_as(zeron_rpc::methods::SEARCH_WORKSPACE_FILES, params)
-                        .await?;
-                    return Ok(super::file_tree::search_result_nodes(&matches, show_hidden));
-                }
-                for directory in directories {
-                    if !directory.is_empty() && !cache.can_expand(&directory) {
-                        continue;
-                    }
-                    let is_append = append.as_deref() == Some(directory.as_str());
-                    let retained = cache.loaded_count(&directory).max(500);
-                    let mut cursor = if is_append {
-                        cache.cursor(&directory).map(str::to_owned)
-                    } else {
-                        None
-                    };
-                    let mut page = zeron_proto::WorkspaceDirectoryPage {
-                        directory: directory.clone(),
-                        entries: Vec::new(),
-                        next_cursor: None,
-                        truncated: false,
-                        checkout_id: None,
-                        mutation_capabilities: None,
-                    };
-                    loop {
-                        let request = zeron_proto::ListWorkspaceDirectoryRequest {
-                            target: target.clone(),
-                            directory: directory.clone(),
-                            include_ignored: true,
-                            cursor,
-                        };
-                        let mut params = serde_json::to_value(request).unwrap();
-                        params["targetDeviceId"] = device.clone().into();
-                        let next: zeron_proto::WorkspaceDirectoryPage = engine
-                            .client()
-                            .call_as(zeron_rpc::methods::LIST_WORKSPACE_DIRECTORY, params)
-                            .await?;
-                        if next.directory != directory {
-                            return Err(zeron_rpc::RpcError::Failed(
-                                "Files returned a different directory".into(),
-                            ));
-                        }
-                        page.entries.extend(next.entries);
-                        page.next_cursor = next.next_cursor;
-                        page.truncated = next.truncated;
-                        if is_append || page.entries.len() >= retained || page.next_cursor.is_none()
-                        {
-                            break;
-                        }
-                        cursor = page.next_cursor.clone();
-                    }
-                    cache.apply(page, is_append);
-                }
-                Ok(cache.nodes(show_hidden))
-            }
-            .await;
-            let _ = this.update(cx, |this, cx| {
-                if !this.sidebar.accept_file_load(generation, &context_key)
-                    || this.search.read(cx).text().trim() != query
-                {
-                    return;
-                }
-                match result {
-                    Ok(nodes) => {
-                        let changed = this.directory_cache != cache
-                            || !matches!(&this.files, LoadState::Ready(old) if old == &nodes);
-                        this.directory_cache = cache;
-                        this.files = LoadState::Ready(nodes);
-                        if changed {
-                            cx.notify();
-                        }
-                    }
-                    Err(error) => {
-                        let message: SharedString = match error {
-                            zeron_rpc::RpcError::UnknownMethod(_) => {
-                                "Update the project device to enable Files browsing.".into()
-                            }
-                            other => format!("Files: {other}").into(),
-                        };
-                        let changed =
-                            !matches!(&this.files, LoadState::Error(old) if old == &message);
-                        this.files = LoadState::Error(message);
-                        if changed {
-                            cx.notify();
-                        }
-                    }
-                }
-            });
-        }));
-        if !silent {
-            cx.notify();
-        }
-    }
-
-    fn ensure_workspace_watch(
-        &mut self,
-        key: String,
-        engine: crate::state::EngineHandle,
-        target: zeron_proto::WorkspaceTarget,
-        device: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.workspace_watch_key.as_ref() == Some(&key) {
-            return;
-        }
-        self.workspace_watch_key = Some(key.clone());
-        self.workspace_watch = Some(cx.spawn(async move |this, cx| {
-            loop {
-                let mut params = serde_json::to_value(zeron_proto::WatchWorkspaceFilesRequest {
-                    target: target.clone(),
-                })
-                .unwrap();
-                params["targetDeviceId"] = device.clone().into();
-                let mut last_sequence = None;
-                let subscription = engine
-                    .client()
-                    .subscribe(zeron_rpc::methods::WATCH_WORKSPACE_FILES, params)
-                    .await;
-                if matches!(&subscription, Err(zeron_rpc::RpcError::UnknownMethod(_))) {
-                    return;
-                }
-                if let Ok(mut stream) = subscription {
-                    while let Some(value) = stream.recv().await {
-                        let Ok(batch) =
-                            serde_json::from_value::<zeron_proto::WorkspaceFileChanges>(value)
-                        else {
-                            continue;
-                        };
-                        let initial = last_sequence.is_none();
-                        let gap = last_sequence.is_some_and(|last| batch.sequence != last + 1);
-                        last_sequence = Some(batch.sequence);
-                        if this
-                            .update(cx, |this, cx| {
-                                if this.sidebar.context().map(|c| c.key.as_str())
-                                    != Some(key.as_str())
-                                {
-                                    return;
-                                }
-                                if initial || gap || batch.resync_required {
-                                    this.load_workspace_files(true, None, None, cx);
-                                    return;
-                                }
-                                let mut parents = std::collections::BTreeSet::new();
-                                let now = std::time::Instant::now();
-                                for change in batch.changes {
-                                    for path in std::iter::once(change.path).chain(change.old_path)
-                                    {
-                                        if super::file_tree::is_denied_relative(
-                                            std::path::Path::new(&path),
-                                        ) {
-                                            continue;
-                                        }
-                                        this.recency.mark(path.clone(), now);
-                                        if let Some(parent) = std::path::Path::new(&path)
-                                            .parent()
-                                            .and_then(|p| p.to_str())
-                                        {
-                                            if this.directory_cache.contains(parent) {
-                                                parents.insert(parent.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                                if !parents.is_empty() {
-                                    this.ensure_recency_tick(cx);
-                                    cx.notify();
-                                    this.load_workspace_files(
-                                        true,
-                                        Some(parents.into_iter().collect()),
-                                        None,
-                                        cx,
-                                    );
-                                }
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                if this
-                    .update(cx, |this, cx| {
-                        this.load_workspace_files(true, None, None, cx)
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(2))
-                    .await;
-            }
-        }));
-    }
-
-    fn stop_recency_watch(&mut self) {
-        self.recency_root = None;
-        self.recency_watch = None;
-        self.recency_refresh = None;
-        self.recency.clear();
-    }
-
-    /// Watches the pane's root for changes so rows can advertise recency. The
-    /// tree carries no timestamps, so the mark is the instant the event
-    /// arrived — never the file's mtime.
-    fn ensure_recency_watch(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
-        if self.recency_root.as_deref() == Some(root.as_path()) {
-            return;
-        }
-        self.recency_root = Some(root.clone());
-        self.recency.clear();
-        self.recency_refresh = None;
-        self.recency_watch = Some(cx.spawn(async move |this, cx| {
-            let (events_tx, mut events_rx) =
-                futures::channel::mpsc::unbounded::<Vec<std::path::PathBuf>>();
-            let watch_root = root.clone();
-            // fsevents reports canonical paths (/private/var over /var), so the
-            // marks are stripped against the canonical root or nothing matches.
-            let canonical_root = cx
-                .background_executor()
-                .spawn(async move { watch_root.canonicalize().unwrap_or(watch_root) })
-                .await;
-            let watch_root = canonical_root.clone();
-            let watcher = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut watcher =
-                        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                            let Ok(event) = event else {
-                                return;
-                            };
-                            if !matches!(
-                                event.kind,
-                                notify::EventKind::Create(_)
-                                    | notify::EventKind::Modify(_)
-                                    | notify::EventKind::Remove(_)
-                            ) {
-                                return;
-                            }
-                            let _ = events_tx.unbounded_send(event.paths);
-                        })
-                        .ok()?;
-                    notify::Watcher::watch(
-                        &mut watcher,
-                        &watch_root,
-                        notify::RecursiveMode::Recursive,
-                    )
-                    .ok()?;
-                    Some(watcher)
-                })
-                .await;
-            // The watcher lives exactly as long as this task: dropping the
-            // task (context switch, remote project) stops the watch.
-            let Some(_watcher) = watcher else {
-                return;
-            };
-            while let Some(paths) = futures::StreamExt::next(&mut events_rx).await {
-                let marks: Vec<String> = paths
-                    .iter()
-                    .filter_map(|path| {
-                        let relative = path.strip_prefix(&canonical_root).ok()?;
-                        if relative.as_os_str().is_empty() || is_denied_relative(relative) {
-                            return None;
-                        }
-                        Some(
-                            relative
-                                .components()
-                                .filter_map(|component| match component {
-                                    std::path::Component::Normal(value) => value.to_str(),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("/"),
-                        )
-                    })
-                    .filter(|relative| !relative.is_empty())
-                    .collect();
-                if marks.is_empty() {
-                    continue;
-                }
-                let alive = this
-                    .update(cx, |this, cx| {
-                        let now = std::time::Instant::now();
-                        for relative in marks {
-                            this.recency.mark(relative, now);
-                        }
-                        this.ensure_recency_tick(cx);
-                        this.schedule_recency_refresh(cx);
-                        cx.notify();
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        }));
-    }
-
-    /// Re-evaluates tiers and prunes expired marks while any mark is alive.
-    fn ensure_recency_tick(&mut self, cx: &mut Context<Self>) {
-        if self.recency_ticking {
-            return;
-        }
-        self.recency_ticking = true;
-        self.recency_tick = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(RECENCY_TICK).await;
-                let keep_ticking = this.update(cx, |this, cx| {
-                    let pruned = this.recency.prune(std::time::Instant::now());
-                    let remaining = !this.recency.is_empty();
-                    // Notify on the emptying tick too, otherwise the last
-                    // faded row keeps a stale tint until an unrelated render.
-                    if pruned || remaining {
-                        cx.notify();
-                    }
-                    remaining
-                });
-                if !matches!(keep_ticking, Ok(true)) {
-                    break;
-                }
-            }
-            let _ = this.update(cx, |this, _| {
-                this.recency_ticking = false;
-            });
-        }));
-    }
-
-    /// Coalesces a burst of filesystem events into one silent rescan, so a new
-    /// file appears as a row and not only as a mark.
-    fn schedule_recency_refresh(&mut self, cx: &mut Context<Self>) {
-        self.recency_refresh = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(RECENCY_REFRESH_DEBOUNCE)
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.refresh_files(cx);
-            });
-        }));
     }
 
     fn ensure_usage_tick(&mut self, cx: &mut Context<Self>) {
@@ -2619,21 +1961,12 @@ impl DetailsSidebar {
                 .spawn(async move { detect_git_branch(&context.cwd) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.sidebar.accept_file_load(generation, &context_key) {
+                if this.sidebar.accept_load(generation, &context_key) {
                     this.resolved_branch = branch;
                     cx.notify();
                 }
             });
         }));
-    }
-
-    fn all_folder_paths(nodes: &[FileNode], output: &mut Vec<String>) {
-        for node in nodes {
-            if node.is_dir {
-                output.push(node.relative_path.clone());
-                Self::all_folder_paths(&node.children, output);
-            }
-        }
     }
 
     fn material_icon(&mut self, path: SharedString) -> AnyElement {
@@ -2653,28 +1986,6 @@ impl DetailsSidebar {
     }
 
     fn render_header(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let tab = self.sidebar.tab();
-        let pill = |label: &'static str, active: bool| {
-            div()
-                .h(px(28.0))
-                .px(px(14.0))
-                .rounded(px(7.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .bg(if active {
-                    // Translucent active plate (was opaque theme.bg): reads
-                    // active over the glass without a solid black slab.
-                    theme.bg.opacity(0.6)
-                } else {
-                    gpui::transparent_black()
-                })
-                .text_size(px(12.5))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(if active { theme.text } else { theme.text_muted })
-                .child(label)
-        };
         div()
             .h(px(40.0))
             .flex_none()
@@ -2708,36 +2019,19 @@ impl DetailsSidebar {
                     )
                     .child(
                         div()
-                            .p(px(2.0))
-                            .rounded(px(9.0))
-                            .bg(crate::theme::ink(0.03))
-                            .flex()
-                            .items_center()
-                            .child(
-                                pill("Details", tab == DetailsTab::Details)
-                                    .id("details-tab")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_tab(DetailsTab::Details, cx)
-                                    })),
-                            )
-                            .child(
-                                pill("Files", tab == DetailsTab::Files)
-                                    .id("files-tab")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_tab(DetailsTab::Files, cx)
-                                    })),
-                            ),
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child("Details"),
                     ),
             )
-            .when(tab == DetailsTab::Details, |header| {
-                header.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(2.0))
-                        .child(self.render_widgets_gear(theme, cx)),
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(self.render_widgets_gear(theme, cx)),
+            )
     }
 
     fn toolbar_button(
@@ -2776,7 +2070,7 @@ impl DetailsSidebar {
         self.toolbar_button(id, icon_path, theme, listener)
             .aria_label(tooltip)
             .tooltip(move |_, cx| {
-                cx.new(|_| FileActionTooltip {
+                cx.new(|_| ActionTooltip {
                     label: label.clone(),
                 })
                 .into()
@@ -4196,347 +3490,6 @@ impl DetailsSidebar {
             })
     }
 
-    fn close_file_menu(&mut self, cx: &mut Context<Self>) {
-        if self.file_menu.begin_close() {
-            popover::reap_popup(cx, |this: &mut Self| &mut this.file_menu);
-        }
-    }
-
-    fn open_file_menu(&mut self, target: FileMenuTarget, cx: &mut Context<Self>) {
-        self.file_menu.open(target);
-        cx.notify();
-    }
-
-    fn files_access(&self, cx: &App) -> FileCheckoutAccess {
-        let Some(context) = self.sidebar.context() else {
-            return FileCheckoutAccess::Local;
-        };
-        match context_file_access(context, self.app_state.read(cx).local_device_id.as_deref()) {
-            ContextFileAccess::Local => FileCheckoutAccess::Local,
-            ContextFileAccess::Remote | ContextFileAccess::WaitingForDevice => {
-                FileCheckoutAccess::Remote
-            }
-        }
-    }
-
-    fn selected_file_path(&self) -> Option<(String, bool)> {
-        let relative = self.active_file.clone()?;
-        let is_dir = match &self.files {
-            LoadState::Ready(files) => file_node_is_dir(files, &relative),
-            _ => false,
-        };
-        Some((relative, is_dir))
-    }
-
-    fn sibling_names(&self, parent: &str) -> Vec<String> {
-        let LoadState::Ready(files) = &self.files else {
-            return Vec::new();
-        };
-        sibling_entry_names(files, parent)
-    }
-
-    fn start_inline_create(
-        &mut self,
-        kind: InlineCreateKind,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (selected, is_dir) = self
-            .selected_file_path()
-            .map(|(path, is_dir)| (Some(path), is_dir))
-            .unwrap_or((None, false));
-        if let Some(target) = self.file_menu.as_open() {
-            let parent = create_parent_path(
-                if target.is_root {
-                    None
-                } else {
-                    Some(target.path.as_str())
-                },
-                target.is_dir,
-            );
-            self.close_file_menu(cx);
-            self.begin_inline_edit(InlineEditState::create(parent, kind), window, cx);
-            return;
-        }
-        let parent = create_parent_path(selected.as_deref(), is_dir);
-        if !parent.is_empty() {
-            if !self.sidebar.expanded_paths().contains(&parent) {
-                self.sidebar.toggle_expanded(&parent);
-                self.emit_preferences(cx);
-            }
-            if self.workspace_file_source(cx).is_some() {
-                self.load_workspace_files(true, Some(vec![parent.clone()]), None, cx);
-            }
-        }
-        self.begin_inline_edit(InlineEditState::create(parent, kind), window, cx);
-    }
-
-    fn start_inline_rename(
-        &mut self,
-        path: String,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        if path.is_empty() {
-            return;
-        }
-        let original = std::path::Path::new(&path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(path.as_str())
-            .to_string();
-        self.begin_inline_edit(InlineEditState::rename(path, original), window, cx);
-    }
-
-    fn begin_inline_edit(
-        &mut self,
-        state: InlineEditState,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let placeholder = match &state.edit {
-            super::file_actions::InlineFileEdit::Create { kind, .. } => match kind {
-                InlineCreateKind::File => "File name",
-                InlineCreateKind::Directory => "Folder name",
-            },
-            super::file_actions::InlineFileEdit::Rename { .. } => "Name",
-        };
-        let draft = state.draft.clone();
-        let input = cx.new(|cx| {
-            let mut input = ComposerInput::new(placeholder, cx).with_single_line();
-            input.set_text(draft, cx);
-            input
-        });
-        self.inline_events = Some(cx.subscribe(&input, |this, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.confirm_inline_edit(cx);
-            }
-        }));
-        let focus = input.read(cx).focus_handle(cx);
-        self.inline_input = Some(input);
-        self.inline_edit = Some(state);
-        self.delete_prompt = None;
-        window.focus(&focus, cx);
-        cx.notify();
-    }
-
-    fn cancel_inline_edit(&mut self, cx: &mut Context<Self>) {
-        self.inline_edit = None;
-        self.inline_input = None;
-        self.inline_events = None;
-        cx.notify();
-    }
-
-    fn confirm_inline_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(mut state) = self.inline_edit.take() else {
-            return;
-        };
-        if let Some(input) = &self.inline_input {
-            state.draft = input.read(cx).text().to_string();
-        }
-        let parent = match &state.edit {
-            super::file_actions::InlineFileEdit::Create { parent, .. } => parent.clone(),
-            super::file_actions::InlineFileEdit::Rename { path, .. } => {
-                super::file_actions::parent_directory(path)
-            }
-        };
-        let siblings = self.sibling_names(&parent);
-        let sibling_refs: Vec<&str> = siblings.iter().map(String::as_str).collect();
-        match state.confirm(&sibling_refs) {
-            Ok(None) => {
-                self.inline_input = None;
-                self.inline_events = None;
-                cx.notify();
-            }
-            Ok(Some(mutation)) => {
-                self.inline_input = None;
-                self.inline_events = None;
-                self.execute_file_mutation(mutation, cx);
-            }
-            Err(error) => {
-                state.error = Some(error);
-                self.inline_edit = Some(state);
-                cx.notify();
-            }
-        }
-    }
-
-    fn request_delete(&mut self, path: String, is_dir: bool, cx: &mut Context<Self>) {
-        if path.is_empty() {
-            return;
-        }
-        let name = std::path::Path::new(&path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(path.as_str())
-            .to_string();
-        self.delete_prompt = Some(DeletePrompt { path, name, is_dir });
-        self.close_file_menu(cx);
-        cx.notify();
-    }
-
-    fn execute_file_mutation(&mut self, mutation: FileMutation, cx: &mut Context<Self>) {
-        self.file_mutation_error = None;
-        if self.workspace_file_source(cx).is_some() {
-            self.execute_rpc_file_mutation(mutation, cx);
-        } else {
-            self.execute_local_file_mutation(mutation, cx);
-        }
-    }
-
-    fn execute_local_file_mutation(&mut self, mutation: FileMutation, cx: &mut Context<Self>) {
-        let Some(context) = self.sidebar.context().cloned() else {
-            return;
-        };
-        let root = context.cwd.clone();
-        let result = match &mutation {
-            FileMutation::CreateFile { parent, name } => create_entry(&root, parent, name, false),
-            FileMutation::CreateDir { parent, name } => create_entry(&root, parent, name, true),
-            FileMutation::Rename { path, new_name } => rename_entry(&root, path, new_name),
-            FileMutation::Delete { path } => delete_entry(&root, path).map(|()| path.clone()),
-            FileMutation::Move {
-                source,
-                destination_directory,
-            } => move_entry(&root, source, destination_directory),
-            FileMutation::Copy {
-                source,
-                destination_directory,
-            } => copy_entry(&root, source, destination_directory),
-        };
-        match result {
-            Ok(path) => self.after_file_mutation(&mutation, path, cx),
-            Err(error) => {
-                self.file_mutation_error = Some(file_action_error_message(&error));
-                cx.notify();
-            }
-        }
-    }
-
-    fn execute_rpc_file_mutation(&mut self, mutation: FileMutation, cx: &mut Context<Self>) {
-        let Some((engine, target, device)) = self.workspace_file_source(cx) else {
-            return;
-        };
-        self.file_mutation_task = Some(cx.spawn(async move |this, cx| {
-            let result = rpc_file_mutation(&engine, target, device, &mutation).await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(path) => this.after_file_mutation(&mutation, path, cx),
-                Err(zeron_rpc::RpcError::UnknownMethod(_)) => {
-                    this.file_mutation_error =
-                        Some("Update the project device to enable Files browsing.".into());
-                    cx.notify();
-                }
-                Err(error) => {
-                    this.file_mutation_error = Some(format!("{error}").into());
-                    cx.notify();
-                }
-            });
-        }));
-    }
-
-    fn after_file_mutation(
-        &mut self,
-        mutation: &FileMutation,
-        path: String,
-        cx: &mut Context<Self>,
-    ) {
-        match mutation {
-            FileMutation::Delete { path: deleted } => {
-                if let Some(active) = self.active_file.clone() {
-                    if path_is_within(deleted, &active) {
-                        self.active_file = None;
-                        if active != *deleted {
-                            self.emit_close_file(&active, cx);
-                        }
-                    }
-                }
-                self.emit_close_file(deleted, cx);
-                if self
-                    .file_clipboard
-                    .as_ref()
-                    .is_some_and(|clip| path_is_within(deleted, &clip.relative_path))
-                {
-                    self.file_clipboard = None;
-                }
-                if self
-                    .delete_prompt
-                    .as_ref()
-                    .is_some_and(|prompt| path_is_within(deleted, &prompt.path))
-                {
-                    self.delete_prompt = None;
-                }
-                if self
-                    .inline_edit
-                    .as_ref()
-                    .is_some_and(|edit| match &edit.edit {
-                        super::file_actions::InlineFileEdit::Rename { path, .. } => {
-                            path_is_within(deleted, path)
-                        }
-                        super::file_actions::InlineFileEdit::Create { parent, .. } => {
-                            path_is_within(deleted, parent)
-                        }
-                    })
-                {
-                    self.inline_edit = None;
-                    self.inline_input = None;
-                }
-            }
-            FileMutation::Rename { path: old, .. } | FileMutation::Move { source: old, .. } => {
-                if let Some(active) = self.active_file.clone() {
-                    if let Some(next) = retarget_path(old, &path, &active) {
-                        if next != active {
-                            self.emit_close_file(&active, cx);
-                            self.emit_open_file(&next, cx);
-                        }
-                        self.active_file = Some(next);
-                    }
-                }
-                let cut_consumed = matches!(mutation, FileMutation::Move { source, .. } if self
-                    .file_clipboard
-                    .as_ref()
-                    .is_some_and(|clip| clip.mode == FileClipboardMode::Cut && clip.relative_path == *source));
-                if cut_consumed {
-                    self.file_clipboard = None;
-                } else if let Some(clip) = self.file_clipboard.as_mut() {
-                    if let Some(next) = retarget_path(old, &path, &clip.relative_path) {
-                        clip.relative_path = next;
-                    }
-                }
-            }
-            _ => {}
-        }
-        let parents = mutation.refresh_directories(&path);
-        for parent in &parents {
-            if !parent.is_empty() && !self.sidebar.expanded_paths().contains(parent) {
-                self.sidebar.toggle_expanded(parent);
-            }
-        }
-        if matches!(mutation, FileMutation::CreateDir { .. })
-            && !self.sidebar.expanded_paths().contains(&path)
-        {
-            self.sidebar.toggle_expanded(&path);
-        }
-        self.emit_preferences(cx);
-        if self.workspace_file_source(cx).is_some() {
-            self.load_workspace_files(true, Some(parents), None, cx);
-        } else {
-            self.refresh_files(cx);
-        }
-        if matches!(mutation, FileMutation::CreateFile { .. }) {
-            self.active_file = Some(path.clone());
-            self.emit_open_file(&path, cx);
-        }
-        cx.notify();
-    }
-
-    fn emit_close_file(&self, relative_path: &str, cx: &mut Context<Self>) {
-        if let Some(context) = self.sidebar.context() {
-            cx.emit(DetailsSidebarEvent::CloseFile {
-                context_key: context.key.clone(),
-                relative_path: relative_path.to_string(),
-            });
-        }
-    }
-
     fn emit_open_file(&self, relative_path: &str, cx: &mut Context<Self>) {
         let Some(context) = self.sidebar.context() else {
             return;
@@ -4556,834 +3509,6 @@ impl DetailsSidebar {
                 None
             },
         });
-    }
-
-    fn apply_file_menu_item(
-        &mut self,
-        item: FileMenuItem,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(target) = self.file_menu.as_open().cloned() else {
-            return;
-        };
-        match item {
-            FileMenuItem::NewFile => self.start_inline_create(InlineCreateKind::File, window, cx),
-            FileMenuItem::NewFolder => {
-                self.start_inline_create(InlineCreateKind::Directory, window, cx)
-            }
-            FileMenuItem::Cut => {
-                if !target.is_root {
-                    self.file_clipboard = Some(FileClipboard {
-                        relative_path: target.path.clone(),
-                        mode: FileClipboardMode::Cut,
-                    });
-                }
-                self.close_file_menu(cx);
-                cx.notify();
-            }
-            FileMenuItem::Copy => {
-                if !target.is_root {
-                    self.file_clipboard = Some(FileClipboard {
-                        relative_path: target.path.clone(),
-                        mode: FileClipboardMode::Copy,
-                    });
-                }
-                self.close_file_menu(cx);
-                cx.notify();
-            }
-            FileMenuItem::Paste => {
-                let destination = create_parent_path(
-                    if target.is_root {
-                        None
-                    } else {
-                        Some(target.path.as_str())
-                    },
-                    target.is_dir,
-                );
-                self.close_file_menu(cx);
-                if let Some(mutation) = paste_mutation(self.file_clipboard.as_ref(), destination) {
-                    self.execute_file_mutation(mutation, cx);
-                }
-            }
-            FileMenuItem::Duplicate => {
-                if !target.is_root {
-                    let parent = super::file_actions::parent_directory(&target.path);
-                    self.execute_file_mutation(
-                        FileMutation::Copy {
-                            source: target.path.clone(),
-                            destination_directory: parent,
-                        },
-                        cx,
-                    );
-                }
-                self.close_file_menu(cx);
-            }
-            FileMenuItem::CopyPath => {
-                self.copy_absolute_path(&target.path, cx);
-                self.close_file_menu(cx);
-            }
-            FileMenuItem::CopyRelativePath => {
-                cx.write_to_clipboard(ClipboardItem::new_string(target.path.clone()));
-                self.close_file_menu(cx);
-            }
-            FileMenuItem::Rename => {
-                self.close_file_menu(cx);
-                self.start_inline_rename(target.path, window, cx);
-            }
-            FileMenuItem::Delete => self.request_delete(target.path, target.is_dir, cx),
-            FileMenuItem::OpenInTerminal => {
-                self.open_in_terminal(&target.path, target.is_dir, cx);
-                self.close_file_menu(cx);
-            }
-            FileMenuItem::RevealInFinder => {
-                self.reveal_in_finder(&target.path, cx);
-                self.close_file_menu(cx);
-            }
-        }
-    }
-
-    fn copy_absolute_path(&self, relative: &str, cx: &mut Context<Self>) {
-        let Some(context) = self.sidebar.context() else {
-            return;
-        };
-        let absolute = if relative.is_empty() {
-            context.cwd.clone()
-        } else {
-            context.cwd.join(relative)
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(
-            absolute.to_string_lossy().to_string(),
-        ));
-    }
-
-    fn reveal_in_finder(&self, relative: &str, cx: &mut Context<Self>) {
-        let Some(context) = self.sidebar.context() else {
-            return;
-        };
-        let path = if relative.is_empty() {
-            context.cwd.clone()
-        } else {
-            context.cwd.join(relative)
-        };
-        cx.background_executor()
-            .spawn(async move {
-                let _ = std::process::Command::new("open")
-                    .arg("-R")
-                    .arg(path)
-                    .status();
-            })
-            .detach();
-    }
-
-    fn open_in_terminal(&self, relative: &str, is_dir: bool, cx: &mut Context<Self>) {
-        let Some(context) = self.sidebar.context() else {
-            return;
-        };
-        let folder = if relative.is_empty() || is_dir {
-            if relative.is_empty() {
-                context.cwd.clone()
-            } else {
-                context.cwd.join(relative)
-            }
-        } else {
-            context
-                .cwd
-                .join(relative)
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| context.cwd.clone())
-        };
-        if let Some((engine, _, device)) = self.workspace_file_source(cx) {
-            let mut params = serde_json::json!({
-                "cwd": folder.to_string_lossy(),
-                "cols": 80,
-                "rows": 24,
-            });
-            params["targetDeviceId"] = device.into();
-            cx.spawn(async move |_, _| {
-                let _ = engine
-                    .client()
-                    .call(zeron_rpc::methods::OPEN_TERMINAL, params)
-                    .await;
-            })
-            .detach();
-            return;
-        }
-        cx.background_executor()
-            .spawn(async move {
-                let _ = std::process::Command::new("open")
-                    .arg("-a")
-                    .arg("Terminal")
-                    .arg(folder)
-                    .status();
-            })
-            .detach();
-    }
-
-    fn on_files_key(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.inline_edit.is_some() {
-            if event.keystroke.key == "escape" {
-                cx.stop_propagation();
-                self.cancel_inline_edit(cx);
-            }
-            return;
-        }
-        let key = event.keystroke.key.as_str();
-        let platform = event.keystroke.modifiers.platform;
-        if key == "escape" {
-            cx.stop_propagation();
-            self.file_clipboard = None;
-            self.close_file_menu(cx);
-            if self.delete_prompt.take().is_some() {
-                cx.notify();
-            }
-            return;
-        }
-        if self.delete_prompt.is_some() {
-            return;
-        }
-        let (path, is_dir) = self
-            .selected_file_path()
-            .unwrap_or_else(|| (String::new(), true));
-        if platform && key == "c" && !path.is_empty() {
-            cx.stop_propagation();
-            self.file_clipboard = Some(FileClipboard {
-                relative_path: path,
-                mode: FileClipboardMode::Copy,
-            });
-            cx.notify();
-        } else if platform && key == "x" && !path.is_empty() {
-            cx.stop_propagation();
-            self.file_clipboard = Some(FileClipboard {
-                relative_path: path,
-                mode: FileClipboardMode::Cut,
-            });
-            cx.notify();
-        } else if platform && key == "v" {
-            cx.stop_propagation();
-            let destination = create_parent_path(
-                if path.is_empty() {
-                    None
-                } else {
-                    Some(path.as_str())
-                },
-                is_dir || path.is_empty(),
-            );
-            if let Some(mutation) = paste_mutation(self.file_clipboard.as_ref(), destination) {
-                self.execute_file_mutation(mutation, cx);
-            }
-        } else if key == "f2" && !path.is_empty() {
-            cx.stop_propagation();
-            self.start_inline_rename(path, window, cx);
-        } else if (key == "delete" || key == "backspace") && !path.is_empty() {
-            cx.stop_propagation();
-            self.request_delete(path, is_dir, cx);
-        }
-    }
-
-    fn render_file_context_menu(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let target = self.file_menu.get()?.clone();
-        let closing = self.file_menu.closing_since();
-        let kind = if target.is_root {
-            FileMenuKind::Root
-        } else {
-            FileMenuKind::Entry
-        };
-        let clipboard = if self.file_clipboard.is_some() {
-            FileClipboardPresence::Occupied
-        } else {
-            FileClipboardPresence::Empty
-        };
-        let access = self.files_access(cx);
-        let entries = file_menu_items(kind, access, clipboard);
-        let mut children: Vec<AnyElement> = Vec::new();
-        for (index, entry) in entries.into_iter().enumerate() {
-            if matches!(
-                entry.item,
-                FileMenuItem::Cut
-                    | FileMenuItem::CopyPath
-                    | FileMenuItem::Rename
-                    | FileMenuItem::OpenInTerminal
-            ) {
-                children.push(popover::menu_separator().into_any_element());
-            }
-            let item = entry.item;
-            let enabled = entry.enabled;
-            let label = item.label();
-            let shortcut = item.shortcut();
-            let mut row = popover::menu_row(
-                theme,
-                false,
-                SharedString::from(format!("details-file-menu-{index}")),
-            )
-            .id(("details-file-menu-row", index))
-            .opacity(if enabled { 1.0 } else { 0.4 });
-            if enabled {
-                row = row.on_click(cx.listener(move |this, _, window, cx| {
-                    this.apply_file_menu_item(item, window, cx);
-                }));
-            }
-            row = row.child(div().flex_1().min_w_0().text_size(px(13.0)).child(label));
-            if let Some(shortcut) = shortcut {
-                row = row.child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted)
-                        .child(shortcut),
-                );
-            }
-            children.push(row.into_any_element());
-        }
-        let menu = popover::popover_card(theme)
-            .id("details-file-context-menu-card")
-            .w(px(240.0))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_file_menu(cx)))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .children(children)
-            .into_any_element();
-        Some(popover::menu_at(
-            "details-file-context-menu",
-            target.position,
-            menu,
-            closing,
-        ))
-    }
-
-    fn render_delete_dialog(
-        &mut self,
-        viewport: gpui::Size<gpui::Pixels>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let prompt = self.delete_prompt.as_ref()?;
-        let name = prompt.name.clone();
-        let kind = if prompt.is_dir { "folder" } else { "file" };
-        let card = popover::dialog_card(theme)
-            .child(popover::dialog_title(theme, "Delete permanently"))
-            .child(div().mt(px(12.0)).child(popover::dialog_body(
-                theme,
-                format!(
-                    "Delete {kind} “{name}”? This cannot be undone and does not use the Trash."
-                ),
-            )))
-            .child(
-                div()
-                    .mt(px(16.0))
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap(px(8.0))
-                    .child(
-                        popover::btn_ghost(theme, "Cancel", "details-file-delete-cancel")
-                            .id("details-file-delete-cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.delete_prompt = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        popover::btn_danger(theme, "Delete")
-                            .id("details-file-delete-confirm")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(prompt) = this.delete_prompt.take() {
-                                    this.execute_file_mutation(
-                                        FileMutation::Delete { path: prompt.path },
-                                        cx,
-                                    );
-                                }
-                            })),
-                    ),
-            )
-            .into_any_element();
-        Some(popover::modal("details-file-delete-dialog", viewport, card))
-    }
-
-    fn render_files(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let mut content = div().size_full().flex().flex_col();
-        if let Some(error) = &self.file_mutation_error {
-            content = content.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.danger)
-                    .child(error.clone()),
-            );
-        }
-        if self.search_visible {
-            content = content.child(
-                div()
-                    .h(px(38.0))
-                    .flex_none()
-                    .mx(px(8.0))
-                    .mb(px(4.0))
-                    .px(px(8.0))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .flex()
-                    .items_center()
-                    .child(self.search.clone()),
-            );
-        }
-        match &self.files {
-            LoadState::Loading => content.child(
-                div()
-                    .p(px(12.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .child("Loading files…"),
-            ),
-            LoadState::Error(message) => content.child(
-                div()
-                    .p(px(12.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.danger)
-                    .child(message.clone()),
-            ),
-            LoadState::Ready(files) => {
-                let mut rows = flatten_visible_rows(files, &self.sidebar.expanded_paths());
-                if let Some(edit) = self.inline_edit.as_ref() {
-                    if let super::file_actions::InlineFileEdit::Create { parent, kind } = &edit.edit
-                    {
-                        let is_dir = matches!(kind, InlineCreateKind::Directory);
-                        let index = inline_create_insert_index(&rows, parent, is_dir);
-                        let depth = if parent.is_empty() {
-                            0
-                        } else {
-                            rows.iter()
-                                .find(|row| row.node.relative_path == *parent)
-                                .map(|row| row.depth + 1)
-                                .unwrap_or(0)
-                        };
-                        rows.insert(
-                            index.min(rows.len()),
-                            VisibleFileRow {
-                                node: FileNode {
-                                    name: String::new(),
-                                    relative_path: if parent.is_empty() {
-                                        "__inline__".into()
-                                    } else {
-                                        format!("{parent}/__inline__")
-                                    },
-                                    is_dir,
-                                    children: Vec::new(),
-                                },
-                                depth,
-                                has_next_sibling: false,
-                                ancestor_continuations: Vec::new(),
-                            },
-                        );
-                    }
-                }
-                let truncated = rows.len() > RENDERED_FILE_ROW_LIMIT;
-                let root_name_string = self
-                    .sidebar
-                    .context()
-                    .and_then(|context| context.cwd.file_name())
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Workspace")
-                    .to_string();
-                let root_name: SharedString = root_name_string.clone().into();
-                let root_icon =
-                    self.material_icon(material_icon_path(&root_name_string, true, true));
-                content.child(
-                    div()
-                        .id("details-files-pane")
-                        .track_focus(&self.files_focus)
-                        .key_context("DetailsFiles")
-                        .role(gpui::Role::Group)
-                        .aria_label("Files")
-                        .on_key_down(cx.listener(|this, event, window, cx| {
-                            this.on_files_key(event, window, cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                window.focus(&this.files_focus, cx);
-                                this.open_file_menu(
-                                    FileMenuTarget {
-                                        path: String::new(),
-                                        is_dir: true,
-                                        is_root: true,
-                                        position: event.position,
-                                    },
-                                    cx,
-                                );
-                            }),
-                        )
-                        .m(px(10.0))
-                        .flex_1()
-                        .min_h_0()
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(theme.border.opacity(0.5))
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(38.0))
-                                .flex_none()
-                                .px(px(10.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .bg(crate::theme::ink(0.012))
-                                .child(
-                                    icons::icon(icons::DETAILS_BOX)
-                                        .size(px(15.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(13.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text)
-                                        .child("Files"),
-                                )
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(2.0))
-                                        .child(self.toolbar_button(
-                                            "details-hidden-toggle",
-                                            if self.sidebar.show_hidden() {
-                                                icons::DETAILS_EYE
-                                            } else {
-                                                icons::DETAILS_EYE_OFF
-                                            },
-                                            theme,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.sidebar.toggle_hidden();
-                                                this.emit_preferences(cx);
-                                                this.reload_files(cx);
-                                            }),
-                                        ))
-                                        .child(self.toolbar_button_with_tooltip(
-                                            "details-new-file",
-                                            icons::DOCUMENT_ADD,
-                                            "New File",
-                                            theme,
-                                            cx.listener(|this, _, window, cx| {
-                                                this.start_inline_create(
-                                                    InlineCreateKind::File,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .child(self.toolbar_button_with_tooltip(
-                                            "details-new-folder",
-                                            icons::FOLDER_WITH_FILES,
-                                            "New Folder",
-                                            theme,
-                                            cx.listener(|this, _, window, cx| {
-                                                this.start_inline_create(
-                                                    InlineCreateKind::Directory,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .child(self.toolbar_button(
-                                            "details-search-toggle",
-                                            icons::MAGNIFER,
-                                            theme,
-                                            cx.listener(|this, _, window, cx| {
-                                                this.search_visible = !this.search_visible;
-                                                if this.search_visible {
-                                                    window.focus(
-                                                        &this.search.read(cx).focus_handle(cx),
-                                                        cx,
-                                                    );
-                                                }
-                                                cx.notify();
-                                            }),
-                                        ))
-                                        .child(self.toolbar_button(
-                                            "details-expand-all",
-                                            icons::FOLD_VERTICAL,
-                                            theme,
-                                            cx.listener(|this, _, _, cx| {
-                                                let folders = match &this.files {
-                                                    LoadState::Ready(files) => {
-                                                        let mut folders = Vec::new();
-                                                        Self::all_folder_paths(files, &mut folders);
-                                                        folders
-                                                    }
-                                                    _ => Vec::new(),
-                                                };
-                                                let all_expanded = folders.iter().all(|path| {
-                                                    this.sidebar.expanded_paths().contains(path)
-                                                });
-                                                for path in folders {
-                                                    if this.sidebar.expanded_paths().contains(&path)
-                                                        == all_expanded
-                                                    {
-                                                        this.sidebar.toggle_expanded(&path);
-                                                    }
-                                                }
-                                                this.emit_preferences(cx);
-                                                cx.notify();
-                                            }),
-                                        )),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("details-files-root")
-                                .h(px(28.0))
-                                .flex_none()
-                                .px(px(10.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        window.focus(&this.files_focus, cx);
-                                        this.open_file_menu(
-                                            FileMenuTarget {
-                                                path: String::new(),
-                                                is_dir: true,
-                                                is_root: true,
-                                                position: event.position,
-                                            },
-                                            cx,
-                                        );
-                                    }),
-                                )
-                                .child(root_icon)
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text)
-                                        .child(root_name),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("details-files-scroll")
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .px(px(8.0))
-                                .children(
-                                    rows.into_iter()
-                                        .take(RENDERED_FILE_ROW_LIMIT)
-                                        .enumerate()
-                                        .map(|(index, row)| {
-                                            self.render_file_row(index, row, theme, cx)
-                                        }),
-                                )
-                                .children(
-                                    self.directory_cache
-                                        .loaded_directories()
-                                        .into_iter()
-                                        .filter(|directory| {
-                                            (directory.is_empty()
-                                                || self
-                                                    .sidebar
-                                                    .expanded_paths()
-                                                    .contains(directory))
-                                                && self.directory_cache.cursor(directory).is_some()
-                                        })
-                                        .map(|directory| {
-                                            let label = if directory.is_empty() {
-                                                "Load more files".to_string()
-                                            } else {
-                                                format!("Load more in {directory}")
-                                            };
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "files-more-{directory}"
-                                                )))
-                                                .px(px(8.0))
-                                                .py(px(6.0))
-                                                .text_size(px(11.0))
-                                                .text_color(theme.text_muted)
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.load_workspace_files(
-                                                        true,
-                                                        Some(vec![directory.clone()]),
-                                                        Some(directory.clone()),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child(label)
-                                        }),
-                                )
-                                .when(truncated, |list| {
-                                    list.child(
-                                        div()
-                                            .px(px(8.0))
-                                            .py(px(6.0))
-                                            .text_size(px(11.0))
-                                            .text_color(theme.text_muted)
-                                            .child("Refine search to show more files"),
-                                    )
-                                }),
-                        ),
-                )
-            }
-            LoadState::Idle => content,
-        }
-    }
-
-    fn render_file_row(
-        &mut self,
-        index: usize,
-        row: super::file_tree::VisibleFileRow,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let relative = row.node.relative_path.clone();
-        let is_dir = row.node.is_dir;
-        let expanded = self.sidebar.expanded_paths().contains(&relative);
-        let active = self.active_file.as_deref() == Some(relative.as_str());
-        let material_icon = self.material_icon(file_glyph(&row.node, expanded));
-        // Tier is read at render against a wall clock; the 5s tick re-renders
-        // so a row decays without an animation replaying on every rescan.
-        let recency_color =
-            match self
-                .recency
-                .row_level(&relative, is_dir, std::time::Instant::now())
-            {
-                Some(RecencyLevel::Fresh) => theme.success,
-                Some(RecencyLevel::Recent) => theme.warning,
-                Some(RecencyLevel::Fading) => theme.warning_muted,
-                None => theme.text,
-            };
-        let inline_create = relative == "__inline__" || relative.ends_with("/__inline__");
-        let inline_rename = self.inline_edit.as_ref().is_some_and(|edit| {
-            matches!(
-                &edit.edit,
-                super::file_actions::InlineFileEdit::Rename { path, .. } if path == &relative
-            )
-        });
-        let inline_error = self
-            .inline_edit
-            .as_ref()
-            .and_then(|edit| edit.error.clone())
-            .filter(|_| inline_create || inline_rename);
-        let menu_path = relative.clone();
-        let mut row_el = div()
-            .id(("details-file-row", index))
-            .h(px(if inline_create || inline_rename {
-                30.0
-            } else {
-                26.0
-            }))
-            .pl(px(26.0 + row.depth as f32 * 18.0))
-            .pr(px(8.0))
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .cursor_pointer()
-            .bg(if active {
-                crate::theme::ink(0.075)
-            } else {
-                gpui::transparent_black()
-            })
-            .hover(|style| style.bg(crate::theme::ink(0.045)));
-        if !inline_create {
-            let click_path = relative.clone();
-            row_el = row_el.on_click(cx.listener(move |this, _, window, cx| {
-                window.focus(&this.files_focus, cx);
-                if is_dir {
-                    this.sidebar.toggle_expanded(&click_path);
-                    if this.sidebar.expanded_paths().contains(&click_path)
-                        && this.workspace_file_source(cx).is_some()
-                    {
-                        this.load_workspace_files(true, Some(vec![click_path.clone()]), None, cx);
-                    }
-                    this.emit_preferences(cx);
-                } else {
-                    this.active_file = Some(click_path.clone());
-                    if let Some(context) = this.sidebar.context() {
-                        cx.emit(DetailsSidebarEvent::OpenFile {
-                            context_key: context.key.clone(),
-                            root: context.cwd.clone(),
-                            relative_path: click_path.clone(),
-                            remote_target: if context_file_access(
-                                context,
-                                this.app_state.read(cx).local_device_id.as_deref(),
-                            ) == ContextFileAccess::Remote
-                            {
-                                this.workspace_file_source(cx)
-                                    .map(|(_, target, device)| (target, device))
-                            } else {
-                                None
-                            },
-                        });
-                    }
-                }
-                cx.notify();
-            }));
-            row_el = row_el.on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    window.focus(&this.files_focus, cx);
-                    this.active_file = Some(menu_path.clone());
-                    this.open_file_menu(
-                        FileMenuTarget {
-                            path: menu_path.clone(),
-                            is_dir,
-                            is_root: false,
-                            position: event.position,
-                        },
-                        cx,
-                    );
-                }),
-            );
-        }
-        row_el = row_el.child(material_icon);
-        if inline_create || inline_rename {
-            if let Some(input) = self.inline_input.clone() {
-                row_el = row_el.child(div().flex_1().min_w_0().h(px(24.0)).child(input));
-            }
-            if let Some(error) = inline_error {
-                row_el = row_el.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(10.0))
-                        .text_color(theme.danger)
-                        .child(error),
-                );
-            }
-        } else {
-            row_el = row_el.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.0))
-                    .text_color(recency_color)
-                    .child(row.node.name),
-            );
-        }
-        row_el
     }
 }
 
@@ -5445,14 +3570,7 @@ impl Render for DetailsSidebar {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let viewport = window.viewport_size();
-        let body: AnyElement = match self.sidebar.tab() {
-            DetailsTab::Details => self.render_details(&theme, cx).into_any_element(),
-            DetailsTab::Files => self.render_files(&theme, cx).into_any_element(),
-            // Legacy value; `tab()` already maps it to Details.
-            DetailsTab::SourceControl => self.render_details(&theme, cx).into_any_element(),
-        };
-        let file_menu = self.render_file_context_menu(&theme, cx);
-        let delete_dialog = self.render_delete_dialog(viewport, &theme, cx);
+        let body = self.render_details(&theme, cx);
         let discard_dialog = self.render_discard_dialog(viewport, &theme, cx);
         div()
             .size_full()
@@ -5470,236 +3588,7 @@ impl Render for DetailsSidebar {
                     .overflow_y_scroll()
                     .child(body),
             )
-            .children(file_menu)
-            .children(delete_dialog)
             .children(discard_dialog)
-    }
-}
-
-fn file_action_error_message(error: &FileActionError) -> SharedString {
-    match error {
-        FileActionError::OutsideCheckout => "Path is outside the workspace.".into(),
-        FileActionError::InvalidName => "Invalid name.".into(),
-        FileActionError::MissingEntry => "That file no longer exists.".into(),
-        FileActionError::TargetExists => "an entry with that name already exists".into(),
-        FileActionError::MoveIntoDescendant => "cannot paste a folder into itself".into(),
-        FileActionError::Unsupported => "path is a symlink".into(),
-        FileActionError::Io(message) => message.clone().into(),
-    }
-}
-
-fn file_node_is_dir(nodes: &[FileNode], relative: &str) -> bool {
-    fn walk(nodes: &[FileNode], relative: &str) -> Option<bool> {
-        for node in nodes {
-            if node.relative_path == relative {
-                return Some(node.is_dir);
-            }
-            if let Some(found) = walk(&node.children, relative) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    walk(nodes, relative).unwrap_or(false)
-}
-
-fn sibling_entry_names(nodes: &[FileNode], parent: &str) -> Vec<String> {
-    if parent.is_empty() {
-        return nodes.iter().map(|node| node.name.clone()).collect();
-    }
-    fn find<'a>(nodes: &'a [FileNode], parent: &str) -> Option<&'a FileNode> {
-        for node in nodes {
-            if node.relative_path == parent {
-                return Some(node);
-            }
-            if let Some(found) = find(&node.children, parent) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    find(nodes, parent)
-        .map(|node| {
-            node.children
-                .iter()
-                .map(|child| child.name.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn paste_mutation(clipboard: Option<&FileClipboard>, destination: String) -> Option<FileMutation> {
-    let clip = clipboard?;
-    Some(match clip.mode {
-        FileClipboardMode::Cut => FileMutation::Move {
-            source: clip.relative_path.clone(),
-            destination_directory: destination,
-        },
-        FileClipboardMode::Copy => FileMutation::Copy {
-            source: clip.relative_path.clone(),
-            destination_directory: destination,
-        },
-    })
-}
-
-async fn rpc_file_mutation(
-    engine: &crate::state::EngineHandle,
-    target: zeron_proto::WorkspaceTarget,
-    device: String,
-    mutation: &FileMutation,
-) -> Result<String, zeron_rpc::RpcError> {
-    let (method, mut params) = match mutation {
-        FileMutation::CreateFile { parent, name } => (
-            zeron_rpc::methods::CREATE_WORKSPACE_ENTRY,
-            serde_json::to_value(zeron_proto::CreateWorkspaceEntryRequest {
-                target: target.clone(),
-                parent_path: parent.clone(),
-                name: name.clone(),
-                kind: zeron_proto::WorkspaceEntryKind::File,
-            })
-            .unwrap(),
-        ),
-        FileMutation::CreateDir { parent, name } => (
-            zeron_rpc::methods::CREATE_WORKSPACE_ENTRY,
-            serde_json::to_value(zeron_proto::CreateWorkspaceEntryRequest {
-                target: target.clone(),
-                parent_path: parent.clone(),
-                name: name.clone(),
-                kind: zeron_proto::WorkspaceEntryKind::Directory,
-            })
-            .unwrap(),
-        ),
-        FileMutation::Rename { path, new_name } => (
-            zeron_rpc::methods::RENAME_WORKSPACE_ENTRY,
-            serde_json::to_value(zeron_proto::RenameWorkspaceEntryRequest {
-                target: target.clone(),
-                path: path.clone(),
-                new_name: new_name.clone(),
-            })
-            .unwrap(),
-        ),
-        FileMutation::Delete { path } => {
-            let (checkout, revision, kind) =
-                workspace_entry_identity(engine, &target, &device, path).await?;
-            let mut params = serde_json::to_value(zeron_proto::DeleteWorkspaceEntryRequest {
-                target,
-                operation_id: uuid::Uuid::new_v4().to_string(),
-                expected_checkout_id: checkout,
-                path: path.clone(),
-                expected_source_revision: revision,
-                expected_kind: kind,
-                // The Details tree already asked the user to confirm.
-                recursive: kind == zeron_proto::WorkspaceEntryKind::Directory,
-            })
-            .unwrap();
-            params["targetDeviceId"] = device.into();
-            let outcome: zeron_proto::WorkspaceMutationOutcome = engine
-                .client()
-                .call_as(zeron_rpc::methods::DELETE_WORKSPACE_ENTRY, params)
-                .await?;
-            return workspace_mutation_path(outcome);
-        }
-        FileMutation::Move {
-            source,
-            destination_directory,
-        } => {
-            let (checkout, revision, kind) =
-                workspace_entry_identity(engine, &target, &device, source).await?;
-            let name = source.rsplit('/').next().unwrap_or(source.as_str());
-            let mut params = serde_json::to_value(zeron_proto::MoveWorkspaceEntryRequest {
-                target,
-                operation_id: uuid::Uuid::new_v4().to_string(),
-                expected_checkout_id: checkout,
-                source_path: source.clone(),
-                destination_path: zeron_proto::join_workspace_relative(destination_directory, name),
-                expected_source_revision: revision,
-                expected_kind: kind,
-            })
-            .unwrap();
-            params["targetDeviceId"] = device.into();
-            let outcome: zeron_proto::WorkspaceMutationOutcome = engine
-                .client()
-                .call_as(zeron_rpc::methods::MOVE_WORKSPACE_ENTRY, params)
-                .await?;
-            return workspace_mutation_path(outcome);
-        }
-        FileMutation::Copy {
-            source,
-            destination_directory,
-        } => (
-            zeron_rpc::methods::COPY_WORKSPACE_ENTRY,
-            serde_json::to_value(zeron_proto::CopyWorkspaceEntryRequest {
-                target: target.clone(),
-                source_path: source.clone(),
-                destination_directory: destination_directory.clone(),
-            })
-            .unwrap(),
-        ),
-    };
-    params["targetDeviceId"] = device.into();
-    let reply: zeron_proto::WorkspaceEntryMutation =
-        engine.client().call_as(method, params).await?;
-    Ok(reply.path)
-}
-
-/// Upstream's Move/Delete compare-and-swap against the entry's listed
-/// revision and checkout. The Details tree keeps neither, so read them from
-/// the parent directory listing right before the mutation: a change in
-/// between still rejects instead of clobbering.
-async fn workspace_entry_identity(
-    engine: &crate::state::EngineHandle,
-    target: &zeron_proto::WorkspaceTarget,
-    device: &str,
-    path: &str,
-) -> Result<(String, String, zeron_proto::WorkspaceEntryKind), zeron_rpc::RpcError> {
-    let directory = path
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.to_owned())
-        .unwrap_or_default();
-    let mut cursor = None;
-    loop {
-        let mut params = serde_json::to_value(zeron_proto::ListWorkspaceDirectoryRequest {
-            target: target.clone(),
-            directory: directory.clone(),
-            include_ignored: true,
-            cursor: cursor.take(),
-        })
-        .unwrap();
-        params["targetDeviceId"] = device.into();
-        let page: zeron_proto::WorkspaceDirectoryPage = engine
-            .client()
-            .call_as(zeron_rpc::methods::LIST_WORKSPACE_DIRECTORY, params)
-            .await?;
-        if let Some(entry) = page.entries.iter().find(|entry| entry.path == path) {
-            let checkout = page.checkout_id.clone().ok_or_else(|| {
-                zeron_rpc::RpcError::Failed(
-                    "This device's engine cannot move or delete files yet".into(),
-                )
-            })?;
-            let revision = entry.mutation_revision.clone().ok_or_else(|| {
-                zeron_rpc::RpcError::Failed("Symlinks cannot be moved or deleted here".into())
-            })?;
-            return Ok((checkout, revision, entry.kind));
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => {
-                return Err(zeron_rpc::RpcError::Failed(format!(
-                    "{path} no longer exists"
-                )));
-            }
-        }
-    }
-}
-
-fn workspace_mutation_path(
-    outcome: zeron_proto::WorkspaceMutationOutcome,
-) -> Result<String, zeron_rpc::RpcError> {
-    match outcome {
-        zeron_proto::WorkspaceMutationOutcome::Applied { change, .. } => Ok(change.path),
-        zeron_proto::WorkspaceMutationOutcome::Rejected { message, .. } => {
-            Err(zeron_rpc::RpcError::Failed(message))
-        }
     }
 }
 
@@ -5709,12 +3598,11 @@ mod tests {
 
     use super::{
         ContextFileAccess, DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
-        FileNode, context_file_access, details_sidebar_background, file_node_is_dir,
-        open_subagent_event, open_worker_event, sibling_entry_names, subagent_row_avatar_path,
-        worker_click_event,
+        context_file_access, details_sidebar_background, open_subagent_event, open_worker_event,
+        subagent_row_avatar_path, worker_click_event,
     };
     use crate::details_sidebar::chat_workers::{ChatActivityRow, ChatWorkerRow, WorkerSemantic};
-    use crate::details_sidebar::context::{DetailsContext, DetailsMode, DetailsTab};
+    use crate::details_sidebar::context::{DetailsContext, DetailsMode};
     use crate::theme::Theme;
     use zeron_proto::agent::WorkflowTaskStatus;
 
@@ -5744,31 +3632,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_source_control_tab_opens_on_details() {
-        // Changes now lives in the Files explorer; an old persisted value
-        // must not strand the sidebar on a tab with no pill.
-        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
-        state.set_tab(DetailsTab::SourceControl);
-        assert_eq!(state.tab(), DetailsTab::Details);
-    }
-
-    #[test]
-    fn tab_and_per_context_tree_preferences_round_trip() {
-        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
-        state.set_tab(DetailsTab::Files);
-        state.set_context(Some(context("one")));
-        state.toggle_expanded("src");
-        state.toggle_hidden();
-        state.set_context(Some(context("two")));
-        assert!(state.expanded_paths().is_empty());
-        assert!(!state.show_hidden());
-        state.set_context(Some(context("one")));
-        assert!(state.expanded_paths().contains("src"));
-        assert!(state.show_hidden());
+    fn preferences_from_a_files_tree_build_load_and_drop_file_paths() {
+        // Written by builds that had the Details Files tree.
+        let old = r#"{
+            "activeTab": "files",
+            "expanded": {"one": ["src", ":projects_worked:collapsed"], "two": ["docs"]},
+            "hidden": {"one": true},
+            "hiddenWidgets": ["usage-widget"]
+        }"#;
+        let preferences: DetailsSidebarPreferences = serde_json::from_str(old).unwrap();
+        let mut state = DetailsSidebarState::new(preferences);
         let preferences = state.preferences();
-        assert_eq!(preferences.active_tab, DetailsTab::Files);
-        assert_eq!(preferences.expanded.get("one").unwrap(), &["src"]);
-        assert_eq!(preferences.hidden, HashMap::from([("one".into(), true)]));
+        assert_eq!(
+            preferences.expanded,
+            HashMap::from([(
+                "one".to_string(),
+                vec![":projects_worked:collapsed".to_string()]
+            )])
+        );
+        assert!(state.widget_hidden("usage-widget"));
+        state.set_context(Some(context("one")));
+        assert!(state.projects_worked_collapsed());
     }
 
     #[test]
@@ -5804,13 +3688,6 @@ mod tests {
         // Toggle to collapsed
         state.toggle_projects_worked_collapsed();
         assert!(state.projects_worked_collapsed());
-
-        // Expanded paths for file tree must NOT contain the collapse key
-        assert!(
-            !state
-                .expanded_paths()
-                .contains(":projects_worked:collapsed")
-        );
 
         // Switch context: other context defaults to expanded
         state.set_context(Some(context("two")));
@@ -5982,29 +3859,6 @@ mod tests {
     }
 
     #[test]
-    fn open_file_event_carries_context_root_and_relative_path() {
-        let event = DetailsSidebarEvent::OpenFile {
-            context_key: "project".into(),
-            root: PathBuf::from("/tmp/project"),
-            relative_path: "README.md".into(),
-            remote_target: None,
-        };
-        let DetailsSidebarEvent::OpenFile {
-            context_key,
-            root,
-            relative_path,
-            remote_target,
-        } = event
-        else {
-            panic!("expected open file event");
-        };
-        assert_eq!(context_key, "project");
-        assert_eq!(root, PathBuf::from("/tmp/project"));
-        assert_eq!(relative_path, "README.md");
-        assert!(remote_target.is_none());
-    }
-
-    #[test]
     fn workers_widget_actions_preserve_stable_target_identity() {
         let subagent = ChatActivityRow {
             id: "chat--sub--review".into(),
@@ -6089,13 +3943,13 @@ mod tests {
     }
 
     #[test]
-    fn stale_file_load_cannot_replace_current_context() {
+    fn stale_load_cannot_replace_current_context() {
         let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
         let first = state.set_context(Some(context("one")));
         let second = state.set_context(Some(context("two")));
         assert!(first < second);
-        assert!(!state.accept_file_load(first, "one"));
-        assert!(state.accept_file_load(second, "two"));
+        assert!(!state.accept_load(first, "one"));
+        assert!(state.accept_load(second, "two"));
     }
 
     #[test]
@@ -6115,32 +3969,5 @@ mod tests {
             context_file_access(&remote, Some("device-b")),
             ContextFileAccess::Local
         );
-    }
-
-    #[test]
-    fn sibling_lookup_walks_nested_directories() {
-        let tree = vec![FileNode {
-            name: "src".into(),
-            relative_path: "src".into(),
-            is_dir: true,
-            children: vec![
-                FileNode {
-                    name: "a.rs".into(),
-                    relative_path: "src/a.rs".into(),
-                    is_dir: false,
-                    children: Vec::new(),
-                },
-                FileNode {
-                    name: "b.rs".into(),
-                    relative_path: "src/b.rs".into(),
-                    is_dir: false,
-                    children: Vec::new(),
-                },
-            ],
-        }];
-        assert!(file_node_is_dir(&tree, "src"));
-        assert!(!file_node_is_dir(&tree, "src/a.rs"));
-        assert_eq!(sibling_entry_names(&tree, "src"), vec!["a.rs", "b.rs"]);
-        assert_eq!(sibling_entry_names(&tree, ""), vec!["src"]);
     }
 }

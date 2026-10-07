@@ -22,7 +22,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
 
-- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `RenameWorkspaceEntry`, `DeleteWorkspaceEntry`, `MoveWorkspaceEntry` e `CopyWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Copy/move usam deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash). Desde o sync v0.2.102, `MoveWorkspaceEntry`/`DeleteWorkspaceEntry` usam o modelo do upstream #514 (`operationId`, `expectedCheckoutId`, `expectedSourceRevision`, `expectedKind`, `destinationPath`, `recursive`; reply `WorkspaceMutationOutcome`). Create/Rename/Copy continuam do fork, com reply `WorkspaceEntryMutation`.
+- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `DeleteWorkspaceEntry` e `MoveWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Move usa deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash). Desde o sync v0.2.102, `MoveWorkspaceEntry`/`DeleteWorkspaceEntry` usam o modelo do upstream #514 (`operationId`, `expectedCheckoutId`, `expectedSourceRevision`, `expectedKind`, `destinationPath`, `recursive`; reply `WorkspaceMutationOutcome`). Create continua do fork, com reply `WorkspaceEntryMutation`.
 
 - `SpawnChat` é `local_only`: params `parentChatId`, `prompt`, `spaceId?`; reply `chatId`, `spaceId?`, `deviceId`. Não é relay-forwardable.
 
@@ -36,6 +36,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `GetTitleSettings` and `SetTitleSettings` are device-forwardable registry methods; title preferences are device-local and not CRDT data.
 - `LinkCache` trata `host_offline` do relay como evidência, não blip: a sequência que termina nele estaciona dials daquele device por `offline_cooldown` (5 min). Esse cooldown sobrevive ao broadcast "online" (que todo handshake emite — inclusive o dial rejeitado — e zerava o próprio backoff, gerando o loop 1.5s/3s/6s) e ao refresh de token; só `reset_cooldown` (presença fresca) ou sign-out o limpam. Falhas comuns seguem a curva 5s→60s. O motivo do link-down pode chegar logo depois da falha do probe; o dial espera até 250ms por ele.
+- Um sinal de retomada do sistema invalida o socket ativo do `HostRelay`, inclusive durante o dial, e inicia outro sem esperar o lease. `LinkCache` fecha links de peers e remove backoffs comuns nesse sinal, mas conserva cooldowns `host_offline` até presença remota fresca (ou sign-out); o sinal `online` continua separado.
 
 ## Work Guidance
 
@@ -50,6 +51,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 | `src/**` (envelopes, transporte) | unit | `cargo test -p zeron-rpc` |
 | `src/method.rs` (registro de métodos) | unit | `cargo test -p zeron-rpc method::tests::every_method_has_info_and_stream_implies_forwardable -- --exact` |
 | `src/server.rs` (classificação do handshake IPC) | unit | `cargo test -p zeron-rpc server::tests::only_an_incomplete_websocket_handshake_is_benign -- --exact` |
+| `src/device_room.rs` (retomada do HostRelay e cooldown remoto) | unit | `cargo test -p zeron-rpc --lib device_room::tests::local_wake -- --nocapture` |
 | `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p zeron-rpc` |
 | `tests/device_room.rs` (revogação de credencial) | integration | `cargo test -p zeron-rpc --test device_room sign_out_closes_cached_peer_links -- --exact` |
 | `tests/device_room.rs` (cooldown de `host_offline`) | integration | `cargo test -p zeron-rpc --test device_room host_offline -- --nocapture` |

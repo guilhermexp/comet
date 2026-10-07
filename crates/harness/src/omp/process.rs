@@ -77,10 +77,9 @@ fn skill_scope_overlay() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Teto de frames guardados antes do `ready`. Generoso porque o caso normal e
-/// zero (o `ready` e a primeira linha); existe so para um produtor patologico
-/// nao virar consumo de memoria sem limite.
-const PRE_READY_EVENT_BUFFER: usize = 1024;
+/// Bounded event capacity shared by pre-ready, negotiation, and live startup.
+/// Keeping one queue avoids a second copy/buffer during the transition.
+const EVENT_BUFFER_CAPACITY: usize = 1024;
 
 struct Pending {
     command: String,
@@ -99,6 +98,9 @@ struct Inner {
     /// Frames de stdout vistos antes do `ready`. Zero num timeout significa
     /// que o processo nunca falou — outra investigacao que "falou e demorou".
     frames_before_ready: AtomicU64,
+    /// True once the public event receiver is taken; protects the switch from
+    /// startup buffering to the existing live-channel backpressure behavior.
+    events_taken: Mutex<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -258,8 +260,9 @@ impl OmpProcess {
             closed: AtomicBool::new(false),
             stderr_tail,
             frames_before_ready: AtomicU64::new(0),
+            events_taken: Mutex::new(false),
         });
-        let (event_tx, event_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<OmpCapabilities, String>>();
         let reader_inner = Arc::clone(&inner);
         tokio::spawn(read_stdout(
@@ -281,6 +284,11 @@ impl OmpProcess {
                 process.capabilities = capabilities;
                 if capabilities.chunked_frames {
                     process.negotiate_chunked_frames().await;
+                }
+                let fatal = lock(&process.inner.fatal).clone();
+                if let Some(message) = fatal {
+                    let _ = process.shutdown().await;
+                    return Err(HarnessError::Protocol(message));
                 }
                 Ok(process)
             }
@@ -308,6 +316,8 @@ impl OmpProcess {
                 let alive = process.child_state().await;
                 tracing::warn!(
                     target: "zeron_harness::omp",
+                    executable = %launch.executable.display(),
+                    cwd = %launch.cwd.display(),
                     waited_ms = launch.handshake_timeout.as_millis() as u64,
                     child = %alive,
                     stdout_frames_before_deadline =
@@ -450,9 +460,12 @@ impl OmpProcess {
     }
 
     pub fn take_events(&self) -> Result<mpsc::Receiver<Value>, HarnessError> {
-        lock(&self.events)
+        let mut events_taken = lock(&self.inner.events_taken);
+        let receiver = lock(&self.events)
             .take()
-            .ok_or_else(|| HarnessError::Protocol("OMP RPC events already taken".into()))
+            .ok_or_else(|| HarnessError::Protocol("OMP RPC events already taken".into()))?;
+        *events_taken = true;
+        Ok(receiver)
     }
 
     /// Estado do filho para o log de timeout: "vivo" separa um boot lento de
@@ -494,13 +507,9 @@ async fn read_stdout(
     ready_tx: oneshot::Sender<Result<OmpCapabilities, String>>,
 ) {
     let mut ready_tx = Some(ready_tx);
-    // `event_rx` so e retirado do processo DEPOIS que `start` retorna, entao
-    // durante a janela do handshake ninguem drena o canal. Mandar frames para
-    // ele antes do `ready` podia encher os 256 slots e travar este reader no
-    // `send().await` — e o `ready` que viesse depois nunca seria lido, dando um
-    // "handshake timed out" que nao tem nada a ver com lentidao. Hoje o `ready`
-    // vem primeiro e o alcapao nao morde; fica fechado de qualquer forma.
-    let mut pending_events: Vec<Value> = Vec::new();
+    // The public event receiver is not taken until after `start` returns. Its
+    // bounded queue holds startup events, and try_send keeps this stdout reader
+    // free to route negotiation and RPC responses while the consumer is absent.
     let mut chunks = ChunkAssembler::default();
     let mut reader = BufReader::new(stdout);
     loop {
@@ -553,24 +562,37 @@ async fn read_stdout(
                 if let Some(ready) = ready_tx.take() {
                     let _ = ready.send(Ok(parse_capabilities(&frame)));
                 }
-                // O receptor so comeca a ser drenado depois do handshake:
-                // segurar os frames aqui e o que impede o bloqueio descrito em
-                // `pending_events`.
-                for frame in pending_events.drain(..) {
-                    if event_tx.send(frame).await.is_err() {
-                        return;
-                    }
-                }
             }
             Some("response") => route_response(&inner, frame),
             _ => {
                 if ready_tx.is_some() {
                     inner.frames_before_ready.fetch_add(1, Ordering::SeqCst);
-                    if pending_events.len() < PRE_READY_EVENT_BUFFER {
-                        pending_events.push(frame);
+                }
+                let live_frame = {
+                    let events_taken = lock(&inner.events_taken);
+                    if *events_taken {
+                        Some(frame)
+                    } else {
+                        match event_tx.try_send(frame) {
+                            Ok(()) => None,
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                let message = format!(
+                                    "OMP RPC event buffer exceeded its limit of {EVENT_BUFFER_CAPACITY} frames"
+                                );
+                                fail(&inner, message.clone());
+                                if let Some(ready) = ready_tx.take() {
+                                    let _ = ready.send(Err(message));
+                                }
+                                return;
+                            }
+                        }
                     }
-                } else if event_tx.send(frame).await.is_err() {
-                    return;
+                };
+                if let Some(frame) = live_frame {
+                    if event_tx.send(frame).await.is_err() {
+                        return;
+                    }
                 }
             }
         }

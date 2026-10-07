@@ -855,6 +855,92 @@ async fn process_correlates_out_of_order_responses() {
 }
 
 #[tokio::test]
+async fn startup_event_burst_does_not_block_negotiation_or_followup_requests() {
+    const STARTUP_EVENT_COUNT: u64 = 300;
+
+    let process = OmpProcess::start(fake_launch("startup-event-flood"))
+        .await
+        .unwrap();
+    assert!(process.capabilities().chunked_frames);
+
+    // Catalog discovery sends requests before it takes the event stream. This
+    // burst exceeds the former 256-frame live channel and must not strand the
+    // stdout reader before it can route negotiation or this response.
+    let state = process
+        .request(json!({ "type": "get_state" }))
+        .await
+        .expect("startup event burst must not block subsequent RPC responses");
+    assert_eq!(state["sessionId"], "s-1");
+
+    let mut events = process.take_events().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for sequence in 0..STARTUP_EVENT_COUNT {
+            let event = events
+                .recv()
+                .await
+                .expect("all startup events should remain available");
+            assert_eq!(event["type"], "extension_startup");
+            assert_eq!(event["sequence"].as_u64(), Some(sequence));
+        }
+    })
+    .await
+    .expect("startup events should be delivered in order within the bound");
+
+    process.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_event_overflow_fails_startup_instead_of_returning_a_dead_reader() {
+    let error = OmpProcess::start(fake_launch("startup-event-overflow"))
+        .await
+        .expect_err("startup event overflow must fail the transport");
+
+    assert!(
+        error
+            .to_string()
+            .contains("event buffer exceeded its limit of 1024 frames"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn process_keeps_live_event_backpressure_after_consumer_attaches() {
+    const LIVE_EVENT_COUNT: u64 = 1100;
+
+    let (process, mut events) = start_fake("live-event-flood").await;
+    let state_request = process.request(json!({ "type": "get_state" }));
+    tokio::pin!(state_request);
+
+    // The event receiver is attached, but intentionally not drained yet.
+    // Once it is attached, live saturation should retain normal backpressure
+    // until the consumer resumes instead of becoming a fatal overflow.
+    tokio::select! {
+        result = &mut state_request => {
+            panic!("live flood should wait for the paused event consumer: {result:?}");
+        }
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+
+    let state = tokio::time::timeout(Duration::from_secs(2), async {
+        for sequence in 0..LIVE_EVENT_COUNT {
+            let event = events
+                .recv()
+                .await
+                .expect("live events should remain available after backpressure");
+            assert_eq!(event["type"], "extension_runtime");
+            assert_eq!(event["sequence"].as_u64(), Some(sequence));
+        }
+        state_request.await
+    })
+    .await
+    .expect("draining the live event queue should release the stdout reader")
+    .expect("the following RPC response should still be routed");
+    assert_eq!(state["sessionId"], "s-1");
+
+    process.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn process_rejects_exit_before_ready() {
     let error = OmpProcess::start(fake_launch("early-exit"))
         .await
@@ -866,16 +952,27 @@ async fn process_rejects_exit_before_ready() {
 async fn process_rejects_oversized_frame_before_waiting_for_newline() {
     let mut launch = fake_launch("oversized-no-newline");
     launch.request_timeout = Duration::from_secs(5);
-    let process = OmpProcess::start(launch).await.unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        process.request(json!({ "type": "get_state" })),
-    )
-    .await
-    .expect("reader must reject once the byte limit is crossed, without waiting for newline");
-    let error = result.unwrap_err();
-    assert!(error.to_string().contains("frame exceeded"), "{error}");
-    process.shutdown().await.unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(2), OmpProcess::start(launch))
+        .await
+        .expect("reader must reject once the byte limit is crossed, without waiting for newline");
+    match started {
+        Err(error) => {
+            assert!(error.to_string().contains("frame exceeded"), "{error}");
+        }
+        Ok(process) => {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                process.request(json!({ "type": "get_state" })),
+            )
+            .await
+            .expect(
+                "reader must reject once the byte limit is crossed, without waiting for newline",
+            );
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("frame exceeded"), "{error}");
+            process.shutdown().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -1779,9 +1876,9 @@ async fn local_command_output_burst_exceeding_channel_capacity_progresses() {
         })
         .collect();
 
-    assert_eq!(text_deltas.len(), 300);
+    assert_eq!(text_deltas.len(), 1100);
     assert_eq!(text_deltas[0], "chunk-0\n");
-    assert_eq!(text_deltas[299], "chunk-299\n");
+    assert_eq!(text_deltas[1099], "chunk-1099\n");
     assert_eq!(
         events
             .iter()

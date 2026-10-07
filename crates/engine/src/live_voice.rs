@@ -387,6 +387,27 @@ struct ActiveLiveVoice {
     task: Option<JoinHandle<()>>,
 }
 
+impl Drop for ActiveLiveVoice {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
+}
+
+struct ResetLiveVoiceStateOnDrop(Arc<CoordinatorInner>);
+
+impl Drop for ResetLiveVoiceStateOnDrop {
+    fn drop(&mut self) {
+        let active = lock(&self.0.active);
+        let is_stopping = self.0.state.borrow().phase == LiveVoicePhase::Stopping;
+        if active.is_none() && is_stopping {
+            self.0.state.send_replace(LiveVoiceState::default());
+        }
+    }
+}
+
 struct CoordinatorInner {
     state: watch::Sender<LiveVoiceState>,
     active: Mutex<Option<ActiveLiveVoice>>,
@@ -424,7 +445,7 @@ impl LiveVoiceCoordinator {
 
     pub(crate) fn reserve(&self, chat_id: &str) -> Result<String, EngineError> {
         let mut active = lock(&self.inner.active);
-        if active.is_some() {
+        if active.is_some() || self.inner.state.borrow().phase == LiveVoicePhase::Stopping {
             return Err(EngineError::Other(
                 "another Live Voice call is already active".into(),
             ));
@@ -688,36 +709,54 @@ impl LiveVoiceCoordinator {
     }
 
     pub(crate) async fn stop(&self) -> Result<(), EngineError> {
-        let Some(mut active) = lock(&self.inner.active).take() else {
-            self.inner.state.send_replace(LiveVoiceState::default());
-            return Ok(());
+        let _reset_state;
+        let mut active = {
+            let mut active_slot = lock(&self.inner.active);
+            let Some(active) = active_slot.take() else {
+                if self.inner.state.borrow().phase != LiveVoicePhase::Stopping {
+                    self.inner.state.send_replace(LiveVoiceState::default());
+                }
+                return Ok(());
+            };
+            let mut stopping = self.inner.state.borrow().clone();
+            stopping.phase = LiveVoicePhase::Stopping;
+            stopping.muted = false;
+            stopping.input_level = 0.0;
+            stopping.output_level = 0.0;
+            self.inner.state.send_replace(stopping);
+            active
         };
-        let mut stopping = self.inner.state.borrow().clone();
-        stopping.phase = LiveVoicePhase::Stopping;
-        stopping.muted = false;
-        stopping.input_level = 0.0;
-        stopping.output_level = 0.0;
-        self.inner.state.send_replace(stopping);
+        let deadline = tokio::time::Instant::now() + LIVE_STOP_TIMEOUT;
+        _reset_state = ResetLiveVoiceStateOnDrop(self.inner.clone());
 
-        let send_result = if let Some(controls) = active.controls.take() {
-            controls
-                .send(LiveVoiceControl::Stop)
-                .await
-                .map_err(|_| EngineError::Other("Live Voice control channel closed".into()))
-        } else {
-            Ok(())
-        };
-        if let Some(mut task) = active.task.take()
-            && tokio::time::timeout(LIVE_STOP_TIMEOUT, &mut task)
-                .await
-                .is_err()
-        {
+        let stopped = tokio::time::timeout_at(deadline, async {
+            let send_result = if let Some(controls) = active.controls.take() {
+                controls
+                    .send(LiveVoiceControl::Stop)
+                    .await
+                    .map_err(|_| EngineError::Other("Live Voice control channel closed".into()))
+            } else {
+                Ok(())
+            };
             active.cancellation.cancel();
-            let _ = task.await;
+            if let Some(task) = active.task.as_mut() {
+                let _ = task.await;
+            }
+            send_result
+        })
+        .await;
+
+        match stopped {
+            Ok(result) => result,
+            Err(_) => {
+                active.cancellation.cancel();
+                if let Some(task) = active.task.as_mut() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                Err(EngineError::Other("Live Voice stop timed out".into()))
+            }
         }
-        active.cancellation.cancel();
-        self.inner.state.send_replace(LiveVoiceState::default());
-        send_result
     }
 
     pub(crate) fn fail(&self, call_id: &str, message: &str) {
@@ -778,7 +817,7 @@ mod tests {
     use futures::{StreamExt, stream::BoxStream};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
     use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
     use zeron_harness::{
         Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
@@ -1322,6 +1361,167 @@ mod tests {
         assert!(child.is_cancelled());
         coordinator.stop().await.unwrap();
         assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn live_voice_stop_is_bounded_when_control_queue_is_full() {
+        let coordinator = LiveVoiceCoordinator::new();
+        let state = coordinator.watch();
+        let (controls, _received) = mpsc::channel(1);
+        controls
+            .send(LiveVoiceControl::SetMuted(true))
+            .await
+            .unwrap();
+        let call_id = coordinator.reserve("chat-full-controls").unwrap();
+        let cancellation = coordinator.cancellation(&call_id).unwrap();
+        assert!(coordinator.attach_controls(&call_id, controls));
+
+        let stopped = tokio::time::timeout(
+            LIVE_STOP_TIMEOUT + Duration::from_millis(250),
+            coordinator.stop(),
+        )
+        .await;
+
+        assert!(stopped.is_ok(), "stop waited on a full controls channel");
+        assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
+        assert!(cancellation.is_cancelled());
+        assert!(!coordinator.is_active());
+    }
+
+    #[tokio::test]
+    async fn live_voice_stop_aborts_observer_that_ignores_cancellation() {
+        let coordinator = LiveVoiceCoordinator::new();
+        let state = coordinator.watch();
+        let (controls, _received) = mpsc::channel(1);
+        let call_id = coordinator.reserve("chat-unresponsive-observer").unwrap();
+        let cancellation = coordinator.cancellation(&call_id).unwrap();
+        assert!(coordinator.attach_controls(&call_id, controls));
+        let (release, blocked) = oneshot::channel::<()>();
+        let observer = tokio::spawn(async move {
+            let _ = blocked.await;
+        });
+        coordinator.attach_task(&call_id, observer);
+
+        let stopped = tokio::time::timeout(
+            LIVE_STOP_TIMEOUT + Duration::from_millis(250),
+            coordinator.stop(),
+        )
+        .await;
+        let mut release = release;
+        let observer_was_dropped =
+            tokio::time::timeout(Duration::from_millis(250), release.closed())
+                .await
+                .is_ok();
+        if !observer_was_dropped {
+            let _ = release.send(());
+        }
+
+        assert!(stopped.is_ok(), "stop awaited an unresponsive observer");
+        assert!(
+            observer_was_dropped,
+            "observer was detached instead of aborted"
+        );
+        assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
+        assert!(cancellation.is_cancelled());
+        assert!(!coordinator.is_active());
+    }
+
+    #[tokio::test]
+    async fn cancelling_live_voice_stop_aborts_its_owned_observer() {
+        let coordinator = LiveVoiceCoordinator::new();
+        let mut state = coordinator.watch();
+        let (controls, _received) = mpsc::channel(1);
+        let call_id = coordinator.reserve("chat-cancelled-stop").unwrap();
+        let cancellation = coordinator.cancellation(&call_id).unwrap();
+        assert!(coordinator.attach_controls(&call_id, controls));
+        let (release, blocked) = oneshot::channel::<()>();
+        let observer = tokio::spawn(async move {
+            let _ = blocked.await;
+        });
+        coordinator.attach_task(&call_id, observer);
+
+        let stopping = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move { coordinator.stop().await })
+        };
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while state.borrow().phase != LiveVoicePhase::Stopping {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("stop did not publish its stopping state");
+        stopping.abort();
+        let _ = stopping.await;
+
+        let mut release = release;
+        let observer_was_dropped =
+            tokio::time::timeout(Duration::from_millis(250), release.closed())
+                .await
+                .is_ok();
+        if !observer_was_dropped {
+            let _ = release.send(());
+        }
+
+        assert!(observer_was_dropped, "cancelled stop detached its observer");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
+        assert!(!coordinator.is_active());
+    }
+
+    #[tokio::test]
+    async fn stopping_voice_excludes_new_calls_until_cleanup_finishes() {
+        let coordinator = LiveVoiceCoordinator::new();
+        let mut state = coordinator.watch();
+        let (controls, _received) = mpsc::channel(1);
+        controls
+            .send(LiveVoiceControl::SetMuted(true))
+            .await
+            .unwrap();
+        let call_id = coordinator.reserve("chat-stopping").unwrap();
+        assert!(coordinator.attach_controls(&call_id, controls));
+        let (release, blocked) = oneshot::channel::<()>();
+        let observer = tokio::spawn(async move {
+            let _ = blocked.await;
+        });
+        coordinator.attach_task(&call_id, observer);
+
+        let stopping = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move { coordinator.stop().await })
+        };
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while state.borrow().phase != LiveVoicePhase::Stopping {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("stop did not publish its stopping state");
+
+        let reserve_rejected = coordinator.reserve("chat-during-stop").is_err();
+        coordinator.stop().await.unwrap();
+        let repeated_stop_preserved_stopping = state.borrow().phase == LiveVoicePhase::Stopping;
+
+        stopping.abort();
+        let _ = stopping.await;
+        let mut release = release;
+        let observer_was_dropped =
+            tokio::time::timeout(Duration::from_millis(250), release.closed())
+                .await
+                .is_ok();
+        if !observer_was_dropped {
+            let _ = release.send(());
+        }
+
+        let next_call = coordinator.reserve("chat-after-stop");
+        assert!(reserve_rejected, "a new call replaced the stopping call");
+        assert!(
+            repeated_stop_preserved_stopping,
+            "a repeated stop cleared another stop's projection"
+        );
+        assert!(observer_was_dropped, "cancelled stop detached its observer");
+        assert!(next_call.is_ok(), "cleanup did not release the call slot");
+        assert_eq!(state.borrow().phase, LiveVoicePhase::Connecting);
     }
 
     #[test]

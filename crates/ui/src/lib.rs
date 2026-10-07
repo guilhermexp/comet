@@ -50,6 +50,7 @@ pub mod live_voice;
 pub mod loaders;
 pub mod markdown;
 pub mod markdown_decor;
+pub mod material_icons;
 pub mod mermaid_preview;
 pub mod motion;
 mod new_thread_background_effects;

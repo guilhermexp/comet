@@ -19,6 +19,7 @@ use crate::{
 
 pub mod client;
 mod context_menu;
+pub mod create;
 pub mod document;
 mod drag;
 pub mod editor;
@@ -1513,10 +1514,7 @@ impl FilesSurface {
             .as_deref()
             .and_then(|path| self.tree.node(path))
             .is_some_and(|node| node.entry.kind == zeron_proto::WorkspaceEntryKind::Directory);
-        let parent = crate::details_sidebar::file_actions::create_parent_path(
-            selected.as_deref(),
-            selected_is_dir,
-        );
+        let parent = create::create_parent_path(selected.as_deref(), selected_is_dir);
         if !parent.is_empty() && self.tree.expand(&parent) {
             self.sync_tree_list();
             if !self.tree.is_directory_loaded(&parent) {
@@ -1562,9 +1560,7 @@ impl FilesSurface {
                     .collect()
             })
             .unwrap_or_default();
-        if let Err(error) =
-            crate::details_sidebar::file_actions::validate_create_name(&name, &siblings)
-        {
+        if let Err(error) = create::validate_create_name(&name, &siblings) {
             if let Some(create) = self.create.as_mut() {
                 create.error = Some(error.into());
             }

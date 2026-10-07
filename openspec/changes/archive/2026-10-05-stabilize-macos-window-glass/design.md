@@ -26,3 +26,11 @@ The active `monocode-dark` variant declares a radius of 24 and tint coverage of 
 ## Migration Plan
 
 No data migration. Update the vendored source and provenance together; reverting the snapshot delta restores the previous renderer behavior.
+
+## Verification evidence
+
+- Native RED: an isolated app bundle found zero standard backing views where one was required. Bare executables were interrupted with SIGTERM during AppKit startup; foreground execution did not resolve that local launch limitation.
+- Native GREEN: the same configuration/lifecycle assertions passed after the patch, including a main-loop timer yield, with exit zero and a required PASS marker. CI builds the harness-free executable, launches an isolated bundle with a 60-second timeout, and checks both completion conditions.
+- Four blur selector tests and both closing-punctuation rules passed. The source and vendored Git trees match; all prior patches and licenses were retained.
+- Independent review approved the implementation without material findings. The frame-source recovery regression and the downstream `cargo build -p zeron` passed through the protected Cargo wrapper. The app build emitted only the existing compact-unwind `__eh_frame` size warning. Formatting, diff checks and strict OpenSpec validation passed.
+- Headed before/after WindowServer fixtures were launched as isolated app bundles. Both window-only captures showed a uniform gray backdrop without enough desktop detail to establish that the reported moving waves disappeared. This optical result is inconclusive. No desktop settings, tint, radius, or user preferences were changed, and both fixture processes were cleaned up.

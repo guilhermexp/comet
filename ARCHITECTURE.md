@@ -169,7 +169,7 @@ zeron/
     workers-unpeel/ zeron-workers-unpeel  # local worker runtime adapter, activity bridge, controller MCP,
                                           # project git/ledger, hibernation/resource reaper
     ui/             zeron-ui              # gpui app: Orchestrator/Workers shell, chat/composer,
-                                          # Terminal/Git/file-preview surface host, Details/Files,
+                                          # Terminal/Git/file-preview surface host, Files explorer, Details,
                                           # settings, animation kit
   apps/
     zeron/                                # the binary (headed default, `headless` subcommand)
@@ -217,12 +217,11 @@ feature spec `docs/research/feature-inventory.md` §1.
   checkout index; `@` and `/` menus span the pill, scroll internally, and keep keyboard selection
   visible. Double-click selects the complete field value.
 - **Right-side surfaces**: one tab host owns Terminal, Git diff/history, native Browser tabs, and file-preview
-  surfaces while a separate `Details / Files` column owns workspace metadata and
-  the checkout tree. Both columns are available in Orchestrator and Workers;
-  their normal responsive layout preserves a minimum conversation width. The
-  detailed contracts are specified in
-  [`docs/plans/2026-08-20-details-files-sidebar-design.md`](docs/plans/2026-08-20-details-files-sidebar-design.md)
-  and [`docs/plans/2026-08-20-file-preview-parity-design.md`](docs/plans/2026-08-20-file-preview-parity-design.md).
+  surfaces; the upstream Files explorer (`crates/ui/src/files/`, Explorer | Changes) owns the checkout
+  tree and source control, and a separate `Details` column owns workspace metadata. Both columns are
+  available in Orchestrator and Workers; their normal responsive layout preserves a minimum
+  conversation width. File preview contracts are specified in
+  [`docs/plans/2026-08-20-file-preview-parity-design.md`](docs/plans/2026-08-20-file-preview-parity-design.md).
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
   engine side; custom gpui grid element; 12ms input coalescing / 80ms resize debounce, 1MB
   replay, detach ≠ close. Panel chrome (the shared full-height utility column, its Terminal +

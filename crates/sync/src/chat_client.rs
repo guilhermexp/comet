@@ -575,6 +575,31 @@ impl ChatClient {
         tuning: ChatTuning,
         transport: Option<Arc<dyn ChatTransport>>,
     ) -> Result<Self, SyncError> {
+        Self::connect_with_transport_and_signals(
+            connector,
+            sink,
+            fetcher,
+            device_id,
+            initial_cursor,
+            tuning,
+            transport,
+            crate::wake::subscribe(),
+            crate::wake::subscribe_online(),
+        )
+        .await
+    }
+
+    async fn connect_with_transport_and_signals(
+        connector: Arc<dyn BinConnector>,
+        sink: Arc<dyn ChatDocSink>,
+        fetcher: Arc<dyn CheckpointFetcher>,
+        device_id: &str,
+        initial_cursor: u64,
+        tuning: ChatTuning,
+        transport: Option<Arc<dyn ChatTransport>>,
+        wake: broadcast::Receiver<()>,
+        online: broadcast::Receiver<()>,
+    ) -> Result<Self, SyncError> {
         let (events, _) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -619,7 +644,7 @@ impl ChatClient {
             offline_task: offline_task.clone(),
             sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let task = tokio::spawn(actor.run(ready_tx));
+        let task = tokio::spawn(actor.run_with_signals(ready_tx, wake, online));
 
         // Own both actor tasks BEFORE the await. Cancelling a timed-out
         // construction must not detach its JoinHandle and leak a live socket.
@@ -867,6 +892,8 @@ struct Actor {
 
 enum SessionEnd {
     Reconnect,
+    /// System wake invalidated the whole socket even if it remains half-open.
+    Wake,
     Stop,
 }
 
@@ -879,7 +906,12 @@ enum Waited {
 }
 
 impl Actor {
-    async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
+    async fn run_with_signals(
+        mut self,
+        ready: oneshot::Sender<Result<(), SyncError>>,
+        mut wake: broadcast::Receiver<()>,
+        mut online: broadcast::Receiver<()>,
+    ) {
         let mut ready = Some(ready);
         let mut backoff = BACKOFF_BASE;
         // Pull-first bootstrap (see registry.rs run): with an HTTPS
@@ -894,8 +926,6 @@ impl Actor {
         // Suspend/resume and sibling-dial successes are EVENTS that end a
         // backoff wait immediately (see room.rs) — without them a recovered
         // network still waited out the full accumulated delay.
-        let mut wake = crate::wake::subscribe();
-        let mut online = crate::wake::subscribe_online();
         loop {
             if *self.shutdown.borrow() {
                 return;
@@ -906,8 +936,13 @@ impl Actor {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             let dial = tokio::select! {
-                result = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()) => result,
+                biased;
                 _ = self.shutdown.changed() => return,
+                _ = wake.recv() => {
+                    backoff = BACKOFF_BASE;
+                    continue;
+                }
+                result = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()) => result,
             };
             let pipe = match dial {
                 Ok(Ok(pipe)) => pipe,
@@ -949,10 +984,26 @@ impl Actor {
             let end = tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => SessionEnd::Stop,
+                _ = wake.recv() => SessionEnd::Wake,
                 end = self.run_session(pipe, &mut ready) => end,
             };
             match end {
                 SessionEnd::Stop => return,
+                SessionEnd::Wake => {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let joined = self.flags.connected.swap(false, Relaxed);
+                    if joined {
+                        let mut shared = lock(&self.shared);
+                        shared.http_replay_epoch = shared.http_replay_epoch.wrapping_add(1);
+                        self.flags.disconnects.fetch_add(1, Relaxed);
+                        let _ = self.events.send(ChatEvent::Disconnected);
+                    }
+                    // A wake during the first handshake is a recoverable
+                    // interruption, not a failed construction. Keep `ready`
+                    // until the next session completes its initial catch-up.
+                    self.spawn_offline_sync();
+                    backoff = BACKOFF_BASE;
+                }
                 SessionEnd::Reconnect => {
                     use std::sync::atomic::Ordering::Relaxed;
                     // Only a session that joined AND stayed healthy for a

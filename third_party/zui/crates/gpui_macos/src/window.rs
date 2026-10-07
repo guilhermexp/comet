@@ -173,11 +173,13 @@ enum WindowBackgroundBlurMode {
 /// macOS 12+ `NSVisualEffectView` manages the effect layer itself, which
 /// performs better because it downsamples the backdrop — and that downsampling
 /// is precisely what erases high-frequency structure behind the window.
-/// Declaring a radius is how a consumer trades the material for WindowServer
-/// blur, which preserves that structure: measured on a single display
-/// configuration over an identical backdrop, the material and WindowServer
-/// radius 24 land on the same mean luminance (92.4 vs 90.4), but WindowServer
-/// passes 18.1x more high-frequency energy.
+/// Declaring a radius selects WindowServer as the primary blur and keeps a
+/// separate standard `NSVisualEffectView` at 1% alpha beneath the content as
+/// composition support. The measurements below predate that support view and
+/// compare the primary blur paths on a single display configuration over an
+/// identical backdrop: the material and WindowServer radius 24 land on the
+/// same mean luminance (92.4 vs 90.4), but WindowServer passes 18.1x more
+/// high-frequency energy.
 fn window_background_blur_mode(
     appearance: WindowBackgroundAppearance,
     declared_radius: Option<Pixels>,
@@ -632,6 +634,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    window_server_blur_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
     background_blur_radius: Option<Pixels>,
     window_server_blur_applied: bool,
@@ -931,6 +934,9 @@ impl MacWindowState {
                     if let Some(blur_view) = self.blurred_view.take() {
                         NSView::removeFromSuperview(blur_view);
                     }
+                    if let Some(blur_view) = self.window_server_blur_view.take() {
+                        NSView::removeFromSuperview(blur_view);
+                    }
                     let should_clear_window_server =
                         self.window_server_blur_applied || !is_modern_appkit;
                     if should_clear_window_server {
@@ -940,6 +946,9 @@ impl MacWindowState {
                     }
                 }
                 WindowBackgroundBlurMode::Material => {
+                    if let Some(blur_view) = self.window_server_blur_view.take() {
+                        NSView::removeFromSuperview(blur_view);
+                    }
                     if self.window_server_blur_applied {
                         let window_number = self.native_window.windowNumber();
                         CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, 0);
@@ -964,6 +973,25 @@ impl MacWindowState {
                 WindowBackgroundBlurMode::WindowServer { radius } => {
                     if let Some(blur_view) = self.blurred_view.take() {
                         NSView::removeFromSuperview(blur_view);
+                    }
+                    if self.window_server_blur_view.is_none() {
+                        let content_view = self.native_window.contentView();
+                        let frame = NSView::bounds(content_view);
+                        let mut blur_view: id = msg_send![class!(NSVisualEffectView), alloc];
+                        blur_view = NSVisualEffectView::initWithFrame_(blur_view, frame);
+                        blur_view.setMaterial_(NSVisualEffectMaterial::UnderWindowBackground);
+                        blur_view.setBlendingMode_(NSVisualEffectBlendingMode::BehindWindow);
+                        blur_view.setState_(NSVisualEffectState::Active);
+                        let _: () = msg_send![blur_view, setAlphaValue: 0.01f64];
+                        blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+
+                        let _: () = msg_send![
+                            content_view,
+                            addSubview: blur_view
+                            positioned: NSWindowOrderingMode::NSWindowBelow
+                            relativeTo: nil
+                        ];
+                        self.window_server_blur_view = Some(blur_view.autorelease());
                     }
                     let window_number = self.native_window.windowNumber();
                     CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, radius);
@@ -1116,6 +1144,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                window_server_blur_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 background_blur_radius: None,
                 window_server_blur_applied: false,

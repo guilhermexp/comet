@@ -6,10 +6,10 @@ use cocoa::{
     appkit::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSView,
         NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectBlendingMode,
-        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+        NSVisualEffectMaterial, NSVisualEffectState, NSWindow,
     },
     base::{NO, id, nil},
-    foundation::{NSDictionary, NSRect, NSSize, NSString, NSUInteger},
+    foundation::{NSAutoreleasePool, NSDictionary, NSRect, NSSize, NSString, NSUInteger},
 };
 #[cfg(target_os = "macos")]
 use gpui::{
@@ -19,9 +19,9 @@ use gpui::{
 #[cfg(target_os = "macos")]
 use gpui_macos::MacPlatform;
 #[cfg(target_os = "macos")]
-use objc::{class, msg_send, runtime::BOOL};
+use objc::{class, msg_send, runtime::BOOL, sel, sel_impl};
 #[cfg(target_os = "macos")]
-use std::{cell::Cell, ffi::CStr, rc::Rc};
+use std::{cell::Cell, ffi::CStr, rc::Rc, time::Duration};
 
 #[cfg(target_os = "macos")]
 struct EmptyView;
@@ -169,7 +169,11 @@ fn run_regression() {
     let native_window = Rc::new(Cell::new(nil));
     let expected_backing = Rc::new(Cell::new(nil));
     register_temporary_autofill_default();
-    Application::with_platform(Rc::new(MacPlatform::new(false))).run(move |cx: &mut App| {
+    let platform = Rc::new(MacPlatform::new(false));
+    // Accessibility is unrelated to this native blur regression. Avoid
+    // initializing the AppKit AccessKit adapter while opening the fixture.
+    let application = Application::new_inaccessible(platform);
+    application.run(move |cx: &mut App| {
         let window_title = title.clone();
         let native_window_for_build = native_window.clone();
         let expected_backing_for_build = expected_backing.clone();
@@ -265,22 +269,40 @@ fn run_regression() {
         assert!(!expected_backing.is_null());
         assert_eq!(only_backing_view(native_window), expected_backing);
         assert_backing_configuration(native_window, expected_backing);
-        cx.quit();
+        cx.spawn(async move |async_cx| {
+            async_cx
+                .background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            async_cx.update(|cx| {
+                assert_eq!(only_backing_view(native_window), expected_backing);
+                assert_backing_configuration(native_window, expected_backing);
+                println!("PASS: native window glass backing lifecycle and configuration");
+                cx.quit();
+            });
+        })
+        .detach();
     });
 }
 
 #[cfg(target_os = "macos")]
 fn register_temporary_autofill_default() {
     unsafe {
+        let pool = NSAutoreleasePool::new(nil);
         let user_defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
-        let key = NSString::alloc(nil).init_str("NSAutoFillHeuristicControllerEnabled");
+        let key = NSString::alloc(nil)
+            .init_str("NSAutoFillHeuristicControllerEnabled")
+            .autorelease();
         let disabled: id = msg_send![class!(NSNumber), numberWithBool: NO];
         let registration = NSDictionary::dictionaryWithObject_forKey_(nil, disabled, key);
         let _: () = msg_send![user_defaults, registerDefaults: registration];
+        pool.drain();
     }
 }
 
 fn main() {
     #[cfg(target_os = "macos")]
-    run_regression();
+    {
+        run_regression();
+    }
 }

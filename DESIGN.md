@@ -163,7 +163,7 @@ A casca do aplicativo (`Shell`) estrutura a interface em três regiões principa
 
 ```
 +------------------+------------------------------+--------------------+------------------+
-| Sidebar          | Chat Column (Chat Panel)     | Right Pane (Tabs)  | Details / Files  |
+| Sidebar          | Chat Column (Chat Panel)     | Right Pane (Tabs)  | Details          |
 | 208..400px       | Min: 300px (Default: 768px)  | 360..Max px        | 300..700px       |
 | (Default: 256px) |                              | (Default: 520px)   | (Default: 500px) |
 +------------------+------------------------------+--------------------+------------------+
@@ -185,8 +185,8 @@ A casca do aplicativo (`Shell`) estrutura a interface em três regiões principa
   - Larguras: mínima `360.0 px`, padrão `520.0 px` (`crates/ui/src/settings.rs:36-37`).
   - Teto dinâmico: $(\text{viewport} - \text{sidebar} - \text{CHAT\_PANEL\_MIN}).\text{max}(0.0)$ (`crates/ui/src/shell.rs:436`).
   - Modo expandido (`takeover`): ocupa todo o espaço da janela descontando a sidebar (`crates/ui/src/shell.rs:442`).
-- **Coluna Details / Files**:
-  - Exibe metadados de workspace, telemetria de Workers e árvore de arquivos.
+- **Coluna Details**:
+  - Exibe metadados de workspace e telemetria de Workers. A árvore de arquivos vive no explorer Files do upstream (`crates/ui/src/files/`), não nesta coluna.
   - Larguras: mínima `300.0 px`, máxima `700.0 px`, padrão `500.0 px` (`crates/ui/src/settings.rs:42-44`).
 - **Transições de Painéis**:
   - Alterações de largura e colapso de sidebar e panes realizam interpolação por tween de `200 ms` com curva `EASE_OUT` (`motion::RESIZE`, `crates/ui/src/motion.rs:296`, `WidthTween` em `crates/ui/src/shell.rs:4536`).

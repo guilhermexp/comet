@@ -18,4 +18,4 @@ Test: integration — native macOS backing reuse and removal through surface tra
 
 - **WHEN** the same glass surface is reapplied, its blur radius changes, or it switches to opaque or platform-material mode
 - **THEN** reapplication reuses the existing supporting surface
-- **AND** leaving declared-radius glass removes that surface without changing the selected theme or leaving stale glass behind
+- **AND** leaving the WindowServer blur mode removes that surface without changing the selected theme or leaving stale glass behind

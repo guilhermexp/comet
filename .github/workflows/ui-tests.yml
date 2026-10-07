@@ -191,9 +191,52 @@ jobs:
       - name: Native frame-source recovery regression
         working-directory: third_party/zui
         run: cargo test --release --locked -p gpui_macos --test frame_source_recovery
-      - name: Native window glass backing regression
+      - name: Build native window glass backing regression
         working-directory: third_party/zui
-        run: cargo test --release --locked -p gpui_macos --test window_glass_backing
+        run: cargo test --release --locked -p gpui_macos --features runtime_shaders --test window_glass_backing --no-run --message-format=json > "$RUNNER_TEMP/window-glass-build.jsonl"
+      - name: Run native window glass backing regression
+        timeout-minutes: 2
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, pathlib, plistlib, shlex, shutil, subprocess
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'window-glass'
+          evidence.mkdir()
+          artifacts = [json.loads(line) for line in (evidence.parent / 'window-glass-build.jsonl').read_text().splitlines()]
+          binary = next(pathlib.Path(item['executable']) for item in artifacts
+                        if item.get('reason') == 'compiler-artifact'
+                        and item.get('target', {}).get('name') == 'window_glass_backing'
+                        and item.get('executable'))
+          app = evidence / 'Native Glass Regression.app'
+          contents = app / 'Contents'
+          executable = contents / 'MacOS'
+          executable.mkdir(parents=True)
+          shutil.copy2(binary, executable / 'native-test')
+          (contents / 'Info.plist').write_bytes(plistlib.dumps({
+              'CFBundleIdentifier': 'sh.zeron.validation.window-glass-backing',
+              'CFBundleName': 'Native Glass Regression',
+              'CFBundleExecutable': 'run-fixture',
+              'CFBundlePackageType': 'APPL', 'CFBundleVersion': '1',
+              'NSHighResolutionCapable': True, 'NSSupportsAutomaticTermination': False,
+          }))
+          launcher = executable / 'run-fixture'
+          launcher.write_text('#!/bin/sh\n' + shlex.quote(str(executable / 'native-test')) +
+                              ' >' + shlex.quote(str(evidence / 'native.log')) + ' 2>&1\n' +
+                              'result=$?\nprintf "%s\\n" "$result" >' +
+                              shlex.quote(str(evidence / 'native.exit')) + '\nexit "$result"\n')
+          launcher.chmod(0o755)
+          subprocess.run(['open', '-W', '-n', str(app)], check=True, timeout=60)
+          log = (evidence / 'native.log').read_text()
+          print(log)
+          assert (evidence / 'native.exit').read_text().strip() == '0', 'native regression failed'
+          assert 'PASS: native window glass backing lifecycle and configuration' in log, 'native regression did not finish its assertions'
+          PYTHON
+      - name: Upload native window glass evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: window-glass-macos
+          path: ${{ runner.temp }}/window-glass
+          if-no-files-found: ignore
 
   ios-tests:
     needs: changes

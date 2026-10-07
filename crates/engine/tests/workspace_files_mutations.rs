@@ -77,108 +77,6 @@ async fn nested_create_name_makes_intermediate_directories() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rename_preserves_content_and_refuses_collision() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("a.txt"), "hello").unwrap();
-    std::fs::write(root.join("b.txt"), "other").unwrap();
-    let core = assemble(&temp.path().join("data"));
-    create_owned_space(&core, &root);
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
-    let renamed = client
-        .call(
-            "RenameWorkspaceEntry",
-            json!({
-                "spaceId": "files",
-                "path": "a.txt",
-                "newName": "renamed.txt",
-            }),
-        )
-        .await
-        .expect("rename");
-    assert_eq!(renamed["path"], "renamed.txt");
-    assert!(!root.join("a.txt").exists());
-    assert_eq!(std::fs::read(root.join("renamed.txt")).unwrap(), b"hello");
-
-    let collision = client
-        .call(
-            "RenameWorkspaceEntry",
-            json!({
-                "spaceId": "files",
-                "path": "renamed.txt",
-                "newName": "b.txt",
-            }),
-        )
-        .await
-        .expect_err("rename collision");
-    assert!(collision.to_string().contains("exist"), "{collision}");
-    assert_eq!(std::fs::read(root.join("renamed.txt")).unwrap(), b"hello");
-    assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"other");
-    core.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn copy_collision_gets_unique_name() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("a.txt"), "original").unwrap();
-    let core = assemble(&temp.path().join("data"));
-    create_owned_space(&core, &root);
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
-    let copied = client
-        .call(
-            "CopyWorkspaceEntry",
-            json!({
-                "spaceId": "files",
-                "sourcePath": "a.txt",
-                "destinationDirectory": "",
-            }),
-        )
-        .await
-        .expect("copy");
-    assert_eq!(copied["path"], "a copy.txt");
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"original");
-    assert_eq!(std::fs::read(root.join("a copy.txt")).unwrap(), b"original");
-    core.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn paste_folder_into_itself_is_refused() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir_all(root.join("docs/adr")).unwrap();
-    std::fs::write(root.join("docs/adr/note.md"), "keep").unwrap();
-    let core = assemble(&temp.path().join("data"));
-    create_owned_space(&core, &root);
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
-    for method in ["CopyWorkspaceEntry"] {
-        let err = client
-            .call(
-                method,
-                json!({
-                    "spaceId": "files",
-                    "sourcePath": "docs",
-                    "destinationDirectory": "docs/adr",
-                }),
-            )
-            .await
-            .expect_err("descendant paste");
-        assert!(
-            err.to_string().to_ascii_lowercase().contains("itself")
-                || err.to_string().to_ascii_lowercase().contains("descendant"),
-            "{method}: {err}"
-        );
-    }
-    assert!(root.join("docs/adr/note.md").is_file());
-    core.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn path_escape_is_refused_and_writes_nothing_outside() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
@@ -205,21 +103,6 @@ async fn path_escape_is_refused_and_writes_nothing_outside() {
         assert!(
             err.to_string().contains("path") || err.to_string().contains("invalid"),
             "{path}: {err}"
-        );
-        let rename = client
-            .call(
-                "RenameWorkspaceEntry",
-                json!({
-                    "spaceId": "files",
-                    "path": path,
-                    "newName": "x.txt",
-                }),
-            )
-            .await
-            .expect_err("escaped rename");
-        assert!(
-            rename.to_string().contains("path") || rename.to_string().contains("invalid"),
-            "{rename}"
         );
     }
     assert_eq!(std::fs::read(&outside).unwrap(), b"secret");

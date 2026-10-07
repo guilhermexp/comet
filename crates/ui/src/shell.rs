@@ -2894,10 +2894,6 @@ impl Shell {
                         cx,
                     );
                 }
-                DetailsSidebarEvent::CloseFile {
-                    context_key,
-                    relative_path,
-                } => this.close_preview_surface(context_key, relative_path, cx),
                 DetailsSidebarEvent::OpenSubagent {
                     chat_id,
                     doc_id,
@@ -2941,15 +2937,9 @@ impl Shell {
                 } => this.open_chat_worker(chat_id, session_id, title, cx),
             },
         );
-        let details_for_preview = details_sidebar.clone();
         let file_preview_sub = cx.subscribe(
             &file_preview,
             move |this: &mut Shell, _, event: &FilePreviewEvent, cx| match event {
-                FilePreviewEvent::ActiveChanged { relative_path, .. } => {
-                    details_for_preview.update(cx, |sidebar, cx| {
-                        sidebar.set_active_file(relative_path.clone(), cx)
-                    });
-                }
                 FilePreviewEvent::DisplayModeChanged(mode) => {
                     this.right_pane_expanded =
                         *mode == crate::file_preview::model::PreviewDisplayMode::FullPage;
@@ -4351,7 +4341,12 @@ impl Shell {
             RightSurface::Preview(id) => {
                 if let Some(info) = self.preview_surfaces.get(&id).cloned() {
                     self.file_preview.update(cx, |preview, cx| {
-                        preview.open(info.context_key, info.root, info.relative_path, cx)
+                        preview.activate_surface(
+                            info.context_key,
+                            info.root,
+                            info.relative_path,
+                            cx,
+                        )
                     });
                 }
             }
@@ -12777,9 +12772,7 @@ impl Shell {
                             .rsplit('/')
                             .next()
                             .unwrap_or(&info.relative_path);
-                        let path = crate::details_sidebar::files_view::material_icon_path(
-                            name, false, false,
-                        );
+                        let path = crate::material_icons::material_icon_path(name, false, false);
                         icons::material_file_icon_image(path.as_ref())
                     })
                     .map(|image| {
@@ -12832,8 +12825,7 @@ impl Shell {
                 RightSurface::File(_) => {
                     let identity: &str = detail.as_deref().unwrap_or(&title);
                     let name = identity.rsplit('/').next().unwrap_or(identity);
-                    let path =
-                        crate::details_sidebar::files_view::material_icon_path(name, false, false);
+                    let path = crate::material_icons::material_icon_path(name, false, false);
                     icons::material_file_icon_image(path.as_ref())
                         .map(|image| {
                             img(image)

@@ -73,7 +73,7 @@ fn main() {
                 |_, cx| {
                     let preview = cx.new(|cx| {
                         let mut p = FilePreview::new();
-                        p.open(
+                        p.activate_surface(
                             "probe".into(),
                             path.parent().unwrap().into(),
                             path.file_name().unwrap().to_str().unwrap().into(),

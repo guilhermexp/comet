@@ -122,6 +122,16 @@ else
   emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"capabilities":{"liveVoice":1,"liveVoiceSessionContext":1}}'
 fi
 
+if [ "$scenario" = "startup-event-flood" ] || [ "$scenario" = "startup-event-overflow" ]; then
+  event_count=300
+  [ "$scenario" != "startup-event-overflow" ] || event_count=1100
+  sequence=0
+  while [ "$sequence" -lt "$event_count" ]; do
+    emit "{\"type\":\"extension_startup\",\"sequence\":$sequence}"
+    sequence=$((sequence + 1))
+  done
+fi
+
 if [ "$scenario" = "oversized-no-newline" ]; then
   dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\000' x
   sleep 5
@@ -172,7 +182,14 @@ while IFS= read -r line; do
       ;;
     get_state)
       live_state_seen=1
-      if [ "$scenario" = "local-compaction-background" ]; then
+      if [ "$scenario" = "live-event-flood" ]; then
+        sequence=0
+        while [ "$sequence" -lt 1100 ]; do
+          emit "{\"type\":\"extension_runtime\",\"sequence\":$sequence}"
+          sequence=$((sequence + 1))
+        done
+        respond "$line" '{"sessionId":"s-1"}'
+      elif [ "$scenario" = "local-compaction-background" ]; then
         if [ -f "$FAKE_OMP_HOLD_PATH.done" ]; then tokens=59000; else tokens=16000; fi
         respond "$line" "{\"sessionId\":\"s-1\",\"sessionFile\":\"/tmp/omp-session.jsonl\",\"contextUsage\":{\"tokens\":$tokens,\"contextWindow\":828000}}"
       elif [ "$local_command_completed" = 1 ] && [ "$scenario" = "local-compaction" ]; then
@@ -300,7 +317,7 @@ while IFS= read -r line; do
         respond "$line" '{"agentInvoked":false}'
       elif [ "$scenario" = "local-burst-output" ]; then
         i=0
-        while [ "$i" -lt 300 ]; do
+        while [ "$i" -lt 1100 ]; do
           emit "{\"type\":\"command_output\",\"text\":\"chunk-$i\n\"}"
           i=$((i + 1))
         done
