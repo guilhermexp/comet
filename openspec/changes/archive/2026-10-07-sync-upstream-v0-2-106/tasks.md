@@ -17,5 +17,5 @@
 - [x] 2.1 Audit auto-merges and new call sites, format and validate OpenSpec.
 - [x] 2.2 Run serial focused and workspace/native verification through cargo-verify; record exact coverage and limitations.
 - [x] 2.3 Review the integrated result and repair material findings.
-- [ ] 2.4 Update owner DOX, canonical specs and upstream-sync history; refresh Graft.
-- [ ] 2.5 Commit the integration, advance clean main and report any outstanding acceptance evidence without deploying.
+- [x] 2.4 Update owner DOX, canonical specs and upstream-sync history; refresh Graft.
+- [x] 2.5 Commit the integration, advance clean main and report any outstanding acceptance evidence without deploying.

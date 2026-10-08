@@ -80,3 +80,7 @@ Stage25 workspace/all-targets check with zeron-ui/project-palette-fixture PASS (
 Stage26 cargo fmt --all --check PASS; source snapshot checked1,600 Rust/Swift/manifest digests against the tested snapshot plus individually recorded integration amendments, PASS. Strict change and all62 canonical specs PASS after adding the explicit iOS preference/navigation e2e scenario. Final source includes no new ignores or skipped assertions. The optional example correction is fixture-only; the native desktop production source remains the source proved in stage16/native2.
 
 The protected Cargo queue is stopped after completed proof, so its disposable target is cleaned. Only the owned simulator and private fixture apps/daemons are stopped; the installed app and its Chat data remain untouched. The final archive/main commits are recorded in upstream-sync history.
+
+## Merge identity
+
+Actual integration merge: cd38b6dc084ac32b76538926285ccf22c85c3b10, parents b01350d6781332d715f3527de377fbd586278066 and916cb1ccb1342c2061963a5f6ecf5c977ba46f2c. The clean primary main was advanced by fast-forward to that merge. Graft was rebuilt on main after the final source correction. The protected verification wrapper exited0 and removed its target; the owned simulator was already Shutdown. Canonical specs were synchronized before archive, so archive uses --skip-specs to avoid applying the same additions twice. No source change is part of the archival closeout commit.

@@ -8,10 +8,10 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
 | | |
 |---|---|
-| Último commit do upstream mergeado | `9e1a1115` (pós-v0.2.102, 2026-10-02) |
-| Merge | branch `sync/upstream-v0.2.102` (worktree `~/.zeron/worktrees/comet/sync-v0-2-102`) |
-| OpenSpec | `openspec/changes/sync-upstream-v0-2-102/` |
-| Próximo sync começa de | `9e1a1115`, merge-base natural |
+| Último commit do upstream mergeado | `916cb1cc` (v0.2.106, 2026-10-07) |
+| Merge | `cd38b6dc`, incorporado na `main` a partir de `sync/upstream-v0.2.106` |
+| OpenSpec | `openspec/changes/archive/2026-10-07-sync-upstream-v0-2-106/` |
+| Próximo sync começa de | `916cb1cc`, merge-base natural |
 
 ## Receita
 
@@ -149,7 +149,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
 Intervalo completo: `9e1a1115..916cb1ccb1342c2061963a5f6ecf5c977ba46f2c`, 15 commits. Branch `sync/upstream-v0.2.106`, base local autorizada `b01350d6`, worktree `../comet-sync-v0-2-106`. OpenSpec `sync-upstream-v0-2-106` registra decisões e prova. Toda a funcionalidade foi selecionada; bumps de versão e detalhes de release/navegação foram adaptados aos contratos acima. O zui vendorizado vai a `0966d065`, árvore `6e4082751218f31cc40f3f2ace860c0556ba5baa`. A fonte reutilizável fica no `.tmp/zui-source` ignorado do worktree.
 
-A integração foi revisada com preservação dos contratos do fork. Workspace/all-targets, build nativa, UI desktop completa (2.232 testes), Codex, anexos enfileirados, Edge e packaging passaram; as provas nativas de intake/undo/send/echo e Files usaram perfis isolados. A execução inicial do workspace teve 5.051 passes, 21 falhas e 44 ignores já existentes; grupos corrigidos foram reexecutados, sem declarar uma suite final toda verde. O RPC CreateWorktree ainda excedeu o prazo original de quatro segundos na repetição corrigida, e preview churn falhou na drenagem de conexões em três execuções isoladas. Causas não estabelecidas, limites preservados. O core iOS e os bindings foram regenerados, e a rodada final passou com 12 testes unitários ligados e 4 testes de interface, sem falha ou skip; commit fica no closeout. Nenhum push, tag ou troca do app instalado foi feito.
+A integração foi revisada com preservação dos contratos do fork. Workspace/all-targets, build nativa, UI desktop completa (2.232 testes), Codex, anexos enfileirados, Edge e packaging passaram; as provas nativas de intake/undo/send/echo e Files usaram perfis isolados. A execução inicial do workspace teve 5.051 passes, 21 falhas e 44 ignores já existentes; grupos corrigidos foram reexecutados, sem declarar uma suite final toda verde. O RPC CreateWorktree ainda excedeu o prazo original de quatro segundos na repetição corrigida, e preview churn falhou na drenagem de conexões em três execuções isoladas. Causas não estabelecidas, limites preservados. O core iOS e os bindings foram regenerados, e a rodada final passou com 12 testes unitários ligados e 4 testes de interface, sem falha ou skip. O merge `cd38b6dc084ac32b76538926285ccf22c85c3b10` tem os pais `b01350d6` e `916cb1cc` e foi incorporado por fast-forward na main limpa. OpenSpec arquivada, Graft reconstruído na main, target Cargo temporário removido. As duas pendências de aceitação permanecem explícitas na prova arquivada. Nenhum push, tag ou troca do app instalado foi feito.
 
 ## Histórico
 
@@ -163,3 +163,4 @@ A integração foi revisada com preservação dos contratos do fork. Workspace/a
 | 2026-09-27 | até `9d3cc8b2` (v0.2.96) | `openspec/changes/sync-upstream-v0-2-94/` | Segundo merge na mesma branch; #595 recusado via revert local `a65f309e`; entram #389/#596, #588, #586, #592 e iOS |
 | 2026-09-28 | `e13b18de` (#599) | porte pontual | Cmd/Ctrl+C copia a seleção do transcript com o foco fora do composer; o próximo sync resolve para o lado do upstream |
 | 2026-10-02 | até `9e1a1115` (v0.2.102 + 21) | `openspec/changes/sync-upstream-v0-2-102/` | 56 commits; Pi nativo, ditado, seletor compacto opt-in, file tree actions; zui recebe 3 commits por patch |
+| 2026-10-07 | até `916cb1cc` (v0.2.106) | `openspec/changes/archive/2026-10-07-sync-upstream-v0-2-106/` | Merge `cd38b6dc`; 15 commits, Codex voice local/remoto/iOS, chips, identidade Git e catálogos; contratos do fork preservados. Prova desktop/iOS passou; RPC worktree e preview churn permanecem pendentes |
