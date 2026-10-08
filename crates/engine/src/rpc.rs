@@ -97,18 +97,6 @@ struct ChatParams {
 }
 
 #[derive(Debug, Deserialize)]
-struct SetLiveVoiceMutedParams {
-    muted: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProbeLiveVoiceParams {
-    chat_id: Option<String>,
-    cwd: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
@@ -2321,51 +2309,6 @@ impl RpcService for EngineRpc {
                     handle.doc_arc(),
                 )))
             }
-            methods::PROBE_LIVE_VOICE => {
-                let p: ProbeLiveVoiceParams = parse_params(params)?;
-                let availability =
-                    if let Some(chat_id) = p.chat_id.as_deref().filter(|id| !id.is_empty()) {
-                        self.sessions
-                            .probe_live_voice(chat_id)
-                            .await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?
-                    } else {
-                        let cwd = p.cwd.filter(|cwd| !cwd.trim().is_empty()).ok_or_else(|| {
-                            RpcError::Failed("ProbeLiveVoice requires chatId or cwd".into())
-                        })?;
-                        self.sessions
-                            .probe_live_voice_at_cwd(&cwd)
-                            .await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?
-                    };
-                RpcReply::value(&availability)
-            }
-            methods::START_LIVE_VOICE => {
-                let p: ChatParams = parse_params(params)?;
-                self.sessions
-                    .start_live_voice(&p.chat_id)
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "active": true }))
-            }
-            methods::SET_LIVE_VOICE_MUTED => {
-                let p: SetLiveVoiceMutedParams = parse_params(params)?;
-                self.sessions
-                    .set_live_voice_muted(p.muted)
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "muted": p.muted }))
-            }
-            methods::STOP_LIVE_VOICE => {
-                self.sessions
-                    .stop_live_voice()
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "active": false }))
-            }
-            methods::WATCH_LIVE_VOICE => Ok(RpcReply::Stream(watch_stream(
-                self.sessions.watch_live_voice(),
-            ))),
             methods::WATCH_QUEUE => {
                 let p: ChatParams = parse_params(params)?;
                 let handle = self
@@ -4416,13 +4359,46 @@ mod tests {
         assert!(info(methods::WATCH_CHECKOUT_CHANGE_REQUEST).unwrap().stream);
     }
 
-    #[test]
-    fn live_voice_rpc_methods_are_local_only() {
-        assert!(!is_forwardable(methods::PROBE_LIVE_VOICE));
-        assert!(!is_forwardable(methods::START_LIVE_VOICE));
-        assert!(!is_forwardable(methods::SET_LIVE_VOICE_MUTED));
-        assert!(!is_forwardable(methods::STOP_LIVE_VOICE));
-        assert!(!is_forwardable(methods::WATCH_LIVE_VOICE));
+    #[tokio::test]
+    async fn retired_omp_voice_methods_are_unknown_without_chat_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(HarnessRegistry::new()),
+            HarnessId::Codex,
+            None,
+        )
+        .unwrap();
+        let service: std::sync::Arc<dyn zeron_rpc::RpcService> = core.rpc_service();
+        assert!(core.workspace.chat("retired-live-chat").unwrap().is_none());
+
+        for (method, params) in [
+            (
+                "ProbeLiveVoice",
+                serde_json::json!({ "chatId": "retired-live-chat", "cwd": "/tmp" }),
+            ),
+            (
+                "StartLiveVoice",
+                serde_json::json!({ "chatId": "retired-live-chat" }),
+            ),
+            ("SetLiveVoiceMuted", serde_json::json!({ "muted": true })),
+            ("StopLiveVoice", serde_json::Value::Null),
+            ("WatchLiveVoice", serde_json::Value::Null),
+        ] {
+            let error = match service.handle(method, params).await {
+                Err(error) => error,
+                Ok(_) => panic!("{method} must use unknown-method handling"),
+            };
+            assert!(
+                matches!(&error, RpcError::UnknownMethod(name) if name.as_str() == method),
+                "{method} returned the wrong error: {error}"
+            );
+            assert!(
+                core.workspace.chat("retired-live-chat").unwrap().is_none(),
+                "{method} must not create a Chat"
+            );
+        }
+        core.sessions.shutdown().await;
     }
 
     #[test]

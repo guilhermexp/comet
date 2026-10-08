@@ -31,7 +31,6 @@ pub mod harness_updates;
 mod http_error;
 pub mod instance_lock;
 pub(crate) mod kimi_usage;
-pub mod live_voice;
 pub mod local_import;
 mod model_catalogs;
 pub(crate) mod process;

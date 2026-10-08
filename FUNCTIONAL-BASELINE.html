@@ -588,10 +588,10 @@ flowchart TD
         </article>
         <article class="ve-card">
           <div class="card-kicker">Voz ao vivo</div>
-          <h3>OMP Live Voice</h3>
-          <p>Streaming bidirecional de áudio e contexto operacional conectado ao harness Oh My Pi.</p>
-          <ul><li>Loop de transcrição, níveis de áudio, controle de mute e transições de fase de voz em tempo real.</li><li>Injeção contínua de contexto da sessão (janela de texto e deltas) para o modelo de voz durante a execução.</li></ul>
-          <div class="card-foot">Engine: <code>crates/engine/src/live_voice.rs</code> · Harness: <code>crates/harness/src/omp/</code></div>
+          <h3>Codex Voice</h3>
+          <p>Chamada realtime local ou remota pela engine host, usando o helper da instalação standalone do Codex.</p>
+          <ul><li>Controle na sidebar, stage e retorno à chamada ativa no composer; clientes desktop e iOS.</li><li>A integração antiga OMP Live Voice foi removida em 2026-10-08 após aceite manual da voz Codex pelo usuário.</li></ul>
+          <div class="card-foot">Engine: <code>crates/engine</code> · UI: <code>crates/ui/src/voice.rs</code> · Media: <code>crates/voice-media</code></div>
         </article>
         <article class="ve-card">
           <div class="card-kicker">Exportação</div>
@@ -664,7 +664,7 @@ flowchart TD
             <tr><td>10</td><td>Settings</td><td>Desktop</td><td><span class="status partial">PARCIAL</span></td><td>Devices, Accounts, Shortcuts e Archived existem; ações visuais não executadas.</td></tr>
             <tr><td>11</td><td>Daemon e headless</td><td>CLI / engine</td><td><span class="status partial">PARCIAL</span></td><td>Headless do demo está ativo; install/start/restart do serviço real não foi alterado.</td></tr>
             <tr><td>12</td><td>Workers e subagents locais</td><td>Unpeel / UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/workers-unpeel</code> e <code>crates/ui/src/workers/</code>; fluxos de orquestração completos não foram exercitados nesta sessão.</td></tr>
-            <tr><td>13</td><td>OMP Live Voice</td><td>Engine / Harness</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/engine/src/live_voice.rs</code> e <code>crates/harness/src/omp/</code>; streaming de áudio não acionado nesta sessão.</td></tr>
+            <tr><td>13</td><td>Codex Voice</td><td>Engine / Desktop / iOS</td><td><span class="status partial">PARCIAL</span></td><td>Voz desktop aceita manualmente pelo usuário em 2026-10-08. Helper standalone instalado; OMP Live Voice aposentado. Demais variantes mantêm seus limites de comprovação específicos.</td></tr>
             <tr><td>14</td><td>Chat Transcript Export</td><td>Desktop UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/ui/src/chat_export.rs</code>; geração e salvamento de arquivo não disparados na auditoria.</td></tr>
             <tr><td>15</td><td>Projects Settings</td><td>Desktop UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/ui/src/settings/projects.rs</code>; navegação e mutações de ledger não foram executadas.</td></tr>
             <tr><td>16</td><td>GPUI Dev Inspector</td><td>Desktop UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado sob <code>#[cfg(debug_assertions)]</code> em <code>crates/ui/src/inspector.rs</code>; atalho ⌥⌘I não enviado via automação.</td></tr>
@@ -700,7 +700,7 @@ mindmap
     Viewports
       Desktop gpui — PARCIAL
       Workers e subagents — PARCIAL
-      OMP Live Voice — PARCIAL
+      Codex Voice — PARCIAL
       Export e Inspector — PARCIAL
       iOS SwiftUI — FONTE
     Plataforma

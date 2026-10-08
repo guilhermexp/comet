@@ -21,7 +21,7 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 - `GenerateCommitMessageRequest { cwd }` e `GeneratedCommitMessage { message }` são tipos aditivos de rascunho; a mensagem preserva título/corpo com quebras de linha, sem mutação Git implícita.
 
-- `CreateWorktreeOutcome` mantém `Worktree` achatado para leitores antigos e adiciona `setupError`/`copyWarning` opcionais: um erro de preparo bloqueia o início por Live Voice e um cache ignorado não copiado chega como aviso ao consumidor.
+- `CreateWorktreeOutcome` mantém `Worktree` achatado para leitores antigos e adiciona `setupError`/`copyWarning` opcionais: erros de preparo e caches ignorados não copiados chegam como outcomes explícitos ao consumidor.
 
 - `hashline_file_paths` extrai paths únicos de headers canônicos `[PATH#TAG]` (quatro hex maiúsculos), compartilhado pela normalização OMP e recuperação visual de histórico; não interpreta conteúdo de linhas de corpo.
 

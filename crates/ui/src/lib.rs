@@ -46,7 +46,6 @@ pub mod inline_media;
 pub mod inspector;
 pub mod link_favicons;
 pub mod links;
-pub mod live_voice;
 pub mod loaders;
 pub mod markdown;
 pub mod markdown_decor;
@@ -327,16 +326,7 @@ pub fn run_app(config: UiConfig) {
                 .then(|| quit_state.read(cx).engine().cloned())
                 .flatten()
                 .map(|handle| {
-                    let executor = cx.background_executor().clone();
                     gpui_tokio::Tokio::spawn(cx, async move {
-                        let _ = attachments::call_with_timeout(
-                            &handle,
-                            &executor,
-                            zeron_rpc::methods::STOP_LIVE_VOICE,
-                            serde_json::Value::Null,
-                            std::time::Duration::from_secs(2),
-                        )
-                        .await;
                         handle.shutdown().await;
                     })
                 });
@@ -557,17 +547,6 @@ fn open_main_window(
             },
         )
         .expect("failed to open window");
-    let window_id = handle.window_id();
-    cx.on_window_closed(move |cx, closed| {
-        if closed == window_id {
-            state.update(cx, |state, cx| {
-                if state.live_voice_active() {
-                    state.stop_live_voice(cx);
-                }
-            });
-        }
-    })
-    .detach();
     // Belt and braces: assert the blur once the window actually exists. The
     // `WindowOptions` value is applied during creation, before the view is
     // attached; re-pushing it here means a window is never left opaque.

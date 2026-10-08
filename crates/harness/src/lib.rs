@@ -14,7 +14,7 @@
 //! first uncorrelated idle), manufacturing done-status bugs the native
 //! wires don't have (decision record: docs/research/acp.md).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, LiveVoicePhase, LiveVoiceTranscript, LiveVoiceUnavailableReason, Model,
-    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -79,80 +79,6 @@ pub struct RunControls {
     pub generate_native_title: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveVoiceRequest {
-    pub cwd: String,
-    pub resume: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LiveVoiceSupport {
-    pub available: bool,
-    pub session_context: bool,
-}
-
-impl LiveVoiceSupport {
-    /// Why Live Voice cannot start, in the OMP's own terms; `None` means it can.
-    ///
-    /// Both gaps are a missing OMP capability, never a stale Comet host: either
-    /// the base capability is absent from the ready frame, or it is there
-    /// without the operational-context capability that joining an already
-    /// active run additionally needs. Returning the reason instead of a bool
-    /// keeps the two apart all the way to the tooltip.
-    pub fn gap(&self, active_run: bool) -> Option<LiveVoiceUnavailableReason> {
-        if !self.available {
-            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
-        } else if active_run && !self.session_context {
-            Some(LiveVoiceUnavailableReason::ActiveRun)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LiveVoiceContextKind {
-    Progress,
-    Final,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LiveVoiceControl {
-    SetMuted(bool),
-    AppendContext {
-        delegation_id: String,
-        kind: LiveVoiceContextKind,
-        text: String,
-    },
-    AppendSessionContext {
-        text: String,
-    },
-    Stop,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum LiveVoiceEvent {
-    Phase(LiveVoicePhase),
-    Levels {
-        input: f32,
-        output: f32,
-    },
-    Transcript(LiveVoiceTranscript),
-    Delegation {
-        delegation_id: String,
-        request: String,
-    },
-    Ended {
-        error: Option<String>,
-    },
-}
-
-pub struct LiveVoiceHandle {
-    pub session_id: String,
-    pub events: BoxStream<'static, Result<LiveVoiceEvent, HarnessError>>,
-    pub controls: mpsc::Sender<LiveVoiceControl>,
-}
-
 /// Catalog provenance stays internal; RPC clients retain the Vec<Model> shape.
 #[derive(Clone, Debug)]
 pub struct ModelCatalog {
@@ -198,18 +124,6 @@ pub trait Harness: Send + Sync {
     /// Autonomous activity may still need the independent quiesce fallback.
     fn authoritative_prompt_end(&self) -> bool {
         self.deterministic_turn_end()
-    }
-    async fn probe_live_voice(&self, _cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
-        Ok(LiveVoiceSupport::default())
-    }
-    async fn start_live_voice(
-        &self,
-        _request: LiveVoiceRequest,
-    ) -> Result<LiveVoiceHandle, HarnessError> {
-        Err(HarnessError::Unsupported(format!(
-            "{} does not support Live Voice",
-            self.display_name()
-        )))
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -616,13 +530,12 @@ mod stderr_tests {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use std::path::Path;
     use zeron_proto::{DoneStatus, SandboxLevel};
 
-    struct UnsupportedLiveHarness;
+    struct DefaultHarness;
 
     #[async_trait]
-    impl Harness for UnsupportedLiveHarness {
+    impl Harness for DefaultHarness {
         fn id(&self) -> HarnessId {
             HarnessId::Mock
         }
@@ -665,28 +578,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_voice_defaults_are_unsupported_without_changing_run() {
-        let harness = UnsupportedLiveHarness;
-        assert_eq!(
-            harness.probe_live_voice(Path::new(".")).await.unwrap(),
-            LiveVoiceSupport::default()
-        );
-
-        let error = match harness
-            .start_live_voice(LiveVoiceRequest {
-                cwd: ".".into(),
-                resume: None,
-            })
-            .await
-        {
-            Ok(_) => panic!("unsupported harness started Live Voice"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            HarnessError::Unsupported(message) if message == "Test does not support Live Voice"
-        ));
-
+    async fn default_harness_run_emits_done() {
+        let harness = DefaultHarness;
         let (_steering_tx, steering) = mpsc::channel(1);
         let mut events = harness
             .run(

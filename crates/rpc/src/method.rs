@@ -185,13 +185,6 @@ rpc_methods! {
     WATCH_SESSIONS / WatchSessions = "WatchSessions" { params: serde_json::Value, reply: serde_json::Value },
     /// Spaces registry (device+folder pairs) from the workspace doc.
     WATCH_SPACES / WatchSpaces = "WatchSpaces" { params: serde_json::Value, reply: serde_json::Value },
-    /// Local-only OMP Live Voice lifecycle. Media remains inside OMP; Comet
-    /// exposes only control, state, and transcript metadata.
-    PROBE_LIVE_VOICE / ProbeLiveVoice = "ProbeLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    START_LIVE_VOICE / StartLiveVoice = "StartLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    SET_LIVE_VOICE_MUTED / SetLiveVoiceMuted = "SetLiveVoiceMuted" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    STOP_LIVE_VOICE / StopLiveVoice = "StopLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    WATCH_LIVE_VOICE / WatchLiveVoice = "WatchLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
     /// Remote Codex realtime voice, routed to the device that owns the Chat.
     VOICE_CAPABILITIES_V2 / VoiceCapabilitiesV2 = "VoiceCapabilitiesV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     PREPARE_VOICE_V2 / PrepareVoiceV2 = "PrepareVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 65 },
@@ -391,6 +384,31 @@ mod tests {
     }
 
     #[test]
+    fn retired_omp_voice_methods_are_absent_and_codex_voice_remains() {
+        for name in [
+            "ProbeLiveVoice",
+            "StartLiveVoice",
+            "SetLiveVoiceMuted",
+            "StopLiveVoice",
+            "WatchLiveVoice",
+        ] {
+            assert!(
+                info(name).is_none(),
+                "retired OMP method {name} is registered"
+            );
+        }
+        for name in [
+            methods::VOICE_CAPABILITIES_V2,
+            methods::PREPARE_VOICE_V2,
+            methods::OWN_VOICE_V2,
+            methods::NEGOTIATE_VOICE_V2,
+            methods::STOP_VOICE_V2,
+        ] {
+            assert!(info(name).is_some(), "Codex method {name} must remain");
+        }
+    }
+
+    #[test]
     fn local_only_methods_are_never_forwardable() {
         for name in ALL_METHOD_NAMES {
             let method = info(name).unwrap_or_else(|| panic!("{name} missing from registry"));
@@ -401,7 +419,6 @@ mod tests {
                 );
             }
         }
-        assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
         assert!(methods::is_local_only(methods::GENERATE_CHAT_RECAP));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));
         assert!(!methods::is_local_only("Nope"));

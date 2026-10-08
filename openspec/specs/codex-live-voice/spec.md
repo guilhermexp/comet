@@ -7,7 +7,7 @@ Support host-owned Codex realtime calls across desktop and iOS with compatible i
 ## Requirements
 
 ### Requirement: Codex voice belongs to the Chat host
-The system SHALL support Codex realtime voice through the Chat host engine, including desktop local and authenticated remote/iOS clients, without replacing OMP Live or routing audio through durable command transcripts. Starting an idle voice session SHALL NOT submit an empty coding turn.
+The system SHALL support Codex realtime voice through the Chat host engine, including desktop local and authenticated remote/iOS clients, without routing audio through durable command transcripts. Starting an idle voice session SHALL NOT submit an empty coding turn.
 
 #### Scenario: Idle voice and retained coding run
 Test: integration — harness realtime fixtures and engine voice/session lifecycle tests.

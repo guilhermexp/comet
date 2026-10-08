@@ -95,16 +95,6 @@ if [ "$scenario" = "require-skill-scope" ]; then
   has "$body" "enableCodexUser: false" || exit 45
   has "$body" "enablePiUser: false" || exit 46
 fi
-case "$scenario" in
-  live-probe)
-    has " $* " " --no-session " || exit 47
-    ;;
-  live-frontend|live-crash)
-    for arg in "$@"; do
-      [ "$arg" != "--no-session" ] || exit 48
-    done
-    ;;
-esac
 [ -z "${FAKE_OMP_PID_FILE:-}" ] || printf '%s\n' "$$" > "$FAKE_OMP_PID_FILE"
 if [ "$scenario" = "early-exit" ]; then
   exit 9
@@ -114,13 +104,7 @@ if [ "$scenario" = "stderr-crash" ]; then
   exit 7
 fi
 
-if [ "$scenario" = "no-live-capability" ]; then
-  emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
-elif [ "$scenario" = "live-basic-only" ]; then
-  emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"capabilities":{"liveVoice":1}}'
-else
-  emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"capabilities":{"liveVoice":1,"liveVoiceSessionContext":1}}'
-fi
+emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
 
 if [ "$scenario" = "startup-event-flood" ] || [ "$scenario" = "startup-event-overflow" ]; then
   event_count=300
@@ -168,8 +152,6 @@ emit_chunked() {
   emit "{\"type\":\"rpc_chunk\",\"chunkId\":\"rpc-1\",\"index\":1,\"count\":2,\"byteLength\":$total,\"data\":\"$second_half\"}"
 }
 
-live_delegations=0
-live_state_seen=0
 local_command_completed=0
 while IFS= read -r line; do
   case "$(field type "$line")" in
@@ -181,7 +163,6 @@ while IFS= read -r line; do
       fi
       ;;
     get_state)
-      live_state_seen=1
       if [ "$scenario" = "live-event-flood" ]; then
         sequence=0
         while [ "$sequence" -lt 1100 ]; do
@@ -215,14 +196,12 @@ while IFS= read -r line; do
       respond "$line" '{"commands":[{"name":"model","description":"Select model","input":{"hint":"provider/model"}},{"name":"compact","description":"Compact context"}]}'
       ;;
     set_subagent_subscription)
-      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_subscription 53; fi
       respond "$line" '{"level":"events"}'
       ;;
     switch_session)
       case "$line" in *'"sessionPath":"/tmp/omp-session.jsonl"'*) respond "$line" '{"cancelled":false}' ;; *) exit 22 ;; esac
       ;;
     set_host_tools)
-      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_tools 56; fi
       if [ "$scenario" = "mixed-host-tools" ]; then
         has "$line" '"name":"workers"' || exit 60
         has "$line" '"name":"sessions"' || exit 61
@@ -232,7 +211,6 @@ while IFS= read -r line; do
       fi
       ;;
     set_model)
-      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_model 57; fi
       if has "$line" '"provider":"openai-codex"' && has "$line" '"modelId":"gpt-5.6-sol"'; then
         respond "$line" '{"provider":"openai-codex","id":"gpt-5.6-sol","reasoning":true}'
       else
@@ -240,7 +218,6 @@ while IFS= read -r line; do
       fi
       ;;
     set_thinking_level)
-      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_thinking 58; fi
       case "$line" in *'"level":"high"'*) respond "$line" '{}' ;; *) exit 24 ;; esac
       ;;
     steer)
@@ -249,51 +226,7 @@ while IFS= read -r line; do
     abort)
       respond "$line" '{}'
       ;;
-    live_start)
-      has "$line" '"delegationMode":"host"' || fail_stage live_start 50
-      [ "$live_state_seen" -eq 1 ] || fail_stage live_state_order 59
-      respond "$line" '{"active":true}'
-      if [ "$scenario" = "live-crash" ]; then
-        printf 'Authorization: Bearer token-secret-123\n' >&2
-        exit 60
-      fi
-      live_delegations=1
-      emit '{"type":"live_phase","phase":"connecting"}'
-      emit '{"type":"live_phase","phase":"listening"}'
-      emit '{"type":"live_levels","input":0.25,"output":0.5}'
-      emit '{"type":"live_transcript","role":"user","turn":1,"text":"Inspect auth","final":true}'
-      emit '{"type":"live_delegation_created","delegationId":"del-1","request":"Inspect auth"}'
-      ;;
-    live_set_muted)
-      has "$line" '"muted":true' || fail_stage live_mute 51
-      respond "$line" '{"muted":true}'
-      ;;
-    live_append_context)
-      delegation_id=$(field delegationId "$line")
-      [ "$delegation_id" = "del-$live_delegations" ] || fail_stage live_context 52
-      if has "$line" '"kind":"final"'; then
-        emit '{"type":"live_phase","phase":"listening"}'
-        if [ "$live_delegations" -eq 1 ]; then
-          live_delegations=2
-          emit '{"type":"live_delegation_created","delegationId":"del-2","request":"Run tests"}'
-        fi
-      fi
-      respond "$line" "{\"delegationId\":\"$delegation_id\"}"
-      ;;
-    live_append_session_context)
-      has "$line" '"text":"Session status: Working"' || fail_stage live_session_context 53
-      if [ "$scenario" = "live-basic-only" ]; then
-        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"live_append_session_context\",\"success\":false,\"error\":\"OMP does not support session context\"}"
-      else
-        respond "$line" '{"accepted":true}'
-      fi
-      ;;
-    live_stop)
-      respond "$line" '{"active":false}'
-      emit '{"type":"live_ended","error":null}'
-      ;;
     prompt)
-      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_prompt 59; fi
       if [ "$scenario" = "local-compaction-background" ]; then
         respond "$line" '{"agentInvoked":false}'
         (

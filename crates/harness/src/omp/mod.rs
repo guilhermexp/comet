@@ -18,15 +18,9 @@ use zeron_proto::{
 
 use self::normalize::{AgentEndDisposition, OmpNormalizer};
 use self::process::{OmpLaunch, OmpProcess};
-use self::protocol::{
-    MAX_OUTBOUND_BYTES, live_context_command, live_mute_command, live_session_context_command,
-    live_start_command, live_stop_command, parse_live_event,
-};
+use self::protocol::MAX_OUTBOUND_BYTES;
 use self::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
-use crate::{
-    Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
-    LiveVoiceSupport, RunControls, SteerMessage,
-};
+use crate::{Harness, HarnessError, RunControls, SteerMessage};
 
 #[doc(hidden)]
 pub mod normalize;
@@ -333,73 +327,6 @@ impl Harness for OmpHarness {
         true
     }
 
-    async fn probe_live_voice(&self, cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
-        let process = OmpProcess::start(self.launch(cwd.to_path_buf(), true, None)?).await?;
-        let capabilities = process.capabilities();
-        process.shutdown().await?;
-        Ok(LiveVoiceSupport {
-            available: capabilities.live_voice,
-            session_context: capabilities.live_voice_session_context,
-        })
-    }
-
-    async fn start_live_voice(
-        &self,
-        request: LiveVoiceRequest,
-    ) -> Result<LiveVoiceHandle, HarnessError> {
-        if request.cwd.trim().is_empty() {
-            return Err(HarnessError::Protocol(
-                "OMP Live Voice requires a working directory".into(),
-            ));
-        }
-        let process =
-            OmpProcess::start(self.launch(PathBuf::from(request.cwd), false, None)?).await?;
-        let setup = async {
-            if !process.capabilities().live_voice {
-                return Err(HarnessError::Unsupported(
-                    "this OMP's ready frame has no Live Voice capability".into(),
-                ));
-            }
-            if let Some(session_path) = request.resume.as_deref() {
-                let response = process
-                    .request(json!({ "type": "switch_session", "sessionPath": session_path }))
-                    .await?;
-                if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
-                    return Err(HarnessError::Protocol(
-                        "OMP Live session resume was cancelled".into(),
-                    ));
-                }
-            }
-            let state = process.request(json!({ "type": "get_state" })).await?;
-            let session_id = state_session_id(&state).ok_or_else(|| {
-                HarnessError::Protocol("OMP Live state omitted its session identity".into())
-            })?;
-            let events = process.take_events()?;
-            process.request(live_start_command()).await?;
-            Ok((session_id, events))
-        }
-        .await;
-        let (session_id, events) = match setup {
-            Ok(setup) => setup,
-            Err(error) => {
-                let _ = process.shutdown().await;
-                return Err(error);
-            }
-        };
-
-        let (control_tx, control_rx) = mpsc::channel(16);
-        let (event_tx, event_rx) = mpsc::channel(32);
-        tokio::spawn(run_live_voice(process, events, control_rx, event_tx));
-        Ok(LiveVoiceHandle {
-            session_id,
-            events: futures::stream::unfold(event_rx, |mut receiver| async move {
-                receiver.recv().await.map(|event| (event, receiver))
-            })
-            .boxed(),
-            controls: control_tx,
-        })
-    }
-
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         discover_models_with_launch(self.launch(std::env::current_dir()?, true, None)?).await
     }
@@ -571,93 +498,6 @@ impl Harness for OmpHarness {
             })
             .boxed(),
         )
-    }
-}
-
-async fn run_live_voice(
-    process: OmpProcess,
-    mut frames: mpsc::Receiver<Value>,
-    mut controls: mpsc::Receiver<LiveVoiceControl>,
-    events: mpsc::Sender<Result<LiveVoiceEvent, HarnessError>>,
-) {
-    loop {
-        tokio::select! {
-            frame = frames.recv() => {
-                let Some(frame) = frame else {
-                    let _ = events
-                        .send(Err(HarnessError::Protocol(
-                            "OMP Live frontend exited unexpectedly".into(),
-                        )))
-                        .await;
-                    let _ = process.shutdown().await;
-                    return;
-                };
-                let event = match parse_live_event(&frame) {
-                    Ok(Some(event)) => event,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        let _ = events.send(Err(error)).await;
-                        let _ = process.shutdown().await;
-                        return;
-                    }
-                };
-                let terminal = matches!(event, LiveVoiceEvent::Ended { .. });
-                let delivered = if matches!(event, LiveVoiceEvent::Levels { .. }) {
-                    match events.try_send(Ok(event)) {
-                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    }
-                } else {
-                    events.send(Ok(event)).await.is_ok()
-                };
-                if terminal || !delivered {
-                    let _ = process.shutdown().await;
-                    return;
-                }
-            }
-            control = controls.recv() => {
-                let Some(control) = control else {
-                    let _ = process.request(live_stop_command()).await;
-                    let _ = events.send(Ok(LiveVoiceEvent::Ended { error: None })).await;
-                    let _ = process.shutdown().await;
-                    return;
-                };
-                let command = match control {
-                    LiveVoiceControl::SetMuted(muted) => Ok(live_mute_command(muted)),
-                    LiveVoiceControl::AppendContext {
-                        delegation_id,
-                        kind,
-                        text,
-                    } => live_context_command(&delegation_id, kind, &text),
-                    LiveVoiceControl::AppendSessionContext { text } => {
-                        live_session_context_command(&text)
-                    }
-                    LiveVoiceControl::Stop => {
-                        match process.request(live_stop_command()).await {
-                            Ok(_) => {
-                                let _ = events
-                                    .send(Ok(LiveVoiceEvent::Ended { error: None }))
-                                    .await;
-                            }
-                            Err(error) => {
-                                let _ = events.send(Err(error)).await;
-                            }
-                        }
-                        let _ = process.shutdown().await;
-                        return;
-                    }
-                };
-                let sent = match command {
-                    Ok(command) => process.request(command).await,
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = sent {
-                    let _ = events.send(Err(error)).await;
-                    let _ = process.shutdown().await;
-                    return;
-                }
-            }
-        }
     }
 }
 

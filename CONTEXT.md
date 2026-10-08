@@ -99,11 +99,6 @@ _Avoid_: Chat, subagent, task worker, background agent, thread
 
 ## Voice
 
-**Live Voice**:
-A call de voz interativa mantida pela engine host em segundo plano com um agente/runtime (OMP), projetando contexto operacional contínuo (status, texto visível em janela temporal e labels de tool) e despachando comandos vocais confirmados como comandos duráveis `Steer` no Chat ativo. Pertence à engine host, sobrevivendo à troca de Chat ativo, perda de foco ou minimização da janela. Não pertence à surface selecionada nem a uma aba específica, e não é transcrição assíncrona de áudio.
-_Avoid_: voice input, chat voice, voice note, speech-to-text, microfone do chat
-
-
 **Codex Voice**:
-A chamada realtime Codex local ou remota controlada pela engine host, usando o helper da instalação standalone do usuário. Desktop e iOS compartilham lifecycle, captions e estado; uma conversa de voz concluída é persistida uma vez no Chat Transcript. O orquestrador de voz dedicado recebe os tools de Chat pelo grant raiz da engine, sem injeção global de MCP. Convive com o Live Voice do OMP, cujo áudio e conversa casual permanecem no runtime e cujas instruções confirmadas seguem o ledger durável.
+A chamada realtime Codex local ou remota controlada pela engine host, usando o helper da instalação standalone do usuário. Desktop e iOS compartilham lifecycle, captions e estado; uma conversa de voz concluída é persistida uma vez no Chat Transcript. O orquestrador de voz dedicado recebe os tools de Chat pelo grant raiz da engine, sem injeção global de MCP. A integração antiga de Live Voice do OMP foi aposentada.
 _Avoid_: ditado local, Worker, billing de API

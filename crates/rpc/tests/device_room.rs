@@ -904,20 +904,20 @@ async fn relay_ingress_rejects_local_only_methods() {
         "expected local-only error, got: {recap_msg}"
     );
 
-    // Attempting to call ProbeLiveVoice without targetDeviceId over peer relay must be rejected:
-    let voice_err = client
+    // LocalDevice is also local-only even when a peer omits targetDeviceId:
+    let device_err = client
         .call(
-            methods::PROBE_LIVE_VOICE,
+            methods::LOCAL_DEVICE,
             serde_json::json!({
                 "chatId": "chat-secret"
             }),
         )
         .await
-        .expect_err("ProbeLiveVoice must be rejected on relay ingress");
-    let voice_msg = voice_err.to_string();
+        .expect_err("LocalDevice must be rejected on relay ingress");
+    let device_msg = device_err.to_string();
     assert!(
-        voice_msg.contains("local-only"),
-        "expected local-only error, got: {voice_msg}"
+        device_msg.contains("local-only"),
+        "expected local-only error, got: {device_msg}"
     );
 }
 

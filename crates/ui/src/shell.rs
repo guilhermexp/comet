@@ -2602,11 +2602,10 @@ pub struct Shell {
     /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
     was_window_active: bool,
     /// Dev/testing knobs (`ZERON_OPEN_DIALOG`, `ZERON_FORCE_GATE`,
-    /// `ZERON_DEMO_UPLOAD`, `ZERON_DEMO_LIVE`) — see [`Shell::new`].
+    /// `ZERON_DEMO_UPLOAD`) — see [`Shell::new`].
     debug_dialog: Option<String>,
     debug_gate: Option<GatePhase>,
     debug_upload: Option<String>,
-    debug_live_voice: Option<String>,
     sidebar_tween: Option<WidthTween>,
     files_tween: Option<WidthTween>,
     sidebar_edge_bounce: Option<motion::ResizeEdgeBounce>,
@@ -3041,9 +3040,6 @@ impl Shell {
         // send on the selected chat (echo bubble + frozen thumbnail progress
         // ring) — display-only; a real upload can't be paused for a capture.
         let debug_upload = crate::capture::knob("ZERON_DEMO_UPLOAD");
-        // `ZERON_DEMO_LIVE=<state>` freezes a visual Live Voice state after
-        // chat selection. Product runs ignore it through the capture umbrella.
-        let debug_live_voice = crate::capture::knob("ZERON_DEMO_LIVE");
         let debug_gate = match crate::capture::knob("ZERON_FORCE_GATE").as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
@@ -3244,7 +3240,6 @@ impl Shell {
             debug_dialog,
             debug_gate,
             debug_upload,
-            debug_live_voice,
             sidebar_tween: None,
             files_tween: None,
             sidebar_edge_bounce: None,
@@ -3437,21 +3432,6 @@ impl Shell {
                     cx.notify();
                 });
             }
-        }
-        if let Some(spec) = self.debug_live_voice.as_deref()
-            && let Some(chat_id) = state.read(cx).selected_chat.clone()
-            && let Some((availability, live_voice)) =
-                crate::live_voice::capture_state(spec, &chat_id)
-        {
-            state.update(cx, |state, cx| {
-                if state.live_voice_availability.as_ref() != Some(&availability)
-                    || state.live_voice != live_voice
-                {
-                    state.live_voice_availability = Some(availability);
-                    state.apply_live_voice(live_voice);
-                    cx.notify();
-                }
-            });
         }
         // Banners and chimes share one session detector. Completion markers survive
         // queue handoffs and never advance for interrupts or stale activity.
@@ -14594,22 +14574,6 @@ impl Render for Shell {
                 }),
             )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
-            // Live Voice owns Escape on its own Chat (fork contract): it ends
-            // the call before the shell's Escape-interrupt policy runs.
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
-                    return;
-                }
-                let stop_live_voice = {
-                    let state = this.state.read(cx);
-                    state.live_voice_active()
-                        && state.live_voice.chat_id.as_deref() == state.selected_chat.as_deref()
-                };
-                if stop_live_voice {
-                    this.state.update(cx, |state, cx| state.stop_live_voice(cx));
-                    cx.stop_propagation();
-                }
-            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))

@@ -46,14 +46,14 @@ Atualizar este arquivo é parte do closeout de todo sync.
 
 ## Contratos do fork que sempre vencem
 
-- **Workers e harnesses:** Workers (`crates/workers-unpeel`, `WorkflowTask`, aba Workers), os harnesses OMP e Kimi, Live Voice. A Trajectory foi removida do fork em 2026-10-05 (`openspec/changes/remove-chat-trajectory/`); merges antigos que a citem não a restauram.
+- **Workers e harnesses:** Workers (`crates/workers-unpeel`, `WorkflowTask`, aba Workers), os harnesses OMP e Kimi. A integração Live Voice OMP foi aposentada em 2026-10-08; merges não devem restaurá-la. A Trajectory foi removida do fork em 2026-10-05 (`openspec/changes/remove-chat-trajectory/`); merges antigos que a citem não a restauram.
 - **Notificações genuínas de Workers:** entram diretamente no mailbox do run parent steerable, inclusive com update pendente e harness TurnBoundary; mensagens comuns continuam sujeitas ao gate. A lease de execução continua bloqueando o instalador.
 - **Steering:** Enter com run ativo faz steer. A fila do upstream coexiste, mas não substitui (v0.2.83 D3).
 - **Modelo de grant MCP:**
   - `comet-workers` vai para quem pode lançar Workers.
   - `comet-sessions` e `zeron` (o `zeron mcp`) vão **só** para o orquestrador raiz com IPC ativo.
   - `RunRequest.mcp` fica sempre vazio: não entra a injeção do upstream em todo run.
-- **Voz:** Codex voice usa o helper standalone instalado e o lifecycle host-owned; convive com Live Voice OMP. A autorização de tools do seu orquestrador usa o grant raiz do fork, não injeção global por `RunRequest.mcp`. Consulta opcional de conta tem deadline e não bloqueia indefinidamente o início de texto.
+- **Voz:** Codex voice usa o helper standalone instalado e o lifecycle host-owned; substitui a integração antiga de Live Voice OMP, aposentada em 2026-10-08. A autorização de tools do seu orquestrador usa o grant raiz do fork, não injeção global por `RunRequest.mcp`. Consulta opcional de conta tem deadline e não bloqueia indefinidamente o início de texto.
 - **Contas e uso:** o painel Usage da Details, os medidores do fork (Grok gerenciado, Cursor, Kimi, Antigravity) e `usage_lines`.
 - **Visual:** Settings no layout do upstream #449, mas com as seções Projects e Accounts do fork; Changes dentro do Files, transcript compacto, sem anel de contexto e sem terminal de rodapé.
 - **Painel direito:** só conta como aberto se tiver aba viva.
@@ -112,14 +112,14 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Pi via RPC nativo | #630 | v0.2.102 | O grant MCP do fork (`comet-workers`/`comet-sessions`/`zeron`) vai por uma extensão-ponte por servidor (`pi/mcp.rs`) |
 | Move/Delete na árvore de arquivos | #514 | v0.2.102 | Ficou o modelo do upstream (revisão + `WorkspaceMutationOutcome`). Create continua do fork, usado pelo New File/New Folder do explorer. A árvore Files própria do Details e os RPCs `RenameWorkspaceEntry`/`CopyWorkspaceEntry` foram removidos em 2026-10-05 (`openspec/changes/remove-details-files-tab/`): só existe o explorer do upstream |
 | Updates de CLI via Homebrew e Antigravity | #661/#617 | v0.2.102 | Um mecanismo só, `UpdatePlan::PackageManager { program, args, env }`: brew primeiro, depois o npm prefix/Caskroom do fork. Antigravity entrou no monitor |
-| Ditado local no composer | #591 | v0.2.102 | Convive com o Live Voice: botões separados, atalho `mod-d` |
+| Ditado local no composer | #591 | v0.2.102 | Ditado separado, atalho `mod-d`; Live Voice OMP aposentado em 2026-10-08 |
 | Seletor compacto de modelo/effort | #471 | v0.2.102 | Opt-in, padrão desligado (o upstream liga por padrão) |
 | `core-tests` (um nextest) no lugar de `session-sync-regressions` | CI | v0.2.102 | Mantido o gate por path do fork, agora incluindo `crates/preview/` e `scripts/ci/` |
 | Renomear chat inline em vez de diálogo | c78bb1c1 | v0.2.102 | Na sidebar como no upstream. Side chat do fork só existe como aba: o rename inline acontece na aba (duplo clique ou menu); com a aba fechada, a sidebar pede para abri-la |
 | Painel de checklist do agente (`TodoStatus`, `inProgress`) | #707 | v0.2.102 | O OMP também mapeia `in_progress` das fases para `InProgress` |
 | Anexos BMP → PNG em background | #739 | v0.2.102 | A classificação de drop do fork (imagem, menção de projeto, arquivo externo) continua síncrona; só o staging lento vai para o background |
 | Inline code com nome de arquivo real vira link | #606/#633 | v0.2.102 | Substitui o chip do fork só nesses spans; os demais seguem chip |
-| Codex voice local/remoto, stage, iOS Live Activities, helper 0.161 | #819/#834 | v0.2.106 | Cinco crates novas e helper standalone do usuário; sem runtime Codex/GStreamer no app. Convive com OMP Live, preserva grants do fork e limita o warmup opcional de conta |
+| Codex voice local/remoto, stage, iOS Live Activities, helper 0.161 | #819/#834 | v0.2.106 | Cinco crates novas e helper standalone do usuário; sem runtime Codex/GStreamer no app. OMP Live foi aposentado em 2026-10-08; preserva grants do fork e limita o warmup opcional de conta |
 | Identidade Git, filtros multi-device, ícones e rolling labels | #799/#811 | v0.2.106 | Grupos não substituem Checkout/device nem identidade de Workers; zui recebe a API de glifo transformado mantendo os patches locais |
 | Chips de anexos e pin font | #775/#816 | v0.2.106 | Referências no caret e undo com classificação de menções, long paste e Appshots do fork |
 | Recovery de Chat iOS e snapshots Claude | #826/#835 | v0.2.106 | Recovery real sem fixture; snapshots conhecidos usam linha curada, desconhecidos permanecem |

@@ -9,7 +9,6 @@ pub mod attachment_mentions;
 pub mod entities;
 pub mod file_mentions;
 pub mod invocation;
-pub mod live_voice;
 pub mod motion;
 pub mod preview;
 pub mod sidebar_pins;
@@ -19,7 +18,6 @@ pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
-pub use live_voice::*;
 pub use preview::*;
 pub use sidebar_pins::*;
 pub use workspace::*;

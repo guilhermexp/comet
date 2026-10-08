@@ -443,7 +443,6 @@ mod tests {
 
     #[test]
     fn test_rpc_methods_local_only() {
-        assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
         assert!(methods::is_local_only(methods::LOCAL_DEVICE));
         assert!(methods::is_local_only(methods::STOP_ENGINE));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));

@@ -14,11 +14,10 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const DISABLE_ENV: &str = "ZERON_DISABLE_SOUND";
-static LIVE_VOICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -44,9 +43,6 @@ pub enum Sound {
 /// Play a chime on a background thread. Silently a no-op when disabled or no
 /// player is available.
 pub fn play(sound: Sound) {
-    if !should_play(sound) {
-        return;
-    }
     let data = match sound {
         Sound::Done => SOUND_DONE,
         Sound::Request => SOUND_REQUEST,
@@ -66,10 +62,9 @@ pub fn play_voice(start: bool) {
 }
 
 /// Confirm captured pixels with a soft shutter and clear chime.
-/// The caller honors the dedicated capture sound setting; Live Voice
-/// suppresses it like every notification cue.
+/// The caller honors the dedicated capture sound setting.
 pub fn play_appshot() {
-    if !should_play(Sound::Done) || std::env::var_os(DISABLE_ENV).is_some() {
+    if std::env::var_os(DISABLE_ENV).is_some() {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -193,14 +188,6 @@ fn play_in_background(data: &'static [u8]) {
             tracing::debug!(error = %err, "sound playback failed");
         }
     });
-}
-
-pub fn set_live_voice_active(active: bool) {
-    LIVE_VOICE_ACTIVE.store(active, Ordering::Relaxed);
-}
-
-fn should_play(_sound: Sound) -> bool {
-    !LIVE_VOICE_ACTIVE.load(Ordering::Relaxed)
 }
 
 fn play_bytes(data: &[u8]) -> Result<(), String> {
@@ -464,19 +451,6 @@ mod tests {
             last_completed_turn: turn.map(str::to_owned),
             fresh: true,
         }
-    }
-
-    #[test]
-    fn live_voice_suppresses_every_notification_sound_until_stopped() {
-        set_live_voice_active(true);
-        assert!(!should_play(Sound::Done));
-        assert!(!should_play(Sound::Request));
-        assert!(!should_play(Sound::Attention));
-
-        set_live_voice_active(false);
-        assert!(should_play(Sound::Done));
-        assert!(should_play(Sound::Request));
-        assert!(should_play(Sound::Attention));
     }
 
     #[test]

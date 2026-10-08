@@ -26,25 +26,16 @@ use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use zeron_doc::{
-    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter,
-    SessionCommandPayload, SessionDoc, SessionMessageEntry, fold_event_into_parts,
-    merge_workflow_task, sanitize_tool_call,
+    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
+    SessionMessageEntry, fold_event_into_parts, merge_workflow_task, sanitize_tool_call,
 };
-use zeron_harness::{
-    CancellationToken, Harness, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent,
-    LiveVoiceHandle, LiveVoiceRequest, RunControls, SteerMessage,
-};
+use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
-    LiveVoiceUnavailableReason, RunRequest, Session, SessionStatus, UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion, WorkflowTaskStatus, WorkflowTaskUpdate,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
-use crate::live_voice::{
-    BackendSpeechAccumulator, BackendSpeechUpdate, LiveOperationalContext, LiveVoiceCoordinator,
-    latest_visible_assistant_text,
-};
 use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
@@ -263,7 +254,6 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
-    live_voice: LiveVoiceCoordinator,
     restart_gate: Mutex<Option<zeron_update::RestartGate>>,
     /// Bound local IPC endpoint (`ws://127.0.0.1:<port>`). Empty when this
     /// process lost the bind, so `comet-sessions` is not pointed at another engine.
@@ -311,30 +301,6 @@ pub(crate) fn stamp_sessions(
     };
 }
 
-fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String {
-    match reason {
-        LiveVoiceUnavailableReason::RemoteChat => {
-            "Live Voice is available only on the Chat's host device".into()
-        }
-        LiveVoiceUnavailableReason::NonOmp => "Live Voice requires an OMP Chat".into(),
-        LiveVoiceUnavailableReason::Archived => {
-            "Live Voice is unavailable for archived Chats".into()
-        }
-        // Both OMP gaps are a capability absent from the ready frame, so neither
-        // message may promise that updating anything fixes it: the published
-        // `omp` can be strictly newer than a build that has Live Voice.
-        LiveVoiceUnavailableReason::ActiveRun => {
-            "The OMP here cannot join Live Voice during active work".into()
-        }
-        LiveVoiceUnavailableReason::UnsupportedOmp => {
-            "The OMP here has no Live Voice capability".into()
-        }
-        LiveVoiceUnavailableReason::AnotherLiveCall => {
-            "Another Live Voice call is already active on this device".into()
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct SessionsEngine {
     inner: Arc<Inner>,
@@ -363,7 +329,6 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
-                live_voice: LiveVoiceCoordinator::new(),
                 restart_gate: Mutex::new(None),
                 local_ipc: Mutex::new(None),
                 #[cfg(test)]
@@ -552,429 +517,6 @@ impl SessionsEngine {
 
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
         lock(&self.inner.statuses).get(chat_id).cloned()
-    }
-
-    pub fn watch_live_voice(&self) -> watch::Receiver<LiveVoiceState> {
-        self.inner.live_voice.watch()
-    }
-
-    pub async fn probe_live_voice(
-        &self,
-        chat_id: &str,
-    ) -> Result<LiveVoiceAvailability, EngineError> {
-        let (reason, cwd) = self.live_voice_precondition(chat_id)?;
-        if let Some(reason) = reason {
-            return Ok(LiveVoiceAvailability {
-                available: false,
-                reason: Some(reason),
-            });
-        }
-        let active = self.is_active_session(chat_id);
-        let harness = self.inner.registry.resolve(HarnessId::Omp)?;
-        let support = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
-        let gap = support.gap(active);
-        Ok(LiveVoiceAvailability {
-            available: gap.is_none(),
-            reason: gap,
-        })
-    }
-
-    /// Probe the installed OMP without a Chat. Draft Live uses this so the
-    /// composer never synthesizes availability — the ready frame is the gate.
-    pub async fn probe_live_voice_at_cwd(
-        &self,
-        cwd: &str,
-    ) -> Result<LiveVoiceAvailability, EngineError> {
-        let cwd = crate::repos::expand_home(cwd.trim())
-            .map_err(|error| EngineError::Other(error.into()))?;
-        if cwd.is_empty() {
-            return Err(EngineError::Other(
-                "Live Voice requires a working directory".into(),
-            ));
-        }
-        if self.inner.live_voice.is_active() {
-            return Ok(LiveVoiceAvailability {
-                available: false,
-                reason: Some(LiveVoiceUnavailableReason::AnotherLiveCall),
-            });
-        }
-        let harness = self.inner.registry.resolve(HarnessId::Omp)?;
-        let support = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
-        let gap = support.gap(false);
-        Ok(LiveVoiceAvailability {
-            available: gap.is_none(),
-            reason: gap,
-        })
-    }
-
-    pub async fn start_live_voice(&self, chat_id: &str) -> Result<(), EngineError> {
-        let (reason, cwd) = self.live_voice_precondition(chat_id)?;
-        if let Some(reason) = reason {
-            return Err(EngineError::Other(live_voice_unavailable_message(reason)));
-        }
-        let call_id = self.inner.live_voice.reserve(chat_id)?;
-        let harness = match self.inner.registry.resolve(HarnessId::Omp) {
-            Ok(harness) => harness,
-            Err(error) => {
-                self.inner.live_voice.fail(&call_id, &error.to_string());
-                return Err(error.into());
-            }
-        };
-        let supported = match harness.probe_live_voice(std::path::Path::new(&cwd)).await {
-            Ok(supported) => supported,
-            Err(error) => {
-                self.inner.live_voice.fail(&call_id, &error.to_string());
-                return Err(error.into());
-            }
-        };
-        if let Some(gap) = supported.gap(self.is_active_session(chat_id)) {
-            let message = live_voice_unavailable_message(gap);
-            self.inner.live_voice.fail(&call_id, &message);
-            return Err(EngineError::Other(message));
-        }
-        if !self.inner.live_voice.matches(&call_id) {
-            return Err(EngineError::Other("Live Voice start was cancelled".into()));
-        }
-        let operational_context = if supported.session_context {
-            match self.live_operational_context(chat_id) {
-                Ok(context) => Some(context),
-                Err(error) => {
-                    self.inner.live_voice.fail(&call_id, &error.to_string());
-                    return Err(error);
-                }
-            }
-        } else {
-            None
-        };
-        let resume = self.inner.resume_for(chat_id, &cwd);
-        let handle = match harness
-            .start_live_voice(LiveVoiceRequest {
-                cwd: cwd.clone(),
-                resume,
-            })
-            .await
-        {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.inner.live_voice.fail(&call_id, &error.to_string());
-                return Err(error.into());
-            }
-        };
-        self.inner
-            .remember_harness_session(chat_id, &handle.session_id, &cwd);
-        if let Err(handle) = self.attach_live_handle(&call_id, handle, operational_context) {
-            let _ = handle.controls.send(LiveVoiceControl::Stop).await;
-            return Err(EngineError::Other("Live Voice start was cancelled".into()));
-        }
-        Ok(())
-    }
-
-    pub async fn set_live_voice_muted(&self, muted: bool) -> Result<(), EngineError> {
-        self.inner.live_voice.set_muted(muted).await
-    }
-
-    pub async fn stop_live_voice(&self) -> Result<(), EngineError> {
-        self.inner.live_voice.stop().await
-    }
-
-    pub(crate) async fn prepare_for_command(&self, chat_id: &str, command_id: &str) {
-        if !self.inner.live_voice.is_active()
-            || self.inner.live_voice.owns_command(chat_id, command_id)
-        {
-            return;
-        }
-        if let Err(error) = self.stop_live_voice().await {
-            tracing::warn!(
-                chat = %chat_id,
-                command = %command_id,
-                error = %error,
-                "Live Voice stop failed after releasing the call; continuing command"
-            );
-        }
-    }
-
-    pub(crate) fn complete_live_command(&self, chat_id: &str, command_id: &str) {
-        self.inner.live_voice.complete_command(chat_id, command_id);
-    }
-
-    fn attach_live_handle(
-        &self,
-        call_id: &str,
-        mut handle: LiveVoiceHandle,
-        operational_context: Option<(LiveOperationalContext, broadcast::Receiver<JournaledEvent>)>,
-    ) -> Result<(), LiveVoiceHandle> {
-        if !self
-            .inner
-            .live_voice
-            .attach_controls(call_id, handle.controls.clone())
-        {
-            return Err(handle);
-        }
-        let Some(cancellation) = self.inner.live_voice.cancellation(call_id) else {
-            return Err(handle);
-        };
-        if let Some((context, receiver)) = operational_context {
-            self.spawn_live_context_observer(
-                call_id.to_owned(),
-                cancellation.clone(),
-                context,
-                receiver,
-            );
-        }
-        let sessions = self.clone();
-        let task_call_id = call_id.to_owned();
-        let coordinator = self.inner.live_voice.clone();
-        let task_coordinator = coordinator.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    event = handle.events.next() => match event {
-                        Some(Ok(LiveVoiceEvent::Delegation {
-                            delegation_id,
-                            request,
-                        })) => {
-                            if let Err(error) = sessions
-                                .handle_live_delegation(&task_call_id, &delegation_id, request)
-                                .await
-                            {
-                                task_coordinator.fail(&task_call_id, &error.to_string());
-                                return;
-                            }
-                        }
-                        Some(Ok(event)) => {
-                            let terminal = matches!(event, LiveVoiceEvent::Ended { .. });
-                            task_coordinator.handle_event(&task_call_id, event);
-                            if terminal {
-                                return;
-                            }
-                        }
-                        Some(Err(error)) => {
-                            task_coordinator.fail(&task_call_id, &error.to_string());
-                            return;
-                        }
-                        None => {
-                            task_coordinator.fail(
-                                &task_call_id,
-                                "Live Voice event stream closed unexpectedly",
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        coordinator.attach_task(call_id, task);
-        Ok(())
-    }
-
-    fn is_active_session(&self, chat_id: &str) -> bool {
-        lock(&self.inner.statuses)
-            .get(chat_id)
-            .is_some_and(|session| {
-                matches!(
-                    session.status,
-                    SessionStatus::Working | SessionStatus::AwaitingInput
-                )
-            })
-    }
-
-    fn live_operational_context(
-        &self,
-        chat_id: &str,
-    ) -> Result<(LiveOperationalContext, broadcast::Receiver<JournaledEvent>), EngineError> {
-        let (_, receiver) = self.subscribe(chat_id, u64::MAX)?;
-        let entries = self.doc_handle(chat_id)?.doc().read_entries()?;
-        let visible_text = latest_visible_assistant_text(&entries);
-        let status = self
-            .session_status(chat_id)
-            .map_or(SessionStatus::Idle, |session| session.status);
-        Ok((LiveOperationalContext::new(status, &visible_text), receiver))
-    }
-
-    fn spawn_live_context_observer(
-        &self,
-        call_id: String,
-        cancellation: CancellationToken,
-        mut context: LiveOperationalContext,
-        mut events: broadcast::Receiver<JournaledEvent>,
-    ) {
-        let (context_tx, mut context_rx) = watch::channel(context.render());
-        let producer_cancellation = cancellation.clone();
-        tokio::spawn(async move {
-            loop {
-                let flush_due = async {
-                    match context.next_flush_at() {
-                        Some(at) => tokio::time::sleep_until(at.into()).await,
-                        None => std::future::pending().await,
-                    }
-                };
-                let event = tokio::select! {
-                    _ = producer_cancellation.cancelled() => return,
-                    _ = flush_due => {
-                        if context.flush_at(std::time::Instant::now()) {
-                            context_tx.send_replace(context.render());
-                        }
-                        continue;
-                    }
-                    event = events.recv() => match event {
-                        Ok(event) => event.event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                };
-                if context.observe(&event) {
-                    context_tx.send_replace(context.render());
-                }
-            }
-        });
-
-        let coordinator = self.inner.live_voice.clone();
-        tokio::spawn(async move {
-            loop {
-                let text = context_rx.borrow_and_update().clone();
-                let sent = tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    sent = coordinator.append_session_context(&call_id, text) => sent,
-                };
-                if !sent {
-                    return;
-                }
-                tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    changed = context_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    async fn handle_live_delegation(
-        &self,
-        call_id: &str,
-        delegation_id: &str,
-        request: String,
-    ) -> Result<(), EngineError> {
-        let ownership = self
-            .inner
-            .live_voice
-            .claim_delegation(call_id, delegation_id)?;
-        if !ownership.newly_created {
-            return Ok(());
-        }
-        let chat_id = self
-            .inner
-            .live_voice
-            .active_chat_id()
-            .ok_or_else(|| EngineError::Other("Live Voice call is no longer active".into()))?;
-        if request.trim().is_empty() {
-            return Err(EngineError::Other(
-                "Live Voice delegation request is empty".into(),
-            ));
-        }
-        let (_, receiver) = self.subscribe(&chat_id, u64::MAX)?;
-        let host = self
-            .inner
-            .doc_host()
-            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
-        host.queue_command_with_id(
-            &chat_id,
-            ownership.command_id.clone(),
-            SessionCommandPayload::Steer {
-                prompt: request,
-                message_id: Some(ownership.message_id),
-            },
-        )?;
-        self.spawn_live_backend_observer(
-            call_id.to_owned(),
-            delegation_id.to_owned(),
-            ownership.cancellation,
-            receiver,
-        );
-        Ok(())
-    }
-
-    fn spawn_live_backend_observer(
-        &self,
-        call_id: String,
-        delegation_id: String,
-        cancellation: CancellationToken,
-        mut receiver: broadcast::Receiver<JournaledEvent>,
-    ) {
-        let coordinator = self.inner.live_voice.clone();
-        tokio::spawn(async move {
-            let mut speech = BackendSpeechAccumulator::default();
-            loop {
-                let event = tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    event = receiver.recv() => match event {
-                        Ok(event) => event.event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                };
-                match speech.observe(&event) {
-                    BackendSpeechUpdate::None => {}
-                    BackendSpeechUpdate::Progress(text) => {
-                        let _ = coordinator
-                            .append_delegation_context(
-                                &call_id,
-                                &delegation_id,
-                                LiveVoiceContextKind::Progress,
-                                text,
-                            )
-                            .await;
-                    }
-                    BackendSpeechUpdate::Final(text) => {
-                        if coordinator
-                            .append_delegation_context(
-                                &call_id,
-                                &delegation_id,
-                                LiveVoiceContextKind::Final,
-                                text,
-                            )
-                            .await
-                        {
-                            coordinator.complete_delegation(&call_id, &delegation_id);
-                        }
-                        return;
-                    }
-                }
-            }
-        });
-    }
-
-    fn live_voice_precondition(
-        &self,
-        chat_id: &str,
-    ) -> Result<(Option<LiveVoiceUnavailableReason>, String), EngineError> {
-        let workspace = self
-            .inner
-            .workspace()
-            .ok_or_else(|| EngineError::Other("workspace is unavailable".into()))?;
-        let chat = workspace
-            .chat(chat_id)?
-            .ok_or_else(|| EngineError::Other(format!("no such chat: {chat_id}")))?;
-        let cwd = chat
-            .cwd
-            .clone()
-            .filter(|cwd| !cwd.trim().is_empty())
-            .ok_or_else(|| EngineError::Other("Chat has no working directory".into()))?;
-        let reason = if chat.device_id != self.inner.device_id {
-            Some(LiveVoiceUnavailableReason::RemoteChat)
-        } else if chat.config.as_ref().map(|config| config.harness) != Some(HarnessId::Omp) {
-            Some(LiveVoiceUnavailableReason::NonOmp)
-        } else if chat.archived {
-            Some(LiveVoiceUnavailableReason::Archived)
-        } else if self.inner.live_voice.is_active() {
-            Some(LiveVoiceUnavailableReason::AnotherLiveCall)
-        } else {
-            None
-        };
-        Ok((reason, cwd))
     }
 
     /// Whether this harness takes a prompt *during* a turn, rather than only at
@@ -2005,9 +1547,8 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
-        if let Err(err) = self.stop_live_voice().await {
-            tracing::warn!(error = %err, "Live Voice shutdown failed");
-        }
+        // Retire the Codex realtime runtimes while keeping shutdown independent
+        // of the per-chat run settlement budget below.
         self.inner.voice.retire();
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         let results = futures::future::join_all(chats.into_iter().map(|chat_id| async move {

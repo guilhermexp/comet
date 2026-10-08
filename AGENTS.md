@@ -58,8 +58,7 @@ Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml`
 - `dist/` guarda **assets-fonte** de packaging (ícone, `.desktop`, `Info.plist`), consumidos por `scripts/package-*.sh` e pelo workflow de release. Só `edge/dist/` é gerado/ignorado — não apagar a `dist/` da raiz.
 - Build do gpui é caro; `[profile.dev]` já usa `opt-level = 2` pras deps. Primeira build leva minutos.
 - Re-vendorizar `third_party/zui` exige verificar ambas as regras de `comet/line-wrap-closing-punctuation` (`line_wrapper` e `line_layout`); não editar o conteúdo do vendor no lugar.
-- **Codex voice usa o helper standalone instalado**, com media local/remote na engine host e clientes desktop/iOS; não substitui o Live OMP nem embute runtime Codex/GStreamer no pacote.
-- **Live Voice pertence à engine host, não à surface selecionada.** Trocar/limpar o Chat, perder foco ou minimizar não encerra a call. Em `Working`/`AwaitingInput`, start exige que o OMP anuncie contexto operacional silencioso; a engine projeta só status/texto visível/label de tool/espera/erro e coalesce o último snapshot. Delegação vocal confirmada entra como comando durável `Steer`, com fallback único para novo turno se o run assentar; comando durável alheio, End/Escape no Chat ativo, falha de transporte, shutdown ou quit encerram. Run OMP estacionado em `Idle` continua quente e requer só Live básico.
+- **Codex voice usa o helper standalone instalado**, com media local/remote na engine host e clientes desktop/iOS; não embute runtime Codex/GStreamer no pacote. A integração antiga de Live Voice OMP foi removida; não restaurar seu microfone, probes ou RPCs no composer.
 - Este é um repo de terceiro sob MIT. Preservar licença e atribuição.
 
 ## Onde mudar o quê

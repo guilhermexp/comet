@@ -64,7 +64,7 @@ not built yet).
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
 | Pi (RPC) | done | Native `PiHarness` (Pi ≥0.85.1), step-boundary steering, native/legacy session resume, per-model thinking levels including off, extension dialogs and Zeron MCP delegation. See [Pi integration](pi.md). |
 | OpenCode adapter | done | `crates/harness/src/opencode/`, HTTP/SSE server protocol, model discovery, turn-boundary steering. |
-| OMP adapter & Live Voice | done | `crates/harness/src/omp/`, native driver over `omp --mode rpc-ui`, live voice audio/context streaming, subagent mapping. |
+| OMP adapter | done | `crates/harness/src/omp/`, native driver over `omp --mode rpc-ui`, text runs, durable steering and subagent mapping. Legacy OMP Live Voice retired on 2026-10-08; Codex Voice remains. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema

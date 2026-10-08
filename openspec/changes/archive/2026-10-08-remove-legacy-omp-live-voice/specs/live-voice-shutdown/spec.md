@@ -1,9 +1,16 @@
-# live-voice-shutdown Specification
+# Spec Delta
 
-## Purpose
-Ensure independent execution shutdown waits run concurrently while preserving each Chat settlement budget and durable state handling.
+## REMOVED Requirements
 
-## Requirements
+### Requirement: Voice stop has one bounded cleanup budget
+**Reason**: OMP Live Voice is retired at the user's request.
+**Migration**: Use Codex Voice from the sidebar with the standalone Codex helper.
+
+### Requirement: Cancelling stop retains task ownership
+**Reason**: OMP Live Voice is retired at the user's request.
+**Migration**: Use Codex Voice from the sidebar with the standalone Codex helper.
+
+## MODIFIED Requirements
 
 ### Requirement: Independent execution shutdown waits run concurrently
 

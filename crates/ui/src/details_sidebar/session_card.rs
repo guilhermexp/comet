@@ -3,7 +3,9 @@
 //! bordered card with divided sections.
 
 use super::*;
-use crate::details_sidebar::widgets::{card_divider, card_header, card_row, details_card};
+use crate::details_sidebar::widgets::{
+    ActionTooltip, card_divider, card_header, card_row, details_card,
+};
 
 /// Working-tree totals for the context's checkout (`WatchCheckoutDiffs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -255,6 +257,57 @@ impl DetailsSidebar {
             Some(folder.into_any_element()),
             theme,
         ));
+        let device_name: SharedString = {
+            let state = self.app_state.read(cx);
+            context
+                .target_device_id
+                .as_deref()
+                .or(state.local_device_id.as_deref())
+                .and_then(|device_id| state.device_name(device_id))
+                .unwrap_or("Unknown device")
+                .to_owned()
+                .into()
+        };
+        let device_tooltip = device_name.clone();
+        card = card.child(
+            div()
+                .h(px(28.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    icons::icon(icons::MONITOR)
+                        .size(px(15.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(12.5))
+                        .text_color(theme.text)
+                        .child("Device"),
+                )
+                .child(
+                    div()
+                        .id("session-device-name")
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.5))
+                        .text_color(theme.text_muted)
+                        .text_right()
+                        .aria_label(device_name.clone())
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| ActionTooltip {
+                                label: device_tooltip.clone(),
+                            })
+                            .into()
+                        })
+                        .child(device_name),
+                ),
+        );
         if has_git {
             let ahead_behind: Option<SharedString> =
                 self.checkout_status.as_ref().and_then(|status| {

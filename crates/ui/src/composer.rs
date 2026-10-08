@@ -27,17 +27,16 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, LiveVoiceAvailability, LiveVoiceUnavailableReason, RunRequest,
-    SandboxLevel, SlashCommand, UserInputAnswer, UserInputQuestion, capabilities,
+    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
+    UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
 use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::composer_markdown::{self, in_code};
-use crate::live_voice::{self, LiveVoiceTooltip, LiveVoiceViewModel};
 use crate::motion;
-use crate::pickers::{CheckoutPlan, Pickers};
+use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
@@ -223,70 +222,6 @@ pub fn escape_stops_run(armed: Option<Instant>, now: Instant) -> bool {
 /// contract cannot accidentally regress into forcing every new chat open.
 pub fn composer_layout_expanded(expanded_mode: bool, _new_chat: bool) -> bool {
     expanded_mode
-}
-
-const LIVE_VOICE_STACK_WIDTH: f32 = 440.0;
-
-fn live_voice_strip_stacked(available_width: f32) -> bool {
-    available_width < LIVE_VOICE_STACK_WIDTH
-}
-
-fn draft_live_voice_available(
-    engine_connected: bool,
-    target_device_id: Option<&str>,
-    local_device_id: Option<&str>,
-    harness: Option<HarnessId>,
-) -> bool {
-    let local_target = target_device_id.is_none_or(|target| local_device_id == Some(target));
-    engine_connected && local_target && harness == Some(HarnessId::Omp)
-}
-
-fn draft_live_voice_probe_cwd(plan: &NewChatLiveCheckout) -> &str {
-    match plan {
-        NewChatLiveCheckout::Ready { cwd, .. } => cwd,
-        NewChatLiveCheckout::CreateWorktree { repo_path, .. } => repo_path,
-    }
-}
-
-fn draft_live_voice_ready(availability: Option<&LiveVoiceAvailability>) -> bool {
-    availability.is_some_and(|availability| availability.available)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DraftLiveVoiceProbeKey {
-    cwd: String,
-    target_device_id: Option<String>,
-    local_device_id: Option<String>,
-    harness: Option<HarnessId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NewChatLiveCheckout {
-    Ready { cwd: String, branch: Option<String> },
-    CreateWorktree { repo_path: String, base: String },
-}
-
-fn new_chat_live_checkout(plan: &CheckoutPlan, space_path: Option<&str>) -> NewChatLiveCheckout {
-    match plan {
-        CheckoutPlan::CurrentCheckout { branch } => NewChatLiveCheckout::Ready {
-            cwd: space_path.unwrap_or("~").to_owned(),
-            branch: branch.clone(),
-        },
-        CheckoutPlan::ReuseWorktree { path, branch } => NewChatLiveCheckout::Ready {
-            cwd: path.clone(),
-            branch: Some(branch.clone()),
-        },
-        CheckoutPlan::NewWorktree { base } => match space_path {
-            Some(repo_path) => NewChatLiveCheckout::CreateWorktree {
-                repo_path: repo_path.to_owned(),
-                base: base.clone().unwrap_or_else(|| "HEAD".to_owned()),
-            },
-            None => NewChatLiveCheckout::Ready {
-                cwd: "~".to_owned(),
-                branch: base.clone(),
-            },
-        },
-    }
 }
 
 fn create_chat_mutation(
@@ -7071,10 +7006,6 @@ pub struct Composer {
     /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
     /// a send grinds" shape).
     action_task: Option<Task<()>>,
-    live_start_task: Option<Task<()>>,
-    draft_live_availability: Option<LiveVoiceAvailability>,
-    draft_live_probe_key: Option<DraftLiveVoiceProbeKey>,
-    draft_live_probe_task: Option<Task<()>>,
     /// Chats whose durable Interrupt command has been accepted or is still
     /// being queued. Kept independently so stopping one chat cannot replace
     /// another chat's request when the user navigates quickly.
@@ -7350,10 +7281,6 @@ impl Composer {
             action_task: None,
             advance_task: None,
             send_task: None,
-            live_start_task: None,
-            draft_live_availability: None,
-            draft_live_probe_key: None,
-            draft_live_probe_task: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
@@ -10075,7 +10002,7 @@ impl Composer {
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
-            // Busy: steer the live run (OMP and Live Voice depend on it).
+            // Busy: steer the live run.
             SendButtonMode::Steer => self.send(text, true, cx),
         }
     }
@@ -11554,7 +11481,7 @@ impl Composer {
 
     /// Microphone at rest; the one Stop control while dictating. `t` morphs
     /// the mic glyph out and the accent glass plate, stop square or spinner
-    /// in; the glow follows the live voice level.
+    /// in; the glow follows the live audio level.
     fn render_dictation_button(
         &self,
         t: f32,
@@ -12071,601 +11998,6 @@ impl Composer {
             )
             .into_any_element()
     }
-
-    fn start_live_voice(&mut self, cx: &mut Context<Self>) {
-        if self.state.read(cx).selected_chat.is_some() {
-            self.state
-                .update(cx, |state, cx| state.start_live_voice(cx));
-            return;
-        }
-        if self.live_start_task.is_some() {
-            return;
-        }
-
-        let (engine, space, target_device_id, local_device_id) = {
-            let state = self.state.read(cx);
-            (
-                state.engine().cloned(),
-                state.selected_space_row().cloned(),
-                state.effective_device_id(),
-                state.local_device_id.clone(),
-            )
-        };
-        let resolved = self.pickers.read(cx).resolved(cx);
-        if !draft_live_voice_available(
-            engine.is_some(),
-            target_device_id.as_deref(),
-            local_device_id.as_deref(),
-            resolved.harness,
-        ) || !draft_live_voice_ready(self.draft_live_availability.as_ref())
-        {
-            return;
-        }
-        let Some(engine) = engine else {
-            return;
-        };
-        let plan = new_chat_live_checkout(
-            &self.pickers.read(cx).checkout_plan(),
-            space.as_ref().map(|space| space.path.as_str()),
-        );
-        let probe_cwd = draft_live_voice_probe_cwd(&plan).to_owned();
-        let chat_config = resolved
-            .chat_config()
-            .expect("an OMP draft always resolves a Chat config");
-        let chat_id = uuid::Uuid::new_v4().to_string();
-        let device_id = target_device_id
-            .or(local_device_id)
-            .unwrap_or_else(|| "local".to_owned());
-        let space_id = space.map(|space| space.id);
-        self.failure = None;
-        self.failure_key = None;
-
-        self.live_start_task = Some(cx.spawn(async move |this, cx| {
-            let mut created_worktree: Option<(String, String)> = None;
-            let mut live_started = false;
-            let mut chat_created = false;
-            let mut probed_availability: Option<LiveVoiceAvailability> = None;
-            let mut copy_warning: Option<String> = None;
-            let result: Result<(), String> = async {
-                let availability = match engine
-                    .client()
-                    .call_as::<LiveVoiceAvailability>(
-                        methods::PROBE_LIVE_VOICE,
-                        serde_json::json!({ "cwd": probe_cwd }),
-                    )
-                    .await
-                {
-                    Ok(availability) => availability,
-                    Err(RpcError::UnknownMethod(_)) => LiveVoiceAvailability {
-                        available: false,
-                        reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
-                    },
-                    Err(error) => return Err(error.to_string()),
-                };
-                probed_availability = Some(availability);
-                if !availability.available {
-                    return Err(availability
-                        .reason
-                        .map(live_voice::unavailable_message)
-                        .unwrap_or("Live Voice is unavailable")
-                        .to_owned());
-                }
-                let (cwd, branch) = match plan {
-                    NewChatLiveCheckout::Ready { cwd, branch } => (cwd, branch),
-                    NewChatLiveCheckout::CreateWorktree { repo_path, base } => {
-                        let value = attachments::call_with_timeout(
-                            &engine,
-                            cx.background_executor(),
-                            methods::CREATE_WORKTREE,
-                            serde_json::json!({
-                                "repoPath": repo_path,
-                                "branch": base,
-                            }),
-                            Duration::from_secs(1800),
-                        )
-                        .await?;
-                        if let (Some(repo_path), Some(path)) = (
-                            value.get("repoPath").and_then(serde_json::Value::as_str),
-                            value.get("path").and_then(serde_json::Value::as_str),
-                        ) {
-                            created_worktree = Some((repo_path.to_owned(), path.to_owned()));
-                        }
-                        if let Some(setup_error) = value.get("setupError").and_then(|v| v.as_str()) {
-                            return Err(format!("Worktree setup failed: {setup_error}"));
-                        }
-                        copy_warning = value
-                            .get("copyWarning")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned);
-                        let worktree: zeron_proto::Worktree = serde_json::from_value(value)
-                            .map_err(|error| {
-                                format!("CreateWorktree returned invalid data: {error}")
-                            })?;
-                        (worktree.path, Some(worktree.branch))
-                    }
-                };
-                let mutation = create_chat_mutation(
-                    &chat_id,
-                    space_id.as_deref(),
-                    &device_id,
-                    Some(&cwd),
-                    branch.as_deref(),
-                    Some(&chat_config),
-                );
-                attachments::call_with_timeout(
-                    &engine,
-                    cx.background_executor(),
-                    methods::MUTATE,
-                    mutation,
-                    Duration::from_secs(30),
-                )
-                .await?;
-                chat_created = true;
-                engine
-                    .client()
-                    .call(
-                        methods::START_LIVE_VOICE,
-                        serde_json::json!({ "chatId": chat_id }),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                live_started = true;
-                let selected = this
-                    .update(cx, |composer, cx| {
-                        composer.state.update(cx, |state, cx| {
-                            if state.selected_chat.is_some() {
-                                return false;
-                            }
-                            state.select_chat(Some(chat_id.clone()), cx);
-                            true
-                        })
-                    })
-                    .map_err(|_| "Composer closed before Live Voice started".to_owned())?;
-                if !selected {
-                    return Err(
-                        "another Chat was selected while Live Voice was starting".to_owned()
-                    );
-                }
-                Ok(())
-            }
-            .await;
-
-            let mut retained_checkout = None;
-            if result.is_err() {
-                if live_started {
-                    let _ = attachments::call_with_timeout(
-                        &engine,
-                        cx.background_executor(),
-                        methods::STOP_LIVE_VOICE,
-                        serde_json::Value::Null,
-                        Duration::from_secs(5),
-                    )
-                    .await;
-                }
-                if chat_created {
-                    let _ = attachments::call_with_timeout(
-                        &engine,
-                        cx.background_executor(),
-                        methods::MUTATE,
-                        serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
-                        Duration::from_secs(5),
-                    )
-                    .await;
-                }
-                if let Some((repo_path, worktree_path)) = created_worktree {
-                    if let Err(cleanup_error) = attachments::call_with_timeout(
-                        &engine,
-                        cx.background_executor(),
-                        methods::DELETE_WORKTREE,
-                        serde_json::json!({
-                            "repoPath": repo_path,
-                            "worktreePath": worktree_path,
-                        }),
-                        Duration::from_secs(30),
-                    )
-                    .await
-                    {
-                        retained_checkout = Some(format!(
-                            "Checkout kept at {worktree_path}: {cleanup_error}. Remove it after preserving any local files."
-                        ));
-                    }
-                }
-            }
-
-            this.update(cx, |composer, cx| {
-                composer.live_start_task = None;
-                if let Some(availability) = probed_availability {
-                    composer.draft_live_availability = Some(availability);
-                }
-                match result {
-                    Ok(()) => {
-                        composer.failure = None;
-                        composer.failure_key = None;
-                        if let Some(warning) = copy_warning {
-                            cx.emit(ComposerEvent::WorktreeSetup {
-                                chat_id: chat_id.clone(),
-                                setup_action: None,
-                                setup_error: None,
-                                setup_warning: Some(warning),
-                                target_device_id: Some(device_id.clone()),
-                            });
-                        }
-                    }
-                    Err(error) => {
-                        let detail = retained_checkout
-                            .map(|warning| format!("{error}. {warning}"))
-                            .unwrap_or(error);
-                        composer.failure = Some(format!("Live Voice failed: {detail}").into());
-                        composer.failure_key = Some(String::new());
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn refresh_draft_live_voice_availability(&mut self, cx: &mut Context<Self>) {
-        let (is_draft, engine, target_device_id, local_device_id, space_path) = {
-            let state = self.state.read(cx);
-            (
-                state.selected_chat.is_none(),
-                state.engine().cloned(),
-                state.effective_device_id(),
-                state.local_device_id.clone(),
-                state.selected_space_row().map(|space| space.path.clone()),
-            )
-        };
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let eligible = draft_live_voice_available(
-            engine.is_some(),
-            target_device_id.as_deref(),
-            local_device_id.as_deref(),
-            harness,
-        );
-        let key = if is_draft && eligible {
-            let plan = new_chat_live_checkout(
-                &self.pickers.read(cx).checkout_plan(),
-                space_path.as_deref(),
-            );
-            Some(DraftLiveVoiceProbeKey {
-                cwd: draft_live_voice_probe_cwd(&plan).to_owned(),
-                target_device_id,
-                local_device_id,
-                harness,
-            })
-        } else {
-            None
-        };
-        if self.draft_live_probe_key == key {
-            return;
-        }
-        self.draft_live_probe_key = key.clone();
-        self.draft_live_availability = None;
-        self.draft_live_probe_task = None;
-        let (Some(key), Some(engine)) = (key, engine) else {
-            return;
-        };
-        self.draft_live_probe_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call_as::<LiveVoiceAvailability>(
-                    methods::PROBE_LIVE_VOICE,
-                    serde_json::json!({ "cwd": key.cwd }),
-                )
-                .await;
-            let availability = match result {
-                Ok(availability) => Some(availability),
-                Err(RpcError::UnknownMethod(_)) => Some(LiveVoiceAvailability {
-                    available: false,
-                    reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
-                }),
-                Err(error) => {
-                    tracing::debug!(%error, "draft Live Voice probe failed");
-                    None
-                }
-            };
-            let _ = this.update(cx, |composer, cx| {
-                if composer.draft_live_probe_key.as_ref() == Some(&key) {
-                    composer.draft_live_availability = availability;
-                    cx.notify();
-                }
-            });
-        }));
-    }
-
-    fn live_voice_model(&mut self, cx: &mut Context<Self>) -> LiveVoiceViewModel {
-        self.refresh_draft_live_voice_availability(cx);
-        let state = self.state.read(cx);
-        let is_draft = state.selected_chat.is_none();
-        let eligible = is_draft
-            && draft_live_voice_available(
-                state.engine().is_some(),
-                state.effective_device_id().as_deref(),
-                state.local_device_id.as_deref(),
-                self.pickers.read(cx).resolved(cx).harness,
-            );
-        let mut model = if is_draft {
-            LiveVoiceViewModel::derive_draft(
-                self.draft_live_availability.as_ref(),
-                &state.live_voice,
-                eligible,
-            )
-        } else {
-            LiveVoiceViewModel::derive(
-                state.selected_chat.as_deref(),
-                state.live_voice_availability.as_ref(),
-                &state.live_voice,
-            )
-        };
-        if is_draft && self.live_start_task.is_some() {
-            model.microphone_enabled = false;
-            model.microphone_tooltip = "Starting Live Voice…".to_owned();
-        }
-        model
-    }
-
-    fn render_live_voice_button(
-        &self,
-        model: &LiveVoiceViewModel,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if !model.show_microphone {
-            return None;
-        }
-        let enabled = model.microphone_enabled;
-        let tooltip = SharedString::from(model.microphone_tooltip.clone());
-        Some(
-            div()
-                .id("composer-live-voice")
-                .role(gpui::Role::Button)
-                .aria_label(tooltip.clone())
-                .size(px(32.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .when(!enabled, |element| element.opacity(0.38))
-                .when(enabled, |element| {
-                    element
-                        .tab_index(0)
-                        .focus_visible(|style| {
-                            style.border_1().border_color(theme.accent.opacity(0.75))
-                        })
-                        .cursor_pointer()
-                        .bg(motion::hover_blend(
-                            "composer-live-voice",
-                            gpui::transparent_black(),
-                            theme.accent_wash,
-                        ))
-                        .on_hover(motion::hover_listener("composer-live-voice"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.start_live_voice(cx);
-                        }))
-                })
-                .tooltip(move |_, cx| cx.new(|_| LiveVoiceTooltip::new(tooltip.clone())).into())
-                .tooltip_show_delay(Duration::from_millis(220))
-                .child(
-                    crate::icons::icon(crate::icons::MICROPHONE)
-                        .size(px(16.0))
-                        .text_color(if enabled {
-                            theme.text_muted
-                        } else {
-                            theme.text_faint
-                        }),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn render_live_voice_strip(
-        &self,
-        model: &LiveVoiceViewModel,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let stacked =
-            live_voice_strip_stacked(self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH));
-        let level = |id, name: &'static str, value: f32| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .child(
-                    div()
-                        .w(px(19.0))
-                        .text_size(px(8.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.text_faint)
-                        .child(name),
-                )
-                .child(
-                    div()
-                        .w(px(52.0))
-                        .h(px(3.0))
-                        .rounded_full()
-                        .overflow_hidden()
-                        .bg(theme.border)
-                        .child(
-                            div()
-                                .w(px(52.0 * value))
-                                .h_full()
-                                .rounded_full()
-                                .bg(theme.accent),
-                        ),
-                )
-        };
-        let muted = model.muted;
-        let mute_label = if muted { "Unmute" } else { "Mute" };
-        let caption_role = model.caption_role.map(|role| match role {
-            zeron_proto::LiveVoiceRole::User => "You",
-            zeron_proto::LiveVoiceRole::Assistant => "Assistant",
-        });
-        let status = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(div().size(px(8.0)).rounded_full().bg(if model.is_error {
-                theme.danger
-            } else {
-                theme.accent
-            }))
-            .child(
-                div()
-                    .w(px(86.0))
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child(SharedString::from(model.status.clone())),
-            );
-        let levels = div()
-            .w(px(84.0))
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(level("live-input-level", "IN", model.input_level))
-            .child(level("live-output-level", "OUT", model.output_level));
-        let caption = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .when_some(caption_role, |element, role| {
-                element.child(
-                    div()
-                        .text_size(px(9.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.text_faint)
-                        .child(role),
-                )
-            })
-            .child(
-                div()
-                    .truncate()
-                    .text_size(px(12.5))
-                    .line_height(px(16.0))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(
-                        model
-                            .caption
-                            .clone()
-                            .unwrap_or_else(|| "Voice transcript will appear here".into()),
-                    )),
-            );
-        let mute = div()
-            .id("live-voice-mute")
-            .role(gpui::Role::Button)
-            .aria_label(mute_label)
-            .aria_selected(muted)
-            .tab_index(0)
-            .h(px(32.0))
-            .px(px(10.0))
-            .rounded_full()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(6.0))
-            .text_size(px(11.0))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme.text)
-            .bg(if muted {
-                theme.accent_wash
-            } else {
-                theme.element_hover
-            })
-            .cursor_pointer()
-            .focus_visible(|style| style.border_1().border_color(theme.accent.opacity(0.75)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.state
-                    .update(cx, |state, cx| state.set_live_voice_muted(!muted, cx));
-            }))
-            .child(
-                crate::icons::icon(crate::icons::MICROPHONE)
-                    .size(px(14.0))
-                    .text_color(theme.text_muted),
-            )
-            .child(mute_label);
-        let end = div()
-            .id("live-voice-end")
-            .role(gpui::Role::Button)
-            .aria_label("End Live Voice")
-            .tab_index(0)
-            .h(px(32.0))
-            .px(px(12.0))
-            .rounded_full()
-            .flex()
-            .flex_none()
-            .items_center()
-            .text_size(px(11.0))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme.danger_muted)
-            .bg(theme.danger.opacity(0.08))
-            .cursor_pointer()
-            .focus_visible(|style| style.border_1().border_color(theme.danger.opacity(0.75)))
-            .hover(|style| style.bg(theme.danger.opacity(0.13)))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.state.update(cx, |state, cx| state.stop_live_voice(cx));
-            }))
-            .child("End");
-        let content = if stacked {
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(status)
-                        .child(levels),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(caption)
-                        .child(mute)
-                        .child(end),
-                )
-        } else {
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap(px(Theme::SPACE_MD))
-                .child(status)
-                .child(levels)
-                .child(caption)
-                .child(mute)
-                .child(end)
-        };
-        div()
-            .id("composer-live-voice-strip")
-            .role(gpui::Role::Group)
-            .aria_label("Live Voice")
-            .tab_group()
-            .min_h(px(if stacked { 88.0 } else { 76.0 }))
-            .rounded(px(COMPOSER_CORNER_RADIUS))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.composer_glass_bg())
-            .px(px(12.0))
-            .py(px(10.0))
-            .flex()
-            .items_center()
-            .child(content)
-            .into_any_element()
-    }
 }
 
 /// The completion popups' floating rails run through
@@ -12739,7 +12071,6 @@ impl Render for Composer {
             window.focus(&focus, cx);
         }
         let theme = Theme::of(cx).clone();
-        let live_voice = self.live_voice_model(cx);
         let wizard_active = self.wizard.is_some();
         if self.mention.token.is_some()
             && (wizard_active || !self.input.focus_handle(cx).is_focused(window))
@@ -13029,10 +12360,6 @@ impl Render for Composer {
         if wizard_active {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
-        }
-
-        if live_voice.replaces_editor {
-            return container.child(self.render_live_voice_strip(&live_voice, &theme, cx));
         }
 
         // What is waiting to be sent, stacked directly above the box it was
@@ -13382,12 +12709,12 @@ impl Render for Composer {
         // (round-9 follow-up: the send/attach/chips must not ride the height,
         // and none of them fade — the full cluster stays visible throughout).
         // Model/effort stay in the footer (fork presentation), so the pill's
-        // trailing cluster is Live Voice, attachment, dictation and Send.
+        // trailing cluster is attachment, dictation and Send.
         let cluster_dy = morph_cluster_dy(layout_morph_t);
         let action_inset = morph_cluster_inset(expanded, layout_morph_t);
         // The dictation voice track runs from the pill's leading edge up to the
-        // attachment slot (Cancel while dictating), covering the draft and the
-        // Live Voice button, which fade beneath it.
+        // attachment slot (Cancel while dictating), covering the draft while
+        // it fades beneath the track.
         let voice_track = voice_frame
             .as_ref()
             .filter(|_| voice_t > 0.0 && microphone.is_some())
@@ -13409,9 +12736,6 @@ impl Render for Composer {
                 )
             });
         let beneath_voice = 1.0 - voice_t.clamp(0.0, 1.0);
-        let live_voice_button = self
-            .render_live_voice_button(&live_voice, &theme, cx)
-            .map(|button| div().flex_none().opacity(beneath_voice).child(button));
         let body = if expanded {
             // Expanded: textarea on top (`px-4 pb-1 pt-4`), actions row
             // (`px-3 pb-2.5 pt-1`, h-8 controls → 46px) ABSOLUTE at the pill's
@@ -13456,7 +12780,6 @@ impl Render for Composer {
                         .pt(px(4.0))
                         .pb(px(ACTIONS_BOTTOM_PAD))
                         .child(div().flex_1().min_w_0())
-                        .children(live_voice_button)
                         .child(attach)
                         .children(microphone)
                         .child(send_button)
@@ -13516,7 +12839,6 @@ impl Render for Composer {
                                 .pr(px(action_inset))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .children(live_voice_button)
                                 .child(attach)
                                 .children(microphone)
                                 .child(send_button),
@@ -14225,63 +13547,7 @@ mod tests {
     }
 
     #[test]
-    fn live_voice_new_chat_accepts_local_omp_draft() {
-        assert!(draft_live_voice_available(
-            true,
-            Some("local-device"),
-            Some("local-device"),
-            Some(HarnessId::Omp),
-        ));
-        assert!(!draft_live_voice_available(
-            true,
-            Some("remote-device"),
-            Some("local-device"),
-            Some(HarnessId::Omp),
-        ));
-        assert!(!draft_live_voice_available(
-            true,
-            Some("local-device"),
-            Some("local-device"),
-            Some(HarnessId::Codex),
-        ));
-        assert!(!draft_live_voice_ready(None));
-        assert!(!draft_live_voice_ready(Some(&LiveVoiceAvailability {
-            available: false,
-            reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
-        })));
-        assert!(draft_live_voice_ready(Some(&LiveVoiceAvailability {
-            available: true,
-            reason: None,
-        })));
-    }
-
-    #[test]
-    fn live_voice_new_chat_probes_checkout_or_repo_path() {
-        assert_eq!(
-            draft_live_voice_probe_cwd(&NewChatLiveCheckout::Ready {
-                cwd: "/repo".into(),
-                branch: Some("main".into()),
-            }),
-            "/repo"
-        );
-        assert_eq!(
-            draft_live_voice_probe_cwd(&NewChatLiveCheckout::CreateWorktree {
-                repo_path: "/repo".into(),
-                base: "HEAD".into(),
-            }),
-            "/repo"
-        );
-        assert_eq!(
-            draft_live_voice_probe_cwd(&NewChatLiveCheckout::Ready {
-                cwd: "~".into(),
-                branch: None,
-            }),
-            "~"
-        );
-    }
-
-    #[test]
-    fn live_voice_new_chat_builds_normal_chat_mutation() {
+    fn create_chat_mutation_builds_normal_chat_record() {
         assert_eq!(
             create_chat_mutation(
                 "chat-1",
@@ -14306,55 +13572,6 @@ mod tests {
                 "chatId": "chat-2",
                 "deviceId": "local-device",
             })
-        );
-    }
-
-    #[test]
-    fn live_voice_new_chat_uses_current_checkout() {
-        assert_eq!(
-            new_chat_live_checkout(
-                &crate::pickers::CheckoutPlan::CurrentCheckout {
-                    branch: Some("main".into()),
-                },
-                Some("/repo"),
-            ),
-            NewChatLiveCheckout::Ready {
-                cwd: "/repo".into(),
-                branch: Some("main".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn live_voice_new_chat_reuses_existing_worktree() {
-        assert_eq!(
-            new_chat_live_checkout(
-                &crate::pickers::CheckoutPlan::ReuseWorktree {
-                    path: "/repo-wt".into(),
-                    branch: "feature".into(),
-                },
-                Some("/repo"),
-            ),
-            NewChatLiveCheckout::Ready {
-                cwd: "/repo-wt".into(),
-                branch: Some("feature".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn live_voice_new_chat_creates_selected_worktree() {
-        assert_eq!(
-            new_chat_live_checkout(
-                &crate::pickers::CheckoutPlan::NewWorktree {
-                    base: Some("develop".into()),
-                },
-                Some("/repo"),
-            ),
-            NewChatLiveCheckout::CreateWorktree {
-                repo_path: "/repo".into(),
-                base: "develop".into(),
-            }
         );
     }
 
@@ -14648,12 +13865,6 @@ mod tests {
         assert!(!composer_layout_expanded(false, false));
         assert!(composer_layout_expanded(true, true));
         assert!(composer_layout_expanded(true, false));
-    }
-
-    #[test]
-    fn live_voice_strip_stacks_below_threshold() {
-        assert!(!live_voice_strip_stacked(LIVE_VOICE_STACK_WIDTH));
-        assert!(live_voice_strip_stacked(LIVE_VOICE_STACK_WIDTH - 1.0));
     }
 
     pub(super) fn composer_focus_window(
@@ -15256,8 +14467,8 @@ mod tests {
                         queued_command = Some(frame.clone());
                         serde_json::json!({ "commandId": "queued-steer" })
                     }
-                    // Composer initialization may issue read-only catalog and
-                    // Live Voice probes; they are unrelated to the send.
+                    // Composer initialization may issue read-only catalog
+                    // probes; they are unrelated to the send.
                     _ => continue,
                 };
                 let reply = serde_json::to_string(&zeron_rpc::ServerFrame {
@@ -15816,12 +15027,8 @@ mod tests {
             }
             frames
         };
-        // The fork's read-only Live Voice probe may name the chat; only
-        // writes would materialize it.
-        let touches_side = |frame: &zeron_rpc::ClientFrame| {
-            frame.params["chatId"] == "side"
-                && frame.method.as_deref() != Some(zeron_rpc::methods::PROBE_LIVE_VOICE)
-        };
+        // An unsaved side chat receives no chat-scoped RPC until its first send.
+        let touches_side = |frame: &zeron_rpc::ClientFrame| frame.params["chatId"] == "side";
         cx.run_until_parked();
         assert!(!drain().iter().any(touches_side));
 
