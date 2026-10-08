@@ -74,11 +74,14 @@ jobs:
             // The app links the Rust mobile core and everything it depends on.
             const mobileCore = ['apps/ios/', 'crates/mobile/', 'crates/client/', 'crates/text/',
               'crates/markdown/', 'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/',
-              'crates/syntax/', 'scripts/ios/'];
+              'crates/syntax/', 'crates/voice-session/', 'crates/voice-media/',
+              'crates/audio/', 'crates/orb/', 'crates/veil/', 'scripts/ios/'];
             // Native macOS/Linux fixtures: browser, preview, notifications,
             // diff font geometry and the vendored GPUI frame source.
             const nativeSurfaces = ['crates/ui/src/browser/', 'crates/ui/src/file_preview/',
-              'crates/ui/src/notify.rs', 'crates/ui/src/changes.rs', 'crates/ui/examples/',
+              'crates/ui/src/notify.rs', 'crates/ui/src/changes.rs', 'crates/ui/src/attachments.rs',
+              'crates/ui/src/composer.rs', 'crates/ui/src/queue.rs', 'crates/ui/src/transcript.rs',
+              'crates/ui/src/shell/', 'crates/ui/src/voice.rs', 'crates/ui/src/orb/', 'crates/ui/examples/',
               'crates/ui/Cargo.toml', 'crates/preview/', 'third_party/zui/', 'edge/', 'dist/macos/',
               'scripts/run-macos-browser-fixture.sh', 'scripts/test-linux-browser.sh'];
             // core-tests: every non-UI Linux suite (scripts/ci/test-core.sh).
@@ -125,7 +128,7 @@ jobs:
             libfontconfig1-dev libfreetype-dev libasound2-dev
             libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
       - name: UI and headless layout regressions
-        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib
+        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib --test voice_orb_geometry
 
   macos-frame-recovery:
     needs: changes
@@ -150,6 +153,14 @@ jobs:
       - name: Native notification click regressions
         run: |
           cargo test --release --locked -p zeron-ui --lib notify::tests:: -- --test-threads=1
+      - name: Native attachment and composer chip regressions
+        run: |
+          for filter in attachments::tests:: composer::attachment_chip_tests:: shell::chat_dropzone_tests:: \
+            queue_rows_label_attachment_chips_and_file_only_sends \
+            user_bubbles_project_attachment_chips_in_place_of_the_strip \
+            sent_chips_show_upload_progress_until_their_bytes_land; do
+            cargo test --release --locked -p zeron-ui --lib "$filter" -- --test-threads=1
+          done
       - name: Build native browser fixture
         run: cargo build --release --locked -p zeron-ui --example browser-fixture --example preview-fixture --features browser-fixture
       - name: Native browser regression and screenshots

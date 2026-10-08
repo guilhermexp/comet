@@ -31,6 +31,19 @@ fn fixture_path() -> PathBuf {
     path
 }
 
+fn account_read_hang_fixture_path() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-codex-account-read-hang.py");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    path
+}
+
 fn harness() -> CodexHarness {
     CodexHarness::new().with_executable(fixture_path())
 }
@@ -118,6 +131,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
@@ -151,6 +165,111 @@ async fn run_to_end(
     )
     .await
     .expect("run finished in time")
+}
+
+fn account_read_methods(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("account-read-wire.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|frame| frame.get("method")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn account_read_warmup_timeout_does_not_block_text_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = CodexHarness::new().with_executable(account_read_hang_fixture_path());
+    let (mut controls, _steer, _token) = controls("Yes");
+    let (_voice, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
+    controls.realtime = Some(realtime);
+    let mut req = request("account-warmup-timeout");
+    req.cwd = temp.path().display().to_string();
+
+    let started = tokio::time::Instant::now();
+    // A live Codex session parks after Done while its steering mailbox is
+    // open. Verify text completion, then drop the stream to retire the child.
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = harness.run(req, controls).await.expect("run starts");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event");
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                return events;
+            }
+        }
+        panic!("stream ended without an authoritative Done");
+    })
+    .await
+    .expect("text completion remains bounded after account warmup");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "text run should finish after optional account/read times out: {events:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let methods = account_read_methods(temp.path());
+    for method in ["account/read", "thread/start", "turn/start"] {
+        assert!(
+            methods.iter().any(|seen| seen == method),
+            "missing {method}: {methods:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_read_warmup_cancellation_still_interrupts_text_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = CodexHarness::new()
+        .with_executable(account_read_hang_fixture_path())
+        .with_graces(Duration::from_millis(20), Duration::from_millis(200));
+    let (mut controls, _steer, token) = controls("Yes");
+    let (_voice, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
+    controls.realtime = Some(realtime);
+    let mut req = request("account-warmup-cancel");
+    req.cwd = temp.path().display().to_string();
+    let stream = harness.run(req, controls).await.expect("run starts");
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if account_read_methods(temp.path())
+                .iter()
+                .any(|method| method == "account/read")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("account/read reaches the fake server");
+    token.cancel();
+
+    let events = tokio::time::timeout(
+        Duration::from_secs(3),
+        stream
+            .map(|event| event.expect("stream event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("cancellation ends the run");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            }
+        )),
+        "cancelled warmup should interrupt the run: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -475,6 +594,7 @@ async fn approvals_round_trip_as_input_requests() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
@@ -1636,4 +1756,155 @@ async fn isolated_recap_preserves_read_only_and_replaces_coding_instructions() {
         )),
         "{events:?}"
     );
+}
+
+#[tokio::test]
+async fn idle_voice_runtime_has_no_initial_turn_and_preserves_mcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex-voice.py");
+    let driver = CodexHarness::new()
+        .with_executable(fixture)
+        .with_graces(Duration::from_millis(10), Duration::from_millis(100));
+    let mut req = request("must never be submitted");
+    req.cwd = dir.path().display().to_string();
+    req.mcp = Some(zeron_proto::McpServer {
+        name: "zeron".into(),
+        command: "zeron".into(),
+        args: vec!["mcp".into()],
+        env: Default::default(),
+    });
+    let (mut controls, steer, token) = controls("Yes");
+    let (voice, bridge, _events) = zeron_harness::codex::realtime::channel();
+    controls.realtime = Some(bridge);
+    let mut stream = driver.start_idle(req, controls).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentEvent::SessionStarted { .. }
+    ));
+    let (reply, receive) = oneshot::channel();
+    voice
+        .commands
+        .send(zeron_harness::codex::realtime::VoiceCommand::Start {
+            voice: None,
+            session_id: "fixture-voice".into(),
+            generation: 1,
+            reply,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        receive.await.unwrap(),
+        Err(zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable)
+    );
+    let calls = std::fs::read_to_string(dir.path().join("voice-wire.jsonl")).unwrap();
+    assert!(!calls.contains("turn/start"));
+    assert!(!calls.contains("thread/realtime/start"));
+    assert!(calls.contains("mcp_servers"));
+    steer
+        .send(SteerMessage {
+            prompt: "text remains usable".into(),
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    token.cancel();
+    drop(stream);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_voice_keeps_canonical_events_without_any_local_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    use zeron_harness::codex::realtime::{VoiceCommand, channel};
+    use zeron_proto::voice::{VoiceEvent, remote::Sdp};
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("bin/codex");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex-voice-native.py"),
+        &binary,
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let driver = CodexHarness::new().with_executable(binary);
+    let mut req = request("");
+    req.cwd = dir.path().display().to_string();
+    req.mcp = Some(zeron_proto::McpServer {
+        name: "zeron".into(),
+        command: "zeron".into(),
+        args: vec!["mcp".into()],
+        env: Default::default(),
+    });
+    let (mut controls, _steer, token) = controls("Yes");
+    let (voice, bridge, mut events) = channel();
+    controls.realtime = Some(bridge);
+    let mut stream = driver.start_idle(req, controls).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentEvent::SessionStarted { .. }
+    ));
+    let pump = tokio::spawn(async move { while stream.next().await.is_some() {} });
+    assert!(voice.probe_external().await.unwrap().available);
+    assert_eq!(
+        voice.probe().await.unwrap_err(),
+        zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable
+    );
+    let (reply, answer) = oneshot::channel();
+    voice
+        .commands
+        .send(VoiceCommand::External {
+            voice: None,
+            session_id: "external-session".into(),
+            generation: 1,
+            offer: Sdp::new("fixture-offer".into()).unwrap(),
+            reply,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), answer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "fixture-answer"
+    );
+    // Re-emission occurs after negotiation has completed, when there is no NativeHost.
+    std::fs::write(dir.path().join("replay-transcripts"), "true").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let VoiceEvent::Final { transcript } = events.recv().await.unwrap() {
+                assert_eq!(transcript.session_id, "external-session");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    voice.stop().await.unwrap();
+    assert!(!dir.path().join("helper-wire.jsonl").exists());
+    let wire = std::fs::read_to_string(dir.path().join("voice-wire.jsonl")).unwrap();
+    assert!(wire.contains("mcp_servers"));
+    assert!(!wire.contains("appendAudio"));
+    token.cancel();
+    pump.abort();
 }

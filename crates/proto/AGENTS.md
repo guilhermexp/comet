@@ -15,6 +15,7 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - `AgentEvent::NativeTitle` transporta metadata local de título da CLI para a engine. É consumido antes de journal/broadcast; somente o título resultante do Chat sincroniza pelo contrato existente.
 
 - `ContextUsage` conserva `tokens`/`contextWindow` numéricos no fio; `tokensReported: false` é aditivo e distingue tokens ausentes de zero (ausência do flag mantém semântica legada). `reported_tokens`/`reported_window` e `merge` são a fonte compartilhada para snapshots parciais. Contexto do Chat é distinto de Managed Provider Usage e continua sincronizado nas rows de Session.
+- `RunRequest.mcp` continua campo opcional do request serializado, independente dos controles realtime host-local da harness. `voice` define mídia e signaling efêmeros: áudio, leases e partial transcripts nunca entram em documento; só o `VoiceTranscript` final pode ser reduzido pelo contrato de `zeron-doc`. Remote media v1 usa envelopes estritos, chave de tentativa aleatória e SDP limitado.
 
 - `GeneratedImage` transporta referência raster (`id`, `path`, `name`, `mimeType`). Paths emitidos pelo runtime são entrada privada da engine: antes de journal/sync ela importa para uploads do perfil. O evento não carrega bytes/base64.
 
@@ -23,6 +24,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - `CreateWorktreeOutcome` mantém `Worktree` achatado para leitores antigos e adiciona `setupError`/`copyWarning` opcionais: um erro de preparo bloqueia o início por Live Voice e um cache ignorado não copiado chega como aviso ao consumidor.
 
 - `hashline_file_paths` extrai paths únicos de headers canônicos `[PATH#TAG]` (quatro hex maiúsculos), compartilhado pela normalização OMP e recuperação visual de histórico; não interpreta conteúdo de linhas de corpo.
+
+- `attachment_mentions::pair_attachment_mentions` associa chips distintos a paths em ordem estável, um-para-um, compartilhado entre desktop e iOS. Nome visível exato desempata colisões do nome sanitizado pelo upload; nomes duplicados preservam a ordem de staging. É uma derivação local pura e não altera o schema de mensagens.
 
 - GitHistoryPage inclui branchTips com default vazio e comparison opcional. SearchGitHistoryParams e ResolveGitAvatarsParams definem as novas requests aditivas; versões antigas podem continuar lendo páginas sem esses campos.
 

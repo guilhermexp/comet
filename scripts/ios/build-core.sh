@@ -22,6 +22,9 @@ esac
 PROFILE=mobile
 if [[ "${CONFIGURATION:-Debug}" == "Release" ]]; then PROFILE=mobile-dist; fi
 
+# Respect the disposable target selected by cargo-verify. Xcode still links
+# the copied output under target/ios-core after the verification target is gone.
+CARGO_OUT="${CARGO_TARGET_DIR:-$ROOT/target}"
 OUT="$ROOT/target/ios-core/$PLATFORM"
 mkdir -p "$OUT/include"
 
@@ -34,25 +37,37 @@ fi
 # Xcode exports SDKROOT/deployment vars for the *app* SDK; host build scripts
 # (proc macros, build.rs) must not see them, so cargo runs in a clean env.
 run_cargo() {
+  if [[ "${CARGO_INCREMENTAL+x}" == "x" ]]; then
+    set -- "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" cargo "$@"
+  else
+    set -- cargo "$@"
+  fi
+  if [[ "${RUSTC+x}" == "x" ]]; then
+    set -- "RUSTC=$RUSTC" "$@"
+  fi
   env -i HOME="$HOME" USER="${USER:-}" TERM="${TERM:-dumb}" \
     PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     IPHONEOS_DEPLOYMENT_TARGET=26.0 \
-    CARGO_TARGET_DIR="$ROOT/target" \
-    cargo "$@"
+    CARGO_TARGET_DIR="$CARGO_OUT" \
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
+    "$@"
 }
 
 cd "$ROOT"
 run_cargo build --locked -p zeron-mobile --lib --profile "$PROFILE" --target "$TARGET"
 run_cargo build --locked -p zeron-mobile --bin uniffi-bindgen --features bindgen --profile mobile
 
-LIB="$ROOT/target/$TARGET/$PROFILE/libzeron_mobile.a"
+LIB="$CARGO_OUT/$TARGET/$PROFILE/libzeron_mobile.a"
 cp -p "$LIB" "$OUT/libzeron_mobile.a"
 
 GEN="$OUT/gen"
-"$ROOT/target/mobile/uniffi-bindgen" generate --library "$LIB" --language swift --out-dir "$GEN" >/dev/null
+"$CARGO_OUT/mobile/uniffi-bindgen" generate --library "$LIB" --language swift --out-dir "$GEN" >/dev/null
 cp "$GEN/zeron_coreFFI.h" "$OUT/include/zeron_coreFFI.h"
 cp "$GEN/zeron_coreFFI.modulemap" "$OUT/include/module.modulemap"
 # Only touch the Swift file when it changed so Xcode doesn't recompile it.
 SWIFT_OUT="$ROOT/apps/ios/Zeron/Core/Generated/zeron_core.swift"
 mkdir -p "$(dirname "$SWIFT_OUT")"
-cmp -s "$GEN/zeron_core.swift" "$SWIFT_OUT" || cp "$GEN/zeron_core.swift" "$SWIFT_OUT"
+# UniFFI emits whitespace-only indentation on blank lines. Normalize the
+# generated output before comparison so the committed binding stays lint-clean.
+sed 's/[[:blank:]]*$//' "$GEN/zeron_core.swift" >"$GEN/zeron_core.normalized.swift"
+cmp -s "$GEN/zeron_core.normalized.swift" "$SWIFT_OUT" || cp "$GEN/zeron_core.normalized.swift" "$SWIFT_OUT"

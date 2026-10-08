@@ -30,6 +30,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - **`src/method.rs` é a lista única de métodos**: nome de fio, `params`, `reply`, `forwardable`, `stream` e `deadline` de um método moram todos numa linha do macro `rpc_methods!`. Adicionar RPC = uma linha no macro + o handler na engine. Nome e valor de cada const de `methods::` são fio — nunca renomear. A engine lê esses atributos por `zeron_rpc::info(method)`; não existe segunda lista para estender.
 - Frame do device room é o envelope de relay — método novo que precisa ser dirigível de outro device tem que ser relay-forwardable.
 - `FetchToolInput` é unary e relay-forwardable ao device dono; a engine valida ownership do chat antes de ler o journal local.
+- Os RPCs `*Voice*V2` roteiam controle Codex realtime ao device dono: capabilities/prepare/negotiate e mutações são unary forwardable; `OwnVoiceV2` é stream forwardable (prepare 65s, negotiate 95s). Tokens de lease, áudio e signaling não viram comando durável. Os RPCs experimentais de Live Voice do OMP continuam locais.
 - Handler é async e não bloqueia: enumerar path, ler arquivo e afins vão pra `spawn_blocking`.
 - No IPC local, `ProtocolError::HandshakeIncomplete` significa que o peer TCP saiu antes do upgrade e fica em debug; handshakes completos inválidos, `Origin` de browser e demais falhas continuam em warning.
 - `LinkCache::new` instala o watcher de credenciais antes de retornar; sign-out não pode perder a primeira versão do `watch` nem manter sockets autenticados em cache.

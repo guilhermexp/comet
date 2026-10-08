@@ -680,9 +680,19 @@ fn bench_layout_passes() {
 }
 
 #[test]
-fn user_mentions_render_as_accent_chips() {
+fn user_mentions_render_as_chips() {
+    // Keep the fork's @name/link accent for file mentions while importing
+    // the shared icon wells and canonical skill chip.
     let mut w = worker(390.0);
-    let text = "Look at [mod.rs](zeron-file:crates/mobile/src/layout/mod.rs) please".to_owned();
+    let skill = zeron_proto::invocation::Invocation::Skill {
+        name: "review".into(),
+        path: "/repo/SKILL.md".into(),
+        command: None,
+    };
+    let text = format!(
+        "Look at [mod.rs](zeron-file:crates/mobile/src/layout/mod.rs) in [layout](zeron-file:crates/mobile/src/layout/) with {}",
+        skill.link()
+    );
     w.input = debug_input(
         vec![DebugEntry {
             id: "u".into(),
@@ -694,9 +704,36 @@ fn user_mentions_render_as_accent_chips() {
     );
     let frame = w.pass();
     let d = frame.display(0).unwrap();
-    assert!(d.text.contains("@mod.rs"), "{}", d.text);
-    assert!(!d.text.contains("zeron-file:"));
+    assert!(
+        d.text.contains("@mod.rs") && d.text.contains("@layout"),
+        "{}",
+        d.text
+    );
+    assert!(!d.text.contains("zeron-"), "{}", d.text);
     assert!(d.runs.iter().any(|r| r.color == display::ColorRole::Link));
+    let icons: Vec<&str> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::Icon { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        icons,
+        [
+            "fileicon-files-rust",
+            "fileicon-folders-folder",
+            "wand.and.stars"
+        ]
+    );
+    assert_eq!(
+        d.boxes
+            .iter()
+            .filter(|b| b.color == display::ColorRole::ToolBadge)
+            .count(),
+        3
+    );
 }
 
 #[test]
@@ -717,6 +754,134 @@ fn user_attachments_render_as_images_not_trailer_text() {
     assert!(!d.text.contains("Attached images"), "{}", d.text);
     assert!(d.text.contains("Fix the header spacing"));
     assert!(d.widgets.iter().any(|w| matches!(&w.kind, display::WidgetKind::Image { reference } if reference.ends_with("shot.png"))));
+}
+
+#[test]
+fn synced_file_attachments_render_as_chips_and_name_pills() {
+    // A desktop send mixing an image and ZIPs (one still a queued-upload ref),
+    // with composer chips in the prompt. Chipped attachments show as their
+    // chip only; the image chip opens its upload; the unchipped ZIP keeps a
+    // name pill and never reaches image loading.
+    let mut w = worker(390.0);
+    let text = "Compare [Image 1](zeron-image:1) with [notes.zip](zeron-attachment:2)\n\nAttached images (local files — open them to view):\n- /tmp/uploads/ab12cd34-Image_1.png\n- /tmp/uploads/ab12cd34-notes.zip\n- pending://up-3/logs.zip".to_owned();
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "u".into(),
+            user: true,
+            text,
+            streaming: false,
+        }],
+        false,
+    );
+    let frame = w.pass();
+    let d = frame.display(0).unwrap();
+    assert!(
+        !d.widgets
+            .iter()
+            .any(|w| matches!(&w.kind, display::WidgetKind::Image { .. }))
+    );
+    let icons: Vec<&str> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::Icon { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    // The unchipped ZIP's pill, then the bubble's two chips.
+    assert_eq!(
+        icons,
+        [
+            "fileicon-files-compressed",
+            "photo",
+            "fileicon-files-compressed"
+        ]
+    );
+    assert!(
+        d.text.contains("Compare Image 1 with notes.zip"),
+        "{}",
+        d.text
+    );
+    assert!(
+        d.text.contains("logs.zip") && !d.text.contains("ab12cd34-"),
+        "{}",
+        d.text
+    );
+    assert!(
+        !d.text.contains("zeron-image") && !d.text.contains("zeron-attachment"),
+        "{}",
+        d.text
+    );
+    let links: Vec<&str> = d.links.iter().map(|l| l.url.as_str()).collect();
+    assert_eq!(
+        links,
+        ["zeron-preview://image?ref=%2Ftmp%2Fuploads%2Fab12cd34-Image_1.png"]
+    );
+}
+
+#[test]
+fn sanitized_attachment_name_collision_keeps_only_the_unpaired_upload_pill() {
+    // The visible name exactly matches the second upload. The first upload
+    // sanitizes to the same name, but only one path may be consumed by a chip.
+    let mut w = worker(390.0);
+    let text = "Open [Report final.pdf](zeron-attachment:1)\n\nAttached images (local files — open them to view):\n- /tmp/uploads/ab12cd34-Report_final.pdf\n- /tmp/uploads/ef56ab78-Report final.pdf".to_owned();
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "u".into(),
+            user: true,
+            text,
+            streaming: false,
+        }],
+        false,
+    );
+
+    let frame = w.pass();
+    let d = frame.display(0).unwrap();
+    assert!(d.text.contains("Report final.pdf"), "{}", d.text);
+    assert!(d.text.contains("Report_final.pdf"), "{}", d.text);
+    assert!(!d.text.contains("ab12cd34-") && !d.text.contains("ef56ab78-"));
+    assert!(
+        d.links.is_empty(),
+        "non-image attachment chips are not previews"
+    );
+}
+
+#[test]
+fn reordered_image_uploads_keep_each_preview_on_its_indexed_chip() {
+    // The trailer order is reversed; generated Image N names keep each image
+    // chip attached to its own upload path.
+    let mut w = worker(390.0);
+    let text = "Compare [Image 1](zeron-image:1) with [Image 2](zeron-image:2)\n\nAttached images (local files — open them to view):\n- /tmp/uploads/ef56ab78-Image_2.png\n- /tmp/uploads/ab12cd34-Image_1.png".to_owned();
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "u".into(),
+            user: true,
+            text,
+            streaming: false,
+        }],
+        false,
+    );
+
+    let frame = w.pass();
+    let d = frame.display(0).unwrap();
+    assert!(
+        d.text.contains("Compare Image 1 with Image 2"),
+        "{}",
+        d.text
+    );
+    assert!(
+        !d.widgets
+            .iter()
+            .any(|widget| matches!(&widget.kind, display::WidgetKind::Image { .. }))
+    );
+    let links: Vec<&str> = d.links.iter().map(|link| link.url.as_str()).collect();
+    assert_eq!(
+        links,
+        [
+            "zeron-preview://image?ref=%2Ftmp%2Fuploads%2Fab12cd34-Image_1.png",
+            "zeron-preview://image?ref=%2Ftmp%2Fuploads%2Fef56ab78-Image_2.png",
+        ]
+    );
 }
 
 #[test]

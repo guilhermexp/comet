@@ -1,7 +1,7 @@
 # macos-dev-identity Specification
 
 ## Purpose
-TBD - created by archiving change fix-macos-cargo-app-identity. Update Purpose after archive.
+Give headed macOS development builds the native Zeron application identity while preserving the selected executable, environment, command-line behavior and normal process termination.
 
 ## Requirements
 

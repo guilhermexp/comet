@@ -192,6 +192,15 @@ rpc_methods! {
     SET_LIVE_VOICE_MUTED / SetLiveVoiceMuted = "SetLiveVoiceMuted" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
     STOP_LIVE_VOICE / StopLiveVoice = "StopLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
     WATCH_LIVE_VOICE / WatchLiveVoice = "WatchLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    /// Remote Codex realtime voice, routed to the device that owns the Chat.
+    VOICE_CAPABILITIES_V2 / VoiceCapabilitiesV2 = "VoiceCapabilitiesV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    PREPARE_VOICE_V2 / PrepareVoiceV2 = "PrepareVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 65 },
+    OWN_VOICE_V2 / OwnVoiceV2 = "OwnVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
+    NEGOTIATE_VOICE_V2 / NegotiateVoiceV2 = "NegotiateVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 95 },
+    CONFIRM_VOICE_MEDIA_V2 / ConfirmVoiceMediaV2 = "ConfirmVoiceMediaV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    REPORT_VOICE_MEDIA_V2 / ReportVoiceMediaV2 = "ReportVoiceMediaV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    STOP_VOICE_V2 / StopVoiceV2 = "StopVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    CANCEL_VOICE_ATTEMPT_V2 / CancelVoiceAttemptV2 = "CancelVoiceAttemptV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
@@ -368,6 +377,16 @@ mod tests {
         assert_eq!(
             info(methods::CLONE_REPO).unwrap().deadline,
             std::time::Duration::from_secs(15 * 60)
+        );
+        assert!(info(methods::VOICE_CAPABILITIES_V2).unwrap().forwardable);
+        assert!(info(methods::OWN_VOICE_V2).unwrap().stream);
+        assert_eq!(
+            info(methods::PREPARE_VOICE_V2).unwrap().deadline,
+            std::time::Duration::from_secs(65)
+        );
+        assert_eq!(
+            info(methods::NEGOTIATE_VOICE_V2).unwrap().deadline,
+            std::time::Duration::from_secs(95)
         );
     }
 

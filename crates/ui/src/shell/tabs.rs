@@ -175,6 +175,9 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
+        // Opening any session steps the voice stage aside — including the one
+        // already selected under it. The call keeps running in the background.
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.state
@@ -220,6 +223,9 @@ impl Shell {
             });
             return;
         }
+        // Closing the stage only changes its visibility and focus; the voice
+        // call remains owned by the engine and continues across navigation.
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         let target = {
@@ -518,7 +524,7 @@ impl Shell {
                 .child(
                     header_icon_button(
                         "session-fork",
-                        icons::GIT_BRANCH,
+                        icons::FORK,
                         "Fork this session",
                         false,
                         &theme,

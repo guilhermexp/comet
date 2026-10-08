@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         .run(
             request,
             RunControls {
+                realtime: None,
                 chat_id: "cursor-steering-probe".into(),
                 generate_native_title: false,
                 execution_lease: None,

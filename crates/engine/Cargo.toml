@@ -45,6 +45,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 # Chat MCP `list_projects` read against the same engine as the Workers controller.
+tokio = { workspace = true, features = ["test-util"] }
 zeron-mcp.workspace = true
 zeron-harness = { workspace = true, features = ["installer-fixture"] }
 zip.workspace = true

@@ -4,7 +4,12 @@ default-members = ["apps/zeron"]
 members = [
     "crates/syntax",
     "crates/voice",
+    "crates/voice-media",
+    "crates/voice-session",
+    "crates/orb",
+    "crates/veil",
     "crates/theme",
+    "crates/audio",
     "crates/proto",
     "crates/preview",
     "crates/doc",
@@ -38,6 +43,11 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+zeron-voice-session = { path = "crates/voice-session" }
+zeron-orb = { path = "crates/orb" }
+zeron-veil = { path = "crates/veil" }
+zeron-voice-media = { path = "crates/voice-media" }
+zeron-audio = { path = "crates/audio" }
 zeron-preview = { path = "crates/preview" }
 zeron-proto = { path = "crates/proto" }
 zeron-doc = { path = "crates/doc" }
@@ -101,7 +111,15 @@ gpui_tokio = { path = "third_party/zui/crates/gpui_tokio" }
 # Upstream component primitives. Its own `gpui`/`gpui_macros` git deps are
 # redirected to the vendored tree by the `[patch]` below, so the workspace
 # keeps a single GPUI identity.
-gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "03cd9947a6aa07921cb284ad66c87fd6735e55b0" }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "4764fd002ab5894ec9413511d01d37481b2129ab" }
+
+# Native voice support. Optional activation is declared by the consuming crate.
+base64 = "0.22"
+crossbeam-queue = "0.3"
+cpal = "=0.18.2"
+webrtc-audio-processing = { version = "~2.1.0", features = ["bundled"] }
+semver = "1"
+uniffi = "0.32"
 
 # diffs
 similar = "2"

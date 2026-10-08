@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         sessions: None,
     };
     let controls = RunControls {
+        realtime: None,
         chat_id: "steering-probe".into(),
         generate_native_title: false,
         execution_lease: None,

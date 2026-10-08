@@ -31,17 +31,27 @@ fn config(
     }
 }
 
-async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+async fn rejecting_edge() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(AtomicUsize::new(0));
-    let seen = requests.clone();
+    let seen_requests = requests.clone();
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let accepted = accepted_connections.clone();
     let task = tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
-            let seen = seen.clone();
+            // Record acceptance before spawning a handler so shutdown checks
+            // cannot mistake delayed handler scheduling for new Edge traffic.
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let seen = seen_requests.clone();
             tokio::spawn(async move {
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request).await;
@@ -55,7 +65,12 @@ async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<
             });
         }
     });
-    (format!("http://127.0.0.1:{port}"), requests, task)
+    (
+        format!("http://127.0.0.1:{port}"),
+        requests,
+        accepted_connections,
+        task,
+    )
 }
 
 struct DaemonEdge {
@@ -300,7 +315,7 @@ async fn signed_out_workos_boot_serves_local_data_without_dev_identity() {
 #[tokio::test]
 async fn clean_local_auth_construction_does_not_probe_edge_health() {
     let dir = tempfile::tempdir().unwrap();
-    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let (edge_url, requests, _, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, Some("client_test"), None);
 
     let auth = Engine::build_auth(&config).await;
@@ -321,7 +336,7 @@ async fn revoked_captured_session_stays_on_its_synced_cache() {
         r#"{"refreshToken":"dead","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
     )
     .unwrap();
-    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let (edge_url, requests, _, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, Some("client_test"), None);
     let auth = Engine::build_auth(&config).await;
     let scope = Engine::initial_workspace_scope(&auth);
@@ -446,7 +461,7 @@ async fn workspace_recovers_from_an_unreachable_edge_without_restarting() {
 #[tokio::test]
 async fn development_without_an_explicit_bearer_stays_offline() {
     let dir = tempfile::tempdir().unwrap();
-    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let (edge_url, requests, _, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, None, None);
     let auth = Engine::build_auth(&config).await;
     let scope = Engine::initial_workspace_scope(&auth);
@@ -609,7 +624,7 @@ async fn headless_sign_out_closes_joined_edge_rooms_and_stops_daemon() {
 #[tokio::test]
 async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
     let dir = tempfile::tempdir().unwrap();
-    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let (edge_url, requests, accepted_connections, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, None, Some("dev-user@dev-org"));
     let auth = Engine::build_auth(&config).await;
     let scope = Engine::initial_workspace_scope(&auth);
@@ -636,7 +651,9 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
     tokio::time::timeout(std::time::Duration::from_secs(30), runtime.shutdown())
         .await
         .expect("shutdown never returned — an Edge worker did not join");
-    let after = requests.load(Ordering::SeqCst);
+    // This boundary uses accept-time counts; the per-connection request
+    // handlers may finish their first read after shutdown due to scheduling.
+    let accepted_after = accepted_connections.load(Ordering::SeqCst);
     drop(runtime);
 
     wait_until(
@@ -648,9 +665,9 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
     // Edge worker loop would land another request in this window.
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
     assert_eq!(
-        requests.load(Ordering::SeqCst),
-        after,
-        "edge received requests after shutdown returned"
+        accepted_connections.load(Ordering::SeqCst),
+        accepted_after,
+        "edge accepted connections after shutdown returned"
     );
     edge_task.abort();
 }

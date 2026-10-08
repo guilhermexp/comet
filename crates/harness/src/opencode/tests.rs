@@ -255,6 +255,7 @@ impl TurnWire {
             server: Server::attached(base),
             event_tx,
             controls: RunControls {
+                realtime: None,
                 chat_id: String::new(),
                 generate_native_title: false,
                 execution_lease: None,

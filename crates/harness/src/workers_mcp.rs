@@ -428,6 +428,27 @@ mod tests {
     }
 
     #[test]
+    fn voice_root_grant_mounts_only_chat_tools() {
+        let request = request(false, true);
+        assert!(request.mcp.is_none());
+        let servers = servers_for(Path::new("/opt/zeron"), &request, false);
+        let names: Vec<_> = servers.iter().map(|server| server.name).collect();
+        assert_eq!(names, ["comet-sessions", "zeron"]);
+
+        let codex: Vec<_> = servers
+            .iter()
+            .flat_map(|server| server.codex_overrides())
+            .collect();
+        assert!(
+            codex
+                .iter()
+                .any(|line| line.contains("mcp_servers.comet-sessions."))
+        );
+        assert!(codex.iter().any(|line| line.contains("mcp_servers.zeron.")));
+        assert!(!codex.iter().any(|line| line.contains("comet-workers")));
+    }
+
+    #[test]
     fn workers_only_omits_sessions() {
         let servers = servers_for(Path::new("/opt/zeron"), &request(true, false), false);
         assert_eq!(servers.len(), 1);

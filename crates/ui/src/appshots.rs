@@ -751,7 +751,9 @@ pub(crate) fn restore_queued_appshots(
         if png_dimensions(screenshot.bytes()).is_some() {
             if let Some(bytes) = trim_appshot_padding(screenshot.bytes()).map_err(|_| invalid())? {
                 screenshot.size = bytes.len() as u64;
-                screenshot.image = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
+                screenshot.content = crate::attachments::AttachmentContent::Image(Arc::new(
+                    gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
+                ));
             }
         }
         let content = node.text().unwrap_or_default();
@@ -938,7 +940,11 @@ pub(crate) mod tests {
                 kind: crate::attachments::StagedAttachmentKind::Image,
                 source_path: None,
                 size: 0,
-                image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
+                content: crate::attachments::AttachmentContent::Image(Arc::new(Image::from_bytes(
+                    ImageFormat::Png,
+                    Vec::new(),
+                ))),
+                mention: None,
             },
             screenshot_dimensions: Some((1440, 900)),
             app_icon: None,

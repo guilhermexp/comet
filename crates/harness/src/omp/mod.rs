@@ -909,6 +909,7 @@ async fn run_session(
     prompt_timeout: Duration,
 ) {
     let RunControls {
+        realtime: _,
         // Held for the whole turn so a queued CLI update waits for it.
         execution_lease: _execution_lease,
         request_input,

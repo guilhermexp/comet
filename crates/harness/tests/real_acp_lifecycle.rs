@@ -14,6 +14,7 @@ async fn live_run(cancel: bool) {
     let (steer, steering) = mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         chat_id: String::new(),
         generate_native_title: false,
         execution_lease: None,

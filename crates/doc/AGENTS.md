@@ -13,6 +13,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 ## Local Contracts
 
 - `NativeTitle` é metadata consumida pela engine e não produz nenhuma part de transcript no fold.
+- `commit_voice_transcript` só aceita texto final canônico e idempotente, com identidade por sessão/item; partial, áudio, SDP e lease não são conteúdo do doc. Transcript promovido pelo roteamento nativo não duplica a mensagem já persistida, e precisa referenciar uma mensagem que já existe.
 
 - **Device aposentado é tombstone, não delete.** `RegistryDoc` guarda o kind `retiredDevices` (camelCase: a edge só aceita kinds `^[a-z][a-zA-Z0-9]{0,31}$` e rejeitaria o batch inteiro com `retired_devices`). `read_devices` filtra ids aposentados, `upsert_device` de id aposentado é no-op (um engine antigo que reconecte não ressuscita), e `retire_device` move Spaces (mesmo id; `Space.device_id` só muda aqui), chats e rows de sessão desses Spaces para o device sucessor no mesmo batch do tombstone. Validação é da engine. Cobertura: `registry::tests::retiring_a_device_rehomes_its_spaces_and_chats_and_hides_it`, `a_retired_device_is_never_resurrected`.
 

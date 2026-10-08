@@ -1,7 +1,7 @@
 # global-file-preview Specification
 
 ## Purpose
-TBD - created by archiving change global-file-preview. Update Purpose after archive.
+Provide local previews of readable files across projects and recorded virtual Read results, resolving paths from the Chat cwd and preserving explicit errors when content is unavailable.
 
 ## Requirements
 

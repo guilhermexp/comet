@@ -136,6 +136,7 @@ mod tests {
             git_detected: true,
             git_checked_at: None,
             checkout_id: Some("checkout-1".into()),
+            repository_id: None,
             created_at: Utc::now(),
         }
     }

@@ -5,6 +5,7 @@
 //! per-turn tokens plus an optional current-context snapshot mirrored onto live sessions.
 
 pub mod agent;
+pub mod attachment_mentions;
 pub mod entities;
 pub mod file_mentions;
 pub mod invocation;
@@ -13,6 +14,7 @@ pub mod motion;
 pub mod preview;
 pub mod sidebar_pins;
 pub mod view;
+pub mod voice;
 pub mod workspace;
 
 pub use agent::*;

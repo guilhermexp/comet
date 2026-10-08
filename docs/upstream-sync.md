@@ -23,7 +23,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 2. **Medir antes de mexer.**
    - `git merge-tree --write-tree --name-only origin/main refs/upstream/zeron-main` lista os arquivos que vão conflitar.
    - Auditar por área (engine/sync, contas/settings, UI, Explorer/MCP, iOS, infra), classificando cada commit como TAKE, ADAPT ou SKIP e dizendo onde encosta no fork.
-3. **Worktree e branch próprias**, a partir do `origin/main`. O checkout principal costuma estar ocupado por outra sessão.
+3. **Worktree e branch próprias**, a partir da revisão do fork autorizada pelo dono. Use `origin/main` quando ela estiver atualizada; se o checkout principal tiver commits locais já aceitos, use seu `HEAD` para não perdê-los. O checkout principal costuma estar ocupado por outra sessão.
    ```sh
    git worktree add -b sync/upstream-vX.Y.Z ../comet-sync-vX.Y.Z origin/main
    ```
@@ -47,16 +47,18 @@ Atualizar este arquivo é parte do closeout de todo sync.
 ## Contratos do fork que sempre vencem
 
 - **Workers e harnesses:** Workers (`crates/workers-unpeel`, `WorkflowTask`, aba Workers), os harnesses OMP e Kimi, Live Voice. A Trajectory foi removida do fork em 2026-10-05 (`openspec/changes/remove-chat-trajectory/`); merges antigos que a citem não a restauram.
+- **Notificações genuínas de Workers:** entram diretamente no mailbox do run parent steerable, inclusive com update pendente e harness TurnBoundary; mensagens comuns continuam sujeitas ao gate. A lease de execução continua bloqueando o instalador.
 - **Steering:** Enter com run ativo faz steer. A fila do upstream coexiste, mas não substitui (v0.2.83 D3).
 - **Modelo de grant MCP:**
   - `comet-workers` vai para quem pode lançar Workers.
   - `comet-sessions` e `zeron` (o `zeron mcp`) vão **só** para o orquestrador raiz com IPC ativo.
   - `RunRequest.mcp` fica sempre vazio: não entra a injeção do upstream em todo run.
+- **Voz:** Codex voice usa o helper standalone instalado e o lifecycle host-owned; convive com Live Voice OMP. A autorização de tools do seu orquestrador usa o grant raiz do fork, não injeção global por `RunRequest.mcp`. Consulta opcional de conta tem deadline e não bloqueia indefinidamente o início de texto.
 - **Contas e uso:** o painel Usage da Details, os medidores do fork (Grok gerenciado, Cursor, Kimi, Antigravity) e `usage_lines`.
 - **Visual:** Settings no layout do upstream #449, mas com as seções Projects e Accounts do fork; Changes dentro do Files, transcript compacto, sem anel de contexto e sem terminal de rodapé.
 - **Painel direito:** só conta como aberto se tiver aba viva.
 - **Publicação e update:**
-  - versão 0.2.18, `release.yml` do fork, zui vendorizado em `third_party/zui`, com os pins de zui do upstream ignorados;
+  - versão 0.2.18, `release.yml` do fork, zui vendorizado em `third_party/zui`; deltas de API do pin upstream são aplicados numa fonte separada e copiados com proveniência, sem trocar para git dependency;
   - o updater não usa o feed `zeron.sh`: vale o `has_release_feed`, e um feed próprio exige `ZERON_RELEASES_URL`.
 
 ## Recusado: continua a versão do fork
@@ -117,6 +119,10 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | Painel de checklist do agente (`TodoStatus`, `inProgress`) | #707 | v0.2.102 | O OMP também mapeia `in_progress` das fases para `InProgress` |
 | Anexos BMP → PNG em background | #739 | v0.2.102 | A classificação de drop do fork (imagem, menção de projeto, arquivo externo) continua síncrona; só o staging lento vai para o background |
 | Inline code com nome de arquivo real vira link | #606/#633 | v0.2.102 | Substitui o chip do fork só nesses spans; os demais seguem chip |
+| Codex voice local/remoto, stage, iOS Live Activities, helper 0.161 | #819/#834 | v0.2.106 | Cinco crates novas e helper standalone do usuário; sem runtime Codex/GStreamer no app. Convive com OMP Live, preserva grants do fork e limita o warmup opcional de conta |
+| Identidade Git, filtros multi-device, ícones e rolling labels | #799/#811 | v0.2.106 | Grupos não substituem Checkout/device nem identidade de Workers; zui recebe a API de glifo transformado mantendo os patches locais |
+| Chips de anexos e pin font | #775/#816 | v0.2.106 | Referências no caret e undo com classificação de menções, long paste e Appshots do fork |
+| Recovery de Chat iOS e snapshots Claude | #826/#835 | v0.2.106 | Recovery real sem fixture; snapshots conhecidos usam linha curada, desconhecidos permanecem |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
 ## Armadilhas conhecidas
@@ -138,6 +144,12 @@ Atualizar este arquivo é parte do closeout de todo sync.
 - **zui vendorizado fica atrás do pin do upstream.** O upstream sobe o rev do `zui` no `Cargo.toml`, e o fork ignora o pin. Código novo do upstream que usa API nova do gpui não compila (`EdgeFade { band_left }` no v0.2.102). Aplicar como patch em `third_party/zui` os commits do zui entre o `base_revision` do `zui-upstream.toml` e o novo pin, e registrar lá.
 - **Testes do fork que o upstream reescreveu por cima.** Quando o upstream acrescenta testes num arquivo que o fork reescreveu (ex.: `engine/tests/workspace_files.rs`), os helpers dele não existem do nosso lado. Mover os testes novos para um arquivo próprio (`workspace_entry_mutations.rs`) com o cabeçalho de helpers do upstream.
 - **Resolver com agentes:** eles podem apagar código "morto" que outro arquivo ainda usa (por exemplo `motion::fast_tier`). A etapa de compilação precisa reconciliar isso.
+
+## Integração v0.2.106
+
+Intervalo completo: `9e1a1115..916cb1ccb1342c2061963a5f6ecf5c977ba46f2c`, 15 commits. Branch `sync/upstream-v0.2.106`, base local autorizada `b01350d6`, worktree `../comet-sync-v0-2-106`. OpenSpec `sync-upstream-v0-2-106` registra decisões e prova. Toda a funcionalidade foi selecionada; bumps de versão e detalhes de release/navegação foram adaptados aos contratos acima. O zui vendorizado vai a `0966d065`, árvore `6e4082751218f31cc40f3f2ace860c0556ba5baa`. A fonte reutilizável fica no `.tmp/zui-source` ignorado do worktree.
+
+A integração foi revisada com preservação dos contratos do fork. Workspace/all-targets, build nativa, UI desktop completa (2.232 testes), Codex, anexos enfileirados, Edge e packaging passaram; as provas nativas de intake/undo/send/echo e Files usaram perfis isolados. A execução inicial do workspace teve 5.051 passes, 21 falhas e 44 ignores já existentes; grupos corrigidos foram reexecutados, sem declarar uma suite final toda verde. O RPC CreateWorktree ainda excedeu o prazo original de quatro segundos na repetição corrigida, e preview churn falhou na drenagem de conexões em três execuções isoladas. Causas não estabelecidas, limites preservados. O core iOS e os bindings foram regenerados, e a rodada final passou com 12 testes unitários ligados e 4 testes de interface, sem falha ou skip; commit fica no closeout. Nenhum push, tag ou troca do app instalado foi feito.
 
 ## Histórico
 
