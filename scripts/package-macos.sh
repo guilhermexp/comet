@@ -4,10 +4,10 @@
 #   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
 # containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set). Outside CI
 # it then installs that bundle as /Applications/Zeron.app — quitting a running
-# copy and replacing any previous install — and launches it.
+# copy and replacing any previous install. It does not launch the app.
 #
 # Usage: scripts/package-macos.sh
-# Env:   ZERON_PACKAGE_INSTALL=0|1 skips/forces the install + launch step
+# Env:   ZERON_PACKAGE_INSTALL=0|1 skips/forces the install step
 #        (default: 1 locally, 0 when CI is set).
 #        CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
 #        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store Connect
@@ -179,6 +179,3 @@ rm -rf "$INSTALL_APP"
 mv "$INSTALL_STAGE" "$INSTALL_APP"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALL_APP"
 echo "installed: $INSTALL_APP"
-
-open "$INSTALL_APP"
-echo "launched: $INSTALL_APP"
