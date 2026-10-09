@@ -1,0 +1,99 @@
+schema_version: 1
+id: 20261009T171751Z-1c4bfd40
+skill_version: 1.1.0
+started_at: "2026-10-09T17:17:51Z"
+finished_at: "2026-10-09T17:19:23Z"
+request: "Usar upstream-sync como teste real no repositório do Comet, sem push ou deploy."
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: refs/heads/main
+  target_sha: 1074bc540b995d6b7e5a6fa5431f1a2420df8d91
+  previous_integrated_sha: 1074bc540b995d6b7e5a6fa5431f1a2420df8d91
+  previous_integration_merge: 5facb8320bd141a31b39f382785630bcce5d123c
+  target_label: v0.2.107
+  target_label_source: docs/upstream-sync.md
+  target_observation: "Fetch de main confirmou o mesmo SHA anunciado pelo remoto; nenhum novo commit incoming."
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: main
+  target_branch: main
+  initial_sha: b74840cf0499905521adcf1c98ef9a2328d8b229
+  observed_target_sha: b74840cf0499905521adcf1c98ef9a2328d8b229
+  observed_origin_main_sha: b74840cf0499905521adcf1c98ef9a2328d8b229
+  result_sha: b74840cf0499905521adcf1c98ef9a2328d8b229
+  result_sha_scope: "Revisão do produto permaneceu igual; este registro e os links documentais pertencem a um commit posterior."
+  initial_worktree: clean
+strategy:
+  operation: none
+  reason: "O alvo upstream já é ancestral de main. Não repetir merge, rebase ou formatação do código."
+changes:
+  incoming_range: 1074bc540b995d6b7e5a6fa5431f1a2420df8d91..1074bc540b995d6b7e5a6fa5431f1a2420df8d91
+  incoming_count: 0
+  imported: []
+  summary: "Nenhuma novidade upstream nesta execução. Primeira adoção do histórico estruturado, sem reconstruir execuções passadas."
+  metadata:
+    - "Este registro YAML versionado."
+    - "Links de descoberta no AGENTS.md e em docs/upstream-sync.md; marco histórico anterior preservado."
+customizations:
+  preserved:
+    - "Todo o código do fork permaneceu inalterado; contratos existentes em docs/upstream-sync.md."
+  adapted: []
+  removed: []
+conflicts: []
+verification:
+  - command: "git status -sb"
+    revision: b74840cf0499905521adcf1c98ef9a2328d8b229
+    result: passed
+    observed: "main...origin/main, sem alterações staged, unstaged ou untracked no início."
+  - command: "git ls-remote --symref upstream HEAD"
+    result: passed
+    observed: "refs/heads/main; 1074bc540b995d6b7e5a6fa5431f1a2420df8d91."
+  - command: "git ls-remote origin refs/heads/main"
+    result: passed
+    observed: "b74840cf0499905521adcf1c98ef9a2328d8b229."
+  - command: "git fetch --no-tags upstream refs/heads/main"
+    result: passed
+    observed: "FETCH_HEAD e upstream/main apontam para 1074bc540b995d6b7e5a6fa5431f1a2420df8d91; nenhuma tag local criada."
+  - command: "git rev-parse --verify 'FETCH_HEAD^{commit}'"
+    result: passed
+    observed: 1074bc540b995d6b7e5a6fa5431f1a2420df8d91
+  - command: "git merge-base --is-ancestor FETCH_HEAD HEAD"
+    result: passed
+    observed: "exit 0: alvo já incorporado."
+  - command: "git rev-list --count HEAD..FETCH_HEAD"
+    result: passed
+    observed: 0
+  - command: "git merge-base --all HEAD FETCH_HEAD"
+    result: passed
+    observed: 1074bc540b995d6b7e5a6fa5431f1a2420df8d91
+  - command: "git show --no-patch --format='%H%n%P%n%s' 5facb832"
+    result: passed
+    observed:
+      merge: 5facb8320bd141a31b39f382785630bcce5d123c
+      parents:
+        - a643cbe38495cfd917b11cc69b68f40c4b543dd3
+        - 1074bc540b995d6b7e5a6fa5431f1a2420df8d91
+  - command: "git merge-base --is-ancestor 5facb8320bd141a31b39f382785630bcce5d123c b74840cf0499905521adcf1c98ef9a2328d8b229"
+    result: passed
+    observed: "exit 0: merge histórico presente na main observada."
+limits:
+  - "Teste real do caminho sem novidades e da adoção do histórico; não exercitou resolução de conflitos."
+  - "Nenhum build, teste de runtime, UI ou CI do Comet foi repetido, pois não houve alteração de código."
+  - "Não renova o aceite das integrações anteriores nem elimina suas limitações."
+  - "finished_at marca o fim da consulta/sincronização; o commit documental de entrega vem depois."
+references:
+  - docs/upstream-sync.md
+  - openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/verification.md
+outcome: unchanged
+pending: []
+delivery:
+  integration: already_present
+  target_branch: main
+  commit: b74840cf0499905521adcf1c98ef9a2328d8b229
+  pr: null
+  pr_reason: "Nenhum PR criado para esta execução documental local."
+  history: "Versionado em commit documental posterior; localizar pelo histórico Git deste arquivo, sem autorreferência ao próprio SHA."
+  publication: not_requested
+  record_pushed: false
+  deploy: not_requested

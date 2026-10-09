@@ -40,7 +40,7 @@ Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml`
 
 ## Remotes e publicação
 
-- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/zeron` (terceiro, MIT; renomeado de `zeronsh/comet`). O upstream reassinou o histórico em set/2026. Estado do último sync, receita, o que recusamos e por quê, armadilhas e histórico: [`docs/upstream-sync.md`](docs/upstream-sync.md).
+- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/zeron` (terceiro, MIT; renomeado de `zeronsh/comet`). O upstream reassinou o histórico em set/2026. Receita, decisões e histórico anterior: [`docs/upstream-sync.md`](docs/upstream-sync.md). Desde 2026-10-09, cada execução da skill gera um [registro YAML versionado](.upstream-sync/history/), inclusive sem novidades ou com falha; confronte os registros com o Git atual antes do próximo sync.
 - **Nunca pushar para o upstream.** Qualquer push vai pro fork.
 - `gh` resolve pro upstream por default: **sempre passar `-R guilhermexp/comet`** em `gh run list`, `gh release view`, etc.
 - `.github/workflows/{deploy,release}.yml` são herdados do upstream: `deploy` publica o Worker Cloudflare em push na `main` que toque `edge/`; `release` dispara em tag `v*` e publica no R2. **Não pushar tag `v*` no fork sem entender o efeito.**

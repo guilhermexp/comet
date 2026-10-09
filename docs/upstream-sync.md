@@ -1,17 +1,25 @@
 # Sync com o upstream (`zeronsh/zeron`)
 
-Registro vivo de **como** sincronizamos com o upstream e **o que decidimos** a cada vez. As decisões detalhadas de cada sync ficam na OpenSpec dele (tabela no fim). Este arquivo guarda o que precisa sobreviver entre syncs: a receita, o que recusamos e por quê, e as armadilhas que já custaram tempo.
+Receita de sincronização e decisões do fork que precisam sobreviver entre syncs. As decisões detalhadas das integrações anteriores ficam nas OpenSpecs da tabela ao fim; os novos relatos por execução ficam no [histórico estruturado](../.upstream-sync/history/).
 
-Atualizar este arquivo é parte do closeout de todo sync.
+No closeout, registre a execução em `.upstream-sync/history/` e atualize esta receita quando houver nova decisão ou armadilha durável. Não duplique aqui um segundo estado atual mantido manualmente.
 
-## Estado atual
+## Marco anterior ao histórico estruturado
 
 | | |
 |---|---|
-| Último commit do upstream mergeado | `1074bc54` (v0.2.107, 2026-10-09) |
+| Upstream incorporado nesse marco | `1074bc54` (v0.2.107, 2026-10-09) |
 | Merge | `5facb832`, incorporado por fast-forward na `main` a partir de `sync/upstream-v0.2.107` |
 | OpenSpec | `openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/` |
-| Próximo sync começa de | `1074bc54`, merge-base natural |
+| Base comprovada nesse marco | `1074bc54`, merge-base natural |
+
+## Registros por execução
+
+A skill `upstream-sync` registra data, alvo, SHAs, mudanças efetivamente trazidas, customizações, conflitos, verificações, resultado e entrega em [`.upstream-sync/history/`](../.upstream-sync/history/), no próprio fork. Antes de sincronizar, leia os registros pertinentes e confirme os commits, a ancestralidade e eventuais reverts no Git; tentativa falha ou só preparada não avança a base integrada.
+
+Cada execução autorizada tem um YAML próprio, incluindo `unchanged`, falhas e abortos. Consultas somente de leitura não escrevem. O registro referencia a revisão do produto e chega ao destino num commit documental posterior, sem incluir o próprio hash; push/publicação continuam separados e exigem autoridade. Histórico que ainda não chegou ao destino permanece pendente.
+
+Primeiro uso da skill: [2026-10-09, sem novidades](../.upstream-sync/history/20261009T171751Z-1c4bfd40.yaml). Os relatos anteriores permanecem preservados neste documento e nas OpenSpecs, sem reconstrução artificial de execuções.
 
 ## Receita
 
