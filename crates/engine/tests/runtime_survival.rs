@@ -1130,6 +1130,9 @@ async fn worker_notice_to_a_parked_parent_waits_for_the_update_and_runs_once() {
         .await
         .unwrap();
     settle(&rig, 1).await;
+    // A real chat's Run command claims its cwd on the row; the queued replay
+    // after the update rebuilds its request from that row.
+    rig.core.workspace.set_chat_cwd(CHAT, "/tmp").unwrap();
 
     rig.core.registry.begin_update(HarnessId::Mock);
     let notice = "[worker-task-notification] Worker finished while the parent was parked.";
