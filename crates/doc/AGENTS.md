@@ -17,6 +17,9 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 - **Device aposentado é tombstone, não delete.** `RegistryDoc` guarda o kind `retiredDevices` (camelCase: a edge só aceita kinds `^[a-z][a-zA-Z0-9]{0,31}$` e rejeitaria o batch inteiro com `retired_devices`). `read_devices` filtra ids aposentados, `upsert_device` de id aposentado é no-op (um engine antigo que reconecte não ressuscita), e `retire_device` move Spaces (mesmo id; `Space.device_id` só muda aqui), chats e rows de sessão desses Spaces para o device sucessor no mesmo batch do tombstone. Validação é da engine. Cobertura: `registry::tests::retiring_a_device_rehomes_its_spaces_and_chats_and_hides_it`, `a_retired_device_is_never_resurrected`.
 
+- `RegistryDoc` e `WorkspaceDoc` persistem `runningSubagents` junto dos campos de contexto e status; ausência em rows antigas vale zero. A contagem não substitui os campos de contexto nem a evidência de conclusão.
+- Perfis sem edge usam `RegistryDoc::set_local_only(true)` para materializar writes sem fila impossível de ACK. Ao conectar edge, um re-seed preserva edições offline e tombstones. Perfis conectados coalescem apenas o tail compatível por row e limitam batches; transições de status que produzem notificações conservam a ordem. Compactação preserva o estado materializado e a fila pendente; aposentadoria de devices mantém seu kind/tombstone.
+
 - Contexto parcial usa os mesmos campos opcionais `contextTokens`/`contextWindow`: Registry grava null e Workspace remove o campo não reportado. `RawSession` aceita tokens sem limite, limite sem tokens e zero real; restart não transforma ausência em zero.
 
 - `MessagePart::Image` é atômica e idempotente por id; fold encerra reasoning anterior e preserva ordem. Schema e salvage validam path/nome não vazios e MIME PNG/JPEG/WebP/GIF, nunca SVG. O gêmeo Edge preserva os mesmos campos.

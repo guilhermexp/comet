@@ -28,6 +28,12 @@ WebRTC e o lifecycle remoto ficam em `Zeron/Voice/`.
   O preview DEBUG usa um Chat seeded explícito, sem fallback na rota real.
 - Voice Activity reflete estado efêmero, oferece mute/end e é encerrada ao
   encerrar a chamada ou ao iniciar o app com estado antigo.
+- Ao ir para background após um envio recente ou ainda pendente, o app solicita
+  uma `UIApplication` background task de até 25 segundos (ou o prazo menor do
+  sistema) para concluir a entrega já persistida. Ela termina ao voltar ao
+  foreground ou sair da conta. O recibo durável retoma no próximo launch; force
+  quit ou perda de rede antes do Edge aceitar os bytes ainda exige reabrir o
+  app para transmitir.
 - `Core/Generated/zeron_core.swift` é gerado a partir do core Rust. Não editar à
   mão; preserve os avisos de licença de WebRTC e Thinking Orbs.
 

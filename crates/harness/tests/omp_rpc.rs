@@ -147,6 +147,7 @@ fn controls_with_answer(
         interrupt: interrupt.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     (controls, steer_tx, interrupt)
 }
@@ -171,6 +172,7 @@ fn controls_with_pending_answer() -> (
         interrupt: interrupt.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     (controls, steer_tx, interrupt)
 }
@@ -202,6 +204,7 @@ fn controls_declining() -> (
         interrupt: interrupt.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     (controls, steer_tx, interrupt)
 }
@@ -557,7 +560,7 @@ async fn process_rejects_oversized_frame_before_waiting_for_newline() {
     launch.request_timeout = Duration::from_secs(5);
     let started = tokio::time::timeout(Duration::from_secs(2), OmpProcess::start(launch))
         .await
-        .expect("reader must reject once the byte limit is crossed, without waiting for newline");
+        .expect("startup must finish or reject oversized output before the handshake deadline");
     match started {
         Err(error) => {
             assert!(error.to_string().contains("frame exceeded"), "{error}");
@@ -568,9 +571,7 @@ async fn process_rejects_oversized_frame_before_waiting_for_newline() {
                 process.request(json!({ "type": "get_state" })),
             )
             .await
-            .expect(
-                "reader must reject once the byte limit is crossed, without waiting for newline",
-            );
+            .expect("reader must reject oversized output without waiting for a newline");
             let error = result.unwrap_err();
             assert!(error.to_string().contains("frame exceeded"), "{error}");
             process.shutdown().await.unwrap();
@@ -693,6 +694,33 @@ async fn commands_are_discovered_from_the_rpc_runtime() {
         .unwrap();
     assert_eq!(commands[0].name, "model");
     assert_eq!(commands[0].input_hint.as_deref(), Some("provider/model"));
+}
+
+#[test]
+fn omp_runtime_identity_tracks_host_tool_grants_but_ignores_codex_mcp() {
+    let harness = fake_harness("normal");
+    let live = request("hello");
+
+    let mut root_grant = live.clone();
+    root_grant.sessions = Some(SessionsGrant {
+        parent_chat_id: "root-chat".into(),
+        endpoint: "ws://127.0.0.1:9".into(),
+        engine_id: "engine-1".into(),
+    });
+    assert!(!harness.same_runtime(&live, &root_grant));
+
+    let mut codex_mcp = live.clone();
+    codex_mcp.mcp = Some(zeron_proto::McpServer {
+        name: "fixture".into(),
+        command: "fixture-mcp".into(),
+        args: vec!["serve".into()],
+        env: Default::default(),
+    });
+    assert!(harness.same_runtime(&live, &codex_mcp));
+
+    let mut inactive_parent = live.clone();
+    inactive_parent.workers_parent_chat_id = Some("unused-parent".into());
+    assert!(harness.same_runtime(&live, &inactive_parent));
 }
 
 #[test]
@@ -1153,6 +1181,9 @@ async fn workers_bridge_rejects_duplicate_and_excess_pending_calls() {
 async fn run_streams_resumes_steers_answers_and_completes_once() {
     let harness = fake_harness("full-run");
     let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let image_dir = tempfile::tempdir().unwrap();
+    let image_path = image_dir.path().join("steer.png");
+    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
     let mut request = request("hello");
     request.model = Some("openai-codex/gpt-5.6-sol".into());
     request.reasoning = Some(ReasoningLevel::High);
@@ -1165,6 +1196,8 @@ async fn run_streams_resumes_steers_answers_and_completes_once() {
         .send(SteerMessage {
             prompt: "next".into(),
             message_id: Some("m2".into()),
+            attachments: vec![image_path.to_string_lossy().into_owned()],
+            config: None,
         })
         .await
         .unwrap();
@@ -1845,6 +1878,8 @@ async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
                 .send(SteerMessage {
                     prompt: "steer-now".into(),
                     message_id: Some("m-steer".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -1939,6 +1974,8 @@ async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
                 .send(SteerMessage {
                     prompt: "steer-now".into(),
                     message_id: Some("m-steer".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -2047,6 +2084,8 @@ async fn worker_notification_during_pending_wait_for_status_is_delivered_promptl
                 .send(SteerMessage {
                     prompt: "[worker-task-notification] Worker \"worker-1\" -> completed.".into(),
                     message_id: Some("m-notice".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -2128,6 +2167,8 @@ async fn natural_result_racing_notification_is_preserved_and_steer_delivered_onc
                     prompt: "[worker-task-notification] Worker \"race-worker\" -> completed."
                         .into(),
                     message_id: Some("m-notice-race".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();

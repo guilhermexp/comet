@@ -93,6 +93,7 @@ mod failure_text_tests {
             context_usage: None,
             error: reason.map(str::to_owned),
             turn_stats: None,
+            running_subagents: 0,
         }
     }
 
@@ -117,6 +118,15 @@ mod failure_text_tests {
         );
         assert_eq!(run_failure_text(None), RUN_FAILED_LABEL);
     }
+}
+
+/// Subagents running under a chat, staleness-checked like
+/// [`effective_indicator`]: a session row nobody has refreshed inside
+/// [`SESSION_STALE_MS`] belongs to a dead engine and counts nothing. Pure.
+pub fn running_subagents(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .map_or(0, |s| s.running_subagents)
 }
 
 /// The full display status for a chat row / tab dot: live states win, then the
@@ -301,6 +311,35 @@ mod gate_tests {
             email: "user@example.com".into(),
             name: None,
         }
+    }
+
+    fn running_session(running: u32, updated_at: DateTime<Utc>) -> Session {
+        Session {
+            last_completed_turn: None,
+            chat_id: "chat".into(),
+            device_id: "dev".into(),
+            status: SessionStatus::Working,
+            started_at: None,
+            updated_at,
+            running_subagents: running,
+            context_usage: None,
+            error: None,
+            turn_stats: None,
+        }
+    }
+
+    #[test]
+    fn running_subagents_count_only_while_the_session_row_is_fresh() {
+        let now = Utc::now();
+        let fresh = running_session(3, now - chrono::Duration::seconds(10));
+        assert_eq!(running_subagents(Some(&fresh), now), 3);
+        // A crashed engine's row must not badge a chat forever.
+        let stale = running_session(
+            3,
+            now - chrono::Duration::milliseconds(SESSION_STALE_MS + 1),
+        );
+        assert_eq!(running_subagents(Some(&stale), now), 0);
+        assert_eq!(running_subagents(None, now), 0);
     }
 
     #[test]

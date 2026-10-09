@@ -327,6 +327,16 @@ impl Harness for OmpHarness {
         true
     }
 
+    /// OMP binds Workers and root-session grants when host tools are
+    /// registered. `RunRequest::mcp` is a separate provider bridge it ignores.
+    fn same_runtime(&self, live: &RunRequest, next: &RunRequest) -> bool {
+        live.model == next.model
+            && live.reasoning == next.reasoning
+            && crate::same_model_options(&live.model_options, &next.model_options)
+            && live.cwd == next.cwd
+            && crate::same_worker_mcp_config(live, next)
+    }
+
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         discover_models_with_launch(self.launch(std::env::current_dir()?, true, None)?).await
     }
@@ -348,7 +358,7 @@ impl Harness for OmpHarness {
         // Attachments are filesystem work that gates nothing on the child:
         // resolve them BEFORE the spawn so no process sits idle through
         // multi-megabyte reads.
-        let images = load_images(&request.attachments, &request.prompt).await?;
+        let images = load_images(&request.attachments, &request.prompt, "prompt").await?;
         let process = OmpProcess::start(self.launch(cwd, false, system_prompt_append)?).await?;
         let events = process.take_events()?;
         process
@@ -716,13 +726,20 @@ fn dispatch_steer(
     process: OmpProcess,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     prompt: String,
+    attachments: Vec<String>,
     failed: mpsc::UnboundedSender<String>,
 ) {
     tokio::spawn(async move {
-        match process
-            .request(json!({ "type": "steer", "message": prompt }))
-            .await
-        {
+        let result = async {
+            let images = load_images(&attachments, &prompt, "steer").await?;
+            let mut request = json!({ "type": "steer", "message": prompt });
+            if !images.is_empty() {
+                request["images"] = Value::Array(images);
+            }
+            process.request(request).await.map(|_| ())
+        }
+        .await;
+        match result {
             Ok(_) => {}
             Err(error) => {
                 let _ = failed.send(prompt);
@@ -757,6 +774,7 @@ async fn run_session(
         interrupt,
         chat_id: _,
         generate_native_title,
+        turn: _,
     } = controls;
     let request_input: Arc<RequestInputFn> = request_input.into();
     let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
@@ -882,13 +900,17 @@ async fn run_session(
             }
             steer = steering.recv(), if steering_open => {
                 match steer {
-                    Some(SteerMessage { prompt, message_id }) => {
+                    Some(steer) => {
+                        let prompt = steer.prompt.clone();
+                        let message_id = steer.message_id.clone();
                         if delivering.is_empty() {
+                            let attachments = steer.attachments;
                             in_flight_steers.push((prompt.clone(), message_id));
                             dispatch_steer(
                                 process.clone(),
                                 event_tx.clone(),
                                 prompt,
+                                attachments,
                                 steer_failed_tx.clone(),
                             );
                         } else {
@@ -902,7 +924,7 @@ async fn run_session(
                                     }
                                 }
                             }
-                            queued_steers.push_back(SteerMessage { prompt, message_id });
+                            queued_steers.push_back(steer);
                         }
                     }
                     None => steering_open = false,
@@ -923,7 +945,12 @@ async fn run_session(
                 if answered.contains(&tool_id) {
                     delivering.remove(&tool_id);
                     if delivering.is_empty() {
-                        while let Some(SteerMessage { prompt, message_id }) =
+                        while let Some(SteerMessage {
+                            prompt,
+                            message_id,
+                            attachments,
+                            ..
+                        }) =
                             queued_steers.pop_front()
                         {
                             in_flight_steers.push((prompt.clone(), message_id));
@@ -931,6 +958,7 @@ async fn run_session(
                                 process.clone(),
                                 event_tx.clone(),
                                 prompt,
+                                attachments,
                                 steer_failed_tx.clone(),
                             );
                         }
@@ -977,12 +1005,13 @@ async fn run_session(
                 }
                 delivering.remove(&tool_id);
                 if delivering.is_empty() {
-                    while let Some(SteerMessage { prompt, message_id }) = queued_steers.pop_front() {
+                    while let Some(SteerMessage { prompt, message_id, attachments, .. }) = queued_steers.pop_front() {
                         in_flight_steers.push((prompt.clone(), message_id));
                         dispatch_steer(
                             process.clone(),
                             event_tx.clone(),
                             prompt,
+                            attachments,
                             steer_failed_tx.clone(),
                         );
                     }
@@ -1496,7 +1525,11 @@ fn cancelled_interactive_response(id: &str, timed_out: bool) -> Value {
 /// file tools, so an oversized set degrades to those paths instead of killing
 /// the turn. Three Retina screenshots routinely exceed the 2 MiB frame once
 /// base64-expanded; refusing them made a routine send unusable.
-async fn load_images(paths: &[String], prompt: &str) -> Result<Vec<Value>, HarnessError> {
+async fn load_images(
+    paths: &[String],
+    prompt: &str,
+    message_type: &str,
+) -> Result<Vec<Value>, HarnessError> {
     let mut candidates = Vec::new();
     for path in paths {
         let Ok(metadata) = tokio::fs::metadata(path).await else {
@@ -1520,7 +1553,7 @@ async fn load_images(paths: &[String], prompt: &str) -> Result<Vec<Value>, Harne
     // envelope, UTF-8 prompt bytes, worst plausible request id, and base64
     // expansion before materializing any attachment into memory.
     let skeleton = json!({
-        "type": "prompt",
+        "type": message_type,
         "message": prompt,
         "images": candidates
             .iter()
@@ -1718,7 +1751,7 @@ mod tests {
             png(dir.path(), "a.png", 64 * 1024),
             png(dir.path(), "b.png", 64 * 1024),
         ];
-        let images = load_images(&paths, "look").await.unwrap();
+        let images = load_images(&paths, "look", "prompt").await.unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(images[0]["mimeType"], "image/png");
         assert!(images[0]["data"].as_str().is_some_and(|d| !d.is_empty()));
@@ -1736,7 +1769,7 @@ mod tests {
         ];
         // Empty, not Err: the prompt already lists every path, so the turn runs.
         assert!(
-            load_images(&paths, "corrige essas falhas")
+            load_images(&paths, "corrige essas falhas", "prompt")
                 .await
                 .unwrap()
                 .is_empty()
@@ -1747,7 +1780,7 @@ mod tests {
     async fn a_single_attachment_over_the_budget_falls_back_too() {
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![png(dir.path(), "huge.png", MAX_OUTBOUND_BYTES + 1)];
-        assert!(load_images(&paths, "").await.unwrap().is_empty());
+        assert!(load_images(&paths, "", "prompt").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1759,6 +1792,6 @@ mod tests {
             notes.to_string_lossy().into_owned(),
             dir.path().join("gone.png").to_string_lossy().into_owned(),
         ];
-        assert!(load_images(&paths, "").await.unwrap().is_empty());
+        assert!(load_images(&paths, "", "prompt").await.unwrap().is_empty());
     }
 }

@@ -36,6 +36,7 @@ async fn managed_install_reaches_session_started() {
         interrupt: interrupt.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     let request = RunRequest {
         mcp: None,

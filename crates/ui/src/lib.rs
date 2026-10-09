@@ -64,6 +64,7 @@ mod questions;
 pub mod queue;
 pub mod rail;
 mod roll_text;
+pub mod running_pill;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -76,6 +77,7 @@ pub mod theme_library;
 pub mod toast;
 mod todo_panel;
 pub mod tool_icons;
+pub(crate) mod tool_images;
 pub mod transcript;
 mod turn_steps;
 pub mod typography;
@@ -273,7 +275,11 @@ pub fn run_app(config: UiConfig) {
 
         cx.register_url_scheme("zeron").detach();
 
-        let state = cx.new(|_| state::AppState::new());
+        let state = cx.new(|cx| {
+            let mut state = state::AppState::new();
+            state.watch_clock_transitions(cx);
+            state
+        });
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {

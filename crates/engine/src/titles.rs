@@ -433,9 +433,10 @@ async fn collect_text(
             rx
         }),
         steering: steer_rx,
-        interrupt,
+        interrupt: interrupt.clone(),
         chat_id: chat_id.to_string(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     let mut stream = harness.run_title(request, controls).await?;
     let mut text = String::new();

@@ -105,6 +105,8 @@ impl TurnWire {
         let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = posts.clone();
         let hold_prompt = overrides["holdPrompt"].as_bool().unwrap_or(false);
+        let truncate_prompt_body = overrides["truncatePromptBody"].as_bool().unwrap_or(false);
+        let empty_prompt_response = overrides["emptyPromptResponse"].as_bool().unwrap_or(false);
         let busy_polls = overrides["busyPolls"].as_u64().unwrap_or(0) as usize;
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_polls = polls.clone();
@@ -159,6 +161,30 @@ impl TurnWire {
                         let _ = request_tx.send(path);
                         std::future::pending::<()>().await;
                         return;
+                    }
+                    if is_post
+                        && (path.ends_with("/prompt_async") || path.ends_with("/prompt"))
+                    {
+                        if truncate_prompt_body {
+                            let _ = request_tx.send(path);
+                            socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort",
+                                )
+                                .await
+                                .unwrap();
+                            return;
+                        }
+                        if empty_prompt_response {
+                            let _ = request_tx.send(path);
+                            socket
+                                .write_all(
+                                    b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+                                )
+                                .await
+                                .unwrap();
+                            return;
+                        }
                     }
                     if path == "/session/status" || path == "/api/session/active" {
                         let count = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -237,6 +263,8 @@ impl TurnWire {
                 .send(crate::SteerMessage {
                     prompt: "second".into(),
                     message_id: None,
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -275,6 +303,7 @@ impl TurnWire {
                 }),
                 steering,
                 interrupt: interrupt.clone(),
+                turn: Default::default(),
             },
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
@@ -414,6 +443,8 @@ async fn completed_turn_keeps_mailbox_alive_for_the_next_queued_request() {
         .send(crate::SteerMessage {
             prompt: "after completion".into(),
             message_id: Some("second".into()),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -2377,12 +2408,63 @@ async fn stalled_prompt_post_has_a_bounded_timeout() {
         false,
     )
     .await;
+    // `request` is the fake server's barrier: it signals only after the
+    // complete body arrives, then withholds headers. Pause after that barrier
+    // so request setup can finish and advancing time exercises the deadline.
     wire.request("/prompt_async").await;
     wire.status("busy");
-    tokio::task::yield_now().await;
     tokio::time::pause();
+    tokio::task::yield_now().await;
     tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
     assert_eq!(wire.done().await.0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn truncated_prompt_response_body_fails_the_turn_while_sse_stays_open() {
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "1.18.31",
+        json!({"truncatePromptBody": true}),
+        false,
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    let (status, error) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::Done { status, error, .. } => break (status, error),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("truncated response body must terminate the prompt through the bus");
+    assert_eq!(status, DoneStatus::Errored);
+    assert!(error.is_some_and(|message| {
+        message.contains("opencode POST /session/fixture/prompt_async")
+    }));
+}
+
+#[tokio::test]
+async fn empty_204_prompt_response_remains_a_success() {
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "1.18.31",
+        json!({"emptyPromptResponse": true}),
+        false,
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
 }
 
 #[tokio::test]

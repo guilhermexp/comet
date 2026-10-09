@@ -115,12 +115,14 @@ fn main() -> anyhow::Result<()> {
             .join(format!("{name}.png"))
             .to_string_lossy()
             .into_owned();
-        attachments::store_loaded(
-            &device,
-            &path,
-            shot.screenshot.name.clone().into(),
-            shot.screenshot.image.clone(),
-        );
+        if let Some(image) = shot.screenshot.image() {
+            attachments::store_loaded(
+                &device,
+                &path,
+                shot.screenshot.name.clone().into(),
+                Arc::clone(image),
+            );
+        }
         paths.push(path);
         shots.push(shot);
     }

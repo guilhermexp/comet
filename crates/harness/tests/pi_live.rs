@@ -83,6 +83,7 @@ async fn real_pi_mock_lifecycle() {
                 .unwrap();
                 rx
             }),
+            turn: Default::default(),
         };
         let request = RunRequest {
             enable_workers_mcp: false,
@@ -124,6 +125,8 @@ async fn real_pi_mock_lifecycle() {
                                 .send(SteerMessage {
                                     prompt: "redirect".into(),
                                     message_id: None,
+                                    attachments: Vec::new(),
+                                    config: None,
                                 })
                                 .await
                                 .unwrap();
@@ -186,6 +189,7 @@ async fn real_pi_mock_lifecycle() {
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| oneshot::channel().1),
+        turn: Default::default(),
     };
     let request = RunRequest {
         enable_workers_mcp: false,
@@ -263,6 +267,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| oneshot::channel().1),
+        turn: Default::default(),
     };
     let request = RunRequest {
         enable_workers_mcp: false,
@@ -293,6 +298,8 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
         tx.send(SteerMessage {
             prompt: prompt.clone(),
             message_id: Some(format!("burst-user-{i}")),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -313,12 +320,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
     // step, rather than being claimed as part of the already-running call.
     let late = vec!["late-1", "late-2", "late-3"];
     for prompt in &late {
-        tx.send(SteerMessage {
-            prompt: (*prompt).into(),
-            message_id: None,
-        })
-        .await
-        .unwrap();
+        tx.send(SteerMessage::text(*prompt)).await.unwrap();
     }
     drop(tx);
     wait_probe_lines(&inputs, burst.len() + late.len()).await;

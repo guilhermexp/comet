@@ -14,6 +14,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.
 - `edition = "2024"` em todas.
+- `zeron-client` mantém o recibo durável `viewer-delivery` separado do outbox de Chat: descoberta reabre Chats sem viewport, refaz wake com credenciais atuais e só conclui a versão depois do ACK das rows e uma wake final. `hostDevice` é hint de roteamento, nunca grant. Working exige posse do host/output; envio ainda não adotado permanece Sending/Queued.
 - Runtime async é **tokio** em todo lugar; a UI faz a ponte por `gpui_tokio` (`Tokio::spawn` vira `Task` do gpui). A UI nunca bloqueia na engine.
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
 - **Configured worker presets receive `launch_worker` briefing at native
@@ -60,7 +61,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-update` | [`update/AGENTS.md`](update/AGENTS.md) | Checagem de release e auto-update do binário |
 | `zeron-markdown` | — (`markdown/src/lib.rs`) | Parser markdown por blocos + reparse incremental e heurística de path (`file_path`), UI-free; compartilhado por `zeron-ui` e pelo core mobile |
 | `zeron-text` | — (`text/src/lib.rs`) | Medição e quebra de linha analítica (rustybuzz + fallback CoreText) do app iOS |
-| `zeron-client` | — (`client/src/lib.rs`) | Thin client sem engine (registry, chat2, ledger de comandos, RPC via relay, modo Demo) |
+| `zeron-client` | — (`client/src/lib.rs`) | Thin client sem engine (registry, chat2, ledger de comandos, recibos viewer-delivery, RPC via relay, modo Demo) |
 | `zeron-mobile` | [`mobile/AGENTS.md`](mobile/AGENTS.md) | Fachada UniFFI e projeção de transcript mobile; arquitetura em [`docs/mobile-rewrite.md`](../docs/mobile-rewrite.md), build por `scripts/ios/build-core.sh` |
 
 | `zeron-audio` | [`audio/AGENTS.md`](audio/AGENTS.md) | PCM, dispositivos nativos, resampling e AEC opcional |

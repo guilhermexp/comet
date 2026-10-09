@@ -238,9 +238,10 @@ use crate::{
     composer::{Composer, ComposerInput, ComposerInputEvent},
     details_sidebar::{
         chat_workers::{
-            ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerLaunchAge, WorkerSemantic,
-            activity_tasks_from_entries, compact_activity_label, format_token_total,
-            project_chat_workers, snapshot_is_active, worker_compact_metadata, worker_launch_age,
+            ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, SubagentFinishedGroup,
+            SubagentPageState, WorkerLaunchAge, WorkerSemantic, activity_tasks_from_entries,
+            compact_activity_label, format_token_total, group_subagents, project_chat_workers,
+            running_subagent_count, snapshot_is_active, worker_compact_metadata, worker_launch_age,
         },
         context::detect_git_branch,
         source_control,
@@ -269,6 +270,29 @@ use crate::{
 
 const USAGE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 const USAGE_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn subagent_section_heading(label: &'static str, count: usize, theme: &Theme) -> gpui::Div {
+    div()
+        .w_full()
+        .px(px(9.0))
+        .pt(px(8.0))
+        .pb(px(4.0))
+        .text_size(px(10.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.text_muted)
+        .child(format!("{label} · {count}"))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FinishedSubagentsDisclosure {
+    expanded: bool,
+}
+
+impl FinishedSubagentsDisclosure {
+    fn toggle(&mut self) {
+        self.expanded = !self.expanded;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextFileAccess {
@@ -401,6 +425,9 @@ pub struct DetailsSidebar {
     composer: Entity<Composer>,
     sidebar: DetailsSidebarState,
     chat_workers: ChatWorkersWidgetState,
+    subagent_pages_chat: Option<String>,
+    subagent_pages: [SubagentPageState; 3],
+    finished_subagents: FinishedSubagentsDisclosure,
     usage: LoadState<Vec<ProviderUsageRow>>,
     usage_snapshot: Option<AgentAccountsSnapshot>,
     usage_fetched_at: Option<std::time::Instant>,
@@ -503,6 +530,9 @@ impl DetailsSidebar {
             composer,
             sidebar: DetailsSidebarState::new(preferences),
             chat_workers: ChatWorkersWidgetState::default(),
+            subagent_pages_chat: None,
+            subagent_pages: Default::default(),
+            finished_subagents: FinishedSubagentsDisclosure::default(),
             usage: LoadState::Idle,
             usage_snapshot: None,
             usage_fetched_at: None,
@@ -2484,8 +2514,10 @@ impl DetailsSidebar {
                     .child(row.title.clone()),
             )
             .child(status);
+        let row_selector = SharedString::from(format!("chat-subagent-{}", row.id));
         div()
-            .id(SharedString::from(format!("chat-subagent-{}", row.id)))
+            .id(row_selector.clone())
+            .debug_selector(move || row_selector.to_string())
             .border_t_1()
             .border_color(theme.border.opacity(0.45))
             .child(
@@ -2729,7 +2761,13 @@ impl DetailsSidebar {
     ) -> gpui::Stateful<gpui::Div> {
         let workflows = snapshot.workflows.len();
         let subagents = snapshot.subagents.len();
+        let running_subagents = running_subagent_count(&snapshot.subagents);
         let workers = snapshot.workers.len();
+        if self.subagent_pages_chat.as_deref() != Some(chat_id.as_str()) {
+            self.subagent_pages_chat = Some(chat_id.clone());
+            self.subagent_pages = Default::default();
+            self.finished_subagents = FinishedSubagentsDisclosure::default();
+        }
         let expansion_ids = snapshot
             .workflows
             .iter()
@@ -2824,7 +2862,7 @@ impl DetailsSidebar {
             .child(self.render_workers_tab(
                 ChatWorkersTab::Subagents,
                 "Subagents",
-                subagents,
+                running_subagents,
                 active,
                 theme,
                 cx,
@@ -2837,6 +2875,7 @@ impl DetailsSidebar {
                 theme,
                 cx,
             ));
+        let subagent_groups = group_subagents(snapshot.subagents.clone());
         let body = match active {
             ChatWorkersTab::Workflows if workflows > 0 => div().children(
                 snapshot
@@ -2844,12 +2883,118 @@ impl DetailsSidebar {
                     .into_iter()
                     .map(|row| self.render_workflow_row(row, theme, cx)),
             ),
-            ChatWorkersTab::Subagents if subagents > 0 => div().children(
-                snapshot
-                    .subagents
-                    .into_iter()
-                    .map(|row| self.render_subagent_row(row, chat_id.clone(), theme, cx)),
-            ),
+            ChatWorkersTab::Subagents if subagents > 0 => {
+                let mut body = div().w_full().flex().flex_col();
+                if !subagent_groups[0].is_empty() {
+                    body = body.child(subagent_section_heading(
+                        "Running",
+                        subagent_groups[0].len(),
+                        theme,
+                    ));
+                    body = body.children(
+                        subagent_groups[0]
+                            .iter()
+                            .cloned()
+                            .map(|row| self.render_subagent_row(row, chat_id.clone(), theme, cx)),
+                    );
+                }
+                let finished_count = subagent_groups[1..].iter().map(Vec::len).sum::<usize>();
+                if finished_count > 0 {
+                    let expanded = self.finished_subagents.expanded;
+                    body = body.child(
+                        div()
+                            .id("chat-subagents-finished-toggle")
+                            .debug_selector(|| "chat-subagents-finished-toggle".into())
+                            .h(px(30.0))
+                            .w_full()
+                            .px(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_pointer()
+                            .role(gpui::Role::Button)
+                            .aria_label("Finished subagents")
+                            .aria_expanded(expanded)
+                            .hover(|style| style.bg(crate::theme::ink(0.05)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.finished_subagents.toggle();
+                                cx.notify();
+                            }))
+                            .child(
+                                icons::icon(if expanded {
+                                    icons::ALT_ARROW_DOWN
+                                } else {
+                                    icons::ALT_ARROW_RIGHT
+                                })
+                                .size(px(12.0))
+                                .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(10.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted)
+                                    .child("Finished"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted)
+                                    .child(finished_count.to_string()),
+                            ),
+                    );
+                    if expanded {
+                        for (slot, page, label, group) in [
+                            (1, 0, "Completed", SubagentFinishedGroup::Completed),
+                            (2, 1, "Failed", SubagentFinishedGroup::Failed),
+                            (3, 2, "Cancelled", SubagentFinishedGroup::Cancelled),
+                        ] {
+                            let rows = &subagent_groups[slot];
+                            if rows.is_empty() {
+                                continue;
+                            }
+                            body = body.child(subagent_section_heading(label, rows.len(), theme));
+                            let shown = self.subagent_pages[page].shown(group, rows.len());
+                            body = body.children(rows.iter().take(shown).cloned().map(|row| {
+                                self.render_subagent_row(row, chat_id.clone(), theme, cx)
+                            }));
+                            if self.subagent_pages[page].has_more(group, rows.len()) {
+                                let id = SharedString::from(format!(
+                                    "chat-subagents-more-{}",
+                                    label.to_lowercase()
+                                ));
+                                let selector = id.clone();
+                                let total = rows.len();
+                                body = body.child(
+                                    div()
+                                        .id(id)
+                                        .debug_selector(move || selector.to_string())
+                                        .h(px(28.0))
+                                        .mx(px(8.0))
+                                        .my(px(4.0))
+                                        .rounded(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .hover(|style| {
+                                            style.bg(crate::theme::ink(0.05)).text_color(theme.text)
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.subagent_pages[page].page_more(group, total);
+                                            cx.notify();
+                                        }))
+                                        .child("Show more"),
+                                );
+                            }
+                        }
+                    }
+                }
+                body
+            }
             ChatWorkersTab::Workers if workers > 0 => {
                 div().children(snapshot.workers.into_iter().map(|worker| {
                     self.render_worker_row(worker, chat_id.clone(), theme, now.clone(), cx)
@@ -2869,6 +3014,7 @@ impl DetailsSidebar {
             div().child(tabs).child(
                 div()
                     .id("chat-workers-body")
+                    .debug_selector(|| "chat-workers-body".into())
                     .max_h(px(chat_workers_viewport_height_px()))
                     .overflow_y_scroll()
                     .child(body),
@@ -3640,13 +3786,20 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
     use super::{
-        ContextFileAccess, DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
-        context_file_access, details_sidebar_background, open_subagent_event, open_worker_event,
+        ContextFileAccess, DetailsSidebar, DetailsSidebarEvent, DetailsSidebarPreferences,
+        DetailsSidebarState, FinishedSubagentsDisclosure, context_file_access,
+        details_sidebar_background, open_subagent_event, open_worker_event,
         subagent_row_avatar_path, worker_click_event,
     };
-    use crate::details_sidebar::chat_workers::{ChatActivityRow, ChatWorkerRow, WorkerSemantic};
+    use crate::details_sidebar::chat_workers::{
+        ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
+    };
     use crate::details_sidebar::context::{DetailsContext, DetailsMode};
     use crate::theme::Theme;
+    use gpui::{
+        AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
+        Window, div, px,
+    };
     use zeron_proto::agent::WorkflowTaskStatus;
 
     fn context(key: &str) -> DetailsContext {
@@ -3658,6 +3811,170 @@ mod tests {
             target_device_id: None,
             mode: DetailsMode::Workers,
         }
+    }
+
+    #[test]
+    fn finished_subagent_disclosure_defaults_closed_and_toggles() {
+        let mut disclosure = FinishedSubagentsDisclosure::default();
+        assert!(!disclosure.expanded);
+
+        disclosure.toggle();
+        assert!(disclosure.expanded);
+
+        disclosure.toggle();
+        assert!(!disclosure.expanded);
+    }
+
+    #[gpui::test]
+    fn finished_subagents_start_hidden_and_reveal_on_native_click(cx: &mut gpui::TestAppContext) {
+        use crate::details_sidebar::widgets::ChatWorkersTab;
+        use gpui::Modifiers;
+
+        struct Probe {
+            sidebar: Entity<DetailsSidebar>,
+            chat_id: String,
+            snapshot: ChatWorkersSnapshot,
+            _sidebar_observe: Subscription,
+        }
+
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let snapshot = self.snapshot.clone();
+                let chat_id = self.chat_id.clone();
+                let theme = Theme::of(cx).clone();
+                let mut body = None;
+                let _ = self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.chat_workers.select(ChatWorkersTab::Subagents);
+                    body = Some(sidebar.render_chat_workers(chat_id, snapshot, None, &theme, cx));
+                });
+                div()
+                    .w(px(900.0))
+                    .h(px(900.0))
+                    .child(body.expect("the Details widget stays mounted"))
+            }
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| crate::state::AppState::new());
+        let workers = cx.new(|cx| crate::workers::model::WorkersModel::detached(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let pickers = composer.read_with(cx, |composer, _| composer.pickers().clone());
+        let sidebar = cx.new(|cx| {
+            DetailsSidebar::new(
+                state,
+                workers,
+                DetailsSidebarPreferences::default(),
+                pickers,
+                composer,
+                cx,
+            )
+        });
+        let row = |id: String, status| ChatActivityRow {
+            title: id.clone(),
+            description: None,
+            id,
+            status,
+            usage: None,
+            progress: Vec::new(),
+            subagent_type: None,
+            started_at_unix_ms: 1,
+        };
+        let mut subagents = vec![row("running".into(), WorkflowTaskStatus::Running)];
+        subagents.extend((0..12).map(|index| {
+            row(
+                format!("completed-{index:02}"),
+                WorkflowTaskStatus::Completed,
+            )
+        }));
+        subagents.push(row("failed".into(), WorkflowTaskStatus::Failed));
+        subagents.push(row("cancelled".into(), WorkflowTaskStatus::Cancelled));
+        let snapshot = ChatWorkersSnapshot {
+            subagents,
+            ..Default::default()
+        };
+        let (probe_view, window) = cx.add_window_view(|_, cx| {
+            let probe_sidebar = sidebar.clone();
+            let observe = cx.observe(&probe_sidebar, |_, _, cx| cx.notify());
+            Probe {
+                sidebar: probe_sidebar,
+                chat_id: "fixture-chat".into(),
+                snapshot,
+                _sidebar_observe: observe,
+            }
+        });
+
+        window.update(|window, cx| window.draw(cx).clear());
+        assert!(window.debug_bounds("chat-subagent-running").is_some());
+        assert!(
+            window
+                .debug_bounds("chat-subagents-finished-toggle")
+                .is_some()
+        );
+        assert!(window.debug_bounds("chat-subagent-completed-00").is_none());
+        assert!(window.debug_bounds("chat-subagent-failed").is_none());
+        assert!(window.debug_bounds("chat-subagent-cancelled").is_none());
+
+        let finished = window
+            .debug_bounds("chat-subagents-finished-toggle")
+            .expect("finished disclosure is visible");
+        window.simulate_click(finished.center(), Modifiers::default());
+        window.update(|window, cx| window.draw(cx).clear());
+        assert!(window.debug_bounds("chat-subagent-completed-00").is_some());
+        assert!(window.debug_bounds("chat-subagent-failed").is_some());
+        assert!(window.debug_bounds("chat-subagent-cancelled").is_some());
+        assert!(
+            window
+                .debug_bounds("chat-subagents-more-completed")
+                .is_some()
+        );
+
+        let body = window
+            .debug_bounds("chat-workers-body")
+            .expect("workers body remains scrollable");
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: body.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-1_000.0))),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        window.update(|window, cx| window.draw(cx).clear());
+        let more = window
+            .debug_bounds("chat-subagents-more-completed")
+            .expect("the Completed list has another page");
+        window.simulate_click(more.center(), Modifiers::default());
+        window.update(|window, cx| window.draw(cx).clear());
+        let mut completed_shown = None;
+        sidebar.read_with(window, |sidebar, _| {
+            completed_shown = Some(sidebar.subagent_pages[0].shown(
+                crate::details_sidebar::chat_workers::SubagentFinishedGroup::Completed,
+                12,
+            ));
+        });
+        assert_eq!(completed_shown, Some(12));
+
+        let _ = probe_view.update(window, |probe, cx| {
+            probe.chat_id = "another-chat".into();
+            cx.notify();
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        assert!(window.debug_bounds("chat-subagent-completed-00").is_none());
+        assert!(window.debug_bounds("chat-subagent-running").is_some());
+        let mut reset_state = None;
+        sidebar.read_with(window, |sidebar, _| {
+            reset_state = Some((
+                sidebar.finished_subagents.expanded,
+                sidebar.subagent_pages[0].shown(
+                    crate::details_sidebar::chat_workers::SubagentFinishedGroup::Completed,
+                    12,
+                ),
+            ));
+        });
+        assert_eq!(reset_state, Some((false, 10)));
     }
 
     #[test]

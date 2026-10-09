@@ -27,6 +27,7 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 - `edge/dist/` é build gerado e ignorado — não confundir com a `dist/` da raiz, que é asset-fonte de packaging.
 - **Push na `main` que toque `edge/` dispara deploy do Worker** via `.github/workflows/deploy.yml`. Mudança aqui é publicação, não só código.
 - Quota de push do ChatRoom (`admitQuota`) conta só pushes **admitidos** — rejeição não estende a janela — e é dimensionada para o flush de reconexão de um Chat em streaming (1.200 pushes / 48 MiB por minuto, por device e room). Existe para conter loop descontrolado, não para medir tráfego honesto.
+- `chatRoute` deriva o Chat ID da rota autenticada e sobrescreve qualquer query enviada pelo cliente. Em pushes com `hostDevice` válido, ChatRoom grava row, recibo versionado de wake e próximo alarme na mesma transação SQLite antes do ACK; encaminha a wake para DeviceRoom e conserva tentativas falhas no alarme durável, separado do prazo de backup. O hint só roteia: identidade e posse continuam validadas pelos rooms. Hint inválido não recusa a row. Retries do recibo de servidor terminam em rejeição permanente (400/403) ou 1.440 tentativas; após exaustão a recuperação depende do sync do host ou do cliente, sem apagar os bytes do comando.
 
 ## Work Guidance
 
@@ -40,6 +41,7 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/*.test.ts` (device frame, liveness) | unit — vitest | `npm -C edge run test` |
+| `test/workerd/chat-wakes.workerd.test.ts` (receipts, retry, rollback e alarme no SQLite real) | integration — workerd | `npm -C edge run test` |
 | `src/{session-room,device-room}.ts` (DOs) | integration — convergência pelo lado Rust | `cargo test -p zeron-sync` |
 | `src/{auth,auth-routes,workos}.ts` | integration | `npm -C edge run test` + `npm -C edge run smoke` |
 | `src/preview-room.ts` | integration — auth, isolamento e protocolo DO | `npm -C edge run test:workerd` |

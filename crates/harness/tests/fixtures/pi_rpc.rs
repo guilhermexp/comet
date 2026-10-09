@@ -79,7 +79,7 @@ fn main() {
             ),
             "get_available_models" => response(
                 &v,
-                json!({"models":[{"id":"mock","provider":"mock","name":"Mock","reasoning":true,"contextWindow":128000}]}),
+                json!({"models":[{"id":"mock","provider":"mock","name":"Mock","reasoning":true,"contextWindow":128000},{"id":"mock-2","provider":"mock","name":"Mock 2","reasoning":true,"contextWindow":128000}]}),
             ),
             "get_available_thinking_levels" => {
                 response(&v, json!({"levels":["off","low","medium","high"]}))
@@ -106,6 +106,9 @@ fn main() {
                 let mut text = v["message"].as_str().unwrap_or("").to_owned();
                 if text == "env" {
                     text = format!("env:{}", std::env::var_os("CLAUDECODE").is_some());
+                }
+                if text == "which-model" {
+                    text = format!("{model}/{thinking}");
                 }
                 if text == "reject" {
                     emit(
@@ -172,6 +175,13 @@ fn main() {
                             while !std::path::Path::new("release-burst").exists()
                                 && !abort.load(Ordering::SeqCst)
                             {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
+                        // Keep the follow-up model step alive until the test cancels
+                        // after observing the consumed-steer confirmation.
+                        if text == "interrupt-after-steer" {
+                            while !abort.load(Ordering::SeqCst) {
                                 std::thread::sleep(Duration::from_millis(5));
                             }
                         }

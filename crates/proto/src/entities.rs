@@ -321,6 +321,11 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Subagents of this chat streaming right now. Rides the session row (and
+    /// its staleness window) so every device's sidebar can badge a chat it
+    /// has not opened; read it through `view::running_subagents`.
+    #[serde(default)]
+    pub running_subagents: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsage>,
     /// Why the last run ended in [`SessionStatus::Errored`] — the harness's own
@@ -1544,6 +1549,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old.context_usage, None);
+        assert_eq!(old.running_subagents, 0);
 
         let session = Session {
             last_completed_turn: None,

@@ -48,6 +48,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         interrupt: token.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     let request = RunRequest {
         mcp: None,

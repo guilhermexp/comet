@@ -508,6 +508,7 @@ impl WorkspaceDoc {
                 row.delete(key)?;
             }
         }
+        row.insert("runningSubagents", i64::from(session.running_subagents))?;
         self.doc.commit();
         Ok(())
     }
@@ -806,6 +807,8 @@ pub(crate) struct RawSession {
     context_tokens: Option<i64>,
     #[serde(default)]
     context_window: Option<i64>,
+    #[serde(default)]
+    running_subagents: u32,
 }
 
 impl From<RawSession> for Session {
@@ -831,6 +834,7 @@ impl From<RawSession> for Session {
             // carries status alone — remote sidebars show a dot, not a cause.
             error: None,
             turn_stats: None,
+            running_subagents: raw.running_subagents,
         }
     }
 }
@@ -942,6 +946,7 @@ mod tests {
             context_usage: None,
             error: None,
             turn_stats: None,
+            running_subagents: 0,
         }
     }
 
@@ -1048,6 +1053,14 @@ mod tests {
             state.sessions,
             vec![session("chat-1", "dev-a", SessionStatus::Working)]
         );
+
+        // The running-subagent count rides the row and survives the round trip.
+        let mut busy = session("chat-1", "dev-a", SessionStatus::Working);
+        busy.running_subagents = 4;
+        ws.upsert_session(&busy).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![busy]);
+        ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
+            .unwrap();
 
         // Upsert refreshes in place — no duplicate rows, cleared options removed.
         let mut updated = chat("chat-1", "dev-a");
@@ -1315,6 +1328,28 @@ mod tests {
 #[cfg(test)]
 mod partial_context_tests {
     use super::*;
+
+    #[test]
+    fn legacy_session_row_keeps_context_without_a_running_count() {
+        let raw: RawSession = serde_json::from_value(serde_json::json!({
+            "chatId": "legacy-chat",
+            "deviceId": "legacy-device",
+            "status": "working",
+            "contextTokens": 59000,
+            "contextWindow": 200000
+        }))
+        .unwrap();
+        let session = Session::from(raw);
+        assert_eq!(session.running_subagents, 0);
+        assert_eq!(
+            session.context_usage,
+            Some(zeron_proto::ContextUsage::reported(
+                Some(59000),
+                Some(200000)
+            ))
+        );
+    }
+
     #[test]
     fn partial_context_usage_survives_persistence() {
         for usage in [
@@ -1333,6 +1368,7 @@ mod partial_context_tests {
                 error: None,
                 last_completed_turn: None,
                 turn_stats: None,
+                running_subagents: 0,
             };
             row.context_usage = Some(usage);
             doc.upsert_session(&row).unwrap();

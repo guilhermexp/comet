@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        turn: Default::default(),
     };
     let request = RunRequest {
         enable_workers_mcp: false,

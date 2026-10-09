@@ -41,6 +41,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - Tipos de Managed Provider Usage são compatíveis por serde e cruzam apenas engine↔UI; não são persistidos em Loro nem sincronizados pelo edge.
 - `HarnessId` também chaveia providers device-local de conta/Usage. Uma variante não torna um runtime executável — só o registry de harness da engine publica descritores runnable. Snapshots do Kimi carregam apenas campos normalizados de conta/quota, nunca material de credencial.
 
+- `Session.running_subagents` é aditivo, default zero em peers antigos. `view::running_subagents` aplica a mesma janela de staleness de status; contagem expirada nunca mantém badge de execução. Contexto e estatísticas do fork continuam campos independentes.
+
 - `Session.last_completed_turn` is optional/defaulted completion evidence. Interrupts, errors and liveness expiry do not advance it; subsequent Working and heartbeat rows retain it.
 
 ## Work Guidance

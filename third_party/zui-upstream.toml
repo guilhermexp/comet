@@ -1,6 +1,6 @@
 repository = "https://github.com/zeronsh/zui"
-base_revision = "0966d065b23e0b7c9b53c2e186705b8bce16fe2d"
-vendored_tree = "6e4082751218f31cc40f3f2ace860c0556ba5baa"
+base_revision = "dce5c1f737a834b32c2b531d552ea78035e54093"
+vendored_tree = "7e0cdc6185ee4f71274883b686010f2283dac6ed"
 vendored_from = "working-tree"
 license = "Apache-2.0"
 
@@ -57,3 +57,12 @@ license = "Apache-2.0"
 # WindowServer blur now retains one standard NSVisualEffectView at 1% alpha
 # behind content; native regression covers reuse, cleanup, resize and lifetime.
 # vendored_tree is the actual Git tree above, not the historical source head.
+
+# Upstream delta integrated for sync/upstream-v0.2.107 (2026-10-09):
+#   0966d065b23e0b7c9b53c2e186705b8bce16fe2d..
+#   dce5c1f737a834b32c2b531d552ea78035e54093.
+# Reused the exact tracked snapshot tree 6e4082751218f31cc40f3f2ace860c0556ba5baa
+# in a separate source checkout, then merged upstream without conflicts.
+# Source merge: 53cd299ab333c94ccab11ada6add7cdf5cd1adcb.
+# Adds borrowed native-composition handles and Windows image/blur composition;
+# macOS glass/headless and both punctuation patches remain unchanged.

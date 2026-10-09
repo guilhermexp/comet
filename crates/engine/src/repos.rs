@@ -385,7 +385,11 @@ impl Repos {
                 program: "git".into(),
                 args,
                 cwd: cwd.map(Path::to_path_buf),
-                env: env.to_vec(),
+                env: env
+                    .iter()
+                    .map(|(key, value)| (key.clone().into(), value.clone().into()))
+                    .collect(),
+                stdin: None,
                 timeout: LONG_GIT_TIMEOUT,
                 output_limit: GIT_OUTPUT_LIMIT,
                 kill_on_drop: false,
@@ -3378,7 +3382,7 @@ prunable gitdir file points to non-existent location
         porcelain: String,
         refuse: &'static [&'static str],
         calls: std::sync::Mutex<Vec<Vec<String>>>,
-        envs: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        envs: std::sync::Mutex<Vec<Vec<(std::ffi::OsString, std::ffi::OsString)>>>,
     }
 
     impl FakeGit {

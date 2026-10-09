@@ -97,6 +97,7 @@ loro-protocol = "0.3"
 # stopped vending CABackdropLayer for Selection — window blur went dead);
 # b68970e rasterizes BackdropBlur in the wgpu renderer (frosted floats on
 # Linux — the Metal path's snapshot/blur/composite, ported).
+# Rounded image masks and blur-aware scene batching come from dce5c1f.
 # The tree now lives at `third_party/zui` (see `third_party/zui-upstream.toml`);
 # path deps replace the previous git pin so `Window::set_background_blur_radius`
 # is available without pushing to zeronsh/zui.
@@ -111,7 +112,7 @@ gpui_tokio = { path = "third_party/zui/crates/gpui_tokio" }
 # Upstream component primitives. Its own `gpui`/`gpui_macros` git deps are
 # redirected to the vendored tree by the `[patch]` below, so the workspace
 # keeps a single GPUI identity.
-gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "4764fd002ab5894ec9413511d01d37481b2129ab" }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "47ccd07295858d66f8fe826df9651a56218eb887" }
 
 # Native voice support. Optional activation is declared by the consuming crate.
 base64 = "0.22"

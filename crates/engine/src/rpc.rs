@@ -1460,8 +1460,8 @@ impl EngineRpc {
                 let chat_ids = deleted.chat_ids;
                 tokio::spawn(async move {
                     for chat_id in chat_ids {
-                        if let Err(err) = sessions.interrupt(&chat_id).await {
-                            tracing::debug!(chat = %chat_id, error = %err, "deleteSpace interrupt skipped");
+                        if let Err(err) = sessions.terminate(&chat_id).await {
+                            tracing::debug!(chat = %chat_id, error = %err, "deleteSpace teardown skipped");
                         }
                         doc_host.purge_chat(&chat_id);
                     }
@@ -2295,19 +2295,27 @@ impl RpcService for EngineRpc {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let p: ChatParams = parse_params(params)?;
-                if opening_tail {
-                    return Ok(RpcReply::Stream(
-                        opening_doc_messages_stream(self.doc_host.clone(), p.chat_id).await?,
-                    ));
-                }
-                let handle = self
-                    .doc_host
-                    .open(&p.chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(RpcReply::Stream(doc_messages_stream(
-                    handle.watch_messages(),
-                    handle.doc_arc(),
-                )))
+                // An open transcript keeps its chat's checkout diff live (and
+                // discardable) even when the chat is archived; the guard lives
+                // exactly as long as the stream.
+                let interest = self.diff_sync.retain_chat(&p.chat_id);
+                let stream = if opening_tail {
+                    opening_doc_messages_stream(self.doc_host.clone(), p.chat_id).await?
+                } else {
+                    let handle = self
+                        .doc_host
+                        .open(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    doc_messages_stream(handle.watch_messages(), handle.doc_arc())
+                };
+                Ok(RpcReply::Stream(
+                    stream
+                        .map(move |frame| {
+                            let _held = &interest;
+                            frame
+                        })
+                        .boxed(),
+                ))
             }
             methods::WATCH_QUEUE => {
                 let p: ChatParams = parse_params(params)?;
@@ -3050,7 +3058,7 @@ impl RpcService for EngineRpc {
 
                     let snapshot = self
                         .diff_sync
-                        .discard_working_tree(&identity.id, &p.expected_checksum)
+                        .discard_working_tree(&identity, &p.expected_checksum)
                         .await
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                     RpcReply::value(&serde_json::json!({
@@ -3081,7 +3089,7 @@ impl RpcService for EngineRpc {
                         p.chat_id.as_deref(),
                     )
                     .map_err(RpcError::Failed)?;
-                    let (snapshot, base, target) =
+                    let (snapshot, base, target, turn_snapshot) =
                         Box::pin(crate::diff_sync::capture_with_base_for_mode(
                             &self.repos,
                             &self.diff_sync,
@@ -3113,6 +3121,7 @@ impl RpcService for EngineRpc {
                     let pair = Box::pin(crate::diff_sync::read_diff_file_text_at(
                         root,
                         &base,
+                        turn_snapshot.as_ref(),
                         target.as_deref(),
                         file,
                     ))
@@ -3123,6 +3132,7 @@ impl RpcService for EngineRpc {
                         root,
                         &mode,
                         &base,
+                        turn_snapshot.as_ref(),
                     ))
                     .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
@@ -3782,10 +3792,13 @@ impl RpcService for EngineRpc {
                     .filter_map(|chat| chat.cwd)
                     .map(std::path::PathBuf::from)
                     .collect();
-                let chunk = self
-                    .uploads
-                    .read_chunk(&p.path, p.offset, &roots)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let uploads = self.uploads.clone();
+                let chunk = tokio::task::spawn_blocking(move || {
+                    uploads.read_chunk(&p.path, p.offset, &roots)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
             }
             methods::FETCH_TOOL_BLOB => {

@@ -120,6 +120,9 @@ impl Harness for HeldHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // Subscribe before publishing the prompt as started. Tests can then
+        // safely finish this run as soon as they observe the prompt.
+        let finish = self.finish.subscribe();
         self.prompts.lock().unwrap().push(request.prompt.clone());
         self.requests.lock().unwrap().push(request.clone());
         let answer = self.asks.then(|| {
@@ -135,7 +138,6 @@ impl Harness for HeldHarness {
                 multi_select: false,
             }])
         });
-        let finish = self.finish.subscribe();
         let steering = controls.steering;
         let prompts = self.prompts.clone();
         let gate = self.mailbox_gate.lock().unwrap().take();
@@ -564,7 +566,11 @@ async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
 /// next turn instead of sitting behind a pause nobody will lift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frozen_queue_still_delivers_worker_notifications() {
-    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    // A genuine Worker notice waits in the queue when the live agent cannot
+    // steer. Stopping that run must preserve the app-owned notice while the
+    // user's follow-up remains frozen.
+    let (core, harness, prompts) =
+        setup_with(HeldHarness::unsteerable(SteeringMode::TurnBoundary)).await;
 
     core.doc_host
         .queue_message(CHAT, "opening", Vec::new())
@@ -579,22 +585,20 @@ async fn a_frozen_queue_still_delivers_worker_notifications() {
         .queue_message(CHAT, "user follow-up", Vec::new())
         .expect("queue user row");
     core.doc_host
-        .queue_command(
+        .queue_worker_notification(
             CHAT,
-            SessionCommandPayload::Steer {
-                prompt: "worker finished".into(),
-                message_id: Some("worker-notify-message:worker-1:event-1".into()),
-            },
+            "worker-notify:worker-1:frozen-event".into(),
+            worker_notice_payload(WORKER_NOTICE, WORKER_NOTICE_ID),
         )
         .expect("queue worker notification");
-    // Upstream v0.2.94 holds a turn-boundary steer ahead of ordinary rows.
     wait_for(
-        || queue_texts(&core) == vec!["worker finished", "user follow-up"],
-        "both rows to be held behind the running turn",
+        || queue_texts(&core) == vec![WORKER_NOTICE, "user follow-up"],
+        "the genuine Worker notice and user row to be held behind the run",
     )
     .await;
 
-    core.doc_host
+    let stop_id = core
+        .doc_host
         .queue_command(CHAT, SessionCommandPayload::Interrupt {})
         .expect("queue interrupt");
     wait_for(
@@ -603,11 +607,35 @@ async fn a_frozen_queue_still_delivers_worker_notifications() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|p| p == "worker finished")
+                .filter(|prompt| prompt.as_str() == WORKER_NOTICE)
+                .count()
+                >= 1
         },
-        "the worker notification to be delivered despite the frozen queue",
+        "Stop to preserve and deliver the genuine Worker notice as one next turn",
     )
     .await;
+
+    let handle = core.doc_host.open(CHAT).expect("open parent chat");
+    wait_for(
+        || {
+            handle.doc().read_commands().unwrap().iter().any(|command| {
+                command.id == stop_id && command.status == zeron_doc::SessionCommandStatus::Applied
+            })
+        },
+        "Stop to settle after releasing the Worker notice",
+    )
+    .await;
+    assert_eq!(
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|prompt| prompt.as_str() == WORKER_NOTICE)
+            .count(),
+        1,
+        "the Worker notice must be delivered exactly once after Stop"
+    );
+    assert!(core.sessions.turn_in_flight(CHAT));
     assert_eq!(queue_texts(&core), vec!["user follow-up"]);
     assert!(
         !prompts
@@ -619,6 +647,12 @@ async fn a_frozen_queue_still_delivers_worker_notifications() {
     );
 
     let _ = harness.finish.send(());
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "the Worker notification turn to finish",
+    )
+    .await;
+    assert_eq!(queue_texts(&core), vec!["user follow-up"]);
     core.shutdown().await;
 }
 
@@ -771,6 +805,169 @@ async fn interrupt_bypasses_a_saturated_prompt_command_drain() {
         "interrupt to bypass blocked prompts",
     )
     .await;
+    core.shutdown().await;
+}
+
+/// A genuine Worker command already pending behind prompt backpressure is
+/// app-owned work. Stop must leave it eligible to run, while ordinary prompts
+/// remain cancelled and the user's composer row stays frozen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_worker_notification_survives_stop_and_keeps_user_queue_paused() {
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *harness.mailbox_gate.lock().unwrap() = Some(gate.clone());
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(|| prompts.lock().unwrap().len() == 1, "opening turn").await;
+
+    // Fill the live steering mailbox so the prompt drain is held with later
+    // commands still Pending. The separate control lane must still Stop it.
+    for i in 0..40 {
+        core.doc_host
+            .queue_command(
+                CHAT,
+                SessionCommandPayload::Steer {
+                    prompt: format!("blocked {i}"),
+                    message_id: Some(format!("blocked-{i}")),
+                },
+            )
+            .expect("queue blocked steer");
+    }
+    wait_for(
+        || user_messages(&core).len() >= 34,
+        "prompt drain to block on the saturated mailbox",
+    )
+    .await;
+
+    core.doc_host
+        .queue_message(CHAT, "user follow-up", Vec::new())
+        .expect("queue user follow-up");
+    let worker_command = "worker-notify:worker-1:pending-before-stop";
+    core.doc_host
+        .queue_worker_notification(
+            CHAT,
+            worker_command.into(),
+            worker_notice_payload(WORKER_NOTICE, WORKER_NOTICE_ID),
+        )
+        .expect("queue Worker notification behind the blocked prompts");
+    let handle = core.doc_host.open(CHAT).expect("open parent chat");
+    wait_for(
+        || {
+            handle.doc().read_commands().unwrap().iter().any(|command| {
+                command.id == worker_command
+                    && command.status == zeron_doc::SessionCommandStatus::Pending
+            })
+        },
+        "Worker command to remain pending behind the prompt drain",
+    )
+    .await;
+    assert_eq!(queue_texts(&core), vec!["user follow-up"]);
+    assert!(
+        !prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt == WORKER_NOTICE)
+    );
+
+    let stop_id = core
+        .doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .expect("queue Stop");
+    wait_for(
+        || {
+            handle.doc().read_commands().unwrap().iter().any(|command| {
+                command.id == stop_id && command.status == zeron_doc::SessionCommandStatus::Applied
+            })
+        },
+        "Stop to bypass the saturated prompt drain",
+    )
+    .await;
+
+    // Stopping drops the old runtime and releases the blocked send. Opening
+    // the stream gate also keeps teardown deterministic if cancellation races
+    // with the test's own harness stream.
+    gate.notify_one();
+    wait_for(
+        || {
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt == WORKER_NOTICE)
+        },
+        "the pending Worker notification to run after Stop",
+    )
+    .await;
+    wait_for(
+        || {
+            handle.doc().read_commands().unwrap().iter().any(|command| {
+                command.id == worker_command
+                    && command.status == zeron_doc::SessionCommandStatus::Applied
+            })
+        },
+        "Worker command to settle as applied",
+    )
+    .await;
+    assert_eq!(
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|prompt| prompt.as_str() == WORKER_NOTICE)
+            .count(),
+        1,
+        "the pending Worker notification must run exactly once"
+    );
+    assert!(core.sessions.turn_in_flight(CHAT));
+    assert_eq!(queue_texts(&core), vec!["user follow-up"]);
+    assert!(
+        !prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt == "user follow-up"),
+        "ordinary composer rows remain frozen while the Worker runs"
+    );
+
+    let _ = harness.finish.send(());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while core.sessions.turn_in_flight(CHAT) {
+        if tokio::time::Instant::now() >= deadline {
+            let observed_prompts = prompts.lock().unwrap().clone();
+            let observed_requests = harness
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.prompt.clone())
+                .collect::<Vec<_>>();
+            let observed_queue = queue_texts(&core);
+            let observed_user_messages = user_messages(&core);
+            let observed_commands = handle
+                .doc()
+                .read_commands()
+                .expect("read commands for timeout diagnostics")
+                .into_iter()
+                .map(|command| (command.id, command.status))
+                .collect::<Vec<_>>();
+            let observed_status = core
+                .sessions
+                .session_status(CHAT)
+                .map(|session| session.status);
+            panic!(
+                "timed out waiting for Worker turn to finish; prompts={observed_prompts:?}; \
+                 request_count={}; request_prompts={observed_requests:?}; queue={observed_queue:?}; \
+                 user_messages={observed_user_messages:?}; command_statuses={observed_commands:?}; \
+                 session_status={observed_status:?}; turn_in_flight={}",
+                observed_requests.len(),
+                core.sessions.turn_in_flight(CHAT),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    assert_eq!(queue_texts(&core), vec!["user follow-up"]);
     core.shutdown().await;
 }
 
@@ -2190,18 +2387,26 @@ async fn worker_notice_bypasses_update_gate_but_ordinary_steers_wait() {
 
     // Held steers can be inserted at the send-now slot, so follow the
     // observed queue order rather than assuming which append is at the head.
-    for expected in ordinary_prompts {
+    for (index, expected) in ordinary_prompts.iter().enumerate() {
         wait_for(
-            || prompts.lock().unwrap().iter().any(|p| p == &expected),
+            || prompts.lock().unwrap().iter().any(|p| p == expected),
             "ordinary prompt to run after the update",
         )
         .await;
         let _ = harness.finish.send(());
-        wait_for(
-            || !core.sessions.turn_in_flight(CHAT),
-            "queued run to finish",
-        )
-        .await;
+        if let Some(next) = ordinary_prompts.get(index + 1) {
+            wait_for(
+                || prompts.lock().unwrap().iter().any(|prompt| prompt == next),
+                "next ordinary prompt to start after the previous run",
+            )
+            .await;
+        } else {
+            wait_for(
+                || !core.sessions.turn_in_flight(CHAT),
+                "last queued run to finish",
+            )
+            .await;
+        }
     }
     core.shutdown().await;
 }

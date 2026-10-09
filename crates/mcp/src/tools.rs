@@ -1534,6 +1534,7 @@ mod tests {
             context_usage: None,
             error: None,
             turn_stats: None,
+            running_subagents: 0,
         };
         // No mid-turn capability is required for a live mailbox delivery.
         let sent = tools

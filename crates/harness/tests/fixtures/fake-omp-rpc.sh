@@ -117,7 +117,7 @@ if [ "$scenario" = "startup-event-flood" ] || [ "$scenario" = "startup-event-ove
 fi
 
 if [ "$scenario" = "oversized-no-newline" ]; then
-  dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\000' x
+  dd if=/dev/zero bs=1048576 count=9 2>/dev/null
   sleep 5
   exit 0
 fi
@@ -310,6 +310,10 @@ while IFS= read -r line; do
         emit '{"type":"tool_execution_end","toolCallId":"tool-1","toolName":"bash","result":{"content":[{"type":"text","text":"ok"}]},"isError":false}'
         if [ -n "$queued_steer" ]; then steer=$queued_steer; else read -r steer; fi
         if has "$steer" '"type":"steer"' && has "$steer" '"message":"next"'; then
+          has "$steer" '"images":' || fail_stage steer_image_missing 51
+          has "$steer" '"type":"image"' || fail_stage steer_image_missing 51
+          has "$steer" '"mimeType":"image/png"' || fail_stage steer_image_mime 52
+          has "$steer" '"data":"iVBORw0KGgpmaXh0dXJl"' || fail_stage steer_image_data 53
           respond "$steer" '{}'
         else
           fail_stage steer 27

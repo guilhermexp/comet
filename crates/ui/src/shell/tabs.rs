@@ -666,6 +666,13 @@ impl Shell {
     /// the explorer slot over its column while open.
     fn render_files_panel_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.files_panel_open(cx);
+        let running_subagents = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat
+                .as_deref()
+                .map_or(0, |chat| state.running_subagents_for(chat, Utc::now()))
+        };
         header_icon_button(
             "toggle-files-panel",
             icons::FILE_TREE,
@@ -683,6 +690,9 @@ impl Shell {
             "Hide files panel"
         } else {
             "Show files panel"
+        })
+        .when(running_subagents > 0, |button| {
+            crate::running_pill::mark_files_button(button, running_subagents, theme)
         })
         .into_any_element()
     }

@@ -13,6 +13,8 @@ use crate::transcript::subagent_tab_title;
 use super::widgets::{ChatWorkersTab, auto_tab_by_recency};
 
 const SETTLED_ACTIVITY_LIMIT: usize = 100;
+pub const SUBAGENT_INITIAL_ROWS: usize = 10;
+pub const SUBAGENT_PAGE_ROWS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerSemantic {
@@ -113,6 +115,80 @@ impl ChatWorkersSnapshot {
                 self.latest_started_at(ChatWorkersTab::Workers),
             ),
         )
+    }
+}
+
+/// Keep the Subagents tab ordered by lifecycle while preserving the snapshot
+/// order within each section. The Details widget uses these groups in place
+/// of the upstream Files footer, so grouping stays on the existing surface.
+pub fn group_subagents(rows: Vec<ChatActivityRow>) -> [Vec<ChatActivityRow>; 4] {
+    let mut groups: [Vec<ChatActivityRow>; 4] = std::array::from_fn(|_| Vec::new());
+    for row in rows {
+        let index = match row.status {
+            WorkflowTaskStatus::Running => 0,
+            WorkflowTaskStatus::Completed => 1,
+            WorkflowTaskStatus::Failed => 2,
+            WorkflowTaskStatus::Cancelled => 3,
+        };
+        groups[index].push(row);
+    }
+    groups
+}
+
+/// Running subagents shown by the widget's current-lifecycle counter.
+pub fn running_subagent_count(rows: &[ChatActivityRow]) -> usize {
+    rows.iter()
+        .filter(|row| row.status == WorkflowTaskStatus::Running)
+        .count()
+}
+
+/// A finished list with its own page limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentFinishedGroup {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl SubagentFinishedGroup {
+    fn index(self) -> usize {
+        match self {
+            Self::Completed => 0,
+            Self::Failed => 1,
+            Self::Cancelled => 2,
+        }
+    }
+}
+
+/// Per-list pagination for the settled Subagents sections.
+///
+/// Each finished category starts with ten rows and advances independently by
+/// ten, so paging a long Completed list does not reveal more Failed rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubagentPageState {
+    shown: [usize; 3],
+}
+
+impl SubagentPageState {
+    pub fn shown(&self, group: SubagentFinishedGroup, total: usize) -> usize {
+        self.shown[group.index()]
+            .max(SUBAGENT_INITIAL_ROWS)
+            .min(total)
+    }
+
+    pub fn has_more(&self, group: SubagentFinishedGroup, total: usize) -> bool {
+        self.shown(group, total) < total
+    }
+
+    /// Reveals the next page for `group` and returns the visible row count.
+    pub fn page_more(&mut self, group: SubagentFinishedGroup, total: usize) -> usize {
+        let index = group.index();
+        let shown = self
+            .shown(group, total)
+            .saturating_add(SUBAGENT_PAGE_ROWS)
+            .min(total);
+        self.shown[index] = shown;
+        shown
     }
 }
 
@@ -440,7 +516,13 @@ pub fn activity_tasks_from_entries(entries: &[SessionMessageEntry]) -> Vec<ChatA
                             subagent_type: None,
                         });
                     task.task_id = subagent_ref.clone();
-                    task.status = status;
+                    // Spawn chips expose running/done/failed, while the
+                    // richer lifecycle row can also report cancellation.
+                    // Keep that terminal state when correlating the two
+                    // records; the chip's fallback Running must not reopen it.
+                    if task.status != WorkflowTaskStatus::Cancelled {
+                        task.status = status;
+                    }
                     if task.description.is_none() {
                         task.description = subagent_tail.clone();
                     }
@@ -480,14 +562,102 @@ mod tests {
     };
 
     use super::{
-        ChatActivityRow, ChatActivityTask, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
-        activity_tasks_from_entries, compact_activity_label, format_token_total, format_usage,
-        project_chat_workers, snapshot_is_active, worker_compact_metadata, worker_launch_age,
-        worker_semantic,
+        ChatActivityRow, ChatActivityTask, ChatWorkerRow, ChatWorkersSnapshot,
+        SUBAGENT_INITIAL_ROWS, SUBAGENT_PAGE_ROWS, SubagentFinishedGroup, SubagentPageState,
+        WorkerSemantic, activity_tasks_from_entries, compact_activity_label, format_token_total,
+        format_usage, group_subagents, project_chat_workers, running_subagent_count,
+        snapshot_is_active, worker_compact_metadata, worker_launch_age, worker_semantic,
     };
 
     fn fixed_now() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp")
+    }
+
+    #[test]
+    fn subagents_group_by_lifecycle_without_reordering_each_group() {
+        let rows = [
+            WorkflowTaskStatus::Completed,
+            WorkflowTaskStatus::Running,
+            WorkflowTaskStatus::Failed,
+            WorkflowTaskStatus::Running,
+            WorkflowTaskStatus::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, status)| ChatActivityRow {
+            id: format!("subagent-{index}"),
+            title: format!("Subagent {index}"),
+            description: None,
+            status,
+            usage: None,
+            progress: Vec::new(),
+            subagent_type: None,
+            started_at_unix_ms: index as u64,
+        })
+        .collect();
+
+        let groups = group_subagents(rows);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.iter().map(|row| row.id.as_str()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["subagent-1", "subagent-3"],
+                vec!["subagent-0"],
+                vec!["subagent-2"],
+                vec!["subagent-4"],
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_finished_lists_page_independently_in_tens() {
+        let mut pages = SubagentPageState::default();
+        assert_eq!(pages.shown(SubagentFinishedGroup::Completed, 25), 10);
+        assert_eq!(pages.shown(SubagentFinishedGroup::Failed, 21), 10);
+        assert_eq!(pages.shown(SubagentFinishedGroup::Cancelled, 3), 3);
+        assert!(pages.has_more(SubagentFinishedGroup::Completed, 25));
+        assert!(!pages.has_more(SubagentFinishedGroup::Cancelled, 3));
+
+        assert_eq!(
+            pages.page_more(SubagentFinishedGroup::Failed, 21),
+            SUBAGENT_INITIAL_ROWS + SUBAGENT_PAGE_ROWS
+        );
+        assert_eq!(pages.shown(SubagentFinishedGroup::Completed, 25), 10);
+        assert_eq!(pages.shown(SubagentFinishedGroup::Failed, 21), 20);
+
+        assert_eq!(pages.page_more(SubagentFinishedGroup::Completed, 25), 20);
+        assert_eq!(pages.page_more(SubagentFinishedGroup::Completed, 25), 25);
+        assert!(!pages.has_more(SubagentFinishedGroup::Completed, 25));
+        assert_eq!(pages.page_more(SubagentFinishedGroup::Completed, 25), 25);
+    }
+
+    #[test]
+    fn running_subagent_count_uses_only_running_lifecycle_rows() {
+        let rows = [
+            WorkflowTaskStatus::Running,
+            WorkflowTaskStatus::Completed,
+            WorkflowTaskStatus::Failed,
+            WorkflowTaskStatus::Cancelled,
+            WorkflowTaskStatus::Running,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, status)| ChatActivityRow {
+            id: format!("subagent-{index}"),
+            title: format!("Subagent {index}"),
+            description: None,
+            status,
+            usage: None,
+            progress: Vec::new(),
+            subagent_type: None,
+            started_at_unix_ms: index as u64,
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(running_subagent_count(&rows), 2);
+        assert_eq!(running_subagent_count(&[]), 0);
     }
 
     fn workflow_task(id: &str) -> ChatActivityTask {
@@ -850,6 +1020,35 @@ mod tests {
             snapshot.subagents[0].description.as_deref(),
             Some("Reviewed parser")
         );
+    }
+
+    #[test]
+    fn cancelled_subagent_lifecycle_update_survives_running_spawn_chip() {
+        let mut cancelled = subagent_task("spawn-1");
+        cancelled.task.status = WorkflowTaskStatus::Cancelled;
+        let entry = SessionMessageEntry {
+            id: "entry-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![
+                MessagePart::WorkflowTask {
+                    id: "workflow-spawn-1".into(),
+                    task: cancelled.task,
+                },
+                spawn_part("spawn-1", SubagentStatus::Running, "Cancelled review"),
+            ],
+            created_at: 1,
+            device_id: "device-1".into(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        };
+
+        let snapshot = project_chat_workers(activity_tasks_from_entries(&[entry]), Vec::new());
+
+        assert_eq!(snapshot.subagents.len(), 1);
+        assert_eq!(snapshot.subagents[0].status, WorkflowTaskStatus::Cancelled);
+        assert_eq!(running_subagent_count(&snapshot.subagents), 0);
+        assert_eq!(group_subagents(snapshot.subagents)[3].len(), 1);
     }
 
     #[test]
