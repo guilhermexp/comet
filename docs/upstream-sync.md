@@ -9,7 +9,7 @@ Atualizar este arquivo é parte do closeout de todo sync.
 | | |
 |---|---|
 | Último commit do upstream mergeado | `1074bc54` (v0.2.107, 2026-10-09) |
-| Merge | A registrar no closeout, branch `sync/upstream-v0.2.107` |
+| Merge | `5facb832`, incorporado por fast-forward na `main` a partir de `sync/upstream-v0.2.107` |
 | OpenSpec | `openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/` |
 | Próximo sync começa de | `1074bc54`, merge-base natural |
 
@@ -159,7 +159,7 @@ Intervalo incoming: `916cb1ccb1342c2061963a5f6ecf5c977ba46f2c..1074bc540b995d6b7
 
 A resolução preserva OMP/Kimi, grants MCP raiz, avisos diretos dos Workers mesmo com fila comum pausada, contexto/erro/usage e o transcript compacto. Revisão e testes também motivaram teardown de descendentes/limite de saída no runner Git, invalidação de runtime por grants, imagens inline no steer OMP, manutenção SQLite sem espera por lock e propagação de erro/timeout completo no POST OpenCode. A auditoria compara somente o intervalo incoming e classifica adaptações intencionais.
 
-Prova e limites: `openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/verification.md`. A build nativa, checks de API, regressões focadas de UI/runtime/harness/sync, Edge/workerd e round-trip iOS têm evidência local. Permanecem limites explícitos no timing Kimi inalterado, prazo intermitente do Stop saturado, benchmark iOS e automação de paste; não se declara suite ampla ou CI verde. Nenhum push, deploy, tag, instalação ou reinício do dev normal integra este sync.
+Prova e limites: `openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/verification.md`. A build nativa, checks de API, regressões focadas de UI/runtime/harness/sync, Edge/workerd e round-trip iOS têm evidência local. Permanecem limites explícitos no timing Kimi inalterado, prazo intermitente do Stop saturado, benchmark iOS e automação de paste; não se declara suite ampla ou CI verde. O merge `5facb832` tem pais `a643cbe3` e `1074bc54`; main incorporada por fast-forward e Graft reconstruído (1.628 arquivos, 52.194 nós). Target temporário removido. Nenhum push, deploy, tag, instalação ou reinício do dev normal integra este sync.
 
 ## Integração v0.2.106
 
@@ -180,5 +180,4 @@ A integração foi revisada com preservação dos contratos do fork. Workspace/a
 | 2026-09-28 | `e13b18de` (#599) | porte pontual | Cmd/Ctrl+C copia a seleção do transcript com o foco fora do composer; o próximo sync resolve para o lado do upstream |
 | 2026-10-02 | até `9e1a1115` (v0.2.102 + 21) | `openspec/changes/sync-upstream-v0-2-102/` | 56 commits; Pi nativo, ditado, seletor compacto opt-in, file tree actions; zui recebe 3 commits por patch |
 | 2026-10-07 | até `916cb1cc` (v0.2.106) | `openspec/changes/archive/2026-10-07-sync-upstream-v0-2-106/` | Merge `cd38b6dc`; 15 commits, Codex voice local/remoto/iOS, chips, identidade Git e catálogos; contratos do fork preservados. Prova desktop/iOS passou; RPC worktree e preview churn permanecem pendentes |
-
 | 2026-10-09 | `916cb1cc..1074bc54` (v0.2.107) | `openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/` | Oito commits: memória, runtimes/Stop, snapshots privados, entrega remota, imagens/badges e subagentes concluídos; contratos do fork preservados. Provas e limites registrados no arquivo verification.md |

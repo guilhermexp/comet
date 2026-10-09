@@ -113,3 +113,5 @@ Final replay acceptance: the correct atomic-hold unit selector passed one case (
 Closeout-only source edits after executable acceptance: remove an unused Option binding without changing the cancellation condition, and apply cargo fmt whitespace. No behavioral change or additional heavy test round.
 
 Protected verification runner exited normally and removed its disposable target. Free disk returned to approximately 100 GiB. Final cargo fmt and diff checks completed; all 62 canonical specs validated, and every delta requirement matched its canonical spec before archive.
+
+Final merge: `5facb8320bd141a31b39f382785630bcce5d123c`, parents `a643cbe38495cfd917b11cc69b68f40c4b543dd3` and `1074bc540b995d6b7e5a6fa5431f1a2420df8d91`. Main was clean and fast-forwarded to this merge. Graft rebuilt successfully on main: 1,628 files, 52,194 nodes, 89,505 edges. No tracked auto-configuration changes resulted. Closeout records the merge identity separately; no publication was performed.
