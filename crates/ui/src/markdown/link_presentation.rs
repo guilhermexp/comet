@@ -387,8 +387,15 @@ impl Element for ResponsiveText {
                     AvailableSpace::Definite(width) => Some(width),
                     _ => None,
                 });
-                let shown = width.map(|width| present(&flat, width, font_size, window, &opts));
-                let flat = shown.as_ref().unwrap_or(&flat);
+                // Intrinsic (unbounded) measurement must still include the
+                // file-link glyph slots: prepaint always inserts them, so a
+                // width measured without them wraps the link's trailing
+                // punctuation onto a second line inside an inline flow box.
+                let shown = match width {
+                    Some(width) => present(&flat, width, font_size, window, &opts),
+                    None => with_file_link_glyphs(&flat, &opts),
+                };
+                let flat = &shown;
                 let lines = window
                     .text_system()
                     .shape_text(flat.text.clone(), font_size, &flat.runs, width, None)

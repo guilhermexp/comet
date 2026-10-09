@@ -1,15 +1,10 @@
 pub mod chat_workers;
 pub mod context;
-pub mod file_actions;
-pub mod file_menu;
-pub mod file_tree;
-pub(crate) mod files_view;
 pub mod idle_recap;
-pub mod recency;
 pub mod source_control;
 pub(crate) mod subagent_avatars;
 pub mod todos;
 pub mod usage;
 pub mod view;
-mod widgets;
+pub(crate) mod widgets;
 pub mod worked_projects;

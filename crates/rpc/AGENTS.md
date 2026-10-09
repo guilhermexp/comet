@@ -22,7 +22,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
 
-- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `RenameWorkspaceEntry`, `DeleteWorkspaceEntry`, `MoveWorkspaceEntry` e `CopyWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Copy/move usam deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash). Desde o sync v0.2.102, `MoveWorkspaceEntry`/`DeleteWorkspaceEntry` usam o modelo do upstream #514 (`operationId`, `expectedCheckoutId`, `expectedSourceRevision`, `expectedKind`, `destinationPath`, `recursive`; reply `WorkspaceMutationOutcome`). Create/Rename/Copy continuam do fork, com reply `WorkspaceEntryMutation`.
+- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `DeleteWorkspaceEntry` e `MoveWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Move usa deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash). Desde o sync v0.2.102, `MoveWorkspaceEntry`/`DeleteWorkspaceEntry` usam o modelo do upstream #514 (`operationId`, `expectedCheckoutId`, `expectedSourceRevision`, `expectedKind`, `destinationPath`, `recursive`; reply `WorkspaceMutationOutcome`). Create continua do fork, com reply `WorkspaceEntryMutation`.
 
 - `SpawnChat` é `local_only`: params `parentChatId`, `prompt`, `spaceId?`; reply `chatId`, `spaceId?`, `deviceId`. Não é relay-forwardable.
 
@@ -30,13 +30,14 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - **`src/method.rs` é a lista única de métodos**: nome de fio, `params`, `reply`, `forwardable`, `stream` e `deadline` de um método moram todos numa linha do macro `rpc_methods!`. Adicionar RPC = uma linha no macro + o handler na engine. Nome e valor de cada const de `methods::` são fio — nunca renomear. A engine lê esses atributos por `zeron_rpc::info(method)`; não existe segunda lista para estender.
 - Frame do device room é o envelope de relay — método novo que precisa ser dirigível de outro device tem que ser relay-forwardable.
 - `FetchToolInput` é unary e relay-forwardable ao device dono; a engine valida ownership do chat antes de ler o journal local.
+- Os RPCs `*Voice*V2` roteiam controle Codex realtime ao device dono: capabilities/prepare/negotiate e mutações são unary forwardable; `OwnVoiceV2` é stream forwardable (prepare 65s, negotiate 95s). Tokens de lease, áudio e signaling não viram comando durável. Os cinco RPCs antigos de Live Voice do OMP foram removidos do registry; clientes antigos recebem método desconhecido sem mutação de Chat.
 - Handler é async e não bloqueia: enumerar path, ler arquivo e afins vão pra `spawn_blocking`.
 - No IPC local, `ProtocolError::HandshakeIncomplete` significa que o peer TCP saiu antes do upgrade e fica em debug; handshakes completos inválidos, `Origin` de browser e demais falhas continuam em warning.
 - `LinkCache::new` instala o watcher de credenciais antes de retornar; sign-out não pode perder a primeira versão do `watch` nem manter sockets autenticados em cache.
-- `WatchTrajectory` e `RevealTrajectoryRaw` são métodos estritamente device-local (IPC local apenas; nunca relay-forwarded — rejeitados no ingresso de conexões virtuais de peer relay pelo wrapper de transporte `RelayPeerService` antes do dispatch, além do gate de `targetDeviceId` no engine como defesa em profundidade). `TrajectoryCursor` é `(source_seq, sub_seq, rev)`: a tupla de posição desambigua o terminal Interrupted legado que compartilha `source_seq` com o prefixo em `sub_seq = u32::MAX`, e `rev` é a revisão de commit do store — sem ela, resume por posição perde a substituição in-place de partial→final. `rev` é `#[serde(default)]` e `0` significa "sem conhecimento de revisão"; `Ord` continua position-first, com `rev` só como desempate.
 
 - `GetTitleSettings` and `SetTitleSettings` are device-forwardable registry methods; title preferences are device-local and not CRDT data.
 - `LinkCache` trata `host_offline` do relay como evidência, não blip: a sequência que termina nele estaciona dials daquele device por `offline_cooldown` (5 min). Esse cooldown sobrevive ao broadcast "online" (que todo handshake emite — inclusive o dial rejeitado — e zerava o próprio backoff, gerando o loop 1.5s/3s/6s) e ao refresh de token; só `reset_cooldown` (presença fresca) ou sign-out o limpam. Falhas comuns seguem a curva 5s→60s. O motivo do link-down pode chegar logo depois da falha do probe; o dial espera até 250ms por ele.
+- Um sinal de retomada do sistema invalida o socket ativo do `HostRelay`, inclusive durante o dial, e inicia outro sem esperar o lease. `LinkCache` fecha links de peers e remove backoffs comuns nesse sinal, mas conserva cooldowns `host_offline` até presença remota fresca (ou sign-out); o sinal `online` continua separado.
 
 ## Work Guidance
 
@@ -49,9 +50,9 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/**` (envelopes, transporte) | unit | `cargo test -p zeron-rpc` |
-| `src/lib.rs` (Trajectory wire contracts, cursor ordering, params/items serde) | unit | `cargo test -p zeron-rpc trajectory` |
-| `src/method.rs` (registro de métodos) | unit | `cargo test -p zeron-rpc method::tests::every_method_has_info_and_stream_implies_forwardable -- --exact` |
+| `src/method.rs` (registro de métodos, incluindo aposentadoria OMP e preservação de Codex Voice) | unit | `cargo test -p zeron-rpc method::tests::every_method_has_info_and_stream_implies_forwardable -- --exact` |
 | `src/server.rs` (classificação do handshake IPC) | unit | `cargo test -p zeron-rpc server::tests::only_an_incomplete_websocket_handshake_is_benign -- --exact` |
+| `src/device_room.rs` (retomada do HostRelay e cooldown remoto) | unit | `cargo test -p zeron-rpc --lib device_room::tests::local_wake -- --nocapture` |
 | `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p zeron-rpc` |
 | `tests/device_room.rs` (revogação de credencial) | integration | `cargo test -p zeron-rpc --test device_room sign_out_closes_cached_peer_links -- --exact` |
 | `tests/device_room.rs` (cooldown de `host_offline`) | integration | `cargo test -p zeron-rpc --test device_room host_offline -- --nocapture` |

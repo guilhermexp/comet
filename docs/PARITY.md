@@ -11,7 +11,7 @@ not built yet).
 | --- | --- | --- |
 | 1.1 Window shell | partial | gpui window, light/dark built-in and imported themes, accent/surface preferences, configurable interface typography, and external links via OS browser. Deferred: frameless-inset/traffic-light chrome (macOS packaging not executed), single-instance lock, dev-vs-packaged port split (env vars instead). |
 | 1.2 App phases | done | Gate / OrgGate ("Create your workspace" + memberships) / app with crossfade; boot splash uses the standard 2.5px dot spinner and fade-out cap (`ui/src/shell.rs`). |
-| 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), tabbed Terminal/Git/file-preview host (360–760), independent Details/Files sidebar (300–700), responsive minimum-width arbitration, header variants, and persisted widths/state in `ui-settings.json`. |
+| 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), tabbed Terminal/Git/file-preview host (360–760), upstream Files explorer (Explorer \| Changes), independent Details sidebar (300–700), responsive minimum-width arbitration, header variants, and persisted widths/state in `ui-settings.json`. |
 | 1.4 Keyboard shortcuts | done | Customizable keymap, click-to-record with conflict detection, per-row reset (`ui/src/settings/shortcuts.rs`); persisted with UI settings. Archive, numeric jump, Ctrl+Tab and Ctrl+Shift+Tab are Chat-scoped and follow the exact visible sidebar order, including device grouping/sort; focused popovers suppress them. |
 | 1.5 Routes | partial | Native navigation instead of URL routes; devices / agents / shortcuts / archived settings pages exist. Profile page (heatmap) is an §8 exclusion. |
 | 1.6 Sidebar | done | Device switcher, project filter, one-list or by-device organization, updated/created sort, optional harness/branch/PR context, status dots, disclosure animation, row actions and resort glide. |
@@ -22,7 +22,6 @@ not built yet).
 | 1.11 Changes viewer | done | Unified and side-by-side file/hunk/line projection, paired no-newline markers, sticky active-file headers, per-file collapse, ±gutters, time-sliced highlighting, preparing/clean/error states, checkout_id → device+cwd resolution. |
 | 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Gap: prefers-reduced-motion switch. |
 | 1.13 State & connection | done | All subscriptions (AuthStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); reconnect from scratch. |
-| 1.14 Chat Trajectory preview | done | Analytical timeline (3 fixed lanes: Input/Model/Tools, Sequence and Recorded duration modes), virtualized execution ledger, 5-tab record inspector (Summary, Payload, Result, Schema, Timing), ephemeral device-local Raw Reveal, live-edge follow/pause, and responsive Split/NarrowDetail layout switching in the unified right tab strip (`ui/src/trajectory/`). |
 | 1.15 Idle session recap | done | Paridade exata com orchestrator.dev: timer de ociosidade na DetailsSidebar, guarda de época (epoch = message count), RPC GenerateChatRecap one-shot desacoplado sem turnos no chat, persistência em ui-settings.json (prune 50/24h) e renderização no card Workspace abaixo de Projects worked (`crates/ui/src/details_sidebar/`). |
 
 ## §2 Control plane
@@ -40,7 +39,6 @@ not built yet).
 | Mutate ops | partial | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exists on the doc layer but is not yet exposed as a Mutate op. |
 | AuthRpc | done | AuthStatus emits the canonical proto shape (`{"state": "signedIn", …}`); SignIn/SignInHeadless/CompleteSignIn/SignOut/ListOrgs/CreateOrg/SelectOrg. |
 | Wire types | done | `zeron-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
-| Trajectory RPCs | done | Local-only atomic snapshot-watermark-delta watch (`WatchTrajectory`) and bounded owner-checked raw field reveal (`RevealTrajectoryRaw`) over Run Journal; never forwarded across devices. |
 
 | GenerateChatRecap | done | RPC local-only (`crates/rpc`, `crates/engine/src/recap.rs`) que projeta o transcript tail e executa one-shot throwaway via cheapest model do harness. |
 ## §3 Backend engine
@@ -66,7 +64,7 @@ not built yet).
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
 | Pi (RPC) | done | Native `PiHarness` (Pi ≥0.85.1), step-boundary steering, native/legacy session resume, per-model thinking levels including off, extension dialogs and Zeron MCP delegation. See [Pi integration](pi.md). |
 | OpenCode adapter | done | `crates/harness/src/opencode/`, HTTP/SSE server protocol, model discovery, turn-boundary steering. |
-| OMP adapter & Live Voice | done | `crates/harness/src/omp/`, native driver over `omp --mode rpc-ui`, live voice audio/context streaming, subagent mapping. |
+| OMP adapter | done | `crates/harness/src/omp/`, native driver over `omp --mode rpc-ui`, text runs, durable steering and subagent mapping. Legacy OMP Live Voice retired on 2026-10-08; Codex Voice remains. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema

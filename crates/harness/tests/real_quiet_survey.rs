@@ -22,6 +22,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
             let (tx, rx) = oneshot::channel();
@@ -39,6 +40,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         interrupt: token.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     (controls, steer_tx, token)
 }

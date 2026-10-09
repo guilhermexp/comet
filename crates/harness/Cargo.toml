@@ -23,12 +23,13 @@ required-features = ["native-fixture"]
 
 [dependencies]
 zeron-doc.workspace = true
+zeron-voice-media.workspace = true
 zeron-proto.workspace = true
 base64 = "0.22"
 reqwest.workspace = true
 regex = "1"
 tokio.workspace = true
-tokio-util = { workspace = true, features = ["io-util"] }
+tokio-util = { workspace = true, features = ["io-util", "codec"] }
 uuid.workspace = true
 futures.workspace = true
 async-trait.workspace = true

@@ -50,7 +50,7 @@ flowchart TD
 | Projeção | Cache por entry, parse incremental, part → rows, agrupamentos, identidade e versão. [`transcript.rs`](../crates/ui/src/transcript.rs):1395/4350/4630 |
 | Render | `render_row_body` despacha para renderers diferentes; virtualização, altura, folds e caches pertencem ao `Transcript`. [`transcript.rs`](../crates/ui/src/transcript.rs):6001 |
 
-**Fronteira importante:** o Chat Transcript é a fonte normal da UI. O Run Journal é local e mais rico. O fetch de input histórico de **Write/Edit** é um caminho explícito separado. A Trajectory é outra surface, com read model próprio; não deve ser usada como substituta silenciosa do transcript.
+**Fronteira importante:** o Chat Transcript é a fonte normal da UI. O Run Journal é local e mais rico. O fetch de input histórico de **Write/Edit** é um caminho explícito separado.
 
 ### Entradas por harness
 
@@ -198,7 +198,7 @@ Os **3 formatos `ToolDetail`** são `Output`, `Diff`, `Stats`. `tool_detail`:554
 | Doc do subagente em aba | `Transcript::for_doc` / `AppState::sub_transcript` | Conteúdo filho separado do pai; sem eco do composer do pai. |
 | Gauge de contexto / catálogos | Usage/AvailableCommands em estado de engine/UI | Não pertencem à narrativa do transcript. |
 | Toasts / falha de transporte | Shell, AppState e toast overlay | Podem acompanhar erro no transcript; exigem correlação por causa, não dedupe global por texto. |
-| Terminal do Chat / terminal de CLI Worker / Trajectory | Surfaces com transportes e modelos próprios | Fora do renderer de Chat streaming. Alterar S06 não altera esses painéis. |
+| Terminal do Chat / terminal de CLI Worker | Surfaces com transportes e modelos próprios | Fora do renderer de Chat streaming. Alterar S06 não altera esses painéis. |
 
 ## Duplicações: o que já é protegido
 

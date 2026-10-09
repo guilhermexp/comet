@@ -4,24 +4,30 @@ Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes,
 Pi, Antigravity, OMP, Prime Agent, and other local CLI runtimes) locally by
 default, with optional multi-device sync.
 
-*English | [简体中文](README.zh-CN.md)*
+*English | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [日本語](README.ja.md)*
 
-![Zeron driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)
+![Zeron desktop app](docs/media/readme/app-screenshot.jpg)
 
-Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
+## Desktop app
 
-## Install and run locally (Linux)
+This repository is the Comet fork; build it from source to retain its Workers and OMP features. Upstream Zeron desktop binaries are available from [GitHub Releases](https://github.com/zeronsh/zeron/releases/latest):
+
+- **macOS** — `zeron-<version>-macos-arm64.dmg`
+- **Windows** — `zeron-<version>-windows-x86_64-setup.exe`
+- **Linux** — `zeron-<version>-linux-<arch>.tar.gz`, then run its `install.sh`
+
+No account or network connection is needed; sessions stay on your device. The fork enables app updates only when its own release feed is configured.
+
+## Headless (CLI)
+
+For servers and other machines without a display, such as a VPS that keeps agents running after you close your laptop. Build this fork from source and run `zeron headless`. The following Linux installer installs upstream Zeron:
 
 ```bash
 curl -fsSL https://zeron.sh/install.sh | sh
 zeron status
 ```
 
-The installer starts the daemon immediately and keeps it running across reboots. No sign-in or sync configuration is required. It also adds Zeron to your application launcher: a per-user `zeron.desktop` and icon under `~/.local/share` (or `$XDG_DATA_HOME`), rewritten each time the installer runs. Linux requires the system ALSA runtime (`libasound.so.2`), including for headless mode because it shares the desktop executable. The installer checks that the binary starts before activating it and reports missing runtime libraries.
-
-The desktop sidebar browser also needs the [Linux browser runtime](docs/reference/linux-browser.md).
-
-Day-to-day:
+The installer starts the engine as a background service that survives reboots.
 
 ```bash
 zeron status      # local/synced mode and engine status
@@ -29,13 +35,13 @@ zeron update      # update to the latest release
 zeron daemon start|stop|restart|status
 ```
 
-## Optional multi-device sync
+## Multi-device sync (optional)
 
-Sign in only when you want to open your account's synced workspace. Authentication changes the profile selected by the next engine start, so stop the daemon before changing it:
+Sign in to start an agent on one device and follow or drive it from another:
 
 ```bash
 zeron daemon stop
-zeron login
+zeron login        # or: zeron logout to return to local-only
 zeron daemon start
 ```
 
@@ -76,8 +82,12 @@ side panel as Terminal and Git; it supports read-only previews for Markdown,
 source code, HTML, PDF, images, CSV/TSV, and Excel workbooks. Files for a
 checkout hosted on another device must be opened on that host device.
 
+## Upstream sponsors
+
+The upstream project thanks [The Context Company](https://www.thecontextcompany.com/) for sponsoring Zeron and accepts [GitHub sponsorships](https://github.com/sponsors/zeronsh).
+
 ---
 
-Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/zeron) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
+Developing or curious how it works? [Ask DeepWiki](https://deepwiki.com/zeronsh/zeron) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Licensed under the [MIT License](LICENSE).

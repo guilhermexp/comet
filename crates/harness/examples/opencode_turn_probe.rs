@@ -66,6 +66,7 @@ async fn main() {
         .run(
             request,
             RunControls {
+                realtime: None,
                 chat_id: String::new(),
                 generate_native_title: false,
                 execution_lease: None,
@@ -90,6 +91,7 @@ async fn main() {
                 }),
                 steering,
                 interrupt: interrupt.clone(),
+                turn: Default::default(),
             },
         )
         .await

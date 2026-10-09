@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
@@ -28,7 +28,7 @@ use gpui::{
 use gpui_tokio::Tokio;
 use zeron_doc::{SessionMessageEntry, TranscriptFrame};
 use zeron_engine::InstanceLock;
-use zeron_proto::{AuthState, WorkspaceScope};
+use zeron_proto::{AuthState, ChatConfig, HarnessId, WorkspaceScope};
 use zeron_rpc::methods;
 use zeron_workers_unpeel::WorkersLaunchRequest;
 
@@ -67,7 +67,6 @@ use crate::state::{
 };
 use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, ToggleTerminal};
 use crate::theme::Theme;
-use crate::trajectory::TrajectoryView;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workers::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
@@ -94,6 +93,8 @@ mod sidebar_sections;
 pub(crate) mod spaces;
 use side_chats::SideChatTab;
 mod tabs;
+mod voice_stage;
+use voice_stage::VOICE_STAGE_ORB_SCALE;
 
 use spaces::{AddSpaceFlow, ProjectPickerTarget, RenameSpaceDialog};
 
@@ -837,9 +838,7 @@ fn sidebar_mode_switch_catalog(
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct TitlebarCapabilities {
     right_pane: bool,
-    trajectory: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkersPanelContext {
     key: String,
@@ -858,7 +857,6 @@ fn titlebar_capabilities(
     };
     TitlebarCapabilities {
         right_pane: available,
-        trajectory: matches!(mode, SidebarMode::Orchestrator) && has_orchestrator_chat,
     }
 }
 
@@ -959,8 +957,6 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
-    /// A Chat's technical trajectory preview. The handle keys [`Shell::trajectory_tabs`].
-    Trajectory(u64),
     /// A side chat forked from the conversation (`shell/side_chats.rs`). The
     /// handle keys [`Shell::side_chats`].
     SideChat(u64),
@@ -977,55 +973,6 @@ fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface
 
 fn workspace_file_title(path: &str) -> SharedString {
     path.rsplit('/').next().unwrap_or(path).to_string().into()
-}
-
-struct TrajectoryTab<T = Entity<TrajectoryView>> {
-    chat_id: String,
-    title: SharedString,
-    view: T,
-}
-
-fn register_trajectory_surface<T>(
-    surfaces: &mut std::collections::HashMap<u64, TrajectoryTab<T>>,
-    sequence: &mut u64,
-    chat_id: &str,
-    title: &str,
-    create_view: impl FnOnce() -> T,
-) -> (RightSurface, bool) {
-    if let Some((id, _)) = surfaces.iter().find(|(_, tab)| tab.chat_id == chat_id) {
-        return (RightSurface::Trajectory(*id), false);
-    }
-    *sequence = sequence.wrapping_add(1);
-    let id = *sequence;
-    surfaces.insert(
-        id,
-        TrajectoryTab {
-            chat_id: chat_id.to_string(),
-            title: title.to_string().into(),
-            view: create_view(),
-        },
-    );
-    (RightSurface::Trajectory(id), true)
-}
-
-fn remove_chat_trajectory_surfaces<T>(
-    surfaces: &mut std::collections::HashMap<u64, TrajectoryTab<T>>,
-    right_tabs: &mut std::collections::HashMap<String, Vec<RightSurface>>,
-    chat_id: &str,
-) -> Vec<u64> {
-    let matching_ids: Vec<u64> = surfaces
-        .iter()
-        .filter(|(_, tab)| tab.chat_id == chat_id)
-        .map(|(&id, _)| id)
-        .collect();
-    for id in &matching_ids {
-        surfaces.remove(id);
-        let surface = RightSurface::Trajectory(*id);
-        if let Some(tabs) = right_tabs.get_mut(chat_id) {
-            remove_right_surface(tabs, surface);
-        }
-    }
-    matching_ids
 }
 
 struct WorkerTerminalTab<T = Entity<WorkersTerminal>> {
@@ -2111,6 +2058,63 @@ enum ShellEscapeOutcome {
     Ignored,
 }
 
+/// When the shell next has render-only clock pixels to repaint, as of `now`:
+/// every second while the selected chat is Working (the trailer's elapsed
+/// timer and its 7s flavour word), else the next wall-clock minute for
+/// relative "5m"/"2h" labels. State transitions (staleness, device presence,
+/// send grace) arrive as AppState notifications instead — see
+/// [`AppState::watch_clock_transitions`]. Nothing else ticks: AwaitingInput
+/// and Errored show no clock, and the connection pill has no countdown (its
+/// spinner animates itself).
+fn shell_clock_wake(state: &AppState, now: DateTime<Utc>) -> DateTime<Utc> {
+    let working = state
+        .selected_chat
+        .as_deref()
+        .is_some_and(|id| state.indicator_for(id, now) == Indicator::Working);
+    if working {
+        return now + chrono::TimeDelta::seconds(1);
+    }
+    DateTime::from_timestamp((now.timestamp().div_euclid(60) + 1) * 60, 0)
+        .unwrap_or(now + chrono::TimeDelta::minutes(1))
+}
+
+/// A one-shot redraw timer, re-armed on every render for the view's next
+/// clock-driven change. Idle views sleep until that deadline instead of
+/// polling.
+#[derive(Default)]
+struct ClockRedraw {
+    wake_at: Option<DateTime<Utc>>,
+    task: Option<Task<()>>,
+}
+
+impl ClockRedraw {
+    /// Notify the view at `wake` unless a redraw is already due no later.
+    /// `slot` finds this timer on the view so the firing task can clear it.
+    fn arm<V: 'static>(
+        &mut self,
+        wake: DateTime<Utc>,
+        now: DateTime<Utc>,
+        slot: fn(&mut V) -> &mut ClockRedraw,
+        cx: &mut Context<V>,
+    ) {
+        if self.task.is_some() && self.wake_at.is_some_and(|at| at <= wake) {
+            return;
+        }
+        let delay = (wake - now).to_std().unwrap_or_default();
+        self.wake_at = Some(wake);
+        self.task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |view, cx| {
+                let clock = slot(view);
+                clock.wake_at = None;
+                clock.task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+}
+
 fn resolve_shell_escape(
     key: &str,
     blocking_overlay: bool,
@@ -2371,6 +2375,24 @@ pub struct Shell {
     sidebar_pane: Entity<SidebarPane>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// The window's voice orchestrator: independent of the selected chat.
+    voice: Entity<crate::voice::VoiceController>,
+    /// Sidebar footer orb (session live) and the full-window stage's orb.
+    voice_footer_orb: Entity<crate::orb::Orb>,
+    voice_stage_orb: Entity<crate::orb::Orb>,
+    /// Above the composer, only while the orchestrator's own chat is open.
+    voice_composer_orb: Entity<crate::orb::Orb>,
+    /// The stage caption's streaming veil (shared with mobile).
+    voice_caption: zeron_veil::CaptionVeil,
+    voice_stage_focus: FocusHandle,
+    voice_stage_was_open: bool,
+    /// Last rendered route, used to distinguish navigation from staying in Settings.
+    voice_stage_route: Route,
+    voice_stage_changed_at: Option<std::time::Instant>,
+    /// The chat selected when the stage opened; picking another closes it.
+    voice_stage_selection: Option<String>,
+    _voice_observation: gpui::Subscription,
+    _voice_catalog: gpui::Subscription,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under. Paint-time
     /// measurement schedules another frame whenever this value changes.
@@ -2446,8 +2468,6 @@ pub struct Shell {
     /// session id. A session gets at most one entity while its tab is open.
     worker_terminal_tabs: std::collections::HashMap<u64, WorkerTerminalTab>,
     worker_terminal_seq: u64,
-    trajectory_tabs: std::collections::HashMap<u64, TrajectoryTab>,
-    trajectory_seq: u64,
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
     side_chat_creating: bool,
@@ -2639,11 +2659,10 @@ pub struct Shell {
     /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
     was_window_active: bool,
     /// Dev/testing knobs (`ZERON_OPEN_DIALOG`, `ZERON_FORCE_GATE`,
-    /// `ZERON_DEMO_UPLOAD`, `ZERON_DEMO_LIVE`) — see [`Shell::new`].
+    /// `ZERON_DEMO_UPLOAD`) — see [`Shell::new`].
     debug_dialog: Option<String>,
     debug_gate: Option<GatePhase>,
     debug_upload: Option<String>,
-    debug_live_voice: Option<String>,
     sidebar_tween: Option<WidthTween>,
     files_tween: Option<WidthTween>,
     sidebar_edge_bounce: Option<motion::ResizeEdgeBounce>,
@@ -2715,8 +2734,8 @@ pub struct Shell {
     /// Clears the jump hints when the window deactivates: a Cmd+Tab away
     /// swallows the key-up, so without this the chips stay on screen for good.
     activation_sub: Option<Subscription>,
-    /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
-    _ticker: Task<()>,
+    /// Redraw scheduled for the next clock-driven change (see [`shell_clock_wake`]).
+    clock: ClockRedraw,
     _state_observation: Subscription,
     _workers_observation: Subscription,
     _workers_sidebar_events: Subscription,
@@ -2792,6 +2811,32 @@ impl Shell {
                 }
             },
         );
+        let voice = cx.new(|_| crate::voice::VoiceController::default());
+        let voice_footer_orb = cx.new(|_| {
+            crate::orb::Orb::new()
+                .size(crate::orb::OrbSize::Inline)
+                .state_transition(Duration::from_millis(300))
+                .visible(false)
+        });
+        let voice_stage_orb = cx.new(|_| {
+            crate::orb::Orb::new()
+                .size(crate::orb::OrbSize::Hero)
+                .state_transition(Duration::from_millis(300))
+                .scale(VOICE_STAGE_ORB_SCALE)
+                .visible(false)
+        });
+        let voice_composer_orb = cx.new(|_| {
+            crate::orb::Orb::new()
+                .size(crate::orb::OrbSize::Avatar)
+                .state_transition(Duration::from_millis(300))
+                .visible(false)
+        });
+        let voice_observation = cx.observe(&voice, |_: &mut Shell, _, cx| cx.notify());
+        // Settings → Agents installed or toggled Codex: voice follows.
+        let voice_catalog =
+            cx.observe_global::<crate::pickers::HarnessCatalogChanged>(|this: &mut Shell, cx| {
+                this.check_voice_codex(true, cx)
+            });
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -2852,43 +2897,10 @@ impl Shell {
         });
         // Spawn chips open their subagent's transcript as a right-pane tab.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
-        // Working-indicator heartbeat: notify once a second while a session is
-        // live so elapsed time and the flavour word stay fresh.
-        let ticker = cx.spawn(async move |this, cx| {
-            let mut displayed_minute = Utc::now().timestamp().div_euclid(60);
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                let minute = Utc::now().timestamp().div_euclid(60);
-                let minute_changed = minute != displayed_minute;
-                displayed_minute = minute;
-                let alive = this.update(cx, |shell: &mut Shell, cx| {
-                    let live = {
-                        let s = shell.state.read(cx);
-                        s.selected_chat
-                            .as_deref()
-                            .is_some_and(|id| s.indicator_for(id, Utc::now()) != Indicator::None)
-                            // The connection pill's retry countdown needs the
-                            // same per-second refresh while degraded.
-                            || matches!(
-                                s.connectivity.state,
-                                zeron_proto::ConnectivityState::Offline
-                                    | zeron_proto::ConnectivityState::Reconnecting
-                            )
-                    };
-                    // Relative sidebar times still advance when unchanged
-                    // presence heartbeats no longer invalidate the whole UI.
-                    if live || minute_changed {
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
         let data_dir = boot.data_dir.clone();
         let mut settings = settings::current(cx);
         state.update(cx, |state, cx| {
+            state.watch_clock_transitions(cx);
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
         // Restore the Workers tree filter. A filter naming a project the next
@@ -2951,10 +2963,6 @@ impl Shell {
                         cx,
                     );
                 }
-                DetailsSidebarEvent::CloseFile {
-                    context_key,
-                    relative_path,
-                } => this.close_preview_surface(context_key, relative_path, cx),
                 DetailsSidebarEvent::OpenSubagent {
                     chat_id,
                     doc_id,
@@ -2998,15 +3006,9 @@ impl Shell {
                 } => this.open_chat_worker(chat_id, session_id, title, cx),
             },
         );
-        let details_for_preview = details_sidebar.clone();
         let file_preview_sub = cx.subscribe(
             &file_preview,
             move |this: &mut Shell, _, event: &FilePreviewEvent, cx| match event {
-                FilePreviewEvent::ActiveChanged { relative_path, .. } => {
-                    details_for_preview.update(cx, |sidebar, cx| {
-                        sidebar.set_active_file(relative_path.clone(), cx)
-                    });
-                }
                 FilePreviewEvent::DisplayModeChanged(mode) => {
                     this.right_pane_expanded =
                         *mode == crate::file_preview::model::PreviewDisplayMode::FullPage;
@@ -3062,9 +3064,6 @@ impl Shell {
         // send on the selected chat (echo bubble + frozen thumbnail progress
         // ring) — display-only; a real upload can't be paused for a capture.
         let debug_upload = crate::capture::knob("ZERON_DEMO_UPLOAD");
-        // `ZERON_DEMO_LIVE=<state>` freezes a visual Live Voice state after
-        // chat selection. Product runs ignore it through the capture umbrella.
-        let debug_live_voice = crate::capture::knob("ZERON_DEMO_LIVE");
         let debug_gate = match crate::capture::knob("ZERON_FORCE_GATE").as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
@@ -3092,6 +3091,18 @@ impl Shell {
             sidebar_pane,
             transcript,
             composer,
+            voice,
+            voice_footer_orb,
+            voice_stage_orb,
+            voice_composer_orb,
+            voice_caption: zeron_veil::CaptionVeil::new(voice_stage::STAGE_CAPTION_CHARS),
+            voice_stage_focus: cx.focus_handle(),
+            voice_stage_was_open: false,
+            voice_stage_route: Route::Chat,
+            voice_stage_changed_at: None,
+            voice_stage_selection: None,
+            _voice_observation: voice_observation,
+            _voice_catalog: voice_catalog,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
@@ -3130,8 +3141,6 @@ impl Shell {
             subagent_seq: 0,
             worker_terminal_tabs: std::collections::HashMap::new(),
             worker_terminal_seq: 0,
-            trajectory_tabs: std::collections::HashMap::new(),
-            trajectory_seq: 0,
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
             side_chat_creating: false,
@@ -3255,7 +3264,6 @@ impl Shell {
             debug_dialog,
             debug_gate,
             debug_upload,
-            debug_live_voice,
             sidebar_tween: None,
             files_tween: None,
             sidebar_edge_bounce: None,
@@ -3287,7 +3295,7 @@ impl Shell {
             navigation_focus: navigation_focus::NavigationFocus::new(cx),
             unfocused: cx.focus_handle(),
             activation_sub: None,
-            _ticker: ticker,
+            clock: ClockRedraw::default(),
             _state_observation: observation,
             _workers_observation: workers_observation,
             _workers_sidebar_events: workers_sidebar_events,
@@ -3331,6 +3339,16 @@ impl Shell {
     }
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        // Voice is an orchestrator over every thread: navigation keeps it,
+        // only losing the engine that hosts it ends the session.
+        if self.voice.read(cx).chat_id.is_some()
+            && state
+                .read(cx)
+                .engine()
+                .is_none_or(|engine| !self.voice.read(cx).belongs_to(engine))
+        {
+            self.voice.update(cx, |voice, cx| voice.cancel(cx));
+        }
         self.prune_file_explorers(cx);
         self.refresh_harness_update_watch(cx);
         if state.read(cx).engine().is_none() {
@@ -3410,12 +3428,7 @@ impl Shell {
                         .collect()
                 };
                 for device_id in &device_ids {
-                    crate::attachments::seed_attachment(
-                        device_id,
-                        &pending_path,
-                        &att.name,
-                        att.image.clone(),
-                    );
+                    crate::attachments::seed_staged(device_id, &pending_path, &att);
                 }
                 let text = crate::attachments::with_attachments(
                     "Here is the screenshot of the bug.",
@@ -3444,21 +3457,6 @@ impl Shell {
                 });
             }
         }
-        if let Some(spec) = self.debug_live_voice.as_deref()
-            && let Some(chat_id) = state.read(cx).selected_chat.clone()
-            && let Some((availability, live_voice)) =
-                crate::live_voice::capture_state(spec, &chat_id)
-        {
-            state.update(cx, |state, cx| {
-                if state.live_voice_availability.as_ref() != Some(&availability)
-                    || state.live_voice != live_voice
-                {
-                    state.live_voice_availability = Some(availability);
-                    state.apply_live_voice(live_voice);
-                    cx.notify();
-                }
-            });
-        }
         // Banners and chimes share one session detector. Completion markers survive
         // queue handoffs and never advance for interrupts or stale activity.
         // A row's first appearance seeds the baseline silently (boot/replay).
@@ -3483,7 +3481,7 @@ impl Shell {
                         let send_pending = state.send_pending(&s.chat_id, now);
                         let chat = state.chats.iter().find(|c| c.id == s.chat_id);
                         let title = chat.and_then(|c| c.title.clone());
-                        let notify = chat.is_some_and(|c| c.parent_chat_id.is_none());
+                        let notify = chat.is_some_and(|c| c.is_top_level());
                         (s.chat_id.clone(), status, send_pending, title, notify)
                     })
                     .collect();
@@ -3738,11 +3736,6 @@ impl Shell {
                 && let Some(changes) = self.diffs.get(&id).cloned()
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
-            }
-            if let RightSurface::Trajectory(id) = self.resolved_right_active(cx)
-                && let Some(tab) = self.trajectory_tabs.get(&id)
-            {
-                tab.view.update(cx, |view, cx| view.ensure_watch(cx));
             }
         }
         match state.read(cx).connection {
@@ -4233,10 +4226,6 @@ impl Shell {
                     .worker_terminal_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone(), false, None)),
-                RightSurface::Trajectory(id) => self
-                    .trajectory_tabs
-                    .get(id)
-                    .map(|tab| (*surface, tab.title.clone(), false, None)),
                 RightSurface::Browser(id) => self.browsers.get(id).map(|browser| {
                     let browser = browser.read(cx);
                     (
@@ -4298,8 +4287,7 @@ impl Shell {
             | RightSurface::Subagent(_)
             | RightSurface::Browser(_)
             | RightSurface::Preview(_)
-            | RightSurface::Worker(_)
-            | RightSurface::Trajectory(_) => {
+            | RightSurface::Worker(_) => {
                 return None;
             }
         };
@@ -4420,7 +4408,12 @@ impl Shell {
             RightSurface::Preview(id) => {
                 if let Some(info) = self.preview_surfaces.get(&id).cloned() {
                     self.file_preview.update(cx, |preview, cx| {
-                        preview.open(info.context_key, info.root, info.relative_path, cx)
+                        preview.activate_surface(
+                            info.context_key,
+                            info.root,
+                            info.relative_path,
+                            cx,
+                        )
                     });
                 }
             }
@@ -4440,11 +4433,6 @@ impl Shell {
                     tab.view
                         .terminal()
                         .update(cx, |terminal, cx| terminal.focus(cx));
-                }
-            }
-            RightSurface::Trajectory(id) => {
-                if let Some(tab) = self.trajectory_tabs.get(&id) {
-                    tab.view.update(cx, |view, cx| view.ensure_watch(cx));
                 }
             }
             RightSurface::Picker => {}
@@ -4608,7 +4596,8 @@ impl Shell {
                 LinkAction::External
             };
         }
-        let outcome = resolved.web_outcome(cfg!(any(target_os = "macos", target_os = "linux")));
+        let outcome =
+            resolved.web_outcome(cfg!(any(target_os = "macos", target_os = "linux", windows)));
         if outcome == LinkOutcome::Internal {
             // `add_browser_surface` opens the pane (fork `panels.show` +
             // `finish_right_transition`), so no separate open is needed.
@@ -5329,41 +5318,6 @@ impl Shell {
         self.set_right_active(RightSurface::Subagent(id), cx);
     }
 
-    pub(super) fn open_trajectory_surface(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        if !self.right_pane_open(cx) {
-            let from = self.right_target(cx);
-            let key = self.panel_key(cx);
-            self.panels.show(&key);
-            self.finish_right_transition(from, cx);
-        }
-        let state = self.state.clone();
-        let cid = chat_id.clone();
-        let (surface, inserted) = register_trajectory_surface(
-            &mut self.trajectory_tabs,
-            &mut self.trajectory_seq,
-            &chat_id,
-            "Trajectory",
-            || {
-                let fixture = crate::capture::trajectory_capture_fixture();
-                cx.new(move |cx| {
-                    let mut view = TrajectoryView::new(state, cid);
-                    match fixture {
-                        Some(fixture) => {
-                            crate::capture::seed_trajectory_fixture(&mut view, fixture, cx)
-                        }
-                        None => view.ensure_watch(cx),
-                    }
-                    view
-                })
-            },
-        );
-        if inserted {
-            let key = self.panel_key(cx);
-            self.right_tabs.entry(key).or_default().push(surface);
-        }
-        self.set_right_active(surface, cx);
-    }
-
     /// Fetch a finished subagent's frozen transcript blob
     /// (`{chat_id}/{doc_id}`); on ANY failure fall back to watching the doc
     /// — the blob upload is best-effort engine-side.
@@ -5543,9 +5497,6 @@ impl Shell {
                 if let Some(tab) = self.worker_terminal_tabs.remove(&id) {
                     tab.view.detach();
                 }
-            }
-            RightSurface::Trajectory(id) => {
-                self.trajectory_tabs.remove(&id);
             }
             RightSurface::Picker => {}
         }
@@ -6471,7 +6422,38 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Voice => crate::dictation::card(cx).into_any_element(),
+            SettingsSection::Voice => {
+                let card = crate::dictation::card(cx);
+                let state = self.state.read(cx);
+                let mut hosts = vec![(None, "This device".to_owned(), true, "Local".to_owned())];
+                for device in &state.devices {
+                    if state.local_device_id.as_deref() == Some(&device.id) {
+                        continue;
+                    }
+                    let online = state.device_online(&device.id, chrono::Utc::now());
+                    let compatible = device.supports(zeron_proto::voice::remote::CAPABILITY);
+                    let detail = if !online {
+                        "Offline"
+                    } else if !compatible {
+                        "Update Zeron to use remote voice"
+                    } else {
+                        "Available"
+                    };
+                    hosts.push((
+                        Some(device.id.clone()),
+                        device.name.clone(),
+                        online && compatible,
+                        detail.into(),
+                    ));
+                }
+                let live = self.voice.read(cx).is_live();
+                card.update(cx, |card, cx| card.set_hosts(hosts, live, cx));
+                if let Some(snapshot) = &self.voice.read(cx).snapshot {
+                    let voices = snapshot.voices.clone();
+                    card.update(cx, |card, cx| card.set_voices(&voices, cx));
+                }
+                card.into_any_element()
+            }
             SettingsSection::Shortcuts | SettingsSection::General | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -7248,6 +7230,7 @@ impl Shell {
     /// Keyboard-owning overlays suppress session navigation shortcuts.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
         self.command_palette.is_some()
+            || self.voice.read(cx).stage_open
             || self.section_dialog.is_some()
             || self.section_menu.is_some()
             || self.add_space.is_some()
@@ -7314,7 +7297,6 @@ impl Shell {
         }
         self.composer
             .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
-        remove_chat_trajectory_surfaces(&mut self.trajectory_tabs, &mut self.right_tabs, &chat_id);
         self.mutate(
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
@@ -8337,29 +8319,6 @@ impl Shell {
         }
     }
 
-    fn render_orchestrator_trajectory_button(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let active = self.right_pane_open(cx)
-            && matches!(self.resolved_right_active(cx), RightSurface::Trajectory(_));
-        header_icon_button(
-            "orchestrator-trajectory",
-            icons::CLOCK_CIRCLE,
-            "Trajectory",
-            active,
-            theme,
-            cx.listener(|this, _, _, cx| {
-                let chat_id = this.active_chat.clone();
-                if !chat_id.is_empty() {
-                    this.open_trajectory_surface(chat_id, cx);
-                }
-            }),
-        )
-        .into_any_element()
-    }
-
     fn render_workers_session_gallery_button(
         &mut self,
         session_id: String,
@@ -8530,13 +8489,14 @@ impl Shell {
         // leave two competing + placements across the responsive variants.
         let plus_alpha = self.titlebar_plus_alpha(cx);
         let show_plus = plus_alpha > 0.01;
+        let over_artwork = settings::current(cx)
+            .new_thread_composer_background
+            .as_ref()
+            .is_some_and(|background| std::path::Path::new(&background.path).is_file());
         let island_target = if matches!(self.route, Route::Chat)
-            && self.state.read(cx).selected_chat.is_none()
+            && (self.state.read(cx).selected_chat.is_none() || self.voice.read(cx).stage_open)
             && self.settings.sidebar_collapsed
-            && settings::current(cx)
-                .new_thread_composer_background
-                .as_ref()
-                .is_some_and(|background| std::path::Path::new(&background.path).is_file())
+            && over_artwork
         {
             1.0
         } else {
@@ -8594,9 +8554,19 @@ impl Shell {
                     .h_full()
                     .w(px(caption_buttons_width(self.linux_left_caption_count())))
             }))
-            .child(window_control_button(
+            .child(window_control_button_with(
                 "toggle-sidebar",
-                icons::SIDEBAR_MINIMALISTIC_LEFT,
+                icons::sidebar_glyph(
+                    motion::state_t(
+                        "toggle-sidebar",
+                        !self.settings.sidebar_collapsed,
+                        motion::GLYPH_STATE,
+                        self.reduced_motion,
+                    ),
+                    false,
+                    16.0,
+                    theme.text_muted,
+                ),
                 ShortcutId::ToggleSidebar.label(),
                 &theme,
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
@@ -9208,6 +9178,7 @@ impl Shell {
                     // carries the titlebar clearance inside the scroll.
                     .flex()
                     .flex_col()
+                    .opacity(self.voice_stage_underlay_opacity(cx))
                     .child(div().flex_1().min_h_0().child(outlet)),
             )
             .child(
@@ -9442,6 +9413,9 @@ impl Shell {
         // Query that owns this row when rendered inside the command palette.
         // Palette rows use namespaced ids/hover keys so they cannot mutate
         // the matching sidebar row.
+        // Whether the row wears its project icon. Rows inside a project
+        // group leave it to the group header.
+        project_icon: bool,
         search_query: Option<&str>,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -9475,7 +9449,7 @@ impl Shell {
             .is_some_and(|chat| {
                 self.state.read(cx).local_device_id.as_deref() != Some(chat.device_id.as_str())
             });
-        let project_icon = (search_query.is_none() && self.settings.sidebar_show_project_icon)
+        let project_icon = (project_icon && search_query.is_none())
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
         let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
@@ -9522,6 +9496,20 @@ impl Shell {
         let shows_metadata = branch.is_some() || change_request.is_some();
         let queued = queued && !undelivered;
         let working = status == zeron_proto::ChatIndicator::Working && !queued && !undelivered;
+        // Subagents running under this chat show as a "● N" pill beside the
+        // row's own activity indicator, never in place of it: the pill takes
+        // the time stamp's spot (compact) or leads the status (regular), and
+        // keeps showing after the parent's own turn has settled.
+        let running_subagents = self.state.read(cx).running_subagents_for(&id, Utc::now());
+        let subagent_pill = |suffix: &str| {
+            (running_subagents > 0).then(|| {
+                crate::running_pill::running_pill(
+                    format!("{row_id}-subagents-{suffix}"),
+                    running_subagents,
+                    theme,
+                )
+            })
+        };
         let compact_status = compact.then(|| {
             let glyph = if working {
                 loaders::mini_glyph_spinner(
@@ -9672,20 +9660,33 @@ impl Shell {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(4.0))
-                        .child(glyph)
+                        .gap(px(6.0))
+                        .children(subagent_pill("label"))
                         .child(
                             div()
-                                .text_size(px(10.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(status_color)
-                                .child(SharedString::from(label)),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(glyph)
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(status_color)
+                                        .child(SharedString::from(label)),
+                                ),
                         )
                         .into_any_element()
                 }
                 None => div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
                     .text_size(px(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
+                    .children(subagent_pill("idle"))
                     .child(time_ago.clone())
                     .into_any_element(),
             }
@@ -9994,22 +9995,38 @@ impl Shell {
                                 .text_color(subline),
                         )
                     })
-                    .when(
-                        if compact {
-                            remote || corner_hovered
-                        } else {
-                            !show_label
-                        },
-                        |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_color(subline)
-                                    .children(corner.take()),
-                            )
-                        },
-                    )
+                    .when(!compact && !show_label, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_color(subline)
+                                .children(corner.take()),
+                        )
+                    })
+                    // Compact trailing cluster, right-packed: the PR badge sits
+                    // LEFT of one fixed slot that shows the relative time, swaps
+                    // to the archive affordance while the row is hovered, and
+                    // shows the Cmd+N jump legend while the modifier is held.
+                    // The legend wins over the hover archive (user request).
+                    // There is no remote globe — the slot's fixed width keeps
+                    // the column aligned across rows regardless of a PR badge.
                     .when(compact, |el| {
+                        // Cmd-held legend beats the hover archive; preview rows
+                        // (the palette) never archive.
+                        let show_legend = compact_jump_label.is_some();
+                        let show_archive = corner_hovered && !show_legend && !preview;
+                        // The slot is 30px (holds "17m"); a text-length jump
+                        // hint widens it to a floor so "Ctrl+1" vs "Ctrl+2"
+                        // never nudges the column.
+                        let text_hint = compact_jump_label
+                            .as_ref()
+                            .is_some_and(|label| label.chars().count() > 3);
+                        // Running subagents take the time stamp's place; the
+                        // legend and the hover archive still win.
+                        let pill = (!show_legend && !show_archive)
+                            .then(|| subagent_pill("compact"))
+                            .flatten();
+                        let archive_id = id.clone();
                         el.children(change_request.clone().map(|summary| {
                             if preview {
                                 crate::change_requests::pull_request_badge_preview(
@@ -10027,22 +10044,9 @@ impl Shell {
                                 )
                             }
                         }))
-                    })
-                    .when(compact, |el| {
-                        // The time slot is 30px, which holds "17m" but not
-                        // "Ctrl+2": unwrapped, the hint broke after the `+`
-                        // and stacked two lines. A text-length hint keeps one
-                        // line in a wider slot — a floor, not content sized,
-                        // so "Ctrl+1" (a narrower glyph) doesn't nudge its
-                        // row's badge off the others'. The floor scales with
-                        // the UI font like the text does, and a longer
-                        // rebound combo grows the slot instead of spilling
-                        // over the title.
-                        let text_hint = compact_jump_label
-                            .as_ref()
-                            .is_some_and(|label| label.chars().count() > 3);
-                        el.child(
+                        .child(
                             div()
+                                .id(SharedString::from(format!("{row_id}-corner")))
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("chat-time-{id}")
@@ -10050,13 +10054,63 @@ impl Shell {
                                 .when(text_hint, |el| {
                                     el.min_w(crate::typography::ui_rems(COMPACT_JUMP_HINT_WIDTH))
                                 })
-                                .when(!text_hint, |el| el.w(px(30.0)))
+                                // A running-subagents pill can be wider than the plain time.
+                                .when(!text_hint, |el| el.min_w(px(30.0)))
+                                // Fixed height so swapping the time text for the
+                                // archive glyph never resizes the slot.
+                                .h(px(14.0))
                                 .flex_none()
-                                .whitespace_nowrap()
-                                .text_right()
-                                .text_size(px(11.0))
-                                .text_color(subline)
-                                .child(compact_jump_label.unwrap_or(time_ago)),
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .aria_label(if show_archive {
+                                    if archived { "Unarchive" } else { "Archive" }
+                                } else {
+                                    "Session time"
+                                })
+                                .when(show_archive, |el| {
+                                    el.cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.chat_hover_resync = true;
+                                            this.set_chat_archived(
+                                                archive_id.clone(),
+                                                !archived,
+                                                cx,
+                                            );
+                                        }))
+                                        .tooltip(crate::settings::widgets::text_tooltip_above(
+                                            if archived {
+                                                "Unarchive session"
+                                            } else {
+                                                ShortcutId::ArchiveSession.label()
+                                            },
+                                        ))
+                                })
+                                .child(if show_archive {
+                                    icon(if archived {
+                                        icons::ARCHIVE_UP_MINIMALISTIC
+                                    } else {
+                                        icons::ARCHIVE_MINIMALISTIC
+                                    })
+                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                    .flex_none()
+                                    .text_color(theme.text_muted)
+                                    .into_any_element()
+                                } else if let Some(pill) = pill {
+                                    pill
+                                } else {
+                                    div()
+                                        .whitespace_nowrap()
+                                        .text_right()
+                                        .text_size(crate::typography::ui_rems(11.0))
+                                        .text_color(subline)
+                                        .child(compact_jump_label.unwrap_or(time_ago))
+                                        .into_any_element()
+                                }),
                         )
                     }),
             )
@@ -10898,6 +10952,7 @@ impl Shell {
             (true, true) => "Close settings · ⌘,".into(),
             (true, false) => "Close settings · Ctrl+,".into(),
         };
+        let voice_trigger = self.render_voice_trigger(theme, cx);
         div()
             .w_full()
             .flex()
@@ -10907,55 +10962,61 @@ impl Shell {
             .child(trigger)
             .child(
                 div()
-                    .id("settings-trigger")
-                    .debug_selector(|| "settings-trigger".into())
-                    .role(gpui::Role::Button)
-                    .aria_label(if settings_open {
-                        "Close settings"
-                    } else {
-                        "Settings"
-                    })
-                    .aria_toggled(if settings_open {
-                        gpui::Toggled::True
-                    } else {
-                        gpui::Toggled::False
-                    })
-                    .tooltip(move |_, cx| {
-                        let text = settings_tooltip.clone();
-                        cx.new(|_| SurfaceTabTooltip { text }).into()
-                    })
-                    .tab_index(0)
-                    .size(px(SIDEBAR_FOOTER_BUTTON_SIZE))
-                    .flex_none()
-                    .rounded(px(8.0))
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .bg(if settings_open {
-                        theme.glass_hover()
-                    } else {
-                        motion::hover_blend(
-                            "settings-trigger",
-                            theme.glass_hover().opacity(0.0),
-                            theme.glass_hover(),
-                        )
-                    })
-                    .on_hover(motion::hover_listener("settings-trigger"))
-                    .focus_visible(|s| s.border_2().border_color(theme.accent))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx)))
+                    .gap(px(2.0))
+                    .children(voice_trigger)
                     .child(
-                        icon(icons::SETTINGS)
-                            .size(px(15.0))
-                            .text_color(if settings_open {
-                                theme.text
+                        div()
+                            .id("settings-trigger")
+                            .debug_selector(|| "settings-trigger".into())
+                            .role(gpui::Role::Button)
+                            .aria_label(if settings_open {
+                                "Close settings"
+                            } else {
+                                "Settings"
+                            })
+                            .aria_toggled(if settings_open {
+                                gpui::Toggled::True
+                            } else {
+                                gpui::Toggled::False
+                            })
+                            .tooltip(move |_, cx| {
+                                let text = settings_tooltip.clone();
+                                cx.new(|_| SurfaceTabTooltip { text }).into()
+                            })
+                            .tab_index(0)
+                            .size(px(SIDEBAR_FOOTER_BUTTON_SIZE))
+                            .flex_none()
+                            .rounded(px(8.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .bg(if settings_open {
+                                theme.glass_hover()
                             } else {
                                 motion::hover_blend(
                                     "settings-trigger",
-                                    theme.text_muted,
-                                    theme.text,
+                                    theme.glass_hover().opacity(0.0),
+                                    theme.glass_hover(),
                                 )
-                            }),
+                            })
+                            .on_hover(motion::hover_listener("settings-trigger"))
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx)))
+                            .child(icon(icons::SETTINGS).size(px(15.0)).text_color(
+                                if settings_open {
+                                    theme.text
+                                } else {
+                                    motion::hover_blend(
+                                        "settings-trigger",
+                                        theme.text_muted,
+                                        theme.text,
+                                    )
+                                },
+                            )),
                     ),
             )
             .into_any_element()
@@ -11407,6 +11468,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "escape" && self.voice.read(cx).stage_open {
+            self.set_voice_stage_open(false, cx);
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.sidebar_session_transfer.is_some() {
             cx.stop_active_drag(window);
             self.cancel_sidebar_session_transfer(cx);
@@ -12211,6 +12277,7 @@ impl Shell {
                         .absolute()
                         .inset_0(),
                     )
+                    .children(self.render_voice_composer_orb(composer_width, cx))
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
                         let composer_opacity = self.composer_dock.borrow().opacity();
@@ -12656,14 +12723,6 @@ impl Shell {
                 .terminal()
                 .clone()
                 .into_any_element(),
-            RightSurface::Trajectory(id) => self
-                .trajectory_tabs
-                .get(&id)
-                .map(|tab| {
-                    tab.view.update(cx, |view, cx| view.ensure_watch(cx));
-                    tab.view.clone().into_any_element()
-                })
-                .unwrap_or_else(|| gpui::Empty.into_any_element()),
             // No tabs: the column is closed, so nothing to host.
             RightSurface::Picker => gpui::Empty.into_any_element(),
         };
@@ -12921,9 +12980,7 @@ impl Shell {
                             .rsplit('/')
                             .next()
                             .unwrap_or(&info.relative_path);
-                        let path = crate::details_sidebar::files_view::material_icon_path(
-                            name, false, false,
-                        );
+                        let path = crate::material_icons::material_icon_path(name, false, false);
                         icons::material_file_icon_image(path.as_ref())
                     })
                     .map(|image| {
@@ -12960,10 +13017,6 @@ impl Shell {
                     .size(px(12.0))
                     .text_color(theme.text_muted)
                     .into_any_element(),
-                RightSurface::Trajectory(_) => icon(icons::CLOCK_CIRCLE)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
                 RightSurface::Browser(id) => self
                     .browsers
                     .get(&id)
@@ -12980,8 +13033,7 @@ impl Shell {
                 RightSurface::File(_) => {
                     let identity: &str = detail.as_deref().unwrap_or(&title);
                     let name = identity.rsplit('/').next().unwrap_or(identity);
-                    let path =
-                        crate::details_sidebar::files_view::material_icon_path(name, false, false);
+                    let path = crate::material_icons::material_icon_path(name, false, false);
                     icons::material_file_icon_image(path.as_ref())
                         .map(|image| {
                             img(image)
@@ -13160,7 +13212,7 @@ impl Shell {
                 }))
                 .child(
                     // Leading slot: the surface's icon (fork icon set: Material
-                    // file icons, doc-keyed subagent avatars, Worker/Trajectory).
+                    // file icons, doc-keyed subagent avatars, Worker).
                     div()
                         .flex_none()
                         .size(px(18.0))
@@ -14049,7 +14101,19 @@ fn window_control_button(
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let muted = theme.text_muted;
+    let glyph = icon(icon_path).size(px(16.0)).text_color(theme.text_muted);
+    window_control_button_with(id, glyph, label, theme, on_click)
+}
+
+/// [`window_control_button`] around a caller-drawn glyph (the morphing
+/// sidebar glyph).
+fn window_control_button_with(
+    id: &'static str,
+    glyph: impl IntoElement,
+    label: &'static str,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let fade_key = format!("window-control-{id}");
     div()
         .id(id)
@@ -14086,7 +14150,7 @@ fn window_control_button(
             on_click(event, window, cx)
         })
         .tooltip(crate::settings::widgets::text_tooltip(label))
-        .child(icon(icon_path).size(px(16.0)).text_color(muted))
+        .child(glyph)
 }
 
 const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
@@ -14236,6 +14300,23 @@ fn header_icon_button(
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let glyph = icon(icon_path).size(px(16.0)).text_color(if active {
+        theme.text
+    } else {
+        theme.text_muted
+    });
+    header_icon_button_with(id, glyph, label, active, on_click)
+}
+
+/// [`header_icon_button`] around a caller-drawn glyph (the morphing sidebar
+/// glyph).
+fn header_icon_button_with(
+    id: &'static str,
+    glyph: impl IntoElement,
+    label: &'static str,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
     let fade_key = format!("header-icon-{id}");
     let bg = if active {
         crate::theme::glass_selected_bg()
@@ -14265,11 +14346,7 @@ fn header_icon_button(
             on_click(event, window, cx)
         })
         .tooltip(crate::settings::widgets::text_tooltip(label))
-        .child(icon(icon_path).size(px(16.0)).text_color(if active {
-            theme.text
-        } else {
-            theme.text_muted
-        }))
+        .child(glyph)
 }
 
 impl Render for Shell {
@@ -14280,6 +14357,13 @@ impl Render for Shell {
                 self.push_toast(crate::toast::Toast::info(notice), cx);
             }
         }
+        // Every repaint (state frame, input, or the clock firing) reschedules
+        // the next clock-driven one; the sidebar and transcript follow this
+        // view's notifications.
+        let now = Utc::now();
+        let wake = shell_clock_wake(self.state.read(cx), now);
+        self.clock
+            .arm(wake, now, |shell: &mut Shell| &mut shell.clock, cx);
         let active_files_key = self.panel_key(cx);
         let hidden_explorers = self
             .files
@@ -14293,6 +14377,7 @@ impl Render for Shell {
             files.update(cx, |files, cx| files.suspend_tree_interactions(cx));
         }
         settings::wallpaper::preload(cx);
+        self.sync_voice_stage(window, cx);
         self.navigation_focus
             .remember(&self.shortcut_focus, window, cx);
         // A diff header's "open in Files" (#311) arrives through a window-less
@@ -14419,7 +14504,7 @@ impl Render for Shell {
         } else {
             px(0.0)
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let browser_overlay_width = px(if self.files_visible_width(cx) > 0.0 {
             self.files_visible_width(cx) + PANE_RESIZE_HITBOX_HALF_WIDTH
         } else {
@@ -14433,10 +14518,9 @@ impl Render for Shell {
             );
             browser.update(cx, |browser, cx| {
                 #[cfg(target_os = "macos")]
-                {
-                    browser.set_resize_inset(browser_resize_inset, cx);
-                    browser.set_right_occlusion(browser_overlay_width, cx);
-                }
+                browser.set_resize_inset(browser_resize_inset, cx);
+                #[cfg(any(target_os = "macos", windows))]
+                browser.set_right_occlusion(browser_overlay_width, cx);
                 browser.set_shortcuts(&self.settings.keymap);
                 browser.set_presentation(presentation, cx);
             });
@@ -14472,6 +14556,9 @@ impl Render for Shell {
                 window,
                 |this: &mut Shell, window, cx| {
                     motion::window_activation_changed(window.is_window_active(), cx);
+                    if window.is_window_active() && !this.voice.read(cx).offered() {
+                        this.check_voice_codex(true, cx);
+                    }
                     if !window.is_window_active() {
                         this.reset_command_palette_key_state();
                         this.set_jump_hints(false, cx);
@@ -14553,22 +14640,6 @@ impl Render for Shell {
                 }),
             )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
-            // Live Voice owns Escape on its own Chat (fork contract): it ends
-            // the call before the shell's Escape-interrupt policy runs.
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
-                    return;
-                }
-                let stop_live_voice = {
-                    let state = this.state.read(cx);
-                    state.live_voice_active()
-                        && state.live_voice.chat_id.as_deref() == state.selected_chat.as_deref()
-                };
-                if stop_live_voice {
-                    this.state.update(cx, |state, cx| state.stop_live_voice(cx));
-                    cx.stop_propagation();
-                }
-            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
@@ -14774,6 +14845,8 @@ impl Render for Shell {
                     && let Route::Settings(section) = self.route
                 {
                     let settings_page = self.render_settings_page(section, window, cx);
+                    // A call started from Settings opens its stage here too.
+                    let voice_stage = self.render_voice_stage(window, cx);
                     let overlays = self.render_overlays(window.viewport_size(), window, cx);
                     let border_color = Theme::of(cx).border;
                     let window_corner = Self::window_corner_radius(window);
@@ -14805,6 +14878,7 @@ impl Render for Shell {
                         .size_full()
                         .relative()
                         .child(settings_page)
+                        .children(voice_stage)
                         .child(drag)
                         .children(overlays);
                     break 'ready root
@@ -14916,6 +14990,9 @@ impl Render for Shell {
                 };
                 let files_panel = self.render_files_panel(window, cx);
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
+                // Full-window voice stage: above the page chrome, below dialogs.
+                let voice_stage = self.render_voice_stage(window, cx);
+                let under_stage = self.voice_stage_underlay_opacity(cx);
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
                 // No inset cards (user request): the conversation column sits
@@ -14939,6 +15016,7 @@ impl Render for Shell {
                     .flex()
                     .flex_row()
                     .overflow_hidden()
+                    .opacity(under_stage)
                     .child(main)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (zeron
@@ -15033,6 +15111,7 @@ impl Render for Shell {
                                     .h_full()
                                     .flex_none()
                                     .relative()
+                                    .opacity(under_stage)
                                     .child(
                                         div()
                                             .h_full()
@@ -15045,16 +15124,24 @@ impl Render for Shell {
                             )
                             .child(details),
                     )
-                    .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    // Route-gated like the columns above: on a settings page
-                    // there is no details column, so its header (the
-                    // Details/Files tabs plus the eye/search/collapse icons)
-                    // has nothing to sit over - it just leaked onto the page.
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .opacity(under_stage)
+                            .child(title_bar),
+                    )
+                    // Keep the fork's Details header route-gated, then let the
+                    // voice stage cover the conversation while the titlebar
+                    // cluster remains live.
                     .children(
                         on_chat
                             .then(|| self.render_details_header_overlay(cx))
                             .flatten(),
                     )
+                    .children(voice_stage)
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
@@ -15081,7 +15168,7 @@ impl Render for Shell {
         // scheduling `with_animation` would have requested). Hover color fades
         // ride the same clock; their once-per-frame tick lives here (this is
         // the window's root render — it runs exactly once per frame).
-        if self.motion_active.get() | motion::hover_fades_active() {
+        if self.motion_active.get() | motion::hover_fades_active() | motion::state_morphs_active() {
             window.request_animation_frame();
         }
 
@@ -15668,6 +15755,141 @@ mod tests {
             ),
             ShellEscapeOutcome::InterruptChat("chat-b".to_owned())
         );
+    }
+
+    /// A minute boundary.
+    fn clock_epoch() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
+            .unwrap()
+            .to_utc()
+    }
+
+    fn clock_session(
+        chat_id: &str,
+        status: zeron_proto::SessionStatus,
+        updated_at: DateTime<Utc>,
+    ) -> zeron_proto::Session {
+        zeron_proto::Session {
+            last_completed_turn: None,
+            chat_id: chat_id.into(),
+            device_id: "remote".into(),
+            status,
+            started_at: Some(updated_at),
+            updated_at,
+            context_usage: None,
+            error: None,
+            turn_stats: None,
+            running_subagents: 0,
+        }
+    }
+
+    struct ClockProbe {
+        clock: ClockRedraw,
+    }
+
+    fn clock_probe(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<ClockProbe>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        gpui::Subscription,
+    ) {
+        use gpui::AppContext as _;
+        let probe = cx.new(|_| ClockProbe {
+            clock: ClockRedraw::default(),
+        });
+        let redraws = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = redraws.clone();
+        let subscription =
+            cx.update(|cx| cx.observe(&probe, move |_, _| counter.set(counter.get() + 1)));
+        (probe, redraws, subscription)
+    }
+
+    fn arm_probe(
+        cx: &mut gpui::TestAppContext,
+        probe: &gpui::Entity<ClockProbe>,
+        wake: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) {
+        probe.update(cx, |probe, cx| {
+            probe
+                .clock
+                .arm(wake, now, |probe: &mut ClockProbe| &mut probe.clock, cx)
+        });
+    }
+
+    /// Schedules the shell clock for `state` at `now` and proves the redraw
+    /// lands exactly at `expected` on the simulated clock — not a millisecond
+    /// earlier, and without any intermediate polling.
+    fn assert_redraw_at(
+        cx: &mut gpui::TestAppContext,
+        state: &AppState,
+        now: DateTime<Utc>,
+        expected: DateTime<Utc>,
+    ) {
+        let wake = shell_clock_wake(state, now);
+        assert_eq!(wake, expected);
+        let (probe, redraws, _subscription) = clock_probe(cx);
+        arm_probe(cx, &probe, wake, now);
+        let delay = (expected - now).to_std().unwrap();
+        cx.executor()
+            .advance_clock(delay - Duration::from_millis(1));
+        assert_eq!(redraws.get(), 0, "no redraw before the deadline");
+        cx.executor().advance_clock(Duration::from_millis(1));
+        assert_eq!(redraws.get(), 1, "one redraw at the deadline");
+    }
+
+    #[gpui::test]
+    fn idle_shell_sleeps_until_the_minute(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch() + chrono::TimeDelta::seconds(20);
+        let mut state = AppState::new();
+        // A failed run, a pending question and a reconnecting pill show no
+        // clock: only the relative-time minute remains.
+        state.sessions = vec![
+            clock_session("failed", zeron_proto::SessionStatus::Errored, now),
+            clock_session("idle", zeron_proto::SessionStatus::Idle, now),
+        ];
+        state.selected_chat = Some("failed".into());
+        state.connectivity.state = zeron_proto::ConnectivityState::Reconnecting;
+        assert_redraw_at(
+            cx,
+            &state,
+            now,
+            clock_epoch() + chrono::TimeDelta::minutes(1),
+        );
+    }
+
+    #[gpui::test]
+    fn selected_working_chat_redraws_every_second(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let mut state = AppState::new();
+        state.sessions = vec![clock_session(
+            "chat",
+            zeron_proto::SessionStatus::Working,
+            now,
+        )];
+        state.selected_chat = Some("chat".into());
+        assert_redraw_at(cx, &state, now, now + chrono::TimeDelta::seconds(1));
+        // Awaiting input shows no elapsed timer; its staleness cutoff is an
+        // AppState notification, not a shell tick.
+        state.sessions[0].status = zeron_proto::SessionStatus::AwaitingInput;
+        assert_redraw_at(cx, &state, now, now + chrono::TimeDelta::minutes(1));
+    }
+
+    #[gpui::test]
+    fn clock_redraw_keeps_the_earliest_deadline(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let (probe, redraws, _subscription) = clock_probe(cx);
+        arm_probe(cx, &probe, now + chrono::TimeDelta::seconds(10), now);
+        // An earlier deadline replaces the pending wake; a later one does not.
+        arm_probe(cx, &probe, now + chrono::TimeDelta::seconds(5), now);
+        arm_probe(cx, &probe, now + chrono::TimeDelta::seconds(30), now);
+        cx.executor().advance_clock(Duration::from_secs(5));
+        assert_eq!(redraws.get(), 1);
+        // Fired timers are one-shot: nothing else is pending.
+        cx.executor().advance_clock(Duration::from_secs(60));
+        assert_eq!(redraws.get(), 1);
+        assert!(probe.read_with(cx, |probe, _| probe.clock.task.is_none()));
     }
 
     #[test]
@@ -16320,10 +16542,7 @@ mod tests {
     fn cross_mode_titlebar_capabilities_require_the_active_mode_context() {
         assert_eq!(
             titlebar_capabilities(SidebarMode::Orchestrator, true, false),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: true,
-            }
+            TitlebarCapabilities { right_pane: true }
         );
         assert_eq!(
             titlebar_capabilities(SidebarMode::Orchestrator, false, false),
@@ -16331,187 +16550,12 @@ mod tests {
         );
         assert_eq!(
             titlebar_capabilities(SidebarMode::Workers, false, true),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: false,
-            }
+            TitlebarCapabilities { right_pane: true }
         );
         assert_eq!(
             titlebar_capabilities(SidebarMode::Workers, true, false),
             TitlebarCapabilities::default()
         );
-    }
-
-    #[test]
-    fn test_trajectory_shell_titlebar_capabilities_orchestrator_and_workers() {
-        // Main chat selected in Orchestrator -> trajectory capability is present
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Orchestrator, true, false),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: true,
-            }
-        );
-        // No main chat selected in Orchestrator -> trajectory capability is absent
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Orchestrator, false, false),
-            TitlebarCapabilities::default()
-        );
-        // Workers mode (even with active worker context) -> trajectory capability is NEVER shown
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Workers, false, true),
-            TitlebarCapabilities {
-                right_pane: true,
-                trajectory: false,
-            }
-        );
-        // Workers mode without worker context
-        assert_eq!(
-            titlebar_capabilities(SidebarMode::Workers, false, false),
-            TitlebarCapabilities::default()
-        );
-    }
-
-    #[test]
-    fn test_trajectory_shell_dedup_one_surface_per_chat() {
-        let mut sequence = 0;
-        let mut surfaces: std::collections::HashMap<u64, TrajectoryTab<()>> =
-            std::collections::HashMap::new();
-
-        // First registration creates new surface
-        let (first, inserted) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-1",
-            "Trajectory",
-            || (),
-        );
-        assert!(inserted);
-        assert_eq!(first, RightSurface::Trajectory(1));
-
-        // Second registration for same chat deduplicates to the existing surface
-        let (second, inserted) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-1",
-            "Trajectory",
-            || panic!("must not create duplicate view"),
-        );
-        assert!(!inserted);
-        assert_eq!(second, RightSurface::Trajectory(1));
-
-        // Registration for another chat creates a distinct surface
-        let (third, inserted) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-2",
-            "Trajectory",
-            || (),
-        );
-        assert!(inserted);
-        assert_eq!(third, RightSurface::Trajectory(2));
-    }
-
-    #[test]
-    fn test_trajectory_shell_state_isolation_between_chats() {
-        let mut panels = SessionPanels::default();
-        panels.update("chat-a", |p| {
-            p.right_active = RightSurface::Trajectory(1);
-        });
-        panels.update("chat-b", |p| {
-            p.right_active = RightSurface::Diff(2);
-        });
-
-        assert_eq!(
-            panels.get("chat-a").right_active,
-            RightSurface::Trajectory(1)
-        );
-        assert_eq!(panels.get("chat-b").right_active, RightSurface::Diff(2));
-        // Independent chats maintain separate active picks
-        assert_eq!(panels.get("chat-c").right_active, RightSurface::Picker);
-    }
-
-    #[test]
-    fn test_trajectory_shell_deletion_closes_surface_and_removes_tabs() {
-        let mut sequence = 0;
-        let mut surfaces: std::collections::HashMap<u64, TrajectoryTab<()>> =
-            std::collections::HashMap::new();
-        let mut right_tabs: std::collections::HashMap<String, Vec<RightSurface>> =
-            std::collections::HashMap::new();
-
-        let (surface_a, _) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-a",
-            "Trajectory",
-            || (),
-        );
-        let (surface_b, _) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-b",
-            "Trajectory",
-            || (),
-        );
-
-        right_tabs.insert(
-            "chat-a".to_string(),
-            vec![surface_a, RightSurface::Diff(10)],
-        );
-        right_tabs.insert("chat-b".to_string(), vec![surface_b]);
-
-        // Deleting chat-a removes its trajectory surface and strips it from right_tabs
-        let removed = remove_chat_trajectory_surfaces(&mut surfaces, &mut right_tabs, "chat-a");
-        assert_eq!(removed, vec![1]);
-        assert!(!surfaces.contains_key(&1));
-        assert!(surfaces.contains_key(&2));
-
-        assert_eq!(right_tabs.get("chat-a").unwrap(), &[RightSurface::Diff(10)]);
-        assert_eq!(
-            right_tabs.get("chat-b").unwrap(),
-            &[RightSurface::Trajectory(2)]
-        );
-    }
-
-    #[test]
-    fn test_trajectory_shell_archive_retains_surface() {
-        let mut sequence = 0;
-        let mut surfaces: std::collections::HashMap<u64, TrajectoryTab<()>> =
-            std::collections::HashMap::new();
-        let mut right_tabs: std::collections::HashMap<String, Vec<RightSurface>> =
-            std::collections::HashMap::new();
-
-        let (surface_archived, _) = register_trajectory_surface(
-            &mut surfaces,
-            &mut sequence,
-            "chat-archived",
-            "Trajectory",
-            || (),
-        );
-        right_tabs.insert(
-            "chat-archived".to_string(),
-            vec![surface_archived, RightSurface::Terminal(5)],
-        );
-
-        // Archiving does not call remove_chat_trajectory_surfaces, so the tab and surface remain intact
-        assert!(surfaces.contains_key(&1));
-        assert_eq!(
-            right_tabs.get("chat-archived").unwrap(),
-            &[RightSurface::Trajectory(1), RightSurface::Terminal(5)]
-        );
-    }
-
-    #[test]
-    fn test_trajectory_shell_close_surface_teardown() {
-        let terminal = RightSurface::Terminal(1);
-        let trajectory = RightSurface::Trajectory(2);
-        let diff = RightSurface::Diff(3);
-        let mut tabs = vec![terminal, trajectory, diff];
-
-        // Closing trajectory surface selects its previous neighbor
-        let next = remove_right_surface(&mut tabs, trajectory);
-        assert_eq!(next, terminal);
-        assert_eq!(tabs, vec![terminal, diff]);
     }
 
     #[test]
@@ -17795,6 +17839,7 @@ mod exit_regressions {
                 settings::update(SavePolicy::Immediate, cx, |settings| {
                     settings.dictation_enabled = true;
                     settings.dictation_input = Some("coreaudio:usb".into());
+                    settings.codex_voice = Some("ember".into());
                     settings.transcript_compact_mode = true;
                     settings.code_fences_fit_content = true;
                     settings.diff_split = true;
@@ -17807,6 +17852,7 @@ mod exit_regressions {
                 let saved = settings::current(cx);
                 assert!(saved.dictation_enabled);
                 assert_eq!(saved.dictation_input.as_deref(), Some("coreaudio:usb"));
+                assert_eq!(saved.codex_voice.as_deref(), Some("ember"));
                 assert!(saved.transcript_compact_mode);
                 assert!(saved.code_fences_fit_content);
                 assert!(saved.diff_split);
@@ -17817,11 +17863,13 @@ mod exit_regressions {
                 // once the Shell has nothing newer of its own.
                 settings::update(SavePolicy::Immediate, cx, |settings| {
                     settings.dictation_enabled = false;
+                    settings.codex_voice = None;
                     settings.sidebar_width = 320.0;
                 });
                 shell.schedule_save(cx);
                 let saved = settings::current(cx);
                 assert!(!saved.dictation_enabled);
+                assert_eq!(saved.codex_voice, None);
                 assert_eq!(saved.sidebar_width, 320.0);
                 assert_eq!(shell.settings.sidebar_width, 320.0);
             })
@@ -18009,6 +18057,7 @@ mod exit_regressions {
                         git_detected: false,
                         git_checked_at: None,
                         checkout_id: None,
+                        repository_id: None,
                         created_at: Utc::now(),
                     }]);
                     // Boot opened an existing project session after loading defaults.
@@ -18077,6 +18126,7 @@ mod exit_regressions {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            repository_id: None,
             created_at: Utc::now(),
         };
         window
@@ -18161,6 +18211,7 @@ mod exit_regressions {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            repository_id: None,
             created_at: Utc::now(),
         };
         window
@@ -18431,6 +18482,7 @@ mod exit_regressions {
                         git_detected: false,
                         git_checked_at: None,
                         checkout_id: None,
+                        repository_id: None,
                         created_at: Utc::now(),
                     }]);
                 });
@@ -19370,6 +19422,9 @@ impl Shell {
         self.transcript
             .update(cx, |t, cx| t.fixture_appshots_start(cx));
     }
+    pub fn fixture_transcript(&self) -> Entity<crate::transcript::Transcript> {
+        self.transcript.clone()
+    }
 }
 
 #[cfg(test)]
@@ -19629,6 +19684,38 @@ mod settings_section_persistence {
             }
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn voice_stage_opens_over_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| settings_test_shell(dir.path(), cx));
+        shell.update(cx, |shell, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.reduced_motion = true;
+            shell.open_settings(SettingsSection::Voice, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("voice-stage").is_none());
+
+        shell.update(cx, |shell, cx| {
+            shell.voice.update(cx, |voice, _| {
+                voice.phase = zeron_proto::voice::VoicePhase::Active
+            });
+            shell.set_voice_stage_open(true, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let stage = cx
+            .debug_bounds("voice-stage")
+            .expect("stage renders in Settings");
+        shell.read_with(cx, |shell, cx| {
+            assert!(matches!(shell.route, Route::Settings(_)));
+            assert!(shell.voice.read(cx).stage_open);
+            // The settings sidebar stays usable beside the stage.
+            assert_eq!(f32::from(stage.origin.x), shell.settings.sidebar_width);
+        });
     }
 
     #[gpui::test]

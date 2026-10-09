@@ -152,6 +152,7 @@ fn main() -> anyhow::Result<()> {
                             last_completed_turn: None,
                             context_usage: None,
                             error: None,
+                            running_subagents: 0,
                             chat_id: "profile".into(),
                             device_id: "local".into(),
                             status: if streaming {

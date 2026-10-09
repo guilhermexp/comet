@@ -5,23 +5,21 @@
 //! per-turn tokens plus an optional current-context snapshot mirrored onto live sessions.
 
 pub mod agent;
+pub mod attachment_mentions;
 pub mod entities;
 pub mod file_mentions;
 pub mod invocation;
-pub mod live_voice;
 pub mod motion;
 pub mod preview;
 pub mod sidebar_pins;
-pub mod trajectory;
 pub mod view;
+pub mod voice;
 pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
-pub use live_voice::*;
 pub use preview::*;
 pub use sidebar_pins::*;
-pub use trajectory::*;
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)

@@ -921,9 +921,10 @@ impl Normalizer {
             }
 
             // A claude.ai plan window was hit. A hard `rejected` blocks the
-            // turn — make it visible; allowed/allowed_warning stay quiet.
+            // turn — make it visible; allowed/allowed_warning stay quiet, and
+            // so does a reject the account's overage carries past.
             Frame::RateLimit(f) => {
-                if f.rate_limit_info.status != "rejected" {
+                if !f.rate_limit_info.blocks() {
                     return Vec::new();
                 }
                 let window =
@@ -1046,7 +1047,10 @@ impl Normalizer {
             }
 
             // Control frames are handled by the run loop, not normalized.
-            Frame::ControlRequest(_) | Frame::Other => Vec::new(),
+            Frame::ControlRequest(_)
+            | Frame::ControlResponse(_)
+            | Frame::CommandLifecycle(_)
+            | Frame::Other => Vec::new(),
         }
     }
 }
@@ -1121,6 +1125,24 @@ mod tests {
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
         Normalizer::new().normalize(frame, false)
+    }
+
+    #[test]
+    fn a_rejected_window_carried_by_overage_is_not_an_error() {
+        let blocked = normalize_one(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","overageStatus":"rejected"}}"#,
+        );
+        assert!(matches!(blocked.as_slice(), [AgentEvent::Error { .. }]));
+        for overage in [
+            r#""overageStatus":"allowed""#,
+            r#""overageStatus":"allowed_warning""#,
+            r#""isUsingOverage":true"#,
+        ] {
+            let raw = format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour",{overage}}}}}"#
+            );
+            assert!(normalize_one(&raw).is_empty(), "{overage}");
+        }
     }
 
     fn result_done(raw: &str) -> AgentEvent {
@@ -1303,11 +1325,28 @@ mod tests {
             },
             None,
         );
+        let synthetic_start = std::time::Instant::now();
+        let preview_interval = std::time::Duration::from_millis(zeron_doc::STREAM_COMMIT_MS);
+        normalizer
+            .streaming_tools
+            .get_mut(&9)
+            .expect("started Claude write")
+            .input
+            .set_test_now(synthetic_start);
         let mut events = normalizer
             .update_streaming_tool(9, "{\"file_path\":\"large.txt\",\"content\":\"")
             .into_iter()
             .collect::<Vec<_>>();
-        for chunk in std::iter::repeat_n("x".repeat(8 * 1024), body_bytes.div_ceil(8 * 1024)) {
+        for (index, chunk) in
+            std::iter::repeat_n("x".repeat(8 * 1024), body_bytes.div_ceil(8 * 1024)).enumerate()
+        {
+            let interval_count = (index / 2 + 1) as u32;
+            normalizer
+                .streaming_tools
+                .get_mut(&9)
+                .expect("started Claude write")
+                .input
+                .set_test_now(synthetic_start + preview_interval * interval_count);
             events.extend(normalizer.update_streaming_tool(9, &chunk));
         }
         let serialized_bytes = events

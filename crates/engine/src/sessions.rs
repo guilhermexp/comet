@@ -26,29 +26,18 @@ use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use zeron_doc::{
-    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter,
-    SessionCommandPayload, SessionDoc, SessionMessageEntry, fold_event_into_parts,
-    merge_workflow_task, sanitize_tool_call,
+    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
+    SessionMessageEntry, fold_event_into_parts, merge_workflow_task, sanitize_tool_call,
 };
-use zeron_harness::{
-    CancellationToken, Harness, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent,
-    LiveVoiceHandle, LiveVoiceRequest, RunControls, SteerMessage,
-};
-use zeron_proto::trajectory::*;
+use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage, TurnControl};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
-    LiveVoiceUnavailableReason, RunRequest, Session, SessionStatus, UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion, WorkflowTaskStatus, WorkflowTaskUpdate,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
-use crate::live_voice::{
-    BackendSpeechAccumulator, BackendSpeechUpdate, LiveOperationalContext, LiveVoiceCoordinator,
-    latest_visible_assistant_text,
-};
 use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
-use crate::trajectory_store::{TrajectoryStore, TrajectoryStoreEvent};
 use crate::{EngineError, new_id, now_ms};
 /// One published event. Durable events carry their journal seq; transient
 /// previews use seq 0 and exist only on the live broadcast.
@@ -67,6 +56,18 @@ pub enum SteerOutcome {
     DeferredByUpdate,
     /// No live steerable run — the caller should dispatch the prompt as a new turn.
     NotSteerable,
+}
+
+const WORKER_NOTIFICATION_ID_PREFIX: &str = "worker-notify-message:";
+const WORKER_NOTIFICATION_PROMPT_PREFIX: &str = "[worker-task-notification]";
+
+pub(crate) fn is_worker_notification(prompt: &str, message_id: Option<&str>) -> bool {
+    message_id.is_some_and(is_worker_notification_id)
+        && prompt.starts_with(WORKER_NOTIFICATION_PROMPT_PREFIX)
+}
+
+pub(crate) fn is_worker_notification_id(id: &str) -> bool {
+    id.starts_with(WORKER_NOTIFICATION_ID_PREFIX)
 }
 
 struct PendingInput {
@@ -102,38 +103,47 @@ struct HarnessSessionRef {
     cwd: String,
 }
 
-/// Configuration baked into a live harness runtime. The steering mailbox only
-/// carries prompt text, so routing a request whose model/effort/sandbox changed
-/// would silently run it with the old process configuration. Such requests
+/// The configuration a live harness runtime launched with. The steering
+/// mailbox carries only the prompt (and its images), so a request whose
+/// launch settings differ would silently run with the old process's — it
 /// must replace the runtime and resume its harness-native session instead.
-#[derive(Debug, Clone, PartialEq)]
+/// The driver decides what "differ" means ([`Harness::same_runtime`]): a
+/// replacement kills the runtime's background work, so a setting the
+/// launch never reads, or the same value spelled differently by another
+/// client, must never force one.
+#[derive(Clone)]
 struct RuntimeConfig {
     harness_id: HarnessId,
-    model: Option<String>,
-    reasoning: Option<zeron_proto::ReasoningLevel>,
-    model_options: serde_json::Map<String, serde_json::Value>,
-    cwd: String,
-    sandbox: zeron_proto::SandboxLevel,
-    auto_approve: bool,
-    worktree: Option<zeron_proto::WorktreeSpec>,
+    request: RunRequest,
+    harness: Arc<dyn Harness>,
 }
 
 impl RuntimeConfig {
-    fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
+    fn new(harness_id: HarnessId, request: &RunRequest, harness: Arc<dyn Harness>) -> Self {
         Self {
             harness_id,
-            model: request.model.clone(),
-            reasoning: request.reasoning,
-            model_options: request.model_options.clone(),
-            cwd: request.cwd.clone(),
-            sandbox: request.sandbox,
-            auto_approve: request.auto_approve,
-            worktree: request.worktree.clone(),
+            request: request.clone(),
+            harness,
         }
     }
 
     fn can_route(&self, harness_id: HarnessId, request: &RunRequest) -> bool {
-        request.attachments.is_empty() && self == &Self::from_request(harness_id, request)
+        self.harness_id == harness_id && self.harness.same_runtime(&self.request, request)
+    }
+
+    /// How `request` reaches this runtime: `Some(false)` as is, `Some(true)`
+    /// with its configuration adopted in place first
+    /// ([`Harness::reconfigures_in_place`]), `None` only by replacing it.
+    fn route(&self, harness_id: HarnessId, request: &RunRequest) -> Option<bool> {
+        if self.can_route(harness_id, request) {
+            Some(false)
+        } else if self.harness_id == harness_id
+            && self.harness.reconfigures_in_place(&self.request, request)
+        {
+            Some(true)
+        } else {
+            None
+        }
     }
 }
 
@@ -159,13 +169,50 @@ fn apply_run_error_to_session(session: &mut Session, status: SessionStatus, erro
     };
 }
 
+/// A run's live voice calls. They hold its idle reaper off, and each hang-up
+/// wakes the reaper to restart its window from there.
+#[derive(Default)]
+pub(crate) struct VoiceActivity {
+    calls: std::sync::atomic::AtomicUsize,
+    ended: tokio::sync::Notify,
+}
+impl VoiceActivity {
+    pub(crate) fn live(&self) -> bool {
+        self.calls.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+    /// A live call until the returned guard drops.
+    pub(crate) fn call(self: &Arc<Self>) -> VoiceCall {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        VoiceCall(self.clone())
+    }
+}
+pub(crate) struct VoiceCall(Arc<VoiceActivity>);
+impl Drop for VoiceCall {
+    fn drop(&mut self) {
+        self.0
+            .calls
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        // A stored permit: the reaper hears it even while busy elsewhere.
+        self.0.ended.notify_one();
+    }
+}
+
 struct RunHandle {
+    voice: Option<zeron_harness::codex::realtime::RealtimeHandle>,
+    voice_active: Arc<VoiceActivity>,
     run_id: String,
     steerable: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
+    /// Turn-level stop + the runtime's background-work report. Used for
+    /// stopping a turn when the driver [`Harness::stops_turn_in_place`].
+    turn: TurnControl,
+    stops_turn_in_place: bool,
+    /// The harness stream is open. Before that there is no runtime to keep:
+    /// a stop tears the pending start down instead.
+    started: Arc<std::sync::atomic::AtomicBool>,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
     /// ignores its token can never strand the run.
     cancel: watch::Sender<bool>,
@@ -181,6 +228,11 @@ struct RunHandle {
     /// This runtime's provider session holds the fork's copied history (a
     /// side chat's bootstrap went out on its run or on one of its steers).
     fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
+    /// The user stopped this runtime: it is being torn down and takes no
+    /// more prompts. Flipped under the ledger lock, so every accepted steer
+    /// is unambiguously before the stop (cancelled with it) or after it
+    /// (re-dispatched to a fresh runtime — never lost).
+    retiring: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -192,49 +244,25 @@ struct RoutedSteer {
     /// is recorded only when the runtime confirms consuming it (`Steered`).
     /// An orphan re-dispatches the bare prompt, still owing the history.
     fork_history: bool,
-}
-#[derive(Debug)]
-struct BoundedTombstones {
-    set: HashSet<String>,
-    queue: std::collections::VecDeque<String>,
-    capacity: usize,
-}
-
-impl BoundedTombstones {
-    fn new(capacity: usize) -> Self {
-        Self {
-            set: HashSet::new(),
-            queue: std::collections::VecDeque::new(),
-            capacity,
-        }
-    }
-
-    fn insert(&mut self, chat_id: String) {
-        if self.set.insert(chat_id.clone()) {
-            self.queue.push_back(chat_id);
-            if self.queue.len() > self.capacity
-                && let Some(oldest) = self.queue.pop_front()
-            {
-                self.set.remove(&oldest);
-            }
-        }
-    }
-
-    fn contains(&self, chat_id: &str) -> bool {
-        self.set.contains(chat_id)
-    }
-}
-
-struct InFlightTrajectory {
-    run_id: String,
-    start_seq: u64,
-    text: String,
-    last_emitted_at: std::time::Instant,
-    turn_id: Option<String>,
-    step_id: Option<String>,
+    /// Accepted after the user's Stop began tearing the runtime down: the
+    /// Stop did not cancel it, so the message still runs.
+    after_stop: bool,
+    /// The run configuration it was sent with, images included: an orphan
+    /// re-dispatches exactly this, not whatever the chat's latest request
+    /// became. `None` when the chat had no recorded request.
+    request: Option<Box<RunRequest>>,
 }
 struct Inner {
+    voice: crate::voice::VoiceManager,
     device_id: String,
+    /// The engine is shutting down: dying runs re-dispatch nothing.
+    shutting_down: std::sync::atomic::AtomicBool,
+    /// Per chat: messages a Stop cancelled while they were still on their
+    /// way (see [`SessionsEngine::cancel_sent_messages`]).
+    cancelled_sends: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Loopback IPC port this engine serves, once known (0 = not serving):
+    /// what the injected `zeron mcp` server dials back into.
+    ipc_port: std::sync::atomic::AtomicU16,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
@@ -262,13 +290,6 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
-    live_voice: LiveVoiceCoordinator,
-    trajectory: Mutex<Option<Arc<TrajectoryStore>>>,
-    in_flight_text: Mutex<HashMap<String, InFlightTrajectory>>,
-    in_flight_reasoning: Mutex<HashMap<String, InFlightTrajectory>>,
-    fallback_trajectory_runs: Mutex<HashMap<String, String>>,
-    trajectory_tool_names: Mutex<HashMap<String, HashMap<String, String>>>,
-    tombstoned_chats: Mutex<BoundedTombstones>,
     restart_gate: Mutex<Option<zeron_update::RestartGate>>,
     /// Bound local IPC endpoint (`ws://127.0.0.1:<port>`). Empty when this
     /// process lost the bind, so `comet-sessions` is not pointed at another engine.
@@ -302,9 +323,11 @@ pub(crate) fn stamp_sessions(
     origin: ChatOrigin,
     endpoint: Option<&str>,
     engine_id: &str,
+    voice_orchestrator: bool,
 ) {
     let endpoint = endpoint.map(str::trim).filter(|value| !value.is_empty());
-    request.sessions = match (request.enable_workers_mcp, origin, endpoint) {
+    let voice_root = voice_orchestrator && zeron_proto::voice::is_orchestrator_chat(chat_id);
+    request.sessions = match (request.enable_workers_mcp || voice_root, origin, endpoint) {
         (true, ChatOrigin::Root, Some(endpoint)) => Some(zeron_proto::SessionsGrant {
             parent_chat_id: chat_id.to_owned(),
             endpoint: endpoint.to_owned(),
@@ -312,30 +335,6 @@ pub(crate) fn stamp_sessions(
         }),
         _ => None,
     };
-}
-
-fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String {
-    match reason {
-        LiveVoiceUnavailableReason::RemoteChat => {
-            "Live Voice is available only on the Chat's host device".into()
-        }
-        LiveVoiceUnavailableReason::NonOmp => "Live Voice requires an OMP Chat".into(),
-        LiveVoiceUnavailableReason::Archived => {
-            "Live Voice is unavailable for archived Chats".into()
-        }
-        // Both OMP gaps are a capability absent from the ready frame, so neither
-        // message may promise that updating anything fixes it: the published
-        // `omp` can be strictly newer than a build that has Live Voice.
-        LiveVoiceUnavailableReason::ActiveRun => {
-            "The OMP here cannot join Live Voice during active work".into()
-        }
-        LiveVoiceUnavailableReason::UnsupportedOmp => {
-            "The OMP here has no Live Voice capability".into()
-        }
-        LiveVoiceUnavailableReason::AnotherLiveCall => {
-            "Another Live Voice call is already active on this device".into()
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -352,7 +351,11 @@ impl SessionsEngine {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(Inner {
+                voice: crate::voice::VoiceManager::default(),
                 device_id,
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                cancelled_sends: Mutex::new(HashMap::new()),
+                ipc_port: std::sync::atomic::AtomicU16::new(0),
                 journal,
                 registry,
                 doc_host: Mutex::new(None),
@@ -365,13 +368,6 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
-                live_voice: LiveVoiceCoordinator::new(),
-                trajectory: Mutex::new(None),
-                in_flight_text: Mutex::new(HashMap::new()),
-                in_flight_reasoning: Mutex::new(HashMap::new()),
-                fallback_trajectory_runs: Mutex::new(HashMap::new()),
-                trajectory_tool_names: Mutex::new(HashMap::new()),
-                tombstoned_chats: Mutex::new(BoundedTombstones::new(4096)),
                 restart_gate: Mutex::new(None),
                 local_ipc: Mutex::new(None),
                 #[cfg(test)]
@@ -401,9 +397,18 @@ impl SessionsEngine {
     pub fn set_ipc_port(&self, _port: u16) {}
 
     /// Overwrite any client-supplied grant. `sessions` exists only on an
-    /// orchestrator run (workers grant) of a chat whose row reads as root, and only
+    /// authorized root run or the engine-owned voice orchestrator, and only
     /// while this engine has a bound IPC endpoint.
     pub(crate) fn stamp_sessions_grant(&self, chat_id: &str, request: &mut RunRequest) {
+        self.stamp_sessions_grant_for_voice(chat_id, request, false);
+    }
+
+    fn stamp_sessions_grant_for_voice(
+        &self,
+        chat_id: &str,
+        request: &mut RunRequest,
+        voice_orchestrator: bool,
+    ) {
         let origin = self
             .inner
             .doc_host()
@@ -415,34 +420,8 @@ impl SessionsEngine {
             origin,
             endpoint.as_deref(),
             &self.inner.device_id,
+            voice_orchestrator,
         );
-    }
-
-    pub fn set_trajectory_store(&self, store: Arc<TrajectoryStore>) {
-        let mut slot = lock(&self.inner.trajectory);
-        *slot = Some(store.clone());
-        drop(slot);
-        let weak = Arc::downgrade(&self.inner);
-        let mut rx = store.subscribe_events();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(TrajectoryStoreEvent::ChatDeleted { chat_id }) => {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.tombstone_chat(&chat_id);
-                        } else {
-                            break;
-                        }
-                    }
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
-
-    pub fn tombstone_chat(&self, chat_id: &str) {
-        self.inner.tombstone_chat(chat_id);
     }
 
     pub fn set_restart_gate(&self, gate: zeron_update::RestartGate) {
@@ -454,10 +433,6 @@ impl SessionsEngine {
     pub fn set_admission_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
         let mut slot = lock(&self.inner.admission_hook);
         *slot = Some(hook);
-    }
-
-    pub fn trajectory_store(&self) -> Option<Arc<TrajectoryStore>> {
-        lock(&self.inner.trajectory).clone()
     }
 
     pub fn run_journal(&self) -> Arc<crate::run_journal::RunJournal> {
@@ -480,6 +455,10 @@ impl SessionsEngine {
             parent_tool_use_id,
             max_bytes,
         )
+    }
+
+    pub(crate) fn voice_manager(&self) -> crate::voice::VoiceManager {
+        self.inner.voice.clone()
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -579,429 +558,6 @@ impl SessionsEngine {
         lock(&self.inner.statuses).get(chat_id).cloned()
     }
 
-    pub fn watch_live_voice(&self) -> watch::Receiver<LiveVoiceState> {
-        self.inner.live_voice.watch()
-    }
-
-    pub async fn probe_live_voice(
-        &self,
-        chat_id: &str,
-    ) -> Result<LiveVoiceAvailability, EngineError> {
-        let (reason, cwd) = self.live_voice_precondition(chat_id)?;
-        if let Some(reason) = reason {
-            return Ok(LiveVoiceAvailability {
-                available: false,
-                reason: Some(reason),
-            });
-        }
-        let active = self.is_active_session(chat_id);
-        let harness = self.inner.registry.resolve(HarnessId::Omp)?;
-        let support = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
-        let gap = support.gap(active);
-        Ok(LiveVoiceAvailability {
-            available: gap.is_none(),
-            reason: gap,
-        })
-    }
-
-    /// Probe the installed OMP without a Chat. Draft Live uses this so the
-    /// composer never synthesizes availability — the ready frame is the gate.
-    pub async fn probe_live_voice_at_cwd(
-        &self,
-        cwd: &str,
-    ) -> Result<LiveVoiceAvailability, EngineError> {
-        let cwd = crate::repos::expand_home(cwd.trim())
-            .map_err(|error| EngineError::Other(error.into()))?;
-        if cwd.is_empty() {
-            return Err(EngineError::Other(
-                "Live Voice requires a working directory".into(),
-            ));
-        }
-        if self.inner.live_voice.is_active() {
-            return Ok(LiveVoiceAvailability {
-                available: false,
-                reason: Some(LiveVoiceUnavailableReason::AnotherLiveCall),
-            });
-        }
-        let harness = self.inner.registry.resolve(HarnessId::Omp)?;
-        let support = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
-        let gap = support.gap(false);
-        Ok(LiveVoiceAvailability {
-            available: gap.is_none(),
-            reason: gap,
-        })
-    }
-
-    pub async fn start_live_voice(&self, chat_id: &str) -> Result<(), EngineError> {
-        let (reason, cwd) = self.live_voice_precondition(chat_id)?;
-        if let Some(reason) = reason {
-            return Err(EngineError::Other(live_voice_unavailable_message(reason)));
-        }
-        let call_id = self.inner.live_voice.reserve(chat_id)?;
-        let harness = match self.inner.registry.resolve(HarnessId::Omp) {
-            Ok(harness) => harness,
-            Err(error) => {
-                self.inner.live_voice.fail(&call_id, &error.to_string());
-                return Err(error.into());
-            }
-        };
-        let supported = match harness.probe_live_voice(std::path::Path::new(&cwd)).await {
-            Ok(supported) => supported,
-            Err(error) => {
-                self.inner.live_voice.fail(&call_id, &error.to_string());
-                return Err(error.into());
-            }
-        };
-        if let Some(gap) = supported.gap(self.is_active_session(chat_id)) {
-            let message = live_voice_unavailable_message(gap);
-            self.inner.live_voice.fail(&call_id, &message);
-            return Err(EngineError::Other(message));
-        }
-        if !self.inner.live_voice.matches(&call_id) {
-            return Err(EngineError::Other("Live Voice start was cancelled".into()));
-        }
-        let operational_context = if supported.session_context {
-            match self.live_operational_context(chat_id) {
-                Ok(context) => Some(context),
-                Err(error) => {
-                    self.inner.live_voice.fail(&call_id, &error.to_string());
-                    return Err(error);
-                }
-            }
-        } else {
-            None
-        };
-        let resume = self.inner.resume_for(chat_id, &cwd);
-        let handle = match harness
-            .start_live_voice(LiveVoiceRequest {
-                cwd: cwd.clone(),
-                resume,
-            })
-            .await
-        {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.inner.live_voice.fail(&call_id, &error.to_string());
-                return Err(error.into());
-            }
-        };
-        self.inner
-            .remember_harness_session(chat_id, &handle.session_id, &cwd);
-        if let Err(handle) = self.attach_live_handle(&call_id, handle, operational_context) {
-            let _ = handle.controls.send(LiveVoiceControl::Stop).await;
-            return Err(EngineError::Other("Live Voice start was cancelled".into()));
-        }
-        Ok(())
-    }
-
-    pub async fn set_live_voice_muted(&self, muted: bool) -> Result<(), EngineError> {
-        self.inner.live_voice.set_muted(muted).await
-    }
-
-    pub async fn stop_live_voice(&self) -> Result<(), EngineError> {
-        self.inner.live_voice.stop().await
-    }
-
-    pub(crate) async fn prepare_for_command(&self, chat_id: &str, command_id: &str) {
-        if !self.inner.live_voice.is_active()
-            || self.inner.live_voice.owns_command(chat_id, command_id)
-        {
-            return;
-        }
-        if let Err(error) = self.stop_live_voice().await {
-            tracing::warn!(
-                chat = %chat_id,
-                command = %command_id,
-                error = %error,
-                "Live Voice stop failed after releasing the call; continuing command"
-            );
-        }
-    }
-
-    pub(crate) fn complete_live_command(&self, chat_id: &str, command_id: &str) {
-        self.inner.live_voice.complete_command(chat_id, command_id);
-    }
-
-    fn attach_live_handle(
-        &self,
-        call_id: &str,
-        mut handle: LiveVoiceHandle,
-        operational_context: Option<(LiveOperationalContext, broadcast::Receiver<JournaledEvent>)>,
-    ) -> Result<(), LiveVoiceHandle> {
-        if !self
-            .inner
-            .live_voice
-            .attach_controls(call_id, handle.controls.clone())
-        {
-            return Err(handle);
-        }
-        let Some(cancellation) = self.inner.live_voice.cancellation(call_id) else {
-            return Err(handle);
-        };
-        if let Some((context, receiver)) = operational_context {
-            self.spawn_live_context_observer(
-                call_id.to_owned(),
-                cancellation.clone(),
-                context,
-                receiver,
-            );
-        }
-        let sessions = self.clone();
-        let task_call_id = call_id.to_owned();
-        let coordinator = self.inner.live_voice.clone();
-        let task_coordinator = coordinator.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    event = handle.events.next() => match event {
-                        Some(Ok(LiveVoiceEvent::Delegation {
-                            delegation_id,
-                            request,
-                        })) => {
-                            if let Err(error) = sessions
-                                .handle_live_delegation(&task_call_id, &delegation_id, request)
-                                .await
-                            {
-                                task_coordinator.fail(&task_call_id, &error.to_string());
-                                return;
-                            }
-                        }
-                        Some(Ok(event)) => {
-                            let terminal = matches!(event, LiveVoiceEvent::Ended { .. });
-                            task_coordinator.handle_event(&task_call_id, event);
-                            if terminal {
-                                return;
-                            }
-                        }
-                        Some(Err(error)) => {
-                            task_coordinator.fail(&task_call_id, &error.to_string());
-                            return;
-                        }
-                        None => {
-                            task_coordinator.fail(
-                                &task_call_id,
-                                "Live Voice event stream closed unexpectedly",
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        coordinator.attach_task(call_id, task);
-        Ok(())
-    }
-
-    fn is_active_session(&self, chat_id: &str) -> bool {
-        lock(&self.inner.statuses)
-            .get(chat_id)
-            .is_some_and(|session| {
-                matches!(
-                    session.status,
-                    SessionStatus::Working | SessionStatus::AwaitingInput
-                )
-            })
-    }
-
-    fn live_operational_context(
-        &self,
-        chat_id: &str,
-    ) -> Result<(LiveOperationalContext, broadcast::Receiver<JournaledEvent>), EngineError> {
-        let (_, receiver) = self.subscribe(chat_id, u64::MAX)?;
-        let entries = self.doc_handle(chat_id)?.doc().read_entries()?;
-        let visible_text = latest_visible_assistant_text(&entries);
-        let status = self
-            .session_status(chat_id)
-            .map_or(SessionStatus::Idle, |session| session.status);
-        Ok((LiveOperationalContext::new(status, &visible_text), receiver))
-    }
-
-    fn spawn_live_context_observer(
-        &self,
-        call_id: String,
-        cancellation: CancellationToken,
-        mut context: LiveOperationalContext,
-        mut events: broadcast::Receiver<JournaledEvent>,
-    ) {
-        let (context_tx, mut context_rx) = watch::channel(context.render());
-        let producer_cancellation = cancellation.clone();
-        tokio::spawn(async move {
-            loop {
-                let flush_due = async {
-                    match context.next_flush_at() {
-                        Some(at) => tokio::time::sleep_until(at.into()).await,
-                        None => std::future::pending().await,
-                    }
-                };
-                let event = tokio::select! {
-                    _ = producer_cancellation.cancelled() => return,
-                    _ = flush_due => {
-                        if context.flush_at(std::time::Instant::now()) {
-                            context_tx.send_replace(context.render());
-                        }
-                        continue;
-                    }
-                    event = events.recv() => match event {
-                        Ok(event) => event.event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                };
-                if context.observe(&event) {
-                    context_tx.send_replace(context.render());
-                }
-            }
-        });
-
-        let coordinator = self.inner.live_voice.clone();
-        tokio::spawn(async move {
-            loop {
-                let text = context_rx.borrow_and_update().clone();
-                let sent = tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    sent = coordinator.append_session_context(&call_id, text) => sent,
-                };
-                if !sent {
-                    return;
-                }
-                tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    changed = context_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    async fn handle_live_delegation(
-        &self,
-        call_id: &str,
-        delegation_id: &str,
-        request: String,
-    ) -> Result<(), EngineError> {
-        let ownership = self
-            .inner
-            .live_voice
-            .claim_delegation(call_id, delegation_id)?;
-        if !ownership.newly_created {
-            return Ok(());
-        }
-        let chat_id = self
-            .inner
-            .live_voice
-            .active_chat_id()
-            .ok_or_else(|| EngineError::Other("Live Voice call is no longer active".into()))?;
-        if request.trim().is_empty() {
-            return Err(EngineError::Other(
-                "Live Voice delegation request is empty".into(),
-            ));
-        }
-        let (_, receiver) = self.subscribe(&chat_id, u64::MAX)?;
-        let host = self
-            .inner
-            .doc_host()
-            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
-        host.queue_command_with_id(
-            &chat_id,
-            ownership.command_id.clone(),
-            SessionCommandPayload::Steer {
-                prompt: request,
-                message_id: Some(ownership.message_id),
-            },
-        )?;
-        self.spawn_live_backend_observer(
-            call_id.to_owned(),
-            delegation_id.to_owned(),
-            ownership.cancellation,
-            receiver,
-        );
-        Ok(())
-    }
-
-    fn spawn_live_backend_observer(
-        &self,
-        call_id: String,
-        delegation_id: String,
-        cancellation: CancellationToken,
-        mut receiver: broadcast::Receiver<JournaledEvent>,
-    ) {
-        let coordinator = self.inner.live_voice.clone();
-        tokio::spawn(async move {
-            let mut speech = BackendSpeechAccumulator::default();
-            loop {
-                let event = tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    event = receiver.recv() => match event {
-                        Ok(event) => event.event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                };
-                match speech.observe(&event) {
-                    BackendSpeechUpdate::None => {}
-                    BackendSpeechUpdate::Progress(text) => {
-                        let _ = coordinator
-                            .append_delegation_context(
-                                &call_id,
-                                &delegation_id,
-                                LiveVoiceContextKind::Progress,
-                                text,
-                            )
-                            .await;
-                    }
-                    BackendSpeechUpdate::Final(text) => {
-                        if coordinator
-                            .append_delegation_context(
-                                &call_id,
-                                &delegation_id,
-                                LiveVoiceContextKind::Final,
-                                text,
-                            )
-                            .await
-                        {
-                            coordinator.complete_delegation(&call_id, &delegation_id);
-                        }
-                        return;
-                    }
-                }
-            }
-        });
-    }
-
-    fn live_voice_precondition(
-        &self,
-        chat_id: &str,
-    ) -> Result<(Option<LiveVoiceUnavailableReason>, String), EngineError> {
-        let workspace = self
-            .inner
-            .workspace()
-            .ok_or_else(|| EngineError::Other("workspace is unavailable".into()))?;
-        let chat = workspace
-            .chat(chat_id)?
-            .ok_or_else(|| EngineError::Other(format!("no such chat: {chat_id}")))?;
-        let cwd = chat
-            .cwd
-            .clone()
-            .filter(|cwd| !cwd.trim().is_empty())
-            .ok_or_else(|| EngineError::Other("Chat has no working directory".into()))?;
-        let reason = if chat.device_id != self.inner.device_id {
-            Some(LiveVoiceUnavailableReason::RemoteChat)
-        } else if chat.config.as_ref().map(|config| config.harness) != Some(HarnessId::Omp) {
-            Some(LiveVoiceUnavailableReason::NonOmp)
-        } else if chat.archived {
-            Some(LiveVoiceUnavailableReason::Archived)
-        } else if self.inner.live_voice.is_active() {
-            Some(LiveVoiceUnavailableReason::AnotherLiveCall)
-        } else {
-            None
-        };
-        Ok((reason, cwd))
-    }
-
     /// Whether this harness takes a prompt *during* a turn, rather than only at
     /// the boundary between turns. The queue drain's central question: a
     /// mid-turn agent gets the message now, everything else holds it until the
@@ -1025,10 +581,21 @@ impl SessionsEngine {
             .is_some_and(is_active)
     }
 
+    /// Whether the chat's live runtime reports background work (subagents,
+    /// background shells) still running — parked or not.
+    pub fn holds_background_work(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| h.turn.background_live())
+    }
+
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {
         lock(&self.inner.statuses).values().any(is_active)
+            || lock(&self.inner.runs)
+                .values()
+                .any(|r| r.voice_active.live())
     }
 
     /// A text prompt for `chat_id` would land in the mailbox of a live
@@ -1036,7 +603,8 @@ impl SessionsEngine {
     /// but a mailbox delivery writes the user message now — above the reply
     /// still streaming for the message before it. Such prompts belong in the
     /// visible queue. `request` = a Run that may differ from the live config
-    /// (a different config restarts the runtime instead, which is no hold).
+    /// (one the runtime adopts in place still lands in its mailbox; any other
+    /// config restarts the runtime instead, which is no hold).
     pub fn defers_to_turn_end(
         &self,
         chat_id: &str,
@@ -1048,7 +616,8 @@ impl SessionsEngine {
         let live = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.runtime_config.harness_id,
-                h.steerable && request.is_none_or(|(id, r)| h.runtime_config.can_route(id, r)),
+                h.steerable
+                    && request.is_none_or(|(id, r)| h.runtime_config.route(id, r).is_some()),
             )
         });
         live.is_some_and(|(harness, routable)| routable && !self.steers_mid_turn(harness))
@@ -1067,7 +636,7 @@ impl SessionsEngine {
     pub fn live_run_steerable(&self, chat_id: &str) -> bool {
         lock(&self.inner.runs)
             .get(chat_id)
-            .is_some_and(|h| h.steerable)
+            .is_some_and(|h| h.steerable && !h.retiring.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
@@ -1097,6 +666,96 @@ impl SessionsEngine {
             .map(|(seq, event)| JournaledEvent { seq, event })
             .collect();
         Ok((replay, rx))
+    }
+
+    /// Local experimental bootstrap. No Submit, empty user entry or title request.
+    pub async fn start_idle(
+        &self,
+        chat_id: &str,
+        request: RunRequest,
+    ) -> Result<String, EngineError> {
+        self.start_idle_with_voice_authority(chat_id, request, false)
+            .await
+    }
+
+    /// The engine-owned voice lifecycle can grant root Chat tools to its own
+    /// dedicated orchestrator, without turning on the Workers controller MCP.
+    pub(crate) async fn start_voice_idle(
+        &self,
+        chat_id: &str,
+        request: RunRequest,
+    ) -> Result<String, EngineError> {
+        if !zeron_proto::voice::is_orchestrator_chat(chat_id) {
+            return Err(EngineError::Other(
+                "voice root tools require the engine-owned orchestrator Chat".into(),
+            ));
+        }
+        self.start_idle_with_voice_authority(chat_id, request, true)
+            .await
+    }
+
+    async fn start_idle_with_voice_authority(
+        &self,
+        chat_id: &str,
+        request: RunRequest,
+        voice_orchestrator: bool,
+    ) -> Result<String, EngineError> {
+        // A fresh explicit request may renew an identity-invalidated idle
+        // process. Never interrupt a native delegated turn to recover voice.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let stale = lock(&self.inner.runs).get(chat_id).map(|run| {
+                (
+                    run.voice.as_ref().is_some_and(|v| v.invalidated()),
+                    run.voice_active.live(),
+                )
+            });
+            match stale {
+                Some((true, false)) => {
+                    if self.turn_in_flight(chat_id) {
+                        return Err(EngineError::Other(
+                            "identity changed during delegated work".into(),
+                        ));
+                    }
+                    self.interrupt(chat_id).await?;
+                    break;
+                }
+                Some((true, _)) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(EngineError::Other("voice cleanup in progress".into()));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                _ => break,
+            }
+        }
+        self.dispatch_inner(
+            chat_id,
+            HarnessId::Codex,
+            request,
+            None,
+            false,
+            true,
+            voice_orchestrator,
+        )
+        .await
+    }
+
+    pub(crate) fn take_voice_bridge(
+        &self,
+        chat_id: &str,
+    ) -> Option<(
+        zeron_harness::codex::realtime::RealtimeHandle,
+        tokio::sync::broadcast::Receiver<zeron_proto::voice::VoiceEvent>,
+        Arc<VoiceActivity>,
+    )> {
+        let mut runs = lock(&self.inner.runs);
+        let run = runs.get_mut(chat_id)?;
+        Some((
+            run.voice.clone()?,
+            run.voice.as_ref()?.events.subscribe(),
+            run.voice_active.clone(),
+        ))
     }
 
     /// Start (or route) a run for `chat_id`.
@@ -1129,7 +788,15 @@ impl SessionsEngine {
         message_id: Option<String>,
         startup_retry: bool,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(self.dispatch_inner(chat_id, harness_id, request, message_id, startup_retry))
+        Box::pin(self.dispatch_inner(
+            chat_id,
+            harness_id,
+            request,
+            message_id,
+            startup_retry,
+            false,
+            false,
+        ))
     }
 
     async fn dispatch_inner(
@@ -1139,6 +806,8 @@ impl SessionsEngine {
         mut request: RunRequest,
         mut message_id: Option<String>,
         startup_retry: bool,
+        idle: bool,
+        voice_orchestrator: bool,
     ) -> Result<String, EngineError> {
         let _admission_guard = if let Some(gate) = lock(&self.inner.restart_gate).as_ref() {
             Some(
@@ -1161,60 +830,95 @@ impl SessionsEngine {
         // cross-harness delivery before recording or routing the user turn.
         zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
             .map_err(EngineError::Other)?;
-        self.stamp_sessions_grant(chat_id, &mut request);
-        // Every dispatched prompt is a turn — routed steer or fresh run alike.
-        self.note_turn_start(chat_id, &request.cwd);
+        if !idle || voice_orchestrator {
+            self.stamp_sessions_grant_for_voice(chat_id, &mut request, voice_orchestrator);
+        } else {
+            // Preserve ordinary idle startup's closed grant surface while still
+            // discarding any client-supplied sessions grant.
+            request.sessions = None;
+        }
+        // A Stop can cancel a prompt while it is queued behind a live runtime.
+        // Consume that cancellation before the warm-runtime route can reuse the
+        // mailbox; the later check still covers a fresh dispatch racing Stop.
+        if let Some(id) = &message_id
+            && lock(&self.inner.cancelled_sends)
+                .get_mut(chat_id)
+                .is_some_and(|ids| ids.remove(id))
+        {
+            tracing::info!(chat = %chat_id, "message cancelled by a later Stop: not dispatched");
+            return Ok(String::new());
+        }
+        if !idle {
+            // Every dispatched prompt is a turn — routed steer or fresh run alike.
+            self.note_turn_start(chat_id, &request.cwd);
+        }
+        let worker_notification = is_worker_notification(&request.prompt, message_id.as_deref());
         let run_id = new_id();
         let mut displaced = None;
         let activity_reservation = loop {
             let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
                 (
                     h.run_id.clone(),
-                    h.steerable,
-                    h.runtime_config.can_route(harness_id, &request),
+                    h.steerable && !h.retiring.load(std::sync::atomic::Ordering::Acquire),
+                    h.runtime_config.route(harness_id, &request),
                     h.steer_tx.clone(),
                     h.routed_steers.clone(),
                     h.fork_history_sent.clone(),
+                    h.retiring.clone(),
                 )
             });
-            if let Some((run_id, steerable, same_runtime, steer_tx, ledger, history_sent)) = routed
+            if let Some((run_id, steerable, route, steer_tx, ledger, history_sent, retiring)) =
+                routed
             {
+                if idle {
+                    return if route == Some(false) && harness_id == HarnessId::Codex {
+                        Ok(run_id)
+                    } else {
+                        Err(EngineError::Other("incompatible live runtime".into()))
+                    };
+                }
                 let user_id = message_id.clone().unwrap_or_else(new_id);
                 let mut bootstrap = None;
+                let same_runtime = route.is_some();
+                let reconfigure = route == Some(true);
                 let accepted = if steerable && same_runtime {
                     bootstrap =
                         self.warm_fork_history(chat_id, harness_id, &request.prompt, &history_sent);
                     let delivered = bootstrap.as_deref().unwrap_or(&request.prompt);
-                    // Warm dispatch uses the same mailbox as explicit steering.
-                    // Register acceptance before a fast boundary can retire it.
                     let message = SteerMessage {
-                        // OpenCode must see the canonical selection before it
-                        // decodes the provider command: a project-scoped command
-                        // can disappear between composer discovery and delivery.
                         prompt: if harness_id == HarnessId::Opencode {
                             delivered.to_owned()
                         } else {
                             zeron_proto::invocation::harness_prompt(delivered, harness_id)
                         },
                         message_id: Some(user_id.clone()),
+                        attachments: request.attachments.clone(),
+                        config: reconfigure.then(|| Box::new(request.clone())),
                     };
                     if let Ok(permit) = steer_tx.reserve().await {
-                        // Commit the reserved slot atomically with the update
-                        // marker. An accepted update releases the slot instead,
-                        // and the prompt takes the fresh-run path behind the
-                        // update.
-                        self.inner
-                            .registry
-                            .while_update_clear(harness_id, || {
-                                let mut pending = lock(&ledger);
-                                pending.push_back(RoutedSteer {
-                                    prompt: request.prompt.clone(),
-                                    message_id: user_id.clone(),
-                                    fork_history: bootstrap.is_some(),
-                                });
-                                permit.send(message);
-                            })
-                            .is_some()
+                        let enqueue = || {
+                            let mut pending = lock(&ledger);
+                            pending.push_back(RoutedSteer {
+                                prompt: request.prompt.clone(),
+                                message_id: user_id.clone(),
+                                fork_history: bootstrap.is_some(),
+                                after_stop: retiring.load(std::sync::atomic::Ordering::Acquire),
+                                request: Some(Box::new(request.clone())),
+                            });
+                            permit.send(message);
+                        };
+                        // Worker notifications must reach a running orchestrator
+                        // turn or its background work even while an update is
+                        // pending; ordinary prompts keep the update gate and
+                        // are dispatched only after it clears.
+                        if worker_notification
+                            && (self.turn_in_flight(chat_id) || self.holds_background_work(chat_id))
+                        {
+                            Some(enqueue())
+                        } else {
+                            self.inner.registry.while_update_clear(harness_id, enqueue)
+                        }
+                        .is_some()
                     } else {
                         false
                     }
@@ -1222,48 +926,46 @@ impl SessionsEngine {
                     false
                 };
                 if accepted {
+                    if reconfigure {
+                        if let Some(handle) = lock(&self.inner.runs)
+                            .get_mut(chat_id)
+                            .filter(|handle| handle.run_id == run_id)
+                        {
+                            handle.runtime_config.request = request.clone();
+                        }
+                        lock(&self.inner.last_requests)
+                            .insert(chat_id.to_string(), request.clone());
+                    }
                     let handle = self.doc_handle(chat_id)?;
                     handle.write_user_message(&user_id, &request.prompt, now_ms())?;
                     if self.is_live(chat_id, &run_id) {
                         if bootstrap.is_some() {
                             history_sent.store(true, std::sync::atomic::Ordering::Release);
                         }
-                        // Working BEFORE the lastMessageAt bump: both ride the
-                        // workspace doc from this one peer, so causal order makes it
-                        // impossible for an observer to hold [new message, old status]
-                        // — that gap read as unseen-with-no-live-run = a phantom
-                        // "completed" flash on every remote send (2026-07-31).
                         self.set_status(chat_id, SessionStatus::Working, false);
                         self.inner.note_message(chat_id, &request.prompt);
                         return Ok(run_id);
                     }
-                    // The run died around the send. If its exit drain already
-                    // claimed the entry, that re-dispatch owns the message —
-                    // otherwise reclaim it and fall through to a fresh run.
                     let reclaimed = {
                         let mut ledger = lock(&ledger);
                         let before = ledger.len();
-                        ledger.retain(|s| s.message_id != user_id);
+                        ledger.retain(|steer| steer.message_id != user_id);
                         ledger.len() != before
                     };
                     if !reclaimed {
                         self.inner.note_message(chat_id, &request.prompt);
                         return Ok(run_id);
                     }
-                    // Keep the already-written doc entry's id for the fresh run
-                    // below (write_user_message dedupes by id).
                     message_id = Some(user_id);
                 }
                 if !same_runtime {
-                    tracing::debug!(
+                    tracing::info!(
                         chat = %chat_id,
                         "restarting live harness to apply changed run configuration"
                     );
                 }
-                // Mailbox closed (runtime mid-teardown / non-steering harness) or
-                // the routed run died with the message reclaimed, or configuration
-                // changed beyond what the text-only mailbox can carry: replace it.
-                self.interrupt(chat_id).await?;
+                // A runtime replacement ends its background jobs too.
+                self.terminate(chat_id).await?;
                 displaced = Some(run_id);
             }
             let cwd = std::path::PathBuf::from(&request.cwd);
@@ -1284,10 +986,22 @@ impl SessionsEngine {
             }
         };
 
+        // A Stop sent after this message cancelled it while it was on its
+        // way: never start the stopped work again in a fresh runtime.
+        if let Some(id) = &message_id
+            && lock(&self.inner.cancelled_sends)
+                .get_mut(chat_id)
+                .is_some_and(|ids| ids.remove(id))
+        {
+            tracing::info!(chat = %chat_id, "message cancelled by a later Stop: not dispatched");
+            return Ok(String::new());
+        }
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        if !idle {
+            handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        }
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -1348,8 +1062,13 @@ impl SessionsEngine {
             })
         };
         let interrupt_token = CancellationToken::new();
+        let turn = TurnControl::default();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fork_history_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (voice_handle, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
+        let voice_active = Arc::new(VoiceActivity::default());
         let controls = RunControls {
+            realtime: (harness_id == HarnessId::Codex).then_some(realtime),
             execution_lease: None,
             request_input,
             steering: steer_rx,
@@ -1368,33 +1087,49 @@ impl SessionsEngine {
                             .as_deref()
                             .is_some_and(|title| !title.trim().is_empty())
                     }),
+            turn: turn.clone(),
         };
 
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
+                voice: (harness_id == HarnessId::Codex).then_some(voice_handle),
+                voice_active: voice_active.clone(),
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
-                runtime_config: RuntimeConfig::from_request(harness_id, &request),
+                runtime_config: RuntimeConfig::new(harness_id, &request, harness.clone()),
                 steer_tx,
                 interrupt_token,
+                stops_turn_in_place: harness.supports_steering() && harness.stops_turn_in_place(),
+                turn: turn.clone(),
+                started: started.clone(),
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fork_history_sent: fork_history_sent.clone(),
+                retiring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
-        self.set_status(chat_id, SessionStatus::Working, true);
+        self.set_status(
+            chat_id,
+            if idle {
+                SessionStatus::Idle
+            } else {
+                SessionStatus::Working
+            },
+            true,
+        );
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, &request.prompt);
+        if !idle {
+            self.inner.note_message(chat_id, &request.prompt);
+        }
 
-        // Isolated title generators can start from the first prompt. OMP's
-        // automatic path waits for native session metadata at completion.
-        // The Done-time call also supplies the textual fallback if needed.
-        if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd, None);
+        if !idle {
+            if let Some(titles) = self.inner.titles.get() {
+                titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd, None);
+            }
         }
 
         tokio::spawn(drive_run(
@@ -1408,12 +1143,16 @@ impl SessionsEngine {
             engine_rx,
             cancel_rx,
             RunResumeState {
+                idle,
+                voice_active,
                 user_message_id: user_id,
                 resume_injected,
                 startup_retry,
                 fork_history_sent,
+                started,
             },
             activity_reservation,
+            turn,
         ));
         Ok(run_id)
     }
@@ -1465,9 +1204,10 @@ impl SessionsEngine {
         message_id: Option<String>,
         issued_at: i64,
     ) -> Result<SteerOutcome, EngineError> {
+        let worker_notification = is_worker_notification(prompt, message_id.as_deref());
         let target = lock(&self.inner.runs)
             .get(chat_id)
-            .filter(|h| h.steerable)
+            .filter(|h| h.steerable && !h.retiring.load(std::sync::atomic::Ordering::Acquire))
             .map(|h| {
                 (
                     h.run_id.clone(),
@@ -1475,9 +1215,10 @@ impl SessionsEngine {
                     h.steer_tx.clone(),
                     h.routed_steers.clone(),
                     h.fork_history_sent.clone(),
+                    h.retiring.clone(),
                 )
             });
-        let Some((run_id, harness_id, steer_tx, ledger, history_sent)) = target else {
+        let Some((run_id, harness_id, steer_tx, ledger, history_sent, retiring)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
         zeron_proto::invocation::validate_harness_invocations(prompt, harness_id)
@@ -1485,6 +1226,13 @@ impl SessionsEngine {
         let user_id = message_id.unwrap_or_else(new_id);
         let bootstrap = self.warm_fork_history(chat_id, harness_id, prompt, &history_sent);
         let delivered = bootstrap.as_deref().unwrap_or(prompt);
+        // A steer runs on the configuration live now; record it with the
+        // message so a re-dispatch keeps it.
+        let sent_with = self.last_request(chat_id).map(|mut request| {
+            request.prompt = prompt.to_string();
+            request.attachments = Vec::new();
+            Box::new(request)
+        });
         let message = SteerMessage {
             prompt: if harness_id == HarnessId::Opencode {
                 delivered.to_owned()
@@ -1492,25 +1240,38 @@ impl SessionsEngine {
                 zeron_proto::invocation::harness_prompt(delivered, harness_id)
             },
             message_id: Some(user_id.clone()),
+            attachments: Vec::new(),
+            config: None,
         };
         // Saturation is backpressure, not a dead runtime. Waiting for room
         // preserves the live process and every accepted message in a burst.
         let Ok(permit) = steer_tx.reserve().await else {
             return Ok(SteerOutcome::NotSteerable);
         };
-        let accepted = self.inner.registry.while_update_clear(harness_id, || {
+        let enqueue = || {
             // Serialize mailbox acceptance with confirmation and Done-time
             // inspection: a fast consumer must never outrun its ledger entry.
-            // The update marker is checked in the same critical section, so an
-            // accepted update releases the reserved slot instead.
             let mut pending = lock(&ledger);
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),
                 message_id: user_id.clone(),
                 fork_history: bootstrap.is_some(),
+                after_stop: retiring.load(std::sync::atomic::Ordering::Acquire),
+                request: sent_with,
             });
             permit.send(message);
-        });
+        };
+        // Genuine Worker notices must reach the parent run so it can finish
+        // and release an update waiting for that run. Ordinary user steers
+        // remain ordered behind the accepted update. The running process still
+        // holds its execution lease until it exits, keeping installation safe.
+        let accepted = if worker_notification
+            && (self.turn_in_flight(chat_id) || self.holds_background_work(chat_id))
+        {
+            Some(enqueue())
+        } else {
+            self.inner.registry.while_update_clear(harness_id, enqueue)
+        };
         if accepted.is_none() {
             return Ok(SteerOutcome::DeferredByUpdate);
         }
@@ -1546,21 +1307,94 @@ impl SessionsEngine {
         Ok(SteerOutcome::Accepted)
     }
 
-    /// Interrupt the live run, if any. The run settles with a synthetic
-    /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
-    /// (bounded) for that settlement so callers observe a consistent doc.
+    /// A Stop acting now cancels these messages, sent before it but still
+    /// on their way: one that reaches dispatch after the runtime went down
+    /// is dropped rather than run in a fresh runtime.
+    pub fn cancel_sent_messages(&self, chat_id: &str, message_ids: Vec<String>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        lock(&self.inner.cancelled_sends)
+            .entry(chat_id.to_string())
+            .or_default()
+            .extend(message_ids);
+    }
+
+    /// The user's Stop: a hard boundary. The in-flight turn ends `aborted`
+    /// and the runtime goes with it — background subagents, background
+    /// shells, everything the agent runs. The next message resumes the
+    /// conversation in a fresh process. (Sending, steering and switching
+    /// models never come here: they keep the runtime and its work.)
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        self.terminate(chat_id).await
+    }
+
+    /// End the in-flight turn so another prompt can take its place ("send
+    /// now"), keeping the runtime and its background work. Its streaming
+    /// entry is stamped `aborted`; this waits (bounded) for that settlement
+    /// so callers observe a consistent doc. Returns whether there was a turn
+    /// (or runtime) to stop.
+    ///
+    /// A driver that [`Harness::stops_turn_in_place`] ends only the turn: the
+    /// runtime parks with its background work — subagents, background shells
+    /// — still running, and the next prompt routes into it. Drivers without
+    /// that, runs whose harness has not started yet, and stops that do not
+    /// settle fall back to [`Self::terminate`].
+    pub async fn stop_turn(&self, chat_id: &str) -> Result<bool, EngineError> {
+        const STOP_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .filter(|h| {
+                h.stops_turn_in_place && h.started.load(std::sync::atomic::Ordering::Acquire)
+            })
+            .map(|h| (h.run_id.clone(), h.turn.clone(), h.pending_inputs.clone()));
+        let Some((run_id, turn, pending)) = target else {
+            return self.terminate(chat_id).await;
+        };
+        if !self.turn_in_flight(chat_id) {
+            return Ok(false); // parked between turns: nothing to stop
+        }
+        // Unpark questions first: the stopped turn can never be answered.
+        let parked: Vec<_> = lock(&pending).drain().map(|(_, input)| input).collect();
+        for input in parked {
+            let _ = input.resolver.send(Vec::new());
+        }
+        turn.stop_turn();
+        let deadline = tokio::time::Instant::now() + STOP_SETTLE;
+        while tokio::time::Instant::now() < deadline {
+            if !self.is_live(chat_id, &run_id) || !self.turn_in_flight(chat_id) {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tracing::warn!(chat = %chat_id, "turn stop did not settle; tearing the runtime down");
+        self.terminate(chat_id).await
+    }
+
+    /// Tear the chat's live runtime down (protocol interrupt, then the
+    /// child). The run settles with a synthetic `Done{interrupted}` and its
+    /// streaming entry stamped `aborted`; this waits (bounded) for that
+    /// settlement. Background work the runtime held dies with it.
+    pub async fn terminate(&self, chat_id: &str) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
                 h.interrupt_token.clone(),
                 h.cancel.clone(),
                 h.pending_inputs.clone(),
+                h.routed_steers.clone(),
+                h.retiring.clone(),
             )
         });
-        let Some((run_id, token, cancel, pending)) = target else {
+        let Some((run_id, token, cancel, pending, ledger, retiring)) = target else {
             return Ok(false);
         };
+        // From here the runtime takes no prompt: a send now starts a fresh
+        // runtime, and one that raced into this mailbox is re-dispatched.
+        {
+            let _order = lock(&ledger);
+            retiring.store(true, std::sync::atomic::Ordering::Release);
+        }
         // Publish cancellation BEFORE waking the harness. Otherwise a fast
         // EOF after token.cancel() can beat this watch notification and be
         // classified as an error instead of an interrupted turn.
@@ -1663,6 +1497,10 @@ impl SessionsEngine {
                     })
             });
             let attempts = self.inner.journal.resume_attempts(&chat_id);
+            // Fresh: the crashed reply's streaming entry is recent — or no
+            // reply entry reached disk at all (the doc saves on a debounce,
+            // and a kill moments into the turn leaves the user's message as
+            // the transcript's last word), and that message is recent.
             let fresh = handle
                 .doc()
                 .read_entries()
@@ -1672,6 +1510,7 @@ impl SessionsEngine {
                         .iter()
                         .rev()
                         .find(|e| e.status == Some(MessageStatus::Streaming))
+                        .or_else(|| entries.last().filter(|e| e.role == MessageRole::User))
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
@@ -1886,12 +1725,20 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
-        if let Err(err) = self.stop_live_voice().await {
-            tracing::warn!(error = %err, "Live Voice shutdown failed");
-        }
+        self.inner
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Retire the Codex realtime runtimes while keeping shutdown independent
+        // of the per-chat run settlement budget below.
+        self.inner.voice.retire();
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
-        for chat_id in chats {
-            if let Err(err) = self.interrupt(&chat_id).await {
+        let results = futures::future::join_all(chats.into_iter().map(|chat_id| async move {
+            let result = self.interrupt(&chat_id).await;
+            (chat_id, result)
+        }))
+        .await;
+        for (chat_id, result) in results {
+            if let Err(err) = result {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
@@ -2008,9 +1855,6 @@ impl Inner {
                 event: event.clone(),
             });
         }
-        if let Some(store) = lock(&self.trajectory).clone() {
-            self.capture_trajectory_event(&store, chat_id, seq, event);
-        }
         seq
     }
 
@@ -2062,6 +1906,33 @@ impl Inner {
         self.set_status_with_completion_and_error(chat_id, status, fresh_start, None, error);
     }
 
+    /// Publish how many subagents of `chat_id` are streaming. A change is
+    /// mirrored like any status transition (it doubles as a heartbeat); an
+    /// unchanged count is a no-op, and a chat without a status row has
+    /// nothing to badge yet.
+    fn set_running_subagents(&self, chat_id: &str, running: usize) {
+        let running = u32::try_from(running).unwrap_or(u32::MAX);
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            if entry.running_subagents == running {
+                return;
+            }
+            entry.running_subagents = running;
+            entry.updated_at = Utc::now();
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -2110,6 +1981,7 @@ impl Inner {
                     context_usage: None,
                     error: None,
                     turn_stats: None,
+                    running_subagents: 0,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -2194,6 +2066,38 @@ impl Inner {
         lock(&self.doc_host).clone()
     }
 
+    /// A message the user already sent follows the turn that is ending
+    /// (see [`crate::doc_host::ChatDocHandle::continues_with_sent_message`]).
+    fn continues_with_sent_message(&self, chat_id: &str) -> bool {
+        self.doc_host()
+            .and_then(|host| host.open(chat_id).ok())
+            .is_some_and(|handle| handle.continues_with_sent_message())
+    }
+
+    /// Zeron's own MCP server for a run of `chat_id`: this binary's `zeron
+    /// mcp` subcommand, dialing the engine's IPC port and stamped with the
+    /// originating chat + device so the agent's side chats link back here.
+    /// None when the engine serves no port or its executable is unknown.
+    fn zeron_mcp(&self, chat_id: &str) -> Option<zeron_proto::McpServer> {
+        let port = self.ipc_port.load(std::sync::atomic::Ordering::Relaxed);
+        if port == 0 {
+            return None;
+        }
+        let command = std::env::current_exe().ok()?.to_str()?.to_owned();
+        Some(zeron_proto::McpServer {
+            name: "zeron".into(),
+            command,
+            args: vec!["mcp".into()],
+            env: [
+                ("ZERON_IPC_PORT".to_owned(), port.to_string()),
+                ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
+                ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
         self.doc_host().and_then(|host| host.workspace().cloned())
     }
@@ -2243,7 +2147,17 @@ impl Inner {
     /// never rides `--resume`. An empty stored id is the explicit tombstone —
     /// no resume, no falling through to staler sources.
     fn resume_for(&self, chat_id: &str, cwd: &str) -> Option<String> {
-        let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || session_cwd == cwd;
+        // The same directory, however it is spelled: an agent reports where
+        // it runs with symlinks resolved (`/private/var/…` for `/var/…` on
+        // macOS), and until a turn's Done restores the request's spelling a
+        // mid-turn crash leaves that one stored — a string compare then
+        // started the resumed run in a fresh session, its history gone.
+        let cwd_ok = |session_cwd: &str| {
+            session_cwd.is_empty()
+                || session_cwd == cwd
+                || std::fs::canonicalize(session_cwd)
+                    .is_ok_and(|a| std::fs::canonicalize(cwd).is_ok_and(|b| a == b))
+        };
         if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
             return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
                 .then_some(known.session_id);
@@ -2263,448 +2177,62 @@ impl Inner {
     /// The last harness session id named anywhere in the chat's journal, with
     /// the cwd of the `SessionStarted` that governs it. `Done.session_id`
     /// inherits the cwd of the most recent `SessionStarted` (same run).
+    ///
+    /// Walks the journal newest-first and stops at the answer, so boot recovery
+    /// doesn't load whole multi-MB journals: the newest non-empty id wins, and a
+    /// `Done` id takes the cwd of the nearest earlier `SessionStarted` (any id).
     fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String)> {
-        let events = match self.journal.replay(chat_id, 0) {
+        let warn = |err: crate::run_journal::JournalError| {
+            tracing::warn!(chat = %chat_id, error = %err, "journal scan for harness session failed");
+        };
+        let events = match self.journal.events_rev(chat_id) {
             Ok(events) => events,
             Err(err) => {
-                tracing::warn!(chat = %chat_id, error = %err, "journal scan for harness session failed");
+                warn(err);
                 return None;
             }
         };
-        let mut current_cwd = String::new();
-        let mut found: Option<(String, String)> = None;
-        for (_, event) in events {
+        // A `Done` id seen first, still waiting for its run's `SessionStarted` cwd.
+        let mut done_id: Option<String> = None;
+        for item in events {
+            let (seq, event) = match item {
+                Ok(item) => item,
+                Err(err) => {
+                    warn(err);
+                    return None;
+                }
+            };
+            if seq == 0 {
+                continue; // `replay(_, 0)` (the old full scan) never yielded seq 0
+            }
             match event {
                 AgentEvent::SessionStarted {
                     session_id, cwd, ..
                 } => {
-                    current_cwd = cwd;
+                    if let Some(id) = done_id {
+                        return Some((id, cwd));
+                    }
                     if !session_id.is_empty() {
-                        found = Some((session_id, current_cwd.clone()));
+                        return Some((session_id, cwd));
                     }
                 }
                 AgentEvent::Done {
                     session_id: Some(session_id),
                     ..
-                } if !session_id.is_empty() => {
-                    found = Some((session_id, current_cwd.clone()));
+                } if done_id.is_none() && !session_id.is_empty() => {
+                    done_id = Some(session_id);
                 }
                 _ => {}
             }
         }
-        found
+        done_id.map(|id| (id, String::new()))
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             runs.remove(chat_id);
-            lock(&self.fallback_trajectory_runs).remove(chat_id);
         }
-    }
-
-    pub fn tombstone_chat(&self, chat_id: &str) {
-        lock(&self.tombstoned_chats).insert(chat_id.to_string());
-        lock(&self.in_flight_text).remove(chat_id);
-        lock(&self.in_flight_reasoning).remove(chat_id);
-        lock(&self.fallback_trajectory_runs).remove(chat_id);
-        lock(&self.trajectory_tool_names).remove(chat_id);
-    }
-
-    fn has_in_flight_buffers(&self, chat_id: &str) -> bool {
-        lock(&self.in_flight_text)
-            .get(chat_id)
-            .is_some_and(|inf| !inf.text.is_empty())
-            || lock(&self.in_flight_reasoning)
-                .get(chat_id)
-                .is_some_and(|inf| !inf.text.is_empty())
-    }
-
-    fn trajectory_run_id(&self, chat_id: &str, seq: u64, event: &AgentEvent) -> String {
-        lock(&self.runs)
-            .get(chat_id)
-            .map(|handle| handle.run_id.clone())
-            .unwrap_or_else(|| {
-                let mut fallback = lock(&self.fallback_trajectory_runs);
-                if matches!(event, AgentEvent::SessionStarted { .. })
-                    && !self.has_in_flight_buffers(chat_id)
-                {
-                    fallback.insert(chat_id.to_string(), format!("run_{}", seq.max(1)));
-                }
-                fallback
-                    .entry(chat_id.to_string())
-                    .or_insert_with(|| format!("run_{}", seq.max(1)))
-                    .clone()
-            })
-    }
-
-    fn flush_in_flight_reasoning(&self, store: &Arc<TrajectoryStore>, chat_id: &str) {
-        if lock(&self.tombstoned_chats).contains(chat_id) {
-            lock(&self.in_flight_reasoning).remove(chat_id);
-            return;
-        }
-        let inf = lock(&self.in_flight_reasoning).remove(chat_id);
-        if let Some(inf) = inf {
-            let (summary, sanitized_text) =
-                zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024);
-            let rec = TrajectoryRecord {
-                id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 1),
-                chat_id: chat_id.to_string(),
-                run_id: inf.run_id.clone(),
-                source_seq: inf.start_seq,
-                sub_seq: 1,
-                lane: TrajectoryLane::Model,
-                kind: TrajectoryRecordKind::Reasoning,
-                status: TrajectoryStatus::Completed,
-                is_partial: false,
-                title: "Reasoning".into(),
-                summary,
-                turn_id: inf.turn_id,
-                step_id: inf.step_id,
-                call_id: None,
-                parent_tool_use_id: None,
-                timing: Some(TrajectoryTiming::recorded(
-                    None,
-                    Some(Utc::now()),
-                    None,
-                    None,
-                )),
-                usage: None,
-                payload: Some(TrajectoryPayloadPreview {
-                    summary: "Reasoning completed".to_string(),
-                    sanitized_text,
-                    schema_info: None,
-                    raw_ref: Some(TrajectoryRawRef::new(
-                        chat_id,
-                        inf.start_seq,
-                        None,
-                        None,
-                        TrajectoryRawField::Payload,
-                    )),
-                }),
-                result: None,
-                error_message: None,
-                is_degraded: false,
-            };
-            let _ = store.try_enqueue(rec);
-        }
-    }
-
-    fn flush_in_flight_text(&self, store: &Arc<TrajectoryStore>, chat_id: &str) {
-        if lock(&self.tombstoned_chats).contains(chat_id) {
-            lock(&self.in_flight_text).remove(chat_id);
-            return;
-        }
-        let inf = lock(&self.in_flight_text).remove(chat_id);
-        if let Some(inf) = inf {
-            let (summary, sanitized_text) =
-                zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024);
-            let rec = TrajectoryRecord {
-                id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 0),
-                chat_id: chat_id.to_string(),
-                run_id: inf.run_id.clone(),
-                source_seq: inf.start_seq,
-                sub_seq: 0,
-                lane: TrajectoryLane::Model,
-                kind: TrajectoryRecordKind::AssistantMessage,
-                status: TrajectoryStatus::Completed,
-                is_partial: false,
-                title: "Assistant".into(),
-                summary,
-                turn_id: inf.turn_id,
-                step_id: inf.step_id,
-                call_id: None,
-                parent_tool_use_id: None,
-                timing: Some(TrajectoryTiming::recorded(
-                    None,
-                    Some(Utc::now()),
-                    None,
-                    None,
-                )),
-                usage: None,
-                payload: Some(TrajectoryPayloadPreview {
-                    summary: "Response completed".to_string(),
-                    sanitized_text,
-                    schema_info: None,
-                    raw_ref: Some(TrajectoryRawRef::new(
-                        chat_id,
-                        inf.start_seq,
-                        None,
-                        None,
-                        TrajectoryRawField::Payload,
-                    )),
-                }),
-                result: None,
-                error_message: None,
-                is_degraded: false,
-            };
-            let _ = store.try_enqueue(rec);
-        }
-    }
-
-    fn capture_trajectory_event(
-        &self,
-        store: &Arc<TrajectoryStore>,
-        chat_id: &str,
-        seq: u64,
-        event: &AgentEvent,
-    ) {
-        if lock(&self.tombstoned_chats).contains(chat_id) {
-            return;
-        }
-        match event {
-            AgentEvent::TextDelta { text } => {
-                let mut in_flight = lock(&self.in_flight_text);
-                if in_flight.get_mut(chat_id).is_none() {
-                    drop(in_flight);
-                    let run_id = self.trajectory_run_id(chat_id, seq, event);
-                    in_flight = lock(&self.in_flight_text);
-                    if in_flight.get_mut(chat_id).is_none() {
-                        in_flight.insert(
-                            chat_id.to_string(),
-                            InFlightTrajectory {
-                                run_id,
-                                start_seq: seq,
-                                text: String::new(),
-                                last_emitted_at: std::time::Instant::now(),
-                                turn_id: None,
-                                step_id: None,
-                            },
-                        );
-                    }
-                }
-                const PREVIEW_CAP: usize = 1024;
-                let entry = in_flight
-                    .get_mut(chat_id)
-                    .expect("in-flight text inserted above");
-                if entry.text.len() < PREVIEW_CAP {
-                    entry.text.push_str(text);
-                }
-                if entry.last_emitted_at.elapsed() >= std::time::Duration::from_millis(120) {
-                    let (summary, sanitized_text) =
-                        zeron_proto::trajectory::sanitize_prompt_preview(&entry.text, PREVIEW_CAP);
-                    let rec = TrajectoryRecord {
-                        id: TrajectoryRecordId::new(&entry.run_id, entry.start_seq, 0),
-                        chat_id: chat_id.to_string(),
-                        run_id: entry.run_id.clone(),
-                        source_seq: entry.start_seq,
-                        sub_seq: 0,
-                        lane: TrajectoryLane::Model,
-                        kind: TrajectoryRecordKind::AssistantMessage,
-                        status: TrajectoryStatus::Running,
-                        is_partial: true,
-                        title: "Assistant".to_string(),
-                        summary,
-                        turn_id: entry.turn_id.clone(),
-                        step_id: entry.step_id.clone(),
-                        call_id: None,
-                        parent_tool_use_id: None,
-                        timing: Some(TrajectoryTiming::recorded(
-                            Some(Utc::now()),
-                            None,
-                            None,
-                            None,
-                        )),
-                        usage: None,
-                        payload: Some(TrajectoryPayloadPreview {
-                            summary: "In-flight response".to_string(),
-                            sanitized_text,
-                            schema_info: None,
-                            raw_ref: Some(TrajectoryRawRef::new(
-                                chat_id,
-                                entry.start_seq,
-                                None,
-                                None,
-                                TrajectoryRawField::Payload,
-                            )),
-                        }),
-                        result: None,
-                        error_message: None,
-                        is_degraded: false,
-                    };
-                    entry.last_emitted_at = std::time::Instant::now();
-                    let _ = store.try_enqueue(rec);
-                }
-            }
-            AgentEvent::ReasoningDelta { text } => {
-                let mut in_flight = lock(&self.in_flight_reasoning);
-                if in_flight.get_mut(chat_id).is_none() {
-                    drop(in_flight);
-                    let run_id = self.trajectory_run_id(chat_id, seq, event);
-                    in_flight = lock(&self.in_flight_reasoning);
-                    if in_flight.get_mut(chat_id).is_none() {
-                        in_flight.insert(
-                            chat_id.to_string(),
-                            InFlightTrajectory {
-                                run_id,
-                                start_seq: seq,
-                                text: String::new(),
-                                last_emitted_at: std::time::Instant::now(),
-                                turn_id: None,
-                                step_id: None,
-                            },
-                        );
-                    }
-                }
-                const PREVIEW_CAP: usize = 1024;
-                let entry = in_flight
-                    .get_mut(chat_id)
-                    .expect("in-flight reasoning inserted above");
-                if entry.text.len() < PREVIEW_CAP {
-                    entry.text.push_str(text);
-                }
-                if entry.last_emitted_at.elapsed() >= std::time::Duration::from_millis(120) {
-                    let (summary, sanitized_text) =
-                        zeron_proto::trajectory::sanitize_prompt_preview(&entry.text, PREVIEW_CAP);
-                    let rec = TrajectoryRecord {
-                        id: TrajectoryRecordId::new(&entry.run_id, entry.start_seq, 1),
-                        chat_id: chat_id.to_string(),
-                        run_id: entry.run_id.clone(),
-                        source_seq: entry.start_seq,
-                        sub_seq: 1,
-                        lane: TrajectoryLane::Model,
-                        kind: TrajectoryRecordKind::Reasoning,
-                        status: TrajectoryStatus::Running,
-                        is_partial: true,
-                        title: "Reasoning".to_string(),
-                        summary,
-                        turn_id: entry.turn_id.clone(),
-                        step_id: entry.step_id.clone(),
-                        call_id: None,
-                        parent_tool_use_id: None,
-                        timing: Some(TrajectoryTiming::recorded(
-                            Some(Utc::now()),
-                            None,
-                            None,
-                            None,
-                        )),
-                        usage: None,
-                        payload: Some(TrajectoryPayloadPreview {
-                            summary: "In-flight reasoning".to_string(),
-                            sanitized_text,
-                            schema_info: None,
-                            raw_ref: Some(TrajectoryRawRef::new(
-                                chat_id,
-                                entry.start_seq,
-                                None,
-                                None,
-                                TrajectoryRawField::Payload,
-                            )),
-                        }),
-                        result: None,
-                        error_message: None,
-                        is_degraded: false,
-                    };
-                    entry.last_emitted_at = std::time::Instant::now();
-                    let _ = store.try_enqueue(rec);
-                }
-            }
-            AgentEvent::AssistantMessageCompleted { .. } => {
-                self.flush_in_flight_reasoning(store, chat_id);
-                self.flush_in_flight_text(store, chat_id);
-            }
-            _ => {
-                let skip_session_started_boundary =
-                    matches!(event, AgentEvent::SessionStarted { .. })
-                        && self.has_in_flight_buffers(chat_id);
-
-                if !skip_session_started_boundary
-                    && matches!(
-                        event,
-                        AgentEvent::SessionStarted { .. }
-                            | AgentEvent::Steered { .. }
-                            | AgentEvent::Done { .. }
-                            | AgentEvent::Error { .. }
-                            | AgentEvent::ToolCall { .. }
-                    )
-                {
-                    self.flush_in_flight_reasoning(store, chat_id);
-                    self.flush_in_flight_text(store, chat_id);
-                }
-
-                if matches!(event, AgentEvent::SessionStarted { .. })
-                    && !skip_session_started_boundary
-                {
-                    lock(&self.trajectory_tool_names).remove(chat_id);
-                }
-                if let Some((call_id, call)) = trajectory_tool_call(event) {
-                    lock(&self.trajectory_tool_names)
-                        .entry(chat_id.to_string())
-                        .or_default()
-                        .insert(
-                            call_id.to_string(),
-                            crate::trajectory_store::tool_name_for(call),
-                        );
-                }
-                let originating_tool_name = trajectory_tool_result_id(event).and_then(|call_id| {
-                    lock(&self.trajectory_tool_names)
-                        .get(chat_id)
-                        .and_then(|names| names.get(call_id))
-                        .cloned()
-                });
-
-                if trajectory_event_projects(event) {
-                    let run_id = self.trajectory_run_id(chat_id, seq, event);
-                    if let Some(record) = crate::trajectory_store::project_event_to_record(
-                        chat_id,
-                        &run_id,
-                        seq,
-                        event,
-                        None,
-                        originating_tool_name.as_deref(),
-                    ) {
-                        let _ = store.try_enqueue(record);
-                    }
-                }
-
-                if matches!(event, AgentEvent::Done { .. }) {
-                    lock(&self.fallback_trajectory_runs).remove(chat_id);
-                    lock(&self.trajectory_tool_names).remove(chat_id);
-                }
-            }
-        }
-    }
-}
-
-fn trajectory_tool_call(event: &AgentEvent) -> Option<(&str, &zeron_proto::ToolCall)> {
-    match event {
-        AgentEvent::ToolCall { id, call } => Some((id, call)),
-        AgentEvent::Subagent { event, .. } => trajectory_tool_call(event),
-        _ => None,
-    }
-}
-
-fn trajectory_tool_result_id(event: &AgentEvent) -> Option<&str> {
-    match event {
-        AgentEvent::ToolResult { id, .. } => Some(id),
-        AgentEvent::Subagent { event, .. } => trajectory_tool_result_id(event),
-        _ => None,
-    }
-}
-
-fn trajectory_event_projects(event: &AgentEvent) -> bool {
-    match event {
-        AgentEvent::SessionStarted { .. }
-        | AgentEvent::ToolCall { .. }
-        | AgentEvent::ToolResult { .. }
-        | AgentEvent::Usage { .. }
-        | AgentEvent::AvailableCommands { .. }
-        | AgentEvent::WorkflowTask { .. }
-        | AgentEvent::Error { .. }
-        | AgentEvent::InputRequested { .. }
-        | AgentEvent::InputResolved { .. }
-        | AgentEvent::Steered { .. }
-        | AgentEvent::Done { .. }
-        | AgentEvent::UserMessage { .. } => true,
-        AgentEvent::Subagent { event, .. } => trajectory_event_projects(event),
-        AgentEvent::TextDelta { .. }
-        | AgentEvent::GeneratedImage { .. }
-        | AgentEvent::ReasoningDelta { .. }
-        | AgentEvent::AssistantMessageCompleted { .. }
-        | AgentEvent::ToolCallPreview { .. }
-        | AgentEvent::NativeTitle { .. }
-        | AgentEvent::TurnMetrics { .. }
-        | AgentEvent::ContextUsage { .. } => false,
     }
 }
 
@@ -3427,10 +2955,14 @@ fn segment_duration_ms(started_at: i64, finished_at: i64) -> u64 {
 /// engine-injected resumes retry — a caller-specified resume fails loudly),
 /// and whether this run already IS the retry (one attempt only).
 struct RunResumeState {
+    idle: bool,
+    voice_active: Arc<VoiceActivity>,
     user_message_id: String,
     resume_injected: bool,
     startup_retry: bool,
     fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the harness stream is open (see [`RunHandle::started`]).
+    started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn cursor_unstarted_history(
@@ -3508,6 +3040,7 @@ async fn drive_run(
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
     checkout_activity: Option<zeron_workers_unpeel::CheckoutActivityReservation>,
+    turn_control: TurnControl,
 ) {
     // Prevent physical removal until this run has actually left the host,
     // even after a newer run replaced its handle.
@@ -3539,14 +3072,16 @@ async fn drive_run(
         None => ProviderSession::Fresh,
         resumed => ProviderSession::Continued(resumed),
     };
-    if let Some(prompt) = inner.fork_history_prompt(
-        &chat_id,
-        &doc,
-        harness_id,
-        &request.prompt,
-        Some(&resume_state.user_message_id),
-        provider,
-    ) {
+    if !resume_state.idle
+        && let Some(prompt) = inner.fork_history_prompt(
+            &chat_id,
+            &doc,
+            harness_id,
+            &request.prompt,
+            Some(&resume_state.user_message_id),
+            provider,
+        )
+    {
         request.prompt = prompt;
         carried_history = true;
         resume_state
@@ -3590,7 +3125,11 @@ async fn drive_run(
                     wire_request.prompt =
                         zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
                 }
-                harness.run(wire_request, controls).await
+                if resume_state.idle {
+                    harness.start_idle(wire_request, controls).await
+                } else {
+                    harness.run(wire_request, controls).await
+                }
             } else {
                 Ok(futures::stream::once(async {
                     Ok(AgentEvent::Done {
@@ -3606,7 +3145,12 @@ async fn drive_run(
         Err(error) => Err(error),
     };
     let mut stream = match started {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            resume_state
+                .started
+                .store(true, std::sync::atomic::Ordering::Release);
+            stream
+        }
         Err(err) => {
             let message = err.to_string();
             tracing::warn!(chat = %chat_id, harness = ?harness_id, error = %message, "run failed to start");
@@ -3695,13 +3239,21 @@ async fn drive_run(
     // its steering mailbox stay warm, and the next user message (dispatch
     // routes into a live run) starts the next turn with zero respawn/resume
     // latency. `Some(when)` = idle since then; the 30-min reaper below ends
-    // a session nobody comes back to (zeron SESSION_IDLE_MS).
-    // `ZERON_SESSION_IDLE_MS` overrides the window (tests).
+    // a session nobody comes back to (zeron SESSION_IDLE_MS). A voice
+    // orchestrator holds Codex and its MCP servers (~200 MB) for calls only,
+    // so it goes after 5 minutes. A call holds the reaper off, and the window
+    // restarts at hang-up. `ZERON_SESSION_IDLE_MS` overrides both (tests).
     let session_idle = std::env::var("ZERON_SESSION_IDLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_secs(30 * 60));
+        .unwrap_or(std::time::Duration::from_secs(
+            if zeron_proto::voice::is_orchestrator_chat(&chat_id) {
+                5 * 60
+            } else {
+                30 * 60
+            },
+        ));
     // A live subagent stretches the window, but never unbounded: every
     // driver's subagent terminal is a best-effort vendor signal (claude's
     // untagged task_notification, grok's subagent_finished, codex thread
@@ -3710,8 +3262,18 @@ async fn drive_run(
     // silent this long (4h by default) is presumed lost; the reap stamps its
     // chip failed.
     let subagent_silence = session_idle * 8;
-    let mut idle_since: Option<tokio::time::Instant> = None;
+    let mut idle_since: Option<tokio::time::Instant> =
+        resume_state.idle.then(tokio::time::Instant::now);
+    // A parked runtime whose agent reports background work (see
+    // `TurnControl::background_live`) is not idle: reaping it killed that
+    // work. The reaper re-checks a full idle window later instead.
+    let mut reap_deferred_until: Option<tokio::time::Instant> = None;
+    // The reaper last deferred for background work. Its end is not idleness
+    // either: the agent reports the drained set a moment before the turn the
+    // completion wakes, and reaping in that gap lost the wake (issue #831).
+    let mut held_for_background = false;
     let steerable = harness.supports_steering();
+    let stops_turn_in_place = steerable && harness.stops_turn_in_place();
     // TURN-QUIESCE WATCHDOG (2026-08-12 stuck-Working incident): a harness
     // that loses a turn's Done — the adapter never settles `session/prompt`
     // even though the agent finished — strands Working forever: the live
@@ -3806,12 +3368,24 @@ async fn drive_run(
                     inner.touch_session(&chat_id);
                     continue;
                 }
+                // A hang-up restarts the idle window, however long the call.
+                _ = resume_state.voice_active.ended.notified() => {
+                    if idle_since.is_some() {
+                        idle_since = Some(tokio::time::Instant::now());
+                    }
+                    continue;
+                }
                 // An accepted update must not wait behind a warm between-turn
                 // child for the full idle-reaper window. The completed turn is
                 // already durable, so retire the parked process cleanly and let
                 // the queued exclusive lease proceed.
                 _ = tokio::time::sleep_until(tokio::time::Instant::now()),
-                    if idle_since.is_some() && inner.registry.update_pending(harness_id) =>
+                    if idle_since.is_some()
+                        && !resume_state.voice_active.live()
+                        && inner.registry.update_pending(harness_id)
+                        && !turn_control.background_live()
+                        && (subagents.is_empty()
+                            || last_subagent_activity.is_none_or(|at| at.elapsed() >= subagent_silence)) =>
                 {
                     if let Some(token) = lock(&inner.runs)
                         .get(&chat_id)
@@ -3823,19 +3397,41 @@ async fn drive_run(
                     break (SessionStatus::Idle, None);
                 }
                 // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
-                // nobody returned to in 30 minutes releases its child. The turn
+                // nobody returned to within its window releases its child. The turn
                 // was finalized at Done, so this end is clean — no aborted stamp.
                 // A live background subagent is somebody still using the child:
                 // the window counts from its last activity, and stretches to
                 // `subagent_silence` while its sink is open.
                 _ = tokio::time::sleep_until(
-                    idle_since
-                        .map(|at| {
-                            at.max(last_subagent_activity.unwrap_or(at))
-                                + if subagents.is_empty() { session_idle } else { subagent_silence }
-                        })
-                        .unwrap_or_else(tokio::time::Instant::now)
-                ), if idle_since.is_some() => {
+                    {
+                        let window = if subagents.is_empty() { session_idle } else { subagent_silence };
+                        let base = idle_since
+                            .map(|at| at.max(last_subagent_activity.unwrap_or(at)) + window);
+                        match (base, reap_deferred_until) {
+                            (Some(base), Some(deferred)) => base.max(deferred),
+                            (base, deferred) => base.or(deferred).unwrap_or_else(tokio::time::Instant::now),
+                        }
+                    }
+                ), if idle_since.is_some() && !resume_state.voice_active.live() => {
+                    // A call that began after this wait was armed holds it off.
+                    if resume_state.voice_active.live() {
+                        continue;
+                    }
+                    // The driver's own report of background work (Claude's
+                    // background agents and shells) is authoritative — it
+                    // lists every task the process still runs — so it holds
+                    // the runtime for as long as that work lives.
+                    if turn_control.background_live() {
+                        tracing::info!(chat = %chat_id, "idle reaper deferred: the agent reports background work");
+                        reap_deferred_until = Some(tokio::time::Instant::now() + session_idle);
+                        held_for_background = true;
+                        continue;
+                    }
+                    if std::mem::take(&mut held_for_background) {
+                        // The work just ended: a full idle window from here.
+                        reap_deferred_until = Some(tokio::time::Instant::now() + session_idle);
+                        continue;
+                    }
                     tracing::info!(
                         chat = %chat_id,
                         live_subagents = subagents.len(),
@@ -3941,7 +3537,8 @@ async fn drive_run(
                     // completion notice, but never notify for an empty boundary
                     // or while an accepted steer still awaits delivery.
                     let completed_turn = ((!folded.is_empty() || writer.is_some())
-                        && !inner.has_pending_steers(&chat_id, &run_id))
+                        && !inner.has_pending_steers(&chat_id, &run_id)
+                        && !inner.continues_with_sent_message(&chat_id))
                         .then(|| entry_id.clone());
                     if !folded.is_empty() || writer.is_some() {
                         if let Err(err) = finish_segment(
@@ -3962,6 +3559,7 @@ async fn drive_run(
                     entry_id = new_id();
                     segment_started = now_ms();
                     idle_since = Some(tokio::time::Instant::now());
+                    reap_deferred_until = None;
                     self_continued_turn = false;
                     inner.set_status_with_completion(
                         &chat_id, SessionStatus::Idle, false, completed_turn,
@@ -4003,6 +3601,12 @@ async fn drive_run(
         {
             inner.publish(&chat_id, &event);
             last_subagent_activity = Some(tokio::time::Instant::now());
+            // Background subagents can outlive the turn and be the only
+            // traffic for minutes: keep the row (and its count) inside the
+            // UI's staleness window while any is live.
+            if !subagents.is_empty() {
+                inner.touch_session(&chat_id);
+            }
             let is_steer = matches!(
                 sub_event.as_ref(),
                 AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. }
@@ -4077,6 +3681,7 @@ async fn drive_run(
                             dirty: false,
                         },
                     );
+                    inner.set_running_subagents(&chat_id, subagents.len());
                     if !chip_streaming {
                         let _ = doc_ref.update_subagent_chip(
                             parent_tool_use_id,
@@ -4139,6 +3744,7 @@ async fn drive_run(
                         _ => MessageStatus::Complete,
                     };
                     let sink = subagents.remove(parent_tool_use_id).expect("checked");
+                    inner.set_running_subagents(&chat_id, subagents.len());
                     let doc_id = sink.doc_id.clone();
                     // FREEZE: the finished transcript uploads as a static R2
                     // blob (`blob/{chatId}/{subDocId}`) so viewers of
@@ -4276,6 +3882,8 @@ async fn drive_run(
                 inner.set_status(&chat_id, SessionStatus::Working, true);
             } else {
                 match &event {
+                    AgentEvent::SessionStarted { .. }
+                        if resume_state.idle && !saw_session_started => {}
                     AgentEvent::Steered { .. } => {
                         idle_since = None;
                         inner.set_status(&chat_id, SessionStatus::Working, true);
@@ -4357,6 +3965,7 @@ async fn drive_run(
         // helper that is down hard fails the retry too and surfaces its
         // crash text (the harness now appends exit status + stderr).
         if resume_state.resume_injected
+            && !resume_state.idle
             && !resume_state.startup_retry
             && !saw_session_started
             && folded.is_empty()
@@ -4562,19 +4171,37 @@ async fn drive_run(
             {
                 titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd, Some(""));
             }
+            // A turn stopped in place: the runtime lives on, parked like a
+            // completed turn. Steers it had accepted but not yet delivered
+            // were cancelled with the turn (never delivered, never
+            // confirmed) — drop them, or they would hold the parked session
+            // Working forever.
+            let stopped_in_place =
+                *status == DoneStatus::Interrupted && stops_turn_in_place && !interrupted;
+            if stopped_in_place
+                && let Some(ledger) = lock(&inner.runs)
+                    .get(&chat_id)
+                    .filter(|h| h.run_id == run_id)
+                    .map(|h| h.routed_steers.clone())
+            {
+                lock(&ledger).clear();
+            }
             // An accepted steer awaiting its boundary owns the continuation:
             // the previous Done is an internal handoff, not a completion ping.
-            // Ordinary queued rows are not in this ledger and still notify.
+            // So does a message the user already sent that is still on its
+            // way (see `continues_with_sent_message`); rows the user queued
+            // themselves still notify.
             let pending_steer = inner.has_pending_steers(&chat_id, &run_id);
             let completed_turn = (*status == DoneStatus::Completed
                 && !interrupted
                 && turn_was_active
-                && !pending_steer)
-                .then(|| entry_id.clone());
+                && !pending_steer
+                && !inner.continues_with_sent_message(&chat_id))
+            .then(|| entry_id.clone());
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for
             // the next routed dispatch; per-turn state resets for it.
-            if *status == DoneStatus::Completed
+            if (*status == DoneStatus::Completed || stopped_in_place)
                 && steerable
                 && !interrupted
                 && !inner.registry.update_pending(harness_id)
@@ -4586,6 +4213,7 @@ async fn drive_run(
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
+                reap_deferred_until = None;
                 self_continued_turn = false;
                 // Accepted steers still own this runtime. Publishing Idle
                 // here lets the ordinary queue overtake that continuation.
@@ -4634,6 +4262,7 @@ async fn drive_run(
             );
         }
     }
+    inner.set_running_subagents(&chat_id, 0);
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
@@ -4651,7 +4280,19 @@ async fn drive_run(
         final_completed_turn,
         final_error,
     );
-    if !interrupted && !orphans.is_empty() {
+    // A Stop cancels the messages it found waiting; one accepted after it
+    // began is still the user's next message and must run.
+    let orphans: Vec<RoutedSteer> = if inner
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        Vec::new()
+    } else if interrupted {
+        orphans.into_iter().filter(|s| s.after_stop).collect()
+    } else {
+        orphans
+    };
+    if !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
         // queued boundary steers, a parked child death). Their user entries
@@ -4664,13 +4305,16 @@ async fn drive_run(
         let chat = chat_id.clone();
         tokio::spawn(async move {
             for steer in orphans {
-                let Some(mut request) = engine.last_request(&chat) else {
+                let Some(mut request) = steer
+                    .request
+                    .map(|request| *request)
+                    .or_else(|| engine.last_request(&chat))
+                else {
                     tracing::warn!(chat = %chat, "orphaned steer lost: no run config to re-dispatch");
                     break;
                 };
                 request.prompt = steer.prompt.clone();
                 request.resume = None;
-                request.attachments = Vec::new();
                 tracing::info!(chat = %chat, "re-dispatching steer orphaned by a dying run");
                 let Some(host) = engine.inner.doc_host() else {
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
@@ -4700,7 +4344,7 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -4711,9 +4355,8 @@ mod tests {
     };
     use crate::doc_host::DocHostConfig;
     use crate::new_id;
-    use crate::trajectory_store::TrajectoryStore;
     use chrono::Utc;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     use zeron_proto::{
         AgentEvent, ContextUsage, DoneStatus, HarnessId, RunRequest, SandboxLevel, Session,
@@ -5303,6 +4946,7 @@ mod tests {
             context_usage: None,
             error: None,
             turn_stats: None,
+            running_subagents: 0,
         };
         let usage = ContextUsage {
             tokens: 392_000,
@@ -5350,6 +4994,7 @@ mod tests {
             context_usage: None,
             error: None,
             turn_stats: None,
+            running_subagents: 0,
         };
         apply_run_error_to_session(
             &mut session,
@@ -5488,6 +5133,148 @@ mod tests {
         assert!(!journal.contains("secret"));
     }
 
+    /// The backwards journal scan must answer exactly what the old full forward
+    /// replay did: newest non-empty id, cwd from the governing `SessionStarted`.
+    #[tokio::test]
+    async fn journal_harness_session_matches_forward_scan() {
+        fn started(id: &str, cwd: &str) -> AgentEvent {
+            AgentEvent::SessionStarted {
+                harness: zeron_proto::HarnessId::ClaudeCode,
+                model: "m".into(),
+                tools: Vec::new(),
+                cwd: cwd.into(),
+                session_id: id.into(),
+                assistant_message_id: "a".into(),
+            }
+        }
+        fn done(id: Option<&str>) -> AgentEvent {
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: id.map(Into::into),
+            }
+        }
+        fn text() -> AgentEvent {
+            AgentEvent::TextDelta { text: "t".into() }
+        }
+        /// The pre-change implementation, verbatim, over a forward replay.
+        fn forward(events: Vec<(u64, AgentEvent)>) -> Option<(String, String)> {
+            let mut current_cwd = String::new();
+            let mut found: Option<(String, String)> = None;
+            for (_, event) in events {
+                match event {
+                    AgentEvent::SessionStarted {
+                        session_id, cwd, ..
+                    } => {
+                        current_cwd = cwd;
+                        if !session_id.is_empty() {
+                            found = Some((session_id, current_cwd.clone()));
+                        }
+                    }
+                    AgentEvent::Done {
+                        session_id: Some(session_id),
+                        ..
+                    } if !session_id.is_empty() => {
+                        found = Some((session_id, current_cwd.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            found
+        }
+
+        /// (chat id, journaled events, expected `(session id, cwd)`).
+        type Case = (
+            &'static str,
+            Vec<AgentEvent>,
+            Option<(&'static str, &'static str)>,
+        );
+        let cases: Vec<Case> = vec![
+            ("empty", vec![], None),
+            ("no-ids", vec![text(), done(None), done(Some(""))], None),
+            (
+                "started-only",
+                vec![started("s1", "/a"), text()],
+                Some(("s1", "/a")),
+            ),
+            (
+                "done-inherits-run-cwd",
+                vec![started("s1", "/a"), text(), done(Some("s2"))],
+                Some(("s2", "/a")),
+            ),
+            (
+                "done-before-any-started",
+                vec![text(), done(Some("s1"))],
+                Some(("s1", "")),
+            ),
+            (
+                "empty-started-sets-cwd-for-later-done",
+                vec![started("s1", "/a"), started("", "/b"), done(Some("s2"))],
+                Some(("s2", "/b")),
+            ),
+            (
+                "later-empty-started-does-not-override",
+                vec![
+                    started("s1", "/a"),
+                    done(Some("s2")),
+                    started("", "/b"),
+                    text(),
+                ],
+                Some(("s2", "/a")),
+            ),
+            (
+                "newest-run-wins",
+                vec![
+                    started("s1", "/a"),
+                    done(Some("s1")),
+                    started("s3", "/c"),
+                    text(),
+                ],
+                Some(("s3", "/c")),
+            ),
+            (
+                "empty-done-ids-ignored",
+                vec![started("s1", "/a"), done(Some("")), done(None)],
+                Some(("s1", "/a")),
+            ),
+            (
+                "only-empty-started-then-done-from-older-run",
+                vec![
+                    started("s1", "/a"),
+                    done(Some("s9")),
+                    started("", "/b"),
+                    done(None),
+                ],
+                Some(("s9", "/a")),
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        for (chat, events, want) in cases {
+            for event in &events {
+                sessions.inner.journal.append(chat, event).unwrap();
+            }
+            let want = want.map(|(id, cwd)| (id.to_string(), cwd.to_string()));
+            let replayed = sessions.inner.journal.replay(chat, 0).unwrap();
+            assert_eq!(forward(replayed), want, "{chat}: reference");
+            assert_eq!(sessions.inner.journal_harness_session(chat), want, "{chat}");
+        }
+        // Torn tail: the last complete SessionStarted still governs.
+        let path = dir.path().join("journals").join("started-only.jsonl");
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut f, b"{\"seq\":3,\"event\":{\"type\":\"done\"").unwrap();
+        assert_eq!(
+            sessions.inner.journal_harness_session("started-only"),
+            Some(("s1".into(), "/a".into()))
+        );
+    }
+
     fn request() -> RunRequest {
         RunRequest {
             mcp: None,
@@ -5527,14 +5314,196 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty());
     }
 
+    struct IdleStartupFixture {
+        idle_calls: Arc<std::sync::atomic::AtomicUsize>,
+        inference_calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+    #[async_trait::async_trait]
+    impl zeron_harness::Harness for IdleStartupFixture {
+        fn id(&self) -> HarnessId {
+            HarnessId::Codex
+        }
+        fn display_name(&self) -> &str {
+            "Offline idle fixture"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<zeron_proto::Model>, zeron_harness::HarnessError> {
+            Ok(vec![])
+        }
+        async fn start_idle(
+            &self,
+            request: RunRequest,
+            _controls: zeron_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            use futures::StreamExt;
+            self.idle_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(request.prompt.is_empty());
+            assert_eq!(request.resume.as_deref(), Some("old-native-thread"));
+            let event = if self.fail {
+                AgentEvent::Done {
+                    status: zeron_proto::DoneStatus::Errored,
+                    result: None,
+                    error: Some("offline startup failed".into()),
+                    session_id: None,
+                }
+            } else {
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Codex,
+                    model: "fixture".into(),
+                    tools: vec![],
+                    cwd: request.cwd,
+                    session_id: "new-native-thread".into(),
+                    assistant_message_id: "fixture-empty".into(),
+                }
+            };
+            Ok(futures::stream::iter([Ok(event)])
+                .chain(futures::stream::pending())
+                .boxed())
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: zeron_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            self.inference_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(zeron_harness::HarnessError::Protocol(
+                "fixture forbids inference".into(),
+            ))
+        }
+    }
+
+    async fn idle_startup_case(fail: bool) {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inference_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = crate::HarnessRegistry::new();
+        registry.register(Arc::new(IdleStartupFixture {
+            idle_calls: idle_calls.clone(),
+            inference_calls: inference_calls.clone(),
+            fail,
+        }));
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            Arc::new(registry),
+            HarnessId::Codex,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat("idle", None, Some(&core.device_id), None, None)
+            .unwrap();
+        let mut request = request();
+        request.prompt.clear();
+        core.sessions
+            .inner
+            .remember_harness_session("idle", "old-native-thread", &request.cwd);
+        core.sessions.start_idle("idle", request).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let completed = if fail {
+                    core.sessions
+                        .session_status("idle")
+                        .is_some_and(|s| s.status == SessionStatus::Errored)
+                } else {
+                    core.sessions.inner.resume_for("idle", "/tmp").as_deref()
+                        == Some("new-native-thread")
+                };
+                if completed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(idle_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(inference_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let entries = core
+            .doc_host
+            .open("idle")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.role == zeron_doc::MessageRole::User)
+        );
+        if !fail {
+            assert!(entries.is_empty());
+            assert_eq!(
+                core.sessions.session_status("idle").unwrap().status,
+                SessionStatus::Idle
+            );
+            assert_eq!(
+                core.workspace.chat_harness_session("idle").unwrap().0,
+                "new-native-thread"
+            );
+            let events = core.sessions.inner.journal.replay("idle", 0).unwrap();
+            assert!(events.iter().any(|(_, event)| matches!(event, AgentEvent::SessionStarted { session_id, .. } if session_id == "new-native-thread")));
+        }
+        core.sessions.shutdown().await;
+    }
+    #[tokio::test]
+    async fn voice_idle_startup_failure_never_retries_as_inference() {
+        idle_startup_case(true).await;
+    }
+    #[tokio::test]
+    async fn voice_idle_startup_remembers_thread_without_creating_messages() {
+        idle_startup_case(false).await;
+    }
+
     #[test]
     fn live_routing_requires_the_same_runtime_configuration() {
         let initial = request();
-        let config = RuntimeConfig::from_request(HarnessId::Grok, &initial);
+        let config = RuntimeConfig::new(
+            HarnessId::Grok,
+            &initial,
+            Arc::new(zeron_harness::AcpHarness::grok()),
+        );
 
         let mut follow_up = initial.clone();
         follow_up.prompt = "second".into();
         follow_up.resume = Some("session-1".into());
+        assert!(config.can_route(HarnessId::Grok, &follow_up));
+        assert!(!config.can_route(HarnessId::Devin, &follow_up));
+
+        // Images ride the mailbox: they never force a replacement runtime.
+        follow_up.attachments.push("/tmp/image.png".into());
+        assert!(config.can_route(HarnessId::Grok, &follow_up));
+
+        // Another client's spelling of the same option value is the same runtime.
+        let mut spelled = initial.clone();
+        spelled
+            .model_options
+            .insert("fastMode".into(), serde_json::json!(true));
+        let config = RuntimeConfig::new(
+            HarnessId::Grok,
+            &spelled,
+            Arc::new(zeron_harness::AcpHarness::grok()),
+        );
+        follow_up
+            .model_options
+            .insert("fastMode".into(), serde_json::json!("true"));
         assert!(config.can_route(HarnessId::Grok, &follow_up));
 
         follow_up.model = Some("grok-4.5".into());
@@ -5543,10 +5512,34 @@ mod tests {
 
         follow_up.reasoning = Some(zeron_proto::ReasoningLevel::Medium);
         assert!(!config.can_route(HarnessId::Grok, &follow_up));
-        follow_up.reasoning = initial.reasoning;
+    }
 
-        follow_up.attachments.push("/tmp/image.png".into());
-        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+    #[test]
+    fn claude_routing_compares_what_the_cli_launches_with() {
+        let claude = || -> Arc<dyn Harness> { Arc::new(zeron_harness::ClaudeHarness::new()) };
+        let mut initial = request();
+        initial.model = Some("claude-opus-5-5".into());
+        initial
+            .model_options
+            .insert("fastMode".into(), serde_json::json!(false));
+        let config = RuntimeConfig::new(HarnessId::ClaudeCode, &initial, claude());
+
+        // The CLI never reads the sandbox level; an option that launches no
+        // flag in either spelling is the same runtime.
+        let mut follow_up = initial.clone();
+        follow_up.sandbox = SandboxLevel::DangerFullAccess;
+        follow_up.model_options.clear();
+        follow_up.worktree = None;
+        assert!(config.can_route(HarnessId::ClaudeCode, &follow_up));
+
+        follow_up
+            .model_options
+            .insert("fastMode".into(), serde_json::json!("true"));
+        assert!(!config.can_route(HarnessId::ClaudeCode, &follow_up));
+        follow_up.model_options.clear();
+
+        follow_up.cwd = "/elsewhere".into();
+        assert!(!config.can_route(HarnessId::ClaudeCode, &follow_up));
     }
 
     #[test]
@@ -5581,959 +5574,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trajectory_capture_complete_run() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine =
-            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat-1";
-        engine.publish(
-            chat_id,
-            &AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "mock-model".into(),
-                tools: vec!["bash".into()],
-                cwd: "/workspace".into(),
-                session_id: "s1".into(),
-                assistant_message_id: "m1".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::UserMessage {
-                text: "List files".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ToolCall {
-                id: "call_1".into(),
-                call: zeron_proto::ToolCall::Exec {
-                    command: "ls -la".into(),
-                },
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ToolResult {
-                id: "call_1".into(),
-                is_error: false,
-                output: Some("total 0\n-rw-r--r-- 1 user user 0 file.txt".into()),
-                diff: None,
-                execution: Some(zeron_proto::ToolExecutionMeta {
-                    exit_code: Some(0),
-                    duration_ms: Some(15),
-                }),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: Some("All files listed".into()),
-                error: None,
-                session_id: Some("s1".into()),
-            },
-        );
-
-        store.flush().await.unwrap();
-        let records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(records.len(), 5);
-
-        assert_eq!(records[0].lane, TrajectoryLane::Input);
-        assert_eq!(records[0].kind, TrajectoryRecordKind::SessionStarted);
-
-        assert_eq!(records[1].lane, TrajectoryLane::Input);
-        assert_eq!(records[1].kind, TrajectoryRecordKind::UserMessage);
-
-        assert_eq!(records[2].lane, TrajectoryLane::Tools);
-        assert!(matches!(
-            records[2].kind,
-            TrajectoryRecordKind::ToolCall { .. }
-        ));
-        assert_eq!(records[2].call_id.as_deref(), Some("call_1"));
-
-        assert_eq!(records[3].lane, TrajectoryLane::Tools);
-        assert_eq!(records[3].status, TrajectoryStatus::Completed);
-        assert_eq!(
-            records[3].kind,
-            TrajectoryRecordKind::ToolResult {
-                tool_name: "bash".into()
-            }
-        );
-        assert_eq!(records[3].call_id.as_deref(), Some("call_1"));
-
-        assert_eq!(records[4].lane, TrajectoryLane::Model);
-        assert_eq!(records[4].kind, TrajectoryRecordKind::Done);
-        assert_eq!(records[4].status, TrajectoryStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_coalescing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine =
-            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat-2";
-        // 1. Initial text delta
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "token0 ".into(),
-            },
-        );
-
-        // 2. Sleep 130ms crossing the 120ms in-flight threshold and emit second delta
-        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "token1 ".into(),
-            },
-        );
-
-        store.flush().await.unwrap();
-        let partial_records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(
-            partial_records.len(),
-            1,
-            "partial delta must create 1 in-flight record"
-        );
-        let partial = &partial_records[0];
-        assert_eq!(partial.lane, TrajectoryLane::Model);
-        assert_eq!(partial.kind, TrajectoryRecordKind::AssistantMessage);
-        assert!(
-            partial.is_partial,
-            "in-flight delta crossing 120ms must be marked partial"
-        );
-        assert_eq!(partial.status, TrajectoryStatus::Running);
-        assert!(partial.summary.contains("token0"));
-        let stable_id = partial.id.clone();
-
-        // 3. Sleep 130ms again and emit third delta
-        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "token2 ".into(),
-            },
-        );
-
-        store.flush().await.unwrap();
-        let updated_records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(updated_records.len(), 1);
-        assert_eq!(
-            updated_records[0].id, stable_id,
-            "record identity must remain stable across partial updates"
-        );
-        assert!(updated_records[0].is_partial);
-        assert!(
-            updated_records[0]
-                .payload
-                .as_ref()
-                .and_then(|p| p.sanitized_text.as_ref())
-                .unwrap()
-                .contains("token2")
-        );
-
-        // 4. Complete assistant message
-        engine.publish(
-            chat_id,
-            &AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: "m1".into(),
-            },
-        );
-
-        store.flush().await.unwrap();
-        let final_records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(
-            final_records.len(),
-            1,
-            "finalized response must remain a single record"
-        );
-        let final_rec = &final_records[0];
-        assert_eq!(
-            final_rec.id, stable_id,
-            "final record must have the exact same stable identity"
-        );
-        assert!(!final_rec.is_partial, "final record must not be partial");
-        assert_eq!(final_rec.status, TrajectoryStatus::Completed);
-        assert!(
-            final_rec
-                .payload
-                .as_ref()
-                .and_then(|p| p.sanitized_text.as_ref())
-                .unwrap()
-                .contains("token0 token1 token2")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_transient_events_preserve_in_flight_identity() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine =
-            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
-        engine.set_trajectory_store(store.clone());
-        let chat_id = "chat-transient";
-
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "first ".into(),
-            },
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "second ".into(),
-            },
-        );
-        store.flush().await.unwrap();
-        let partial = store
-            .list_all_records(chat_id)
-            .unwrap()
-            .into_iter()
-            .find(|record| record.kind == TrajectoryRecordKind::AssistantMessage)
-            .expect("partial assistant record");
-        assert!(partial.is_partial);
-        let stable_id = partial.id;
-
-        engine.publish(
-            chat_id,
-            &AgentEvent::Subagent {
-                parent_tool_use_id: "parent".into(),
-                event: Box::new(AgentEvent::Usage {
-                    input_tokens: 1,
-                    output_tokens: 2,
-                    context_usage: None,
-                }),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ToolCallPreview {
-                id: "preview".into(),
-                call: ToolCall::Exec {
-                    command: "printf preview".into(),
-                },
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::Usage {
-                input_tokens: 3,
-                output_tokens: 5,
-                context_usage: None,
-            },
-        );
-        store.flush().await.unwrap();
-        let assistant_records: Vec<_> = store
-            .list_all_records(chat_id)
-            .unwrap()
-            .into_iter()
-            .filter(|record| record.kind == TrajectoryRecordKind::AssistantMessage)
-            .collect();
-        assert_eq!(assistant_records.len(), 1);
-        assert_eq!(assistant_records[0].id, stable_id);
-        assert!(
-            assistant_records[0].is_partial,
-            "transient events must not finalize the model segment"
-        );
-
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "third".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: "message".into(),
-            },
-        );
-        store.flush().await.unwrap();
-        let assistant_records: Vec<_> = store
-            .list_all_records(chat_id)
-            .unwrap()
-            .into_iter()
-            .filter(|record| record.kind == TrajectoryRecordKind::AssistantMessage)
-            .collect();
-        assert_eq!(assistant_records.len(), 1);
-        assert_eq!(assistant_records[0].id, stable_id);
-        assert!(!assistant_records[0].is_partial);
-        assert_eq!(assistant_records[0].summary, "first second third");
-    }
-    #[tokio::test]
-    async fn test_trajectory_capture_fail_open() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let degraded_store = Arc::new(TrajectoryStore::degraded(
-            dir.path(),
-            "simulated IO failure",
-        ));
-        let engine = SessionsEngine::new(
-            "device".into(),
-            journal.clone(),
-            Arc::new(HarnessRegistry::new()),
-        );
-        engine.set_trajectory_store(degraded_store.clone());
-
-        assert!(degraded_store.is_degraded());
-
-        // Even with a failed/degraded trajectory store, publication and journal replay continue without panic
-        let seq1 = engine.publish(
-            "chat-3",
-            &AgentEvent::UserMessage {
-                text: "Hello".into(),
-            },
-        );
-        let seq2 = engine.publish(
-            "chat-3",
-            &AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: Some("ok".into()),
-                error: None,
-                session_id: None,
-            },
-        );
-
-        assert_eq!(seq1, 1);
-        assert_eq!(seq2, 2);
-        let journal_events = journal.replay("chat-3", 0).unwrap();
-        assert_eq!(journal_events.len(), 2);
-
-        // The degraded store records degraded intervals
-        let intervals = degraded_store.get_degraded_intervals("chat-3").unwrap();
-        assert!(!intervals.is_empty());
-        assert!(intervals[0].reason.contains("simulated IO failure"));
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_mixed_stream_interleaved_reasoning_and_text() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine =
-            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat_mixed";
-        engine.publish(
-            chat_id,
-            &AgentEvent::ReasoningDelta {
-                text: "Thinking part 1. ".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "Response part 1. ".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ReasoningDelta {
-                text: "Thinking part 2.".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "Response part 2.".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: "msg_1".into(),
-            },
-        );
-
-        store.flush().await.unwrap();
-        let records = store.list_all_records(chat_id).unwrap();
-
-        // Must have exactly two distinct records: one Reasoning and one AssistantMessage
-        assert_eq!(records.len(), 2);
-
-        let reasoning_rec = records
-            .iter()
-            .find(|r| matches!(r.kind, TrajectoryRecordKind::Reasoning))
-            .expect("must have distinct Reasoning record");
-        let assistant_rec = records
-            .iter()
-            .find(|r| matches!(r.kind, TrajectoryRecordKind::AssistantMessage))
-            .expect("must have distinct AssistantMessage record");
-
-        assert_eq!(reasoning_rec.title, "Reasoning");
-        assert!(
-            reasoning_rec
-                .payload
-                .as_ref()
-                .unwrap()
-                .sanitized_text
-                .as_ref()
-                .unwrap()
-                .contains("Thinking part 1. Thinking part 2.")
-        );
-        assert!(
-            !reasoning_rec
-                .payload
-                .as_ref()
-                .unwrap()
-                .sanitized_text
-                .as_ref()
-                .unwrap()
-                .contains("Response")
-        );
-
-        assert_eq!(assistant_rec.title, "Assistant");
-        assert!(
-            assistant_rec
-                .payload
-                .as_ref()
-                .unwrap()
-                .sanitized_text
-                .as_ref()
-                .unwrap()
-                .contains("Response part 1. Response part 2.")
-        );
-        assert!(
-            !assistant_rec
-                .payload
-                .as_ref()
-                .unwrap()
-                .sanitized_text
-                .as_ref()
-                .unwrap()
-                .contains("Thinking")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_fallback_run_id_grouping() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine =
-            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat_headless_multi_event";
-        engine.publish(
-            chat_id,
-            &AgentEvent::UserMessage {
-                text: "First turn".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ToolCall {
-                id: "tool_1".into(),
-                call: zeron_proto::ToolCall::ReadFile {
-                    path: "foo.rs".into(),
-                },
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ToolResult {
-                id: "tool_1".into(),
-                is_error: false,
-                output: Some("content".into()),
-                diff: None,
-                execution: None,
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: Some("finished turn 1".into()),
-                error: None,
-                session_id: None,
-            },
-        );
-
-        // Publish turn 2
-        engine.publish(
-            chat_id,
-            &AgentEvent::UserMessage {
-                text: "Second turn".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: Some("finished turn 2".into()),
-                error: None,
-                session_id: None,
-            },
-        );
-
-        store.flush().await.unwrap();
-        let records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(records.len(), 6);
-
-        // Turn 1 records (first 4) must share the same stable run_id
-        let turn1_run_id = &records[0].run_id;
-        assert_eq!(&records[1].run_id, turn1_run_id);
-        assert_eq!(&records[2].run_id, turn1_run_id);
-        assert_eq!(&records[3].run_id, turn1_run_id);
-
-        // Turn 2 records (last 2) must share their own stable run_id
-        let turn2_run_id = &records[4].run_id;
-        assert_eq!(&records[5].run_id, turn2_run_id);
-        assert_ne!(turn1_run_id, turn2_run_id);
-
-        // Pure projection grouping produces exactly two distinct runs
-        let runs = zeron_proto::trajectory::group_records(&records);
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].turns.len(), 1);
-        assert_eq!(runs[1].turns.len(), 1);
-    }
-    #[tokio::test]
-    async fn test_trajectory_capture_missing_done_headless_then_session_started() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine =
-            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat_headless_missing_done";
-        // Run 1: UserMessage and AssistantMessageCompleted WITHOUT a Done event
-        engine.publish(
-            chat_id,
-            &AgentEvent::UserMessage {
-                text: "Prompt 1".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ToolCall {
-                id: "tool_1".into(),
-                call: zeron_proto::ToolCall::ReadFile {
-                    path: "foo.rs".into(),
-                },
-            },
-        );
-
-        // Run 2: Starts with SessionStarted
-        engine.publish(
-            chat_id,
-            &AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "model-2".into(),
-                cwd: "/work".into(),
-                session_id: "s2".into(),
-                assistant_message_id: "m2".into(),
-                tools: Vec::new(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::UserMessage {
-                text: "Prompt 2".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: Some("ok".into()),
-                error: None,
-                session_id: Some("s2".into()),
-            },
-        );
-
-        store.flush().await.unwrap();
-        let records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(records.len(), 5);
-
-        // Records from Run 1 (indices 0 and 1) must have the first run_id
-        let run1_id = records[0].run_id.clone();
-        assert_eq!(records[1].run_id, run1_id);
-
-        // SessionStarted and subsequent records must have a NEW run_id
-        let session_started_rec = &records[2];
-        assert_eq!(
-            session_started_rec.kind,
-            TrajectoryRecordKind::SessionStarted
-        );
-        let run2_id = session_started_rec.run_id.clone();
-        assert_ne!(
-            run2_id, run1_id,
-            "SessionStarted must rotate to a new fallback run ID and not inherit previous unfinished run ID"
-        );
-        assert_eq!(records[3].run_id, run2_id);
-        assert_eq!(records[4].run_id, run2_id);
-
-        let runs = zeron_proto::trajectory::group_records(&records);
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].run_id, run1_id);
-        assert_eq!(runs[1].run_id, run2_id);
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_nested_subagent() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine =
-            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat-4";
-        engine.publish(
-            chat_id,
-            &AgentEvent::Subagent {
-                parent_tool_use_id: "parent_call_10".into(),
-                event: Box::new(AgentEvent::ToolCall {
-                    id: "child_tool_5".into(),
-                    call: zeron_proto::ToolCall::ReadFile {
-                        path: "src/main.rs".into(),
-                    },
-                }),
-            },
-        );
-
-        store.flush().await.unwrap();
-        let records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].parent_tool_use_id.as_deref(),
-            Some("parent_call_10")
-        );
-        assert_eq!(records[0].call_id.as_deref(), Some("child_tool_5"));
-        assert_eq!(
-            records[0]
-                .payload
-                .as_ref()
-                .and_then(|p| p.raw_ref.as_ref())
-                .and_then(|r| r.parent_tool_use_id.as_deref()),
-            Some("parent_call_10")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_zero_viewers() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine = SessionsEngine::new(
-            "device".into(),
-            journal.clone(),
-            Arc::new(HarnessRegistry::new()),
-        );
-        engine.set_trajectory_store(store.clone());
-
-        // Publish events without any watch / subscriber / UI viewer connected
-        let chat_id = "chat_headless";
-        engine.publish(
-            chat_id,
-            &AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "mock-model".into(),
-                tools: vec!["bash".into()],
-                cwd: "/root".into(),
-                session_id: "s_zero".into(),
-                assistant_message_id: "m_zero".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::UserMessage {
-                text: "Running in background with 0 viewers".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: Some("Completed without viewer".into()),
-                error: None,
-                session_id: Some("s_zero".into()),
-            },
-        );
-
-        store.flush().await.unwrap();
-
-        // Proves that all records are captured into TrajectoryStore even with 0 active viewers
-        let records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[0].kind, TrajectoryRecordKind::SessionStarted);
-        assert_eq!(records[1].kind, TrajectoryRecordKind::UserMessage);
-        assert_eq!(records[2].kind, TrajectoryRecordKind::Done);
-    }
-    #[tokio::test]
-    async fn test_trajectory_capture_deleted_chat_events_after_deletion_are_not_persisted() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine = SessionsEngine::new(
-            "device".into(),
-            journal.clone(),
-            Arc::new(HarnessRegistry::new()),
-        );
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat_deleted_test";
-
-        // Run begins and accumulates in-flight text and reasoning
-        engine.publish(
-            chat_id,
-            &AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "mock-model".into(),
-                tools: vec!["bash".into()],
-                cwd: "/root".into(),
-                session_id: "s_del".into(),
-                assistant_message_id: "m_del".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "in-flight streaming text".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ReasoningDelta {
-                text: "in-flight thinking".into(),
-            },
-        );
-        store.flush().await.unwrap();
-
-        // Delete chat in store and tombstone in engine
-        store.delete_chat(chat_id).await.unwrap();
-        engine.tombstone_chat(chat_id);
-        store.flush().await.unwrap();
-
-        assert_eq!(
-            store.list_all_records(chat_id).unwrap().len(),
-            0,
-            "chat must have 0 records after deletion"
-        );
-
-        // Subsequent late events (e.g. interrupt synthesize Done, or late deltas)
-        engine.publish(
-            chat_id,
-            &AgentEvent::Done {
-                status: DoneStatus::Interrupted,
-                result: None,
-                error: Some("Run interrupted by delete".into()),
-                session_id: Some("s_del".into()),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "late delta after deletion".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::ToolCall {
-                id: "call_late".into(),
-                call: ToolCall::Exec {
-                    command: "ls".into(),
-                },
-            },
-        );
-
-        store.flush().await.unwrap();
-
-        // After all late events, deleted chat MUST remain completely empty
-        let records = store.list_all_records(chat_id).unwrap();
-        assert_eq!(
-            records.len(),
-            0,
-            "events published after delete_chat must never re-insert records for tombstoned chat"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_mid_run_session_started_with_in_flight_preserves_run_and_segment()
-     {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine = SessionsEngine::new(
-            "device".into(),
-            journal.clone(),
-            Arc::new(HarnessRegistry::new()),
-        );
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat_mid_session_started";
-
-        // 1. Session starts
-        engine.publish(
-            chat_id,
-            &AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "claude-3-7-sonnet".into(),
-                tools: vec!["bash".into()],
-                cwd: "/root".into(),
-                session_id: "s_mid_1".into(),
-                assistant_message_id: "m_mid_1".into(),
-            },
-        );
-
-        // 2. Stream partial text
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "Initial chunk of answer. ".into(),
-            },
-        );
-
-        // 3. Mid-run SessionStarted re-emission (Claude SDK background re-invocation)
-        engine.publish(
-            chat_id,
-            &AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "claude-3-7-sonnet".into(),
-                tools: vec!["bash".into()],
-                cwd: "/root".into(),
-                session_id: "s_mid_2".into(),
-                assistant_message_id: "m_mid_2".into(),
-            },
-        );
-
-        // 4. Continue streaming text in the same turn
-        engine.publish(
-            chat_id,
-            &AgentEvent::TextDelta {
-                text: "Second chunk continuing the same turn.".into(),
-            },
-        );
-
-        // 5. Complete assistant message
-        engine.publish(
-            chat_id,
-            &AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: "m_mid_2".into(),
-            },
-        );
-        engine.publish(
-            chat_id,
-            &AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: Some("All done".into()),
-                error: None,
-                session_id: Some("s_mid_2".into()),
-            },
-        );
-
-        store.flush().await.unwrap();
-
-        let records = store.list_all_records(chat_id).unwrap();
-
-        // Verify AssistantMessage records: there must be exactly ONE completed AssistantMessage record
-        let assistant_records: Vec<_> = records
-            .iter()
-            .filter(|r| r.kind == TrajectoryRecordKind::AssistantMessage && !r.is_partial)
-            .collect();
-        assert_eq!(
-            assistant_records.len(),
-            1,
-            "mid-run SessionStarted must not split in-flight response into multiple completed records"
-        );
-
-        let assistant_record = assistant_records[0];
-        let payload = assistant_record.payload.as_ref().unwrap();
-        let text = payload.sanitized_text.as_ref().unwrap();
-        assert!(
-            text.contains("Initial chunk of answer") && text.contains("Second chunk continuing"),
-            "accumulated text across mid-run SessionStarted must be preserved in single record: {}",
-            text
-        );
-
-        // Verify all records share the same run_id
-        let first_run_id = &records[0].run_id;
-        for r in &records {
-            assert_eq!(
-                &r.run_id, first_run_id,
-                "mid-run SessionStarted must not rotate fallback run ID"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_trajectory_capture_in_flight_text_growth_is_bounded() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
-        let engine = SessionsEngine::new(
-            "device".into(),
-            journal.clone(),
-            Arc::new(HarnessRegistry::new()),
-        );
-        engine.set_trajectory_store(store.clone());
-
-        let chat_id = "chat_huge_stream";
-        engine.publish(
-            chat_id,
-            &AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "mock-model".into(),
-                tools: vec![],
-                cwd: "/root".into(),
-                session_id: "s_huge".into(),
-                assistant_message_id: "m_huge".into(),
-            },
-        );
-
-        // Publish 50 chunks of 200 bytes (10,000 bytes > 1024 cap)
-        let chunk = "x".repeat(200);
-        for _ in 0..50 {
-            engine.publish(
-                chat_id,
-                &AgentEvent::TextDelta {
-                    text: chunk.clone(),
-                },
-            );
-        }
-
-        engine.publish(
-            chat_id,
-            &AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: "m_huge".into(),
-            },
-        );
-        store.flush().await.unwrap();
-
-        let records = store.list_all_records(chat_id).unwrap();
-        let assistant_rec = records
-            .iter()
-            .find(|r| r.kind == TrajectoryRecordKind::AssistantMessage && !r.is_partial)
-            .expect("must find completed assistant record");
-        let text = assistant_rec
-            .payload
-            .as_ref()
-            .and_then(|p| p.sanitized_text.as_ref())
-            .unwrap();
-        assert!(
-            text.len() <= 1024,
-            "sanitized preview text length must be <= 1024 bytes, got {}",
-            text.len()
-        );
-    }
-
-    #[tokio::test]
     async fn dispatch_rejected_when_restart_authorized() {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(RunJournal::open(temp.path()).unwrap());
@@ -6553,7 +5593,9 @@ mod tests {
     }
 
     struct BarrierHarness {
-        release_rx: Mutex<Option<oneshot::Receiver<()>>>,
+        release_rx: Mutex<VecDeque<oneshot::Receiver<()>>>,
+        started_tx: Option<mpsc::UnboundedSender<CancellationToken>>,
+        settle_after_interrupt: bool,
     }
 
     #[async_trait::async_trait]
@@ -6579,13 +5621,18 @@ mod tests {
         async fn run(
             &self,
             _request: RunRequest,
-            _controls: zeron_harness::RunControls,
+            controls: zeron_harness::RunControls,
         ) -> Result<
             futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
             zeron_harness::HarnessError,
         > {
             use futures::StreamExt as _;
-            let release_rx = self.release_rx.lock().unwrap().take();
+            let release_rx = self.release_rx.lock().unwrap().pop_front();
+            if let Some(started_tx) = &self.started_tx {
+                let _ = started_tx.send(controls.interrupt.clone());
+            }
+            let interrupt = controls.interrupt;
+            let settle_after_interrupt = self.settle_after_interrupt;
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 let _ = tx
@@ -6596,9 +5643,17 @@ mod tests {
                 if let Some(rx) = release_rx {
                     let _ = rx.await;
                 }
+                if settle_after_interrupt {
+                    interrupt.cancelled().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
                 let _ = tx
                     .send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Completed,
+                        status: if settle_after_interrupt {
+                            DoneStatus::Interrupted
+                        } else {
+                            DoneStatus::Completed
+                        },
                         result: None,
                         error: None,
                         session_id: None,
@@ -6618,7 +5673,9 @@ mod tests {
         let (release_tx, release_rx) = oneshot::channel();
         let registry = Arc::new(HarnessRegistry::new());
         registry.register(Arc::new(BarrierHarness {
-            release_rx: Mutex::new(Some(release_rx)),
+            release_rx: Mutex::new(VecDeque::from([release_rx])),
+            started_tx: None,
+            settle_after_interrupt: false,
         }));
         let core = crate::EngineCore::assemble(temp.path(), registry, HarnessId::Mock, None)
             .expect("engine core assembles");
@@ -6675,6 +5732,54 @@ mod tests {
         let _ = release_tx.send(());
     }
 
+    #[tokio::test]
+    async fn shutdown_interrupts_independent_runs_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let (release_one_tx, release_one_rx) = oneshot::channel();
+        let (release_two_tx, release_two_rx) = oneshot::channel();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(BarrierHarness {
+            release_rx: Mutex::new(VecDeque::from([release_one_rx, release_two_rx])),
+            started_tx: Some(started_tx),
+            settle_after_interrupt: true,
+        }));
+        let core = crate::EngineCore::assemble(temp.path(), registry, HarnessId::Mock, None)
+            .expect("engine core assembles");
+        let engine = core.sessions.clone();
+
+        let first = engine
+            .dispatch("shutdown-chat-one", HarnessId::Mock, request(), None)
+            .await
+            .expect("first run dispatches");
+        let second = engine
+            .dispatch("shutdown-chat-two", HarnessId::Mock, request(), None)
+            .await
+            .expect("second run dispatches");
+        assert_ne!(first, second);
+
+        let first_interrupt = started_rx.recv().await.expect("first harness starts");
+        let second_interrupt = started_rx.recv().await.expect("second harness starts");
+        assert!(engine.has_live_run("shutdown-chat-one"));
+        assert!(engine.has_live_run("shutdown-chat-two"));
+
+        // Both streams reach their barriers before shutdown. Each harness then
+        // takes three seconds after its interrupt to report Done(Interrupted).
+        let _ = release_one_tx.send(());
+        let _ = release_two_tx.send(());
+        let started_at = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("shutdown multiplied the per-run settlement budget");
+        let elapsed = started_at.elapsed();
+
+        assert!(first_interrupt.is_cancelled());
+        assert!(second_interrupt.is_cancelled());
+        assert!(elapsed < std::time::Duration::from_secs(5));
+        assert!(!engine.has_live_run("shutdown-chat-one"));
+        assert!(!engine.has_live_run("shutdown-chat-two"));
+    }
+
     #[test]
     fn sessions_grant_requires_a_root_row_and_fails_closed_otherwise() {
         use super::{ChatOrigin, stamp_sessions};
@@ -6696,6 +5801,7 @@ mod tests {
             ChatOrigin::Root,
             Some("ws://127.0.0.1:9"),
             "engine",
+            false,
         );
         let grant = root.sessions.expect("root row with endpoint is granted");
         assert_eq!(grant.parent_chat_id, "chat");
@@ -6710,12 +5816,78 @@ mod tests {
                 origin,
                 Some("ws://127.0.0.1:9"),
                 "engine",
+                false,
             );
             assert!(
                 denied.sessions.is_none(),
                 "{origin:?} never receives sessions"
             );
         }
+
+        let voice_chat = format!("{}fixture", zeron_proto::voice::ORCHESTRATOR_CHAT_PREFIX);
+        let mut voice_root = RunRequest {
+            enable_workers_mcp: false,
+            sessions: Some(forged.clone()),
+            ..request()
+        };
+        stamp_sessions(
+            &mut voice_root,
+            &voice_chat,
+            ChatOrigin::Root,
+            Some("ws://127.0.0.1:9"),
+            "engine",
+            true,
+        );
+        let voice_grant = voice_root
+            .sessions
+            .expect("voice lifecycle grants root tools");
+        assert_eq!(voice_grant.parent_chat_id, voice_chat);
+        assert!(!voice_root.enable_workers_mcp);
+
+        let mut ordinary_root = RunRequest {
+            enable_workers_mcp: false,
+            sessions: Some(forged.clone()),
+            ..request()
+        };
+        stamp_sessions(
+            &mut ordinary_root,
+            "ordinary-root",
+            ChatOrigin::Root,
+            Some("ws://127.0.0.1:9"),
+            "engine",
+            false,
+        );
+        assert!(ordinary_root.sessions.is_none());
+
+        let mut voice_without_ipc = RunRequest {
+            enable_workers_mcp: false,
+            sessions: Some(forged.clone()),
+            ..request()
+        };
+        stamp_sessions(
+            &mut voice_without_ipc,
+            &voice_chat,
+            ChatOrigin::Root,
+            None,
+            "engine",
+            true,
+        );
+        assert!(voice_without_ipc.sessions.is_none());
+
+        let mut forged_voice = RunRequest {
+            enable_workers_mcp: false,
+            sessions: Some(forged),
+            ..request()
+        };
+        stamp_sessions(
+            &mut forged_voice,
+            &voice_chat,
+            ChatOrigin::Spawned,
+            Some("ws://127.0.0.1:9"),
+            "engine",
+            true,
+        );
+        assert!(forged_voice.sessions.is_none());
     }
 
     #[tokio::test]

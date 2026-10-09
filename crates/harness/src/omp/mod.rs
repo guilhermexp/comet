@@ -18,15 +18,9 @@ use zeron_proto::{
 
 use self::normalize::{AgentEndDisposition, OmpNormalizer};
 use self::process::{OmpLaunch, OmpProcess};
-use self::protocol::{
-    MAX_OUTBOUND_BYTES, live_context_command, live_mute_command, live_session_context_command,
-    live_start_command, live_stop_command, parse_live_event,
-};
+use self::protocol::MAX_OUTBOUND_BYTES;
 use self::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
-use crate::{
-    Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
-    LiveVoiceSupport, RunControls, SteerMessage,
-};
+use crate::{Harness, HarnessError, RunControls, SteerMessage};
 
 #[doc(hidden)]
 pub mod normalize;
@@ -333,71 +327,14 @@ impl Harness for OmpHarness {
         true
     }
 
-    async fn probe_live_voice(&self, cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
-        let process = OmpProcess::start(self.launch(cwd.to_path_buf(), true, None)?).await?;
-        let capabilities = process.capabilities();
-        process.shutdown().await?;
-        Ok(LiveVoiceSupport {
-            available: capabilities.live_voice,
-            session_context: capabilities.live_voice_session_context,
-        })
-    }
-
-    async fn start_live_voice(
-        &self,
-        request: LiveVoiceRequest,
-    ) -> Result<LiveVoiceHandle, HarnessError> {
-        if request.cwd.trim().is_empty() {
-            return Err(HarnessError::Protocol(
-                "OMP Live Voice requires a working directory".into(),
-            ));
-        }
-        let process =
-            OmpProcess::start(self.launch(PathBuf::from(request.cwd), false, None)?).await?;
-        let setup = async {
-            if !process.capabilities().live_voice {
-                return Err(HarnessError::Unsupported(
-                    "this OMP's ready frame has no Live Voice capability".into(),
-                ));
-            }
-            if let Some(session_path) = request.resume.as_deref() {
-                let response = process
-                    .request(json!({ "type": "switch_session", "sessionPath": session_path }))
-                    .await?;
-                if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
-                    return Err(HarnessError::Protocol(
-                        "OMP Live session resume was cancelled".into(),
-                    ));
-                }
-            }
-            let state = process.request(json!({ "type": "get_state" })).await?;
-            let session_id = state_session_id(&state).ok_or_else(|| {
-                HarnessError::Protocol("OMP Live state omitted its session identity".into())
-            })?;
-            let events = process.take_events()?;
-            process.request(live_start_command()).await?;
-            Ok((session_id, events))
-        }
-        .await;
-        let (session_id, events) = match setup {
-            Ok(setup) => setup,
-            Err(error) => {
-                let _ = process.shutdown().await;
-                return Err(error);
-            }
-        };
-
-        let (control_tx, control_rx) = mpsc::channel(16);
-        let (event_tx, event_rx) = mpsc::channel(32);
-        tokio::spawn(run_live_voice(process, events, control_rx, event_tx));
-        Ok(LiveVoiceHandle {
-            session_id,
-            events: futures::stream::unfold(event_rx, |mut receiver| async move {
-                receiver.recv().await.map(|event| (event, receiver))
-            })
-            .boxed(),
-            controls: control_tx,
-        })
+    /// OMP binds Workers and root-session grants when host tools are
+    /// registered. `RunRequest::mcp` is a separate provider bridge it ignores.
+    fn same_runtime(&self, live: &RunRequest, next: &RunRequest) -> bool {
+        live.model == next.model
+            && live.reasoning == next.reasoning
+            && crate::same_model_options(&live.model_options, &next.model_options)
+            && live.cwd == next.cwd
+            && crate::same_worker_mcp_config(live, next)
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -421,7 +358,7 @@ impl Harness for OmpHarness {
         // Attachments are filesystem work that gates nothing on the child:
         // resolve them BEFORE the spawn so no process sits idle through
         // multi-megabyte reads.
-        let images = load_images(&request.attachments, &request.prompt).await?;
+        let images = load_images(&request.attachments, &request.prompt, "prompt").await?;
         let process = OmpProcess::start(self.launch(cwd, false, system_prompt_append)?).await?;
         let events = process.take_events()?;
         process
@@ -571,93 +508,6 @@ impl Harness for OmpHarness {
             })
             .boxed(),
         )
-    }
-}
-
-async fn run_live_voice(
-    process: OmpProcess,
-    mut frames: mpsc::Receiver<Value>,
-    mut controls: mpsc::Receiver<LiveVoiceControl>,
-    events: mpsc::Sender<Result<LiveVoiceEvent, HarnessError>>,
-) {
-    loop {
-        tokio::select! {
-            frame = frames.recv() => {
-                let Some(frame) = frame else {
-                    let _ = events
-                        .send(Err(HarnessError::Protocol(
-                            "OMP Live frontend exited unexpectedly".into(),
-                        )))
-                        .await;
-                    let _ = process.shutdown().await;
-                    return;
-                };
-                let event = match parse_live_event(&frame) {
-                    Ok(Some(event)) => event,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        let _ = events.send(Err(error)).await;
-                        let _ = process.shutdown().await;
-                        return;
-                    }
-                };
-                let terminal = matches!(event, LiveVoiceEvent::Ended { .. });
-                let delivered = if matches!(event, LiveVoiceEvent::Levels { .. }) {
-                    match events.try_send(Ok(event)) {
-                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    }
-                } else {
-                    events.send(Ok(event)).await.is_ok()
-                };
-                if terminal || !delivered {
-                    let _ = process.shutdown().await;
-                    return;
-                }
-            }
-            control = controls.recv() => {
-                let Some(control) = control else {
-                    let _ = process.request(live_stop_command()).await;
-                    let _ = events.send(Ok(LiveVoiceEvent::Ended { error: None })).await;
-                    let _ = process.shutdown().await;
-                    return;
-                };
-                let command = match control {
-                    LiveVoiceControl::SetMuted(muted) => Ok(live_mute_command(muted)),
-                    LiveVoiceControl::AppendContext {
-                        delegation_id,
-                        kind,
-                        text,
-                    } => live_context_command(&delegation_id, kind, &text),
-                    LiveVoiceControl::AppendSessionContext { text } => {
-                        live_session_context_command(&text)
-                    }
-                    LiveVoiceControl::Stop => {
-                        match process.request(live_stop_command()).await {
-                            Ok(_) => {
-                                let _ = events
-                                    .send(Ok(LiveVoiceEvent::Ended { error: None }))
-                                    .await;
-                            }
-                            Err(error) => {
-                                let _ = events.send(Err(error)).await;
-                            }
-                        }
-                        let _ = process.shutdown().await;
-                        return;
-                    }
-                };
-                let sent = match command {
-                    Ok(command) => process.request(command).await,
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = sent {
-                    let _ = events.send(Err(error)).await;
-                    let _ = process.shutdown().await;
-                    return;
-                }
-            }
-        }
     }
 }
 
@@ -876,13 +726,20 @@ fn dispatch_steer(
     process: OmpProcess,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     prompt: String,
+    attachments: Vec<String>,
     failed: mpsc::UnboundedSender<String>,
 ) {
     tokio::spawn(async move {
-        match process
-            .request(json!({ "type": "steer", "message": prompt }))
-            .await
-        {
+        let result = async {
+            let images = load_images(&attachments, &prompt, "steer").await?;
+            let mut request = json!({ "type": "steer", "message": prompt });
+            if !images.is_empty() {
+                request["images"] = Value::Array(images);
+            }
+            process.request(request).await.map(|_| ())
+        }
+        .await;
+        match result {
             Ok(_) => {}
             Err(error) => {
                 let _ = failed.send(prompt);
@@ -909,6 +766,7 @@ async fn run_session(
     prompt_timeout: Duration,
 ) {
     let RunControls {
+        realtime: _,
         // Held for the whole turn so a queued CLI update waits for it.
         execution_lease: _execution_lease,
         request_input,
@@ -916,6 +774,7 @@ async fn run_session(
         interrupt,
         chat_id: _,
         generate_native_title,
+        turn: _,
     } = controls;
     let request_input: Arc<RequestInputFn> = request_input.into();
     let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
@@ -1041,13 +900,17 @@ async fn run_session(
             }
             steer = steering.recv(), if steering_open => {
                 match steer {
-                    Some(SteerMessage { prompt, message_id }) => {
+                    Some(steer) => {
+                        let prompt = steer.prompt.clone();
+                        let message_id = steer.message_id.clone();
                         if delivering.is_empty() {
+                            let attachments = steer.attachments;
                             in_flight_steers.push((prompt.clone(), message_id));
                             dispatch_steer(
                                 process.clone(),
                                 event_tx.clone(),
                                 prompt,
+                                attachments,
                                 steer_failed_tx.clone(),
                             );
                         } else {
@@ -1061,7 +924,7 @@ async fn run_session(
                                     }
                                 }
                             }
-                            queued_steers.push_back(SteerMessage { prompt, message_id });
+                            queued_steers.push_back(steer);
                         }
                     }
                     None => steering_open = false,
@@ -1082,7 +945,12 @@ async fn run_session(
                 if answered.contains(&tool_id) {
                     delivering.remove(&tool_id);
                     if delivering.is_empty() {
-                        while let Some(SteerMessage { prompt, message_id }) =
+                        while let Some(SteerMessage {
+                            prompt,
+                            message_id,
+                            attachments,
+                            ..
+                        }) =
                             queued_steers.pop_front()
                         {
                             in_flight_steers.push((prompt.clone(), message_id));
@@ -1090,6 +958,7 @@ async fn run_session(
                                 process.clone(),
                                 event_tx.clone(),
                                 prompt,
+                                attachments,
                                 steer_failed_tx.clone(),
                             );
                         }
@@ -1136,12 +1005,13 @@ async fn run_session(
                 }
                 delivering.remove(&tool_id);
                 if delivering.is_empty() {
-                    while let Some(SteerMessage { prompt, message_id }) = queued_steers.pop_front() {
+                    while let Some(SteerMessage { prompt, message_id, attachments, .. }) = queued_steers.pop_front() {
                         in_flight_steers.push((prompt.clone(), message_id));
                         dispatch_steer(
                             process.clone(),
                             event_tx.clone(),
                             prompt,
+                            attachments,
                             steer_failed_tx.clone(),
                         );
                     }
@@ -1655,7 +1525,11 @@ fn cancelled_interactive_response(id: &str, timed_out: bool) -> Value {
 /// file tools, so an oversized set degrades to those paths instead of killing
 /// the turn. Three Retina screenshots routinely exceed the 2 MiB frame once
 /// base64-expanded; refusing them made a routine send unusable.
-async fn load_images(paths: &[String], prompt: &str) -> Result<Vec<Value>, HarnessError> {
+async fn load_images(
+    paths: &[String],
+    prompt: &str,
+    message_type: &str,
+) -> Result<Vec<Value>, HarnessError> {
     let mut candidates = Vec::new();
     for path in paths {
         let Ok(metadata) = tokio::fs::metadata(path).await else {
@@ -1679,7 +1553,7 @@ async fn load_images(paths: &[String], prompt: &str) -> Result<Vec<Value>, Harne
     // envelope, UTF-8 prompt bytes, worst plausible request id, and base64
     // expansion before materializing any attachment into memory.
     let skeleton = json!({
-        "type": "prompt",
+        "type": message_type,
         "message": prompt,
         "images": candidates
             .iter()
@@ -1877,7 +1751,7 @@ mod tests {
             png(dir.path(), "a.png", 64 * 1024),
             png(dir.path(), "b.png", 64 * 1024),
         ];
-        let images = load_images(&paths, "look").await.unwrap();
+        let images = load_images(&paths, "look", "prompt").await.unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(images[0]["mimeType"], "image/png");
         assert!(images[0]["data"].as_str().is_some_and(|d| !d.is_empty()));
@@ -1895,7 +1769,7 @@ mod tests {
         ];
         // Empty, not Err: the prompt already lists every path, so the turn runs.
         assert!(
-            load_images(&paths, "corrige essas falhas")
+            load_images(&paths, "corrige essas falhas", "prompt")
                 .await
                 .unwrap()
                 .is_empty()
@@ -1906,7 +1780,7 @@ mod tests {
     async fn a_single_attachment_over_the_budget_falls_back_too() {
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![png(dir.path(), "huge.png", MAX_OUTBOUND_BYTES + 1)];
-        assert!(load_images(&paths, "").await.unwrap().is_empty());
+        assert!(load_images(&paths, "", "prompt").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1918,6 +1792,6 @@ mod tests {
             notes.to_string_lossy().into_owned(),
             dir.path().join("gone.png").to_string_lossy().into_owned(),
         ];
-        assert!(load_images(&paths, "").await.unwrap().is_empty());
+        assert!(load_images(&paths, "", "prompt").await.unwrap().is_empty());
     }
 }

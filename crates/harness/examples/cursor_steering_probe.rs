@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         .run(
             request,
             RunControls {
+                realtime: None,
                 chat_id: "cursor-steering-probe".into(),
                 generate_native_title: false,
                 execution_lease: None,
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
                     let _ = tx.send(vec![]);
                     rx
                 }),
+                turn: Default::default(),
             },
         )
         .await?;
@@ -61,6 +63,8 @@ async fn main() -> anyhow::Result<()> {
                                     .send(SteerMessage {
                                         prompt: i.to_string(),
                                         message_id: Some(format!("digit-{i}")),
+                                        attachments: Vec::new(),
+                                        config: None,
                                     })
                                     .await
                                     .is_err()

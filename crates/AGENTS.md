@@ -4,7 +4,7 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `preview` é consumida pela engine para HTTP/RTC; `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. A engine também usa `workers-unpeel` para o serviço comum de worktree, a atividade local e a autorização de Source Control de checkouts Worker pelo link com o projeto (Space). `workers-unpeel` fala com a engine só pelo RPC (`zeron-proto`/`zeron-rpc`), para ler e criar projetos no registro único. `voice` (ditado local, modelo Parakeet opcional) é consumida só pela `ui`, sem RPC nem sync. `sessions-mcp` é fronteira lateral de stdio: depende só de `proto` e `rpc`, e o binário `zeron` a lança; a engine não linka essa crate. Nada abaixo depende de nada acima.
+As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `preview` é consumida pela engine para HTTP/RTC; `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. A engine também usa `workers-unpeel` para o serviço comum de worktree, a atividade local e a autorização de Source Control de checkouts Worker pelo link com o projeto (Space). `workers-unpeel` fala com a engine só pelo RPC (`zeron-proto`/`zeron-rpc`), para ler e criar projetos no registro único. `voice` (ditado local, modelo Parakeet opcional) é consumida só pela `ui`, sem RPC nem sync. `sessions-mcp` é fronteira lateral de stdio: depende só de `proto` e `rpc`, e o binário `zeron` a lança; a engine não linka essa crate. Codex realtime adiciona `audio` (PCM, resampling e AEC nativos opcionais), `voice-media` (helper standalone local, independente da UI), `voice-session` (estado e transporte de cliente sobre RPC), `orb` (geometria/animação pura) e `veil` (fade de texto puro). A engine consome voice-media; desktop e mobile compartilham voice-session/orb/veil. Nada abaixo depende de nada acima.
 
 ## Ownership
 
@@ -14,6 +14,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.
 - `edition = "2024"` em todas.
+- `zeron-client` mantém o recibo durável `viewer-delivery` separado do outbox de Chat: descoberta reabre Chats sem viewport, refaz wake com credenciais atuais e só conclui a versão depois do ACK das rows e uma wake final. `hostDevice` é hint de roteamento, nunca grant. Working exige posse do host/output; envio ainda não adotado permanece Sending/Queued.
 - Runtime async é **tokio** em todo lugar; a UI faz a ponte por `gpui_tokio` (`Tokio::spawn` vira `Task` do gpui). A UI nunca bloqueia na engine.
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
 - **Configured worker presets receive `launch_worker` briefing at native
@@ -23,7 +24,6 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
   (`--` + quoted body: Claude/Codex). Prime-agent and other integrations keep
   interactive delivery. Regression seam:
   `cargo test -p zeron-workers-unpeel --test worker_initial_briefing`.
-- Live Voice é lifecycle da `engine`; a `ui` só projeta e controla, e navegação de Chat nunca manda stop. Em `Working`/`AwaitingInput`, a elegibilidade exige suporte OMP a contexto operacional silencioso; em `Idle`, um handle OMP estacionado permanece elegível com Live básico.
 
 ## Work Guidance
 
@@ -61,5 +61,11 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-update` | [`update/AGENTS.md`](update/AGENTS.md) | Checagem de release e auto-update do binário |
 | `zeron-markdown` | — (`markdown/src/lib.rs`) | Parser markdown por blocos + reparse incremental e heurística de path (`file_path`), UI-free; compartilhado por `zeron-ui` e pelo core mobile |
 | `zeron-text` | — (`text/src/lib.rs`) | Medição e quebra de linha analítica (rustybuzz + fallback CoreText) do app iOS |
-| `zeron-client` | — (`client/src/lib.rs`) | Thin client sem engine (registry, chat2, ledger de comandos, RPC via relay, modo Demo) |
-| `zeron-mobile` | — ([`docs/mobile-rewrite.md`](../docs/mobile-rewrite.md)) | Fachada UniFFI do core mobile; build por `scripts/ios/build-core.sh` |
+| `zeron-client` | — (`client/src/lib.rs`) | Thin client sem engine (registry, chat2, ledger de comandos, recibos viewer-delivery, RPC via relay, modo Demo) |
+| `zeron-mobile` | [`mobile/AGENTS.md`](mobile/AGENTS.md) | Fachada UniFFI e projeção de transcript mobile; arquitetura em [`docs/mobile-rewrite.md`](../docs/mobile-rewrite.md), build por `scripts/ios/build-core.sh` |
+
+| `zeron-audio` | [`audio/AGENTS.md`](audio/AGENTS.md) | PCM, dispositivos nativos, resampling e AEC opcional |
+| `zeron-voice-media` | [`voice-media/AGENTS.md`](voice-media/AGENTS.md) | Helper de voz da instalação standalone do Codex |
+| `zeron-voice-session` | [`voice-session/AGENTS.md`](voice-session/AGENTS.md) | Lifecycle e transporte de cliente de voz local/remoto |
+| `zeron-orb` | [`orb/AGENTS.md`](orb/AGENTS.md) | Geometria e animação de orb compartilhadas, sem renderer |
+| `zeron-veil` | [`veil/AGENTS.md`](veil/AGENTS.md) | Fade e revelação de texto compartilhados, sem renderer |

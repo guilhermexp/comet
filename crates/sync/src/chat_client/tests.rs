@@ -1146,6 +1146,31 @@ struct FlakyConnector {
     times: Mutex<Vec<tokio::time::Instant>>,
 }
 
+struct WakeOnceConnector {
+    next: Mutex<Option<BinPipe>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl BinConnector for WakeOnceConnector {
+    fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>> {
+        let attempt = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pipe = if attempt == 0 {
+            None
+        } else {
+            lock(&self.next).take()
+        };
+        Box::pin(async move {
+            if attempt == 0 {
+                std::future::pending::<Result<BinPipe, SyncError>>().await
+            } else {
+                pipe.ok_or(SyncError::Closed)
+            }
+        })
+    }
+}
+
 impl FlakyConnector {
     fn new(script: Vec<Option<BinPipe>>) -> Arc<Self> {
         Arc::new(Self {
@@ -2333,6 +2358,136 @@ async fn renewed_wakes_require_fresh_reads_without_reconnecting() {
         lock(&sink.replay_rows).is_empty(),
         "wake reads classified live edits as history"
     );
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn os_wake_interrupts_live_chat_session_and_replays_pending_outbox() {
+    let _serial = lock(&PATH_AND_TIMING);
+    let (pipe1, mut end1) = pipe_pair();
+    let (pipe2, mut end2) = pipe_pair();
+    let state = empty_state_json();
+    let first_state = state.clone();
+
+    let first_session = tokio::spawn(async move {
+        serve_join(&mut end1, first_state, &[], vec![], false).await;
+        let push = expect_kind(&mut end1, frame_type::PUSH).await;
+        (
+            push.header["batchId"].as_str().unwrap().to_string(),
+            push.payload,
+            end1,
+        )
+    });
+    let second_session = tokio::spawn(async move {
+        serve_join(&mut end2, state, &[], vec![], true).await;
+        let push = expect_kind(&mut end2, frame_type::PUSH).await;
+        let batch_id = push.header["batchId"].as_str().unwrap().to_string();
+        let payload = push.payload;
+        send(
+            &end2,
+            frame_type::ACK,
+            serde_json::json!({"batchId": batch_id, "seq": 1, "dup": false}),
+            &[],
+        )
+        .await;
+        (batch_id, payload, end2)
+    });
+
+    let (wake_tx, wake_rx) = broadcast::channel(4);
+    let (_online_tx, online_rx) = broadcast::channel(4);
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let client = ChatClient::connect_with_transport_and_signals(
+        connector(vec![pipe1, pipe2]),
+        sink,
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        None,
+        wake_rx,
+        online_rx,
+    )
+    .await
+    .expect("initial join succeeds");
+
+    client.enqueue_batch("wake-pending".into(), vec![0x8f]);
+    let (first_batch, first_payload, _end1) = first_session.await.unwrap();
+    assert_eq!(first_batch, "wake-pending");
+    assert_eq!(first_payload, vec![0x8f]);
+    assert_eq!(client.stats().pending_pushes, 1);
+
+    wake_tx
+        .send(())
+        .expect("local OS-wake receiver is subscribed");
+    let (replayed_batch, replayed_payload, _end2) =
+        tokio::time::timeout(Duration::from_secs(1), second_session)
+            .await
+            .expect("an OS wake must replace a live silent Chat socket promptly")
+            .unwrap();
+    assert_eq!(replayed_batch, first_batch, "replay keeps its batch id");
+    assert_eq!(replayed_payload, first_payload, "replay keeps queued bytes");
+    assert!(
+        _end1.tx.is_closed(),
+        "the stale socket is closed after wake"
+    );
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        client.stats().pending_pushes,
+        0,
+        "the replay ACK retires it"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn os_wake_during_initial_dial_retries_without_losing_readiness() {
+    let _serial = lock(&PATH_AND_TIMING);
+    let (pipe, mut end) = pipe_pair();
+    let server = tokio::spawn(async move {
+        serve_join(&mut end, empty_state_json(), &[], vec![], false).await;
+        end
+    });
+    let connector = Arc::new(WakeOnceConnector {
+        next: Mutex::new(Some(pipe)),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (wake_tx, wake_rx) = broadcast::channel(4);
+    let (_online_tx, online_rx) = broadcast::channel(4);
+    let (fetch, _) = fetcher(b"");
+    let connecting = tokio::spawn(ChatClient::connect_with_transport_and_signals(
+        connector.clone(),
+        Arc::new(RecordingSink::default()),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        None,
+        wake_rx,
+        online_rx,
+    ));
+
+    while connector.calls.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        tokio::task::yield_now().await;
+    }
+    wake_tx
+        .send(())
+        .expect("local OS-wake receiver is subscribed");
+
+    let client = tokio::time::timeout(Duration::from_secs(1), connecting)
+        .await
+        .expect("wake should cancel the pending first dial and retry")
+        .unwrap()
+        .expect("the initial readiness sender survives the interrupted dial");
+    server.await.unwrap();
+    assert_eq!(
+        connector.calls.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert!(client.stats().connected);
     client.shutdown().await;
 }
 

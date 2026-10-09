@@ -1,12 +1,19 @@
+import { realpathSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 
 const notifyPath = {{NOTIFY_PATH_JSON}};
+const filterNestedOmpSubagents = {{FILTER_NESTED_OMP_SUBAGENTS_JSON}};
 
 function providerSessionMetadata(ctx) {
   const manager = ctx?.sessionManager;
   const sessionId = manager?.getSessionId?.();
   const transcriptPath = manager?.getSessionFile?.();
+  const agentKind = ctx?.agent?.kind;
   return {
+    ...(typeof agentKind === "string" && agentKind
+      ? { unpeel_agent_kind: agentKind }
+      : {}),
     ...(typeof sessionId === "string" && sessionId
       ? { session_id: sessionId }
       : {}),
@@ -14,6 +21,34 @@ function providerSessionMetadata(ctx) {
       ? { provider_transcript_path: transcriptPath }
       : {}),
   };
+}
+
+function isNestedOmpAgent(ctx) {
+  if (ctx?.agent?.kind === "sub") {
+    return true;
+  }
+  if (ctx?.agent?.kind === "main") {
+    return false;
+  }
+  if (!filterNestedOmpSubagents) {
+    return false;
+  }
+
+  const transcriptPath = ctx?.sessionManager?.getSessionFile?.();
+  if (typeof transcriptPath !== "string" || !transcriptPath.endsWith(".jsonl")) {
+    return false;
+  }
+
+  let childTranscriptPath = transcriptPath;
+  try {
+    childTranscriptPath = realpathSync(transcriptPath);
+  } catch {}
+
+  try {
+    return statSync(`${dirname(childTranscriptPath)}.jsonl`).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function promptToolName(event) {
@@ -25,6 +60,10 @@ function promptToolName(event) {
 }
 
 function notify(hookEventName, ctx, toolName) {
+  if (isNestedOmpAgent(ctx)) {
+    return Promise.resolve();
+  }
+
   return new Promise((resolve) => {
     const payload = {
       hook_event_name: hookEventName,

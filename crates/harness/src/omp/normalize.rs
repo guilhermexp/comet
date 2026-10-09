@@ -1247,6 +1247,14 @@ mod tests {
                 }
             }
         }));
+        let synthetic_start = std::time::Instant::now();
+        let preview_interval = std::time::Duration::from_millis(zeron_doc::STREAM_COMMIT_MS);
+        normalizer
+            .streaming_tools
+            .get_mut(&0)
+            .expect("started OMP write")
+            .input
+            .set_test_now(synthetic_start);
         let mut events = normalizer.push(json!({
             "type": "message_update",
             "assistantMessageEvent": {
@@ -1255,7 +1263,16 @@ mod tests {
                 "delta": "{\"path\":\"large.txt\",\"content\":\""
             }
         }));
-        for chunk in std::iter::repeat_n("x".repeat(8 * 1024), body_bytes.div_ceil(8 * 1024)) {
+        for (index, chunk) in
+            std::iter::repeat_n("x".repeat(8 * 1024), body_bytes.div_ceil(8 * 1024)).enumerate()
+        {
+            let interval_count = (index / 2 + 1) as u32;
+            normalizer
+                .streaming_tools
+                .get_mut(&0)
+                .expect("started OMP write")
+                .input
+                .set_test_now(synthetic_start + preview_interval * interval_count);
             events.extend(normalizer.push(json!({
                 "type": "message_update",
                 "assistantMessageEvent": {

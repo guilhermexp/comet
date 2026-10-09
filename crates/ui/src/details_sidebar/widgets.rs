@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::{AnyElement, Div, SharedString, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Div, IntoElement, Render, SharedString, Window, div, prelude::*, px,
+};
 
 use crate::{icons, theme::Theme};
 
@@ -22,6 +24,26 @@ pub const CHAT_WORKERS_VISIBLE_ROWS: usize = 6;
 
 pub fn chat_workers_viewport_height_px() -> f32 {
     CHAT_WORKERS_ROW_HEIGHT * CHAT_WORKERS_VISIBLE_ROWS as f32
+}
+
+pub struct ActionTooltip {
+    pub label: SharedString,
+}
+
+impl Render for ActionTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .bg(theme.composer_glass_bg())
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(self.label.clone())
+    }
 }
 #[allow(dead_code)]
 pub fn auto_tab(workflows: usize, subagents: usize, workers: usize) -> ChatWorkersTab {

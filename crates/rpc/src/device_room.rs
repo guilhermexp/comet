@@ -319,9 +319,23 @@ impl HostRelay {
         service: Arc<dyn RpcService>,
         on_nudge: NudgeHandler,
     ) -> Self {
+        Self::spawn_with_signals(
+            config,
+            service,
+            on_nudge,
+            zeron_sync::wake::subscribe(),
+            zeron_sync::wake::subscribe_online(),
+        )
+    }
+
+    fn spawn_with_signals(
+        config: HostRelayConfig,
+        service: Arc<dyn RpcService>,
+        on_nudge: NudgeHandler,
+        mut wake: tokio::sync::broadcast::Receiver<()>,
+        mut online: tokio::sync::broadcast::Receiver<()>,
+    ) -> Self {
         let task = tokio::spawn(async move {
-            let mut wake = zeron_sync::wake::subscribe();
-            let mut online = zeron_sync::wake::subscribe_online();
             let mut token_changes = config.token.subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
@@ -331,7 +345,16 @@ impl HostRelay {
             // failures walk the backoff.
             let mut delay = HOST_REJOIN_MIN;
             loop {
-                match config.token.token().await {
+                let token = tokio::select! {
+                    token = config.token.token() => Some(token),
+                    _ = wake.recv() => None,
+                };
+                let Some(token) = token else {
+                    delay = HOST_REJOIN_MIN;
+                    while wake.try_recv().is_ok() {}
+                    continue;
+                };
+                match token {
                     Ok(token) => {
                         let url = device_room_ws_url(
                             &config.edge_url,
@@ -342,26 +365,40 @@ impl HostRelay {
                         );
                         let url = format!("{url}&nudgeAck=1");
                         let started = tokio::time::Instant::now();
-                        let outcome = {
+                        let (outcome, woke) = {
                             let session = host_session(&url, &service, &on_nudge);
                             tokio::pin!(session);
                             loop {
                                 tokio::select! {
-                                    outcome = &mut session => break outcome,
+                                    outcome = &mut session => break (outcome, false),
+                                    _ = wake.recv() => break (Ok(()), true),
                                     _ = token_changed(&mut token_changes) => {
                                         // Token rotations keep a healthy socket alive. Sign-out is
                                         // different: dropping the session closes the authenticated
                                         // socket and every virtual RPC connection immediately.
-                                        if matches!(config.token.token().await, Err(TokenError::SignedOut)) {
-                                            tracing::info!(
-                                                "device-room: credentials removed; closing host session"
-                                            );
-                                            break Ok(());
+                                        let token = tokio::select! {
+                                            token = config.token.token() => Some(token),
+                                            _ = wake.recv() => None,
+                                        };
+                                        match token {
+                                            None => break (Ok(()), true),
+                                            Some(Err(TokenError::SignedOut)) => {
+                                                tracing::info!(
+                                                    "device-room: credentials removed; closing host session"
+                                                );
+                                                break (Ok(()), false);
+                                            }
+                                            Some(_) => {}
                                         }
                                     }
                                 }
                             }
                         };
+                        if woke {
+                            delay = HOST_REJOIN_MIN;
+                            while wake.try_recv().is_ok() {}
+                            continue;
+                        }
                         let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
                         match outcome {
                             Ok(()) => {
@@ -445,7 +482,7 @@ struct VirtualConn {
 ///
 /// Rejects any device-local method ([`crate::methods::is_local_only`]) before
 /// reaching the inner dispatch loop, ensuring remote peers cannot invoke local-only
-/// Trajectory or Live Voice methods over the relay regardless of param shape.
+/// Live Voice or recap methods over the relay regardless of param shape.
 struct RelayPeerService {
     inner: Arc<dyn RpcService>,
 }
@@ -877,80 +914,98 @@ pub struct LinkCache {
 
 impl LinkCache {
     pub fn new(config: LinkCacheConfig) -> Arc<Self> {
-        let cache = Arc::new(Self {
+        let cache = Self::from_config(config);
+        // Skipped outside a runtime (sync unit tests).
+        if tokio::runtime::Handle::try_current().is_ok() {
+            cache.spawn_watcher(
+                zeron_sync::wake::subscribe(),
+                zeron_sync::wake::subscribe_online(),
+            );
+        }
+        cache
+    }
+
+    fn from_config(config: LinkCacheConfig) -> Arc<Self> {
+        Arc::new(Self {
             config,
             revoked: AtomicBool::new(false),
             links: Mutex::new(HashMap::new()),
             dial_state: Mutex::new(HashMap::new()),
             dial_locks: Mutex::new(HashMap::new()),
-        });
-        // Wake = every cached link is half-open and every cooldown is moot
-        // (the failures belonged to the pre-suspend network). Drop them so the
-        // next call redials immediately with fresh credentials. An online
-        // event (network path back / sibling dial success) likewise voids the
-        // cooldowns — those failures belonged to the dead network — but keeps
-        // live links, which a mere network *recovery* has not invalidated.
-        // Skipped outside a runtime (sync unit tests).
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let weak = Arc::downgrade(&cache);
-            // Subscribe before spawning: credential revocation can happen as soon as
-            // construction returns. Creating the receiver inside the task lets a busy
-            // runtime miss that first watch version and keep authenticated links alive.
-            let mut token_changes = cache.config.token.subscribe();
-            tokio::spawn(async move {
-                let mut wake = zeron_sync::wake::subscribe();
-                let mut online = zeron_sync::wake::subscribe_online();
-                loop {
-                    tokio::select! {
-                        result = wake.recv() => {
-                            if result.is_err() { return; }
-                            let Some(cache) = weak.upgrade() else { return };
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_signals(
+        config: LinkCacheConfig,
+        wake: tokio::sync::broadcast::Receiver<()>,
+        online: tokio::sync::broadcast::Receiver<()>,
+    ) -> Arc<Self> {
+        let cache = Self::from_config(config);
+        cache.spawn_watcher(wake, online);
+        cache
+    }
+
+    fn spawn_watcher(
+        self: &Arc<Self>,
+        mut wake: tokio::sync::broadcast::Receiver<()>,
+        mut online: tokio::sync::broadcast::Receiver<()>,
+    ) {
+        let weak = Arc::downgrade(self);
+        // Subscribe before spawning: credential revocation can happen as soon as
+        // construction returns. Creating the receiver inside the task lets a busy
+        // runtime miss that first watch version and keep authenticated links alive.
+        let mut token_changes = self.config.token.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = wake.recv() => {
+                        if result.is_err() { return; }
+                        let Some(cache) = weak.upgrade() else { return };
+                        lock(&cache.links).clear();
+                        lock(&cache.dial_state).retain(|_, state| state.host_offline);
+                        tracing::info!("peer: links cleared after wake; remote-offline cooldowns retained");
+                    }
+                    result = online.recv() => {
+                        if result.is_err() { return; }
+                        let Some(cache) = weak.upgrade() else { return };
+                        // Our network coming back says nothing about a
+                        // host the relay reported absent — and every
+                        // handshake (including a bounced peer dial)
+                        // broadcasts "online", which used to reset the
+                        // offline peer's backoff on each attempt.
+                        lock(&cache.dial_state).retain(|_, state| state.host_offline);
+                    }
+                    _ = token_changed(&mut token_changes) => {
+                        let Some(cache) = weak.upgrade() else { return };
+                        let signed_out = match cache.config.token.token().await {
+                            Ok(_) => false,
+                            Err(TokenError::SignedOut) => true,
+                            Err(TokenError::TemporarilyUnavailable(_)) => continue,
+                        };
+                        if signed_out {
+                            // Cached clients were authenticated when their sockets
+                            // opened. Revocation must close them even though the
+                            // server has not independently reaped those sockets yet.
+                            cache.revoked.store(true, Ordering::Release);
                             lock(&cache.links).clear();
-                            lock(&cache.dial_state).clear();
-                            tracing::info!("peer: links + cooldowns cleared after wake");
+                        } else {
+                            cache.revoked.store(false, Ordering::Release);
                         }
-                        result = online.recv() => {
-                            if result.is_err() { return; }
-                            let Some(cache) = weak.upgrade() else { return };
-                            // Our network coming back says nothing about a
-                            // host the relay reported absent — and every
-                            // handshake (including a bounced peer dial)
-                            // broadcasts "online", which used to reset the
-                            // offline peer's backoff on each attempt.
+                        if signed_out {
+                            lock(&cache.dial_state).clear();
+                        } else {
                             lock(&cache.dial_state).retain(|_, state| state.host_offline);
                         }
-                        _ = token_changed(&mut token_changes) => {
-                            let Some(cache) = weak.upgrade() else { return };
-                            let signed_out = match cache.config.token.token().await {
-                                Ok(_) => false,
-                                Err(TokenError::SignedOut) => true,
-                                Err(TokenError::TemporarilyUnavailable(_)) => continue,
-                            };
-                            if signed_out {
-                                // Cached clients were authenticated when their sockets
-                                // opened. Revocation must close them even though the
-                                // server has not independently reaped those sockets yet.
-                                cache.revoked.store(true, Ordering::Release);
-                                lock(&cache.links).clear();
-                            } else {
-                                cache.revoked.store(false, Ordering::Release);
-                            }
-                            if signed_out {
-                                lock(&cache.dial_state).clear();
-                            } else {
-                                lock(&cache.dial_state).retain(|_, state| state.host_offline);
-                            }
-                            if signed_out {
-                                tracing::info!("peer: credentials removed; links closed");
-                            } else {
-                                tracing::info!("peer: dial cooldowns cleared after token refresh");
-                            }
+                        if signed_out {
+                            tracing::info!("peer: credentials removed; links closed");
+                        } else {
+                            tracing::info!("peer: dial cooldowns cleared after token refresh");
                         }
                     }
                 }
-            });
-        }
-        cache
+            }
+        });
     }
 
     /// A live `RpcClient` to `device_id`'s engine (dialed + cached on first use).
@@ -1339,5 +1394,162 @@ mod tests {
         );
         let host = device_room_ws_url("http://localhost:26640", "d", "host", None, "t");
         assert_eq!(host, "ws://localhost:26640/device/d/ws?role=host&token=t");
+    }
+
+    struct UnusedService;
+
+    #[async_trait::async_trait]
+    impl RpcService for UnusedService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<crate::RpcReply, RpcError> {
+            Err(RpcError::UnknownMethod(method.into()))
+        }
+    }
+
+    async fn local_host_relay() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<LocalRelayEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { return };
+                        let events_tx = events_tx.clone();
+                        connections.spawn(async move {
+                            let Ok(mut ws) = accept_async(stream).await else {
+                                return;
+                            };
+                            let _ = events_tx.send(LocalRelayEvent::Accepted);
+                            while let Some(message) = ws.next().await {
+                                match message {
+                                    Ok(Message::Ping(payload)) => {
+                                        if ws.send(Message::Pong(payload)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(Message::Close(_)) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                            let _ = events_tx.send(LocalRelayEvent::Closed);
+                        });
+                    }
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        let _ = joined;
+                    }
+                }
+            }
+        });
+        (format!("http://{addr}"), events_rx, task)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum LocalRelayEvent {
+        Accepted,
+        Closed,
+    }
+
+    #[tokio::test]
+    async fn local_wake_reconnects_a_live_host_session() {
+        let (edge_url, mut accepted, relay_task) = local_host_relay().await;
+        let (wake_tx, wake_rx) = tokio::sync::broadcast::channel(4);
+        let (_online_tx, online_rx) = tokio::sync::broadcast::channel(4);
+        let mut config = HostRelayConfig::new(
+            edge_url,
+            "dev-a",
+            Arc::new(StaticToken("test-token".into())),
+        );
+        config.retry = Duration::from_secs(120);
+        let _host = HostRelay::spawn_with_signals(
+            config,
+            Arc::new(UnusedService),
+            Arc::new(|_| true),
+            wake_rx,
+            online_rx,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), accepted.recv())
+            .await
+            .expect("initial host session connects")
+            .expect("relay remains open");
+        wake_tx.send(()).expect("local wake receiver is subscribed");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut old_socket_closed = false;
+            let mut new_socket_accepted = false;
+            while !old_socket_closed || !new_socket_accepted {
+                match accepted.recv().await {
+                    Some(LocalRelayEvent::Closed) => old_socket_closed = true,
+                    Some(LocalRelayEvent::Accepted) => new_socket_accepted = true,
+                    None => panic!("relay event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("wake should close the old socket and promptly accept its replacement");
+
+        drop(_host);
+        relay_task.abort();
+        let _ = relay_task.await;
+    }
+
+    #[tokio::test]
+    async fn local_wake_preserves_remote_offline_cooldown_until_presence_reset() {
+        let (wake_tx, wake_rx) = tokio::sync::broadcast::channel(4);
+        let (_online_tx, online_rx) = tokio::sync::broadcast::channel(4);
+        let config = LinkCacheConfig::new(
+            "http://127.0.0.1:1",
+            Arc::new(StaticToken("test-token".into())),
+        );
+        let cache = LinkCache::new_with_signals(config, wake_rx, online_rx);
+        let now = Instant::now();
+        lock(&cache.dial_state).insert(
+            "remote-offline".into(),
+            DialState {
+                failures: 1,
+                last_failure: Some(now),
+                cooldown_until: Some(now + Duration::from_secs(120)),
+                host_offline: true,
+            },
+        );
+        lock(&cache.dial_state).insert(
+            "transient".into(),
+            DialState {
+                failures: 1,
+                last_failure: Some(now),
+                cooldown_until: Some(now + Duration::from_secs(120)),
+                host_offline: false,
+            },
+        );
+
+        wake_tx.send(()).expect("local wake receiver is subscribed");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lock(&cache.dial_state).contains_key("transient") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wake watcher processes the event");
+
+        assert!(
+            cache
+                .cooling("remote-offline")
+                .is_some_and(|message| message.contains("device is offline")),
+            "local wake must retain the relay's remote-offline evidence"
+        );
+        cache.reset_cooldown("remote-offline");
+        assert!(cache.cooling("remote-offline").is_none());
     }
 }

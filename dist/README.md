@@ -23,14 +23,16 @@ The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 ## macOS
 
 ```sh
-scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dmg
+scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dmg, then /Applications/Zeron.app
 ```
 
 Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc
 signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
 dmg. The auto-update tarball retains an internal `Zeron.app` path so older
-installed builds can update into Zeron. CI runs this on tags
-(`.github/workflows/release.yml`). The manual steps it automates, for reference
+installed builds can update into Zeron. Outside CI it then quits any running
+`/Applications/Zeron.app`, replaces it with the new bundle without launching it
+(`ZERON_PACKAGE_INSTALL=0` skips this, `=1` forces it under CI). CI runs this
+on tags (`.github/workflows/release.yml`). The manual steps it automates, for reference
 (run on a macOS host — gpui needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:

@@ -185,13 +185,15 @@ rpc_methods! {
     WATCH_SESSIONS / WatchSessions = "WatchSessions" { params: serde_json::Value, reply: serde_json::Value },
     /// Spaces registry (device+folder pairs) from the workspace doc.
     WATCH_SPACES / WatchSpaces = "WatchSpaces" { params: serde_json::Value, reply: serde_json::Value },
-    /// Local-only OMP Live Voice lifecycle. Media remains inside OMP; Comet
-    /// exposes only control, state, and transcript metadata.
-    PROBE_LIVE_VOICE / ProbeLiveVoice = "ProbeLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    START_LIVE_VOICE / StartLiveVoice = "StartLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    SET_LIVE_VOICE_MUTED / SetLiveVoiceMuted = "SetLiveVoiceMuted" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    STOP_LIVE_VOICE / StopLiveVoice = "StopLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
-    WATCH_LIVE_VOICE / WatchLiveVoice = "WatchLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    /// Remote Codex realtime voice, routed to the device that owns the Chat.
+    VOICE_CAPABILITIES_V2 / VoiceCapabilitiesV2 = "VoiceCapabilitiesV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    PREPARE_VOICE_V2 / PrepareVoiceV2 = "PrepareVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 65 },
+    OWN_VOICE_V2 / OwnVoiceV2 = "OwnVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
+    NEGOTIATE_VOICE_V2 / NegotiateVoiceV2 = "NegotiateVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 95 },
+    CONFIRM_VOICE_MEDIA_V2 / ConfirmVoiceMediaV2 = "ConfirmVoiceMediaV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    REPORT_VOICE_MEDIA_V2 / ReportVoiceMediaV2 = "ReportVoiceMediaV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    STOP_VOICE_V2 / StopVoiceV2 = "StopVoiceV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    CANCEL_VOICE_ATTEMPT_V2 / CancelVoiceAttemptV2 = "CancelVoiceAttemptV2" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
@@ -249,10 +251,8 @@ rpc_methods! {
     READ_WORKSPACE_FILE / ReadWorkspaceFile = "ReadWorkspaceFile" { params: zeron_proto::ReadWorkspaceFileRequest, reply: zeron_proto::WorkspaceFileText, forwardable: true },
     WATCH_WORKSPACE_FILES / WatchWorkspaceFiles = "WatchWorkspaceFiles" { params: zeron_proto::WatchWorkspaceFilesRequest, reply: zeron_proto::WorkspaceFileChanges, forwardable: true, stream: true },
     CREATE_WORKSPACE_ENTRY / CreateWorkspaceEntry = "CreateWorkspaceEntry" { params: zeron_proto::CreateWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true },
-    RENAME_WORKSPACE_ENTRY / RenameWorkspaceEntry = "RenameWorkspaceEntry" { params: zeron_proto::RenameWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true },
     DELETE_WORKSPACE_ENTRY / DeleteWorkspaceEntry = "DeleteWorkspaceEntry" { params: zeron_proto::DeleteWorkspaceEntryRequest, reply: zeron_proto::WorkspaceMutationOutcome, forwardable: true },
     MOVE_WORKSPACE_ENTRY / MoveWorkspaceEntry = "MoveWorkspaceEntry" { params: zeron_proto::MoveWorkspaceEntryRequest, reply: zeron_proto::WorkspaceMutationOutcome, forwardable: true, deadline_secs: 60 },
-    COPY_WORKSPACE_ENTRY / CopyWorkspaceEntry = "CopyWorkspaceEntry" { params: zeron_proto::CopyWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true, deadline_secs: 60 },
     CREATE_WORKTREE / CreateWorktree = "CreateWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 1800 },
     DELETE_WORKTREE / DeleteWorktree = "DeleteWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 1800 },
     // Terminals (ControlRpc, relay-forwardable — a terminal lives on the chat's
@@ -306,12 +306,6 @@ rpc_methods! {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     APPLY_UPDATE / ApplyUpdate = "ApplyUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
-    // Trajectory (device-local read model & explicit raw reveal; strictly
-    // IPC-only, rejected at relay ingress, never forwarded).
-    /// Stream of bounded Trajectory snapshot frames and ordered live deltas.
-    WATCH_TRAJECTORY / WatchTrajectory = "WatchTrajectory" { params: crate::WatchTrajectoryParams, reply: crate::TrajectoryWatchItem, local_only: true },
-    /// Device-local unary lookup to reveal one raw field from Run Journal.
-    REVEAL_TRAJECTORY_RAW / RevealTrajectoryRaw = "RevealTrajectoryRaw" { params: crate::RevealTrajectoryRawParams, reply: crate::TrajectoryRawRevealResult, local_only: true },
     /// Generate a one-line idle session recap for the chat. Strictly device-local,
     /// rejected at relay ingress, never forwarded — so a `deadline_secs` here
     /// would be dead config: `MethodInfo::deadline` is only read when the engine
@@ -377,6 +371,41 @@ mod tests {
             info(methods::CLONE_REPO).unwrap().deadline,
             std::time::Duration::from_secs(15 * 60)
         );
+        assert!(info(methods::VOICE_CAPABILITIES_V2).unwrap().forwardable);
+        assert!(info(methods::OWN_VOICE_V2).unwrap().stream);
+        assert_eq!(
+            info(methods::PREPARE_VOICE_V2).unwrap().deadline,
+            std::time::Duration::from_secs(65)
+        );
+        assert_eq!(
+            info(methods::NEGOTIATE_VOICE_V2).unwrap().deadline,
+            std::time::Duration::from_secs(95)
+        );
+    }
+
+    #[test]
+    fn retired_omp_voice_methods_are_absent_and_codex_voice_remains() {
+        for name in [
+            "ProbeLiveVoice",
+            "StartLiveVoice",
+            "SetLiveVoiceMuted",
+            "StopLiveVoice",
+            "WatchLiveVoice",
+        ] {
+            assert!(
+                info(name).is_none(),
+                "retired OMP method {name} is registered"
+            );
+        }
+        for name in [
+            methods::VOICE_CAPABILITIES_V2,
+            methods::PREPARE_VOICE_V2,
+            methods::OWN_VOICE_V2,
+            methods::NEGOTIATE_VOICE_V2,
+            methods::STOP_VOICE_V2,
+        ] {
+            assert!(info(name).is_some(), "Codex method {name} must remain");
+        }
     }
 
     #[test]
@@ -390,9 +419,6 @@ mod tests {
                 );
             }
         }
-        assert!(methods::is_local_only(methods::WATCH_TRAJECTORY));
-        assert!(methods::is_local_only(methods::REVEAL_TRAJECTORY_RAW));
-        assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
         assert!(methods::is_local_only(methods::GENERATE_CHAT_RECAP));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));
         assert!(!methods::is_local_only("Nope"));

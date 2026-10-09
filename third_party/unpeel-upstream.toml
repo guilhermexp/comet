@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "93e3511f36724d74992c0025a4538b047ccdf238"
+vendored_tree = "7c917b141d5180d29e29b0c609e6d734ed8704f9"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -89,6 +89,24 @@ base_revision_resolves_upstream = false
 # proofs live in zeron-workers-unpeel activity_bridge tests. Local patch only;
 # local_modifications_count remains the unrecomputed historical value above.
 
+# 2026-10-08 — primary Worker provider binding: the shared Pi-family extension
+# emits agent kind, while OMP installs a distinct asset that drops nested-agent
+# lifecycle events and classifies legacy OMP child transcript paths. The shared
+# notifier supports read-only listener preflight and honors an explicit
+# ignored response before posting. Downstream ingress/journal protection and
+# real-HTTP notifier regressions live in zeron-workers-unpeel. Local patch only;
+# local_modifications_count remains the unrecomputed historical value above.
+
+# 2026-10-08 — regenerated the tracked GeneratedRuntimeCatalog.swift from the
+# unchanged runtime descriptors to repair pre-existing drift: attention
+# reliability for Pi/OMP/Prime and OMP transcript capability. No runtime.toml
+# inputs changed. Local patch only; local_modifications_count remains the
+# unrecomputed historical value above.
+
+# 2026-10-08 — third_party/unpeel/AGENTS.md now documents the Comet downstream
+# OMP primary-binding guard, compatibility preflight, and focused test owners.
+# Local documentation only; local_modifications_count remains unrecomputed.
+
 # 2026-09-20 (merged 2026-09-30) — worker question channel: PermissionRequest/AskUserQuestion takes
 # attention in vendored activity.rs; pi-family lifecycle-extension emits
 # ui_prompt_start/end; omp declares transcript + adapter under pi-sessions.
@@ -98,3 +116,10 @@ base_revision_resolves_upstream = false
 # HOOK_IDLE_TIMEOUT sem rearmar por crescimento; last_hook_at não avança em
 # latch-only; transcript omp casa stem exato no diretório da sessão (sem walk
 # global nem starts_with lexical). Same-commit local form; no upstream patch.
+
+# 2026-10-09 — OMP child-agent classification decides from the parent side:
+# `<dirname(child)>.jsonl` must be a trusted JSONL under the OMP sessions root,
+# while the child transcript is resolved only when it already exists. A child
+# whose JSONL is not yet flushed is therefore still nested. Applied together in
+# the OMP lifecycle extension and runtimes/omp/adapter/telemetry.rs. Local patch
+# only; local_modifications_count remains unrecomputed.

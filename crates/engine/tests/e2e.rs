@@ -17,13 +17,10 @@ use zeron_doc::{
 };
 use zeron_engine::{EngineCore, HarnessRegistry, RunJournal};
 use zeron_harness::mock::MockHarness;
-use zeron_harness::{
-    Harness, HarnessError, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle,
-    LiveVoiceRequest, LiveVoiceSupport, RunControls,
-};
+use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, LiveVoicePhase, Model, ReasoningLevel,
-    RunRequest, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    SessionStatus, SteeringMode, ToolCall,
 };
 use zeron_sync::DocsStore;
 
@@ -210,227 +207,6 @@ impl Harness for ScriptedHarness {
     }
 }
 
-#[derive(Clone, Copy)]
-enum LiveFixtureMode {
-    Stable,
-    ActiveSteer,
-    Conflict,
-    ExitAfterDelegation,
-    Passive,
-    ClosedControls,
-}
-
-struct LiveDelegationHarness {
-    mode: LiveFixtureMode,
-    controls: Arc<tokio::sync::Mutex<Vec<LiveVoiceControl>>>,
-    order: Arc<tokio::sync::Mutex<Vec<&'static str>>>,
-}
-
-impl LiveDelegationHarness {
-    fn new(mode: LiveFixtureMode) -> Self {
-        Self {
-            mode,
-            controls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            order: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-        }
-    }
-}
-
-#[async_trait]
-impl Harness for LiveDelegationHarness {
-    fn id(&self) -> HarnessId {
-        HarnessId::Omp
-    }
-
-    fn display_name(&self) -> &str {
-        "Live delegation fixture"
-    }
-
-    fn supports_steering(&self) -> bool {
-        true
-    }
-
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[ReasoningLevel::Medium]
-    }
-
-    async fn probe_live_voice(
-        &self,
-        _cwd: &std::path::Path,
-    ) -> Result<LiveVoiceSupport, HarnessError> {
-        Ok(LiveVoiceSupport {
-            available: true,
-            session_context: true,
-        })
-    }
-
-    async fn start_live_voice(
-        &self,
-        _request: LiveVoiceRequest,
-    ) -> Result<LiveVoiceHandle, HarnessError> {
-        let (event_tx, event_rx) =
-            tokio::sync::mpsc::channel::<Result<LiveVoiceEvent, HarnessError>>(16);
-        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
-        let controls = Arc::clone(&self.controls);
-        let order = Arc::clone(&self.order);
-        let mode = self.mode;
-        tokio::spawn(async move {
-            let _ = event_tx
-                .send(Ok(LiveVoiceEvent::Phase(LiveVoicePhase::Listening)))
-                .await;
-            if matches!(mode, LiveFixtureMode::ClosedControls) {
-                drop(control_rx);
-                std::future::pending::<()>().await;
-                return;
-            }
-            if !matches!(mode, LiveFixtureMode::Passive) {
-                let delegation = LiveVoiceEvent::Delegation {
-                    delegation_id: "delegation-1".into(),
-                    request: "Fix the durable bug".into(),
-                };
-                let _ = event_tx.send(Ok(delegation.clone())).await;
-                let _ = event_tx.send(Ok(delegation)).await;
-                if matches!(mode, LiveFixtureMode::Conflict) {
-                    let _ = event_tx
-                        .send(Ok(LiveVoiceEvent::Delegation {
-                            delegation_id: "delegation-2".into(),
-                            request: "Start conflicting work".into(),
-                        }))
-                        .await;
-                }
-            }
-            if matches!(mode, LiveFixtureMode::ExitAfterDelegation) {
-                return;
-            }
-            while let Some(control) = control_rx.recv().await {
-                if control == LiveVoiceControl::Stop {
-                    order.lock().await.push("stop");
-                    let _ = event_tx
-                        .send(Ok(LiveVoiceEvent::Ended { error: None }))
-                        .await;
-                }
-                controls.lock().await.push(control);
-            }
-        });
-        Ok(LiveVoiceHandle {
-            session_id: "/tmp/live-fixture.jsonl".into(),
-            events: futures::stream::unfold(event_rx, |mut rx| async move {
-                rx.recv().await.map(|event| (event, rx))
-            })
-            .boxed(),
-            controls: control_tx,
-        })
-    }
-
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(Vec::new())
-    }
-
-    async fn run(
-        &self,
-        request: RunRequest,
-        mut controls: RunControls,
-    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        self.order.lock().await.push("run");
-        let expected_prompt = if matches!(
-            self.mode,
-            LiveFixtureMode::Passive
-                | LiveFixtureMode::ClosedControls
-                | LiveFixtureMode::ActiveSteer
-        ) {
-            "manual command"
-        } else {
-            "Fix the durable bug"
-        };
-        assert_eq!(request.prompt, expected_prompt);
-        if matches!(self.mode, LiveFixtureMode::ActiveSteer) {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(Ok(AgentEvent::SessionStarted {
-                        harness: HarnessId::Omp,
-                        model: "omp-default".into(),
-                        tools: Vec::new(),
-                        cwd: request.cwd,
-                        session_id: "active-session".into(),
-                        assistant_message_id: "active-assistant".into(),
-                    }))
-                    .await;
-                let _ = tx
-                    .send(Ok(AgentEvent::TextDelta {
-                        text: "Initial work".into(),
-                    }))
-                    .await;
-                let message = controls.steering.recv().await.expect("Live steer");
-                assert_eq!(message.prompt, "Fix the durable bug");
-                let _ = tx
-                    .send(Ok(AgentEvent::Steered {
-                        assistant_message_id: Some("active-assistant".into()),
-                        next_assistant_message_id: Some("steered-assistant".into()),
-                    }))
-                    .await;
-                let _ = tx
-                    .send(Ok(AgentEvent::TextDelta {
-                        text: "Durable answer".into(),
-                    }))
-                    .await;
-                let _ = tx
-                    .send(Ok(AgentEvent::AssistantMessageCompleted {
-                        assistant_message_id: "steered-assistant".into(),
-                    }))
-                    .await;
-                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
-                std::future::pending::<()>().await;
-            });
-            return Ok(futures::stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|event| (event, rx))
-            })
-            .boxed());
-        }
-        let script = vec![
-            AgentEvent::SessionStarted {
-                harness: HarnessId::Omp,
-                model: "omp-default".into(),
-                tools: Vec::new(),
-                cwd: request.cwd,
-                session_id: "voice-session".into(),
-                assistant_message_id: "voice-assistant".into(),
-            },
-            AgentEvent::TextDelta {
-                text: "Inspecting".into(),
-            },
-            AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: "voice-assistant".into(),
-            },
-            AgentEvent::TextDelta {
-                text: "Durable answer".into(),
-            },
-            AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: None,
-                error: None,
-                session_id: Some("voice-session".into()),
-            },
-        ];
-        let mut script = script.into_iter();
-        let first = script.next().expect("non-empty Live Voice script");
-        let stream = futures::stream::once(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(first)
-        })
-        .chain(futures::stream::iter(script.map(Ok)));
-        if matches!(self.mode, LiveFixtureMode::Stable) {
-            Ok(stream.chain(futures::stream::pending()).boxed())
-        } else {
-            Ok(stream.boxed())
-        }
-    }
-}
-
 fn omp_chat_config() -> ChatConfig {
     ChatConfig {
         harness: HarnessId::Omp,
@@ -526,21 +302,6 @@ fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
 fn assemble_live(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
     EngineCore::assemble(dir, registry_with(harness), HarnessId::Omp, None)
         .expect("live engine core assembles")
-}
-
-fn create_omp_chat(core: &EngineCore) {
-    core.workspace
-        .create_chat(
-            CHAT,
-            None,
-            Some(&core.device_id),
-            Some(omp_chat_config()),
-            Some("/tmp".into()),
-        )
-        .expect("create OMP chat");
-    core.workspace
-        .rename_chat(CHAT, "Pre-titled")
-        .expect("pre-title OMP chat");
 }
 
 #[tokio::test]
@@ -1976,489 +1737,6 @@ async fn deterministic_queue_command_id_is_returned_and_executes_once() {
         1
     );
 }
-#[tokio::test]
-async fn live_voice_delegation_is_one_durable_turn_with_transient_context() {
-    let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Stable));
-    let core = assemble_live(dir.path(), harness.clone());
-    create_omp_chat(&core);
-
-    core.sessions.start_live_voice(CHAT).await.unwrap();
-    wait_for(
-        || {
-            let handle = core.doc_host.open(CHAT).expect("open live chat");
-            let steer_commands = handle
-                .doc()
-                .read_commands()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
-                .count();
-            let durable_messages = entries_now(&core)
-                .into_iter()
-                .filter(|entry| matches!(entry.role, MessageRole::User | MessageRole::Assistant))
-                .count();
-            steer_commands == 1 && durable_messages == 2
-        },
-        "one durable Live Voice delegation",
-    )
-    .await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let controls = harness.controls.lock().await.clone();
-        let has_progress = controls.iter().any(|control| {
-            matches!(
-                control,
-                LiveVoiceControl::AppendContext {
-                    delegation_id,
-                    kind: LiveVoiceContextKind::Progress,
-                    text,
-                } if delegation_id == "delegation-1" && text == "Inspecting"
-            )
-        });
-        let has_final = controls.iter().any(|control| {
-            matches!(
-                control,
-                LiveVoiceControl::AppendContext {
-                    delegation_id,
-                    kind: LiveVoiceContextKind::Final,
-                    text,
-                } if delegation_id == "delegation-1" && text == "Durable answer"
-            )
-        });
-        if has_progress && has_final {
-            assert!(
-                !controls.contains(&LiveVoiceControl::Stop),
-                "the owned durable command must not preempt its Live Voice call"
-            );
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for Live Voice progress and final context"
-        );
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-
-    let handle = core.doc_host.open(CHAT).unwrap();
-    let commands = handle.doc().read_commands().unwrap();
-    let steers = commands
-        .iter()
-        .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        steers.len(),
-        1,
-        "duplicate delegation id must be idempotent"
-    );
-    assert!(!steers[0].id.is_empty());
-    let SessionCommandPayload::Steer { message_id, .. } = &steers[0].payload else {
-        unreachable!()
-    };
-    assert!(
-        message_id
-            .as_ref()
-            .is_some_and(|message_id| !message_id.is_empty())
-    );
-    assert_eq!(
-        entries(&core)
-            .iter()
-            .filter(|entry| matches!(entry.role, MessageRole::User | MessageRole::Assistant))
-            .count(),
-        2,
-        "spoken progress/final controls must not append extra chat messages"
-    );
-    wait_for(
-        || {
-            core.sessions
-                .session_status(CHAT)
-                .is_some_and(|session| session.status == SessionStatus::Idle)
-        },
-        "delegated run to park",
-    )
-    .await;
-    core.sessions.stop_live_voice().await.unwrap();
-    let availability = core.sessions.probe_live_voice(CHAT).await.unwrap();
-    assert!(
-        availability.available,
-        "a completed parked OMP run must not block Live Voice restart: {:?}",
-        availability.reason
-    );
-    core.sessions.start_live_voice(CHAT).await.unwrap();
-    core.sessions.stop_live_voice().await.unwrap();
-}
-
-#[tokio::test]
-async fn live_voice_delegation_steers_the_active_run_exactly_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::ActiveSteer));
-    let core = assemble_live(dir.path(), harness.clone());
-    create_omp_chat(&core);
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
-        "cmd-active-run",
-        SessionCommandPayload::Run {
-            request: run_request("manual command"),
-            message_id: "message-active-run".into(),
-        },
-    );
-    wait_for(
-        || {
-            core.sessions
-                .session_status(CHAT)
-                .is_some_and(|session| session.status == SessionStatus::Working)
-        },
-        "active run before Live Voice start",
-    )
-    .await;
-
-    core.sessions.start_live_voice(CHAT).await.unwrap();
-    wait_for(
-        || {
-            let commands = core
-                .doc_host
-                .open(CHAT)
-                .unwrap()
-                .doc()
-                .read_commands()
-                .unwrap_or_default();
-            commands
-                .iter()
-                .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
-                .count()
-                == 1
-                && core
-                    .sessions
-                    .session_status(CHAT)
-                    .is_some_and(|session| session.status == SessionStatus::Idle)
-        },
-        "confirmed Live Voice instruction steered active run",
-    )
-    .await;
-
-    let commands = handle.doc().read_commands().unwrap();
-    assert_eq!(
-        commands
-            .iter()
-            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
-            .count(),
-        1
-    );
-    assert_eq!(
-        commands
-            .iter()
-            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
-            .count(),
-        1
-    );
-    assert_eq!(harness.order.lock().await.as_slice(), ["run"]);
-    assert_eq!(
-        entries(&core)
-            .iter()
-            .filter(|entry| entry.role == MessageRole::User)
-            .count(),
-        2
-    );
-    let controls = harness.controls.lock().await.clone();
-    assert!(controls.iter().any(|control| {
-        matches!(
-            control,
-            LiveVoiceControl::AppendContext {
-                delegation_id,
-                kind: LiveVoiceContextKind::Final,
-                text,
-            } if delegation_id == "delegation-1" && text == "Durable answer"
-        )
-    }));
-    assert!(!controls.contains(&LiveVoiceControl::Stop));
-    core.sessions.stop_live_voice().await.unwrap();
-}
-
-#[tokio::test]
-async fn live_voice_conflict_ends_call_but_backend_finishes_durably() {
-    let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Conflict));
-    let core = assemble_live(dir.path(), harness);
-    create_omp_chat(&core);
-
-    let mut state = core.sessions.watch_live_voice();
-    core.sessions.start_live_voice(CHAT).await.unwrap();
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .any(|entry| entry.role == MessageRole::Assistant)
-        },
-        "durable backend completion after Live Voice conflict",
-    )
-    .await;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while state.borrow().phase != LiveVoicePhase::Error {
-            state.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("conflicting delegation ends Live Voice");
-    assert!(
-        state
-            .borrow()
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("delegation")),
-        "conflict reports a bounded delegation error"
-    );
-    assert_eq!(
-        core.doc_host
-            .open(CHAT)
-            .unwrap()
-            .doc()
-            .read_commands()
-            .unwrap()
-            .iter()
-            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
-            .count(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn live_voice_child_exit_does_not_cancel_queued_backend_work() {
-    let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(LiveDelegationHarness::new(
-        LiveFixtureMode::ExitAfterDelegation,
-    ));
-    let core = assemble_live(dir.path(), harness);
-    create_omp_chat(&core);
-
-    core.sessions.start_live_voice(CHAT).await.unwrap();
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .any(|entry| entry.role == MessageRole::Assistant)
-        },
-        "backend completion after Live Voice child exit",
-    )
-    .await;
-    assert_eq!(
-        core.sessions.watch_live_voice().borrow().phase,
-        LiveVoicePhase::Error
-    );
-}
-
-#[tokio::test]
-async fn live_voice_closed_control_does_not_reject_unrelated_command() {
-    let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::ClosedControls));
-    let core = assemble_live(dir.path(), harness);
-    create_omp_chat(&core);
-    core.sessions.start_live_voice(CHAT).await.unwrap();
-    let command_id = "manual-after-closed-live";
-
-    let mut request = run_request("manual command");
-    request.harness = Some(HarnessId::Omp);
-    core.doc_host
-        .queue_command_with_id(
-            CHAT,
-            command_id.into(),
-            SessionCommandPayload::Run {
-                request,
-                message_id: "manual-after-closed-live-message".into(),
-            },
-        )
-        .unwrap();
-    wait_for(
-        || {
-            command_status(&core, command_id)
-                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
-        },
-        "command resolution after closed Live control",
-    )
-    .await;
-
-    assert_eq!(
-        command_status(&core, command_id).unwrap().0,
-        SessionCommandStatus::Applied
-    );
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .any(|entry| entry.role == MessageRole::Assistant)
-        },
-        "unrelated command execution after closed Live control",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn unrelated_durable_command_stops_live_voice_before_dispatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Passive));
-    let core = assemble_live(dir.path(), harness.clone());
-    create_omp_chat(&core);
-    core.sessions.start_live_voice(CHAT).await.unwrap();
-
-    let mut request = run_request("manual command");
-    request.harness = Some(HarnessId::Omp);
-    core.doc_host
-        .queue_command_with_id(
-            CHAT,
-            "manual-command".into(),
-            SessionCommandPayload::Run {
-                request,
-                message_id: "manual-message".into(),
-            },
-        )
-        .unwrap();
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .any(|entry| entry.role == MessageRole::Assistant)
-        },
-        "manual command after Live Voice preemption",
-    )
-    .await;
-    assert_eq!(
-        harness.order.lock().await.as_slice(),
-        ["stop", "run"],
-        "Live Voice must stop before unrelated durable dispatch"
-    );
-}
-
-#[tokio::test]
-async fn live_voice_rpc_controls_are_local_exact_and_watchable() {
-    let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Passive));
-    let core = assemble_live(dir.path(), harness.clone());
-    create_omp_chat(&core);
-    core.workspace
-        .create_chat(
-            "remote-live-chat",
-            None,
-            Some("remote-device"),
-            Some(omp_chat_config()),
-            Some("/tmp".into()),
-        )
-        .unwrap();
-    let client = zeron_rpc::memory_client(core.rpc_service());
-    let mut states = client
-        .subscribe_checked(
-            zeron_rpc::methods::WATCH_LIVE_VOICE,
-            serde_json::Value::Null,
-        )
-        .await
-        .expect("watch Live Voice");
-    assert_eq!(
-        states.recv().await.unwrap()["phase"],
-        serde_json::json!("idle")
-    );
-
-    let availability = client
-        .call(
-            zeron_rpc::methods::PROBE_LIVE_VOICE,
-            serde_json::json!({ "chatId": CHAT }),
-        )
-        .await
-        .expect("probe local OMP Chat");
-    assert_eq!(
-        availability,
-        serde_json::json!({ "available": true, "reason": null })
-    );
-    let remote_availability = client
-        .call(
-            zeron_rpc::methods::PROBE_LIVE_VOICE,
-            serde_json::json!({ "chatId": "remote-live-chat" }),
-        )
-        .await
-        .expect("probe reports remote Chat unavailability");
-    assert_eq!(
-        remote_availability,
-        serde_json::json!({ "available": false, "reason": "remoteChat" })
-    );
-    assert!(
-        client
-            .call(
-                zeron_rpc::methods::START_LIVE_VOICE,
-                serde_json::json!({ "chatId": "remote-live-chat" }),
-            )
-            .await
-            .is_err(),
-        "local-only Live Voice start rejects remote Chats"
-    );
-
-    assert_eq!(
-        client
-            .call(
-                zeron_rpc::methods::START_LIVE_VOICE,
-                serde_json::json!({ "chatId": CHAT }),
-            )
-            .await
-            .expect("start Live Voice"),
-        serde_json::json!({ "active": true })
-    );
-    let listening = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let state = states.recv().await.expect("Live Voice watch update");
-            if state["phase"] == "listening" {
-                return state;
-            }
-        }
-    })
-    .await
-    .expect("watch reaches listening");
-    assert_eq!(listening["chatId"], CHAT);
-
-    assert_eq!(
-        client
-            .call(
-                zeron_rpc::methods::SET_LIVE_VOICE_MUTED,
-                serde_json::json!({ "muted": true }),
-            )
-            .await
-            .expect("mute Live Voice"),
-        serde_json::json!({ "muted": true })
-    );
-    assert!(
-        harness
-            .controls
-            .lock()
-            .await
-            .contains(&LiveVoiceControl::SetMuted(true))
-    );
-    assert_eq!(
-        client
-            .call(zeron_rpc::methods::STOP_LIVE_VOICE, serde_json::Value::Null,)
-            .await
-            .expect("stop Live Voice"),
-        serde_json::json!({ "active": false })
-    );
-    assert_eq!(
-        client
-            .call(zeron_rpc::methods::STOP_LIVE_VOICE, serde_json::Value::Null,)
-            .await
-            .expect("repeat stop Live Voice"),
-        serde_json::json!({ "active": false })
-    );
-    let reset = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let state = states.recv().await.expect("Live Voice reset update");
-            if state["phase"] == "idle" {
-                return state;
-            }
-        }
-    })
-    .await
-    .expect("watch resets to idle");
-    assert_eq!(
-        reset,
-        serde_json::to_value(zeron_proto::LiveVoiceState::default()).unwrap()
-    );
-}
-
 #[tokio::test]
 async fn fetch_tool_input_returns_journal_body_only_for_the_local_chat_owner() {
     let dir = tempfile::tempdir().unwrap();
@@ -4880,6 +4158,8 @@ async fn generated_image_is_materialized_before_publication_and_survives_reopen(
         })
         .collect();
     assert_eq!(images.len(), 1);
+    // Materialization canonicalizes the uploads dir; macOS temp dirs sit
+    // behind the /var -> /private/var symlink.
     assert!(std::path::Path::new(&images[0]).starts_with(uploads.dir().canonicalize().unwrap()));
     let serialized = serde_json::to_string(&journal.replay(CHAT, 0).unwrap()).unwrap();
     assert!(!serialized.contains(source.to_str().unwrap()));
@@ -5150,4 +4430,78 @@ async fn start_failure_lands_in_the_transcript() {
         [MessagePart::Error { message, .. }] if message.contains("server never booted")
     ));
     core.sessions.shutdown().await;
+}
+
+/// The session row carries how many subagents are streaming, so sidebars on
+/// every device can badge a chat they have not opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_row_counts_running_subagents_until_the_run_ends() {
+    fn spawn(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: "Agent: probe".into(),
+                input: None,
+            },
+        }
+    }
+    fn chatter(parent: &str) -> AgentEvent {
+        AgentEvent::Subagent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(AgentEvent::TextDelta {
+                text: "working".into(),
+            }),
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                spawn("sub-1"),
+                spawn("sub-2"),
+                chatter("sub-1"),
+                chatter("sub-2"),
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "sub-1".into(),
+                    event: Box::new(done(DoneStatus::Completed)),
+                },
+            ],
+            step_delay: Duration::from_millis(400),
+            hang_until_interrupt: true,
+        }),
+    );
+    let running = || {
+        core.sessions
+            .session_status(CHAT)
+            .map(|s| s.running_subagents)
+    };
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "subagents-run",
+        SessionCommandPayload::Run {
+            request: run_request("fan out"),
+            message_id: "subagents-user".into(),
+        },
+    );
+
+    wait_for(|| running() == Some(2), "both subagents counted").await;
+    wait_for(|| running() == Some(1), "one subagent settled").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "subagents-interrupt",
+        SessionCommandPayload::Interrupt {},
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "run to end",
+    )
+    .await;
+    assert_eq!(
+        running(),
+        Some(0),
+        "an ended run leaves no subagents counted"
+    );
 }

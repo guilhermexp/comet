@@ -27,6 +27,8 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 - No iOS, `NativeTranscriptTable` preserva identidade/posição de células e aplica keyboard inset com a animação nativa. `SessionStore.lastSubmittedMessageId` distingue envio local de entradas remotas; folding de mensagem vive no store quente. `ComposerEditorController` confirma IME antes do envio e aplica o draft resultante imediatamente. Disclosure de tools é local à célula, sem reconfigurar todo o transcript.
 - Imagens geradas no transcript carregam apenas `path/name/mimeType` no ChatDoc. O iOS valida os quatro MIME raster suportados, tenta o device dono antes do host e decodifica uma única frame com limite de bytes e dimensões antes de medir/renderizar; cache genérico e cache com MIME esperado são chaves distintas.
 - Appshots no iOS preservam o screenshot como anexo e projetam no transcript apenas origem/título; o texto AX observado fica oculto. O parser escolhe o último trailer de anexos válido e ignora marcadores que apareçam dentro do XML observado.
+- Voz Codex no iOS usa o estado compartilhado de `crates/voice-session` e media nativa via WebRTC/CoreAudio, com Live Activities/Dynamic Island; permanece cliente da engine host do Chat. Falha ao abrir Chat real retorna à navegação real com erro, nunca a fixture/demo. O Live OMP mantém seu contrato independente na engine.
+- `apps/zeron/build.rs` inclui a declaração de microfone de `Info-unbundled.plist` no Mach-O para launches sem bundle; o runner de dev continua usando identidade própria de Zeron Dev.
 - `apps/ios` não entra no `cargo build`; build e teste são pelo Xcode.
 
 ## Work Guidance
@@ -45,4 +47,6 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 
 ## Child DOX Index
 
-Sem filhos.
+| Domínio | Doc | Papel |
+|---|---|---|
+| Cliente iOS | [`ios/AGENTS.md`](ios/AGENTS.md) | UIKit, core UniFFI, Chat, media nativa e Live Activities |

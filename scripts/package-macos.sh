@@ -2,10 +2,14 @@
 # macOS packaging: build the release binary for the host arch and produce
 #   target/package/zeron-<version>-macos-<arch>.dmg          (user download)
 #   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
-# containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set).
+# containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set). Outside CI
+# it then installs that bundle as /Applications/Zeron.app — quitting a running
+# copy and replacing any previous install. It does not launch the app.
 #
 # Usage: scripts/package-macos.sh
-# Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
+# Env:   ZERON_PACKAGE_INSTALL=0|1 skips/forces the install step
+#        (default: 1 locally, 0 when CI is set).
+#        CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
 #        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store Connect
 #        API key (.p8) for notarization; all three set → notarize + staple the
 #        app and the dmg, which removes the Gatekeeper warning entirely.
@@ -29,6 +33,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/zeron"
 install -m 644 "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
+mkdir -p "$APP/Contents/Resources/licenses/fonts"
+cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
+cp "$ROOT/THIRD_PARTY_NOTICES.md" "$ROOT/LICENSE" "$APP/Contents/Resources/licenses/"
 
 mkdir -p "$APP/Contents/Resources/licenses"
 cp "$ROOT/crates/voice/NOTICE.md" "$APP/Contents/Resources/licenses"/parakeet-v3.txt
@@ -53,7 +60,7 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
 else
   # Ad-hoc signature so the app launches on Apple silicon (Gatekeeper still
   # requires right-click → Open on first launch without notarization).
-  codesign --deep --force --sign - "$APP"
+  codesign --deep --force --entitlements "$ROOT/dist/macos/voice.entitlements" --sign - "$APP"
 fi
 
 # notarize <path>: submit to Apple and wait for the verdict. A rejection may
@@ -130,3 +137,45 @@ if $NOTARIZE; then
   xcrun stapler staple "$DMG"
 fi
 echo "packaged: $DMG"
+
+if [[ -n "${CI:-}" ]]; then INSTALL_DEFAULT=0; else INSTALL_DEFAULT=1; fi
+[[ "${ZERON_PACKAGE_INSTALL:-$INSTALL_DEFAULT}" == 1 ]] || exit 0
+
+INSTALL_APP="/Applications/Zeron.app"
+# Every process of the installed binary (the headed app and anything it
+# spawned from the same executable) must exit before the bundle is replaced.
+INSTALLED_BIN_PATTERN='^/Applications/Zeron\.app/Contents/MacOS/zeron( |$)'
+installed_running() { pgrep -f "$INSTALLED_BIN_PATTERN" >/dev/null 2>&1; }
+wait_installed_exit() {
+  local tries=$1
+  while installed_running && ((tries-- > 0)); do sleep 0.5; done
+  ! installed_running
+}
+
+if installed_running; then
+  # Quit like ⌘Q: the app drains its engine and may ask to save open files,
+  # so give it a minute before falling back to SIGTERM (an abrupt stop for
+  # the headed app). Waiting on a background job keeps a killed osascript
+  # from printing a "Terminated" notice.
+  echo "quitting running Zeron…"
+  osascript -e 'tell application id "sh.zeron.app" to quit' >/dev/null 2>&1 &
+  wait $! 2>/dev/null || true
+  if ! wait_installed_exit 120; then
+    echo "Zeron did not quit within 60s; sending SIGTERM." >&2
+    pkill -TERM -f "$INSTALLED_BIN_PATTERN" || true
+    if ! wait_installed_exit 20; then
+      echo "Zeron is still running from $INSTALL_APP; quit it and rerun." >&2
+      exit 1
+    fi
+  fi
+fi
+
+# Copy next to the destination first so a failed copy never leaves
+# /Applications without a working Zeron.app.
+INSTALL_STAGE="/Applications/.Zeron.app.installing"
+rm -rf "$INSTALL_STAGE"
+ditto "$APP" "$INSTALL_STAGE"
+rm -rf "$INSTALL_APP"
+mv "$INSTALL_STAGE" "$INSTALL_APP"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALL_APP"
+echo "installed: $INSTALL_APP"

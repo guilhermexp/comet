@@ -1,4 +1,4 @@
-use super::{shared, Integration, RuntimeLaunchOptions};
+use super::{Integration, RuntimeLaunchOptions, shared};
 
 pub(crate) mod setup {
     include!(concat!(
@@ -40,11 +40,35 @@ mod tests {
 
     #[test]
     fn lifecycle_extension_is_added_once_to_both_pi_family_clis() {
-        for command in ["omp", "omp --model x", "prime-agent", "prime-agent --model x"] {
+        for command in [
+            "omp",
+            "omp --model x",
+            "prime-agent",
+            "prime-agent --model x",
+        ] {
             let prepared = startup_command(command);
             assert_eq!(prepared.matches("--extension").count(), 1, "{prepared}");
-            assert!(prepared.contains("pi-family-lifecycle-extension.js"));
+            let expected_asset = if super::FILTER_NESTED_OMP_SUBAGENTS {
+                "omp-lifecycle-extension.js"
+            } else {
+                "pi-family-lifecycle-extension.js"
+            };
+            assert!(prepared.contains(expected_asset), "{prepared}");
             assert_eq!(startup_command(&prepared), prepared);
+        }
+        if super::FILTER_NESTED_OMP_SUBAGENTS {
+            let legacy = format!(
+                "omp --extension {}",
+                crate::app_paths::unpeel_home()
+                    .join("hooks/pi-family-lifecycle-extension.js")
+                    .display()
+            );
+            let updated = startup_command(&legacy);
+            assert!(updated.contains("omp-lifecycle-extension.js"), "{updated}");
+            assert!(
+                !updated.contains("pi-family-lifecycle-extension.js"),
+                "{updated}"
+            );
         }
     }
 }

@@ -129,6 +129,14 @@ pub struct Space {
     /// (sha256(deviceId ‖ NUL ‖ git_dir)) — diff grouping key for root sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
+    /// Owner-stamped when git: identity shared by every clone and worktree of
+    /// one repository — its trunk's root commit (`commit:<sha>`, which
+    /// survives renames, transfers and remote spellings), else for a shallow
+    /// or empty history the normalized origin remote (`host/owner/repo`),
+    /// else `local:` + a device-scoped hash of the common git dir. Opaque to
+    /// readers: projects with equal ids group together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -240,6 +248,12 @@ pub struct Chat {
 }
 
 impl Chat {
+    /// A session the user sees in chat lists: neither another chat's worker
+    /// (`parent_chat_id`) nor a hidden voice orchestrator.
+    pub fn is_top_level(&self) -> bool {
+        self.parent_chat_id.is_none() && !crate::voice::is_orchestrator_chat(&self.id)
+    }
+
     /// True when this chat syncs over the chat2 dumb relay.
     pub fn on_chat2(&self) -> bool {
         self.room_gen.unwrap_or(1) >= 2
@@ -307,6 +321,11 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Subagents of this chat streaming right now. Rides the session row (and
+    /// its staleness window) so every device's sidebar can badge a chat it
+    /// has not opened; read it through `view::running_subagents`.
+    #[serde(default)]
+    pub running_subagents: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsage>,
     /// Why the last run ended in [`SessionStatus::Errored`] — the harness's own
@@ -830,25 +849,6 @@ pub struct CreateWorkspaceEntryRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RenameWorkspaceEntryRequest {
-    #[serde(flatten)]
-    pub target: WorkspaceTarget,
-    pub path: String,
-    pub new_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CopyWorkspaceEntryRequest {
-    #[serde(flatten)]
-    pub target: WorkspaceTarget,
-    pub source_path: String,
-    #[serde(default)]
-    pub destination_directory: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct WorkspaceEntryMutation {
     pub path: String,
     pub is_directory: bool,
@@ -947,44 +947,6 @@ pub fn sibling_name_taken<'a>(existing: impl IntoIterator<Item = &'a str>, name:
     existing
         .into_iter()
         .any(|entry| entry.to_lowercase() == folded)
-}
-
-pub fn unique_copy_name<'a>(
-    original: &str,
-    is_directory: bool,
-    existing: impl IntoIterator<Item = &'a str>,
-) -> String {
-    let taken: Vec<String> = existing
-        .into_iter()
-        .map(|name| name.to_lowercase())
-        .collect();
-    let is_taken = |candidate: &str| taken.iter().any(|name| name == &candidate.to_lowercase());
-    if !is_taken(original) {
-        return original.to_string();
-    }
-    let (stem, ext) = copy_stem_and_ext(original, is_directory);
-    let first = format!("{stem} copy{ext}");
-    if !is_taken(&first) {
-        return first;
-    }
-    let mut index = 2u32;
-    loop {
-        let candidate = format!("{stem} copy {index}{ext}");
-        if !is_taken(&candidate) {
-            return candidate;
-        }
-        index += 1;
-    }
-}
-
-fn copy_stem_and_ext(name: &str, is_directory: bool) -> (String, String) {
-    if is_directory {
-        return (name.to_string(), String::new());
-    }
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
-        _ => (name.to_string(), String::new()),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1587,6 +1549,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old.context_usage, None);
+        assert_eq!(old.running_subagents, 0);
 
         let session = Session {
             last_completed_turn: None,
@@ -1887,22 +1850,6 @@ mod tests {
         assert_eq!(create["parentPath"], "src");
         assert_eq!(create["name"], "notes.md");
         assert_eq!(create["kind"], "file");
-        let rename = serde_json::to_value(RenameWorkspaceEntryRequest {
-            target: target.clone(),
-            path: "src/a.txt".into(),
-            new_name: "b.txt".into(),
-        })
-        .unwrap();
-        assert_eq!(rename["path"], "src/a.txt");
-        assert_eq!(rename["newName"], "b.txt");
-        let copy = serde_json::to_value(CopyWorkspaceEntryRequest {
-            target,
-            source_path: "a.txt".into(),
-            destination_directory: String::new(),
-        })
-        .unwrap();
-        assert_eq!(copy["sourcePath"], "a.txt");
-        assert_eq!(copy["destinationDirectory"], "");
         let mutation = serde_json::to_value(WorkspaceEntryMutation {
             path: "src/notes.md".into(),
             is_directory: false,
@@ -1940,27 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_copy_name_derives_case_insensitive_collisions() {
-        assert_eq!(
-            unique_copy_name("a.txt", false, ["b.txt"].into_iter()),
-            "a.txt"
-        );
-        assert_eq!(
-            unique_copy_name("a.txt", false, ["a.txt"].into_iter()),
-            "a copy.txt"
-        );
-        assert_eq!(
-            unique_copy_name("a.txt", false, ["a.txt", "A copy.txt"].into_iter()),
-            "a copy 2.txt"
-        );
-        assert_eq!(
-            unique_copy_name("docs", true, ["docs"].into_iter()),
-            "docs copy"
-        );
-        assert_eq!(
-            unique_copy_name("ä.txt", false, ["Ä.txt"].into_iter()),
-            "ä copy.txt"
-        );
+    fn workspace_create_names_reject_unsafe_components() {
         assert_eq!(validate_workspace_create_name("docs/adr/0001.md"), Ok(()));
         assert_eq!(
             validate_workspace_component(".."),

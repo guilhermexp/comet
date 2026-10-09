@@ -58,9 +58,9 @@ cargo run -p gpui --example hello_world
 - `set_menus` shows application menu setup.
 - `system_notifications` demonstrates posting, replacing, dismissing, and responding to operating-system notifications.
 - `window` demonstrates creating normal, dialog, popup, and floating windows.
-- `window_blur` opens two macOS windows side by side to compare a declared
-  WindowServer blur radius with the AppKit material used when no radius is
-  declared.
+- `window_blur` opens two macOS windows side by side to compare the AppKit
+  material used without a declared radius with WindowServer blur backed by a
+  separate 1%-alpha `NSVisualEffectView` under the content.
 - `window_positioning` demonstrates window bounds and placement.
 - `window_shadow` demonstrates window shadow styling.
 

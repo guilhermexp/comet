@@ -52,6 +52,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - `cmux/` não é rastreado, está excluído em `.git/info/exclude`, e nenhum build,
   CI ou documento operacional pode depender da sua presença.
 - O renderer gpui (`zeronsh/zui`) mora em `zui/`. O workspace **exclui** `third_party/zui` porque o snapshot tem workspace próprio; só `gpui` / `gpui_platform` / `gpui_tokio` entram no build do Comet pela dependência path. Não editar o conteúdo do vendor: se o head vendorizado não compilar, reportar — não patchar código de terceiro aqui. Crates GPL do Zed permanecem proibidas.
+- O blur WindowServer no macOS retém uma `NSVisualEffectView` padrão, independente do material customizado, atrás do conteúdo: `UnderWindowBackground`, `BehindWindow`, `Active`, alpha 0,01. Reaplicação e troca de raio reutilizam a camada; saída para material ou fundo opaco remove a camada. Mudanças nesse contrato são feitas em fonte separado do zui e copiadas ao snapshot com proveniência, sem alterar tint ou raio do tema para encobrir defeitos.
+- `Window::paint_glyph_transformed` (upstream zui `0966d065`) rasteriza glifos monocromáticos uma vez e aplica transformação/blur gaussiano ao compor. Mantenha os layouts de `MonochromeSprite` e `SubpixelSprite` alinhados entre Rust, Metal, WGSL e HLSL, inicialize os campos de blur/padding em todos os construtores e limite as amostras de blur ao tile do atlas.
+- O snapshot zui `dce5c1f` acrescenta `Window::native_composition`: handles emprestados com geração para superfícies Windows, `None` nas demais plataformas. Consumidores que retêm handles precisam AddRef e remontar após mudança de geração; o sync preserva os patches locais de vidro, headless e ambas as regras de pontuação.
 - Patches em `rust/` não são atualização de dependência: a versão publicada permanece idêntica e a mudança deve se limitar ao diagnóstico documentado que motivou a vendorização. Nova correção exige proveniência em `rust/PATCHES.md`.
 
 ## Work Guidance
@@ -117,8 +120,19 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - **Runtime packages em `unpeel/runtimes/` são descobertos automaticamente.**
   O pacote `agy/` integra o Antigravity CLI com descriptor `runtime.toml`,
   setup idempotente de workspace trust em `~/.gemini/antigravity-cli/settings.json`,
-  resume adapter e ícone autoral. Validação usa `bun run validate:runtimes`
-  em `third_party/unpeel`.
+  resume adapter e ícone autoral. `bun run check:runtimes` verifica somente a
+  projeção de descriptors/ícones para o catálogo Swift gerado; não roda Cargo.
+  `bun run validate:runtimes` acrescenta
+  `cargo test --manifest-path crates/Cargo.toml -p unpeel-core runtime_catalog`,
+  então a validação combinada local roda dentro de
+  `scripts/cargo-verify.py -- bun run --cwd third_party/unpeel validate:runtimes`.
+  Mudanças Rust-only em adapters não alteram o catálogo Swift nem exigem
+  geração: rode apenas filtros Rust focados através de uma única invocação do
+  wrapper. Se `check:runtimes` encontrar drift, compare a projeção esperada com
+  os descriptors/ícones canônicos; atualize o Swift rastreado somente quando
+  ele estiver realmente desatualizado. Em 2026-10-08, foi corrigido um drift
+  preexistente no catálogo Swift (reliability de atenção de Pi/OMP/Prime e
+  capability transcript de OMP) a partir dos descriptors sem alterá-los.
 - **Configured worker `initial_text` is native startup, not PTY follow-up.**
   OMP, Claude, Pi and Codex declare `Integration.native_initial_input`.
   `unpeel_core::native_initial` stages a 0600 file under a 0700 session dir.
@@ -133,17 +147,22 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   The Codex command wrapper must not log argv. Before exec it removes PATH
   entries resolving to itself by file identity, so upstream launchers cannot
   recurse through the managed wrapper. Prime-agent keeps interactive delivery.
-- **A extensão de lifecycle da família pi serve os três CLIs.** `pi`, `omp` e
-  `prime-agent` recebem `--extension
-  <unpeel_home>/hooks/pi-family-lifecycle-extension.js` e emitem `Start`/`Stop`
-  em `agent_start`/`agent_end` e `PermissionRequest`/`UserPromptSubmit` em
-  `ui_prompt_start`/`ui_prompt_end` (prompt bloqueante, com `tool_name`), com
-  id de conversa e transcript do provider. `attention_reliable = true` no
-  `runtime.toml` dos três descreve esse transporte. O append idempotente é
-  `_shared/pi-family/adapter/setup.rs::with_lifecycle_extension`; cada runtime
-  mantém o próprio gate de alias, porque `pi` tem resume/context próprios e não
-  inclui o `mod.rs` compartilhado. `runtime.toml` com `source = "hooks"` exige
-  a capability `lifecycle_hooks` (e `completion_reliable` exige
+- **Lifecycle da família pi e isolamento de subagentes OMP.** `pi`, `omp` e
+  `prime-agent` emitem `Start`/`Stop` em `agent_start`/`agent_end` e
+  `PermissionRequest`/`UserPromptSubmit` em `ui_prompt_start`/`ui_prompt_end`
+  (prompt bloqueante, com `tool_name`), com id de conversa e transcript do
+  provider. `attention_reliable = true` no `runtime.toml` dos três descreve
+  esse transporte. Pi e Prime compartilham
+  `pi-family-lifecycle-extension.js`; OMP usa `omp-lifecycle-extension.js` para
+  descartar eventos `ctx.agent.kind === "sub"` e, para extensões antigas sem
+  esse campo, reconhecer somente o layout canônico de artefato filho OMP.
+  `kind === "main"` prevalece sobre o fallback de caminho, permitindo que o
+  Worker primário retome um transcript após troca/reabertura. O append e a
+  migração idempotentes moram em
+  `_shared/pi-family/adapter/setup.rs::with_lifecycle_extension`; o gate de
+  alias fica no adapter de cada runtime, porque `pi` tem resume/context próprios
+  e não inclui o `mod.rs` compartilhado. `runtime.toml` com `source = "hooks"`
+  exige a capability `lifecycle_hooks` (e `completion_reliable` exige
   `notify_when_done`) — o catálogo valida os dois pares. `omp` também declara
   `transcript`; o adaptador lê JSONL só no diretório gerenciado da sessão
   sob `<unpeel_home>/pi-sessions` (stem exato, sem walk global).
@@ -174,11 +193,14 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `bun run --cwd "$PWD/third_party/unpeel" validate:runtimes` · `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · `cargo test -p zeron-workers-unpeel` |
-| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
+| `third_party/unpeel/scripts/generate-runtime-client-catalog.mjs` + `third_party/unpeel/apps/shared/UnpeelShared/Sources/UnpeelShared/GeneratedRuntimeCatalog.swift` | unit — projeção determinística de descriptors/ícones; sem Cargo | `bun run --cwd "$PWD/third_party/unpeel" check:runtimes` |
+| `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `scripts/cargo-verify.py -- bash -c 'cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core && cargo test -p zeron-workers-unpeel'` |
+| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `scripts/cargo-verify.py -- cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
-| `third_party/zui` | unit no vendor (API de blur da janela) + compile downstream | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --lib window_blur_` · `cargo build -p zeron` |
+| `third_party/zui` | unit no vendor (API de blur e ambas as regras de pontuação) + compile downstream da API de glifo transformado | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --lib window_blur_` · `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui --features gpui_platform/runtime_shaders --lib closing_punctuation_attached` · `cargo build -p zeron` |
+| `third_party/zui/crates/gpui_macos/tests/window_glass_backing.rs` | integration — setters reais, configuração/ordem nativa, reutilização, resize e limpeza; main thread AppKit | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --test window_glass_backing` (macOS com sessão gráfica; no CI `ui-tests.yml`, build `--no-run` e execução em bundle isolado com timeout, exit zero e marcador PASS obrigatório) |
+| Estabilidade óptica do vidro durante repaint | none — asserções AppKit não comprovam desaparecimento das ondas; comparação headed no mesmo desktop é evidência separada | Captura/comparação do vidro real sem trocar wallpaper ou preferências do usuário |
 
 ## Child DOX Index
 

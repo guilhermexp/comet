@@ -326,6 +326,32 @@ fn omp_sessions_root(command: &str, cwd: &Path) -> Result<PathBuf, String> {
     Ok(config_root.join("agent").join("sessions"))
 }
 
+pub(crate) fn is_nested_provider_transcript(
+    manifest: &HostedSessionManifest,
+    transcript_path: &Path,
+) -> bool {
+    let Ok(root) = omp_sessions_root(&manifest.session.command, Path::new(&manifest.cwd)) else {
+        return false;
+    };
+    if transcript_path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return false;
+    }
+    let child = std::fs::canonicalize(transcript_path)
+        .unwrap_or_else(|_| transcript_path.to_path_buf());
+    let Some(artifact_dir) = child.parent() else {
+        return false;
+    };
+    let Some(parent_dir) = artifact_dir.parent() else {
+        return false;
+    };
+    let Some(artifact_name) = artifact_dir.file_name() else {
+        return false;
+    };
+    let mut owner_name = artifact_name.to_os_string();
+    owner_name.push(".jsonl");
+    trusted_jsonl_path(&parent_dir.join(owner_name), &root).is_ok()
+}
+
 pub(crate) fn read(
     manifest: &HostedSessionManifest,
 ) -> Result<Option<SessionTelemetry>, SessionTelemetryReadError> {
@@ -475,6 +501,75 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn identifies_nested_transcripts_by_canonical_omp_artifact_layout() {
+        let root = tempfile::tempdir().expect("OMP root");
+        let primary = root.path().join("primary.jsonl");
+        let child = root.path().join("primary/PgliteSqlCheck.jsonl");
+        write_usage_transcript(&primary);
+        write_usage_transcript(&child);
+        let manifest = manifest(
+            &format!("omp --session-dir '{}'", root.path().display()),
+            &primary,
+        );
+
+        assert!(is_nested_provider_transcript(&manifest, &child));
+        assert!(!is_nested_provider_transcript(&manifest, &primary));
+
+        let unrelated = root.path().join("other/deeper.jsonl");
+        write_usage_transcript(&unrelated);
+        assert!(!is_nested_provider_transcript(&manifest, &unrelated));
+
+        let outside = tempfile::tempdir().expect("outside OMP root");
+        let outside_primary = outside.path().join("primary.jsonl");
+        let outside_child = outside.path().join("primary/child.jsonl");
+        write_usage_transcript(&outside_primary);
+        write_usage_transcript(&outside_child);
+        assert!(!is_nested_provider_transcript(&manifest, &outside_child));
+
+        let unflushed_child = root.path().join("primary/NotYetFlushed.jsonl");
+        assert!(is_nested_provider_transcript(&manifest, &unflushed_child));
+        let unflushed_unrelated = root.path().join("missing/NotYetFlushed.jsonl");
+        assert!(!is_nested_provider_transcript(&manifest, &unflushed_unrelated));
+        let unflushed_outside = outside.path().join("primary/NotYetFlushed.jsonl");
+        assert!(!is_nested_provider_transcript(&manifest, &unflushed_outside));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let alias_dir = root.path().join("alias");
+            std::fs::create_dir_all(&alias_dir).expect("create child alias directory");
+            let alias = alias_dir.join("child.jsonl");
+            symlink(&child, &alias).expect("create child transcript alias");
+            assert!(is_nested_provider_transcript(&manifest, &alias));
+        }
+    }
+
+    #[test]
+    fn identifies_nested_transcripts_under_the_default_omp_sessions_root() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().expect("temporary user home");
+        let _env = EnvGuard::set(&[
+            ("HOME", Some(home.path())),
+            ("PI_CONFIG_DIR", None),
+            ("PI_CODING_AGENT_DIR", None),
+            ("XDG_DATA_HOME", None),
+            ("PI_PROFILE", None),
+            ("OMP_PROFILE", None),
+        ]);
+        let root = home.path().join(".omp/agent/sessions");
+        let primary = root.join("primary.jsonl");
+        let child = root.join("primary/PgliteSqlCheck.jsonl");
+        write_usage_transcript(&primary);
+        write_usage_transcript(&child);
+        let mut manifest = manifest("omp", &primary);
+        manifest.cwd = home.path().to_string_lossy().into_owned();
+
+        assert!(is_nested_provider_transcript(&manifest, &child));
+        assert!(!is_nested_provider_transcript(&manifest, &primary));
     }
 
     #[test]
@@ -657,9 +752,11 @@ mod tests {
                 ("XDG_DATA_HOME", None),
                 ("PI_CONFIG_DIR", None),
             ]);
-            assert!(read(&manifest("omp", &custom_transcript))
-                .expect("custom agent telemetry")
-                .is_some());
+            assert!(
+                read(&manifest("omp", &custom_transcript))
+                    .expect("custom agent telemetry")
+                    .is_some()
+            );
         }
 
         let profile_transcript = home
@@ -676,9 +773,11 @@ mod tests {
                 ("XDG_DATA_HOME", None),
                 ("PI_CONFIG_DIR", None),
             ]);
-            assert!(read(&manifest("omp --profile work", &profile_transcript))
-                .expect("named profile telemetry")
-                .is_some());
+            assert!(
+                read(&manifest("omp --profile work", &profile_transcript))
+                    .expect("named profile telemetry")
+                    .is_some()
+            );
         }
 
         let xdg_transcript = xdg.join("omp/profiles/work/sessions/project/xdg.jsonl");
@@ -693,9 +792,11 @@ mod tests {
                 ("XDG_DATA_HOME", Some(xdg.as_path())),
                 ("PI_CONFIG_DIR", None),
             ]);
-            assert!(read(&manifest("omp --profile=work", &xdg_transcript))
-                .expect("XDG profile telemetry")
-                .is_some());
+            assert!(
+                read(&manifest("omp --profile=work", &xdg_transcript))
+                    .expect("XDG profile telemetry")
+                    .is_some()
+            );
         }
     }
 
@@ -717,11 +818,13 @@ mod tests {
             ("PI_CONFIG_DIR", None),
         ]);
 
-        assert!(read(&manifest(
-            &format!("omp --session-dir={}", explicit_root.path().display()),
-            &transcript,
-        ))
-        .expect("explicit Session directory telemetry")
-        .is_some());
+        assert!(
+            read(&manifest(
+                &format!("omp --session-dir={}", explicit_root.path().display()),
+                &transcript,
+            ))
+            .expect("explicit Session directory telemetry")
+            .is_some()
+        );
     }
 }

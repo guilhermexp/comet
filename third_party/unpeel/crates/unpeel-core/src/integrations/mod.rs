@@ -2,6 +2,7 @@ pub mod shared;
 
 use crate::session_host::SessionHostLaunch;
 use portable_pty::CommandBuilder;
+use std::path::Path;
 
 type ConfigureHostCommand =
     fn(&SessionHostLaunch, &mut CommandBuilder, &mut Vec<String>) -> Result<(), String>;
@@ -10,6 +11,8 @@ type HasAutomaticMcpSetup = fn(&str) -> bool;
 type PrepareRuntimeLaunch = fn(RuntimeLaunchOptions) -> Result<(), String>;
 type LegacyMcpGateKind = fn(&str) -> Option<&'static str>;
 type LegacyMcpGateGranted = fn(&str) -> bool;
+pub type IsNestedProviderTranscript =
+    fn(&crate::session_host::HostedSessionManifest, &Path) -> bool;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuntimeLaunchOptions {
@@ -50,6 +53,7 @@ pub struct Integration {
     pub legacy_mcp_gate_kind: Option<LegacyMcpGateKind>,
     pub legacy_mcp_gate_granted: Option<LegacyMcpGateGranted>,
     pub read_session_telemetry: Option<crate::session_telemetry::ReadSessionTelemetry>,
+    pub is_nested_provider_transcript: Option<IsNestedProviderTranscript>,
     pub native_initial_input: Option<NativeInitialInput>,
 }
 
@@ -69,6 +73,7 @@ impl Integration {
             legacy_mcp_gate_kind: None,
             legacy_mcp_gate_granted: None,
             read_session_telemetry: None,
+            is_nested_provider_transcript: None,
             native_initial_input: None,
         }
     }
@@ -137,6 +142,14 @@ impl Integration {
         self
     }
 
+    pub const fn with_nested_provider_transcript_classifier(
+        mut self,
+        classifier: IsNestedProviderTranscript,
+    ) -> Self {
+        self.is_nested_provider_transcript = Some(classifier);
+        self
+    }
+
     pub const fn with_native_initial_input(mut self, input: NativeInitialInput) -> Self {
         self.native_initial_input = Some(input);
         self
@@ -186,6 +199,18 @@ pub(crate) fn runtime_for_command(
 pub(crate) fn integration_for_command(command: &str) -> Option<&'static Integration> {
     let runtime = runtime_for_command(command)?;
     integration_for_id(&runtime.legacy_slug)
+}
+
+/// Ask the matching runtime adapter whether a transcript is a nested child of
+/// a primary provider session. Runtimes without a known child-session layout
+/// return false and retain their existing lifecycle behavior.
+pub fn is_nested_provider_transcript(
+    manifest: &crate::session_host::HostedSessionManifest,
+    transcript_path: &Path,
+) -> bool {
+    integration_for_command(&manifest.session.command)
+        .and_then(|integration| integration.is_nested_provider_transcript)
+        .is_some_and(|classify| classify(manifest, transcript_path))
 }
 
 fn runtime_for_dispatch(

@@ -4,7 +4,7 @@ use gpui::SharedString;
 use serde_json::Value;
 use zeron_proto::ToolCall;
 
-use crate::details_sidebar::files_view::material_icon_path;
+use crate::material_icons::material_icon_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolIconDescriptor {

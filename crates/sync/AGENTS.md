@@ -18,7 +18,12 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 - Presença é efêmera por design — substitui escrita de heartbeat a cada 15s. Não persistir presença no doc.
 - Chat row import distingue operações aplicadas de dependências causais pendentes. Row pendente segura o cursor e força checkpoint mesmo com frontier aparentemente contida; HTTP e WebSocket usam a mesma regra. Reparo inclui rows próprias e uma geração impede que catch-up antigo limpe um gap mais novo. `CaughtUp` não é emitido enquanto faltar história causal.
 - Publicação de Chat é um outbox SQLite (`chat_outbox`) com `batch_id` estável: o cliente só envia depois de persistir, só remove após ACK persistido e recarrega pendências ao reabrir. Rejeições permanentes ficam marcadas para um checkpoint posterior; a fila em memória nunca substitui o registro durável.
+- No cliente fino, `viewer-delivery` é uma obrigação durável separada do outbox de rows. A descoberta une jobs pendentes e rows não ACKadas, limita páginas, reabre Chats sem viewport e só apaga o recibo depois de uma wake posterior ao ACK das rows, com conclusão condicionada à versão. `hostDevice` informa roteamento ao Edge; não concede autorização. A fila local continua sendo fallback para Edges antigos.
+- `DocsStore::open` tenta truncar o WAL sem esperar por locks de outra conexão. VACUUM só ocorre por `reclaim_free_space` quando a lista livre passa os limites absoluto e proporcional; essa manutenção usa espera zero para locks ocupados, restaura o timeout normal do store e deve rodar fora de caminhos sensíveis a latência. Não mova o VACUUM para o boot interativo.
 - Rejeição `quota` loga **um** `warn` por episódio bloqueado (`chat2: push quota exceeded`); a rajada em voo e as sondas da cabeça da fila que repetem o veredito ficam em `debug`. A drenagem (um batch por grant) não muda.
+
+- OS resume substitui sockets ativos de Registry/Chat, incluindo dial e handshake, preservando readiness e replay de batches. Wakes de consumidor e hints de conexão de outro room não derrubam sockets saudáveis.
+- Registry possui actor e fallback HTTP antes de esperar readiness; cancelar construção/shutdown não destaca tarefas. Shutdown interrompe dial/handshake/envio bloqueado e encerra o fallback antes do snapshot final.
 
 ## Work Guidance
 
@@ -34,6 +39,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 |---|---|---|
 | `src/chat_client.rs` + `src/chat_client/tests.rs` (cursor, checkpoint, recuperação causal, cap de dials) | unit | `cargo test -p zeron-sync --features mock-server --lib chat_client` |
 | `src/**` (backoff, VV, DocsStore) | unit | `cargo test -p zeron-sync --features mock-server --lib` |
+| `src/registry/reliability_tests.rs` (resume, replay e ownership/cancelamento) | unit | `cargo test -p zeron-sync --features mock-server --lib registry::reliability_tests` |
 | `tests/registry_client.rs` | integration — cliente contra o DO mock in-process | `cargo test -p zeron-sync --features mock-server --test registry_client` |
 | `tests/registry_edge.rs` | e2e, `--ignored` por padrão; precisa de `wrangler dev` + `AUTH_MODE=dev` | `ZERON_EDGE_WS=ws://127.0.0.1:27640 cargo test -p zeron-sync --test registry_edge -- --ignored` |
 | `store.rs` outbox + `chat_client.rs` replay/ACK | unit | `cargo test -p zeron-sync --features mock-server --lib` |

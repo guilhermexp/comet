@@ -7,6 +7,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'third_party/zui/**'
       - '.github/actions/linux-ci/**'
       - 'scripts/ci/**'
       - 'scripts/*cursor-sdk*'
@@ -23,6 +24,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'third_party/zui/**'
       - '.github/actions/linux-ci/**'
       - 'scripts/ci/**'
       - 'scripts/*cursor-sdk*'
@@ -72,11 +74,14 @@ jobs:
             // The app links the Rust mobile core and everything it depends on.
             const mobileCore = ['apps/ios/', 'crates/mobile/', 'crates/client/', 'crates/text/',
               'crates/markdown/', 'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/',
-              'crates/syntax/', 'scripts/ios/'];
+              'crates/syntax/', 'crates/voice-session/', 'crates/voice-media/',
+              'crates/audio/', 'crates/orb/', 'crates/veil/', 'scripts/ios/'];
             // Native macOS/Linux fixtures: browser, preview, notifications,
             // diff font geometry and the vendored GPUI frame source.
             const nativeSurfaces = ['crates/ui/src/browser/', 'crates/ui/src/file_preview/',
-              'crates/ui/src/notify.rs', 'crates/ui/src/changes.rs', 'crates/ui/examples/',
+              'crates/ui/src/notify.rs', 'crates/ui/src/changes.rs', 'crates/ui/src/attachments.rs',
+              'crates/ui/src/composer.rs', 'crates/ui/src/queue.rs', 'crates/ui/src/transcript.rs',
+              'crates/ui/src/shell/', 'crates/ui/src/voice.rs', 'crates/ui/src/orb/', 'crates/ui/examples/',
               'crates/ui/Cargo.toml', 'crates/preview/', 'third_party/zui/', 'edge/', 'dist/macos/',
               'scripts/run-macos-browser-fixture.sh', 'scripts/test-linux-browser.sh'];
             // core-tests: every non-UI Linux suite (scripts/ci/test-core.sh).
@@ -123,7 +128,7 @@ jobs:
             libfontconfig1-dev libfreetype-dev libasound2-dev
             libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
       - name: UI and headless layout regressions
-        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib
+        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib --test voice_orb_geometry
 
   macos-frame-recovery:
     needs: changes
@@ -148,6 +153,14 @@ jobs:
       - name: Native notification click regressions
         run: |
           cargo test --release --locked -p zeron-ui --lib notify::tests:: -- --test-threads=1
+      - name: Native attachment and composer chip regressions
+        run: |
+          for filter in attachments::tests:: composer::attachment_chip_tests:: shell::chat_dropzone_tests:: \
+            queue_rows_label_attachment_chips_and_file_only_sends \
+            user_bubbles_project_attachment_chips_in_place_of_the_strip \
+            sent_chips_show_upload_progress_until_their_bytes_land; do
+            cargo test --release --locked -p zeron-ui --lib "$filter" -- --test-threads=1
+          done
       - name: Build native browser fixture
         run: cargo build --release --locked -p zeron-ui --example browser-fixture --example preview-fixture --features browser-fixture
       - name: Native browser regression and screenshots
@@ -189,6 +202,52 @@ jobs:
       - name: Native frame-source recovery regression
         working-directory: third_party/zui
         run: cargo test --release --locked -p gpui_macos --test frame_source_recovery
+      - name: Build native window glass backing regression
+        working-directory: third_party/zui
+        run: cargo test --release --locked -p gpui_macos --features runtime_shaders --test window_glass_backing --no-run --message-format=json > "$RUNNER_TEMP/window-glass-build.jsonl"
+      - name: Run native window glass backing regression
+        timeout-minutes: 2
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, pathlib, plistlib, shlex, shutil, subprocess
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'window-glass'
+          evidence.mkdir()
+          artifacts = [json.loads(line) for line in (evidence.parent / 'window-glass-build.jsonl').read_text().splitlines()]
+          binary = next(pathlib.Path(item['executable']) for item in artifacts
+                        if item.get('reason') == 'compiler-artifact'
+                        and item.get('target', {}).get('name') == 'window_glass_backing'
+                        and item.get('executable'))
+          app = evidence / 'Native Glass Regression.app'
+          contents = app / 'Contents'
+          executable = contents / 'MacOS'
+          executable.mkdir(parents=True)
+          shutil.copy2(binary, executable / 'native-test')
+          (contents / 'Info.plist').write_bytes(plistlib.dumps({
+              'CFBundleIdentifier': 'sh.zeron.validation.window-glass-backing',
+              'CFBundleName': 'Native Glass Regression',
+              'CFBundleExecutable': 'run-fixture',
+              'CFBundlePackageType': 'APPL', 'CFBundleVersion': '1',
+              'NSHighResolutionCapable': True, 'NSSupportsAutomaticTermination': False,
+          }))
+          launcher = executable / 'run-fixture'
+          launcher.write_text('#!/bin/sh\n' + shlex.quote(str(executable / 'native-test')) +
+                              ' >' + shlex.quote(str(evidence / 'native.log')) + ' 2>&1\n' +
+                              'result=$?\nprintf "%s\\n" "$result" >' +
+                              shlex.quote(str(evidence / 'native.exit')) + '\nexit "$result"\n')
+          launcher.chmod(0o755)
+          subprocess.run(['open', '-W', '-n', str(app)], check=True, timeout=60)
+          log = (evidence / 'native.log').read_text()
+          print(log)
+          assert (evidence / 'native.exit').read_text().strip() == '0', 'native regression failed'
+          assert 'PASS: native window glass backing lifecycle and configuration' in log, 'native regression did not finish its assertions'
+          PYTHON
+      - name: Upload native window glass evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: window-glass-macos
+          path: ${{ runner.temp }}/window-glass
+          if-no-files-found: ignore
 
   ios-tests:
     needs: changes

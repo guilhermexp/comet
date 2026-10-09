@@ -95,6 +95,35 @@ fn decoded(events: &[TerminalEvent]) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn setup_outcome_diagnostic(core: &EngineCore, outcome: &CreateWorktreeOutcome) -> String {
+    let Some(setup) = outcome.setup_action.as_ref() else {
+        return format!(
+            "setup_error={:?}; worktree_path={}; setup_action=<none>",
+            &outcome.setup_error, outcome.worktree.path
+        );
+    };
+    let terminal_id = &setup.terminal.id;
+    let replay = match core.terminals.subscribe(terminal_id, None) {
+        Ok(mut rx) => {
+            let mut events = Vec::new();
+            while events.len() < 64 {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(_) => break,
+                }
+            }
+            let text = decoded(&events).chars().take(2_048).collect::<String>();
+            format!("events={}, output={text:?}", events.len())
+        }
+        Err(error) => format!("replay_error={error}"),
+    };
+    let _ = core.terminals.close(terminal_id);
+    format!(
+        "setup_error={:?}; worktree_path={}; terminal_id={terminal_id}; replay=({replay})",
+        &outcome.setup_error, outcome.worktree.path
+    )
+}
+
 /// Drain a terminal subscription until `predicate` matches the decoded transcript
 /// (or the deadline hits).
 async fn drain_until(
@@ -322,6 +351,171 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert!(
         repos.create("demo repo!").await.is_err(),
         "duplicate create rejected"
+    );
+}
+
+#[tokio::test]
+async fn repository_identity_spans_worktrees_and_clones() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repos = test_repos(&temp.path().join("data"));
+    let repo = temp.path().join("repo");
+    init_repo(&repo).await;
+    let linked = temp.path().join("linked");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            linked.to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    // The trunk's root commit: shared by worktrees, and by clones whatever
+    // their remotes say — an old name kept alive by a rename redirect, an
+    // SSH host alias, another transport.
+    let root = git_stdout(&repo, &["rev-list", "--max-parents=0", "HEAD"]).await;
+    let identity = repos.repository_identity(&repo).await.expect("identity");
+    assert_eq!(identity, format!("commit:{root}"));
+    assert_eq!(repos.repository_identity(&linked).await.unwrap(), identity);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github-alias:zeronsh/old-name.git",
+        ],
+    )
+    .await;
+    let clone = temp.path().join("clone");
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "-q",
+            repo.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    )
+    .await;
+    git(
+        &clone,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/zeronsh/new-name",
+        ],
+    )
+    .await;
+    assert_eq!(repos.repository_identity(&repo).await.unwrap(), identity);
+    assert_eq!(repos.repository_identity(&clone).await.unwrap(), identity);
+
+    // Folders below the top level stay their own projects: monorepo
+    // siblings differ, the same subfolder matches across clones.
+    for dir in [&repo, &clone] {
+        std::fs::create_dir_all(dir.join("apps/web")).unwrap();
+        std::fs::create_dir_all(dir.join("apps/api")).unwrap();
+    }
+    let web = repos
+        .repository_identity(&repo.join("apps/web"))
+        .await
+        .unwrap();
+    assert_eq!(web, format!("{identity}:apps/web"));
+    assert_ne!(
+        repos
+            .repository_identity(&repo.join("apps/api"))
+            .await
+            .unwrap(),
+        web
+    );
+    assert_eq!(
+        repos
+            .repository_identity(&clone.join("apps/web"))
+            .await
+            .unwrap(),
+        web
+    );
+
+    // An unrelated repository has its own root.
+    let other = temp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]).await;
+    std::fs::write(other.join("b.txt"), "unrelated\n").unwrap();
+    git(&other, &["add", "."]).await;
+    git(&other, &["commit", "-q", "-m", "other initial"]).await;
+    assert_ne!(repos.repository_identity(&other).await.unwrap(), identity);
+
+    // Merging an unrelated history in adds a root on a second parent; the
+    // trunk's root still names the repository.
+    git(&repo, &["fetch", "-q", other.to_str().unwrap(), "main"]).await;
+    git(
+        &repo,
+        &[
+            "merge",
+            "-q",
+            "--allow-unrelated-histories",
+            "-m",
+            "merge other",
+            "FETCH_HEAD",
+        ],
+    )
+    .await;
+    assert_eq!(repos.repository_identity(&repo).await.unwrap(), identity);
+
+    // A shallow clone can't vouch for its root: the remote names it.
+    let shallow = temp.path().join("shallow");
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", repo.display()),
+            shallow.to_str().unwrap(),
+        ],
+    )
+    .await;
+    git(
+        &shallow,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://GitHub.com/ZeronSH/Zeron.git",
+        ],
+    )
+    .await;
+    assert_eq!(
+        repos.repository_identity(&shallow).await.unwrap(),
+        "github.com/zeronsh/zeron"
+    );
+
+    // No commits yet: the remote (origin, else the first), then a
+    // device-scoped local identity.
+    let empty = temp.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    git(&empty, &["init", "-q", "-b", "main"]).await;
+    let local = repos.repository_identity(&empty).await.unwrap();
+    assert!(local.starts_with("local:"), "{local}");
+    git(
+        &empty,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:Anara/Comet.git",
+        ],
+    )
+    .await;
+    assert_eq!(
+        repos.repository_identity(&empty).await.unwrap(),
+        "github.com/anara/comet"
     );
 }
 
@@ -1347,7 +1541,7 @@ async fn turn_diff_captures_only_changes_since_snapshot() {
     // Pre-turn state: a tracked edit and an untracked file already exist.
     std::fs::write(repo_dir.join("a.txt"), "one\ntwo\npre-turn\n").expect("edit a.txt");
     std::fs::write(repo_dir.join("pre.txt"), "before the turn\n").expect("pre.txt");
-    let turn_tree = snapshot_tree(&repo_dir).await.expect("snapshot");
+    let turn_tree = snapshot_tree(&repos, &repo_dir).await.expect("snapshot");
 
     // Nothing changed yet: the turn diff is empty (pre-existing untracked
     // files must NOT reappear as new).
@@ -1449,6 +1643,7 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
     };
     assert!(!space.git_detected, "plain folder must read as non-git");
     assert!(space.checkout_id.is_none());
+    assert!(space.repository_id.is_none());
 
     // `git init` later flips the stamp (watcher and/or explicit recheck).
     git(&folder, &["init", "-b", "main"]).await;
@@ -1467,6 +1662,14 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
             .expect("watch alive");
     };
     assert!(space.checkout_id.is_some(), "git space gains a checkout id");
+    assert!(
+        space
+            .repository_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:")),
+        "remote-less git space gains a local repository id: {:?}",
+        space.repository_id
+    );
     core.shutdown().await;
 }
 
@@ -2223,6 +2426,8 @@ async fn rpc_dispatch_for_m5_methods() {
 
     // A legacy CreateWorktree caller does not trigger setup, even when one is
     // configured for the project.
+    let setup_started_path = repo_dir.join(".zeron-setup-started");
+    let setup_release_path = repo_dir.join(".zeron-setup-release");
     core.project_actions
         .upsert(
             "space-term",
@@ -2231,7 +2436,8 @@ async fn rpc_dispatch_for_m5_methods() {
             ProjectActionDraft {
                 name: "Setup".into(),
                 command: concat!(
-                    "sleep 6; ",
+                    "touch \"$ZERON_PROJECT_ROOT/.zeron-setup-started\"; ",
+                    "until test -f \"$ZERON_PROJECT_ROOT/.zeron-setup-release\"; do sleep 0.01; done; ",
                     "printf 'ROOT=%s\\nWT=%s\\nCWD=%s\\n' ",
                     "\"$ZERON_PROJECT_ROOT\" \"$ZERON_WORKTREE_PATH\" \"$PWD\" ",
                     "| tee .zeron-setup-env"
@@ -2304,21 +2510,77 @@ async fn rpc_dispatch_for_m5_methods() {
     );
 
     // A space-aware caller gets the already-open setup terminal without
-    // waiting for the command to finish.
-    let started = tokio::time::Instant::now();
-    let outcome = client
-        .call_as::<CreateWorktreeOutcome>(
-            methods::CREATE_WORKTREE,
-            serde_json::json!({
-                "repoPath": repo_path,
-                "branch": "main",
-                "spaceId": "space-term",
-            }),
-        )
-        .await
-        .expect("CreateWorktree with setup");
-    let create_elapsed = started.elapsed();
-    assert!(outcome.setup_error.is_none());
+    // waiting for the command to finish. The command blocks on a fixture gate;
+    // this proves the RPC responds within four seconds while setup is still
+    // pending, including Git worktree preparation in that deadline.
+    let setup_client = zeron_rpc::memory_client(core.rpc_service());
+    let setup_repo_path = repo_path.clone();
+    let mut create_request = tokio::spawn(async move {
+        setup_client
+            .call_as::<CreateWorktreeOutcome>(
+                methods::CREATE_WORKTREE,
+                serde_json::json!({
+                    "repoPath": setup_repo_path,
+                    "branch": "main",
+                    "spaceId": "space-term",
+                }),
+            )
+            .await
+    });
+    let outcome = match tokio::time::timeout(Duration::from_secs(4), &mut create_request).await {
+        Ok(Ok(Ok(outcome))) => outcome,
+        Ok(Ok(Err(error))) => {
+            let _ = std::fs::write(&setup_release_path, "release");
+            core.shutdown().await;
+            panic!("CreateWorktree with setup failed: {error}");
+        }
+        Ok(Err(error)) => {
+            let _ = std::fs::write(&setup_release_path, "release");
+            core.shutdown().await;
+            panic!("CreateWorktree task failed: {error}");
+        }
+        Err(_) => {
+            std::fs::write(&setup_release_path, "release")
+                .expect("release setup after the RPC deadline");
+            let diagnostic =
+                match tokio::time::timeout(Duration::from_secs(15), &mut create_request).await {
+                    Ok(Ok(Ok(outcome))) => setup_outcome_diagnostic(&core, &outcome),
+                    Ok(Ok(Err(error))) => format!("CreateWorktree RPC returned: {error}"),
+                    Ok(Err(error)) => format!("CreateWorktree task failed: {error}"),
+                    Err(_) => {
+                        create_request.abort();
+                        let _ = create_request.await;
+                        "CreateWorktree stayed pending for 15s after release".into()
+                    }
+                };
+            core.shutdown().await;
+            panic!(
+                "CreateWorktree exceeded the four-second RPC deadline; after releasing setup: {diagnostic}"
+            );
+        }
+    };
+    if outcome.setup_error.is_some() || outcome.setup_action.is_none() {
+        let diagnostic = setup_outcome_diagnostic(&core, &outcome);
+        core.shutdown().await;
+        panic!("CreateWorktree returned without its setup terminal; {diagnostic}");
+    }
+    if tokio::time::timeout(Duration::from_secs(15), async {
+        while !setup_started_path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let _ = std::fs::write(&setup_release_path, "release");
+        let diagnostic = setup_outcome_diagnostic(&core, &outcome);
+        core.shutdown().await;
+        panic!(
+            "setup command did not reach its release gate after CreateWorktree returned; {diagnostic}"
+        );
+    }
+    assert!(!setup_release_path.exists(), "setup has not been released");
+    std::fs::write(&setup_release_path, "release").expect("release setup command");
     let setup = outcome.setup_action.expect("setup terminal");
     let mut setup_rx = core
         .terminals
@@ -2337,6 +2599,8 @@ async fn rpc_dispatch_for_m5_methods() {
     assert!(setup_output.contains(&format!("WT={}", canonical_worktree.display())));
     assert!(setup_output.contains(&format!("CWD={}", canonical_worktree.display())));
     assert!(canonical_worktree.join(".zeron-setup-env").exists());
+    std::fs::remove_file(&setup_started_path).expect("remove setup start marker");
+    std::fs::remove_file(&setup_release_path).expect("remove setup release marker");
     core.terminals
         .close(&setup.terminal.id)
         .expect("close setup terminal");
@@ -2569,8 +2833,4 @@ async fn rpc_dispatch_for_m5_methods() {
     );
 
     core.shutdown().await;
-    assert!(
-        create_elapsed < Duration::from_secs(4),
-        "CreateWorktree waited for the setup command ({create_elapsed:?})"
-    );
 }

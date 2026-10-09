@@ -1,4 +1,6 @@
-use super::{shared, Integration, RuntimeLaunchOptions};
+use super::{Integration, RuntimeLaunchOptions, shared};
+
+const FILTER_NESTED_OMP_SUBAGENTS: bool = false;
 
 mod context {
     include!(concat!(

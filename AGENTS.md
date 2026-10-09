@@ -10,7 +10,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 ## Stack
 
-- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,sessions-mcp,preview,voice}` + `apps/zeron` (membro padrão do workspace).
+- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,sessions-mcp,preview,voice,audio,voice-media,voice-session,orb,veil}` + `apps/zeron` (membro padrão do workspace).
 - **UI = gpui**, snapshot vendorizado de `zeronsh/zui` em `third_party/zui` (Apache-2.0; proveniência em `third_party/zui-upstream.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
 - **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres nem Hono server. Sync não usa WebRTC; previews de servidores usam RTC autenticado por PreviewRoom.
@@ -30,7 +30,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Demo local offline (harness mock, seeded) | `scripts/dev-demo.sh` (`--slow` pra ver streaming) |
 | Smoke e2e | `scripts/e2e-smoke.sh` |
 | Edge | `npm -C edge run dev\|test\|typecheck\|deploy` |
-| Packaging | `scripts/package-linux.sh` · `scripts/package-macos.sh` |
+| Packaging | `scripts/package-linux.sh` · `scripts/package-macos.sh` (local: também instala em `/Applications/Zeron.app`, sem abrir) |
 
 O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes executáveis da extensão lifecycle pi-family do Unpeel vendorizado.
 
@@ -58,7 +58,7 @@ Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml`
 - `dist/` guarda **assets-fonte** de packaging (ícone, `.desktop`, `Info.plist`), consumidos por `scripts/package-*.sh` e pelo workflow de release. Só `edge/dist/` é gerado/ignorado — não apagar a `dist/` da raiz.
 - Build do gpui é caro; `[profile.dev]` já usa `opt-level = 2` pras deps. Primeira build leva minutos.
 - Re-vendorizar `third_party/zui` exige verificar ambas as regras de `comet/line-wrap-closing-punctuation` (`line_wrapper` e `line_layout`); não editar o conteúdo do vendor no lugar.
-- **Live Voice pertence à engine host, não à surface selecionada.** Trocar/limpar o Chat, perder foco ou minimizar não encerra a call. Em `Working`/`AwaitingInput`, start exige que o OMP anuncie contexto operacional silencioso; a engine projeta só status/texto visível/label de tool/espera/erro e coalesce o último snapshot. Delegação vocal confirmada entra como comando durável `Steer`, com fallback único para novo turno se o run assentar; comando durável alheio, End/Escape no Chat ativo, falha de transporte, shutdown ou quit encerram. Run OMP estacionado em `Idle` continua quente e requer só Live básico.
+- **Codex voice usa o helper standalone instalado**, com media local/remote na engine host e clientes desktop/iOS; não embute runtime Codex/GStreamer no pacote. A integração antiga de Live Voice OMP foi removida; não restaurar seu microfone, probes ou RPCs no composer.
 - Este é um repo de terceiro sob MIT. Preservar licença e atribuição.
 
 ## Onde mudar o quê

@@ -14,7 +14,6 @@ use gpui::{
 use zeron_syntax::HighlightedDocument;
 
 use crate::{
-    details_sidebar::files_view::material_icon_path,
     file_preview::{
         loader::{
             LoadedPreview, PreviewLoadError, PreviewTypography, find_widest_line_index_with_system,
@@ -24,6 +23,7 @@ use crate::{
     },
     icons,
     markdown::render as markdown_render,
+    material_icons::material_icon_path,
     theme::Theme,
 };
 
@@ -75,10 +75,6 @@ fn preview_absolute_path(root: &Path, relative_path: &str) -> PathBuf {
 
 #[derive(Debug, Clone)]
 pub enum FilePreviewEvent {
-    ActiveChanged {
-        context_key: String,
-        relative_path: Option<String>,
-    },
     CloseRequested {
         context_key: String,
         relative_path: String,
@@ -200,20 +196,6 @@ impl FilePreview {
         self.load_active(cx);
     }
 
-    pub fn open(
-        &mut self,
-        context_key: String,
-        root: PathBuf,
-        relative_path: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.activate_surface(context_key.clone(), root, relative_path.clone(), cx);
-        cx.emit(FilePreviewEvent::ActiveChanged {
-            context_key,
-            relative_path: Some(relative_path),
-        });
-    }
-
     pub fn activate_surface(
         &mut self,
         context_key: String,
@@ -245,14 +227,8 @@ impl FilePreview {
             .remove(&(context_key.to_owned(), relative_path.to_owned()));
         self.scroll_handles
             .remove(&(context_key.to_string(), relative_path.to_string()));
-        if is_active_context {
-            if was_active_tab {
-                self.load_active(cx);
-            }
-            cx.emit(FilePreviewEvent::ActiveChanged {
-                context_key: context_key.to_string(),
-                relative_path: self.tabs.active_path(context_key).map(str::to_owned),
-            });
+        if is_active_context && was_active_tab {
+            self.load_active(cx);
         }
     }
 
@@ -271,10 +247,6 @@ impl FilePreview {
             self.scroll_handles.remove(&(context_key.clone(), path));
         }
         self.load_active(cx);
-        cx.emit(FilePreviewEvent::ActiveChanged {
-            context_key,
-            relative_path: None,
-        });
     }
 
     fn load_active(&mut self, cx: &mut Context<Self>) {
@@ -1080,7 +1052,7 @@ mod tests {
                     text: Some("{\"finding\": \"read result\"}".into()),
                 },
             );
-            preview.open(
+            preview.activate_surface(
                 "chat:read:1".into(),
                 "/nonexistent-chat-root".into(),
                 "agent://Audit?q=.findings[1:]".into(),

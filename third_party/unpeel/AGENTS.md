@@ -918,6 +918,41 @@ exist.
 
 `runtimes/setup_conformance_tests.rs` executes every owned shell hook with explicit proxy variables and empty proxy exclusions. CaptureServer verifies direct loopback delivery and the persisted `last-hook-event.json` event and generation.
 
+## Comet downstream lifecycle isolation (local fork)
+
+This section records the Comet integration layered on the provider-neutral hook
+contracts above; it is not an upstream runtime API guarantee.
+
+- Pi and Prime retain `pi-family-lifecycle-extension.js`. OMP installs the
+  separate `omp-lifecycle-extension.js` from
+  `runtimes/_shared/pi-family/adapter/setup.rs`, so the OMP-only child-agent
+  classifier cannot suppress unrelated Pi-family events.
+- The extension includes `unpeel_agent_kind` from `ctx.agent.kind`: `sub`
+  events stop before posting, while `main` is authoritative and can rebind a
+  primary Worker even when its transcript path resembles a child artifact.
+  Older extension payloads omit that field, so the OMP adapter uses the
+  provider's canonical child-transcript layout beneath the trusted OMP session
+  root (`runtimes/omp/adapter/telemetry.rs::is_nested_provider_transcript`).
+  The decision is parent-side: the owning `<dirname(child)>.jsonl` must be a
+  trusted transcript under that root, so a child whose JSONL is not flushed
+  yet is still nested. It does not classify arbitrary nested JSONL paths or
+  apply this fallback to Pi/Prime.
+- Comet's `crates/workers-unpeel` ingress repeats the classification before
+  queueing lifecycle events, changing activity, writing the session journal,
+  or persisting provider binding/telemetry. Its read-only
+  `POST /hook/<id>?validate=1` route supports old extensions and old listeners:
+  a current listener returns `202` with `ignored: true` for a child event,
+  while an older listener's `404` leaves primary delivery compatible. The
+  shared notifier preflights every known listener for synchronous Worker hooks
+  and suppresses all actual child POSTs and the durable marker if any listener
+  explicitly ignores the event. Async hooks keep marker-before-background-POST
+  ordering.
+- The focused Rust/Bun regressions live in the OMP extension/adapter and the
+  Comet `activity_bridge`/`session_event_journal` tests. From the Comet root,
+  run local Cargo batches through `scripts/cargo-verify.py`; vendor core tests
+  use `--manifest-path third_party/unpeel/crates/Cargo.toml`, while downstream
+  bridge tests use the root workspace.
+
 ## Comet worker output geometry
 
 The session Host initializes its PTY and `TerminalViewportState` from the same

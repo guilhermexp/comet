@@ -1,13 +1,19 @@
 repository = "https://github.com/zeronsh/zui"
-base_revision = "c6076032f0566e631d6c2707f89bd0dd87ab55b4"
-vendored_tree = "37123559dda41271fb4984992f79b644b3d681ba"
+base_revision = "dce5c1f737a834b32c2b531d552ea78035e54093"
+vendored_tree = "7e0cdc6185ee4f71274883b686010f2283dac6ed"
 vendored_from = "working-tree"
 license = "Apache-2.0"
 
-# Snapshot of the local working tree at `feat/window-blur-radius` head
-# 3712355, without `.git` or `target/`. Upstream `main` at vendoring time
-# is `base_revision` (merge of nested-frosted-blur). Six local commits
-# sit on top of that base:
+# `vendored_tree` is the exact Git tree hash of `zui/` without `.git` or
+# `target/`. The snapshot was reconstructed in a separate source checkout at
+# `base_revision`, then the fork's existing patch set was merged and copied.
+# The reusable ignored checkout lives at `.tmp/zui-source`; its merge commit is
+# `e1541c5c6d6b361437516fba63e1a5cd1cd90a42` (parents: reconstructed prior
+# snapshot `f64fda81a29145647aecf2f583f042d4f255ace0` and upstream
+# `0966d065b23e0b7c9b53c2e186705b8bce16fe2d`).
+# The local window-radius patch was originally developed on
+# `feat/window-blur-radius` at `3712355`; its review and documentation commits
+# remain represented in the snapshot:
 
 # 457b8eda4dca592c0cd52d37c334d9ca52fd1f01
 #   Allow consumers to declare the macOS window-background blur radius.
@@ -28,9 +34,35 @@ license = "Apache-2.0"
 #   aborts (SIGABRT in HIToolbox) off the main thread, which killed the
 #   parallel zeron-ui test binary whenever a test shaped text natively.
 
-# Local patch (sync/upstream-v0.2.102, 2026-10-02): upstream zui commits
-#   c6076032..667d0aaf applied as one patch, matching the zui pin upstream
-#   Zeron uses at v0.2.102:
+# Prior upstream delta (sync/upstream-v0.2.102, 2026-10-02), now an ancestor
+# of `base_revision`: commits c6076032..667d0aaf were copied as one patch:
 #   1561532 Implement per pixel text edge fades (#12)
 #   18a89af Raise the drag promotion threshold on Windows (#13)
 #   667d0aa Fade SVG icons per pixel and allow per-edge horizontal fade bands
+
+# Upstream delta integrated for sync/upstream-v0.2.106 (2026-10-07):
+#   667d0aaf9531d2d1b2d0674a5e55f977df1b09f6..
+#   0966d065b23e0b7c9b53c2e186705b8bce16fe2d (one commit):
+#   Transformed and blurred monochrome glyphs. Adds Window::paint_glyph_transformed,
+#   Gaussian glyph blur, and matching Metal, WGSL and HLSL sprite layouts/shaders.
+
+# The fork's closing-punctuation fix (`a6bf17c`) remains in both `LineWrapper`
+# and shaped-text `line_layout`; both implementations and regression tests
+# were already present in the previous `667d0aa` snapshot.
+
+# Local glass stabilization (2026-10-05): reconstructed separate source
+# from the exact tracked pre-change snapshot tree
+# 025faaaa331757932d0a7975b75e593b27766a5c. All prior patches preserved.
+# Source patch commit: 8962c7825322881bcb0b76bfc5e6321e17a17358
+# WindowServer blur now retains one standard NSVisualEffectView at 1% alpha
+# behind content; native regression covers reuse, cleanup, resize and lifetime.
+# vendored_tree is the actual Git tree above, not the historical source head.
+
+# Upstream delta integrated for sync/upstream-v0.2.107 (2026-10-09):
+#   0966d065b23e0b7c9b53c2e186705b8bce16fe2d..
+#   dce5c1f737a834b32c2b531d552ea78035e54093.
+# Reused the exact tracked snapshot tree 6e4082751218f31cc40f3f2ace860c0556ba5baa
+# in a separate source checkout, then merged upstream without conflicts.
+# Source merge: 53cd299ab333c94ccab11ada6add7cdf5cd1adcb.
+# Adds borrowed native-composition handles and Windows image/blur composition;
+# macOS glass/headless and both punctuation patches remain unchanged.

@@ -425,6 +425,7 @@ async fn collect_text(
     let interrupt = CancellationToken::new();
     let _cancel_on_drop = interrupt.clone().drop_guard();
     let controls = RunControls {
+        realtime: None,
         execution_lease,
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
@@ -432,9 +433,10 @@ async fn collect_text(
             rx
         }),
         steering: steer_rx,
-        interrupt,
+        interrupt: interrupt.clone(),
         chat_id: chat_id.to_string(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     let mut stream = harness.run_title(request, controls).await?;
     let mut text = String::new();

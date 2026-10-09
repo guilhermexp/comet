@@ -14,7 +14,7 @@
 //! first uncorrelated idle), manufacturing done-status bugs the native
 //! wires don't have (decision record: docs/research/acp.md).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, LiveVoicePhase, LiveVoiceTranscript, LiveVoiceUnavailableReason, Model,
-    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -48,10 +48,101 @@ pub enum HarnessError {
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
+    /// Staged image paths sent with this prompt. Drivers that inline images
+    /// deliver them with the text; the rest rely on the path refs the prompt
+    /// text already carries.
+    pub attachments: Vec<String>,
+    /// The run configuration this prompt was sent with, when it differs
+    /// from the live runtime's and the driver adopts it in place
+    /// ([`Harness::reconfigures_in_place`]): apply it before the prompt.
+    pub config: Option<Box<RunRequest>>,
+}
+
+impl SteerMessage {
+    pub fn text(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            message_id: None,
+            attachments: Vec::new(),
+            config: None,
+        }
+    }
+}
+
+/// Host ↔ runtime signals that span a persistent runtime's turns.
+///
+/// Stopping a turn is not tearing down the runtime: a runtime holds work the
+/// user never asked to stop (background subagents, background shells). A
+/// driver that returns true from [`Harness::stops_turn_in_place`] answers
+/// [`Self::stop_turn`] by ending only the in-flight turn with
+/// `Done { status: Interrupted }` and staying alive for the next prompt; the
+/// `interrupt` token remains the runtime teardown.
+#[derive(Clone, Default)]
+pub struct TurnControl {
+    stop: std::sync::Arc<tokio::sync::Notify>,
+    background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TurnControl {
+    /// Host: end the in-flight turn, keeping the runtime and its background work.
+    pub fn stop_turn(&self) {
+        self.stop.notify_one();
+    }
+
+    /// Driver: resolves once per [`Self::stop_turn`].
+    pub async fn stop_requested(&self) {
+        self.stop.notified().await;
+    }
+
+    /// Driver: how many background tasks the runtime currently holds.
+    pub fn set_background(&self, tasks: usize) {
+        self.background
+            .store(tasks, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Host: the runtime reports live background work, so retiring it now
+    /// would kill work nobody asked to stop.
+    pub fn background_live(&self) -> bool {
+        self.background.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+}
+
+/// Run-config values compared as their wire meaning, not their JSON type:
+/// clients disagree on spelling (the phone sends `"true"` where the desktop
+/// sends `true`), and neither spelling is a different configuration.
+pub fn same_model_options(
+    a: &serde_json::Map<String, serde_json::Value>,
+    b: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    fn canonical(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) if s.is_empty() => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        }
+    }
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.into_iter()
+        .all(|key| a.get(key).and_then(canonical) == b.get(key).and_then(canonical))
+}
+
+/// Whether the process-bound MCP servers and grants match. These values are
+/// consumed when adapters start and cannot be safely adopted by a live process.
+pub(crate) fn same_mcp_runtime_config(live: &RunRequest, next: &RunRequest) -> bool {
+    same_worker_mcp_config(live, next) && live.mcp == next.mcp
+}
+
+/// OMP has its own host-tool bridge and does not consume `RunRequest::mcp`.
+pub(crate) fn same_worker_mcp_config(live: &RunRequest, next: &RunRequest) -> bool {
+    live.enable_workers_mcp == next.enable_workers_mcp
+        && (!live.enable_workers_mcp || live.workers_parent_chat_id == next.workers_parent_chat_id)
+        && live.sessions == next.sessions
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
+    pub realtime: Option<codex::realtime::RealtimeControls>,
     /// Shared execution gate held until the harness has shut down and reaped
     /// its subprocess, including when the host drops the event stream. Each
     /// detached session task must retain this lease through its cleanup.
@@ -76,80 +167,8 @@ pub struct RunControls {
     /// Ask native OMP runs to use the provider's built-in session title flow.
     /// Host-side only; other harnesses ignore this control.
     pub generate_native_title: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveVoiceRequest {
-    pub cwd: String,
-    pub resume: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LiveVoiceSupport {
-    pub available: bool,
-    pub session_context: bool,
-}
-
-impl LiveVoiceSupport {
-    /// Why Live Voice cannot start, in the OMP's own terms; `None` means it can.
-    ///
-    /// Both gaps are a missing OMP capability, never a stale Comet host: either
-    /// the base capability is absent from the ready frame, or it is there
-    /// without the operational-context capability that joining an already
-    /// active run additionally needs. Returning the reason instead of a bool
-    /// keeps the two apart all the way to the tooltip.
-    pub fn gap(&self, active_run: bool) -> Option<LiveVoiceUnavailableReason> {
-        if !self.available {
-            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
-        } else if active_run && !self.session_context {
-            Some(LiveVoiceUnavailableReason::ActiveRun)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LiveVoiceContextKind {
-    Progress,
-    Final,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LiveVoiceControl {
-    SetMuted(bool),
-    AppendContext {
-        delegation_id: String,
-        kind: LiveVoiceContextKind,
-        text: String,
-    },
-    AppendSessionContext {
-        text: String,
-    },
-    Stop,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum LiveVoiceEvent {
-    Phase(LiveVoicePhase),
-    Levels {
-        input: f32,
-        output: f32,
-    },
-    Transcript(LiveVoiceTranscript),
-    Delegation {
-        delegation_id: String,
-        request: String,
-    },
-    Ended {
-        error: Option<String>,
-    },
-}
-
-pub struct LiveVoiceHandle {
-    pub session_id: String,
-    pub events: BoxStream<'static, Result<LiveVoiceEvent, HarnessError>>,
-    pub controls: mpsc::Sender<LiveVoiceControl>,
+    /// Turn-level stop and background-work reporting (see [`TurnControl`]).
+    pub turn: TurnControl,
 }
 
 /// Catalog provenance stays internal; RPC clients retain the Vec<Model> shape.
@@ -198,17 +217,27 @@ pub trait Harness: Send + Sync {
     fn authoritative_prompt_end(&self) -> bool {
         self.deterministic_turn_end()
     }
-    async fn probe_live_voice(&self, _cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
-        Ok(LiveVoiceSupport::default())
+    /// Whether this driver honors [`TurnControl::stop_turn`]: it ends only
+    /// the in-flight turn (`Done { Interrupted }`) and the runtime stays up
+    /// with its background work. Otherwise stopping a turn tears the runtime
+    /// down through the `interrupt` token.
+    fn stops_turn_in_place(&self) -> bool {
+        false
     }
-    async fn start_live_voice(
-        &self,
-        _request: LiveVoiceRequest,
-    ) -> Result<LiveVoiceHandle, HarnessError> {
-        Err(HarnessError::Unsupported(format!(
-            "{} does not support Live Voice",
-            self.display_name()
-        )))
+    /// Whether a live runtime started for `live` adopts a supported
+    /// configuration change from `next` in place, before `next`'s prompt,
+    /// instead of being replaced (which kills its background work). The
+    /// prompt then arrives with [`SteerMessage::config`] set. Consulted only
+    /// when [`Self::same_runtime`] is false.
+    fn reconfigures_in_place(&self, _live: &RunRequest, _next: &RunRequest) -> bool {
+        false
+    }
+    fn same_runtime(&self, live: &RunRequest, next: &RunRequest) -> bool {
+        live.model == next.model
+            && live.reasoning == next.reasoning
+            && same_model_options(&live.model_options, &next.model_options)
+            && live.cwd == next.cwd
+            && same_mcp_runtime_config(live, next)
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -265,6 +294,15 @@ pub trait Harness: Send + Sync {
         Err(HarnessError::Protocol(
             "isolated generation is not supported by this harness".into(),
         ))
+    }
+
+    /// Bootstrap without a synthetic user prompt; providers opt in explicitly.
+    async fn start_idle(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        Err(HarnessError::Protocol("idle runtime unsupported".into()))
     }
 
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
@@ -526,6 +564,35 @@ pub use pi::PiHarness;
 // Child lifecycle (shared by the codex and ACP harnesses)
 // ---------------------------------------------------------------------------
 
+/// End an agent runtime together with every process it started. `earlier`
+/// is a descendant snapshot taken when the teardown began, in case the
+/// agent exits before this one: its orphans can no longer be traced then.
+/// Windows' job object already owns the whole tree.
+pub(crate) async fn shutdown_agent(
+    child: &mut process::Child,
+    earlier: Vec<i32>,
+    kill_grace: std::time::Duration,
+) {
+    #[cfg(unix)]
+    {
+        let mut tree = earlier;
+        if let Some(pid) = child.id() {
+            for pid in process::descendants(pid).await {
+                if !tree.contains(&pid) {
+                    tree.push(pid);
+                }
+            }
+        }
+        shutdown_child(child, kill_grace).await;
+        process::terminate_tree(&tree, kill_grace).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = earlier;
+        shutdown_child(child, kill_grace).await;
+    }
+}
+
 /// Reap the child: Unix sends SIGTERM then SIGKILL after `kill_grace`;
 /// Windows terminates the owned job after protocol shutdown has finished.
 pub(crate) async fn shutdown_child(child: &mut process::Child, kill_grace: std::time::Duration) {
@@ -606,13 +673,12 @@ mod stderr_tests {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use std::path::Path;
     use zeron_proto::{DoneStatus, SandboxLevel};
 
-    struct UnsupportedLiveHarness;
+    struct DefaultHarness;
 
     #[async_trait]
-    impl Harness for UnsupportedLiveHarness {
+    impl Harness for DefaultHarness {
         fn id(&self) -> HarnessId {
             HarnessId::Mock
         }
@@ -655,28 +721,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_voice_defaults_are_unsupported_without_changing_run() {
-        let harness = UnsupportedLiveHarness;
-        assert_eq!(
-            harness.probe_live_voice(Path::new(".")).await.unwrap(),
-            LiveVoiceSupport::default()
-        );
-
-        let error = match harness
-            .start_live_voice(LiveVoiceRequest {
-                cwd: ".".into(),
-                resume: None,
-            })
-            .await
-        {
-            Ok(_) => panic!("unsupported harness started Live Voice"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            HarnessError::Unsupported(message) if message == "Test does not support Live Voice"
-        ));
-
+    async fn default_harness_run_emits_done() {
+        let harness = DefaultHarness;
         let (_steering_tx, steering) = mpsc::channel(1);
         let mut events = harness
             .run(
@@ -698,6 +744,7 @@ mod tests {
                     mcp: None,
                 },
                 RunControls {
+                    realtime: None,
                     execution_lease: None,
                     request_input: Box::new(|_| {
                         let (_sender, receiver) = oneshot::channel();
@@ -707,6 +754,7 @@ mod tests {
                     interrupt: CancellationToken::new(),
                     chat_id: "chat-1".into(),
                     generate_native_title: false,
+                    turn: TurnControl::default(),
                 },
             )
             .await

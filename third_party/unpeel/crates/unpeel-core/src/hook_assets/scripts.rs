@@ -21,9 +21,24 @@ post_hook_payload() {
   _hook_payload="$1"
   _hook_session_id="$2"
   _hook_port="$3"
+  _hook_query="${4:-}"
   [ -n "$_hook_port" ] || return 1
-  printf '%s' "$_hook_payload" | curl -sS --noproxy '*' --max-time 2 -X POST -H "Content-Type: application/json" \
-    -d @- "http://127.0.0.1:$_hook_port/hook/$_hook_session_id" >/dev/null 2>&1
+  _hook_response=$(printf '%s' "$_hook_payload" | curl -sS --noproxy '*' --max-time 2 \
+    -w '\n%{http_code}' -X POST -H "Content-Type: application/json" \
+    -d @- "http://127.0.0.1:$_hook_port/hook/$_hook_session_id$_hook_query" 2>/dev/null)
+  _hook_curl_status=$?
+  [ "$_hook_curl_status" -eq 0 ] || return 1
+  _hook_status=${_hook_response##*$'\n'}
+  _hook_body=${_hook_response%$'\n'$_hook_status}
+  if [ "$_hook_status" = "202" ] \
+    && printf '%s' "$_hook_body" | grep -qE '"ignored"[[:space:]]*:[[:space:]]*true'; then
+    HOOK_INGRESS_REJECTED=1
+    return 0
+  fi
+  case "$_hook_status" in
+    2[0-9][0-9]) HOOK_INGRESS_ACCEPTED=1; return 0 ;;
+  esac
+  return 1
 }
 
 current_unpeel_ports() {
@@ -45,6 +60,20 @@ post_hook_payload_to_current_ports() {
     fi
   done
   return $_hook_any_posted
+}
+
+preflight_hook_payload_to_known_ports() {
+  _hook_payload="$1"
+  _hook_session_id="$2"
+  _hook_ports="${UNPEEL_APP_PORT:-} $(current_unpeel_ports)"
+  _hook_seen_ports=" "
+  for _hook_candidate_port in $_hook_ports; do
+    [ -n "$_hook_candidate_port" ] || continue
+    case "$_hook_candidate_port" in *[!0-9]*) continue ;; esac
+    case "$_hook_seen_ports" in *" $_hook_candidate_port "*) continue ;; esac
+    _hook_seen_ports="$_hook_seen_ports$_hook_candidate_port "
+    post_hook_payload "$_hook_payload" "$_hook_session_id" "$_hook_candidate_port" "?validate=1" || true
+  done
 }
 
 json_escape_string() {
@@ -120,6 +149,12 @@ record_last_hook_event() {
   fi
 }
 
+record_hook_event_unless_ignored() {
+  if [ "${HOOK_INGRESS_REJECTED:-0}" != "1" ]; then
+    record_last_hook_event "$EVENT_TYPE" "$LAST_TOOL_NAME"
+  fi
+}
+
 add_hook_event_name_to_payload() {
   _hook_event_name="$(json_escape_string "$1")"
   _hook_payload="$2"
@@ -146,7 +181,6 @@ fi
 [ -z "$EVENT_TYPE" ] && exit 0
 
 LAST_TOOL_NAME=$(printf '%s' "$INPUT" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -oE '"[^"]*"$' | tr -d '"')
-record_last_hook_event "$EVENT_TYPE" "$LAST_TOOL_NAME"
 
 HOOK_PAYLOAD="$INPUT"
 if ! printf '%s' "$HOOK_PAYLOAD" | grep -q '"hook_event_name"[[:space:]]*:'; then
@@ -156,6 +190,8 @@ HOOK_PAYLOAD=$(add_runtime_generation_to_payload "$HOOK_PAYLOAD")
 HOOK_PAYLOAD=$(add_task_episode_to_payload "$HOOK_PAYLOAD")
 
 if [ -n "$UNPEEL_SESSION_ID" ]; then
+  HOOK_INGRESS_ACCEPTED=0
+  HOOK_INGRESS_REJECTED=0
   post_to_unpeel() {
     # Several Unpeel instances can run at once (e.g. a dev build next to the
     # installed app) and they share the port registry. Post to every known
@@ -165,10 +201,25 @@ if [ -n "$UNPEEL_SESSION_ID" ]; then
     post_hook_payload_to_current_ports "$HOOK_PAYLOAD" "$UNPEEL_SESSION_ID" "$UNPEEL_APP_PORT"
   }
   if [ "${UNPEEL_HOOK_POST_SYNC:-}" = "1" ]; then
-    post_to_unpeel
+    # Validate every live endpoint before delivery. A current Comet listener
+    # can veto a nested child event before it reaches an older session host
+    # that does not yet know the OMP artifact layout. Old endpoints answer 404
+    # to this additive route and keep the normal delivery path.
+    preflight_hook_payload_to_known_ports "$HOOK_PAYLOAD" "$UNPEEL_SESSION_ID"
+    if [ "${HOOK_INGRESS_REJECTED:-0}" != "1" ]; then
+      post_to_unpeel
+    fi
+    record_hook_event_unless_ignored
   else
+    # Preserve emission order independently of curl completion. Worker hosts
+    # use the synchronous path above; detached hooks retain the original
+    # marker-before-background-post behavior.
+    record_last_hook_event "$EVENT_TYPE" "$LAST_TOOL_NAME"
     ( post_to_unpeel ) &
+    exit 0
   fi
+else
+  record_last_hook_event "$EVENT_TYPE" "$LAST_TOOL_NAME"
 fi
 
 exit 0

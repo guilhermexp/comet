@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded
 ---
 # Complete Trajectory capture is opt-in
 
@@ -8,3 +8,7 @@ A captura semântica sanitizada da Trajectory continua sempre ativa. Capturar ar
 A fonte completa fica isolada por perfil no device executor, separada do read model sanitizado e do Run Journal de recovery, com acesso local controlado e retenção limitada. Habilitar captura não revela conteúdo: Raw Reveal continua explícito e efêmero, fora de watch, sync e Chat Transcript Export. Campos não capturados no histórico permanecem indisponíveis; não são reconstruídos a partir do estado atual do runtime.
 
 Esta decisão complementa ADR 0004 sem alterar a captura sempre ativa dos eventos sanitizados nem autorizar cópia do ambiente inteiro do processo ou de arquivos de credenciais.
+
+## Superseded
+
+Superseded on 2026-10-05 by the removal of the Chat Trajectory capability (`openspec/changes/remove-chat-trajectory/`). The feature, its store and its RPCs no longer exist; this record stays as history.

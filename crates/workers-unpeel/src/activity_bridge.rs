@@ -27,6 +27,9 @@ use crate::WorkersSession;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Debug)]
 struct HookEvent {
     session_id: String,
@@ -516,6 +519,30 @@ fn hook_event_from_json(
     }
 }
 
+pub(crate) fn is_nested_provider_hook(
+    manifest: &unpeel_core::session_host::HostedSessionManifest,
+    payload: &serde_json::Value,
+) -> bool {
+    match first_json_string(payload, &["unpeel_agent_kind", "agent_kind", "agentKind"]).as_deref() {
+        Some("main") => return false,
+        Some("sub") => return true,
+        _ => {}
+    }
+    first_json_string(
+        payload,
+        &[
+            "transcript_path",
+            "transcriptPath",
+            "provider_transcript_path",
+            "providerTranscriptPath",
+        ],
+    )
+    .as_deref()
+    .is_some_and(|path| {
+        unpeel_core::integrations::is_nested_provider_transcript(manifest, Path::new(path))
+    })
+}
+
 fn persist_provider_binding(event: &HookEvent) -> Result<bool, String> {
     unpeel_core::session_ops::set_provider_session(
         &event.session_id,
@@ -573,13 +600,20 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
         respond(&mut stream, "200 OK", r#"{"ok":true}"#);
         return;
     }
-    let Some(session_id) = path
-        .strip_prefix("/hook/")
-        .filter(|id| !id.is_empty() && !id.contains('/') && !id.contains(".."))
-    else {
+    let Some(route) = path.strip_prefix("/hook/") else {
         respond(&mut stream, "404 Not Found", r#"{"error":"not found"}"#);
         return;
     };
+    let (session_id, query) = route.split_once('?').unwrap_or((route, ""));
+    let validate_only = query == "validate=1";
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains("..")
+        || (!query.is_empty() && !validate_only)
+    {
+        respond(&mut stream, "404 Not Found", r#"{"error":"not found"}"#);
+        return;
+    }
     let content_length = lines
         .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
@@ -636,6 +670,19 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
         );
         return;
     };
+    if is_nested_provider_hook(&manifest, &json) {
+        // Old pi-family extensions have no agent-kind marker. Recognize their
+        // persisted OMP child transcript from the adapter's trusted artifacts
+        // layout before queuing anything that can reach activity/binding stores.
+        // The same decision is available on the preflight route, which does
+        // not mutate the Worker before all registered listeners are checked.
+        respond(&mut stream, "202 Accepted", r#"{"ok":true,"ignored":true}"#);
+        return;
+    }
+    if validate_only {
+        respond(&mut stream, "200 OK", r#"{"ok":true,"validated":true}"#);
+        return;
+    }
     let runtime_generation = json
         .get("unpeel_runtime_generation")
         .or_else(|| json.get("unpeelRuntimeGeneration"))
@@ -645,16 +692,14 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
         respond(&mut stream, "200 OK", r#"{"ok":true}"#);
         return;
     }
-    if events
-        .send(hook_event_from_json(
-            session_id,
-            event_name,
-            &json,
-            runtime_generation,
-            received_at,
-        ))
-        .is_ok()
-    {
+    let event = hook_event_from_json(
+        session_id,
+        event_name,
+        &json,
+        runtime_generation,
+        received_at,
+    );
+    if events.send(event).is_ok() {
         change_epoch.fetch_add(1, Ordering::Release);
     }
     respond(&mut stream, "200 OK", r#"{"ok":true}"#);
@@ -662,6 +707,7 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
 
 #[cfg(test)]
 mod tests {
+    use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
 
     #[test]
@@ -703,8 +749,6 @@ mod tests {
 
     use std::ffi::OsString;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     struct UnpeelHomeGuard {
         previous: Option<OsString>,
         previous_home: Option<OsString>,
@@ -728,7 +772,7 @@ mod tests {
 
     impl Drop for UnpeelHomeGuard {
         fn drop(&mut self) {
-            // SAFETY: the guard is dropped while its caller holds ENV_LOCK.
+            // SAFETY: the guard is dropped while its caller holds TEST_ENV_LOCK.
             unsafe {
                 match self.previous.take() {
                     Some(previous) => std::env::set_var("UNPEEL_HOME", previous),
@@ -737,6 +781,29 @@ mod tests {
                 match self.previous_home.take() {
                     Some(previous) => std::env::set_var("HOME", previous),
                     None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    struct HooksRootGuard(Option<OsString>);
+
+    impl HooksRootGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("COMET_WORKERS_HOOKS_DIR");
+            // SAFETY: activity bridge tests serialize process environment changes.
+            unsafe { std::env::set_var("COMET_WORKERS_HOOKS_DIR", path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for HooksRootGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard is dropped while its caller holds TEST_ENV_LOCK.
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("COMET_WORKERS_HOOKS_DIR", previous),
+                    None => std::env::remove_var("COMET_WORKERS_HOOKS_DIR"),
                 }
             }
         }
@@ -892,6 +959,631 @@ mod tests {
             heartbeat_at: 1,
             updated_at: 1,
         }
+    }
+
+    fn post_hook_payload(port: u16, session_id: &str, payload: &serde_json::Value) -> String {
+        post_hook_path(port, &format!("/hook/{session_id}"), payload)
+    }
+
+    fn post_hook_validation(port: u16, session_id: &str, payload: &serde_json::Value) -> String {
+        post_hook_path(port, &format!("/hook/{session_id}?validate=1"), payload)
+    }
+
+    fn post_hook_path(port: u16, path: &str, payload: &serde_json::Value) -> String {
+        let body = serde_json::to_vec(payload).expect("serialize hook payload");
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect hook ingress");
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write hook request headers");
+        stream.write_all(&body).expect("write hook request body");
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read hook response");
+        response
+    }
+
+    fn run_notify_hook(
+        script: &Path,
+        session_id: &str,
+        home: &Path,
+        session_dir: &Path,
+        registry: &Path,
+        app_port: Option<u16>,
+        synchronous: bool,
+        payload: &serde_json::Value,
+    ) -> std::process::Output {
+        notify_hook_command(
+            script,
+            session_id,
+            home,
+            session_dir,
+            registry,
+            app_port,
+            synchronous,
+            payload,
+        )
+        .output()
+        .expect("run installed hook notifier")
+    }
+
+    fn notify_hook_command(
+        script: &Path,
+        session_id: &str,
+        home: &Path,
+        session_dir: &Path,
+        registry: &Path,
+        app_port: Option<u16>,
+        synchronous: bool,
+        payload: &serde_json::Value,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg(script)
+            .arg(payload.to_string())
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("UNPEEL_SESSION_ID", session_id)
+            .env("UNPEEL_SESSION_DIR", session_dir)
+            .env("UNPEEL_APP_PORT_REGISTRY_FILE", registry)
+            .env("UNPEEL_HOOK_TRACE_FILE", session_dir.join("trace.log"));
+        if synchronous {
+            command.env("UNPEEL_HOOK_POST_SYNC", "1");
+        }
+        if let Some(port) = app_port {
+            command.env("UNPEEL_APP_PORT", port.to_string());
+        }
+        command
+    }
+
+    struct TestHttpEndpoint {
+        port: u16,
+        requests: Arc<Mutex<Vec<String>>>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestHttpEndpoint {
+        fn stop(mut self) -> Vec<String> {
+            self.shutdown.store(true, Ordering::Release);
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .expect("join test endpoint");
+            let requests = self.requests.lock().unwrap().clone();
+            requests
+        }
+    }
+
+    fn test_http_endpoint(
+        validation_status: &'static str,
+        request_status: &'static str,
+        validation_is_ignored: bool,
+    ) -> TestHttpEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind status test listener");
+        let port = listener
+            .local_addr()
+            .expect("status listener address")
+            .port();
+        listener
+            .set_nonblocking(true)
+            .expect("set endpoint nonblocking");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&requests);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("set notifier read timeout");
+                        let mut request = [0u8; 4096];
+                        let read = stream.read(&mut request).unwrap_or(0);
+                        let line = String::from_utf8_lossy(&request[..read])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_owned();
+                        thread_requests.lock().unwrap().push(line.clone());
+                        let status = if line.ends_with("?validate=1") {
+                            validation_status
+                        } else {
+                            request_status
+                        };
+                        let body = if status.starts_with("202")
+                            && (!line.ends_with("?validate=1") || validation_is_ignored)
+                        {
+                            r#"{"ok":true,"ignored":true}"#
+                        } else {
+                            r#"{"ok":true}"#
+                        };
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        TestHttpEndpoint {
+            port,
+            requests,
+            shutdown,
+            thread: Some(thread),
+        }
+    }
+
+    fn delayed_http_endpoint() -> (
+        u16,
+        std::sync::mpsc::Receiver<&'static str>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed listener");
+        let port = listener
+            .local_addr()
+            .expect("delayed listener address")
+            .port();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut responses = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept delayed request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set delayed request read timeout");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut chunk).expect("read delayed request");
+                    assert_ne!(read, 0, "delayed request closed before headers");
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut chunk).expect("read delayed request body");
+                    assert_ne!(read, 0, "delayed request closed before body");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let is_start =
+                    String::from_utf8_lossy(&request[header_end..]).contains("\"Start\"");
+                let sender = sender.clone();
+                responses.push(std::thread::spawn(move || {
+                    let event = if is_start { "Start" } else { "Stop" };
+                    if is_start {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    let body = r#"{"ok":true}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .expect("write delayed response");
+                    sender.send(event).expect("send response order");
+                }));
+            }
+            for response in responses {
+                response.join().expect("join delayed response");
+            }
+        });
+        (port, receiver, thread)
+    }
+
+    #[test]
+    fn notify_hook_preserves_snapshot_only_for_accepted_or_offline_delivery() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let state_home = tempfile::tempdir().expect("temporary Unpeel home");
+        let user_home = tempfile::tempdir().expect("temporary user home");
+        let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
+        let _hooks_root = HooksRootGuard::set(&state_home.path().join(".zeron/workers/hooks"));
+        let session_id = "worker-notify";
+        let session_dir = state_home.path().join("app-sessions").join(session_id);
+        std::fs::create_dir_all(&session_dir).expect("Worker session directory");
+        let registry = state_home.path().join("app-ports");
+
+        let omp_root = user_home.path().join("omp-sessions");
+        let primary = omp_root.join("primary.jsonl");
+        let child = omp_root.join("primary/PgliteSqlCheck.jsonl");
+        std::fs::create_dir_all(child.parent().expect("child parent"))
+            .expect("create child transcript directory");
+        std::fs::write(&primary, "{}\n").expect("write primary transcript");
+        std::fs::write(&child, "{}\n").expect("write child transcript");
+        let mut manifest = omp_manifest(session_id);
+        manifest.session.command = format!("omp --session-dir '{}'", omp_root.display());
+        manifest.cwd = user_home.path().to_string_lossy().into_owned();
+        unpeel_core::session_host::save_manifest(&manifest).expect("save Worker manifest");
+        unpeel_core::integrations::install_runtime_support("omp")
+            .expect("install current OMP notifier");
+        let script = unpeel_core::app_paths::app_hooks_root().join("notify-hook.sh");
+        assert!(
+            script.is_file(),
+            "notifier is installed at {}",
+            script.display()
+        );
+
+        let change_epoch = Arc::new(AtomicU64::new(0));
+        let ingress = start_hook_ingress(Arc::clone(&change_epoch)).expect("start ingress");
+        let legacy_host = test_http_endpoint("404 Not Found", "200 OK", false);
+        let generic_acceptor = test_http_endpoint("200 OK", "200 OK", false);
+        let generic_202 = test_http_endpoint("202 Accepted", "200 OK", false);
+        std::fs::write(
+            &registry,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                ingress.port, legacy_host.port, generic_acceptor.port, generic_202.port
+            ),
+        )
+        .expect("register all live hook endpoints");
+
+        // `main` is authoritative even when the transcript happens to match
+        // OMP's nested artifact layout. This keeps a legitimate primary
+        // session switch from being classified as a child by old-path fallback.
+        let accepted = run_notify_hook(
+            &script,
+            session_id,
+            user_home.path(),
+            &session_dir,
+            &registry,
+            Some(legacy_host.port),
+            true,
+            &serde_json::json!({
+                "hook_event_name": "Start",
+                "session_id": "primary-provider",
+                "provider_transcript_path": child,
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            }),
+        );
+        assert!(
+            accepted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert_eq!(change_epoch.load(Ordering::Acquire), 1);
+        let accepted_event = ingress
+            .events
+            .lock()
+            .expect("event receiver lock")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("main-kind event reaches ActivityBridge");
+        assert_eq!(accepted_event.event_name, "Start");
+        let marker_path = session_dir.join("last-hook-event.json");
+        let accepted_marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("accepted marker written"))
+                .expect("accepted marker JSON");
+        assert_eq!(accepted_marker["hook_event_name"], "Start");
+
+        // Existing extension payloads have no agent kind, so ingress uses the
+        // OMP canonical transcript layout and tells the notifier to preserve
+        // the previous durable snapshot.
+        let ignored = run_notify_hook(
+            &script,
+            session_id,
+            user_home.path(),
+            &session_dir,
+            &registry,
+            Some(generic_acceptor.port),
+            true,
+            &serde_json::json!({
+                "hook_event_name": "Stop",
+                "session_id": "nested-provider",
+                "provider_transcript_path": child,
+                "unpeel_runtime_generation": 1
+            }),
+        );
+        assert!(
+            ignored.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ignored.stderr)
+        );
+        assert_eq!(change_epoch.load(Ordering::Acquire), 1);
+        assert!(ingress.events.lock().unwrap().try_recv().is_err());
+        let preserved_marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("preserved marker"))
+                .expect("preserved marker JSON");
+        assert_eq!(preserved_marker, accepted_marker);
+
+        // No reachable listener retains the legacy recovery-snapshot behavior.
+        let offline_registry = state_home.path().join("empty-app-ports");
+        std::fs::write(&offline_registry, "").expect("create empty port registry");
+        let offline = run_notify_hook(
+            &script,
+            session_id,
+            user_home.path(),
+            &session_dir,
+            &offline_registry,
+            None,
+            true,
+            &serde_json::json!({"hook_event_name":"PermissionRequest"}),
+        );
+        assert!(
+            offline.status.success(),
+            "{}",
+            String::from_utf8_lossy(&offline.stderr)
+        );
+        assert_eq!(change_epoch.load(Ordering::Acquire), 1);
+        let offline_marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("offline marker written"))
+                .expect("offline marker JSON");
+        assert_eq!(offline_marker["hook_event_name"], "PermissionRequest");
+
+        // A live listener that reports an error is not an intentional ignore;
+        // keep the durable snapshot so the host can recover the transition.
+        let error_endpoint = test_http_endpoint(
+            "500 Internal Server Error",
+            "500 Internal Server Error",
+            false,
+        );
+        let failed = run_notify_hook(
+            &script,
+            session_id,
+            user_home.path(),
+            &session_dir,
+            &offline_registry,
+            Some(error_endpoint.port),
+            true,
+            &serde_json::json!({"hook_event_name":"Stop"}),
+        );
+        assert!(
+            failed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert_eq!(change_epoch.load(Ordering::Acquire), 1);
+        let failed_marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&marker_path).expect("error fallback marker written"),
+        )
+        .expect("error fallback marker JSON");
+        assert_eq!(failed_marker["hook_event_name"], "Stop");
+
+        let legacy_requests = legacy_host.stop();
+        assert_eq!(
+            legacy_requests,
+            vec![
+                format!("/hook/{session_id}?validate=1"),
+                format!("/hook/{session_id}"),
+                format!("/hook/{session_id}?validate=1"),
+            ],
+            "the legacy host receives preflight but no ignored child POST"
+        );
+        let generic_requests = generic_acceptor.stop();
+        assert_eq!(
+            generic_requests,
+            vec![
+                format!("/hook/{session_id}?validate=1"),
+                format!("/hook/{session_id}"),
+                format!("/hook/{session_id}?validate=1"),
+            ],
+            "a generic validation 200 cannot override the explicit ignore veto"
+        );
+        let generic_202_requests = generic_202.stop();
+        assert_eq!(
+            generic_202_requests,
+            vec![
+                format!("/hook/{session_id}?validate=1"),
+                format!("/hook/{session_id}"),
+                format!("/hook/{session_id}?validate=1"),
+            ],
+            "a generic 202 without ignored:true cannot veto delivery"
+        );
+        let _ = error_endpoint.stop();
+    }
+
+    #[test]
+    fn asynchronous_notify_keeps_marker_order_when_start_response_is_slower() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let state_home = tempfile::tempdir().expect("temporary Unpeel home");
+        let user_home = tempfile::tempdir().expect("temporary user home");
+        let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
+        let _hooks_root = HooksRootGuard::set(&state_home.path().join("hooks"));
+        let session_id = "worker-async-order";
+        let session_dir = state_home.path().join("app-sessions").join(session_id);
+        std::fs::create_dir_all(&session_dir).expect("Worker session directory");
+        let registry = state_home.path().join("empty-app-ports");
+        std::fs::write(&registry, "").expect("create empty port registry");
+        unpeel_core::integrations::install_runtime_support("omp")
+            .expect("install current OMP notifier");
+        let script = unpeel_core::app_paths::app_hooks_root().join("notify-hook.sh");
+        let (port, response_order, listener_thread) = delayed_http_endpoint();
+
+        for event in ["Start", "Stop"] {
+            let status = notify_hook_command(
+                &script,
+                session_id,
+                user_home.path(),
+                &session_dir,
+                &registry,
+                Some(port),
+                false,
+                &serde_json::json!({"hook_event_name":event}),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn asynchronous hook notifier")
+            .wait()
+            .expect("wait for notifier shell");
+            assert!(status.success());
+        }
+
+        assert_eq!(
+            response_order.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "Stop"
+        );
+        assert_eq!(
+            response_order.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "Start"
+        );
+        listener_thread.join().expect("join delayed listener");
+        let marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(session_dir.join("last-hook-event.json")).expect("last marker"),
+        )
+        .expect("marker JSON");
+        assert_eq!(marker["hook_event_name"], "Stop");
+    }
+
+    #[test]
+    fn nested_omp_stop_and_attention_are_rejected_before_activity_or_binding_mutation() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let state_home = tempfile::tempdir().expect("temporary Unpeel home");
+        let user_home = tempfile::tempdir().expect("temporary user home");
+        let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
+        let session_dir = state_home.path().join("app-sessions/worker-1");
+        std::fs::create_dir_all(&session_dir).expect("Worker session directory");
+
+        let omp_root = user_home.path().join("explicit-omp-sessions");
+        let primary = omp_root.join("primary.jsonl");
+        let child = omp_root.join("primary/PgliteSqlCheck.jsonl");
+        let write_transcript = |path: &Path, provider_id: &str, model: &str, tokens: u64| {
+            std::fs::create_dir_all(path.parent().expect("transcript parent"))
+                .expect("create transcript directory");
+            std::fs::write(
+                path,
+                format!(
+                    "{{\"type\":\"session\",\"id\":{}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"provider\":\"provider\",\"model\":{model:?},\"usage\":{{\"totalTokens\":{tokens}}}}}}}\n",
+                    serde_json::to_string(provider_id).unwrap()
+                ),
+            )
+            .expect("write provider transcript");
+        };
+        write_transcript(&primary, "opus-primary", "opus", 48_600_000);
+        write_transcript(&child, "gemini-child", "gemini", 6_600_000);
+
+        let mut manifest = omp_manifest("worker-1");
+        manifest.session.command = format!("omp --session-dir '{}'", omp_root.display());
+        manifest.cwd = user_home.path().to_string_lossy().into_owned();
+        unpeel_core::session_host::save_manifest(&manifest).expect("save Worker manifest");
+
+        // Recreate the bad nested binding first. The primary Start must repair
+        // it, while subsequent child Stop/attention hooks must leave it alone.
+        unpeel_core::session_ops::set_provider_session(
+            "worker-1",
+            Some("gemini-child"),
+            Some(&child.to_string_lossy()),
+        )
+        .expect("seed nested provider binding");
+        unpeel_core::session_telemetry::refresh(&manifest).expect("seed nested provider telemetry");
+        assert_eq!(
+            unpeel_core::session_telemetry::load("worker-1")
+                .expect("nested telemetry")
+                .total_tokens,
+            6_600_000
+        );
+
+        let change_epoch = Arc::new(AtomicU64::new(0));
+        let ingress = start_hook_ingress(Arc::clone(&change_epoch)).expect("start ingress");
+        let primary_payload = serde_json::json!({
+            "hook_event_name": "Start",
+            "session_id": "opus-primary",
+            "provider_transcript_path": primary,
+            "unpeel_runtime_generation": 1
+        });
+        let primary_preflight = post_hook_validation(ingress.port, "worker-1", &primary_payload);
+        assert!(primary_preflight.contains("200 OK"), "{primary_preflight}");
+        assert_eq!(change_epoch.load(Ordering::Acquire), 0);
+        assert!(ingress.events.lock().unwrap().try_recv().is_err());
+        let primary_response = post_hook_payload(ingress.port, "worker-1", &primary_payload);
+        assert!(primary_response.contains("200 OK"), "{primary_response}");
+        let primary_event = ingress
+            .events
+            .lock()
+            .expect("event receiver lock")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("primary Start reaches the consumer");
+        assert_eq!(primary_event.event_name, "Start");
+        update_provider_telemetry(&primary_event, &manifest);
+        assert_eq!(
+            unpeel_core::session_ops::provider_session_marker("worker-1"),
+            (
+                Some("opus-primary".into()),
+                Some(primary.to_string_lossy().into_owned())
+            )
+        );
+        assert_eq!(
+            unpeel_core::session_telemetry::load("worker-1")
+                .expect("primary telemetry after binding repair")
+                .total_tokens,
+            48_600_000
+        );
+
+        let mut activity = ActivityEngine::default();
+        let turn_started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        activity.apply_hook_event("worker-1", "Start", None, turn_started);
+        assert_eq!(activity.hook_owned_state("worker-1"), Some(HookState::Busy));
+        let accepted_epoch = change_epoch.load(Ordering::Acquire);
+        assert_eq!(accepted_epoch, 1);
+
+        for (event_name, tool_name) in [
+            ("Stop", None),
+            ("PermissionRequest", Some("AskUserQuestion")),
+        ] {
+            let payload = serde_json::json!({
+                "hook_event_name": event_name,
+                "tool_name": tool_name,
+                "session_id": "gemini-child",
+                "provider_transcript_path": child,
+                "unpeel_runtime_generation": 1
+            });
+            let preflight = post_hook_validation(ingress.port, "worker-1", &payload);
+            assert!(preflight.contains("202 Accepted"), "{preflight}");
+            assert_eq!(change_epoch.load(Ordering::Acquire), accepted_epoch);
+            assert!(ingress.events.lock().unwrap().try_recv().is_err());
+            let response = post_hook_payload(ingress.port, "worker-1", &payload);
+            assert!(response.contains("202 Accepted"), "{response}");
+            assert_eq!(change_epoch.load(Ordering::Acquire), accepted_epoch);
+            assert!(ingress.events.lock().unwrap().try_recv().is_err());
+            assert_eq!(
+                unpeel_core::session_ops::provider_session_marker("worker-1"),
+                (
+                    Some("opus-primary".into()),
+                    Some(primary.to_string_lossy().into_owned())
+                )
+            );
+            assert_eq!(
+                unpeel_core::session_telemetry::load("worker-1")
+                    .expect("primary telemetry survives child event")
+                    .total_tokens,
+                48_600_000
+            );
+            assert_eq!(activity.hook_owned_state("worker-1"), Some(HookState::Busy));
+            assert!(!activity.hook_confirmed_idle("worker-1"));
+        }
+
+        assert!(!session_dir.join("last-hook-event.json").exists());
+        assert!(
+            !session_dir
+                .join(crate::session_event_journal::JOURNAL_FILE)
+                .exists()
+        );
     }
 
     /// A Worker parked at its prompt keeps writing: the host heartbeats every

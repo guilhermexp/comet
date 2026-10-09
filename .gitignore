@@ -22,3 +22,4 @@ progress.md
 
 # Orchestrator chat uploads written into the workspace at runtime
 .orchestrator/
+/scripts/**/__pycache__/

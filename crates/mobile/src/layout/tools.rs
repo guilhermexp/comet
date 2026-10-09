@@ -856,6 +856,7 @@ fn prepare_thought(
             paints,
             links: Vec::new(),
             chip: (0.0, 0.0),
+            badges: Vec::new(),
         };
         prepared.push(ThoughtLine {
             indent,

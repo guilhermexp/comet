@@ -18,6 +18,7 @@ use zeron_markdown::parser::{IncrementalParser, TopBlock};
 use zeron_text::WhiteSpace;
 
 use super::display::{ColorRole, DisplayBuilder, FadeEdge, TextRun, WidgetKind};
+use super::file_icons::file_icon_asset;
 use super::markdown::{Ctx, PBlock, PText, Px, place, place_text, prepare_block, prepare_plain};
 use super::style::{Family, TYPE, Weight};
 use super::tools::{ThoughtState, ToolGroup, place_tools};
@@ -69,6 +70,8 @@ pub(crate) fn next_version() -> u64 {
 pub(crate) struct UserBubble {
     pub text: PText,
     pub images: Vec<String>,
+    /// Non-image attachments (desktop-sent ZIPs, docs): icon asset + name.
+    pub files: Vec<(String, PText)>,
     pub pending: bool,
     pub expanded: bool,
     pub more: PText,
@@ -139,6 +142,7 @@ pub(crate) mod geom {
     pub const BUBBLE_FOLD_LINES: usize = 8;
     pub const BUBBLE_FOLD_SHOW: usize = 6;
     pub const THUMB: f32 = 76.0;
+    pub const FILE_PILL: f32 = 32.0;
     pub const CHIP_LINE: f32 = 32.0;
     pub const IMAGE: f32 = 260.0;
     pub const WORKING: f32 = 36.0;
@@ -579,14 +583,62 @@ impl RowBuilder {
         let key = row_key(&format!("{id}#u"));
         // Shared parser: strips the image trailer *and* hidden Appshot context.
         let parsed = zeron_client::attachments::parse_user_message(content);
-        let body = parsed.text.as_str();
-        let images: Vec<String> = parsed.images.into_iter().map(|i| i.path).collect();
         let (size, lh) = TYPE.body;
         let style = ctx.typo.style(Family::Sans, Weight::Regular, false, size);
         let lh = ctx.typo.px(lh);
-        let text = prepare_user_text(ctx, body.trim(), style, lh);
+        // Chips stand in for their attachments (as on the desktop): each
+        // chip consumes one upload, and an image chip opens that upload on tap.
+        let paths: Vec<String> = parsed
+            .images
+            .iter()
+            .map(|image| image.path.clone())
+            .collect();
+        let mentions = zeron_proto::attachment_mentions::attachment_mentions(&parsed.text);
+        let pairs =
+            zeron_proto::attachment_mentions::pair_attachment_mentions(&parsed.text, &paths);
+        let paired_paths: HashSet<usize> = pairs.iter().map(|(_, path)| *path).collect();
+        let image_mentions: HashSet<u32> = mentions
+            .iter()
+            .filter(|mention| mention.is_image)
+            .map(|mention| mention.index)
+            .collect();
+        let previews: Vec<(u32, String)> = pairs
+            .iter()
+            .filter(|(index, _)| image_mentions.contains(index))
+            .map(|(index, path)| (*index, paths[*path].clone()))
+            .collect();
+        let text = prepare_user_text(ctx, parsed.text.trim(), style, lh, &previews);
+        // Copied text reads attachment chips as their plain label.
+        let body = zeron_proto::attachment_mentions::attachment_mention_prompt(&parsed.text);
         let (msize, mlh) = TYPE.small;
         let mstyle = ctx.typo.style(Family::Sans, Weight::Medium, false, msize);
+        // Only images go to image widgets; other files (desktop-sent ZIPs)
+        // get a name pill, never an image load.
+        let (images, others): (Vec<_>, Vec<_>) = parsed
+            .images
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !paired_paths.contains(index))
+            .map(|(_, image)| image)
+            .partition(|i| zeron_proto::attachment_mentions::is_image_path(&i.path));
+        let images = images.into_iter().map(|i| i.path).collect();
+        let files = others
+            .iter()
+            .map(|f| {
+                let name = zeron_proto::attachment_mentions::attachment_display_name(&f.name);
+                (
+                    file_icon_asset(name),
+                    prepare_plain(
+                        ctx,
+                        name,
+                        mstyle,
+                        ctx.typo.px(mlh),
+                        ColorRole::Text,
+                        WhiteSpace::Pre,
+                    ),
+                )
+            })
+            .collect();
         let expanded = self.expanded.contains(&key);
         let more = prepare_plain(
             ctx,
@@ -604,70 +656,200 @@ impl RowBuilder {
             content: Content::User(UserBubble {
                 text,
                 images,
+                files,
                 pending,
                 expanded,
                 more,
             }),
-            copy_text: body.to_owned(),
+            copy_text: body,
         }
     }
 }
 
-/// User prompt text with `[name](zeron-file:path)` mentions shown as atomic
-/// accent `@name` chips (the desktop's file-chip rendering).
-fn prepare_user_text(ctx: &mut Ctx, body: &str, style: super::style::Resolved, lh: f32) -> PText {
-    let links = zeron_proto::file_mentions::file_mention_links(body);
-    if links.is_empty() {
+/// One chip in a sent prompt: its source range, label and icon, and for an
+/// image chip the link that opens its upload.
+struct UserChip {
+    range: std::ops::Range<usize>,
+    label: String,
+    icon: String,
+    open: Option<String>,
+    color: ColorRole,
+    medium: bool,
+}
+
+/// The link an image chip opens: the host attachment ref, percent-encoded.
+fn image_preview_link(reference: &str) -> String {
+    let mut out = String::from("zeron-preview://image?ref=");
+    for byte in reference.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// The chips a sent prompt's canonical links read as, like the desktop's:
+/// files and folders (`zeron-file:`), skills and commands (`zeron-invoke:`),
+/// and attachments (`zeron-image:` / `zeron-attachment:`), in text order.
+/// `previews` pairs image chip numbers with the uploads they open.
+fn user_chips(body: &str, previews: &[(u32, String)]) -> Vec<UserChip> {
+    let mut chips: Vec<UserChip> = zeron_proto::file_mentions::file_mention_links(body)
+        .into_iter()
+        .map(|link| UserChip {
+            icon: if link.is_dir {
+                "fileicon-folders-folder".to_owned()
+            } else {
+                file_icon_asset(&link.path)
+            },
+            range: link.range,
+            // Keep the fork's visible @name marker and link accent.
+            label: format!("@{}", link.basename),
+            open: None,
+            color: ColorRole::Link,
+            medium: true,
+        })
+        .collect();
+    chips.extend(
+        zeron_proto::invocation::invocation_links(body)
+            .into_iter()
+            .map(|(range, invocation)| UserChip {
+                range,
+                label: invocation.name().to_owned(),
+                icon: if invocation.prefix() == '/' {
+                    "command"
+                } else {
+                    "wand.and.stars"
+                }
+                .to_owned(),
+                open: None,
+                color: ColorRole::Text,
+                medium: false,
+            }),
+    );
+    chips.extend(
+        zeron_proto::attachment_mentions::attachment_mentions(body)
+            .into_iter()
+            .map(|mention| UserChip {
+                range: mention.range,
+                icon: if mention.is_image {
+                    "photo".to_owned()
+                } else {
+                    file_icon_asset(&mention.label)
+                },
+                open: previews
+                    .iter()
+                    .find(|(index, _)| mention.is_image && *index == mention.index)
+                    .map(|(_, reference)| image_preview_link(reference)),
+                label: mention.label,
+                color: ColorRole::Text,
+                medium: false,
+            }),
+    );
+    chips.sort_by_key(|chip| chip.range.start);
+    // Links never nest; drop any overlap rather than paint two chips at once.
+    let mut end = 0;
+    chips.retain(|chip| {
+        let keep = chip.range.start >= end;
+        if keep {
+            end = chip.range.end;
+        }
+        keep
+    });
+    chips
+}
+
+/// User prompt text with its canonical links shown as atomic chips: the
+/// desktop's soft pill with an icon well, the label in the body font.
+fn prepare_user_text(
+    ctx: &mut Ctx,
+    body: &str,
+    style: super::style::Resolved,
+    lh: f32,
+    previews: &[(u32, String)],
+) -> PText {
+    let chips = user_chips(body, previews);
+    if chips.is_empty() {
         return prepare_plain(ctx, body, style, lh, ColorRole::Text, WhiteSpace::PreWrap);
     }
-    let (size, _) = TYPE.body;
-    let chip = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
+    // The pill sits two points inside the line box, centered like the
+    // desktop's; its icon well is the pill's height less a point each side.
+    let chip_h = lh - ctx.typo.px(4.0);
+    let chip_pad = (1.0 + (chip_h - 2.0) + ctx.typo.px(5.0), ctx.typo.px(6.0));
     let mut text = String::with_capacity(body.len());
     let mut spans = Vec::new();
     let mut paints = Vec::new();
+    let mut badges = Vec::new();
+    let mut links = Vec::new();
     let mut at = 0;
+    let (size, _) = TYPE.body;
+    let chip_style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
+    // Returns the index of the span pushed for a non-empty piece.
     let mut push = |text: &mut String,
                     piece: &str,
-                    style: zeron_text::StyleId,
+                    style_id: zeron_text::StyleId,
+                    pad: (f32, f32),
                     atomic: bool,
-                    color: ColorRole| {
+                    color: ColorRole,
+                    link: Option<u16>| {
         if piece.is_empty() {
-            return;
+            return None;
         }
         let start = text.len();
         text.push_str(piece);
         spans.push(zeron_text::Span {
             range: start..text.len(),
-            style,
-            pad_start: 0.0,
-            pad_end: 0.0,
+            style: style_id,
+            pad_start: pad.0,
+            pad_end: pad.1,
             atomic,
         });
         paints.push(super::markdown::SpanPaint {
             color,
             decoration: super::display::Decoration::None,
-            link: None,
+            link,
             chip: false,
         });
+        Some(spans.len() - 1)
     };
-    for link in &links {
+    for chip in chips {
         push(
             &mut text,
-            &body[at..link.range.start],
+            &body[at..chip.range.start],
             style.id,
+            (0.0, 0.0),
             false,
             ColorRole::Text,
+            None,
         );
-        push(
+        let link = chip.open.map(|url| {
+            links.push(url);
+            (links.len() - 1) as u16
+        });
+        let chip_style_id = if chip.medium { chip_style.id } else { style.id };
+        if let Some(span) = push(
             &mut text,
-            &format!("@{}", link.basename),
-            chip.id,
+            &chip.label,
+            chip_style_id,
+            chip_pad,
             true,
-            ColorRole::Link,
-        );
-        at = link.range.end;
+            chip.color,
+            link,
+        ) {
+            badges.push((span, chip.icon));
+        }
+        at = chip.range.end;
     }
-    push(&mut text, &body[at..], style.id, false, ColorRole::Text);
+    push(
+        &mut text,
+        &body[at..],
+        style.id,
+        (0.0, 0.0),
+        false,
+        ColorRole::Text,
+        None,
+    );
     let p = zeron_text::prepare(
         &ctx.typo.book,
         ctx.cache,
@@ -684,8 +866,9 @@ fn prepare_user_text(ctx: &mut Ctx, body: &str, style: super::style::Resolved, l
         lh,
         base: super::style::baseline(lh, style),
         paints,
-        links: Vec::new(),
-        chip: (0.0, 0.0),
+        links,
+        chip: ((lh - chip_h) / 2.0, chip_h),
+        badges,
     }
 }
 
@@ -883,16 +1066,20 @@ fn place_user(
     } else {
         text_h + more_h + pad_y * 2.0
     };
-    let thumbs_h = if u.images.is_empty() {
-        0.0
+    let side = px.v(THUMB);
+    let gap = px.v(6.0);
+    let pill_h = px.v(FILE_PILL);
+    // Thumbnails row, then one pill per file, stacked above the bubble.
+    let files_y = if u.images.is_empty() { 0.0 } else { side + gap };
+    let attach_h = (files_y + u.files.len() as f32 * (pill_h + gap) - gap).max(0.0);
+    let thumbs_h = if attach_h > 0.0 {
+        attach_h + if bubble_h > 0.0 { px.v(8.0) } else { 0.0 }
     } else {
-        px.v(THUMB) + if bubble_h > 0.0 { px.v(8.0) } else { 0.0 }
+        0.0
     };
     let h = thumbs_h + bubble_h;
     let Some(out) = out else { return h };
     // Thumbnails right-aligned above the bubble.
-    let side = px.v(THUMB);
-    let gap = px.v(6.0);
     let mut tx = x + cw - side;
     for img in u.images.iter().rev() {
         out.fill(tx, y, side, side, px.v(12.0), ColorRole::ChipBackground);
@@ -904,6 +1091,35 @@ fn place_user(
             None,
         );
         tx -= side + gap;
+    }
+    // Files: right-aligned icon + name pills; long names fade at the edge.
+    let is = px.v(16.0);
+    let inset = px.v(10.0) + is + px.v(8.0);
+    let chrome = inset + px.v(12.0);
+    let name_w = (max_w - chrome).max(1.0);
+    let mut fy = y + files_y;
+    for (icon, name) in &u.files {
+        let pw = chrome + name.p.max_content_width().ceil().min(name_w);
+        let fx = x + cw - pw;
+        out.fill(fx, fy, pw, pill_h, px.v(12.0), ColorRole::ChipBackground);
+        out.widget(
+            WidgetKind::Icon {
+                name: icon.clone(),
+                color: ColorRole::TextSoft,
+            },
+            (fx + px.v(10.0), fy + (pill_h - is) / 2.0, is, is),
+            None,
+        );
+        place_text_lines(
+            name,
+            fx + inset,
+            fy + (pill_h - name.lh) / 2.0,
+            name_w,
+            1,
+            px,
+            out,
+        );
+        fy += pill_h + gap;
     }
     if bubble_h > 0.0 {
         let bx = x + cw - bubble_w;
@@ -963,7 +1179,11 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
     }
     match content {
         Content::Block(b) => block(b),
-        Content::User(u) => u.text.p.heap_bytes() + u.more.p.heap_bytes(),
+        Content::User(u) => {
+            u.text.p.heap_bytes()
+                + u.more.p.heap_bytes()
+                + u.files.iter().map(|(_, n)| n.p.heap_bytes()).sum::<usize>()
+        }
         Content::Tools(t) => super::tools::heap_bytes(t),
         Content::Chip(c) => c.text.p.heap_bytes(),
         Content::Image { reference } => reference.len(),

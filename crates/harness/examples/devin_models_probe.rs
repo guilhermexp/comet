@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let (_steering, steering) = tokio::sync::mpsc::channel(8);
     let controls = RunControls {
+        realtime: None,
         chat_id: String::new(),
         generate_native_title: false,
         execution_lease: None,
@@ -37,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        turn: Default::default(),
     };
     let request = RunRequest {
         enable_workers_mcp: false,

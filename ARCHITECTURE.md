@@ -116,7 +116,7 @@ Two persistent doc kinds. When sync is enabled, session docs ride the chat2 row 
    run journal), tail/diff sidecars. Constants carried over (`STREAM_COMMIT_MS=120`,
    `DO_FLUSH_MS=5s`, compaction at 8MB, retain 30d, tail 64).
 
-2. **Workspace registry doc** (per profile) — the `registry1` snapshot stores spaces (id, deviceId, path, name?, gitDetected, checkoutId), the chats index (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt, lastMessagePreview/At, config), devices, session-status rows, and checkout-diff summary pointers. A space is a device+folder pair in the active profile; the owning device's `SpacesSync` stamps git presence so branch pickers and the diff sidebar can gate without another RPC. Local scope keeps the registry entirely in its profile store. Synced and development scopes join `/registry/{orgId}/ws`, backed by the private per-user room `reg1/{orgId}/{userId}`; rows are never visible to every member of an organization.
+2. **Workspace registry doc** (per profile) — the `registry1` snapshot stores spaces (id, deviceId, path, name?, gitDetected, checkoutId, repositoryId), the chats index (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt, lastMessagePreview/At, config), devices, session-status rows, and checkout-diff summary pointers. A space is a device+folder pair in the active profile; the owning device's `SpacesSync` stamps git presence so branch pickers and the diff sidebar can gate without another RPC, plus a repository identity (the trunk's root commit, so renames, transfers and remote spellings don't split a repository; a shallow or empty history falls back to the normalized origin remote, then a device-scoped common-git-dir hash) that groups clones and worktrees of one repository in the sidebar's project mode. Local scope keeps the registry entirely in its profile store. Synced and development scopes join `/registry/{orgId}/ws`, backed by the private per-user room `reg1/{orgId}/{userId}`; rows are never visible to every member of an organization.
 
    Writer discipline: each device writes its own device and session-status rows, rows for chats it hosts, and git stamps for spaces it owns. Creates, renames, archives, and seen marks are LWW sets accepted from any device. `deleteSpace` tombstones the space and every chat/session row in it in one commit. `retireDevice` is the one owner change: after validating that the device is neither local nor online and that its folders exist here without a local space, one batch moves its spaces (same ids) and their chat/session rows to the local device and writes a `retiredDevices` tombstone that every device listing filters. Presence uses ephemeral room frames rather than durable heartbeat writes.
 
@@ -155,13 +155,13 @@ zeron/
                                           # codex (app-server JSON-RPC), opencode, omp, mock; steering mailbox,
                                           # requestInput, models/reasoning/options catalogs
     engine/         zeron-engine          # sessions engine (pub/sub, run journal, recovery, idle
-                                          # reaper), trajectory store (SQLite WAL), doc host + command executor, repos/worktrees,
+                                          # reaper), doc host + command executor, repos/worktrees,
                                           # checkout-diff sync, terminals (portable-pty), uploads,
                                           # agent accounts (cred swap), auth (WorkOS via edge),
                                           # device-room host/peers, identity
     rpc/            zeron-rpc             # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
-                                          # tungstenite) + in-memory transport; local WatchTrajectory/
-                                          # RevealTrajectoryRaw; device-room virtual sockets ({s,k,to,from} frames)
+                                          # tungstenite) + in-memory transport; device-room virtual
+                                          # sockets ({s,k,to,from} frames)
     voice/          zeron-voice           # desktop-local optional Parakeet model, capture and inference; no RPC/sync
     syntax/         zeron-syntax          # syntax definitions, grammars and tree-sitter highlighting
     theme/          zeron-theme           # base theme models, palettes, and styling primitives
@@ -169,7 +169,7 @@ zeron/
     workers-unpeel/ zeron-workers-unpeel  # local worker runtime adapter, activity bridge, controller MCP,
                                           # project git/ledger, hibernation/resource reaper
     ui/             zeron-ui              # gpui app: Orchestrator/Workers shell, chat/composer,
-                                          # Trajectory preview, Terminal/Git/file-preview surface host, Details/Files,
+                                          # Terminal/Git/file-preview surface host, Files explorer, Details,
                                           # settings, animation kit
   apps/
     zeron/                                # the binary (headed default, `headless` subcommand)
@@ -216,15 +216,12 @@ feature spec `docs/research/feature-inventory.md` §1.
   toggle) as gpui popovers with `menu-in` scale/fade. `@` file completion uses the engine's
   checkout index; `@` and `/` menus span the pill, scroll internally, and keep keyboard selection
   visible. Double-click selects the complete field value.
-- **Right-side surfaces**: one tab host owns Trajectory preview, Terminal, Git diff/history, native Browser tabs, and file-preview
-  surfaces while a separate `Details / Files` column owns workspace metadata and
-  the checkout tree. Both columns are available in Orchestrator and Workers;
-  their normal responsive layout preserves a minimum conversation width. The
-  Trajectory surface provides analytical timeline inspection, virtualized execution ledger, 5-tab inspector,
-  and device-local Raw Reveal (`crates/ui/src/trajectory/`). The
-  detailed contracts are specified in
-  [`docs/plans/2026-08-20-details-files-sidebar-design.md`](docs/plans/2026-08-20-details-files-sidebar-design.md)
-  and [`docs/plans/2026-08-20-file-preview-parity-design.md`](docs/plans/2026-08-20-file-preview-parity-design.md).
+- **Right-side surfaces**: one tab host owns Terminal, Git diff/history, native Browser tabs, and file-preview
+  surfaces; the upstream Files explorer (`crates/ui/src/files/`, Explorer | Changes) owns the checkout
+  tree and source control, and a separate `Details` column owns workspace metadata. Both columns are
+  available in Orchestrator and Workers; their normal responsive layout preserves a minimum
+  conversation width. File preview contracts are specified in
+  [`docs/plans/2026-08-20-file-preview-parity-design.md`](docs/plans/2026-08-20-file-preview-parity-design.md).
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
   engine side; custom gpui grid element; 12ms input coalescing / 80ms resize debounce, 1MB
   replay, detach ≠ close. Panel chrome (the shared full-height utility column, its Terminal +
@@ -249,9 +246,7 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
 - **Sessions engine**: per-session broadcast hub; on-disk run journal (resumable `seq` replay,
   crash auto-resume); persistent steerable sessions (steering mailbox at step/turn boundary; idle
   reaper, 30min `SESSION_IDLE`; the 10min stall watchdog was deliberately not ported — see the
-  module doc in `crates/engine/src/sessions.rs`); recovery stamps `aborted`. Trajectory store (`crates/engine/src/trajectory_store.rs`)
-  persists sanitized timeline records into device-local SQLite WAL with bounded background writer, exposed via
-  `WatchTrajectory` and `RevealTrajectoryRaw` RPCs (`crates/rpc/src/method.rs`).
+  module doc in `crates/engine/src/sessions.rs`); recovery stamps `aborted`.
 - **Doc host**: per-chat handle (join room, VV backfill, write user entries + stream assistant
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite

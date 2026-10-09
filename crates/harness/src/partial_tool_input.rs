@@ -149,6 +149,8 @@ pub(crate) struct PartialFileToolInput {
     last_emit_at: Option<std::time::Instant>,
     emission_count: u32,
     last_emitted: Option<ToolCall>,
+    #[cfg(test)]
+    test_now: Option<std::time::Instant>,
 }
 
 impl PartialFileToolInput {
@@ -164,11 +166,28 @@ impl PartialFileToolInput {
             last_emit_at: None,
             emission_count: 0,
             last_emitted: None,
+            #[cfg(test)]
+            test_now: None,
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_now(&mut self, now: std::time::Instant) {
+        self.test_now = Some(now);
+    }
+
+    #[cfg(test)]
+    fn now(&self) -> std::time::Instant {
+        self.test_now.unwrap_or_else(std::time::Instant::now)
+    }
+
+    #[cfg(not(test))]
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
     pub(crate) fn push(&mut self, delta: &str) -> Option<ToolCall> {
-        let now = std::time::Instant::now();
+        let now = self.now();
         let had_body = self.has_body();
         self.fields.push(delta);
         let first = self.last_emitted.is_none();
@@ -188,7 +207,7 @@ impl PartialFileToolInput {
             return None;
         }
         self.last_emitted = Some(call.clone());
-        self.last_emit_at = Some(std::time::Instant::now());
+        self.last_emit_at = Some(self.now());
         self.emission_count = self.emission_count.saturating_add(1);
         Some(call)
     }
@@ -199,7 +218,7 @@ impl PartialFileToolInput {
             return None;
         }
         self.last_emitted = Some(call.clone());
-        self.last_emit_at = Some(std::time::Instant::now());
+        self.last_emit_at = Some(self.now());
         self.emission_count = self.emission_count.saturating_add(1);
         Some(call)
     }

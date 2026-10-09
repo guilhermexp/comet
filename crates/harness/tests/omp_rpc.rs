@@ -8,19 +8,16 @@ use serde_json::{Value, json};
 use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{
-    ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, live_context_command, live_mute_command,
-    live_session_context_command, live_start_command, live_stop_command, parse_frame,
-    parse_live_event, sanitize_diagnostic,
+    ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, parse_frame, sanitize_diagnostic,
 };
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
 use zeron_harness::{
-    CancellationToken, Harness, HarnessError, LiveVoiceContextKind, LiveVoiceControl,
-    LiveVoiceEvent, LiveVoiceRequest, OmpHarness, RunControls, SteerMessage,
+    CancellationToken, Harness, HarnessError, OmpHarness, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole, ReasoningLevel, RunRequest,
-    SandboxLevel, SessionsGrant, ToolCall, ToolDiff, UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, SessionsGrant,
+    ToolCall, ToolDiff, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -132,6 +129,7 @@ fn controls_with_answer(
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -149,6 +147,7 @@ fn controls_with_answer(
         interrupt: interrupt.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     (controls, steer_tx, interrupt)
 }
@@ -162,6 +161,7 @@ fn controls_with_pending_answer() -> (
     let interrupt = CancellationToken::new();
     let held = Arc::new(Mutex::new(Vec::new()));
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |_questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -172,6 +172,7 @@ fn controls_with_pending_answer() -> (
         interrupt: interrupt.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     (controls, steer_tx, interrupt)
 }
@@ -185,6 +186,7 @@ fn controls_declining() -> (
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -202,6 +204,7 @@ fn controls_declining() -> (
         interrupt: interrupt.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     (controls, steer_tx, interrupt)
 }
@@ -443,403 +446,6 @@ fn protocol_bounds_and_redacts_frames() {
 }
 
 #[tokio::test]
-async fn omp_live_protocol_retains_additive_capability() {
-    let supported = OmpProcess::start(fake_launch("live-protocol"))
-        .await
-        .unwrap();
-    assert!(supported.capabilities().live_voice);
-    supported.shutdown().await.unwrap();
-
-    let unsupported = OmpProcess::start(fake_launch("no-live-capability"))
-        .await
-        .unwrap();
-    assert!(!unsupported.capabilities().live_voice);
-    unsupported.shutdown().await.unwrap();
-}
-
-#[test]
-fn omp_live_protocol_parses_and_validates_transient_events() {
-    assert_eq!(
-        parse_live_event(&json!({"type":"live_phase","phase":"working"})).unwrap(),
-        Some(LiveVoiceEvent::Phase(LiveVoicePhase::Working))
-    );
-    assert_eq!(
-        parse_live_event(&json!({"type":"live_levels","input":-0.5,"output":1.5})).unwrap(),
-        Some(LiveVoiceEvent::Levels {
-            input: 0.0,
-            output: 1.0,
-        })
-    );
-    assert_eq!(
-        parse_live_event(&json!({
-            "type":"live_transcript",
-            "role":"assistant",
-            "turn":2,
-            "text":"Done",
-            "final":true
-        }))
-        .unwrap(),
-        Some(LiveVoiceEvent::Transcript(
-            zeron_proto::LiveVoiceTranscript {
-                role: LiveVoiceRole::Assistant,
-                turn: 2,
-                text: "Done".into(),
-                final_text: true,
-            }
-        ))
-    );
-    assert_eq!(
-        parse_live_event(&json!({
-            "type":"live_delegation_created",
-            "delegationId":"del-1",
-            "request":"Inspect auth"
-        }))
-        .unwrap(),
-        Some(LiveVoiceEvent::Delegation {
-            delegation_id: "del-1".into(),
-            request: "Inspect auth".into(),
-        })
-    );
-    let ended = parse_live_event(&json!({
-        "type":"live_ended",
-        "error":"Authorization: Bearer token-secret-123"
-    }))
-    .unwrap();
-    assert!(matches!(
-        ended,
-        Some(LiveVoiceEvent::Ended { error: Some(error) })
-            if error == "Authorization=[redacted]"
-    ));
-    assert_eq!(
-        parse_live_event(&json!({"type":"future_additive_event","value":1})).unwrap(),
-        None
-    );
-
-    for malformed in [
-        json!({"type":"live_levels","input":"bad","output":0.5}),
-        json!({"type":"live_transcript","role":"system","turn":1,"text":"bad","final":true}),
-        json!({"type":"live_delegation_created","delegationId":"","request":"bad"}),
-        json!({"type":"live_phase","phase":"future"}),
-    ] {
-        assert!(parse_live_event(&malformed).is_err(), "{malformed}");
-    }
-}
-
-#[test]
-fn omp_live_protocol_encodes_exact_commands() {
-    assert_eq!(
-        live_start_command(),
-        json!({"type":"live_start","delegationMode":"host"})
-    );
-    assert_eq!(
-        live_mute_command(true),
-        json!({"type":"live_set_muted","muted":true})
-    );
-    assert_eq!(
-        live_context_command("del-1", LiveVoiceContextKind::Final, "Fixed").unwrap(),
-        json!({
-            "type":"live_append_context",
-            "delegationId":"del-1",
-            "kind":"final",
-            "text":"Fixed"
-        })
-    );
-    assert_eq!(
-        live_session_context_command("Session status: Working").unwrap(),
-        json!({
-            "type":"live_append_session_context",
-            "text":"Session status: Working"
-        })
-    );
-    assert_eq!(live_stop_command(), json!({"type":"live_stop"}));
-    assert!(live_context_command("", LiveVoiceContextKind::Progress, "work").is_err());
-    assert!(live_context_command("del-1", LiveVoiceContextKind::Progress, " ").is_err());
-    assert!(live_session_context_command(" ").is_err());
-}
-
-async fn assert_process_reaped(pid: u32) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .is_ok_and(|status| status.success());
-        if !alive {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("OMP process {pid} was not reaped");
-}
-
-async fn next_live_event(
-    events: &mut BoxStream<'static, Result<LiveVoiceEvent, HarnessError>>,
-) -> LiveVoiceEvent {
-    tokio::time::timeout(Duration::from_secs(2), events.next())
-        .await
-        .expect("Live event timed out")
-        .expect("Live stream ended")
-        .expect("Live event failed")
-}
-
-#[tokio::test]
-async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
-    let temp = tempfile::tempdir().unwrap();
-    let pid_file = temp.path().join("omp.pid");
-    let mut env = fake_env("live-probe");
-    env.insert(
-        "FAKE_OMP_PID_FILE".into(),
-        pid_file.to_string_lossy().into_owned(),
-    );
-    let harness = OmpHarness::new()
-        .with_executable(fixture_path())
-        .with_env(env)
-        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
-
-    let support = harness.probe_live_voice(temp.path()).await.unwrap();
-    assert!(support.available);
-    assert!(support.session_context);
-    let pid = std::fs::read_to_string(pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_process_reaped(pid).await;
-}
-
-#[tokio::test]
-async fn older_omp_keeps_idle_live_available_but_rejects_session_context() {
-    let temp = tempfile::tempdir().unwrap();
-    let harness = fake_harness("live-basic-only");
-
-    let support = harness.probe_live_voice(temp.path()).await.unwrap();
-    assert!(support.available);
-    assert!(!support.session_context);
-    assert_eq!(support.gap(false), None);
-    assert_eq!(
-        support.gap(true),
-        Some(zeron_proto::LiveVoiceUnavailableReason::ActiveRun)
-    );
-
-    let handle = harness
-        .start_live_voice(LiveVoiceRequest {
-            cwd: temp.path().to_string_lossy().into_owned(),
-            resume: None,
-        })
-        .await
-        .unwrap();
-    let controls = handle.controls;
-    let mut events = handle.events;
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Phase(LiveVoicePhase::Connecting)
-    );
-    for _ in 0..4 {
-        next_live_event(&mut events).await;
-    }
-
-    controls
-        .send(LiveVoiceControl::AppendSessionContext {
-            text: "Session status: Working".into(),
-        })
-        .await
-        .unwrap();
-    let error = tokio::time::timeout(Duration::from_secs(2), events.next())
-        .await
-        .expect("session-context rejection timed out")
-        .expect("Live event stream ended without rejecting session context")
-        .expect_err("an older OMP must reject unsupported session context");
-    assert!(
-        error
-            .to_string()
-            .contains("does not support session context"),
-        "{error}"
-    );
-}
-
-#[tokio::test]
-async fn omp_live_frontend_resumes_session_and_reuses_one_child_for_serial_delegations() {
-    let temp = tempfile::tempdir().unwrap();
-    let pid_file = temp.path().join("omp.pid");
-    let mut env = fake_env("live-frontend");
-    env.insert(
-        "FAKE_OMP_PID_FILE".into(),
-        pid_file.to_string_lossy().into_owned(),
-    );
-    let harness = OmpHarness::new()
-        .with_executable(fixture_path())
-        .with_env(env)
-        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
-    let handle = harness
-        .start_live_voice(LiveVoiceRequest {
-            cwd: temp.path().to_string_lossy().into_owned(),
-            resume: Some("/tmp/omp-session.jsonl".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(handle.session_id, "/tmp/omp-session.jsonl");
-    let pid: u32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    let controls = handle.controls;
-    let mut events = handle.events;
-
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Phase(LiveVoicePhase::Connecting)
-    );
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Phase(LiveVoicePhase::Listening)
-    );
-    assert!(matches!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Levels {
-            input: 0.25,
-            output: 0.5
-        }
-    ));
-    let transcript_event = next_live_event(&mut events).await;
-    assert!(matches!(
-        &transcript_event,
-        LiveVoiceEvent::Transcript(transcript)
-            if transcript.role == LiveVoiceRole::User
-                && transcript.turn == 1
-                && transcript.text == "Inspect auth"
-                && transcript.final_text
-    ));
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Delegation {
-            delegation_id: "del-1".into(),
-            request: "Inspect auth".into(),
-        }
-    );
-
-    controls
-        .send(LiveVoiceControl::AppendSessionContext {
-            text: "Session status: Working".into(),
-        })
-        .await
-        .unwrap();
-    controls
-        .send(LiveVoiceControl::SetMuted(true))
-        .await
-        .unwrap();
-    controls
-        .send(LiveVoiceControl::AppendContext {
-            delegation_id: "del-1".into(),
-            kind: LiveVoiceContextKind::Progress,
-            text: "Inspecting".into(),
-        })
-        .await
-        .unwrap();
-    controls
-        .send(LiveVoiceControl::AppendContext {
-            delegation_id: "del-1".into(),
-            kind: LiveVoiceContextKind::Final,
-            text: "Fixed".into(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Phase(LiveVoicePhase::Listening)
-    );
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Delegation {
-            delegation_id: "del-2".into(),
-            request: "Run tests".into(),
-        }
-    );
-
-    controls
-        .send(LiveVoiceControl::AppendContext {
-            delegation_id: "del-2".into(),
-            kind: LiveVoiceContextKind::Progress,
-            text: "Testing".into(),
-        })
-        .await
-        .unwrap();
-    controls
-        .send(LiveVoiceControl::AppendContext {
-            delegation_id: "del-2".into(),
-            kind: LiveVoiceContextKind::Final,
-            text: "Passed".into(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Phase(LiveVoicePhase::Listening)
-    );
-    let reused_pid: u32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(reused_pid, pid);
-
-    controls.send(LiveVoiceControl::Stop).await.unwrap();
-    assert_eq!(
-        next_live_event(&mut events).await,
-        LiveVoiceEvent::Ended { error: None }
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), events.next())
-            .await
-            .unwrap()
-            .is_none(),
-        "stop must emit one terminal event"
-    );
-    assert_process_reaped(pid).await;
-}
-
-#[tokio::test]
-async fn omp_live_frontend_returns_new_session_identity_without_resume() {
-    let handle = fake_harness("live-frontend")
-        .start_live_voice(LiveVoiceRequest {
-            cwd: ".".into(),
-            resume: None,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(handle.session_id, "/tmp/omp-session.jsonl");
-    handle.controls.send(LiveVoiceControl::Stop).await.unwrap();
-}
-
-#[tokio::test]
-async fn omp_live_frontend_surfaces_bounded_child_exit() {
-    let harness = fake_harness("live-crash");
-    let handle = harness
-        .start_live_voice(LiveVoiceRequest {
-            cwd: std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            resume: None,
-        })
-        .await
-        .unwrap();
-    let _controls = handle.controls;
-    let mut events = handle.events;
-
-    let error = tokio::time::timeout(Duration::from_secs(2), events.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(message.contains("exited unexpectedly"), "{message}");
-    assert!(message.len() <= 512, "{message}");
-    assert!(!message.contains("token-secret"), "{message}");
-}
-
-#[tokio::test]
 async fn process_correlates_out_of_order_responses() {
     let (process, mut events) = start_fake("out-of-order").await;
     let first = process.request(json!({ "type": "get_state" }));
@@ -855,6 +461,92 @@ async fn process_correlates_out_of_order_responses() {
 }
 
 #[tokio::test]
+async fn startup_event_burst_does_not_block_negotiation_or_followup_requests() {
+    const STARTUP_EVENT_COUNT: u64 = 300;
+
+    let process = OmpProcess::start(fake_launch("startup-event-flood"))
+        .await
+        .unwrap();
+    assert!(process.capabilities().chunked_frames);
+
+    // Catalog discovery sends requests before it takes the event stream. This
+    // burst exceeds the former 256-frame live channel and must not strand the
+    // stdout reader before it can route negotiation or this response.
+    let state = process
+        .request(json!({ "type": "get_state" }))
+        .await
+        .expect("startup event burst must not block subsequent RPC responses");
+    assert_eq!(state["sessionId"], "s-1");
+
+    let mut events = process.take_events().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for sequence in 0..STARTUP_EVENT_COUNT {
+            let event = events
+                .recv()
+                .await
+                .expect("all startup events should remain available");
+            assert_eq!(event["type"], "extension_startup");
+            assert_eq!(event["sequence"].as_u64(), Some(sequence));
+        }
+    })
+    .await
+    .expect("startup events should be delivered in order within the bound");
+
+    process.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_event_overflow_fails_startup_instead_of_returning_a_dead_reader() {
+    let error = OmpProcess::start(fake_launch("startup-event-overflow"))
+        .await
+        .expect_err("startup event overflow must fail the transport");
+
+    assert!(
+        error
+            .to_string()
+            .contains("event buffer exceeded its limit of 1024 frames"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn process_keeps_live_event_backpressure_after_consumer_attaches() {
+    const LIVE_EVENT_COUNT: u64 = 1100;
+
+    let (process, mut events) = start_fake("live-event-flood").await;
+    let state_request = process.request(json!({ "type": "get_state" }));
+    tokio::pin!(state_request);
+
+    // The event receiver is attached, but intentionally not drained yet.
+    // Once it is attached, live saturation should retain normal backpressure
+    // until the consumer resumes instead of becoming a fatal overflow.
+    tokio::select! {
+        result = &mut state_request => {
+            panic!("live flood should wait for the paused event consumer: {result:?}");
+        }
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+
+    let state = tokio::time::timeout(Duration::from_secs(2), async {
+        for sequence in 0..LIVE_EVENT_COUNT {
+            let event = events
+                .recv()
+                .await
+                .expect("live events should remain available after backpressure");
+            assert_eq!(event["type"], "extension_runtime");
+            assert_eq!(event["sequence"].as_u64(), Some(sequence));
+        }
+        state_request.await
+    })
+    .await
+    .expect("draining the live event queue should release the stdout reader")
+    .expect("the following RPC response should still be routed");
+    assert_eq!(state["sessionId"], "s-1");
+
+    process.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn process_rejects_exit_before_ready() {
     let error = OmpProcess::start(fake_launch("early-exit"))
         .await
@@ -866,16 +558,25 @@ async fn process_rejects_exit_before_ready() {
 async fn process_rejects_oversized_frame_before_waiting_for_newline() {
     let mut launch = fake_launch("oversized-no-newline");
     launch.request_timeout = Duration::from_secs(5);
-    let process = OmpProcess::start(launch).await.unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        process.request(json!({ "type": "get_state" })),
-    )
-    .await
-    .expect("reader must reject once the byte limit is crossed, without waiting for newline");
-    let error = result.unwrap_err();
-    assert!(error.to_string().contains("frame exceeded"), "{error}");
-    process.shutdown().await.unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(2), OmpProcess::start(launch))
+        .await
+        .expect("startup must finish or reject oversized output before the handshake deadline");
+    match started {
+        Err(error) => {
+            assert!(error.to_string().contains("frame exceeded"), "{error}");
+        }
+        Ok(process) => {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                process.request(json!({ "type": "get_state" })),
+            )
+            .await
+            .expect("reader must reject oversized output without waiting for a newline");
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("frame exceeded"), "{error}");
+            process.shutdown().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -993,6 +694,33 @@ async fn commands_are_discovered_from_the_rpc_runtime() {
         .unwrap();
     assert_eq!(commands[0].name, "model");
     assert_eq!(commands[0].input_hint.as_deref(), Some("provider/model"));
+}
+
+#[test]
+fn omp_runtime_identity_tracks_host_tool_grants_but_ignores_codex_mcp() {
+    let harness = fake_harness("normal");
+    let live = request("hello");
+
+    let mut root_grant = live.clone();
+    root_grant.sessions = Some(SessionsGrant {
+        parent_chat_id: "root-chat".into(),
+        endpoint: "ws://127.0.0.1:9".into(),
+        engine_id: "engine-1".into(),
+    });
+    assert!(!harness.same_runtime(&live, &root_grant));
+
+    let mut codex_mcp = live.clone();
+    codex_mcp.mcp = Some(zeron_proto::McpServer {
+        name: "fixture".into(),
+        command: "fixture-mcp".into(),
+        args: vec!["serve".into()],
+        env: Default::default(),
+    });
+    assert!(harness.same_runtime(&live, &codex_mcp));
+
+    let mut inactive_parent = live.clone();
+    inactive_parent.workers_parent_chat_id = Some("unused-parent".into());
+    assert!(harness.same_runtime(&live, &inactive_parent));
 }
 
 #[test]
@@ -1453,6 +1181,9 @@ async fn workers_bridge_rejects_duplicate_and_excess_pending_calls() {
 async fn run_streams_resumes_steers_answers_and_completes_once() {
     let harness = fake_harness("full-run");
     let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let image_dir = tempfile::tempdir().unwrap();
+    let image_path = image_dir.path().join("steer.png");
+    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
     let mut request = request("hello");
     request.model = Some("openai-codex/gpt-5.6-sol".into());
     request.reasoning = Some(ReasoningLevel::High);
@@ -1465,6 +1196,8 @@ async fn run_streams_resumes_steers_answers_and_completes_once() {
         .send(SteerMessage {
             prompt: "next".into(),
             message_id: Some("m2".into()),
+            attachments: vec![image_path.to_string_lossy().into_owned()],
+            config: None,
         })
         .await
         .unwrap();
@@ -1779,9 +1512,9 @@ async fn local_command_output_burst_exceeding_channel_capacity_progresses() {
         })
         .collect();
 
-    assert_eq!(text_deltas.len(), 300);
+    assert_eq!(text_deltas.len(), 1100);
     assert_eq!(text_deltas[0], "chunk-0\n");
-    assert_eq!(text_deltas[299], "chunk-299\n");
+    assert_eq!(text_deltas[1099], "chunk-1099\n");
     assert_eq!(
         events
             .iter()
@@ -2145,6 +1878,8 @@ async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
                 .send(SteerMessage {
                     prompt: "steer-now".into(),
                     message_id: Some("m-steer".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -2239,6 +1974,8 @@ async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
                 .send(SteerMessage {
                     prompt: "steer-now".into(),
                     message_id: Some("m-steer".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -2347,6 +2084,8 @@ async fn worker_notification_during_pending_wait_for_status_is_delivered_promptl
                 .send(SteerMessage {
                     prompt: "[worker-task-notification] Worker \"worker-1\" -> completed.".into(),
                     message_id: Some("m-notice".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -2428,6 +2167,8 @@ async fn natural_result_racing_notification_is_preserved_and_steer_delivered_onc
                     prompt: "[worker-task-notification] Worker \"race-worker\" -> completed."
                         .into(),
                     message_id: Some("m-notice-race".into()),
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();

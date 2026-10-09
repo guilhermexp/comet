@@ -81,3 +81,7 @@ gpui = { workspace = true, features = ["test-support"] }
 [[test]]
 name = "frame_source_recovery"
 harness = false
+
+[[test]]
+name = "window_glass_backing"
+harness = false

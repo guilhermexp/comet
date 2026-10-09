@@ -38,12 +38,14 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     let harness = AcpHarness::grok();
     let (_steer_tx, steering) = mpsc::channel(1);
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     let request = RunRequest {
         mcp: None,

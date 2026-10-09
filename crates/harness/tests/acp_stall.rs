@@ -37,6 +37,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
     let (_steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |_| {
             let (tx, rx) = oneshot::channel();
@@ -47,6 +48,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         interrupt: token.clone(),
         chat_id: String::new(),
         generate_native_title: false,
+        turn: Default::default(),
     };
     let request = RunRequest {
         mcp: None,

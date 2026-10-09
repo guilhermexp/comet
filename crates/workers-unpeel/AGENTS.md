@@ -17,8 +17,8 @@ internal host modes (`__session_host__` et al.).
 |---|---|
 | `lib.rs` | All typed `Workers*` models, including optional device-local model/token telemetry on `WorkersSession`, `LocalWorkersClient`, `WorkersRuntime`, `runtime_catalog_snapshot` (o catálogo pinado, público para a UI provar seus espelhos de ícone/tint contra a fonte em vez de copiá-la à mão), session-host mode detection/dispatch (`is_session_host_mode`, `session_host_launch_args`, `session_host_launcher_path`, `run_session_host_mode_if_requested`) |
 | `controller_mcp.rs` | Comet-owned MCP surface for the primary Orchestrator (`CONTROLLER_MCP_ARG`) — intentionally separate from Unpeel's worker-to-worker MCP host |
-| `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine directly from `third_party/unpeel/crates/unpeel-tui/src/activity.rs` so Start/Stop/PermissionRequest, durable seeds, runtime generations and output fallbacks cannot drift from the pinned TUI frontend; persists provider Session metadata and refreshes provider telemetry fail-soft without replacing the URL Worker identity; persistence failure invalidates prior telemetry instead of refreshing stale identity; startup migrates the short-lived unbound telemetry marker in the background by recomputing current provider evidence |
-| `session_event_journal.rs` | Session output/event journaling |
+| `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine directly from `third_party/unpeel/crates/unpeel-tui/src/activity.rs` so Start/Stop/PermissionRequest, durable seeds, runtime generations and output fallbacks cannot drift from the pinned TUI frontend; persists provider Session metadata and refreshes provider telemetry fail-soft without replacing the URL Worker identity; rejects nested OMP provider hooks before queue, activity, binding or telemetry mutation, and serves a read-only `?validate=1` notifier preflight; persistence failure invalidates prior telemetry instead of refreshing stale identity; startup migrates the short-lived unbound telemetry marker in the background by recomputing current provider evidence |
+| `session_event_journal.rs` | Session output/event journaling; rejects nested OMP hooks before journal/task-episode mutation and serves the read-only `?validate=1` notifier preflight |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
 | `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
@@ -538,13 +538,22 @@ apps/zeron (host-mode dispatch at startup).
   new hook asset that reads `$1` must keep the `cat` fallback.
 - **Os três CLIs da família pi são hook-owned, `pi` inclusive.** `pi`, `omp` e
   `prime-agent` aceitam `-e/--extension` e rodam a mesma API de extensão
-  (`agent_start`/`agent_end`), então os três recebem
-  `runtimes/_shared/pi-family/assets/lifecycle-extension.js` e declaram
-  `lifecycle_hooks` + `notify_when_done`. O append idempotente do flag mora em
-  `setup::with_lifecycle_extension`; o gate de alias fica no adapter de cada
-  runtime, porque `pi` tem resume/context próprios e não inclui o `mod.rs`
-  compartilhado. Runtime sem hooks no catálogo hoje é o `agy` — é ele que os
-  testes usam para exercitar o ramo hookless de `derive_activity`.
+  (`agent_start`/`agent_end`), mas OMP usa asset próprio para isolar seus
+  subagentes. A extensão OMP inclui `unpeel_agent_kind`: `sub` é descartado,
+  `main` é evidência autoritativa e payloads de extensões antigas usam apenas a
+  relação canônica entre transcript filho e artefato primário OMP.
+  `activity_bridge` e `session_event_journal` aplicam a mesma defesa antes de
+  qualquer mutação. `POST /hook/<id>?validate=1` verifica aceitação sem gravar
+  journal, avançar atividade ou persistir binding. Notificadores síncronos
+  consultam todos os listeners conhecidos antes de postar; somente uma resposta
+  `202` com `ignored: true` veta entrega e marker. Hosts antigos que devolvem
+  `404` para validação continuam elegíveis para eventos primários. O caminho
+  assíncrono mantém o marker antes do POST em background. Pi e Prime mantêm o
+  asset compartilhado. Os três declaram `lifecycle_hooks` + `notify_when_done`;
+  o append idempotente do flag mora em `setup::with_lifecycle_extension`, e o
+  gate de alias fica no adapter de cada runtime. Runtime sem hooks no catálogo
+  hoje é o `agy` — é ele que os testes usam para exercitar o ramo hookless de
+  `derive_activity`.
 - **Reinstalação limpa de CLI é o caso normal, não a exceção.** Apagar
   `~/.unpeel` (ou a poda do root legado) some com o diretório onde a extensão
   de lifecycle é escrita, e `write_file_atomic` falhava com `No such file or

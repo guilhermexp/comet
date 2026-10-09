@@ -229,7 +229,9 @@ fn handle_connection(
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
     let (path, body) = read_request(&mut stream)?;
-    if path != format!("/hook/{expected_session_id}") {
+    let expected_path = format!("/hook/{expected_session_id}");
+    let validate_only = path == format!("{expected_path}?validate=1");
+    if path != expected_path && !validate_only {
         respond(&mut stream, "404 Not Found", r#"{"error":"not found"}"#);
         return Err("hook session did not match host".into());
     }
@@ -242,6 +244,26 @@ fn handle_connection(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "Hook journal payload is missing hook_event_name".to_string())?;
+    let manifest = unpeel_core::session_host::load_manifest(expected_session_id);
+    if manifest
+        .as_ref()
+        .is_some_and(|manifest| crate::activity_bridge::is_nested_provider_hook(manifest, &value))
+    {
+        respond(&mut stream, "202 Accepted", r#"{"ok":true,"ignored":true}"#);
+        return Ok(None);
+    }
+    if validate_only {
+        if manifest.is_none() {
+            respond(
+                &mut stream,
+                "404 Not Found",
+                r#"{"error":"unknown session"}"#,
+            );
+        } else {
+            respond(&mut stream, "200 OK", r#"{"ok":true,"validated":true}"#);
+        }
+        return Ok(None);
+    }
     let runtime_generation = value
         .get("unpeel_runtime_generation")
         .or_else(|| value.get("unpeelRuntimeGeneration"))
@@ -488,6 +510,126 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::MutexGuard;
+
+    fn test_manifest(
+        session_id: &str,
+        command: String,
+        cwd: &Path,
+    ) -> unpeel_core::session_host::HostedSessionManifest {
+        unpeel_core::session_host::HostedSessionManifest {
+            session: unpeel_core::state::SessionInfo {
+                id: session_id.into(),
+                project_id: "project-1".into(),
+                label: "OMP".into(),
+                custom_title: false,
+                command,
+                created_at: 1,
+                tag_id: None,
+                worktree_path: None,
+                worktree_branch: None,
+                parent_session_id: None,
+                spawned_by: None,
+                role: None,
+                task: None,
+            },
+            cwd: cwd.to_string_lossy().into_owned(),
+            state: unpeel_core::session_host::HostedSessionState::Running,
+            pid: None,
+            pid_started_at: None,
+            exit_code: None,
+            host_build_id: None,
+            host_protocol_version: None,
+            has_been_written_to: true,
+            provider_session_id: None,
+            provider_transcript_path: None,
+            managed_storage_path: None,
+            resume_failure_markers: Vec::new(),
+            runtime: None,
+            runtime_launch_generation: 1,
+            runtime_launch_pending: false,
+            runtime_launched_at: Some(1),
+            runtime_launch_output_offset: 0,
+            mcp_enabled: None,
+            browser_mcp_enabled: None,
+            computer_mcp_enabled: None,
+            mcp_client_registered: false,
+            browser_client_registered: false,
+            computer_client_registered: false,
+            menu_prompt_active: false,
+            screen_changed_at: None,
+            detected_local_urls: Vec::new(),
+            heartbeat_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    struct TestHomes {
+        _lock: MutexGuard<'static, ()>,
+        previous_unpeel_home: Option<OsString>,
+        previous_home: Option<OsString>,
+    }
+
+    impl TestHomes {
+        fn set(unpeel_home: &Path, home: &Path) -> Self {
+            let lock = crate::activity_bridge::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous_unpeel_home = std::env::var_os("UNPEEL_HOME");
+            let previous_home = std::env::var_os("HOME");
+            // SAFETY: all Workers tests that mutate HOME use TEST_ENV_LOCK.
+            unsafe {
+                std::env::set_var("UNPEEL_HOME", unpeel_home);
+                std::env::set_var("HOME", home);
+            }
+            Self {
+                _lock: lock,
+                previous_unpeel_home,
+                previous_home,
+            }
+        }
+    }
+
+    impl Drop for TestHomes {
+        fn drop(&mut self) {
+            // SAFETY: this guard retains TEST_ENV_LOCK until after restoration.
+            unsafe {
+                match self.previous_unpeel_home.take() {
+                    Some(previous) => std::env::set_var("UNPEEL_HOME", previous),
+                    None => std::env::remove_var("UNPEEL_HOME"),
+                }
+                match self.previous_home.take() {
+                    Some(previous) => std::env::set_var("HOME", previous),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    fn post(port: u16, session_id: &str, payload: &serde_json::Value) -> String {
+        post_path(port, &format!("/hook/{session_id}"), payload)
+    }
+
+    fn post_validation(port: u16, session_id: &str, payload: &serde_json::Value) -> String {
+        post_path(port, &format!("/hook/{session_id}?validate=1"), payload)
+    }
+
+    fn post_path(port: u16, path: &str, payload: &serde_json::Value) -> String {
+        let body = serde_json::to_vec(payload).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
 
     /// WouldBlock e Interrupted sao estados transitórios do accept loop; tirar
     /// qualquer um derruba o endpoint sob polling ou sinais de filhos.
@@ -567,6 +709,85 @@ mod tests {
         assert_eq!(entries[1].hook_event_name, "Stop");
         assert_eq!(entries[2].sequence, 3);
         assert!(entries.iter().all(|entry| entry.task_episode == Some(3)));
+    }
+
+    #[test]
+    fn nested_omp_hooks_do_not_advance_the_journal_but_main_kind_overrides_path() {
+        let unpeel_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _homes = TestHomes::set(unpeel_home.path(), home.path());
+        let session_id = "worker-nested-journal";
+        let session_dir = unpeel_home.path().join("app-sessions").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let omp_root = home.path().join("omp-sessions");
+        let primary = omp_root.join("primary.jsonl");
+        let child = omp_root.join("primary/PgliteSqlCheck.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(&primary, "{}\n").unwrap();
+        std::fs::write(&child, "{}\n").unwrap();
+        let manifest = test_manifest(
+            session_id,
+            format!("omp --session-dir '{}'", omp_root.display()),
+            home.path(),
+        );
+        unpeel_core::session_host::save_manifest(&manifest).unwrap();
+
+        let journal_path = session_dir.join(JOURNAL_FILE);
+        append_entry(
+            &journal_path,
+            &SessionHookJournalEntry {
+                sequence: 4,
+                hook_event_name: "Start".into(),
+                tool_name: None,
+                runtime_generation: Some(1),
+                task_episode: Some(8),
+                occurred_at_unix_ms: 1,
+                source_modified_unix_ns: None,
+            },
+        )
+        .unwrap();
+        let previous_journal = std::fs::read(&journal_path).unwrap();
+        let ingress = start(session_id, &session_dir).unwrap();
+
+        let ignored_payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "provider_transcript_path": child,
+            "comet_task_episode": 99
+        });
+        let preflight_ignored = post_validation(ingress.port, session_id, &ignored_payload);
+        assert!(
+            preflight_ignored.contains("202 Accepted"),
+            "{preflight_ignored}"
+        );
+        assert_eq!(std::fs::read(&journal_path).unwrap(), previous_journal);
+        let ignored = post(ingress.port, session_id, &ignored_payload);
+        assert!(ignored.contains("202 Accepted"), "{ignored}");
+        assert_eq!(std::fs::read(&journal_path).unwrap(), previous_journal);
+
+        let primary_switch_payload = serde_json::json!({
+            "hook_event_name": "Start",
+            "provider_transcript_path": child,
+            "unpeel_agent_kind": "main",
+            "comet_task_episode": 9
+        });
+        let primary_switch_preflight =
+            post_validation(ingress.port, session_id, &primary_switch_payload);
+        assert!(
+            primary_switch_preflight.contains("200 OK"),
+            "{primary_switch_preflight}"
+        );
+        assert_eq!(std::fs::read(&journal_path).unwrap(), previous_journal);
+        let primary_switch = post(ingress.port, session_id, &primary_switch_payload);
+        assert!(primary_switch.contains("200 OK"), "{primary_switch}");
+        drop(ingress);
+
+        let entries = read_entries(&session_dir).unwrap().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 4);
+        assert_eq!(entries[1].sequence, 5);
+        assert_eq!(entries[1].hook_event_name, "Start");
+        assert_eq!(entries[1].task_episode, Some(9));
     }
 
     #[test]

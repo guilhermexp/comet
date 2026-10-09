@@ -175,6 +175,9 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
+        // Opening any session steps the voice stage aside — including the one
+        // already selected under it. The call keeps running in the background.
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.state
@@ -220,6 +223,9 @@ impl Shell {
             });
             return;
         }
+        // Closing the stage only changes its visibility and focus; the voice
+        // call remains owned by the engine and continues across navigation.
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         let target = {
@@ -369,11 +375,6 @@ impl Shell {
         let files_open = self.files_panel_open(cx);
         let files_now = self.files_visible_width(cx);
         let changes_trailing: Option<gpui::AnyElement> = if changes_active && !on_canvas {
-            let capabilities = titlebar_capabilities(
-                SidebarMode::Orchestrator,
-                !self.active_chat.is_empty(),
-                false,
-            );
             Some(
                 div()
                     .flex_none()
@@ -381,9 +382,6 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .when(capabilities.trajectory, |el| {
-                        el.child(self.render_orchestrator_trajectory_button(&theme, cx))
-                    })
                     .when(!files_open, |el| {
                         el.child(self.render_files_panel_toggle(&theme, cx))
                     })
@@ -397,19 +395,11 @@ impl Shell {
                     .into_any_element(),
             )
         } else {
-            let capabilities = titlebar_capabilities(
-                SidebarMode::Orchestrator,
-                !self.active_chat.is_empty(),
-                false,
-            );
             Some(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .when(capabilities.trajectory, |el| {
-                        el.child(self.render_orchestrator_trajectory_button(&theme, cx))
-                    })
                     .when(!on_canvas && !files_open, |el| {
                         el.child(self.render_files_panel_toggle(&theme, cx))
                     })
@@ -534,7 +524,7 @@ impl Shell {
                 .child(
                     header_icon_button(
                         "session-fork",
-                        icons::GIT_BRANCH,
+                        icons::FORK,
                         "Fork this session",
                         false,
                         &theme,
@@ -676,6 +666,13 @@ impl Shell {
     /// the explorer slot over its column while open.
     fn render_files_panel_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.files_panel_open(cx);
+        let running_subagents = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat
+                .as_deref()
+                .map_or(0, |chat| state.running_subagents_for(chat, Utc::now()))
+        };
         header_icon_button(
             "toggle-files-panel",
             icons::FILE_TREE,
@@ -693,6 +690,9 @@ impl Shell {
             "Hide files panel"
         } else {
             "Show files panel"
+        })
+        .when(running_subagents > 0, |button| {
+            crate::running_pill::mark_files_button(button, running_subagents, theme)
         })
         .into_any_element()
     }

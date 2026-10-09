@@ -270,6 +270,7 @@ pub struct RegistryClient {
     presence: Arc<Mutex<HashMap<String, (i64, tokio::time::Instant)>>>,
     stats: Arc<Stats>,
     task: Option<tokio::task::JoinHandle<()>>,
+    offline_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl RegistryClient {
@@ -335,6 +336,7 @@ impl RegistryClient {
         let (presence_tx, presence_rx) = mpsc::channel(4);
         let presence = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
+        let offline_task = Arc::new(Mutex::new(None));
 
         let actor = Actor {
             doc: doc.clone(),
@@ -350,31 +352,30 @@ impl RegistryClient {
             presence: presence.clone(),
             stats: stats.clone(),
             transport,
+            offline_task: offline_task.clone(),
             sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let task = tokio::spawn(actor.run(ready_tx));
 
+        // Own every task before awaiting readiness: cancelled construction
+        // must release the actor and any HTTP fallback it started.
+        let client = Self {
+            doc,
+            events,
+            shutdown: shutdown_tx,
+            nudge: nudge_tx,
+            probe: probe_tx,
+            redial: redial_tx,
+            presence_out: presence_tx,
+            presence,
+            stats,
+            task: Some(task),
+            offline_task,
+        };
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self {
-                doc,
-                events,
-                shutdown: shutdown_tx,
-                nudge: nudge_tx,
-                probe: probe_tx,
-                redial: redial_tx,
-                presence_out: presence_tx,
-                presence,
-                stats,
-                task: Some(task),
-            }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Ok(())) => Ok(client),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -436,15 +437,25 @@ impl RegistryClient {
     /// Leave cleanly and stop the actor.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
-        if let Some(task) = self.task.take() {
+        if let Some(task) = self.task.as_mut() {
             let _ = task.await;
         }
+        self.task.take();
+        let offline = lock(&self.offline_task).take();
+        if let Some(task) = offline {
+            task.abort();
+            let _ = task.await;
+        }
+        lock(&self.doc).mark_disconnected();
     }
 }
 
 impl Drop for RegistryClient {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
+            task.abort();
+        }
+        if let Some(task) = lock(&self.offline_task).take() {
             task.abort();
         }
     }
@@ -467,6 +478,7 @@ struct Actor {
     stats: Arc<Stats>,
     /// Plain-HTTPS pull/push (None = socket-only: tests, dev bearers).
     transport: Option<Arc<dyn RegistryTransport>>,
+    offline_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// One offline sync in flight at a time.
     sync_busy: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -476,6 +488,8 @@ enum SessionEnd {
     Reconnect,
     /// Shutdown requested: stop the actor.
     Stop,
+    /// System resume invalidates the old transport, including pre-ready setup.
+    Woke,
 }
 
 /// How a backoff wait ended.
@@ -487,7 +501,21 @@ enum Waited {
 }
 
 impl Actor {
-    async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
+    async fn run(self, ready: oneshot::Sender<Result<(), SyncError>>) {
+        self.run_with_signals(
+            ready,
+            crate::wake::subscribe(),
+            crate::wake::subscribe_online(),
+        )
+        .await;
+    }
+
+    async fn run_with_signals(
+        mut self,
+        ready: oneshot::Sender<Result<(), SyncError>>,
+        mut wake: broadcast::Receiver<()>,
+        mut online: broadcast::Receiver<()>,
+    ) {
         let mut ready = Some(ready);
         let mut backoff = BACKOFF_BASE;
         // Pull-first bootstrap: with an HTTPS transport, the doc syncs in
@@ -505,8 +533,6 @@ impl Actor {
         // Suspend/resume and sibling-dial successes are EVENTS that end a
         // backoff wait immediately (see room.rs) — without them a recovered
         // network still waited out the full accumulated delay.
-        let mut wake = crate::wake::subscribe();
-        let mut online = crate::wake::subscribe_online();
         loop {
             if *self.shutdown.borrow() {
                 return;
@@ -516,7 +542,16 @@ impl Actor {
                 .dial_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
+            let mut shutdown = self.shutdown.clone();
+            let dial = tokio::select! {
+                biased;
+                _ = shutdown.changed() => return,
+                _ = wake.recv() => {
+                    backoff = BACKOFF_BASE;
+                    continue;
+                }
+                dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()) => dial,
+            };
             let pipe = match dial {
                 Ok(Ok(pipe)) => pipe,
                 Ok(Err(err)) => {
@@ -552,9 +587,15 @@ impl Actor {
             };
 
             let session_started = tokio::time::Instant::now();
-            match self.run_session(pipe, &mut ready).await {
+            let ended = tokio::select! {
+                biased;
+                _ = shutdown.changed() => SessionEnd::Stop,
+                _ = wake.recv() => SessionEnd::Woke,
+                ended = self.run_session(pipe, &mut ready) => ended,
+            };
+            match ended {
                 SessionEnd::Stop => return,
-                SessionEnd::Reconnect => {
+                SessionEnd::Reconnect | SessionEnd::Woke => {
                     lock(&self.doc).mark_disconnected();
                     // Only a session that joined AND stayed healthy for a
                     // while earns a fresh backoff. Reset-on-join alone let a
@@ -571,6 +612,11 @@ impl Actor {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.note_failure("connection dropped".into());
                     let _ = self.events.send(RegistryEvent::Disconnected);
+                    if matches!(ended, SessionEnd::Woke) {
+                        // Keep initial readiness pending until a fresh join.
+                        backoff = BACKOFF_BASE;
+                        continue;
+                    }
                     if ready.is_some() {
                         // Handshake failed on the very first session.
                         if let Some(ready) = ready.take() {
@@ -826,7 +872,7 @@ impl Actor {
         let presence = self.presence.clone();
         let stats = self.stats.clone();
         let busy = self.sync_busy.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let batches: Vec<PendingBatch> = lock(&doc).take_pushable();
             let mut push_failed = false;
             for batch in &batches {
@@ -910,6 +956,7 @@ impl Actor {
             }
             busy.store(false, Relaxed);
         });
+        *lock(&self.offline_task) = Some(task);
     }
 
     async fn push_pending(&self, pipe: &mut TextPipe) -> bool {
@@ -989,6 +1036,9 @@ impl Actor {
         true
     }
 }
+
+#[cfg(test)]
+mod reliability_tests;
 
 #[cfg(any(test, feature = "mock-server"))]
 pub mod mock_server;
