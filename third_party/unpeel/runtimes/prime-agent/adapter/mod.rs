@@ -1,3 +1,4 @@
+const FILTER_NESTED_OMP_SUBAGENTS: bool = false;
 const SESSION_TELEMETRY_READER: Option<crate::session_telemetry::ReadSessionTelemetry> = None;
 
 include!(concat!(
@@ -6,4 +7,3 @@ include!(concat!(
 ));
 
 pub(crate) const INTEGRATION: Integration = family_integration();
-

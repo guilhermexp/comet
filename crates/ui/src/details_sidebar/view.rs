@@ -238,9 +238,9 @@ use crate::{
     composer::{Composer, ComposerInput, ComposerInputEvent},
     details_sidebar::{
         chat_workers::{
-            ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
+            ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerLaunchAge, WorkerSemantic,
             activity_tasks_from_entries, compact_activity_label, format_token_total,
-            project_chat_workers, snapshot_is_active, worker_compact_metadata,
+            project_chat_workers, snapshot_is_active, worker_compact_metadata, worker_launch_age,
         },
         context::detect_git_branch,
         source_control,
@@ -1869,12 +1869,16 @@ impl DetailsSidebar {
             loop {
                 cx.background_executor().timer(USAGE_TICK).await;
                 let keep_ticking = this.update(cx, |this, cx| {
+                    let mut should_notify = false;
                     if let Some(snapshot) = &this.usage_snapshot {
                         this.usage = LoadState::Ready(provider_usage_rows(
                             snapshot,
                             &crate::settings::current(cx).usage_widget_hidden_account_ids,
                             chrono::Utc::now(),
                         ));
+                        should_notify = true;
+                    }
+                    if should_notify || this.worker_launch_age_widget_visible(cx) {
                         cx.notify();
                     }
                     let should_fetch = this
@@ -1890,6 +1894,29 @@ impl DetailsSidebar {
                 }
             }
         }));
+    }
+
+    fn worker_launch_age_widget_visible(&self, cx: &App) -> bool {
+        let Some(context) = self.sidebar.context() else {
+            return false;
+        };
+        if context.mode != super::context::DetailsMode::Orchestrator
+            || self.sidebar.widget_hidden("chat-workers-widget")
+        {
+            return false;
+        }
+        let Some(chat_id) = context.chat_id.as_deref() else {
+            return false;
+        };
+        let now = chrono::Utc::now();
+        self.workers_model
+            .read(cx)
+            .sessions_for_parent_chat(chat_id)
+            .is_ok_and(|sessions| {
+                sessions.iter().any(|session| {
+                    worker_launch_age(session.created_at_unix_ms, now.clone()).is_some()
+                })
+            })
     }
 
     fn load_usage(&mut self, cx: &mut Context<Self>) {
@@ -2509,6 +2536,7 @@ impl DetailsSidebar {
         worker: ChatWorkerRow,
         chat_id: String,
         theme: &Theme,
+        now: chrono::DateTime<chrono::Utc>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let event = open_worker_event(&chat_id, &worker);
@@ -2522,24 +2550,39 @@ impl DetailsSidebar {
                 .chat_workers
                 .activity_expanded_with_default(&expansion_key, false);
         let compact_metadata = worker_compact_metadata(&worker);
+        let launch_age = worker_launch_age(worker.created_at_unix_ms, now);
         let model_usage = worker.model_usage.clone();
-        let subtitle = if let Some((model, total)) = compact_metadata {
-            div()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .text_size(px(10.0))
-                .text_color(theme.text_muted)
-                .child(div().min_w_0().flex_1().truncate().child(model))
-                .child(div().flex_none().child(total))
-        } else {
-            div()
-                .truncate()
-                .text_size(px(10.0))
-                .text_color(theme.text_muted)
-                .child(worker.command.clone())
-        };
+        let (label, total) = compact_metadata
+            .map(|(model, total)| (model, Some(total)))
+            .unwrap_or_else(|| (worker.command.clone(), None));
+        let mut subtitle = div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(10.0))
+            .text_color(theme.text_muted)
+            .child(div().min_w_0().flex_1().truncate().child(label));
+        if let Some(total) = total {
+            subtitle = subtitle.child(div().flex_none().child(total));
+        }
+        if let Some(WorkerLaunchAge { label, tooltip }) = launch_age {
+            let tooltip: SharedString = tooltip.into();
+            subtitle = subtitle.child(
+                div()
+                    .id(SharedString::from(format!("chat-worker-age-{session_id}")))
+                    .w(px(32.0))
+                    .flex_none()
+                    .truncate()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| ActionTooltip {
+                            label: tooltip.clone(),
+                        })
+                        .into()
+                    })
+                    .child(label),
+            );
+        }
         let open_target = div()
             .min_w_0()
             .flex_1()
@@ -2758,6 +2801,7 @@ impl DetailsSidebar {
         // um spinner por linha.
         let shimmer = snapshot_is_active(&snapshot)
             .then(|| crate::loaders::activity_shimmer(crate::theme::ink(0.07), cx.entity_id(), cx));
+        let now = chrono::Utc::now();
         let tabs = div()
             .relative()
             .overflow_hidden()
@@ -2806,12 +2850,11 @@ impl DetailsSidebar {
                     .into_iter()
                     .map(|row| self.render_subagent_row(row, chat_id.clone(), theme, cx)),
             ),
-            ChatWorkersTab::Workers if workers > 0 => div().children(
-                snapshot
-                    .workers
-                    .into_iter()
-                    .map(|worker| self.render_worker_row(worker, chat_id.clone(), theme, cx)),
-            ),
+            ChatWorkersTab::Workers if workers > 0 => {
+                div().children(snapshot.workers.into_iter().map(|worker| {
+                    self.render_worker_row(worker, chat_id.clone(), theme, now.clone(), cx)
+                }))
+            }
             ChatWorkersTab::Workflows => Self::render_workers_empty("workflows", theme),
             ChatWorkersTab::Subagents => Self::render_workers_empty("subagents", theme),
             ChatWorkersTab::Workers => workers_error.map_or_else(

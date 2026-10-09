@@ -5,7 +5,10 @@ use std::sync::OnceLock;
 /// Assets the pinned upstream still resolves under the legacy hook root.
 ///
 /// `third_party/unpeel/runtimes/_shared/pi-family/adapter/setup.rs` both writes
-/// and reads the pi-family lifecycle extension at `<unpeel_home>/hooks`, while
+/// and reads the pi-family lifecycle extension at `<unpeel_home>/hooks`. OMP
+/// has a separate extension asset so its child-artifact guard cannot change
+/// Pi or Prime behavior through a shared-file overwrite. These assets coexist
+/// with the Comet-managed hook scripts under `app_hooks_root()`, while
 /// every Comet-managed hook script lives under `app_hooks_root()`. Deleting the
 /// legacy root wholesale therefore strips a live launch dependency: pi-family
 /// runtimes (`pi`, `omp`, `prime-agent`) are started with `--extension <that
@@ -14,7 +17,10 @@ use std::sync::OnceLock;
 /// Start/Stop/PermissionRequest and its activity stays pinned at `idle` while
 /// the PTY streams. Vendored code is read-only here, so the migration keeps
 /// what upstream still owns instead of patching the path.
-const UPSTREAM_OWNED_LEGACY_ASSETS: &[&str] = &["pi-family-lifecycle-extension.js"];
+const UPSTREAM_OWNED_LEGACY_ASSETS: &[&str] = &[
+    "pi-family-lifecycle-extension.js",
+    "omp-lifecycle-extension.js",
+];
 
 pub(crate) fn ensure_managed_hook_migration() -> Result<(), String> {
     static INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -105,9 +111,11 @@ fn install_runtime_hooks_with(
 /// The pinned upstream resolves the pi-family lifecycle extension under the
 /// legacy hook root at spawn time (`--extension <unpeel_home>/hooks/...`): a
 /// missing file launches the runtime with no extension at all, so the session
-/// never emits Start/Stop and stays visually idle. Installation is otherwise
-/// lazy and per-process, which lets the first launch of a fresh process race
-/// the install. Cheap when healthy: one metadata probe per asset.
+/// never emits Start/Stop and stays visually idle. OMP and Pi/Prime use
+/// separate assets to keep the OMP child-session guard runtime-specific.
+/// Installation is otherwise lazy and per-process, which lets the first launch
+/// of a fresh process race the install. Cheap when healthy: one metadata probe
+/// per asset.
 pub(crate) fn ensure_upstream_owned_launch_assets() -> Result<(), String> {
     let legacy_root = unpeel_core::app_paths::unpeel_home().join("hooks");
     if UPSTREAM_OWNED_LEGACY_ASSETS

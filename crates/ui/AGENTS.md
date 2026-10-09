@@ -166,9 +166,14 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Telemetria de modelo/token no widget Workers usa o mesmo mapa de disclosure,
   sob a chave estável `worker:<session-id>`. Colapsado, mostra o modelo ativo e
   o total da Session; expandido, mantém a ordem current-first recebida e um
-  slot de tokens não encolhível. O chevron interrompe propagação e só expande;
-  o restante da row continua abrindo o terminal. Sem telemetria, o subtítulo
-  permanece o comando existente. Isso não altera Chat Transcript Export nem
+  slot de tokens não encolhível. A idade relativa ao launch usa sempre
+  `created_at_unix_ms` e `format_time_ago`, nunca o heartbeat `updated_at`; sem
+  telemetria, aparece ao lado do comando fallback. Timestamp zero ou fora do
+  intervalo aceito é omitido, horário futuro aparece como `now`, e o tooltip
+  traz o instante original de criação. O ticker Details existente, a cada 30s,
+  redesenha o Workers visível em contexto Orchestrator mesmo sem snapshot de
+  Provider Usage. O chevron interrompe propagação e só expande; o restante da
+  row continua abrindo o terminal. Isso não altera Chat Transcript Export nem
   Managed Provider Usage.
 - Linhas do To-dos usam um único slot circular não encolhível, com check/seta
   centralizados nos dois eixos e a mesma geometria `36/12/9` do card inline;
@@ -418,10 +423,10 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/settings/devices.rs` (elegibilidade de Retire, resumo da confirmação) | unit; diálogo é QA nativo | `cargo test -p zeron-ui settings::devices` |
 | `src/details_sidebar/usage.rs` (remaining, tom semanal, gate do badge de reset, pace, membership por hidden-id, placeholder por provider, warning por harness) | unit — derivações puras sobre um `now` injetado | `cargo test -p zeron-ui usage` |
 | `src/details_sidebar/worked_projects.rs` (Worked Projects, Leaf Root, expansão de home, primeiro contato) | unit | `cargo test -p zeron-ui worked_projects` |
-| `src/details_sidebar/{chat_workers,widgets}.rs` (projeção, formatação e disclosure de telemetria de Worker) | unit + visual gpui | `cargo test -p zeron-ui details_sidebar` · `scripts/dev-demo.sh` |
+| `src/details_sidebar/{chat_workers,widgets}.rs` (projeção, idade pelo instante original de launch, formatação e disclosure de telemetria de Worker) | unit + visual gpui | `cargo test -p zeron-ui --lib details_sidebar` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/session_card.rs` (identidade do device local/remoto, placeholder e truncamento) | none — render gpui sem harness; validar card em Chat local/remoto no app nativo | QA visual no dev normal |
 | `src/details_sidebar/source_control.rs` (seções, letra XY, badge, Commit/Sync, discard, empty git) | unit — funções puras | `cargo test -p zeron-ui source_control` |
-| `src/details_sidebar/view.rs` (ticker de usage, retenção de snapshot, render gpui; reducers puros de `DetailsSidebarPreferences` — marcadores de colapso per-context (só chaves `:`; caminhos de arquivo de builds antigos são descartados na carga), visibilidade de widgets) | unit nos reducers de preferência; ciclo de vida de `Task`/render gpui é visual | `cargo test -p zeron-ui details_sidebar::view` · `scripts/dev-demo.sh` |
+| `src/details_sidebar/view.rs` (ticker de usage e idade de launch, retenção de snapshot, render gpui; reducers puros de `DetailsSidebarPreferences` — marcadores de colapso per-context (só chaves `:`; caminhos de arquivo de builds antigos são descartados na carga), visibilidade de widgets) | unit nos reducers de preferência; ciclo de vida de `Task`/render gpui é visual | `cargo test -p zeron-ui --lib details_sidebar::view` · `scripts/dev-demo.sh` |
 | `src/terminal/emulator.rs` (ANSI, seleção e retenção opt-in da tela alternativa) | unit — controle dividido entre chunks, tela principal e tela viva preservadas | `cargo test -p zeron-ui --lib terminal::emulator` |
 | `src/shell.rs` (divisores, orçamento responsivo e preservação da coluna vizinha) | unit — geometria pura; arraste nativo é visual | `cargo test -p zeron-ui --lib shell::tests` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |

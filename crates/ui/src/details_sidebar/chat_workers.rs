@@ -68,6 +68,12 @@ pub struct ChatWorkerModelUsage {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WorkerLaunchAge {
+    pub label: String,
+    pub tooltip: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChatWorkersSnapshot {
     pub workflows: Vec<ChatActivityRow>,
@@ -202,6 +208,24 @@ pub fn format_token_total(tokens: u64) -> String {
     } else {
         format!("{:.1}m tokens", tokens as f64 / 1_000_000.0)
     }
+}
+
+pub(super) fn worker_launch_age(
+    created_at_unix_ms: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<WorkerLaunchAge> {
+    if created_at_unix_ms == 0 {
+        return None;
+    }
+    let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        i64::try_from(created_at_unix_ms).ok()?,
+    )?;
+    let label = crate::state::format_time_ago(created_at.clone(), now);
+    let created_at_label = created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    Some(WorkerLaunchAge {
+        tooltip: format!("Since launch: {label} · Created at {created_at_label}"),
+        label,
+    })
 }
 
 pub fn worker_compact_metadata(row: &ChatWorkerRow) -> Option<(String, String)> {
@@ -445,6 +469,7 @@ pub fn activity_tasks_from_entries(entries: &[SessionMessageEntry]) -> Vec<ChatA
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
     use zeron_doc::parts::{MessagePart, MessageStatus, SubagentStatus};
     use zeron_doc::schema::{MessageRole, SessionMessageEntry};
     use zeron_proto::agent::{
@@ -457,8 +482,13 @@ mod tests {
     use super::{
         ChatActivityRow, ChatActivityTask, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
         activity_tasks_from_entries, compact_activity_label, format_token_total, format_usage,
-        project_chat_workers, snapshot_is_active, worker_compact_metadata, worker_semantic,
+        project_chat_workers, snapshot_is_active, worker_compact_metadata, worker_launch_age,
+        worker_semantic,
     };
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp")
+    }
 
     fn workflow_task(id: &str) -> ChatActivityTask {
         WorkflowTaskUpdate {
@@ -611,16 +641,82 @@ mod tests {
 
     #[test]
     fn worker_without_telemetry_keeps_command_fallback() {
-        let row = project_chat_workers(
-            Vec::new(),
-            vec![worker_session("worker-1", "running", "working")],
-        )
-        .workers
-        .pop()
-        .expect("worker row");
+        let now = fixed_now();
+        let created_at = now.timestamp_millis() as u64 - 5 * 60 * 1_000;
+        let mut session = worker_session("worker-1", "running", "working");
+        session.created_at_unix_ms = created_at;
+        let row = project_chat_workers(Vec::new(), vec![session])
+            .workers
+            .pop()
+            .expect("worker row");
 
         assert_eq!(row.command, "codex");
         assert_eq!(worker_compact_metadata(&row), None);
+        assert_eq!(
+            worker_launch_age(row.created_at_unix_ms, now)
+                .expect("valid launch time")
+                .label,
+            "5m"
+        );
+    }
+
+    #[test]
+    fn worker_launch_age_uses_creation_across_updates_and_terminal_state() {
+        let now = fixed_now();
+        let created_at = now.timestamp_millis() as u64 - 5 * 60 * 1_000;
+        let mut initial = worker_session("worker-1", "running", "working");
+        initial.created_at_unix_ms = created_at;
+        initial.updated_at_unix_ms = created_at;
+        let initial = project_chat_workers(Vec::new(), vec![initial])
+            .workers
+            .pop()
+            .expect("initial worker row");
+
+        let mut settled = worker_session("worker-1", "exited", "done");
+        settled.created_at_unix_ms = created_at;
+        settled.updated_at_unix_ms = now.timestamp_millis() as u64;
+        let settled = project_chat_workers(Vec::new(), vec![settled])
+            .workers
+            .pop()
+            .expect("settled worker row");
+
+        assert_eq!(initial.created_at_unix_ms, settled.created_at_unix_ms);
+        assert_ne!(initial.updated_at_unix_ms, settled.updated_at_unix_ms);
+        assert_eq!(initial.semantic, WorkerSemantic::Working);
+        assert_eq!(settled.semantic, WorkerSemantic::Terminal);
+        let initial_age = worker_launch_age(initial.created_at_unix_ms, now.clone())
+            .expect("initial launch time");
+        let settled_age =
+            worker_launch_age(settled.created_at_unix_ms, now).expect("settled launch time");
+        assert_eq!(initial_age, settled_age);
+        assert_eq!(initial_age.label, "5m");
+        let created_at = DateTime::<Utc>::from_timestamp_millis(created_at as i64)
+            .expect("valid creation timestamp")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(initial_age.tooltip.contains("Since launch: 5m"));
+        assert!(initial_age.tooltip.contains(&created_at));
+    }
+
+    #[test]
+    fn worker_launch_age_omits_missing_and_out_of_range_timestamps() {
+        let now = fixed_now();
+
+        assert_eq!(worker_launch_age(0, now.clone()), None);
+        assert_eq!(worker_launch_age(u64::MAX, now.clone()), None);
+        assert_eq!(worker_launch_age(i64::MAX as u64, now), None);
+    }
+
+    #[test]
+    fn worker_launch_age_clamps_future_timestamps_to_now() {
+        let now = fixed_now();
+        let future = (now.timestamp_millis() + 2 * 60 * 60 * 1_000) as u64;
+
+        assert_eq!(
+            worker_launch_age(future, now)
+                .expect("future timestamp is in range")
+                .label,
+            "now"
+        );
     }
 
     #[test]
