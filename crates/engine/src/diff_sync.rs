@@ -157,9 +157,6 @@ struct CheckoutEntry {
     /// without a pin its entry never exists and its pane sits on "Preparing
     /// diff…" forever (user report). A pinned entry is never orphaned.
     pins: AtomicUsize,
-    /// Destructive mutations are serialized per checkout. File-system
-    /// watchers and read-only captures may still run concurrently.
-    discard_lock: tokio::sync::Mutex<()>,
     /// Keeps the recursive fs watches alive on the shared [`FsWatchHub`];
     /// dropped on entry close. Filled
     /// asynchronously — watcher setup (budget walk + FSEvents registration) can
@@ -842,7 +839,6 @@ fn add_entry(
         orphaned_since: Mutex::new(None),
         pins: AtomicUsize::new(0),
         skipped_while_orphaned: AtomicBool::new(false),
-        discard_lock: tokio::sync::Mutex::new(()),
         kick_tx: kick_tx.clone(),
         watchers: Mutex::new(Vec::new()),
     });

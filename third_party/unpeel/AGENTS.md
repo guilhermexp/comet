@@ -933,8 +933,10 @@ contracts above; it is not an upstream runtime API guarantee.
   Older extension payloads omit that field, so the OMP adapter uses the
   provider's canonical child-transcript layout beneath the trusted OMP session
   root (`runtimes/omp/adapter/telemetry.rs::is_nested_provider_transcript`).
-  It does not classify arbitrary nested JSONL paths or apply this fallback to
-  Pi/Prime.
+  The decision is parent-side: the owning `<dirname(child)>.jsonl` must be a
+  trusted transcript under that root, so a child whose JSONL is not flushed
+  yet is still nested. It does not classify arbitrary nested JSONL paths or
+  apply this fallback to Pi/Prime.
 - Comet's `crates/workers-unpeel` ingress repeats the classification before
   queueing lifecycle events, changing activity, writing the session journal,
   or persisting provider binding/telemetry. Its read-only

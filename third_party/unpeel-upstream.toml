@@ -116,3 +116,10 @@ base_revision_resolves_upstream = false
 # HOOK_IDLE_TIMEOUT sem rearmar por crescimento; last_hook_at não avança em
 # latch-only; transcript omp casa stem exato no diretório da sessão (sem walk
 # global nem starts_with lexical). Same-commit local form; no upstream patch.
+
+# 2026-10-09 — OMP child-agent classification decides from the parent side:
+# `<dirname(child)>.jsonl` must be a trusted JSONL under the OMP sessions root,
+# while the child transcript is resolved only when it already exists. A child
+# whose JSONL is not yet flushed is therefore still nested. Applied together in
+# the OMP lifecycle extension and runtimes/omp/adapter/telemetry.rs. Local patch
+# only; local_modifications_count remains unrecomputed.

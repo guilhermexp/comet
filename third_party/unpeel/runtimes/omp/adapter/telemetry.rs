@@ -333,9 +333,11 @@ pub(crate) fn is_nested_provider_transcript(
     let Ok(root) = omp_sessions_root(&manifest.session.command, Path::new(&manifest.cwd)) else {
         return false;
     };
-    let Ok(child) = trusted_jsonl_path(transcript_path, &root) else {
+    if transcript_path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
         return false;
-    };
+    }
+    let child = std::fs::canonicalize(transcript_path)
+        .unwrap_or_else(|_| transcript_path.to_path_buf());
     let Some(artifact_dir) = child.parent() else {
         return false;
     };
@@ -526,6 +528,13 @@ mod tests {
         write_usage_transcript(&outside_primary);
         write_usage_transcript(&outside_child);
         assert!(!is_nested_provider_transcript(&manifest, &outside_child));
+
+        let unflushed_child = root.path().join("primary/NotYetFlushed.jsonl");
+        assert!(is_nested_provider_transcript(&manifest, &unflushed_child));
+        let unflushed_unrelated = root.path().join("missing/NotYetFlushed.jsonl");
+        assert!(!is_nested_provider_transcript(&manifest, &unflushed_unrelated));
+        let unflushed_outside = outside.path().join("primary/NotYetFlushed.jsonl");
+        assert!(!is_nested_provider_transcript(&manifest, &unflushed_outside));
 
         #[cfg(unix)]
         {

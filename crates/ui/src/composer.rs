@@ -2981,11 +2981,7 @@ impl ComposerInput {
                 .attachment_chips
                 .as_ref()
                 .map(|images| images.keys().copied().collect());
-            TextProjection::rich(
-                &self.content,
-                Some(self.editing_source_range()),
-                live.as_ref(),
-            )
+            TextProjection::rich(&self.content, None, live.as_ref())
         } else {
             TextProjection {
                 display: self.content.clone(),
@@ -2993,10 +2989,6 @@ impl ComposerInput {
                 mappings: Vec::new(),
             }
         };
-    }
-
-    fn editing_source_range(&self) -> Range<usize> {
-        self.line_range_at(self.cursor_offset())
     }
 
     /// Replace a completed `@query` token as one non-coalescing undo step.
@@ -15493,6 +15485,20 @@ mod tests {
             input.layout_text(px(160.), &window.text_style(), window, cx);
             assert_eq!(input.line_indents[0], px(0.));
             assert!(input.projection.display.starts_with(">     - literal"));
+        });
+    }
+
+    #[gpui::test]
+    fn markdown_markers_stay_visible_off_the_caret_line(cx: &mut gpui::TestAppContext) {
+        with_composer_input(cx, |input, window, cx| {
+            let raw = "**bold** `code` ~~gone~~\n# heading\n- item\nsecond";
+            input.set_text(raw, cx);
+            input.move_to(raw.len(), cx);
+            input.layout_text(px(480.), &window.text_style(), window, cx);
+            assert_eq!(input.projection.display, raw);
+            input.move_to(0, cx);
+            input.layout_text(px(480.), &window.text_style(), window, cx);
+            assert_eq!(input.projection.display, raw);
         });
     }
 

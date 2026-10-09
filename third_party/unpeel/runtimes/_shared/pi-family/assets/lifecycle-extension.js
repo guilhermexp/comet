@@ -39,9 +39,13 @@ function isNestedOmpAgent(ctx) {
     return false;
   }
 
+  let childTranscriptPath = transcriptPath;
   try {
-    const canonicalTranscriptPath = realpathSync(transcriptPath);
-    return statSync(`${dirname(canonicalTranscriptPath)}.jsonl`).isFile();
+    childTranscriptPath = realpathSync(transcriptPath);
+  } catch {}
+
+  try {
+    return statSync(`${dirname(childTranscriptPath)}.jsonl`).isFile();
   } catch {
     return false;
   }

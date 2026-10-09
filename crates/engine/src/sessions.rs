@@ -907,10 +907,13 @@ impl SessionsEngine {
                             });
                             permit.send(message);
                         };
-                        // Worker notifications must reach the live orchestrator
-                        // even while an update is pending; ordinary prompts keep
-                        // the update gate and are dispatched only after it clears.
-                        if worker_notification {
+                        // Worker notifications must reach a running orchestrator
+                        // turn or its background work even while an update is
+                        // pending; ordinary prompts keep the update gate and
+                        // are dispatched only after it clears.
+                        if worker_notification
+                            && (self.turn_in_flight(chat_id) || self.holds_background_work(chat_id))
+                        {
                             Some(enqueue())
                         } else {
                             self.inner.registry.while_update_clear(harness_id, enqueue)
@@ -1262,7 +1265,9 @@ impl SessionsEngine {
         // and release an update waiting for that run. Ordinary user steers
         // remain ordered behind the accepted update. The running process still
         // holds its execution lease until it exits, keeping installation safe.
-        let accepted = if worker_notification {
+        let accepted = if worker_notification
+            && (self.turn_in_flight(chat_id) || self.holds_background_work(chat_id))
+        {
             Some(enqueue())
         } else {
             self.inner.registry.while_update_clear(harness_id, enqueue)

@@ -1116,3 +1116,56 @@ async fn the_idle_reaper_spares_a_runtime_holding_background_work() {
     .await;
     rig.core.sessions.shutdown().await;
 }
+
+/// A Worker notification for a parked parent with no background work keeps
+/// the update gate: the update retires that idle process, so the notice runs
+/// once after the update instead of entering a mailbox about to be cancelled
+/// and then being replayed.
+#[tokio::test]
+async fn worker_notice_to_a_parked_parent_waits_for_the_update_and_runs_once() {
+    let rig = rig();
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("launch the scouts"), None)
+        .await
+        .unwrap();
+    settle(&rig, 1).await;
+
+    rig.core.registry.begin_update(HarnessId::Mock);
+    let notice = "[worker-task-notification] Worker finished while the parent was parked.";
+    rig.core
+        .doc_host
+        .queue_worker_notification(
+            CHAT,
+            "worker-notify:worker-1:parked".into(),
+            SessionCommandPayload::Steer {
+                prompt: notice.into(),
+                message_id: Some("worker-notify-message:worker-1:parked".into()),
+            },
+        )
+        .unwrap();
+    let delivered = || {
+        rig.ledger
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(prompt, _)| prompt == notice)
+            .count()
+    };
+    let update = tokio::time::timeout(
+        Duration::from_secs(5),
+        rig.core.registry.update_lease(HarnessId::Mock),
+    )
+    .await
+    .expect("the parked runtime releases the installer lease");
+    assert_eq!(delivered(), 0, "the notice entered the parked runtime");
+    drop(update);
+    rig.core.registry.end_update(HarnessId::Mock);
+
+    wait_for(|| delivered() == 1, "the notice to run after the update").await;
+    settle(&rig, 2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(delivered(), 1, "the notice was replayed");
+    rig.core.sessions.shutdown().await;
+}

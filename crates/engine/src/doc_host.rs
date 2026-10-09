@@ -4542,11 +4542,16 @@ impl DocHost {
         sessions: &SessionsEngine,
         handle: &Arc<ChatDocHandle>,
         stop_id: &str,
+        prepaused: bool,
     ) -> Result<bool, EngineError> {
         let _drain = handle.drain_lock.lock().await;
         if !sessions.turn_in_flight(&handle.chat_id)
             && !sessions.holds_background_work(&handle.chat_id)
         {
+            let stopped_by = lock(&handle.stopped_by);
+            if prepaused && stopped_by.as_deref() == Some(stop_id) {
+                handle.queue_paused.store(false, Ordering::Release);
+            }
             return Ok(false);
         }
         {
@@ -6003,9 +6008,9 @@ impl DocHost {
                     sessions.cancel_sent_messages(&handle.chat_id, earlier);
                 }
                 let interrupted = self
-                    .interrupt_and_pause_queue(sessions, handle, &entry.id)
+                    .interrupt_and_pause_queue(sessions, handle, &entry.id, should_pause)
                     .await?;
-                if interrupted {
+                if interrupted || should_pause {
                     // The status watcher normally retries the paused queue on
                     // the run's Idle transition. Kick it here too: the Stop
                     // command already owns the serialization point, and the
@@ -7017,6 +7022,53 @@ mod stop_fenced_hold_tests {
             handle
                 .queue_paused
                 .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_after_turn_settled_releases_only_its_own_prepause() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store opens"));
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let sessions = crate::sessions::SessionsEngine::new(
+            "device-a".into(),
+            Arc::new(crate::run_journal::RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(crate::registry::HarnessRegistry::new()),
+        );
+        let handle = host.open("chat-late-stop").expect("chat opens");
+
+        *lock(&handle.stopped_by) = Some("late-stop".into());
+        handle.queue_paused.store(true, Ordering::Release);
+        assert!(
+            !host
+                .interrupt_and_pause_queue(&sessions, &handle, "late-stop", true)
+                .await
+                .expect("idle Stop resolves")
+        );
+        assert!(
+            !handle.queue_paused.load(Ordering::Acquire),
+            "a Stop that found the turn already settled must lift its own pre-pause"
+        );
+
+        handle.queue_paused.store(true, Ordering::Release);
+        *lock(&handle.stopped_by) = Some("idle-stop".into());
+        assert!(
+            !host
+                .interrupt_and_pause_queue(&sessions, &handle, "idle-stop", false)
+                .await
+                .expect("idle Stop resolves")
+        );
+        assert!(
+            handle.queue_paused.load(Ordering::Acquire),
+            "an idle Stop must not thaw a pause an earlier Stop left"
         );
     }
 }

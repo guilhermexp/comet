@@ -17,8 +17,7 @@ pub fn create_parent_path(selected: Option<&str>, selected_is_dir: bool) -> Stri
 
 pub fn validate_create_name(name: &str, sibling_names: &[&str]) -> Result<(), String> {
     validate_workspace_create_name(name).map_err(|error| error.as_str().to_string())?;
-    let leaf = name.rsplit('/').next().unwrap_or(name);
-    if sibling_name_taken(sibling_names.iter().copied(), leaf) {
+    if !name.contains('/') && sibling_name_taken(sibling_names.iter().copied(), name) {
         return Err("an entry with that name already exists".into());
     }
     Ok(())
@@ -47,6 +46,10 @@ mod tests {
             "name contains an invalid component"
         );
         assert_eq!(validate_create_name("docs/adr/0001.md", &[]), Ok(()));
+        assert_eq!(
+            validate_create_name("docs/README.md", &["README.md"]),
+            Ok(())
+        );
     }
 
     #[test]

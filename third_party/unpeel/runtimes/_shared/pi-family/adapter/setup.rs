@@ -351,6 +351,7 @@ await handlers.get("agent_end")({{}}, context);
             .join("2026-10-08T12-00-00-000Z_primary")
             .join("PgliteSqlCheck.jsonl");
         let explicit_main_file = nested_file.clone();
+        let unflushed_nested_file = nested_file.with_file_name("NotYetFlushed.jsonl");
         let resumed_file = default_sessions.join("2026-10-08T12-30-00-000Z_resumed.jsonl");
         std::fs::create_dir_all(nested_file.parent().expect("nested transcript directory"))
             .expect("create OMP session artifacts directory");
@@ -417,6 +418,12 @@ const nestedAlias = {{
     getSessionFile() {{ return {nested_alias_file}; }},
   }},
 }};
+const unflushedNested = {{
+  sessionManager: {{
+    getSessionId() {{ return "unflushed-child"; }},
+    getSessionFile() {{ return {unflushed_nested_file}; }},
+  }},
+}};
 const primary = {{
   sessionManager: {{
     getSessionId() {{ return "opus-primary"; }},
@@ -448,6 +455,7 @@ const explicitMain = {{
 }};
 await handlers.get("agent_start")({{}}, nested);
 await handlers.get("agent_end")({{}}, nestedAlias);
+await handlers.get("agent_start")({{}}, unflushedNested);
 await handlers.get("ui_prompt_start")({{ kind: "custom", reason: "ui_prompt" }}, nested);
 await handlers.get("ui_prompt_end")({{}}, nested);
 await handlers.get("agent_start")({{}}, inMemorySubagent);
@@ -463,6 +471,8 @@ await handlers.get("agent_end")({{}}, reboundPrimary);
                 nested_file = serde_json::to_string(&nested_file.to_string_lossy()).unwrap(),
                 nested_alias_file =
                     serde_json::to_string(&nested_alias_file.to_string_lossy()).unwrap(),
+                unflushed_nested_file =
+                    serde_json::to_string(&unflushed_nested_file.to_string_lossy()).unwrap(),
                 primary_file = serde_json::to_string(&primary_file.to_string_lossy()).unwrap(),
                 explicit_primary =
                     serde_json::to_string(&explicit_primary.to_string_lossy()).unwrap(),
