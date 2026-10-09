@@ -4532,6 +4532,14 @@ impl DocHost {
         }
     }
 
+    /// Publish `stop_id` as the latest Stop and pause the queue for it.
+    /// Returns whether this Stop moved the queue from running to paused.
+    fn begin_stop(handle: &ChatDocHandle, stop_id: &str, should_pause: bool) -> bool {
+        let mut stopped_by = lock(&handle.stopped_by);
+        *stopped_by = Some(stop_id.to_owned());
+        should_pause && !handle.queue_paused.swap(true, Ordering::AcqRel)
+    }
+
     /// Stop the active turn without treating the resulting Idle transition as
     /// permission to release the next queued message. The same lock used by
     /// drains closes the race between clicking Cancel and the status watcher.
@@ -4542,37 +4550,32 @@ impl DocHost {
         sessions: &SessionsEngine,
         handle: &Arc<ChatDocHandle>,
         stop_id: &str,
-        prepaused: bool,
+        paused_by_stop: bool,
     ) -> Result<bool, EngineError> {
         let _drain = handle.drain_lock.lock().await;
+        let release_own_pause = |owns_pause: bool| {
+            let stopped_by = lock(&handle.stopped_by);
+            let release = owns_pause && stopped_by.as_deref() == Some(stop_id);
+            if release {
+                handle.queue_paused.store(false, Ordering::Release);
+            }
+            release
+        };
         if !sessions.turn_in_flight(&handle.chat_id)
             && !sessions.holds_background_work(&handle.chat_id)
         {
-            let stopped_by = lock(&handle.stopped_by);
-            if prepaused && stopped_by.as_deref() == Some(stop_id) {
-                handle.queue_paused.store(false, Ordering::Release);
-            }
-            return Ok(false);
+            return Ok(release_own_pause(paused_by_stop));
         }
-        {
+        let owns_pause = {
             let _stopped_by = lock(&handle.stopped_by);
-            handle.queue_paused.store(true, Ordering::Release);
-        }
+            !handle.queue_paused.swap(true, Ordering::AcqRel) || paused_by_stop
+        };
         self.cancel_held_sends(handle);
         match sessions.interrupt(&handle.chat_id).await {
             Ok(true) => Ok(true),
-            Ok(false) => {
-                let stopped_by = lock(&handle.stopped_by);
-                if stopped_by.as_deref() == Some(stop_id) {
-                    handle.queue_paused.store(false, Ordering::Release);
-                }
-                Ok(false)
-            }
+            Ok(false) => Ok(release_own_pause(owns_pause)),
             Err(err) => {
-                let stopped_by = lock(&handle.stopped_by);
-                if stopped_by.as_deref() == Some(stop_id) {
-                    handle.queue_paused.store(false, Ordering::Release);
-                }
+                release_own_pause(owns_pause);
                 Err(err)
             }
         }
@@ -5974,13 +5977,7 @@ impl DocHost {
                     .await;
                 let should_pause =
                     sessions.turn_in_flight(chat_id) || sessions.holds_background_work(chat_id);
-                {
-                    let mut stopped_by = lock(&handle.stopped_by);
-                    *stopped_by = Some(entry.id.clone());
-                    if should_pause {
-                        handle.queue_paused.store(true, Ordering::Release);
-                    }
-                }
+                let paused_by_stop = Self::begin_stop(handle, &entry.id, should_pause);
                 // Sends before this Stop that are still on their way (a slow
                 // dispatch the wait above gave up on) are cancelled with it.
                 if let Ok(commands) = handle.doc.read_commands()
@@ -6007,10 +6004,10 @@ impl DocHost {
                         .collect();
                     sessions.cancel_sent_messages(&handle.chat_id, earlier);
                 }
-                let interrupted = self
-                    .interrupt_and_pause_queue(sessions, handle, &entry.id, should_pause)
+                let drain = self
+                    .interrupt_and_pause_queue(sessions, handle, &entry.id, paused_by_stop)
                     .await?;
-                if interrupted || should_pause {
+                if drain {
                     // The status watcher normally retries the paused queue on
                     // the run's Idle transition. Kick it here too: the Stop
                     // command already owns the serialization point, and the
@@ -7045,30 +7042,49 @@ mod stop_fenced_hold_tests {
         );
         let handle = host.open("chat-late-stop").expect("chat opens");
 
-        *lock(&handle.stopped_by) = Some("late-stop".into());
-        handle.queue_paused.store(true, Ordering::Release);
+        assert!(DocHost::begin_stop(&handle, "late-stop", true));
         assert!(
-            !host
-                .interrupt_and_pause_queue(&sessions, &handle, "late-stop", true)
+            host.interrupt_and_pause_queue(&sessions, &handle, "late-stop", true)
                 .await
-                .expect("idle Stop resolves")
+                .expect("idle Stop resolves"),
+            "lifting its own pre-pause must kick the drain"
         );
         assert!(
             !handle.queue_paused.load(Ordering::Acquire),
             "a Stop that found the turn already settled must lift its own pre-pause"
         );
 
-        handle.queue_paused.store(true, Ordering::Release);
-        *lock(&handle.stopped_by) = Some("idle-stop".into());
+        let follow_up =
+            zeron_doc::QueuedMessage::new("follow-up", "ordinary follow-up", "device-a");
+        handle
+            .doc()
+            .push_queued(&follow_up)
+            .expect("queue ordinary follow-up");
+        assert!(DocHost::begin_stop(&handle, "stop-1", true));
+        assert!(
+            !DocHost::begin_stop(&handle, "stop-2", true),
+            "a Stop arriving while an earlier Stop's pause holds does not own it"
+        );
         assert!(
             !host
-                .interrupt_and_pause_queue(&sessions, &handle, "idle-stop", false)
+                .interrupt_and_pause_queue(&sessions, &handle, "stop-2", false)
                 .await
-                .expect("idle Stop resolves")
+                .expect("late Stop resolves"),
+            "a late Stop must not kick a drain for a pause it did not create"
         );
         assert!(
             handle.queue_paused.load(Ordering::Acquire),
-            "an idle Stop must not thaw a pause an earlier Stop left"
+            "a late Stop must not thaw the pause an earlier Stop left"
+        );
+        assert_eq!(
+            handle
+                .doc()
+                .read_queue()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec!["follow-up".to_string()]
         );
     }
 }
