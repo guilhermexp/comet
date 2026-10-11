@@ -1026,11 +1026,6 @@ fn render_table(
                 let flat: &FlatText = measured.as_ref().unwrap_or(&flat);
                 let mut cell_width = 0.0f32;
                 for (range, chip) in super::inline_chips::segments(flat) {
-                    if !chip && &flat.text[range.clone()] == "\n" {
-                        *natural = cell_width.max(*natural);
-                        cell_width = 0.0;
-                        continue;
-                    }
                     let leads_link = super::inline_chips::web_links(flat)
                         .any(|(link, _)| link.start == range.start);
                     let part = super::inline_chips::fragment(&flat, range);
