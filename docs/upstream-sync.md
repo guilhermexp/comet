@@ -21,6 +21,43 @@ Cada execução autorizada tem um YAML próprio, incluindo `unchanged`, falhas e
 
 Primeiro uso da skill: [2026-10-09, sem novidades](../.upstream-sync/history/20261009T171751Z-1c4bfd40.yaml). Os relatos anteriores permanecem preservados neste documento e nas OpenSpecs, sem reconstrução artificial de execuções.
 
+## Automação recorrente
+
+O [workflow sync-fork](../.github/workflows/sync-fork.yml), instalado a partir de `sync-fork` 1.1.0 do harness, executa no GitHub Actions (`ubuntu-latest`), não na box. Origem: branch padrão de `zeronsh/zeron`; destino fixo: `guilhermexp/comet:main`. Cron `17 */6 * * *`: 00:17, 06:17, 12:17 e 18:17 UTC, sujeito à fila do GitHub. Há disparo manual em [Actions](https://github.com/guilhermexp/comet/actions/workflows/sync-fork.yml).
+
+- **Sem conflito:** API `merge-upstream` atualiza diretamente o fork, conforme autorizado pelo dono. Merge textual limpo não comprova compatibilidade nem execução dos testes.
+- **Com conflito:** Git confirma os arquivos conflitantes; o workflow publica no fork uma branch no SHA upstream e abre PR draft com data, revisões, arquivos e link do run. O destino não é atualizado e o job termina com falha, pois a integração continua pendente.
+- **PR gerenciada aberta:** as próximas execuções informam seu link e param antes do sync. Não duplicam PR, não substituem commits humanos nem seguem uma revisão upstream mais nova silenciosamente. Para trocar o snapshot, feche a PR conscientemente e dispare outro run.
+- **Outros erros:** autenticação, rede, regras ou permissões não são tratados como conflito. Sem force-push, bypass, auto-merge de PR ou agente automático. O diagnóstico não executa código do upstream.
+
+### Credencial e efeitos
+
+O secret `SYNC_FORK_TOKEN` foi provisionado em 2026-10-11, com autorização explícita para reutilizar a credencial autenticada do `gh`. Seu alcance é o dessa credencial, não restrito por este workflow ao Comet; nunca copie seu valor para docs, brief, logs ou chat. Rotação/revogação exige atualizar o secret. A alternativa de menor alcance é um token dedicado ao fork com Contents, Pull requests e Workflows em escrita.
+
+O workflow exige `SYNC_FORK_TOKEN` e falha antes de acessar a API se estiver ausente; não usa `GITHUB_TOKEN` como fallback, pois isso suprimiria disparos de CI e perderia permissões necessárias. A configuração padrão de Actions do repo permanece com permissão de leitura e criação/aprovação de PRs pelo token padrão desabilitada; a automação usa a credencial autorizada, sem mudar essas opções administrativas.
+
+Push/PR por essa credencial pode disparar CI. O deploy herdado só publica com `CLOUDFLARE_API_TOKEN`; na instalação esse secret não existia. Nenhuma credencial Cloudflare foi criada. Não há push de tags `v*`. Se forem adicionadas credenciais de deploy no futuro, reavalie seus efeitos antes de manter sync direto.
+
+Runs e PRs são os registros da automação; ela **não** gera um YAML de histórico a cada tick. Os registros versionados descritos acima pertencem às execuções assistidas da `upstream-sync`.
+
+### Resolver uma PR na box, sob demanda
+
+1. O Main lê a PR pelo fork explícito (`gh pr view NUMERO -R guilhermexp/comet`), fixa as revisões atuais de base/head e confere commits humanos existentes. A PR registra um diagnóstico passado; compare-o com o Git atual.
+2. Use a skill `agents-box` do harness para conferir estado, sessões, disco e WIP de `agents-us/comet` (`/home/agent/projects/comet`). Não altere worktrees ou sessões de outra tarefa. O `upstream` da box tem push desativado.
+3. Com autorização para resolver aquela PR, prepare ticket/brief e worktree exclusivo a partir da base do fork, incorporando o head da PR. O Main leva ao brief as instruções vigentes da `upstream-sync`, os contratos abaixo e os checks pertinentes; não presuma que as skills locais do Mac estejam instaladas na box.
+4. O agente resolve preservando customizações e commits humanos, atualiza `.upstream-sync/history/` e entrega provas. Checks Linux rodam na box pela receita `agents-box`, sem wrappers de limpeza feitos para o disco do Mac; provas específicas macOS/iOS continuam no ambiente correspondente. Sem compilação do Comet só para listar conflitos.
+5. Após conferir a entrega, publique a resolução na branch da PR **no fork**, por avanço normal, sem force. Revisão, checks e aceite precedem o merge da PR. Remova apenas sessões, worktrees e builds exclusivos da tarefa quando deixarem de servir à entrega.
+
+Não há cron de agente, webhook público, runner self-hosted nem ligação automática entre a PR e a box.
+
+### Comprovação da automação
+
+Depois de publicar o workflow na `main`, dispare `gh workflow run sync-fork.yml -R guilhermexp/comet --ref main`, identifique o run pela revisão/evento/janela do disparo e acompanhe seu ID com `gh run watch ID -R guilhermexp/comet --exit-status`.
+
+Confira o resultado remoto, não apenas o exit: no sync limpo, SHA/ancestralidade do destino; em conflito, base/head/draft, arquivos e revisões da PR, destino preservado e link do run. O vermelho de conflito é esperado; erro sem PR não comprova o fluxo. Reexecutar com a PR aberta deve manter a mesma PR e os mesmos refs, sem tentar outro merge.
+
+Prova de instalação não equivale a resolução dos conflitos, CI de produto verde ou deploy. Não fabrique conflitos no repositório do dono. A regressão é mantida na skill do harness, com Git real e transporte HTTP simulado; execute no harness `python3 .agents/skills/sync-fork/tests/test_sync_fork.py --workflow <checkout-comet>/.github/workflows/sync-fork.yml` para exercitar esta cópia instalada, incluindo ausência de credencial e conflitos estruturais sem arquivos individuais.
+
 ## Receita
 
 1. **Buscar o upstream** sem remote fixo e sem tags locais `v*`, que o `release.yml` publicaria:
@@ -50,7 +87,7 @@ Primeiro uso da skill: [2026-10-09, sem novidades](../.upstream-sync/history/202
    - A regressão ampla `cargo test --workspace --no-fail-fast` fica preferencialmente no CI existente; registrar a revisão e os jobs realmente executados. Não declarar CI verde para commits locais ainda não publicados nem repetir bateria pesada só para espelhar CI.
    - Se tocar a Edge: `npm -C edge run typecheck && npm -C edge run test`.
 9. **Comparar linha a linha.** Para cada commit do upstream que foi aceito, procurar as linhas que ele acrescentou, que ainda existem no upstream final e que faltam no nosso código. Isso pega o que se perdeu sem querer na resolução.
-10. **DOX:** atualizar os `AGENTS.md` donos, a OpenSpec e **este arquivo**.
+10. **Closeout:** registre a execução em `.upstream-sync/history/`; reconcilie os `AGENTS.md` donos e a OpenSpec conforme o delta. Atualize esta receita somente quando houver nova decisão ou armadilha durável, sem duplicar nela o relato por execução.
 11. **Publicação:** push só no `origin` (`guilhermexp/comet`), só quando o dono pedir, e com `gh -R guilhermexp/comet`. Nunca pushar para o upstream. Nunca pushar tag `v*`.
 
 ## Contratos do fork que sempre vencem

@@ -1,0 +1,192 @@
+# Adapted from zengsipei/sync-fork-skill (MIT); see references/origin.md in the skill.
+# Copyright (c) 2026 zengsipei
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Sync or open a conflict PR
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_FORK_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Empty selects the fork's default branch. Upstream is its parent's default branch.
+          BRANCH: main
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from datetime import datetime, timezone
+          from urllib.error import HTTPError
+          from urllib.parse import quote, urlencode
+          from urllib.request import Request, urlopen
+
+          repo = os.environ['REPO']
+          api_url = os.environ['GITHUB_API_URL'].rstrip('/')
+          token = os.environ.get('GH_TOKEN')
+          if not token:
+              raise SystemExit('SYNC_FORK_TOKEN is required; configure the authorized sync credential before running.')
+          headers = {
+              'Authorization': 'Bearer ' + token,
+              'Accept': 'application/vnd.github+json',
+              'Content-Type': 'application/json',
+              'X-GitHub-Api-Version': '2022-11-28',
+          }
+
+          def api(path, method='GET', data=None):
+              payload = None if data is None else json.dumps(data).encode()
+              request = Request(api_url + '/' + path, data=payload, headers=headers, method=method)
+              with urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          def revision(repository, branch):
+              return api(f'repos/{repository}/git/ref/heads/{quote(branch, safe="")}')['object']['sha']
+
+          def pending_prs(branch):
+              page = 1
+              while True:
+                  query = urlencode({'state': 'open', 'base': branch, 'per_page': 100, 'page': page})
+                  batch = api(f'repos/{repo}/pulls?{query}')
+                  yield from batch
+                  if len(batch) < 100:
+                      return
+                  page += 1
+
+          def report(message):
+              print(message)
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                      summary.write(message + '\n')
+
+          def main():
+              metadata = api(f'repos/{repo}')
+              if not metadata.get('fork') or not metadata.get('parent'):
+                  raise RuntimeError('Destination is not a GitHub fork.')
+              branch = os.environ.get('BRANCH') or metadata['default_branch']
+              parent = metadata['parent']
+              upstream = parent['full_name']
+              source_branch = parent['default_branch']
+              prefix = 'sync-fork/' + hashlib.sha256(branch.encode()).hexdigest()[:12] + '/'
+              marker = '<!-- sync-fork:v1 -->'
+              for pr in pending_prs(branch):
+                  if (pr['head']['ref'].startswith(prefix)
+                          and (pr['head'].get('repo') or {}).get('full_name') == repo
+                          and marker in (pr.get('body') or '')):
+                      report(f'Pending conflict PR: {pr["html_url"]}. No sync or branch update attempted; resolve or close it first.')
+                      return 1
+
+              try:
+                  result = api(f'repos/{repo}/merge-upstream', 'POST', {'branch': branch})
+              except HTTPError as error:
+                  if error.code != 409:
+                      raise
+              else:
+                  report(f'Sync completed for {repo}:{branch}: {json.dumps(result)}')
+                  return 0
+
+              # An HTTP 409 alone is not a file-conflict diagnosis. Confirm it with Git.
+              base = revision(repo, branch)
+              target = revision(upstream, source_branch)
+              with tempfile.TemporaryDirectory(prefix='sync-fork-') as temporary:
+                  def git(*args, check=True):
+                      return subprocess.run(
+                          ['git', '-c', 'credential.helper=', '-c',
+                           'credential.https://github.com.helper=!gh auth git-credential', *args],
+                          cwd=temporary, check=check, capture_output=True,
+                      )
+                  git('init', '--bare', '--quiet')
+                  git('fetch', '--no-tags', '--no-recurse-submodules', f'https://github.com/{repo}.git', base)
+                  git('fetch', '--no-tags', '--no-recurse-submodules', f'https://github.com/{upstream}.git', target)
+                  merge = git('merge-tree', '--write-tree', '--name-only', '-z', base, target, check=False)
+                  if merge.returncode != 1:
+                      raise RuntimeError(f'HTTP 409, but Git did not confirm conflicts (exit {merge.returncode}). Re-run after checking revisions and repository rules.')
+                  fields = merge.stdout.split(b'\0')
+                  separator = fields.index(b'', 1)
+                  paths = fields[1:separator]
+                  messages = []
+                  cursor = separator + 1
+                  while cursor < len(fields) - 1:
+                      path_count = int(fields[cursor])
+                      messages.append(os.fsdecode(fields[cursor + path_count + 2]))
+                      cursor += path_count + 3
+                  files = [os.fsdecode(path) for path in paths]
+
+              if revision(repo, branch) != base or revision(upstream, source_branch) != target:
+                  raise RuntimeError('A branch moved during diagnosis. No PR published; re-run for fresh revisions.')
+              head = prefix + target
+              try:
+                  api(f'repos/{repo}/git/refs', 'POST', {'ref': 'refs/heads/' + head, 'sha': target})
+              except HTTPError as error:
+                  if error.code != 422 or revision(repo, head) != target:
+                      raise
+
+              run_url = f'https://github.com/{repo}/actions/runs/{os.environ["GITHUB_RUN_ID"]}'
+              file_list = '\n'.join(json.dumps(path, ensure_ascii=True) for path in files)
+              diagnostics = '\n'.join(json.dumps(message, ensure_ascii=True) for message in messages)
+              body = (
+                  f'{marker}\n## Upstream sync blocked by conflicts\n\n'
+                  f'- Checked at: {datetime.now(timezone.utc).isoformat()}\n'
+                  f'- Fork: `{repo}:{branch}` at `{base}`\n'
+                  f'- Upstream: `{upstream}:{source_branch}` at `{target}`\n'
+                  f'- Run: {run_url}\n\n'
+                  f'### Conflicting files ({len(files)})\n\n```json\n{file_list}\n```\n\n'
+                  f'### Git diagnostics\n\n```text\n{diagnostics}\n```\n\n'
+                  'This draft contains the upstream snapshot, not a resolved merge. '
+                  'The destination branch was not updated. No agent was invoked and no tests were run.\n\n'
+                  'Resolve on this fork-owned PR branch with the `upstream-sync` skill, '
+                  'preserving fork customizations, then run the project checks and review before merging. '
+                  'The scheduled job pauses while this PR remains open; it never overwrites human fixes. '
+                  'If a newer upstream revision is required, close this PR and dispatch a new run.\n'
+              )
+              pr = api(f'repos/{repo}/pulls', 'POST', {
+                  'title': f'Upstream sync conflicts: {target[:12]}',
+                  'head': head, 'base': branch, 'body': body, 'draft': True,
+              })
+              observed = api(f'repos/{repo}/pulls/{pr["number"]}')
+              if observed['head']['sha'] != target or observed['base']['ref'] != branch:
+                  raise RuntimeError('Created PR does not match the diagnosed revisions. Inspect it before proceeding.')
+              report(f'Conflicts require review: {observed["html_url"]}. The sync remains blocked.')
+              return 1
+
+          try:
+              raise SystemExit(main())
+          except (HTTPError, OSError, RuntimeError, subprocess.CalledProcessError) as error:
+              report(f'Sync failed ({type(error).__name__}): {error}. Check credentials, workflow permissions and branch rules; no force or bypass is attempted.')
+              raise SystemExit(1)
+          PY

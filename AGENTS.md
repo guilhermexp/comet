@@ -40,11 +40,12 @@ Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml`
 
 ## Remotes e publicação
 
-- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/zeron` (terceiro, MIT; renomeado de `zeronsh/comet`). O upstream reassinou o histórico em set/2026. Receita, decisões e histórico anterior: [`docs/upstream-sync.md`](docs/upstream-sync.md). Desde 2026-10-09, cada execução da skill gera um [registro YAML versionado](.upstream-sync/history/), inclusive sem novidades ou com falha; confronte os registros com o Git atual antes do próximo sync.
+- `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/zeron` (terceiro, MIT; renomeado de `zeronsh/comet`). O upstream reassinou o histórico em set/2026. Receita, decisões e histórico anterior: [`docs/upstream-sync.md`](docs/upstream-sync.md). Desde 2026-10-09, cada execução da skill `upstream-sync` gera um [registro YAML versionado](.upstream-sync/history/), inclusive sem novidades ou com falha; confronte os registros com o Git atual antes do próximo sync.
 - **Nunca pushar para o upstream.** Qualquer push vai pro fork.
 - `gh` resolve pro upstream por default: **sempre passar `-R guilhermexp/comet`** em `gh run list`, `gh release view`, etc.
 - `.github/workflows/{deploy,release}.yml` são herdados do upstream: `deploy` publica o Worker Cloudflare em push na `main` que toque `edge/`; `release` dispara em tag `v*` e publica no R2. **Não pushar tag `v*` no fork sem entender o efeito.**
-- Push passa pelo gate `no-mistakes` (`git push no-mistakes <branch>`); status sempre do checkout principal, nunca de worktree.
+- Publicação local segue a decisão de 2026-10-02 em `CLAUDE.md`: mudança pequena/localizada pode ir direto para `main` por `git push origin HEAD:main`; `no-mistakes` fica para mudanças grandes ou pedido explícito. Status do gate sempre no checkout principal, nunca em worktree.
+- **Sync recorrente:** [sync-fork.yml](.github/workflows/sync-fork.yml) roda no GitHub Actions a cada seis horas (UTC) e aceita disparo manual. Política autorizada: sync direto se limpo; PR draft de diagnóstico se conflitar; PR aberta pausa novos syncs. Resolução por agente na `agents-us` é sob demanda, nunca automática. Credencial, limites, prova remota e procedimento da box ficam em [`docs/upstream-sync.md`](docs/upstream-sync.md#automação-recorrente).
 
 ## Gotchas duráveis
 
@@ -53,7 +54,7 @@ Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml`
 
 - **`cargo run` usa o checkout atual do Comet e o OMP instalado.** Não impor OMP de fonte em `.cargo/config.toml`: desenvolvimento com o checkout irmão é opt-in via `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` (contrato em `scripts/AGENTS.md`). Outro worktree tem código e binário próprios; executar ali não inclui mudanças locais deste checkout.
 
-- **Sync com o upstream é frequente** (várias versões por semana). A receita que faz o merge passar é `cargo fmt --all` do nosso lado **antes** do merge. Conflitos se resolvem a favor do fork, e o motivo de cada um vai no corpo do commit de merge. O closeout de todo sync atualiza `docs/upstream-sync.md`.
+- **Sync com o upstream é frequente** (várias versões por semana). Na integração assistida, rode `cargo fmt --all` do nosso lado **antes** do merge. Preserve a intenção do fork ao resolver cada conflito e registre o motivo. O closeout da skill `upstream-sync` atualiza seu histórico e reconcilia `docs/upstream-sync.md`; a automação recorrente tem o contrato próprio nessa documentação.
 - `crates/tui` / `apps/tui` foram **deletados** (upstream removeu o viewport ratatui). Isso **não** é o painel de terminal dentro do app — esse vive em `crates/ui/src/terminal/` e está intacto.
 - `dist/` guarda **assets-fonte** de packaging (ícone, `.desktop`, `Info.plist`), consumidos por `scripts/package-*.sh` e pelo workflow de release. Só `edge/dist/` é gerado/ignorado — não apagar a `dist/` da raiz.
 - Build do gpui é caro; `[profile.dev]` já usa `opt-level = 2` pras deps. Primeira build leva minutos.
@@ -104,6 +105,7 @@ Suítes canônicas por superfície (detalhe e matriz `Test:` ficam no `AGENTS.md
 | Edge Cloudflare | `npm -C edge run test` (unit + workerd) |
 | Cliente iOS | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=<device do runtime instalado>'` |
 | Fluxo headed/headless | `scripts/e2e-smoke.sh` |
+| Sync recorrente | Disparar `gh workflow run sync-fork.yml -R guilhermexp/comet --ref main`; acompanhar o run exato e conferir SHA/PR conforme [`docs/upstream-sync.md`](docs/upstream-sync.md#comprovação-da-automação) |
 
 ### Build
 
