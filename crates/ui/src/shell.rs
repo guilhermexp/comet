@@ -8699,6 +8699,8 @@ impl Shell {
         inner: AnyElement,
     ) -> AnyElement {
         div()
+            .id("sidebar-column")
+            .debug_selector(|| "sidebar-column".into())
             .h_full()
             .flex_none()
             .overflow_hidden()

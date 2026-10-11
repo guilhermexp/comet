@@ -408,6 +408,8 @@ impl Shell {
             && !matches!(self.resolved_right_active(cx), RightSurface::Picker))
         .then(|| {
             div()
+                .id("right-titlebar-controls")
+                .debug_selector(|| "right-titlebar-controls".into())
                 .absolute()
                 .top_0()
                 .right(px(details_now + files_now))
