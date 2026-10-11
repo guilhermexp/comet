@@ -368,6 +368,8 @@ impl GitHubCli {
         F: std::future::Future<Output = PrResult> + Send + 'static,
     {
         use futures::FutureExt;
+        let _ = self.store_account().await;
+        let account_guard = self.account.lock().await;
         let mut cache = self.pr_cache.lock().await;
         if let Some(index) = cache.entries.iter().position(|entry| entry.0 == key) {
             let entry = cache.entries.remove(index);
@@ -405,14 +407,14 @@ impl GitHubCli {
                         .await
                         .unwrap_or(Err(ChangeRequestError::CommandFailed));
                     let mut cache = shared.lock().await;
-                    if matches!(result, Err(ChangeRequestError::RateLimited)) {
-                        cache.rate_limited_at = Some(Instant::now());
-                    }
                     if cache
                         .in_flight
                         .get(&task_key)
                         .is_some_and(|(current, _)| *current == id)
                     {
+                        if matches!(result, Err(ChangeRequestError::RateLimited)) {
+                            cache.rate_limited_at = Some(Instant::now());
+                        }
                         cache.in_flight.remove(&task_key);
                         cache.entries.retain(|entry| entry.0 != task_key);
                         cache
@@ -433,6 +435,7 @@ impl GitHubCli {
             }
         };
         drop(cache);
+        drop(account_guard);
         pending.await
     }
 
@@ -782,6 +785,13 @@ impl GitHubCli {
         self
     }
 
+    async fn invalidate_pr_cache(&self) {
+        let mut cache = self.pr_cache.lock().await;
+        cache.entries.clear();
+        cache.in_flight.clear();
+        cache.rate_limited_at = None;
+    }
+
     /// The active github.com account, read from `gh`'s local config (no
     /// network). Re-read every 30 seconds so `gh auth switch` takes effect.
     /// `None` when it can't be told — including a token in the environment,
@@ -791,6 +801,12 @@ impl GitHubCli {
             .iter()
             .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
         {
+            let mut account = self.account.lock().await;
+            let changed = account.as_ref().is_some_and(|(_, login)| login.is_some());
+            *account = Some((Instant::now() - Duration::from_secs(31), None));
+            if changed {
+                self.invalidate_pr_cache().await;
+            }
             return None;
         }
         let mut account = self.account.lock().await;
@@ -824,7 +840,13 @@ impl GitHubCli {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             });
+        let changed = account
+            .as_ref()
+            .is_some_and(|(_, current)| current != &login);
         *account = Some((Instant::now(), login.clone()));
+        if changed {
+            self.invalidate_pr_cache().await;
+        }
         login
     }
 
@@ -859,13 +881,16 @@ impl GitHubCli {
             && !refresh
             && let Some((store, account)) = &stored
             && let Some(page) = store.load(account, repository, filter).await
+            && self.store_account().await.as_deref() == Some(account.as_str())
         {
             return Ok(page);
         }
         let page = self
             .fetch_list_page(repository, filter, after, refresh)
             .await?;
-        if let Some((store, account)) = stored {
+        if let Some((store, account)) = stored
+            && self.store_account().await.as_deref() == Some(account.as_str())
+        {
             store.save(&account, repository, filter, &page).await;
         }
         Ok(page)
@@ -1553,6 +1578,13 @@ impl GhPrMetadata {
     fn checks(&self) -> Option<Vec<zeron_proto::ChangeRequestCheck>> {
         match self.status_check_rollup.as_ref()? {
             None => Some(Vec::new()),
+            Some(rollup)
+                if rollup.commit.as_ref().is_some_and(|commit| {
+                    Some(commit.oid.as_str()) != self.head_ref_oid.as_deref()
+                }) =>
+            {
+                Some(Vec::new())
+            }
             Some(rollup) => rollup.contexts.nodes.as_ref().map(|nodes| {
                 nodes
                     .iter()
@@ -2045,6 +2077,18 @@ mod tests {
         }
     }
 
+    async fn github_with_account(runner: Arc<dyn ProcessRunner>, login: &str) -> GitHubCli {
+        let github = GitHubCli::with_runner(runner);
+        *github.account.lock().await = Some((Instant::now(), Some(login.into())));
+        github
+    }
+
+    async fn expire_account(github: &GitHubCli) {
+        if let Some((read_at, _)) = github.account.lock().await.as_mut() {
+            *read_at = Instant::now() - Duration::from_secs(31);
+        }
+    }
+
     #[async_trait]
     impl ProcessRunner for FakeProcessRunner {
         async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
@@ -2220,7 +2264,7 @@ mod tests {
             command_success(serde_json::to_vec(&threads_empty).unwrap()),
             command_failure("authentication required: gh auth login; private-provider-diagnostic"),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         let rpc = Arc::try_unwrap(core.rpc_service())
             .ok()
             .unwrap()
@@ -2492,7 +2536,7 @@ mod tests {
             command_success(br#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}"#.to_vec()),
             command_success("new patch"),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         for key in [
             format!("false:{url}::"),
             format!("false:{url}:{old}:"),
@@ -2698,7 +2742,8 @@ mod tests {
     #[tokio::test]
     async fn pr_detail_normalizes_absent_github_fields_and_uses_bounded_process() {
         let runner = FakeProcessRunner::with_responses([command_success(br#"{"number":12,"title":"A PR","body":"Description","author":null,"reviewDecision":null,"comments":[{"viewerDidAuthor":true,"author":{"login":"viewer"},"body":"Own comment"},{"author":{"login":"other"},"body":"Other comment"}],"statusCheckRollup":[{"name":"build","status":"IN_PROGRESS","conclusion":null}]}"#.to_vec()), command_failure("review threads unavailable")]);
-        let detail = GitHubCli::with_runner(runner.clone())
+        let github = github_with_account(runner.clone(), "fixture").await;
+        let detail = github
             .detail("https://github.com/a/b/pull/12", false)
             .await
             .unwrap();
@@ -2718,6 +2763,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pr_detail_checks_and_assessment_only_attest_to_the_current_head() {
+        use serde_json::json;
+        use zeron_proto::change_request_assessment::{CiState, Facts, MissingInformation};
+
+        let head = "a".repeat(40);
+        let url = "https://github.com/acme/zeron/pull/1";
+        for (state, expected) in [
+            ("SUCCESS", CiState::Passed),
+            ("FAILURE", CiState::Failed),
+            ("PENDING", CiState::Pending),
+        ] {
+            for current in [false, true] {
+                let commit = if current {
+                    head.clone()
+                } else {
+                    "b".repeat(40)
+                };
+                let check = json!({"context": "build", "state": state});
+                let detail = json!({
+                    "number": 1, "url": url, "headRefOid": head,
+                    "statusCheckRollup": [check.clone()]
+                });
+                let metadata = json!({"data": {"repository": {"pullRequest": {
+                    "headRefOid": head,
+                    "statusCheckRollup": {
+                        "commit": {"oid": commit}, "state": state,
+                        "contexts": {"totalCount": 1, "nodes": [check]}
+                    }
+                }}}});
+                let runner = FakeProcessRunner::with_responses([
+                    command_success(serde_json::to_vec(&detail).unwrap()),
+                    command_success(serde_json::to_vec(&metadata).unwrap()),
+                    command_failure("review threads unavailable"),
+                ]);
+                let github = github_with_account(runner, "fixture").await;
+                let loaded = github.detail(url, false).await.unwrap();
+                let assessment = Facts::from_detail(&loaded).assess();
+                let expected = if current { expected } else { CiState::Unknown };
+                assert_eq!(loaded.ci.state, expected);
+                assert_eq!(assessment.ci.state, expected);
+                assert_eq!(loaded.status_check_rollup.len(), usize::from(current));
+                assert_eq!(
+                    assessment.missing.contains(&MissingInformation::Ci),
+                    !current
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pr_diff_returns_patch_and_rejects_truncated_output() {
         let mut truncated = command_success("partial").unwrap();
         truncated.stdout_truncated = true;
@@ -2725,7 +2820,7 @@ mod tests {
             command_success("diff --git a/a b/a\n"),
             Ok(truncated),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         assert_eq!(
             github
                 .diff("https://github.com/a/b/pull/12", false)
@@ -2850,7 +2945,7 @@ mod tests {
             node
         }).collect();
         let runner = FakeProcessRunner::with_responses([command_success(search_response(nodes))]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         let page = github
             .list_page(
                 "acme/zeron",
@@ -2927,7 +3022,7 @@ mod tests {
         Arc<FakeProcessRunner>,
     ) {
         let runner = FakeProcessRunner::with_responses([response]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         let result = authored(&github, "acme/zeron", false).await;
         (result, runner)
     }
@@ -3038,7 +3133,7 @@ mod tests {
             command_success(page(vec![item(1)], Some("Y3Vyc29yOjUw"))),
             command_success(page(vec![item(2)], None)),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         let filter = zeron_proto::ChangeRequestFilter::All;
         let first = github
             .list_page("acme/zeron", filter, None, false, false)
@@ -3149,6 +3244,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pr_account_switch_separates_memory_and_disk_first_pages() {
+        let page = |title: &str| {
+            command_success(search_response(vec![search_pull_request(
+                "acme/zeron",
+                1,
+                title,
+                "OPEN",
+                "UNKNOWN",
+                "2026-08-10T09:30:00Z",
+                "2026-08-19T12:00:00Z",
+                false,
+                None,
+            )]))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeProcessRunner::with_responses([
+            command_success("alice\n"),
+            page("alice result"),
+            command_success("bob\n"),
+            page("bob result"),
+        ]);
+        let github = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
+        let filter = zeron_proto::ChangeRequestFilter::All;
+
+        let alice = github
+            .list_page("acme/zeron", filter, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(alice.items[0].title, "alice result");
+        expire_account(&github).await;
+
+        let bob = github
+            .list_page("acme/zeron", filter, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(bob.items[0].title, "bob result");
+        assert_eq!(runner.requests().len(), 4);
+
+        let store = github.store.as_ref().unwrap();
+        assert_eq!(
+            store
+                .load("alice", "acme/zeron", filter)
+                .await
+                .unwrap()
+                .items[0]
+                .title,
+            "alice result"
+        );
+        assert_eq!(
+            store.load("bob", "acme/zeron", filter).await.unwrap().items[0].title,
+            "bob result"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_account_switch_does_not_reuse_detail_or_diff_cache() {
+        let url = "https://github.com/acme/zeron/pull/1";
+        let runner = FakeProcessRunner::with_responses([
+            command_success("alice\n"),
+            command_success(
+                br#"{"number":1,"title":"alice detail","url":"https://github.com/acme/zeron/pull/1"}"#
+                    .to_vec(),
+            ),
+            command_failure("review threads unavailable"),
+            command_success("alice diff"),
+            command_success("bob\n"),
+            command_success(
+                br#"{"number":1,"title":"bob detail","url":"https://github.com/acme/zeron/pull/1"}"#
+                    .to_vec(),
+            ),
+            command_failure("review threads unavailable"),
+            command_success("bob diff"),
+        ]);
+        let github = GitHubCli::with_runner(runner.clone());
+
+        let alice = github
+            .detail_request(url, false, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(alice["title"], "alice detail");
+        assert_eq!(github.diff(url, false).await.unwrap(), "alice diff");
+        expire_account(&github).await;
+        let bob = github
+            .detail_request(url, false, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(bob["title"], "bob detail");
+        assert_eq!(github.diff(url, false).await.unwrap(), "bob diff");
+        assert_eq!(runner.requests().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn stale_rate_limit_flight_cannot_replace_the_new_accounts_cache() {
+        let runner = FakeProcessRunner::with_responses([command_success("bob\n")]);
+        let github = github_with_account(runner.clone(), "alice").await;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let old_request = tokio::spawn({
+            let github = github.clone();
+            async move {
+                github
+                    .cached_pr_request("shared".into(), false, async move {
+                        receive
+                            .await
+                            .unwrap_or(Err(ChangeRequestError::CommandFailed))
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !github
+                .pr_cache
+                .lock()
+                .await
+                .in_flight
+                .contains_key("shared")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first account starts its request");
+
+        expire_account(&github).await;
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                github.cached_pr_request("shared".into(), false, async {
+                    Ok(serde_json::json!("bob result"))
+                }),
+            )
+            .await
+            .expect("the new account must not join the old account's request"),
+            Ok(serde_json::json!("bob result"))
+        );
+        send.send(Err(ChangeRequestError::RateLimited)).unwrap();
+        assert_eq!(
+            old_request.await.unwrap(),
+            Err(ChangeRequestError::RateLimited)
+        );
+
+        let cache = github.pr_cache.lock().await;
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].2, Ok(serde_json::json!("bob result")));
+        assert!(cache.in_flight.is_empty());
+        assert!(cache.rate_limited_at.is_none());
+        assert_eq!(cache.next_fetch, 2);
+    }
+
+    #[tokio::test]
     async fn pr_renamed_empty_search_follows_once_and_caches_result() {
         let redirect = serde_json::json!({"data": {
             "repository": {"nameWithOwner": "acme/new-name"},
@@ -3169,7 +3413,7 @@ mod tests {
             command_success(serde_json::to_vec(&redirect).unwrap()),
             command_success(items),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         for _ in 0..2 {
             let items = authored(&github, "acme/old-name", false).await.unwrap();
             assert_eq!(items[0].repository, "acme/new-name");
@@ -3201,7 +3445,7 @@ mod tests {
         let runner = FakeProcessRunner::with_responses(
             (0..3).map(|_| command_success(search_response(vec![]))),
         );
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         for (index, filter) in [All, Authored, Reviewing].into_iter().enumerate() {
             github
                 .list_page("acme/zeron", filter, None, false, false)
@@ -3239,7 +3483,7 @@ mod tests {
             command_success(search_response(vec![])),
             command_success(search_response(vec![])),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         let (a, b) = tokio::join!(
             authored(&github, "acme/zeron", false),
             authored(&github, "ACME/ZERON", false)
@@ -3284,7 +3528,7 @@ mod tests {
             gate: tokio::sync::Barrier::new(2),
             runs: Default::default(),
         });
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         let (diff, same_diff, list) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 github.diff("https://github.com/a/b/pull/1", false),
@@ -3309,7 +3553,7 @@ mod tests {
             gate: tokio::sync::Barrier::new(2),
             runs: Default::default(),
         });
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         let url = "https://github.com/a/b/pull/1";
         let caller = tokio::spawn({
             let github = github.clone();
@@ -3338,7 +3582,7 @@ mod tests {
             command_failure("request failed"),
             command_success(search_response(vec![])),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         for _ in 0..2 {
             assert_eq!(
                 authored(&github, "a/b", false).await,
@@ -3354,7 +3598,7 @@ mod tests {
     async fn pr_rate_limit_cooldown_covers_other_repositories_and_details() {
         let runner =
             FakeProcessRunner::with_responses([command_failure("API rate limit exceeded")]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         assert_eq!(
             authored(&github, "a/one", false).await,
             Err(ChangeRequestError::RateLimited)
@@ -3379,7 +3623,7 @@ mod tests {
         let runner = FakeProcessRunner::with_responses(
             (0..26).map(|_| command_success(search_response(vec![]))),
         );
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = github_with_account(runner.clone(), "fixture").await;
         for invalid in ["", "acme", "a/b repo:c/d", "a/*", "a/b/c", "a/.."] {
             assert_eq!(
                 authored(&github, invalid, false).await,

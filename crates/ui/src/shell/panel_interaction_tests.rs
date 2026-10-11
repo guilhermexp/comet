@@ -1,6 +1,9 @@
 //! The panel lifecycle through Shell's actions and actual GPUI layout.
 use super::*;
 use gpui::{AppContext, Bounds, TestAppContext, VisualTestContext};
+use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
+use zeron_proto::ToolCall;
+use zeron_workers_unpeel::{WorkersProject, WorkersSessionSort};
 
 fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -471,4 +474,230 @@ fn details_owns_session_location_metadata_while_session_actions_remain(cx: &mut 
     cx.update(|window, cx| window.draw(cx).clear());
     assert!(cx.debug_bounds("session-info-device").is_some());
     assert!(cx.debug_bounds("session-info-side-chat").is_some());
+}
+
+#[gpui::test]
+fn worked_project_diff_watch_tracks_effective_details_visibility(cx: &mut TestAppContext) {
+    fn project(id: &str, path: &str) -> WorkersProject {
+        WorkersProject {
+            id: id.into(),
+            name: id.into(),
+            path: path.into(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+            repository_id: None,
+            repository_name: None,
+            repository_path: None,
+            checkout_kind: None,
+            checkout_ownership: None,
+            checkout_availability: None,
+            checkout_archived: false,
+            checkout_detached: false,
+            space_id: None,
+        }
+    }
+
+    fn entry(paths: [&str; 2]) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: "msg-1".into(),
+            role: MessageRole::Assistant,
+            parts: paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| MessagePart::Tool {
+                    id: format!("tool-{index}"),
+                    call: ToolCall::ReadFile { path: path.into() },
+                    diff: None,
+                    output: None,
+                    output_ref: None,
+                    output_bytes: None,
+                    diff_ref: None,
+                    diff_stats: None,
+                    file_preview: None,
+                    subagent_ref: None,
+                    subagent_status: None,
+                    subagent_tail: None,
+                    subagent_end: None,
+                    execution: None,
+                    resolved: true,
+                    is_error: false,
+                })
+                .collect(),
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            duration_ms: None,
+            continuation_of: None,
+        }
+    }
+
+    fn drain_requests(
+        requests: &mut tokio::sync::mpsc::Receiver<String>,
+        replies: &tokio::sync::mpsc::Sender<String>,
+        watches: &mut Vec<u64>,
+        cancellations: &mut Vec<u64>,
+    ) {
+        while let Ok(raw) = requests.try_recv() {
+            let request: zeron_rpc::ClientFrame = serde_json::from_str(&raw).unwrap();
+            if request.cancel {
+                cancellations.push(request.id);
+                continue;
+            }
+            if request.method.as_deref() == Some(methods::WATCH_CHECKOUT_DIFFS)
+                && request.params.get("cwds").is_some()
+            {
+                assert_eq!(
+                    request.params["cwds"],
+                    serde_json::json!(["/tmp/worked-first", "/tmp/worked-second"])
+                );
+                watches.push(request.id);
+            }
+            replies
+                .try_send(
+                    serde_json::to_string(&zeron_rpc::ServerFrame {
+                        id: request.id,
+                        ok: Some(serde_json::Value::Null),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    }
+
+    fn settle_watch(
+        shell: &Entity<Shell>,
+        cx: &mut VisualTestContext,
+        runtime: &tokio::runtime::Runtime,
+        requests: &mut tokio::sync::mpsc::Receiver<String>,
+        replies: &tokio::sync::mpsc::Sender<String>,
+        watches: &mut Vec<u64>,
+        cancellations: &mut Vec<u64>,
+    ) {
+        for _ in 0..20 {
+            shell.update(cx, |_, cx| cx.notify());
+            cx.update(|window, cx| window.draw(cx).clear());
+            cx.run_until_parked();
+            runtime.block_on(tokio::task::yield_now());
+            drain_requests(requests, replies, watches, cancellations);
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+    let (_dir, shell, cx) = setup(cx);
+    let (out, mut requests) = tokio::sync::mpsc::channel::<String>(128);
+    let (replies, inbound) = tokio::sync::mpsc::channel::<String>(128);
+    change(&shell, cx, |shell, _, cx| {
+        shell.route = Route::Chat;
+        shell.sidebar_mode = SidebarMode::Orchestrator;
+        shell.debug_gate = Some(GatePhase::Ready);
+        shell.splash = SplashPhase::Gone;
+        shell.settings.details_sidebar_open = true;
+        shell.details_tween = None;
+        settings::update(settings::SavePolicy::Immediate, cx, |settings| {
+            settings.details_sidebar_open = true;
+        });
+        shell.state.update(cx, |state, _| {
+            state.connection = crate::state::ConnectionStatus::Ready;
+            state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+            state.local_device_id = Some("local".into());
+            state.selected_chat = Some("a".into());
+            state.transcript = vec![entry([
+                "/tmp/worked-first/file.txt",
+                "/tmp/worked-second/file.txt",
+            ])];
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+        });
+        shell.workers_model.update(cx, |workers, _| {
+            workers.snapshot = Some(zeron_workers_unpeel::WorkersBootstrap {
+                mac_name: "fixture".into(),
+                protocol: zeron_workers_unpeel::WorkersProtocol {
+                    major_version: 1,
+                    minor_version: 0,
+                    capabilities: vec![],
+                },
+                projects: vec![
+                    project("first", "/tmp/worked-first"),
+                    project("second", "/tmp/worked-second"),
+                ],
+                presets: vec![],
+                sessions: vec![],
+                activity_log: vec![],
+            });
+        });
+    });
+
+    cx.simulate_resize(gpui::size(px(400.0), px(900.0)));
+    let mut watches = Vec::new();
+    let mut cancellations = Vec::new();
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert!(
+        watches.is_empty(),
+        "zero-width Details must not start a watch"
+    );
+
+    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert_eq!(watches.len(), 1, "visible Details starts one local watch");
+
+    cx.simulate_resize(gpui::size(px(400.0), px(900.0)));
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert!(
+        cancellations.contains(&watches[0]),
+        "losing Details width cancels its local watch"
+    );
+    assert_eq!(
+        watches.len(),
+        1,
+        "hidden Details does not restart the watch"
+    );
+
+    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert_eq!(watches.len(), 2, "visible Details starts a fresh watch");
+    assert_ne!(watches[0], watches[1]);
 }

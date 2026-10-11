@@ -13632,7 +13632,8 @@ impl Shell {
     }
 
     fn render_details_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if !self.details_sidebar_open(cx) {
+        let target = self.details_target(cx);
+        if target <= 0.5 {
             return gpui::Empty.into_any_element();
         }
         let context = self.details_context(cx);
@@ -13650,7 +13651,6 @@ impl Shell {
             .top_0()
             .bottom_0()
             .left_0();
-        let target = self.details_target(cx);
         // Animated width container: tweens on collapse/expand and clips the
         // inner so content never reflows mid-transition.
         div()
@@ -13670,10 +13670,11 @@ impl Shell {
     }
 
     fn render_details_header_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.details_sidebar_open(cx) {
+        let target = self.details_target(cx);
+        if target <= 0.5 {
             return None;
         }
-        let width = self.eval_tween(self.details_tween, self.details_target(cx));
+        let width = self.eval_tween(self.details_tween, target);
         let header = self
             .details_sidebar
             .update(cx, |sidebar, cx| sidebar.render_shell_header(cx));
@@ -15743,7 +15744,7 @@ impl Render for Shell {
         // retained sidebar entities must not retain watches while unmounted.
         if !matches!(render_gate, GatePhase::Ready)
             || !matches!(self.route, Route::Chat)
-            || !self.details_sidebar_open(cx)
+            || self.details_target(cx) <= 0.5
         {
             self.details_sidebar.update(cx, |sidebar, cx| {
                 sidebar.hide_worked_project_diffs(cx);

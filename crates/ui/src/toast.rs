@@ -394,15 +394,7 @@ pub fn render_toaster(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
         let clip = crate::motion::lerp(front_height, height, expand);
         targets.insert(toast.id, (bottom, clip, index));
     }
-    let stack_height = live
-        .iter()
-        .map(|&ix| {
-            let (bottom, clip, _) = targets[&store.toasts[ix].id];
-            bottom + clip
-        })
-        .fold(0.0_f32, f32::max)
-        .max(front_height);
-
+    let mut stack_height = front_height;
     let mut moving = animating;
     let mut children: Vec<AnyElement> = Vec::new();
     // Paint oldest first so the front toast lands on top.
@@ -463,6 +455,9 @@ pub fn render_toaster(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
             // but keep measuring below.
         } else if opacity <= 0.001 {
             continue;
+        }
+        if opacity > 0.001 {
+            stack_height = stack_height.max(y + clip_height.max(0.0));
         }
         let kind = toast.kind;
         let message = toast.message.clone();
@@ -880,6 +875,37 @@ mod tests {
         }
     }
 
+    struct OcclusionHost {
+        clicks: std::rc::Rc<std::cell::Cell<usize>>,
+        control_bottom: std::rc::Rc<std::cell::Cell<f32>>,
+    }
+
+    impl gpui::Render for OcclusionHost {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            let control_bottom = self.control_bottom.get();
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("toast-underlay-control")
+                        .debug_selector(|| "toast-underlay-control".into())
+                        .absolute()
+                        .right(px(12.0))
+                        .bottom(px(control_bottom))
+                        .w(px(160.0))
+                        .h(px(2.0))
+                        .child("Underlay control")
+                        .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                )
+                .children(render_toaster(window, cx))
+        }
+    }
+
     #[gpui::test]
     fn toaster_shows_dedupes_and_closes(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| cx.set_global(Theme::dark()));
@@ -897,6 +923,103 @@ mod tests {
         let id = cx.update(|_, cx| cx.global::<ToastStore>().toasts[1].id);
         cx.update(|_, cx| dismiss(id, cx));
         cx.update(|_, cx| assert_eq!(messages(cx), ["Couldn't save"]));
+    }
+
+    #[gpui::test]
+    fn invisible_toasts_do_not_occlude_controls_and_expansion_still_fans_out(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            for message in ["one", "two", "three", "four"] {
+                error(cx, message);
+            }
+            let now = Instant::now();
+            for toast in &mut cx.global_mut::<ToastStore>().toasts {
+                toast.created = now - MOVE;
+            }
+        });
+        let clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let control_bottom = std::rc::Rc::new(std::cell::Cell::new(OFFSET));
+        let (host, cx) = cx.add_window_view(|_, _| OcclusionHost {
+            clicks: clicks.clone(),
+            control_bottom: control_bottom.clone(),
+        });
+        cx.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        cx.run_until_parked();
+        host.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|_, cx| {
+            let now = Instant::now();
+            for toast in &mut cx.global_mut::<ToastStore>().toasts {
+                for glide in [&mut toast.bottom, &mut toast.clip].into_iter().flatten() {
+                    *glide = Glide::new(glide.to, now);
+                }
+            }
+        });
+
+        let (visible_extent, hidden_extent) = cx.update(|_, cx| {
+            let extents = cx
+                .global::<ToastStore>()
+                .toasts
+                .iter()
+                .rev()
+                .take(VISIBLE + 1)
+                .map(|toast| {
+                    toast.bottom.expect("rendered toast has a bottom").to
+                        + toast.clip.expect("rendered toast has a clip").to
+                })
+                .collect::<Vec<_>>();
+            let visible = extents[..VISIBLE].iter().copied().fold(0.0_f32, f32::max);
+            (visible, extents[VISIBLE])
+        });
+        assert!(hidden_extent > visible_extent);
+        control_bottom.set(OFFSET + (visible_extent + hidden_extent) * 0.5 - 1.0);
+        host.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        let collapsed = cx.debug_bounds("toaster").unwrap();
+        let control = cx.debug_bounds("toast-underlay-control").unwrap();
+        assert!(control.center().y < collapsed.origin.y);
+        cx.simulate_mouse_down(
+            control.center(),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            control.center(),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(clicks.get(), 1);
+
+        cx.simulate_mouse_move(collapsed.center(), None, gpui::Modifiers::default());
+        cx.update(|_, cx| assert!(cx.global::<ToastStore>().hovered));
+        cx.run_until_parked();
+        let now = Instant::now();
+        cx.update(|_, cx| {
+            let store = cx.global_mut::<ToastStore>();
+            store.expand = Some(Glide::new(1.0, now));
+            let mut stacked = 0.0;
+            for toast in store.toasts.iter_mut().rev() {
+                let height = if toast.height > 0.0 {
+                    toast.height
+                } else {
+                    52.0
+                };
+                toast.bottom = Some(Glide::new(stacked, now));
+                toast.clip = Some(Glide::new(height, now));
+                stacked += height + GAP;
+            }
+            cx.refresh_windows();
+        });
+        host.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let expanded = cx.debug_bounds("toaster").unwrap();
+        assert!(
+            f32::from(expanded.size.height) > f32::from(collapsed.size.height) + 100.0,
+            "the fourth toast should join the expanded stack"
+        );
     }
 
     #[test]

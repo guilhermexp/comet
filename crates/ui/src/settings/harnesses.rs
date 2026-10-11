@@ -385,6 +385,14 @@ impl HarnessesPage {
             })
     }
 
+    fn cancel_update_action_task(&mut self, cx: &mut Context<Self>) {
+        self.update_action_task = None;
+        if self.checking_updates {
+            self.checking_updates = false;
+            cx.notify();
+        }
+    }
+
     /// Retarget the page at another device: a different device is a different
     /// install/enablement world, so drop the rows and reload through it.
 
@@ -395,6 +403,7 @@ impl HarnessesPage {
             cx.notify();
             return;
         }
+        self.cancel_update_action_task(cx);
         self.installing = None;
         self.install_task = None;
         self.policy_selects.clear();
@@ -408,7 +417,6 @@ impl HarnessesPage {
         self.harnesses = Loadable::Idle;
         self.updates = Loadable::Idle;
         self.update_task = None;
-        self.update_action_task = None;
         self.load(cx);
         cx.notify();
     }
@@ -654,6 +662,7 @@ impl HarnessesPage {
         };
         let params = self.with_target(serde_json::json!({ "harness": harness }));
         self.error = None;
+        self.cancel_update_action_task(cx);
         self.update_action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -677,6 +686,7 @@ impl HarnessesPage {
             return;
         };
         let params = self.with_target(serde_json::json!({ "harness": harness }));
+        self.cancel_update_action_task(cx);
         self.update_action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -709,6 +719,7 @@ impl HarnessesPage {
             "policy": policy,
         }));
         self.error = None;
+        self.cancel_update_action_task(cx);
         self.update_action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -1288,9 +1299,10 @@ impl Render for HarnessesPage {
 
 #[cfg(test)]
 mod tests {
+    use gpui::AppContext;
+
     #[gpui::test]
     fn expanded_agent_preferences_render_inside_the_agent_row(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext;
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             crate::settings::init(Default::default(), dir.path(), cx);
@@ -1370,6 +1382,104 @@ mod tests {
             .unwrap();
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn replacing_a_pending_update_check_clears_checking_for_every_action_and_device(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(32);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(32);
+        let engine =
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound));
+        let state = cx.new(|_| crate::state::AppState::new());
+        let page = cx.new(|cx| super::HarnessesPage::new(state.clone(), cx));
+        state.update(cx, |state, _| {
+            state.local_device_id = Some("local".into());
+            state.devices = vec![zeron_proto::Device {
+                id: "remote".into(),
+                name: "Remote".into(),
+                platform: "macos".into(),
+                last_seen_at: Some(chrono::Utc::now()),
+                created_at: None,
+                version: None,
+                cursor_sdk_version: None,
+                capabilities: vec![zeron_proto::capabilities::HARNESS_UPDATES_V1.into()],
+            }];
+            state.set_test_engine(engine);
+        });
+        page.update(cx, |page, _| {
+            page.target_device = Some("remote".into());
+            page.harnesses = super::Loadable::Ready(Vec::new());
+            page.updates = super::Loadable::Ready(Vec::new());
+        });
+
+        fn next_method(requests: &mut tokio::sync::mpsc::Receiver<String>) -> String {
+            let request = requests.try_recv().expect("RPC request should be pending");
+            serde_json::from_str::<serde_json::Value>(&request)
+                .expect("RPC request is JSON")
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .expect("RPC request has a method")
+                .to_owned()
+        }
+
+        fn start_check(
+            page: &gpui::Entity<super::HarnessesPage>,
+            cx: &mut gpui::TestAppContext,
+            requests: &mut tokio::sync::mpsc::Receiver<String>,
+        ) {
+            page.update(cx, |page, cx| page.check_updates(cx));
+            cx.background_executor.run_until_parked();
+            page.read_with(cx, |page, _| assert!(page.checking_updates));
+            assert_eq!(next_method(requests), super::methods::CHECK_HARNESS_UPDATES);
+        }
+
+        start_check(&page, cx, &mut requests);
+        page.update(cx, |page, cx| {
+            page.apply_harness_update(zeron_proto::HarnessId::Codex, cx)
+        });
+        page.read_with(cx, |page, _| assert!(!page.checking_updates));
+        cx.background_executor.run_until_parked();
+        assert_eq!(
+            next_method(&mut requests),
+            super::methods::APPLY_HARNESS_UPDATE
+        );
+
+        start_check(&page, cx, &mut requests);
+        page.update(cx, |page, cx| {
+            page.cancel_harness_update(zeron_proto::HarnessId::Codex, cx)
+        });
+        page.read_with(cx, |page, _| assert!(!page.checking_updates));
+        cx.background_executor.run_until_parked();
+        assert_eq!(
+            next_method(&mut requests),
+            super::methods::CANCEL_HARNESS_UPDATE
+        );
+
+        start_check(&page, cx, &mut requests);
+        page.update(cx, |page, cx| {
+            page.set_update_policy(
+                zeron_proto::HarnessId::Codex,
+                zeron_proto::HarnessUpdatePolicy::Notify,
+                cx,
+            )
+        });
+        page.read_with(cx, |page, _| assert!(!page.checking_updates));
+        cx.background_executor.run_until_parked();
+        assert_eq!(
+            next_method(&mut requests),
+            super::methods::SET_HARNESS_UPDATE_POLICY
+        );
+
+        start_check(&page, cx, &mut requests);
+        page.update(cx, |page, cx| page.set_target_device(None, cx));
+        page.read_with(cx, |page, _| assert!(!page.checking_updates));
     }
 }
 
