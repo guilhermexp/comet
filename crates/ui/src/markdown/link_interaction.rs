@@ -151,6 +151,10 @@ impl Element for LinkRanges {
                     let keyboard_epoch = state.epoch.clone();
                     let hit = div()
                         .id(format!("link-{index}-{part}-{}", state.epoch.get()))
+                        .debug_selector({
+                            let selector = format!("{}-link-hitbox-{index}-{part}", self.id);
+                            move || selector.clone()
+                        })
                         // Removing the builder cancels both visible tooltips
                         // and GPUI's delayed show task while the menu owns input.
                         .when(state.menu.borrow().is_none(), |hit| {
@@ -1350,9 +1354,7 @@ mod rendered_tests {
         cx: &mut gpui::TestAppContext,
         case: &str,
         markdown: &str,
-        expected_text: &str,
         expected_label: &str,
-        link_range: Range<usize>,
         expected_target: &str,
         roots: Option<Rc<Vec<crate::workspace_links::FileLinkRoot>>>,
         has_copy_path: bool,
@@ -1362,8 +1364,7 @@ mod rendered_tests {
             cx.set_global(Theme::dark());
             crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
         });
-        let snapshot_label = "link-fixture:0";
-        let diagnostic = format!("case={case}, snapshot={snapshot_label}");
+        let diagnostic = format!("case={case}");
         let activated: Rc<RefCell<Vec<LinkActivation>>> = Rc::default();
         let (_view, cx) = cx.add_window_view(|_, _| Fixture {
             markdown: markdown.into(),
@@ -1372,27 +1373,14 @@ mod rendered_tests {
             source_local: false,
             file_roots: roots.clone(),
         });
-        // Paint this fixture before reading its selection snapshot: the
-        // snapshot is populated by the markdown render, and its layout gives
-        // the exact hit box used by LinkRanges for right-clicks.
+        // Paint the fixture once, then use LinkRanges' own prepainted link
+        // hitbox. Inline flow can split a paragraph into several text
+        // fragments, so a text-selection snapshot is not the link's hit area.
         cx.update(|window, cx| window.draw(cx).clear());
-        let position = cx.update(|_, _| {
-            let (text, layout, _) = super::super::render::selection_test_snapshot(snapshot_label);
-            assert_eq!(
-                text.as_ref(),
-                expected_text,
-                "{diagnostic}: fixture snapshot text"
-            );
-            assert_eq!(
-                text.get(link_range.clone()),
-                Some(expected_label),
-                "{diagnostic}: link range identifies the expected label"
-            );
-            super::super::render::range_rects(&layout, &link_range, 0., 0.)
-                .first()
-                .unwrap_or_else(|| panic!("{diagnostic}: link hit box missing from snapshot"))
-                .center()
-        });
+        let position = cx
+            .debug_bounds("link-fixture-session-t0-link-hitbox-0-0")
+            .unwrap_or_else(|| panic!("{diagnostic}: rendered link hitbox is missing"))
+            .center();
         cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
         cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
         cx.update(|window, cx| {
@@ -1431,6 +1419,14 @@ mod rendered_tests {
             activated
                 .borrow()
                 .last()
+                .map(|activation| activation.target.label.as_str()),
+            Some(expected_label),
+            "{diagnostic}: Open in Zeron keeps the link label"
+        );
+        assert_eq!(
+            activated
+                .borrow()
+                .last()
                 .map(|activation| activation.target.original.as_str()),
             Some(expected_target),
             "{diagnostic}: Open in Zeron keeps the link target"
@@ -1450,9 +1446,7 @@ mod rendered_tests {
             cx,
             "remote-file",
             "see [lib](src/lib.rs) here",
-            "see lib here",
             "lib",
-            4..7,
             "src/lib.rs",
             roots,
             true,
@@ -1466,9 +1460,7 @@ mod rendered_tests {
             cx,
             "web",
             "see [docs](https://example.com/) here",
-            "see docs here",
             "docs",
-            4..8,
             "https://example.com/",
             None,
             false,

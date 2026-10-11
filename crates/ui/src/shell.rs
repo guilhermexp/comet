@@ -4083,7 +4083,7 @@ impl Shell {
         // width. Avoid driving an animation clock when its target did not move.
         let to = self.right_target(cx);
         if from != to {
-            self.right_tween = Some(self.clocked_tween(from, to));
+            self.right_tween = Some(self.panel_tween(from, to));
         }
         cx.notify();
     }
@@ -6300,6 +6300,7 @@ impl Shell {
         let mut row =
             popover::menu_row_nav(theme, open, false, format!("chat-menu-copy-{chat_id}"))
                 .id("chat-menu-copy")
+                .debug_selector(|| "chat-menu-copy".to_owned())
                 .relative()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.chat_copy_intent.reset();
@@ -12475,6 +12476,7 @@ impl Shell {
                     let archive =
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
+                            .debug_selector(|| "chat-menu-archive".to_owned())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.archive_chat(archive_id.clone(), cx)
                             }))
@@ -12492,6 +12494,7 @@ impl Shell {
                 let delete =
                     popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
                         .id("chat-menu-delete")
+                        .debug_selector(|| "chat-menu-delete".to_owned())
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_chat_menu(cx);
@@ -12519,8 +12522,10 @@ impl Shell {
                     let export_chat_id = chat_id.clone();
                     let format = item.format;
                     let delivery = item.delivery;
+                    let selector = item.key;
                     let row = popover::menu_row(&theme, false, item.label)
                         .id(item.key)
+                        .debug_selector(move || selector.to_owned())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.export_chat(export_chat_id.clone(), format, delivery, cx)
                         }))
@@ -12830,9 +12835,18 @@ impl Shell {
         // seam drag is direct manipulation, so the width tracks the pointer.
         let direct_width =
             self.reduced_motion || self.viewport_resized || self.pane_resize_dragging.is_some();
+        // Ordinary panel transitions already animate the live conversation
+        // column. Size the composer from that same painted width instead of
+        // jumping to the column's endpoint; takeover keeps its retained layout
+        // width while the conversation is covered.
+        let composer_panel_width = if self.main_takeover_active() {
+            main_content_width
+        } else {
+            live_main_width
+        };
         let composer_width = self.composer_dock.borrow_mut().layout_width(
             composer_target_width(
-                main_content_width - session_reserve,
+                composer_panel_width - session_reserve,
                 ui_settings.transcript_width,
                 has_selection,
             ),
@@ -21296,8 +21310,39 @@ mod settings_section_persistence {
             cx.notify();
         });
         cx.run_until_parked();
+        // A clean cached SidebarPane replays its scene and input handlers,
+        // but GPUI does not replay its debug_bounds map. Invalidate this
+        // cached view once so the measured frame repaints the real session
+        // rows and records their selectors.
+        let sidebar_pane = shell.read_with(cx, |shell, _| shell.sidebar_pane.clone());
+        sidebar_pane.update(cx, |_, cx| cx.notify());
         cx.update(|window, cx| window.draw(cx).clear());
-        let row = cx.debug_bounds("chat-older").expect("sidebar row");
+        let row = cx.debug_bounds("chat-older").unwrap_or_else(|| {
+            let diagnostic = shell.update(cx, |shell, cx| {
+                let filter = shell.settings.space_filter.clone();
+                let (no_project, selected, candidates) = {
+                    let state = shell.state.read(cx);
+                    (
+                        state.no_project,
+                        state.selected_chat.clone(),
+                        state
+                            .sidebar_chats(Utc::now(), filter.as_deref())
+                            .into_iter()
+                            .map(|(_, chat)| chat.id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let visible = shell.sidebar_visible_order(cx);
+                format!(
+                    "route={:?}, sidebar_mode={:?}, sessions_open={}, sidebar_collapsed={}, filter={filter:?}, no_project={no_project}, selected={selected:?}, candidates={candidates:?}, visible={visible:?}",
+                    shell.route,
+                    shell.sidebar_mode,
+                    shell.sessions_open,
+                    shell.settings.sidebar_collapsed,
+                )
+            });
+            panic!("sidebar row chat-older is missing; {diagnostic}");
+        });
         let from = row.center();
         cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
         // Several frames of dragging, inside the sidebar and then out of it.

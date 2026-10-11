@@ -96,6 +96,7 @@ impl Panel {
 struct Frame {
     // Sidebar, Files, surface host, visible conversation.
     widths: [f32; 4],
+    columns: [Option<Bounds<Pixels>>; 4],
     composer: Bounds<Pixels>,
     strip: Option<Bounds<Pixels>>,
 }
@@ -107,14 +108,16 @@ fn draw(shell: &Entity<Shell>, cx: &mut VisualTestContext, millis: u64) -> Frame
         cx.notify();
     });
     cx.update(|window, cx| window.draw(cx).clear());
-    let mut width = |id| cx.debug_bounds(id).map_or(0.0, |b| f32::from(b.size.width));
+    let columns = [
+        "sidebar-column",
+        "files-panel",
+        "right-panel",
+        "conversation-column",
+    ]
+    .map(|id| cx.debug_bounds(id));
     Frame {
-        widths: [
-            width("sidebar-column"),
-            width("files-panel"),
-            width("right-panel"),
-            width("conversation-column"),
-        ],
+        widths: columns.map(|bounds| bounds.map_or(0.0, |b| f32::from(b.size.width))),
+        columns,
         composer: shell.read_with(cx, |s, cx| {
             s.composer.read(cx).surface_bounds().get().unwrap()
         }),
@@ -140,9 +143,11 @@ fn expect(frame: Frame, widths: [f32; 4]) {
 #[track_caller]
 fn continuous(before: Frame, after: Frame) {
     expect(after, before.widths);
-    near(
-        f32::from(after.composer.left()),
-        f32::from(before.composer.left()),
+    let before_left = f32::from(before.composer.left());
+    let after_left = f32::from(after.composer.left());
+    assert!(
+        (after_left - before_left).abs() <= 0.5,
+        "composer left changed in a zero-time panel frame: {before_left}px -> {after_left}px; before={before:#?}; after={after:#?}"
     );
     near(
         f32::from(after.composer.size.width),
@@ -197,7 +202,8 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
         let progress = (first.widths[column] - source) / (target - source);
         assert!(
             progress > 0.0 && progress < 0.1,
-            "column {column} lurches: {progress}"
+            "column {column} lurches: {source}px -> {}px toward {target}px in 16ms (progress {progress})",
+            first.widths[column]
         );
         let mut previous = first.widths[column];
         for _ in 0..15 {

@@ -21,7 +21,7 @@ fork:
   target_branch: main
   initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
   observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
-  result_sha: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result_sha: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
   initial_worktree: clean
 strategy:
   operation: merge
@@ -306,9 +306,65 @@ verification:
     Stop snapshots occur only on the same 10s timeout, with polling and assertions
     unchanged; no runtime Stop fix claimed. Focused local UI execution and fresh combined-head
     CI pending.
+- command: Linux UI CI c423004c
+  revision: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result: failed
+  observed: '2427 passed (1 flaky retry) and 4 failed: export selectors, web-link
+    fixture, composer geometry and sidebar drag row. Device metadata regression passed.
+    The web fixture snapshot contained only the prefix see-space, proving that snapshot0
+    was not the link hitbox; corrected candidate uses the rendered LinkRanges bounds.
+    Composer cause: final target width was used while the conversation column still
+    animated; candidate now follows live_main_width outside takeover. Repairs require
+    execution.'
+  url: https://github.com/guilhermexp/comet/actions/runs/38135702304/job/114459069105
+- command: Linux core CI c423004c
+  revision: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result: passed
+  observed: 1713 passed and22 skipped. Saturated Stop passed5.218s and frozen Worker
+    Stop3.080s with clean production source. The separately failing workspace job
+    below prevents claiming the intermittent Stop failure is fixed.
+  url: https://github.com/guilhermexp/comet/actions/runs/38135702304/job/114459090787
+- command: Rust workspace CI c423004c
+  revision: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result: failed
+  observed: pending_worker_notification_survives_stop_and_keeps_user_queue_paused
+    timed out waiting for Stop to bypass the saturated prompt drain (36 passed,1 failed).
+    This job did not reach queued attachments or UI. Causal investigation remains
+    active; no timeout/assertion change.
+  url: https://github.com/guilhermexp/comet/actions/runs/38135702279
+- command: Linux browser CI c423004c
+  revision: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result: passed
+  observed: Actual X11 and Wayland regressions passed.
+  url: https://github.com/guilhermexp/comet/actions/runs/38135702304/job/114459090729
+- command: Voice offline Linux CI c423004c initial and exact-job retry
+  revision: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result: passed-on-retry
+  observed: Initial offline Linux job114458999178 failed spawning external voice fixture
+    with OS error26 ExecutableFileBusy (38pass,1fail,4ignored). One exact-job rerun114461281871
+    passed. Fixture/test/start path and dependency versions are unchanged from starting
+    main; no conflicting writer established. Initial failure preserved; retry is not
+    a causal fix. Windows Unix-only Unpeel compile failures remain.
+  url: https://github.com/guilhermexp/comet/actions/runs/38135702296
+- command: macOS CI a2c31d79 cancellation and completed steps
+  revision: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result: partial
+  observed: Native font geometry, notifications and attachment/composer/dropzone tests
+    passed. Job was cancelled by the next source push while building the browser fixture.
+    Native browser, preview, frame-source and window-glass execution were not observed
+    on that revision.
+  url: https://github.com/guilhermexp/comet/actions/runs/38133720220
+- command: Local c423 UI executable checks
+  revision: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result: failed
+  observed: Device metadata passed. Panel geometry failed582px versus641px, and sidebar
+    drag failed before the row was found. Rendered Markdown link filter has zero tests
+    on macOS by platform cfg and proves no link behavior. Export regression failed
+    before selector repair. New patch retry is active; first diagnostic compilation
+    found Context/App mismatch, corrected without runtime changes.
 limits:
-- PR21 prior file-link menu failure predates this integration and recurred in CI455;
-  frame-refresh fixture repair remains unproved until rerun.
+- Rendered link regression is Linux/Windows-only. Candidate now uses its actual link
+  hitbox; execution on a matching platform remains required.
 - Native product/UI and macOS install not yet exercised in this attempt.
 references:
 - docs/upstream-sync.md

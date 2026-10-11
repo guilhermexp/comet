@@ -251,6 +251,70 @@ fn user_message_id(core: &EngineCore, text: &str) -> Option<String> {
         .map(|entry| entry.id)
 }
 
+fn stop_failure_snapshot(
+    core: &EngineCore,
+    harness: &HeldHarness,
+    prompts: &Arc<Mutex<Vec<String>>>,
+    stop_id: &str,
+) -> String {
+    let handle = core
+        .doc_host
+        .open(CHAT)
+        .expect("open chat for Stop diagnostics");
+    let observed_commands = handle
+        .doc()
+        .read_commands()
+        .expect("read commands for Stop diagnostics")
+        .into_iter()
+        .map(|command| {
+            let kind = match command.payload {
+                SessionCommandPayload::Run { .. } => "Run",
+                SessionCommandPayload::Steer { .. } => "Steer",
+                SessionCommandPayload::Interrupt {} => "Interrupt",
+                SessionCommandPayload::RespondInput { .. } => "RespondInput",
+                _ => "Other",
+            };
+            (command.id, kind, command.status, command.resolution)
+        })
+        .collect::<Vec<_>>();
+    let observed_queue = handle
+        .doc()
+        .read_queue()
+        .expect("read queue for Stop diagnostics")
+        .into_iter()
+        .map(|item| (item.id, item.text))
+        .collect::<Vec<_>>();
+    let observed_status = core.sessions.session_status(CHAT).map(|session| {
+        (
+            session.status,
+            session.started_at,
+            session.updated_at,
+            session.last_completed_turn,
+        )
+    });
+    let observed_prompts = prompts.lock().unwrap().clone();
+    let observed_request_prompts = harness
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request.prompt.clone())
+        .collect::<Vec<_>>();
+    let test_thread_capacity = std::thread::available_parallelism().map(|threads| threads.get());
+    let configured_test_threads = std::env::var("RUST_TEST_THREADS").ok();
+    let observed_user_messages = user_messages(core);
+    let turn_in_flight = core.sessions.turn_in_flight(CHAT);
+
+    format!(
+        "stop_id={stop_id:?}; commands={observed_commands:?}; queue={observed_queue:?}; \
+         session_status={observed_status:?}; turn_in_flight={turn_in_flight}; \
+         prompts={observed_prompts:?}; request_count={}; request_prompts={observed_request_prompts:?}; \
+         user_messages={observed_user_messages:?}; test_thread_capacity={test_thread_capacity:?}; \
+         RUST_TEST_THREADS={configured_test_threads:?}",
+        observed_request_prompts.len(),
+    )
+}
+
 async fn setup(steering: SteeringMode) -> (EngineCore, Arc<HeldHarness>, Arc<Mutex<Vec<String>>>) {
     setup_with(HeldHarness::new(steering)).await
 }
@@ -624,52 +688,10 @@ async fn a_frozen_queue_still_delivers_worker_notifications() {
             break;
         }
         if tokio::time::Instant::now() >= stop_deadline {
-            let observed_commands = handle
-                .doc()
-                .read_commands()
-                .expect("read commands for Stop timeout diagnostics")
-                .into_iter()
-                .map(|command| {
-                    let kind = match command.payload {
-                        SessionCommandPayload::Run { .. } => "Run",
-                        SessionCommandPayload::Steer { .. } => "Steer",
-                        SessionCommandPayload::Interrupt {} => "Interrupt",
-                        SessionCommandPayload::RespondInput { .. } => "RespondInput",
-                        _ => "Other",
-                    };
-                    (command.id, kind, command.status)
-                })
-                .collect::<Vec<_>>();
-            let observed_queue = handle
-                .doc()
-                .read_queue()
-                .expect("read queue for Stop timeout diagnostics")
-                .into_iter()
-                .map(|item| (item.id, item.text))
-                .collect::<Vec<_>>();
-            let observed_status = core.sessions.session_status(CHAT).map(|session| {
-                (
-                    session.status,
-                    session.started_at,
-                    session.updated_at,
-                    session.last_completed_turn,
-                )
-            });
-            let observed_prompts = prompts.lock().unwrap().clone();
-            let observed_request_prompts = harness
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|request| request.prompt.clone())
-                .collect::<Vec<_>>();
+            let snapshot = stop_failure_snapshot(&core, &harness, &prompts, &stop_id);
             panic!(
                 "timed out waiting for Stop to settle after releasing the Worker notice; \
-                 phase=worker_run_started_stop_not_applied; stop_id={stop_id:?}; \
-                 commands={observed_commands:?}; queue={observed_queue:?}; \
-                 session_status={observed_status:?}; turn_in_flight={}; \
-                 prompts={observed_prompts:?}; request_prompts={observed_request_prompts:?}",
-                core.sessions.turn_in_flight(CHAT),
+                 phase=worker_run_started_stop_not_applied; {snapshot}"
             );
         }
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -924,15 +946,24 @@ async fn pending_worker_notification_survives_stop_and_keeps_user_queue_paused()
         .doc_host
         .queue_command(CHAT, SessionCommandPayload::Interrupt {})
         .expect("queue Stop");
-    wait_for(
-        || {
-            handle.doc().read_commands().unwrap().iter().any(|command| {
-                command.id == stop_id && command.status == zeron_doc::SessionCommandStatus::Applied
-            })
-        },
-        "Stop to bypass the saturated prompt drain",
-    )
-    .await;
+    let stop_applied = || {
+        handle.doc().read_commands().unwrap().iter().any(|command| {
+            command.id == stop_id && command.status == zeron_doc::SessionCommandStatus::Applied
+        })
+    };
+    let stop_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !stop_applied() {
+        if tokio::time::Instant::now() >= stop_deadline {
+            let gate_claimed = harness.mailbox_gate.lock().unwrap().is_none();
+            let snapshot = stop_failure_snapshot(&core, &harness, &prompts, &stop_id);
+            panic!(
+                "timed out waiting for Stop to bypass the saturated prompt drain; \
+                 phase=stop_not_applied_before_gate_release; gate_claimed={gate_claimed}; \
+                 gate_release_signaled=false; {snapshot}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
 
     // Stopping drops the old runtime and releases the blocked send. Opening
     // the stream gate also keeps teardown deterministic if cancellation races
