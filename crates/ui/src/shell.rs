@@ -4350,6 +4350,9 @@ impl Shell {
     /// own toggle undocks it). With nothing to show it opens Changes.
     fn toggle_right_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_pane_open(cx) {
+            if self.promote_hidden_panel(AuxiliaryPanel::Right, cx) {
+                return;
+            }
             self.set_surfaces_open(false, cx);
         } else if self.resolved_right_active(cx) != RightSurface::Picker {
             self.set_surfaces_open(true, cx);
@@ -4652,6 +4655,9 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
+        if self.right_pane_open(cx) {
+            self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
+        }
         match surface {
             RightSurface::File(id) => {
                 if let Some(file) = self.file_surfaces.get(&id).cloned() {
@@ -5960,6 +5966,10 @@ impl Shell {
         if self.right_pane_open(cx)
             && matches!(self.resolved_right_active(cx), RightSurface::Terminal(_))
         {
+            if self.promote_hidden_panel(AuxiliaryPanel::Right, cx) {
+                self.focus_right_terminal(window, cx);
+                return;
+            }
             self.panels.hide(&key);
             window.focus(&self.composer.focus_handle(cx), cx);
             self.finish_right_transition(from, cx);
@@ -6003,6 +6013,9 @@ impl Shell {
 
     fn toggle_utility_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_pane_open(cx) {
+            if self.promote_hidden_panel(AuxiliaryPanel::Right, cx) {
+                return;
+            }
             self.close_utility_pane(window, cx);
             return;
         }
@@ -6017,6 +6030,7 @@ impl Shell {
             cx.notify();
             return;
         }
+        self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
         self.finish_right_transition(from, cx);
     }
 
@@ -6798,6 +6812,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.pending_pull_request = None;
+        let local_device_id = self.state.read(cx).local_device_id.clone();
+        let target = target.filter(|device| Some(device.as_str()) != local_device_id.as_deref());
         if self.pull_requests_page.is_none() {
             self.pull_requests_page =
                 Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
@@ -6805,18 +6821,22 @@ impl Shell {
         if let Some(page) = &self.pull_requests_page {
             page.update(cx, |page, cx| page.select_url(Some(url.clone()), cx));
         }
-        if self
-            .pull_request_detail
-            .as_ref()
-            .is_some_and(|detail| detail.read(cx).url == url)
-        {
+        if self.pull_request_detail.as_ref().is_some_and(|detail| {
+            let detail = detail.read(cx);
+            detail.url == url && detail.target_device() == target.as_deref()
+        }) {
             cx.notify();
             return;
         }
-        let preview = self
-            .pull_requests_page
-            .as_ref()
-            .and_then(|page| page.read(cx).preview(&url));
+        let preview = self.pull_requests_page.as_ref().and_then(|page| {
+            let page = page.read(cx);
+            let page_target = page
+                .target_device()
+                .filter(|device| Some(device.as_str()) != local_device_id.as_deref());
+            (page_target.as_deref() == target.as_deref())
+                .then(|| page.preview(&url))
+                .flatten()
+        });
         self.pull_request_detail = Some(cx.new(|cx| {
             crate::pull_request_detail::PullRequestDetailPage::new(
                 self.state.clone(),
@@ -19166,6 +19186,7 @@ mod exit_regressions {
             let state = cx.new(|_| {
                 let mut state = AppState::new();
                 state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                state.local_device_id = Some("device-local".into());
                 state
             });
             test_shell(
@@ -19217,11 +19238,106 @@ mod exit_regressions {
             window.dispatch_action(
                 Box::new(crate::pull_request_detail::OpenPullRequest(
                     "https://github.com/a/b/pull/1".into(),
-                    None,
+                    Some("device-a".into()),
                 )),
                 cx,
             );
         });
+        cx.run_until_parked();
+        let device_a_detail = shell.read_with(cx, |shell, _| {
+            shell
+                .pull_request_detail
+                .as_ref()
+                .expect("the PR action opens a detail")
+                .entity_id()
+        });
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(
+                shell
+                    .pull_request_detail
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .target_device(),
+                Some("device-a")
+            );
+        });
+
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(crate::pull_request_detail::OpenPullRequest(
+                    "https://github.com/a/b/pull/1".into(),
+                    Some("device-a".into()),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |shell, _| shell
+                .pull_request_detail
+                .as_ref()
+                .unwrap()
+                .entity_id()),
+            device_a_detail,
+            "the same URL and device retain view state"
+        );
+
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(crate::pull_request_detail::OpenPullRequest(
+                    "https://github.com/a/b/pull/1".into(),
+                    Some("device-b".into()),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let device_b_detail = shell.read_with(cx, |shell, cx| {
+            let detail = shell.pull_request_detail.as_ref().unwrap();
+            assert_eq!(detail.read(cx).target_device(), Some("device-b"));
+            detail.entity_id()
+        });
+        assert_ne!(device_b_detail, device_a_detail);
+
+        shell.update(cx, |shell, cx| {
+            shell.apply_nav(
+                NavEntry::PullRequest {
+                    url: "https://github.com/a/b/pull/1".into(),
+                    device: Some("device-local".into()),
+                },
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.run_until_parked();
+        let local_detail = shell.read_with(cx, |shell, cx| {
+            let detail = shell.pull_request_detail.as_ref().unwrap();
+            assert_eq!(detail.read(cx).target_device(), None);
+            detail.entity_id()
+        });
+        assert_ne!(local_detail, device_b_detail);
+
+        shell.update(cx, |shell, cx| {
+            shell.apply_nav(
+                NavEntry::PullRequest {
+                    url: "https://github.com/a/b/pull/1".into(),
+                    device: None,
+                },
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |shell, _| shell
+                .pull_request_detail
+                .as_ref()
+                .unwrap()
+                .entity_id()),
+            local_detail,
+            "the local device ID and no target share one canonical target"
+        );
         for width in [600.0, 1400.0] {
             cx.simulate_resize(gpui::size(px(width), px(800.0)));
             for collapsed in [true, false] {

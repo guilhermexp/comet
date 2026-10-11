@@ -6196,6 +6196,13 @@ impl Shell {
         if !flow.target.allows_device(&device.id, local.as_deref()) {
             return;
         }
+        if flow
+            .device
+            .as_ref()
+            .is_none_or(|current| current.id != device.id)
+        {
+            flow.home_search.unsupported = false;
+        }
         flow.focus_pending = true;
         flow.step = ProjectStep::Locations;
         flow.load_task = None;
@@ -8664,5 +8671,33 @@ mod home_folder_search_tests {
                 .take(methods::RELEASE_HOME_FOLDER_SEARCH, cx)
                 .is_empty()
         );
+    }
+
+    #[gpui::test]
+    fn home_search_is_retried_after_selecting_a_different_device(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = picker(cx, "remote");
+        go_home(window, cx);
+        let warm = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(warm.len(), 1);
+        engine.fail(&warm[0], "unknown method: SearchHomeFolders");
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, _| {
+                assert!(shell.add_space.as_ref().unwrap().home_search.unsupported);
+            })
+            .unwrap();
+
+        window
+            .update(cx, |shell, _, cx| {
+                shell.add_space_back_to(ProjectStep::Devices, cx);
+                shell.add_space_pick_device(device("local"), cx);
+                assert!(!shell.add_space.as_ref().unwrap().home_search.unsupported);
+                shell.add_space_goto_location("Home".into(), None, cx);
+            })
+            .unwrap();
+
+        let warm = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(warm.len(), 1);
+        assert!(warm[0]["params"].get("targetDeviceId").is_none());
     }
 }

@@ -2295,8 +2295,20 @@ mod tests {
     #[gpui::test]
     fn activating_a_file_row_opens_it_for_the_focused_chat(cx: &mut TestAppContext) {
         let (window, _dir, _engine) = engine_palette(cx, true);
+        cx.simulate_window_resize(window.into(), gpui::size(px(1000.0), px(900.0)));
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.run_until_parked();
         window
             .update(cx, |shell, window, cx| {
+                shell.settings.sidebar_collapsed = true;
+                shell.sidebar_tween = None;
+                shell.add_browser_surface(None, window, cx);
+                shell.toggle_sidebar(cx);
+                shell.add_files_surface(window, cx);
+                assert!(shell.right_pane_open(cx));
+                assert!(!shell.horizontal_fit().right);
+
                 let row = PaletteRow::new(
                     Section::Files,
                     RowKind::File {
@@ -2306,6 +2318,11 @@ mod tests {
                 );
                 shell.activate_palette_row(row, window, cx);
                 assert!(shell.command_palette.is_none());
+                assert!(shell.right_pane_shown(cx));
+                assert!(matches!(
+                    shell.resolved_right_active(cx),
+                    crate::shell::RightSurface::File(_)
+                ));
                 assert!(
                     shell
                         .file_surface_paths

@@ -403,6 +403,8 @@ impl HarnessesPage {
             cx.notify();
             return;
         }
+        self.toggle_task = None;
+        self.pending_toggle = None;
         self.cancel_update_action_task(cx);
         self.installing = None;
         self.install_task = None;
@@ -1480,6 +1482,81 @@ mod tests {
         start_check(&page, cx, &mut requests);
         page.update(cx, |page, cx| page.set_target_device(None, cx));
         page.read_with(cx, |page, _| assert!(!page.checking_updates));
+    }
+
+    #[gpui::test]
+    fn retargeting_cancels_toggle_state_and_ignores_the_previous_devices_reply(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(32);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(32);
+        let engine =
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound));
+        let state = cx.new(|_| crate::state::AppState::new());
+        let page = cx.new(|cx| super::HarnessesPage::new(state.clone(), cx));
+        state.update(cx, |state, _| state.set_test_engine(engine));
+
+        let descriptor = |enabled| super::HarnessDescriptor {
+            id: zeron_proto::HarnessId::Codex,
+            name: "Codex".into(),
+            supports_steering: false,
+            steering_mode: zeron_proto::SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: Some(enabled),
+        };
+
+        page.update(cx, |page, cx| {
+            page.target_device = Some("device-a".into());
+            page.harnesses = super::Loadable::Ready(vec![descriptor(true)]);
+            page.set_enabled(zeron_proto::HarnessId::Codex, false, cx);
+        });
+        cx.background_executor.run_until_parked();
+        let previous_toggle: serde_json::Value =
+            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            previous_toggle["method"],
+            super::methods::SET_HARNESS_ENABLED
+        );
+        assert_eq!(previous_toggle["params"]["targetDeviceId"], "device-a");
+        assert_eq!(previous_toggle["params"]["enabled"], false);
+
+        page.update(cx, |page, cx| {
+            page.set_target_device(Some("device-b".into()), cx);
+            assert!(page.toggle_task.is_none());
+            assert!(page.pending_toggle.is_none());
+            page.harnesses = super::Loadable::Ready(vec![descriptor(true)]);
+        });
+        cx.background_executor.run_until_parked();
+        let reload: serde_json::Value =
+            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(reload["method"], super::methods::LIST_HARNESSES);
+        assert_eq!(reload["params"]["targetDeviceId"], "device-b");
+
+        let old_catalog = serde_json::to_value(vec![descriptor(false)]).unwrap();
+        drop(guard);
+        runtime.block_on(async {
+            replies
+                .send(
+                    serde_json::json!({"id": previous_toggle["id"], "ok": old_catalog}).to_string(),
+                )
+                .await
+                .unwrap();
+            while replies.capacity() < replies.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        });
+        cx.background_executor.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.target_device.as_deref(), Some("device-b"));
+            assert_eq!(page.harnesses.ready().unwrap()[0].enabled, Some(true));
+        });
     }
 }
 

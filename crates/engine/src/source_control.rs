@@ -354,8 +354,8 @@ pub struct GitHubCli {
     /// The board's on-disk first pages. `None` keeps everything in memory
     /// (tests, and engines without a data directory).
     store: Option<crate::change_request_store::ChangeRequestStore>,
-    /// The active `gh` account and when it was read, keying the store.
-    account: Arc<tokio::sync::Mutex<Option<(Instant, Option<String>)>>>,
+    account: Arc<tokio::sync::Mutex<Option<String>>>,
+    credential: Option<Arc<str>>,
 }
 
 impl GitHubCli {
@@ -363,13 +363,22 @@ impl GitHubCli {
     /// share one provider call; distinct reads run side by side. The read runs
     /// detached, so it completes and is cached even when every caller has gone
     /// away. Never retry here.
-    async fn cached_pr_request<F>(&self, key: String, refresh: bool, fetch: F) -> PrResult
+    async fn cached_pr_request<F>(
+        &self,
+        key: String,
+        refresh: bool,
+        fetch: impl FnOnce(Self) -> F,
+    ) -> PrResult
     where
         F: std::future::Future<Output = PrResult> + Send + 'static,
     {
         use futures::FutureExt;
-        let _ = self.store_account().await;
-        let account_guard = self.account.lock().await;
+        let (github, account) = self.authenticated().await?;
+        let mut account_guard = self.account.lock().await;
+        if account_guard.as_ref() != Some(&account) {
+            self.invalidate_pr_cache().await;
+            *account_guard = Some(account);
+        }
         let mut cache = self.pr_cache.lock().await;
         if let Some(index) = cache.entries.iter().position(|entry| entry.0 == key) {
             let entry = cache.entries.remove(index);
@@ -401,6 +410,7 @@ impl GitHubCli {
                 cache.next_fetch += 1;
                 let shared = self.pr_cache.clone();
                 let task_key = key.clone();
+                let fetch = fetch(github);
                 let task = tokio::spawn(async move {
                     let result = std::panic::AssertUnwindSafe(fetch)
                         .catch_unwind()
@@ -467,7 +477,6 @@ impl GitHubCli {
                 return Err(ChangeRequestError::Decode);
             }
         }
-        let github = self.clone();
         // A board that observed a new revision must never join an older
         // in-flight read or reuse its five-minute (or refresh) cache entry.
         let key = format!(
@@ -478,7 +487,7 @@ impl GitHubCli {
         let revisions = head
             .zip(base)
             .map(|(head, base)| (head.to_owned(), base.to_owned()));
-        self.cached_pr_request(key, refresh, async move {
+        self.cached_pr_request(key, refresh, |github| async move {
             if diff && let Some((head, base)) = revisions {
                 return github.fetch_revision_diff(&url, &head, &base).await;
             }
@@ -520,7 +529,7 @@ impl GitHubCli {
                     serde_json::to_vec(&serde_json::json!({ "body": body }))
                         .map_err(|_| ChangeRequestError::Decode)?,
                 ),
-                ..github_request()
+                ..self.request()
             })
             .await
             .map_err(classify_run_error)?;
@@ -567,7 +576,7 @@ impl GitHubCli {
                     "-H".into(),
                     "Accept: application/vnd.github.diff".into(),
                 ],
-                ..github_request()
+                ..self.request()
             })
             .await
             .map_err(classify_run_error)?;
@@ -603,7 +612,7 @@ impl GitHubCli {
             .runner
             .run(ProcessRequest {
                 args,
-                ..github_request()
+                ..self.request()
             })
             .await
             .map_err(classify_run_error)?;
@@ -685,7 +694,7 @@ impl GitHubCli {
                     "-F".into(),
                     format!("number={}", parts[6]),
                 ],
-                ..github_request()
+                ..self.request()
             })
             .await
             .map_err(classify_run_error)?;
@@ -722,8 +731,7 @@ impl GitHubCli {
         }
         let repository = repository.to_ascii_lowercase();
         let key = format!("repository:{repository}");
-        let github = self.clone();
-        let lookup = self.cached_pr_request(key, false, async move {
+        let lookup = self.cached_pr_request(key, false, |github| async move {
             let (owner, name) = repository
                 .split_once('/')
                 .ok_or(ChangeRequestError::UnsupportedRepository)?;
@@ -740,7 +748,7 @@ impl GitHubCli {
                         "-f".into(),
                         format!("name={name}"),
                     ],
-                    ..github_request()
+                    ..github.request()
                 })
                 .await
                 .map_err(classify_run_error)?;
@@ -774,6 +782,7 @@ impl GitHubCli {
             pr_cache: Default::default(),
             store: None,
             account: Default::default(),
+            credential: None,
         }
     }
 
@@ -792,62 +801,59 @@ impl GitHubCli {
         cache.rate_limited_at = None;
     }
 
-    /// The active github.com account, read from `gh`'s local config (no
-    /// network). Re-read every 30 seconds so `gh auth switch` takes effect.
-    /// `None` when it can't be told — including a token in the environment,
-    /// which may belong to another account — and then nothing is stored.
-    async fn store_account(&self) -> Option<String> {
-        if ["GH_TOKEN", "GITHUB_TOKEN"]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
-        {
-            let mut account = self.account.lock().await;
-            let changed = account.as_ref().is_some_and(|(_, login)| login.is_some());
-            *account = Some((Instant::now() - Duration::from_secs(31), None));
-            if changed {
-                self.invalidate_pr_cache().await;
-            }
-            return None;
-        }
-        let mut account = self.account.lock().await;
-        if let Some((read_at, login)) = account.as_ref()
-            && read_at.elapsed() < Duration::from_secs(30)
-        {
-            return login.clone();
-        }
-        let login = self
-            .runner
-            .run(ProcessRequest {
-                args: vec![
-                    "config".into(),
-                    "get".into(),
-                    "user".into(),
-                    "-h".into(),
-                    "github.com".into(),
-                ],
-                timeout: Duration::from_secs(5),
-                ..github_request()
-            })
-            .await
-            .ok()
-            .filter(|output| output.success && !output.stdout_truncated)
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|login| login.trim().to_owned())
-            .filter(|login| {
-                !login.is_empty()
-                    && login.len() <= 39
-                    && login
+    async fn authenticated(&self) -> Result<(Self, String), ChangeRequestError> {
+        use sha2::{Digest, Sha256};
+        let credential = match &self.credential {
+            Some(credential) => credential.clone(),
+            None => {
+                let output = self
+                    .runner
+                    .run(ProcessRequest {
+                        args: vec![
+                            "auth".into(),
+                            "token".into(),
+                            "--hostname".into(),
+                            "github.com".into(),
+                        ],
+                        timeout: Duration::from_secs(5),
+                        output_limit: 16 * 1024,
+                        ..github_request()
+                    })
+                    .await
+                    .map_err(classify_run_error)?;
+                if !output.success {
+                    return Err(ChangeRequestError::Authentication);
+                }
+                if output.stdout_truncated {
+                    return Err(ChangeRequestError::Decode);
+                }
+                let token =
+                    String::from_utf8(output.stdout).map_err(|_| ChangeRequestError::Decode)?;
+                let token = token.trim();
+                if token.is_empty()
+                    || token
                         .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            });
-        let changed = account
-            .as_ref()
-            .is_some_and(|(_, current)| current != &login);
-        *account = Some((Instant::now(), login.clone()));
-        if changed {
-            self.invalidate_pr_cache().await;
+                        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+                {
+                    return Err(ChangeRequestError::Authentication);
+                }
+                Arc::<str>::from(token)
+            }
+        };
+        let account = format!("credential-v1:{:x}", Sha256::digest(credential.as_bytes()));
+        let mut github = self.clone();
+        github.credential = Some(credential);
+        Ok((github, account))
+    }
+
+    fn request(&self) -> ProcessRequest {
+        let mut request = github_request();
+        if let Some(credential) = &self.credential {
+            request
+                .env
+                .push(("GH_TOKEN".into(), credential.as_ref().into()));
         }
-        login
+        request
     }
 
     /// One page of open pull requests, 50 at a time, newest updates first.
@@ -869,28 +875,19 @@ impl GitHubCli {
         if after.is_some_and(|cursor| !valid_page_cursor(cursor)) {
             return Err(ChangeRequestError::Decode);
         }
-        let first_page = after.is_none();
-        let stored = match &self.store {
-            Some(store) if first_page => self
-                .store_account()
-                .await
-                .map(|account| (store.clone(), account)),
-            _ => None,
-        };
+        let (github, account) = self.authenticated().await?;
+        let stored = self.store.as_ref().filter(|_| after.is_none());
         if cached
             && !refresh
-            && let Some((store, account)) = &stored
-            && let Some(page) = store.load(account, repository, filter).await
-            && self.store_account().await.as_deref() == Some(account.as_str())
+            && let Some(store) = stored
+            && let Some(page) = store.load(&account, repository, filter).await
         {
             return Ok(page);
         }
-        let page = self
+        let page = github
             .fetch_list_page(repository, filter, after, refresh)
             .await?;
-        if let Some((store, account)) = stored
-            && self.store_account().await.as_deref() == Some(account.as_str())
-        {
+        if let Some(store) = stored {
             store.save(&account, repository, filter, &page).await;
         }
         Ok(page)
@@ -905,10 +902,9 @@ impl GitHubCli {
     ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
         let repository = repository.to_ascii_lowercase();
         let key = format!("list:{repository}:{filter:?}:{}", after.unwrap_or_default());
-        let github = self.clone();
         let after = after.map(str::to_owned);
         let result = self
-            .cached_pr_request(key, refresh, async move {
+            .cached_pr_request(key, refresh, |github| async move {
                 let page = github
                     .fetch_filtered_page(&repository, filter, after.as_deref())
                     .await?;
@@ -976,7 +972,7 @@ impl GitHubCli {
             )
             .collect(),
             stdin: None,
-            ..github_request()
+            ..self.request()
         };
         let output = self.runner.run(request).await.map_err(classify_run_error)?;
         let response = (!output.stdout_truncated)
@@ -2077,16 +2073,11 @@ mod tests {
         }
     }
 
-    async fn github_with_account(runner: Arc<dyn ProcessRunner>, login: &str) -> GitHubCli {
-        let github = GitHubCli::with_runner(runner);
-        *github.account.lock().await = Some((Instant::now(), Some(login.into())));
+    async fn github_with_credential(runner: Arc<dyn ProcessRunner>, token: &str) -> GitHubCli {
+        let mut github = GitHubCli::with_runner(runner);
+        github.credential = Some(token.into());
+        *github.account.lock().await = Some(github.authenticated().await.unwrap().1);
         github
-    }
-
-    async fn expire_account(github: &GitHubCli) {
-        if let Some((read_at, _)) = github.account.lock().await.as_mut() {
-            *read_at = Instant::now() - Duration::from_secs(31);
-        }
     }
 
     #[async_trait]
@@ -2264,7 +2255,7 @@ mod tests {
             command_success(serde_json::to_vec(&threads_empty).unwrap()),
             command_failure("authentication required: gh auth login; private-provider-diagnostic"),
         ]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let rpc = Arc::try_unwrap(core.rpc_service())
             .ok()
             .unwrap()
@@ -2483,7 +2474,8 @@ mod tests {
                 request.env,
                 [
                     ("GH_PROMPT_DISABLED".into(), "1".into()),
-                    ("GH_HOST".into(), "github.com".into())
+                    ("GH_HOST".into(), "github.com".into()),
+                    ("GH_TOKEN".into(), "fixture".into())
                 ]
             );
             assert!(request.cwd.is_none());
@@ -2536,7 +2528,7 @@ mod tests {
             command_success(br#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}"#.to_vec()),
             command_success("new patch"),
         ]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         for key in [
             format!("false:{url}::"),
             format!("false:{url}:{old}:"),
@@ -2742,7 +2734,7 @@ mod tests {
     #[tokio::test]
     async fn pr_detail_normalizes_absent_github_fields_and_uses_bounded_process() {
         let runner = FakeProcessRunner::with_responses([command_success(br#"{"number":12,"title":"A PR","body":"Description","author":null,"reviewDecision":null,"comments":[{"viewerDidAuthor":true,"author":{"login":"viewer"},"body":"Own comment"},{"author":{"login":"other"},"body":"Other comment"}],"statusCheckRollup":[{"name":"build","status":"IN_PROGRESS","conclusion":null}]}"#.to_vec()), command_failure("review threads unavailable")]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let detail = github
             .detail("https://github.com/a/b/pull/12", false)
             .await
@@ -2797,7 +2789,7 @@ mod tests {
                     command_success(serde_json::to_vec(&metadata).unwrap()),
                     command_failure("review threads unavailable"),
                 ]);
-                let github = github_with_account(runner, "fixture").await;
+                let github = github_with_credential(runner, "fixture").await;
                 let loaded = github.detail(url, false).await.unwrap();
                 let assessment = Facts::from_detail(&loaded).assess();
                 let expected = if current { expected } else { CiState::Unknown };
@@ -2820,7 +2812,7 @@ mod tests {
             command_success("diff --git a/a b/a\n"),
             Ok(truncated),
         ]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         assert_eq!(
             github
                 .diff("https://github.com/a/b/pull/12", false)
@@ -2945,7 +2937,7 @@ mod tests {
             node
         }).collect();
         let runner = FakeProcessRunner::with_responses([command_success(search_response(nodes))]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let page = github
             .list_page(
                 "acme/zeron",
@@ -3022,7 +3014,7 @@ mod tests {
         Arc<FakeProcessRunner>,
     ) {
         let runner = FakeProcessRunner::with_responses([response]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let result = authored(&github, "acme/zeron", false).await;
         (result, runner)
     }
@@ -3133,7 +3125,7 @@ mod tests {
             command_success(page(vec![item(1)], Some("Y3Vyc29yOjUw"))),
             command_success(page(vec![item(2)], None)),
         ]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let filter = zeron_proto::ChangeRequestFilter::All;
         let first = github
             .list_page("acme/zeron", filter, None, false, false)
@@ -3190,7 +3182,10 @@ mod tests {
         let runner = FakeProcessRunner::with_responses([
             command_success("me\n"),
             page("first"),
+            command_success("me\n"),
+            command_success("me\n"),
             page("refreshed"),
+            command_success("me\n"),
         ]);
         let github = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
         let filter = zeron_proto::ChangeRequestFilter::All;
@@ -3203,7 +3198,6 @@ mod tests {
         assert!(first.fetched_at.is_some());
         // A fresh engine (a relaunch) serves the stored page without GitHub.
         let relaunched = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
-        *relaunched.account.lock().await = Some((Instant::now(), Some("me".into())));
         let stored = relaunched
             .list_page("acme/zeron", filter, None, false, true)
             .await
@@ -3226,10 +3220,10 @@ mod tests {
             .unwrap();
         assert_eq!(stored.items[0].title, "refreshed");
         let requests = runner.requests();
-        assert_eq!(requests.len(), 3, "one account read and two searches");
+        assert_eq!(requests.len(), 6, "four credential reads and two searches");
         assert_eq!(
             requests[0].args,
-            ["config", "get", "user", "-h", "github.com"]
+            ["auth", "token", "--hostname", "github.com"]
         );
         // Another account never sees it.
         assert!(
@@ -3273,7 +3267,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alice.items[0].title, "alice result");
-        expire_account(&github).await;
 
         let bob = github
             .list_page("acme/zeron", filter, None, false, false)
@@ -3283,9 +3276,21 @@ mod tests {
         assert_eq!(runner.requests().len(), 4);
 
         let store = github.store.as_ref().unwrap();
+        let alice_key = github_with_credential(runner.clone(), "alice")
+            .await
+            .authenticated()
+            .await
+            .unwrap()
+            .1;
+        let bob_key = github_with_credential(runner.clone(), "bob")
+            .await
+            .authenticated()
+            .await
+            .unwrap()
+            .1;
         assert_eq!(
             store
-                .load("alice", "acme/zeron", filter)
+                .load(&alice_key, "acme/zeron", filter)
                 .await
                 .unwrap()
                 .items[0]
@@ -3293,9 +3298,105 @@ mod tests {
             "alice result"
         );
         assert_eq!(
-            store.load("bob", "acme/zeron", filter).await.unwrap().items[0].title,
+            store
+                .load(&bob_key, "acme/zeron", filter)
+                .await
+                .unwrap()
+                .items[0]
+                .title,
             "bob result"
         );
+    }
+
+    #[tokio::test]
+    async fn pr_credential_is_pinned_when_gh_switches_during_fetch() {
+        struct SwitchingRunner {
+            active: Mutex<String>,
+            requests: Mutex<Vec<ProcessRequest>>,
+        }
+        #[async_trait]
+        impl ProcessRunner for SwitchingRunner {
+            async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+                self.requests.lock().unwrap().push(request.clone());
+                if request.args.first().is_some_and(|arg| arg == "auth") {
+                    let token = std::mem::replace(&mut *self.active.lock().unwrap(), "bob".into());
+                    return command_success(token);
+                }
+                let token = request
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == "GH_TOKEN")
+                    .map(|(_, token)| token.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.active.lock().unwrap().clone());
+                command_success(search_response(vec![search_pull_request(
+                    "acme/zeron",
+                    1,
+                    &token,
+                    "OPEN",
+                    "UNKNOWN",
+                    "2026-08-10T09:30:00Z",
+                    "2026-08-19T12:00:00Z",
+                    false,
+                    None,
+                )]))
+            }
+        }
+        let runner = Arc::new(SwitchingRunner {
+            active: Mutex::new("alice".into()),
+            requests: Mutex::new(Vec::new()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let github = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
+        let filter = zeron_proto::ChangeRequestFilter::Authored;
+        let alice = github
+            .list_page("acme/zeron", filter, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(alice.items[0].title, "alice");
+        let bob = github
+            .list_page("acme/zeron", filter, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(bob.items[0].title, "bob");
+        *runner.active.lock().unwrap() = "alice".into();
+        let relaunched = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
+        let restored = relaunched
+            .list_page("acme/zeron", filter, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(restored.items[0].title, "alice");
+        let requests = runner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.args.first().is_some_and(|arg| arg == "api"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_missing_credentials_cannot_read_an_existing_disk_cache() {
+        let runner = FakeProcessRunner::with_responses([
+            command_success("alice"),
+            command_success(search_response(vec![])),
+            command_failure("not logged in"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let github = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
+        let filter = zeron_proto::ChangeRequestFilter::All;
+        github
+            .list_page("acme/zeron", filter, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            github
+                .list_page("acme/zeron", filter, None, false, true)
+                .await,
+            Err(ChangeRequestError::Authentication)
+        );
+        assert_eq!(runner.requests().len(), 3);
     }
 
     #[tokio::test]
@@ -3308,6 +3409,7 @@ mod tests {
                     .to_vec(),
             ),
             command_failure("review threads unavailable"),
+            command_success("alice\n"),
             command_success("alice diff"),
             command_success("bob\n"),
             command_success(
@@ -3315,6 +3417,7 @@ mod tests {
                     .to_vec(),
             ),
             command_failure("review threads unavailable"),
+            command_success("bob\n"),
             command_success("bob diff"),
         ]);
         let github = GitHubCli::with_runner(runner.clone());
@@ -3325,26 +3428,28 @@ mod tests {
             .unwrap();
         assert_eq!(alice["title"], "alice detail");
         assert_eq!(github.diff(url, false).await.unwrap(), "alice diff");
-        expire_account(&github).await;
         let bob = github
             .detail_request(url, false, false, None, None)
             .await
             .unwrap();
         assert_eq!(bob["title"], "bob detail");
         assert_eq!(github.diff(url, false).await.unwrap(), "bob diff");
-        assert_eq!(runner.requests().len(), 8);
+        assert_eq!(runner.requests().len(), 10);
     }
 
     #[tokio::test]
     async fn stale_rate_limit_flight_cannot_replace_the_new_accounts_cache() {
-        let runner = FakeProcessRunner::with_responses([command_success("bob\n")]);
-        let github = github_with_account(runner.clone(), "alice").await;
+        let runner = FakeProcessRunner::with_responses([
+            command_success("alice\n"),
+            command_success("bob\n"),
+        ]);
+        let github = GitHubCli::with_runner(runner);
         let (send, receive) = tokio::sync::oneshot::channel();
         let old_request = tokio::spawn({
             let github = github.clone();
             async move {
                 github
-                    .cached_pr_request("shared".into(), false, async move {
+                    .cached_pr_request("shared".into(), false, |_| async move {
                         receive
                             .await
                             .unwrap_or(Err(ChangeRequestError::CommandFailed))
@@ -3366,11 +3471,10 @@ mod tests {
         .await
         .expect("the first account starts its request");
 
-        expire_account(&github).await;
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(5),
-                github.cached_pr_request("shared".into(), false, async {
+                github.cached_pr_request("shared".into(), false, |_| async {
                     Ok(serde_json::json!("bob result"))
                 }),
             )
@@ -3413,7 +3517,7 @@ mod tests {
             command_success(serde_json::to_vec(&redirect).unwrap()),
             command_success(items),
         ]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         for _ in 0..2 {
             let items = authored(&github, "acme/old-name", false).await.unwrap();
             assert_eq!(items[0].repository, "acme/new-name");
@@ -3445,7 +3549,7 @@ mod tests {
         let runner = FakeProcessRunner::with_responses(
             (0..3).map(|_| command_success(search_response(vec![]))),
         );
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         for (index, filter) in [All, Authored, Reviewing].into_iter().enumerate() {
             github
                 .list_page("acme/zeron", filter, None, false, false)
@@ -3483,7 +3587,7 @@ mod tests {
             command_success(search_response(vec![])),
             command_success(search_response(vec![])),
         ]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let (a, b) = tokio::join!(
             authored(&github, "acme/zeron", false),
             authored(&github, "ACME/ZERON", false)
@@ -3528,7 +3632,7 @@ mod tests {
             gate: tokio::sync::Barrier::new(2),
             runs: Default::default(),
         });
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let (diff, same_diff, list) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 github.diff("https://github.com/a/b/pull/1", false),
@@ -3553,7 +3657,7 @@ mod tests {
             gate: tokio::sync::Barrier::new(2),
             runs: Default::default(),
         });
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         let url = "https://github.com/a/b/pull/1";
         let caller = tokio::spawn({
             let github = github.clone();
@@ -3582,7 +3686,7 @@ mod tests {
             command_failure("request failed"),
             command_success(search_response(vec![])),
         ]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         for _ in 0..2 {
             assert_eq!(
                 authored(&github, "a/b", false).await,
@@ -3598,7 +3702,7 @@ mod tests {
     async fn pr_rate_limit_cooldown_covers_other_repositories_and_details() {
         let runner =
             FakeProcessRunner::with_responses([command_failure("API rate limit exceeded")]);
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         assert_eq!(
             authored(&github, "a/one", false).await,
             Err(ChangeRequestError::RateLimited)
@@ -3623,7 +3727,7 @@ mod tests {
         let runner = FakeProcessRunner::with_responses(
             (0..26).map(|_| command_success(search_response(vec![]))),
         );
-        let github = github_with_account(runner.clone(), "fixture").await;
+        let github = github_with_credential(runner.clone(), "fixture").await;
         for invalid in ["", "acme", "a/b repo:c/d", "a/*", "a/b/c", "a/.."] {
             assert_eq!(
                 authored(&github, invalid, false).await,
@@ -3707,6 +3811,7 @@ mod tests {
             [
                 ("GH_PROMPT_DISABLED".into(), "1".into()),
                 ("GH_HOST".into(), "github.com".into()),
+                ("GH_TOKEN".into(), "fixture".into()),
             ]
         );
         assert_eq!(requests[0].timeout, GITHUB_TIMEOUT);

@@ -425,6 +425,10 @@ pub struct PullRequestDetailPage {
 }
 
 impl PullRequestDetailPage {
+    pub(crate) fn target_device(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
     pub(crate) fn new(
         state: Entity<AppState>,
         url: String,
