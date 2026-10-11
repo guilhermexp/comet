@@ -4331,3 +4331,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "worked_project_diffs_tests.rs"]
+mod worked_project_diffs_tests;
