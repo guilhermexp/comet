@@ -5,6 +5,65 @@
 use super::*;
 use std::ops::Range;
 
+#[derive(Default)]
+pub(super) struct CodeTextWidth {
+    measured: RefCell<Option<MeasuredCodeWidth>>,
+}
+
+struct MeasuredCodeWidth {
+    key: (u32, u32, u32, SharedString),
+    diff: Arc<ParsedDiff>,
+    width: f32,
+}
+
+impl CodeTextWidth {
+    fn width(
+        &self,
+        diff: &Arc<ParsedDiff>,
+        theme: &Theme,
+        text_system: &gpui::WindowTextSystem,
+        generation: u32,
+    ) -> f32 {
+        let key = (
+            generation,
+            crate::theme::style_generation(),
+            crate::changes::diff_text_size(theme).to_bits(),
+            theme.font_mono.clone(),
+        );
+        let mut cached = self.measured.borrow_mut();
+        if !cached
+            .as_ref()
+            .is_some_and(|cached| cached.key == key && Arc::ptr_eq(&cached.diff, diff))
+        {
+            let font = gpui::font(theme.font_mono.clone());
+            let lines = diff
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.role == RowRole::Line && row.kind != crate::changes::LineKind::Meta
+                })
+                .map(|row| {
+                    (
+                        row.text.as_ref(),
+                        crate::markdown::render::runs_for_syntax_line_with_plain(
+                            &row.text,
+                            &row.spans,
+                            &font,
+                            theme.text.opacity(0.92),
+                            theme,
+                        ),
+                    )
+                });
+            *cached = Some(MeasuredCodeWidth {
+                key,
+                diff: diff.clone(),
+                width: crate::changes::max_shaped_text_width(lines, theme, text_system),
+            });
+        }
+        cached.as_ref().unwrap().width
+    }
+}
+
 const FILES_WIDTH: f32 = 260.0;
 const WORKSPACE_GAP: f32 = 16.0;
 const WIDE_MIN: f32 = 760.0;
@@ -351,7 +410,12 @@ impl PullRequestDetailPage {
         let Some(diff) = &self.diff else {
             return div().into_any_element();
         };
-        let text_width = self.code_text_width(&theme, window);
+        let text_width = self.review.text_width.width(
+            diff,
+            &theme,
+            window.text_system(),
+            crate::typography::generation(cx),
+        );
         let gutter = diff.gutter;
         let rows = &diff.rows;
         let meta = |row: &CodeRow, theme: &Theme| match row.role {
@@ -404,19 +468,6 @@ impl PullRequestDetailPage {
                 })
             }
         }
-    }
-
-    /// The shared horizontal extent of every code plane in the stream.
-    fn code_text_width(&self, theme: &Theme, window: &Window) -> f32 {
-        let mono = gpui::font(theme.font_mono.clone());
-        let size = px(crate::changes::diff_text_size(theme));
-        let text = window.text_system();
-        let advance = text
-            .ch_advance(text.resolve_font(&mono), size)
-            .map(|advance| advance.as_f32())
-            .unwrap_or(size.as_f32() * 0.6);
-        // Slack covers ligatures and wide glyphs the column count misses.
-        self.parsed_diff().columns as f32 * advance * 1.05
     }
 
     fn file_header(
@@ -980,6 +1031,188 @@ impl PullRequestDetailPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FontWidthFixture {
+        diff: Arc<ParsedDiff>,
+        widths: CodeTextWidth,
+        text_system: gpui::WindowTextSystem,
+        theme: Theme,
+        split: bool,
+        scroll: gpui::ScrollHandle,
+    }
+
+    impl Render for FontWidthFixture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let width = self
+                .widths
+                .width(&self.diff, &self.theme, &self.text_system, 0);
+            let rows = self
+                .diff
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.role == RowRole::Line && row.kind != crate::changes::LineKind::Meta
+                })
+                .collect::<Vec<_>>();
+            let content = if self.split {
+                crate::changes::readonly_split_line(
+                    Some((&diff_line(rows[0]), &rows[0].spans)),
+                    Some((&diff_line(rows[1]), &rows[1].spans)),
+                    &self.theme,
+                    self.diff.gutter,
+                    width,
+                    &self.scroll,
+                    0,
+                )
+            } else {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .children(rows.iter().enumerate().map(|(index, row)| {
+                        crate::changes::readonly_scrolled_diff_line(
+                            &diff_line(row),
+                            &row.spans,
+                            &self.theme,
+                            self.diff.gutter,
+                            width,
+                            &self.scroll,
+                            index,
+                        )
+                    }))
+                    .into_any_element()
+            };
+            div().size_full().child(content)
+        }
+    }
+
+    fn font_width_patch(columns: usize) -> Arc<ParsedDiff> {
+        ParsedDiff::new(format!(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-{}\n+{}\n",
+            "W".repeat(columns),
+            "W".repeat(columns + 40),
+        ))
+    }
+
+    #[gpui::test]
+    fn pull_request_code_native_font_scroll_extent(cx: &mut gpui::TestAppContext) {
+        let text_system =
+            gpui::WindowTextSystem::new(crate::file_preview::loader::PREVIEW_TEXT_SYSTEM.clone());
+        text_system
+            .add_fonts(
+                crate::typography::bundled_font_faces()
+                    .map(std::borrow::Cow::Borrowed)
+                    .collect(),
+            )
+            .unwrap();
+        let (host, cx) = cx.add_window_view(|_, _| FontWidthFixture {
+            diff: font_width_patch(100),
+            widths: Default::default(),
+            text_system,
+            theme: Theme::dark(),
+            split: false,
+            scroll: gpui::ScrollHandle::new(),
+        });
+        cx.simulate_resize(gpui::size(px(600.), px(200.)));
+        for (family, size) in [
+            ("Geist", 12.5),
+            ("Geist", 32.),
+            ("Geist", 8.),
+            ("Geist Mono", 8.),
+            ("Geist Mono", 12.5),
+            ("Geist", 12.5),
+        ] {
+            for split in [false, true] {
+                cx.update(|window, cx| {
+                    host.update(cx, |host, cx| {
+                        host.theme.font_mono = family.into();
+                        host.theme.code_font_size = size;
+                        host.split = split;
+                        host.scroll.set_offset(gpui::Point::default());
+                        cx.notify();
+                    });
+                    window.draw(cx).clear();
+                });
+                let scroll = host.read_with(cx, |host, _| {
+                    let font = gpui::font(family);
+                    let column = host
+                        .text_system
+                        .ch_advance(host.text_system.resolve_font(&font), px(size))
+                        .unwrap()
+                        .as_f32();
+                    let mut painted_max = 0.0f32;
+                    for row in host.diff.rows.iter().filter(|row| {
+                        row.role == RowRole::Line && row.kind != crate::changes::LineKind::Meta
+                    }) {
+                        let runs = crate::markdown::render::runs_for_syntax_line_with_plain(
+                            &row.text,
+                            &row.spans,
+                            &font,
+                            host.theme.text.opacity(0.92),
+                            &host.theme,
+                        );
+                        let painted = host
+                            .text_system
+                            .shape_line(row.text.clone(), px(size), &runs, None)
+                            .width()
+                            .as_f32();
+                        if family == "Geist" {
+                            assert!(
+                                painted > row.text.len() as f32 * column * 1.1,
+                                "requires a real proportional font"
+                            );
+                        }
+                        painted_max = painted_max.max(painted);
+                    }
+                    let width = host
+                        .widths
+                        .width(&host.diff, &host.theme, &host.text_system, 0);
+                    assert!(
+                        (width - painted_max).abs() < 1.,
+                        "{family} {size}: {width} vs {painted_max}"
+                    );
+                    let viewport = host.scroll.bounds();
+                    let content = host.scroll.bounds_for_item(0).unwrap();
+                    assert!(viewport.size.width > px(0.));
+                    assert!(content.size.width >= px(painted_max));
+                    assert!(host.scroll.max_offset().x > px(0.));
+                    assert!(host.scroll.max_offset().x + viewport.size.width >= px(painted_max));
+                    host.scroll.clone()
+                });
+                if split {
+                    let left = cx.debug_bounds("pr-split-cell-0-true").unwrap();
+                    let right = cx.debug_bounds("pr-split-cell-0-false").unwrap();
+                    assert!((left.size.width - right.size.width).abs() < px(1.));
+                    assert!(left.right() <= right.left());
+                }
+                let end = scroll.max_offset().x;
+                host.update(cx, |_, cx| {
+                    scroll.set_offset(gpui::point(-end, px(0.)));
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                assert!((scroll.offset().x + end).abs() < px(1.));
+            }
+        }
+        let previous = host.read_with(cx, |host, _| {
+            host.widths
+                .width(&host.diff, &host.theme, &host.text_system, 0)
+        });
+        host.update(cx, |host, cx| {
+            host.diff = font_width_patch(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        host.read_with(cx, |host, _| {
+            let width = host
+                .widths
+                .width(&host.diff, &host.theme, &host.text_system, 0);
+            assert!(
+                width < previous / 2.,
+                "replacing the patch invalidates its width"
+            );
+        });
+    }
 
     #[test]
     fn pull_request_split_pairs_preserve_hunks_files_and_missing_newlines() {

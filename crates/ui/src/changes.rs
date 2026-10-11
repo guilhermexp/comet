@@ -317,9 +317,8 @@ impl DiffHorizontalGeometry {
 
 /// Measure the same runs the row paints. Color boundaries can break kerning
 /// and ligatures on native platforms even when every run uses the same font.
-fn max_shaped_text_width(
-    file: &FileDiff,
-    highlights: Option<&DiffHighlights>,
+pub(crate) fn max_shaped_text_width<'a>(
+    lines: impl Iterator<Item = (&'a str, Vec<gpui::TextRun>)>,
     theme: &Theme,
     text_system: &gpui::WindowTextSystem,
 ) -> f32 {
@@ -329,20 +328,16 @@ fn max_shaped_text_width(
         .ch_advance(text_system.resolve_font(&mono), size)
         .unwrap_or(size * 0.6)
         .as_f32();
-    file.hunks
-        .iter()
-        .flat_map(|hunk| &hunk.lines)
-        .fold(0.0f32, |widest, line| {
-            let runs = line_runs(line, highlights, theme);
-            let shaped = text_system
-                .shape_line(line.text.clone().into(), size, &runs, None)
-                .width()
-                .as_f32();
-            // Preserve the old column estimate as a floor, including tab stops.
-            widest
-                .max(shaped)
-                .max(visual_columns(&line.text) as f32 * column_width)
-        })
+    lines.fold(0.0f32, |widest, (text, runs)| {
+        let shaped = text_system
+            .shape_line(text.to_owned().into(), size, &runs, None)
+            .width()
+            .as_f32();
+        // Preserve the old column estimate as a floor, including tab stops.
+        widest
+            .max(shaped)
+            .max(visual_columns(text) as f32 * column_width)
+    })
 }
 
 /// Count terminal-style display columns, including tab stops and wide
@@ -1234,8 +1229,12 @@ impl FileHorizontalState {
                 key,
                 highlights: highlights.cloned(),
                 width: max_shaped_text_width(
-                    file,
-                    highlights.map(AsRef::as_ref),
+                    file.hunks.iter().flat_map(|hunk| &hunk.lines).map(|line| {
+                        (
+                            line.text.as_str(),
+                            line_runs(line, highlights.map(AsRef::as_ref), theme),
+                        )
+                    }),
                     theme,
                     text_system,
                 ),

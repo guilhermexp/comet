@@ -220,8 +220,6 @@ struct ParsedDiff {
     pairs: Vec<Vec<crate::changes::LinePair>>,
     /// Per-file (additions, deletions), counted from the patch itself.
     stats: Vec<(u64, u64)>,
-    /// Widest code line, in display columns, across the whole patch.
-    columns: usize,
     gutter: f32,
 }
 
@@ -243,12 +241,6 @@ impl ParsedDiff {
                     })
             })
             .collect();
-        let columns = rows
-            .iter()
-            .filter(|row| row.role == RowRole::Line)
-            .map(|row| crate::changes::visual_columns(&row.text))
-            .max()
-            .unwrap_or(0);
         Arc::new(Self {
             pairs: code::split_files(&rows, &files),
             gutter: code::code_gutter(&rows),
@@ -256,7 +248,6 @@ impl ParsedDiff {
             rows,
             files,
             stats,
-            columns,
         })
     }
 }
@@ -335,6 +326,7 @@ impl PullRequestCache {
 struct CodeReview {
     split: bool,
     horizontal: gpui::ScrollHandle,
+    text_width: code::CodeTextWidth,
     /// The review stream: every file's header and (unless folded) body.
     list: gpui::ListState,
     stream: Rc<Vec<code::StreamRow>>,
@@ -351,6 +343,7 @@ impl Default for CodeReview {
         Self {
             split: false,
             horizontal: gpui::ScrollHandle::new(),
+            text_width: Default::default(),
             list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(1024.0)),
             stream: Default::default(),
             ranges: Vec::new(),
