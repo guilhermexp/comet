@@ -39,6 +39,8 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 
 - Comandos: `bash -n scripts/<script>.sh` (sintaxe) · execução real do script
 
+- Para QA nativo de um release já compilado sem abrir a instalação do usuário, copie o bundle gerado para `.tmp/verify/<run>/Zeron Sync QA.app`, dê identidade de bundle própria e refaça apenas a assinatura ad hoc dessa cópia. Execute o binário da cópia com `ZERON_DATA_DIR`, `ZERON_IPC_PORT`, `UNPEEL_HOME` e `COMET_WORKERS_HOOKS_DIR` exclusivos; semear Chat/Space e harness mock segue os RPCs públicos de `dev-demo.sh`, sem sua limpeza/rebuild. Não lance agentes reais. Registre revisão/hash/PIDs e observe o Shell pela UI nativa (ex.: Cmd+K e Details). Confira digest/mtime dos arquivos reais de hooks antes/depois; encerre somente os PIDs próprios e preserve evidências. Essa prova cobre apenas as interações observadas, não substitui suites nem abre `/Applications/Zeron.app`.
+
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `e2e-smoke.sh` | e2e — é o próprio teste | `scripts/e2e-smoke.sh` |
