@@ -3797,6 +3797,21 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             &["config", "branch.main.merge", "refs/heads/main"],
         );
 
+        let fetch_url = std::process::Command::new("git")
+            .args(["remote", "get-url", "upstream"])
+            .current_dir(&checkout)
+            .output()
+            .expect("git fetch URL command starts");
+        assert!(
+            fetch_url.status.success(),
+            "git remote get-url upstream failed: {}",
+            String::from_utf8_lossy(&fetch_url.stderr)
+        );
+        let fetch_url = String::from_utf8(fetch_url.stdout)
+            .expect("git fetch URL is UTF-8")
+            .trim()
+            .to_owned();
+
         let resolver = ChangeRequestResolver::new();
         let source = resolver
             .inspect_checkout(&checkout)
@@ -3806,7 +3821,8 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         assert_eq!(source.branch.remote_name.as_deref(), Some("upstream"));
         assert_eq!(
             source.branch.remote_url.as_deref(),
-            Some("git@github.com:acme/zeron.git")
+            Some(fetch_url.as_str()),
+            "a disabled push URL must fall back to Git's resolved fetch URL"
         );
         assert_eq!(
             resolver.repository_for_checkout(&checkout).await.as_deref(),

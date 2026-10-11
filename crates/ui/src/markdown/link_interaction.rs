@@ -1375,6 +1375,10 @@ mod rendered_tests {
         });
         cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
         cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
         assert!(
             cx.debug_bounds("link-menu-open-zeron").is_some(),
             "{diagnostic}: Open in Zeron row should be present"

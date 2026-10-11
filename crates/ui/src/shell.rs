@@ -4250,7 +4250,9 @@ impl Shell {
             self.right_images_suspended = false;
         } else {
             self.panels.hide(&key);
-            self.suspend_file_images(cx);
+            // Let the render-time visibility check release images after the
+            // close mask lands. Suspending here would blank file content on
+            // the first closing frame.
             // Closing always leaves takeover mode — reopening at full bleed
             // with the conversation gone read as a broken chat.
             self.right_pane_expanded = false;
@@ -13948,9 +13950,6 @@ impl Shell {
                     window.prevent_default()
                 })
                 .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
-                .when(!is_active, |el| {
-                    el.hover(|s| s.bg(crate::theme::wash(0.06)))
-                })
                 .on_click(
                     cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                         cx.stop_propagation();
@@ -15409,6 +15408,15 @@ impl Render for Shell {
                 cx.notify();
             }));
         }
+        if self.settings_restore_pending {
+            self.settings_restore_pending = false;
+            if matches!(self.route, Route::Chat) {
+                // Settings replaces the Chat tree. Request its composer focus
+                // after the restored route has mounted, using the same
+                // one-shot path as ordinary session navigation.
+                self.focus_composer(cx);
+            }
+        }
         let shortcut_focus = self.shortcut_focus.clone();
         let (preferred_focus, unfocused) = self.navigation_focus_fallback(cx);
         window.defer(cx, move |window, cx| {
@@ -16340,7 +16348,10 @@ mod tests {
             });
             cx.notify();
         });
-        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear()
+        });
         assert_exports_rendered(cx);
         for key in ["chat-menu-archive", "chat-menu-copy", "chat-menu-delete"] {
             assert!(cx.debug_bounds(key).is_some(), "missing existing row {key}");
@@ -16355,7 +16366,10 @@ mod tests {
             });
             cx.notify();
         });
-        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear()
+        });
         assert_exports_rendered(cx);
     }
 
@@ -19434,6 +19448,14 @@ mod exit_regressions {
                     _ => {}
                 })
                 .unwrap();
+            // The shell owns the settings-return transition; let its render
+            // request one-shot composer focus before mounting the same
+            // Composer in the isolated test window below.
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
             cx.update_window(composer_window.into(), |composer, window, cx| {
                 window.draw(cx).clear();
                 // The fork's settings route closes back into the composer.
@@ -21256,6 +21278,9 @@ mod settings_section_persistence {
                 state.selected_chat = Some("newer".into());
             });
             shell.active_chat = "newer".into();
+            // The sidebar is cached and observes Shell; publish the fixture
+            // state before its first measured draw.
+            cx.notify();
         });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());

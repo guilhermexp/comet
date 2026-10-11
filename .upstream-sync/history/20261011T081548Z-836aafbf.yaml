@@ -21,7 +21,7 @@ fork:
   target_branch: main
   initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
   observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
-  result_sha: 45702a8d0949dd21b6480325792594768ec012f5
+  result_sha: 455bc4e5e67f14c589bba967d48a9324625da7cd
   initial_worktree: clean
 strategy:
   operation: merge
@@ -204,9 +204,59 @@ verification:
     have identical51 unpeel-core compiler errors from Unix-only APIs. Source/workflow
     unchanged from initial main; main Windows execution not observed. Latest revision
     Windows CI pending.
+- command: Protected workspace/all-targets check attempt 4
+  revision: 8adfb2a4b5ef0444d1937d4e5029cbd3524e1843
+  result: passed
+  observed: All workspace and test targets compiled in 2m32s. Focused executable batch
+    continues in the same protected target; this is not release packaging evidence.
+- command: Focused proto, RPC and sidebar-section library tests
+  result: passed
+  observed: 96 proto, 24 RPC and 5 document tests passed. Engine and UI groups pending.
+- command: Linux UI CI455bc4e5
+  revision: 455bc4e5e67f14c589bba967d48a9324625da7cd
+  result: failed
+  observed: 2431 tests run, 2395 passed and 36 failed. 23 failures share a duplicate
+    hover panic, also reproduced by linux-browser. Other failures include incompatible
+    merge fixtures, Windows path joining and menu frame invalidation. Repairs remain
+    under review and require executable validation.
+- command: Linux core CI455bc4e5 with temporary Stop diagnostics
+  revision: 455bc4e5e67f14c589bba967d48a9324625da7cd
+  result: passed
+  observed: Saturated Stop regression passed in 5.279s with diagnostic prints, after
+    two previous 10s timeouts. This does not prove a causal fix. All temporary logs
+    must be removed and the original test rerun before delivery.
+- command: Local focused source-control retry
+  result: passed
+  observed: All58 tests passed after adapting the fallback assertion to the fetch
+    URL resolved by Git, which may honor host insteadOf rewrites. Production unchanged.
+- command: Temporary Stop instrumentation removal
+  result: passed
+  observed: Direct already-built diagnostic executable passed in5.32s with a2.005s
+    fence and3.013s interrupt. doc_host restored byte-for-byte to pre455 and sessions
+    clean. Original clean-source regression execution remains pending.
+- command: Local focused engine RPC tests
+  result: failed
+  observed: 22 passed,1 ignored,1 failed. checkout_diff_watch_pins_multiple_paths_and_releases_on_drop
+    timed out waiting for both orphan checkouts; investigation active without increasing
+    timeout or weakening pin-release assertions.
+- command: Local engine RPC retry with canonical expected paths
+  result: passed
+  observed: 23 passed, 0 failed, 1 ignored in 1.50s. Requests still use original
+    paths; returned CheckoutDiff.cwd is compared with the canonical Git roots.
+    Reconcile and drop-release assertions remain unchanged.
+- command: Independent static review of CI455 repair candidate
+  result: passed
+  observed: Duplicate hover, close-mask image lifetime, one-shot Settings focus,
+    disconnected folder path state and test fixture repairs reviewed independently.
+    All assertions retained; executable UI verification and fresh CI pending.
+- command: CI455 platform checks
+  revision: 455bc4e5e67f14c589bba967d48a9324625da7cd
+  result: partial
+  observed: iOS job passed. macOS application check and native diff font geometry
+    steps passed; full macOS job still running. These results predate final repairs.
 limits:
-- PR21 prior CI Linux file-link menu failure is pre-existing and not a proved integration
-  regression; merged-head CI still pending.
+- PR21 prior file-link menu failure predates this integration and recurred in CI455;
+  frame-refresh fixture repair remains unproved until rerun.
 - Native product/UI and macOS install not yet exercised in this attempt.
 references:
 - docs/upstream-sync.md

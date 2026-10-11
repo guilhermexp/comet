@@ -426,7 +426,11 @@ pub fn child_path(base: &str, name: &str) -> String {
     if base.ends_with('/') {
         format!("{base}{name}")
     } else if windows_browser_path(base).is_some() {
-        format!("{base}\\{name}")
+        if base.ends_with('\\') {
+            format!("{base}{name}")
+        } else {
+            format!("{base}\\{name}")
+        }
     } else {
         format!("{base}/{name}")
     }

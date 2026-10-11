@@ -4032,6 +4032,7 @@ mod tests {
         )
         .unwrap();
         let mut paths = Vec::new();
+        let mut canonical_paths = Vec::new();
         for name in ["first", "second"] {
             let path = temp.path().join(name);
             std::fs::create_dir(&path).unwrap();
@@ -4045,6 +4046,15 @@ mod tests {
             );
             std::fs::write(path.join("new.txt"), "new line\n").unwrap();
             paths.push(path.to_string_lossy().into_owned());
+            // CheckoutDiff publishes the canonical Git root. On macOS,
+            // tempfile may return /var/... while canonicalization resolves to
+            // /private/var/..., so keep request paths and expected paths apart.
+            canonical_paths.push(
+                std::fs::canonicalize(&path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         let plain = temp.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
@@ -4074,7 +4084,7 @@ mod tests {
                 let frame = stream.next().await.unwrap();
                 let diffs: Vec<zeron_proto::CheckoutDiff> = serde_json::from_value(frame).unwrap();
                 for diff in diffs {
-                    if paths.contains(&diff.cwd) {
+                    if canonical_paths.contains(&diff.cwd) {
                         seen.insert(diff.cwd);
                     }
                 }

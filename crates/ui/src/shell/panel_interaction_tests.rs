@@ -168,6 +168,17 @@ fn select(shell: &mut Shell, chat: Option<&str>, cx: &mut Context<Shell>) {
 #[gpui::test]
 fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);
+    // A right-pane toggle can only open a live surface in the fork. Open a
+    // real Browser tab through Shell's normal lifecycle, then hide its pane
+    // while keeping the tab. The empty-Picker behavior is covered separately.
+    change(&shell, cx, |shell, window, cx| {
+        shell.add_browser_surface(None, window, cx);
+        shell.set_surfaces_open(false, cx);
+        // This fixture starts from a settled closed state; the loop below
+        // measures the next user-driven opening transition.
+        shell.right_tween = None;
+        shell.right_content_tween = None;
+    });
     let initial = settled(&shell, cx);
     expect(initial, [300.0, 0.0, 0.0, 1300.0]);
 
@@ -427,9 +438,11 @@ fn details_owns_session_location_metadata_while_session_actions_remain(cx: &mut 
     assert!(cx.debug_bounds("session-info-device").is_none());
     assert!(cx.debug_bounds("session-info-side-chat").is_some());
 
-    // Details remains opted in, but its responsive budget is below its
-    // minimum at this width; SessionInfo must keep the location metadata.
-    cx.simulate_resize(gpui::size(px(640.0), px(900.0)));
+    // Details remains opted in, but at 620px its responsive budget is below
+    // the minimum even after the sidebar is hidden; SessionInfo keeps the
+    // location metadata only when Details actually has no width.
+    cx.simulate_resize(gpui::size(px(620.0), px(900.0)));
+    shell.read_with(cx, |shell, cx| assert_eq!(shell.details_target(cx), 0.0));
     cx.update(|window, cx| window.draw(cx).clear());
     assert!(cx.debug_bounds("session-info-device").is_some());
     cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));

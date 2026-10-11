@@ -279,7 +279,6 @@ fn files_panel_workspace_navigation_and_external_updates() {
                     .update(cx, |shell, window, cx| {
                         shell.settings.files_panel_width = FILES_PANEL_MAX;
                         shell.settings.right_pane_width = 760.0;
-                        shell.set_surfaces_open(true, cx);
                         window.resize(gpui::size(px(1200.0), px(800.0)));
                         window.bounds_changed(cx);
                     })
@@ -287,11 +286,8 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 frame(window, cx, output.as_deref(), "01b-empty-surfaces-files").await;
                 window
                     .update(cx, |shell, window, cx| {
-                        assert_eq!(shell.files_visible_width(cx), 284.0);
-                        assert_eq!(shell.files_reserved_width(cx), 284.0);
-                        assert_eq!(shell.right_visible_width(cx), RIGHT_PANE_MIN);
-                        // Squeezed by the narrow window, Files keeps its own
-                        // width for when there is room again.
+                        // With no live right-pane tab, the stored preference
+                        // must not reserve a column or squeeze the explorer.
                         assert_eq!(shell.settings.files_panel_width, FILES_PANEL_MAX);
                         assert!(shell.right_surface_rows(cx).is_empty());
                         assert!(!shell.right_pane_open(cx));

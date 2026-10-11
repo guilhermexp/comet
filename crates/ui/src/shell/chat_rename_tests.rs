@@ -107,10 +107,10 @@ fn double_click(cx: &mut VisualTestContext, position: Point<Pixels>) {
     redraw(cx);
 }
 
-/// A rename that reached `mutate` reports the missing engine (the fork's
-/// `mutate` raises an error toast rather than a sidebar notice).
+/// A rename that reached `mutate` reports the missing engine through the
+/// sidebar notice bridge (and the current toaster).
 fn mutated(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> bool {
-    shell.read_with(cx, |shell, _| !shell.toasts.is_empty())
+    shell.read_with(cx, |shell, _| shell.sidebar_notice.is_some())
 }
 
 #[gpui::test]

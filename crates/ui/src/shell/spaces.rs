@@ -6599,9 +6599,7 @@ impl Shell {
 
     /// ListFolders on the flow's device (relay-forwarded when remote).
     pub(super) fn load_space_folders(&mut self, path: Option<String>, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
+        let engine = self.state.read(cx).engine().cloned();
         let local = self.state.read(cx).local_device_id.clone();
         let Some(flow) = self.add_space.as_mut() else {
             return;
@@ -6615,10 +6613,16 @@ impl Shell {
         }
         let show_hidden = flow.show_hidden;
         let went_home = path.is_none();
+        flow.focus_pending = true;
         flow.browser_path = path.clone();
         flow.browser = Loadable::Loading;
         flow.active = 0;
         flow.list_scroll.set_offset(gpui::Point::default());
+        let Some(engine) = engine else {
+            flow.browser = Loadable::Error("Device is not connected".into());
+            cx.notify();
+            return;
+        };
         flow.load_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             if let Some(p) = &path {
