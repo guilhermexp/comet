@@ -14794,6 +14794,16 @@ impl Render for Shell {
         } else {
             gate.clone()
         };
+        // Decide before the Settings early exit and all non-ready gates:
+        // retained sidebar entities must not retain watches while unmounted.
+        if !matches!(render_gate, GatePhase::Ready)
+            || !matches!(self.route, Route::Chat)
+            || !self.details_sidebar_open(cx)
+        {
+            self.details_sidebar.update(cx, |sidebar, cx| {
+                sidebar.hide_worked_project_diffs(cx);
+            });
+        }
         let root = match &render_gate {
             GatePhase::Ready => 'ready: {
                 // Focus is a sync signal: on the rising edge of window
@@ -14983,11 +14993,6 @@ impl Render for Shell {
                 } else {
                     Empty.into_any_element()
                 };
-                if !on_chat || !self.details_sidebar_open(cx) {
-                    self.details_sidebar.update(cx, |sidebar, cx| {
-                        sidebar.hide_worked_project_diffs(cx);
-                    });
-                }
                 let details: AnyElement = if on_chat {
                     self.render_details_sidebar(cx)
                 } else {

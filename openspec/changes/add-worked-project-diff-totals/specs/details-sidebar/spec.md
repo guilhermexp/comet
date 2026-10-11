@@ -28,7 +28,7 @@ Test: unit — mock RPC requests and incremental frames.
 - **THEN** one local WatchCheckoutDiffs stream pins its set of paths, independently of the Chat host
 - **AND** changes update totals without polling
 - **AND** the active stream restarts only when its path set or local device changes
-- **AND** collapsing, hiding or emptying the section, or hiding the Details panel releases its stream
+- **AND** collapsing, hiding or emptying the section, or hiding the Details panel (including Settings and non-ready application gates) releases its stream
 - **AND** showing Details again subscribes for the visible paths
 
 #### Scenario: Subscription failure and disconnection
