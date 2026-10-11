@@ -3890,6 +3890,195 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inline_flow_hard_break_keeps_prose_on_one_baseline(cx: &mut gpui::TestAppContext) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        struct Fixture;
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let tree = super::super::parser::parse_full(
+                    "Como aproveitaria: referência de medição em `engineering-principles`, acionada por `to-execute` quando a entrega envolver performance. Sem impor benchmark a tarefas comuns.  \n[Fonte: benchmark-checklist](https://github.com/michael-denyer/pstack-claude/blob/main/plugins/pstack/skills/benchmark-checklist/SKILL.md)",
+                );
+                div()
+                    .w(px(736.0))
+                    .child(selection_frame_reset())
+                    .child(render_tree(
+                        &tree,
+                        &RenderOptions::settled("hard-break".into()),
+                        Theme::of(cx),
+                        window,
+                        &|_| None,
+                    ))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Fixture);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            REGISTRY.with(|registry| {
+                let registry = registry.borrow();
+                let bounds = |prefix: &str| {
+                    registry
+                        .iter()
+                        .find(|entry| entry.text.starts_with(prefix))
+                        .unwrap_or_else(|| panic!("missing fragment {prefix:?}"))
+                        .layout
+                        .bounds()
+                };
+                let tasks = bounds("tarefas");
+                let last = bounds("comuns.");
+                let first = bounds("Como");
+                let link = bounds("Fonte:");
+                assert_eq!(last.size.height, tasks.size.height, "one prose line");
+                assert_eq!(last.top(), tasks.top(), "same prose baseline");
+                assert_eq!(link.top(), last.bottom(), "link on the next line");
+                assert_eq!(
+                    link.left() - px(super::super::inline_chips::FAVICON_ADVANCE),
+                    first.left(),
+                    "favicon starts at the paragraph margin",
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn inline_flow_hard_break_variants_keep_layout_and_copy(cx: &mut gpui::TestAppContext) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        struct Fixture(&'static str);
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let tree = super::super::parser::parse_full(self.0);
+                div()
+                    .w(px(736.0))
+                    .child(selection_frame_reset())
+                    .child(render_tree(
+                        &tree,
+                        &RenderOptions::settled("break-variants".into()),
+                        Theme::of(cx),
+                        window,
+                        &|_| None,
+                    ))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        for (source, copied, lines, first_icon, last_icon, last_chip) in [
+            (
+                "antes  \n[depois](https://example.com)",
+                "antes\ndepois",
+                1,
+                false,
+                true,
+                false,
+            ),
+            ("antes\\\n`depois`", "antes\ndepois", 1, false, false, true),
+            (
+                "antes  \ndepois `chip`",
+                "antes\ndepois chip",
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "antes\\\n\\\n[depois](https://example.com)",
+                "antes\n\ndepois",
+                2,
+                false,
+                true,
+                false,
+            ),
+            (
+                "[antes](https://example.com)  \ndepois",
+                "antes\ndepois",
+                1,
+                true,
+                false,
+                false,
+            ),
+            (
+                "antes `chip`  \ndepois",
+                "antes chip\ndepois",
+                1,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let (_, cx) = cx.add_window_view(|_, _| Fixture(source));
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let (key, end) = REGISTRY.with(|registry| {
+                    let registry = registry.borrow();
+                    let first = registry
+                        .iter()
+                        .find(|entry| entry.text.starts_with("antes"))
+                        .unwrap();
+                    let last = registry
+                        .iter()
+                        .find(|entry| entry.text.starts_with("depois"))
+                        .unwrap();
+                    let first_bounds = first.layout.bounds();
+                    let last_bounds = last.layout.bounds();
+                    assert_eq!(first_bounds.size.height, px(24.0), "{source:?}");
+                    assert_eq!(
+                        last_bounds.size.height,
+                        px(if last_chip { 20.0 } else { 24.0 }),
+                        "{source:?}"
+                    );
+                    assert_eq!(
+                        last_bounds.top(),
+                        first_bounds.top()
+                            + px(24.0 * lines as f32 + if last_chip { 2.0 } else { 0.0 }),
+                        "{source:?}"
+                    );
+                    let margin = first_bounds.left()
+                        - px(if first_icon {
+                            super::super::inline_chips::FAVICON_ADVANCE
+                        } else {
+                            0.0
+                        });
+                    assert_eq!(
+                        last_bounds.left(),
+                        margin
+                            + px(if last_icon {
+                                super::super::inline_chips::FAVICON_ADVANCE
+                            } else if last_chip {
+                                6.0
+                            } else {
+                                0.0
+                            }),
+                        "{source:?}"
+                    );
+                    let end = registry.last().unwrap().layout.bounds();
+                    (first.key.clone(), point(end.right(), end.center().y))
+                });
+                super::super::selection::begin(&key, 0);
+                assert!(update_drag_at(end), "{source:?}");
+                assert_eq!(
+                    super::super::selection::selected_text().as_deref(),
+                    Some(copied),
+                    "{source:?}"
+                );
+                super::super::selection::end_active_drag();
+                super::super::selection::clear_if_owner(&key);
+            });
+        }
+    }
+
+    #[gpui::test]
     fn inline_chip_layout_routes_clicks_and_selects_later_fragments(cx: &mut gpui::TestAppContext) {
         let _selection_state = crate::markdown::selection::tests::state_lock();
         struct Fixture(Rc<RefCell<Vec<String>>>);
