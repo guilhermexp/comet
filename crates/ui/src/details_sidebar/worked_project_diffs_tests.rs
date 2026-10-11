@@ -66,7 +66,10 @@ fn assistant_entry(calls: Vec<ToolCall>) -> SessionMessageEntry {
 
 #[gpui::test]
 fn worked_project_rows_show_only_their_own_diff(cx: &mut gpui::TestAppContext) {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let _guard = runtime.enter();
     let data = tempfile::tempdir().unwrap();
     cx.update(|cx| {
@@ -76,25 +79,6 @@ fn worked_project_rows_show_only_their_own_diff(cx: &mut gpui::TestAppContext) {
     });
     let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
     let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
-    let server = runtime.spawn(async move {
-        while let Some(request) = requests.recv().await {
-            let request: zeron_rpc::ClientFrame = serde_json::from_str(&request).unwrap();
-            if request.cancel { continue; }
-            let mut reply = zeron_rpc::ServerFrame { id: request.id, ..Default::default() };
-            if request.method.as_deref() == Some(methods::WATCH_CHECKOUT_DIFFS) {
-                let diff = |cwd: &str, additions, deletions| serde_json::json!({
-                    "checkoutId": cwd, "deviceId": "local", "cwd": cwd,
-                    "patch": "", "files": [{"path":"file.txt", "status":"modified", "additions":additions, "deletions":deletions}],
-                    "additions": additions, "deletions": deletions, "truncated": false,
-                    "checksum": cwd, "updatedAt": "2026-10-11T00:00:00Z"
-                });
-                reply.item = Some(serde_json::json!([
-                    diff("/tmp/worked-first", 17, 4), diff("/tmp/not-worked", 999, 888)
-                ]));
-            } else { reply.ok = Some(serde_json::Value::Null); }
-            if replies.send(serde_json::to_string(&reply).unwrap()).await.is_err() { break; }
-        }
-    });
     let state = cx.new(|_| AppState::new());
     state.update(cx, |state, _| {
         state.set_test_engine(crate::state::EngineHandle::from_test_client(
@@ -173,7 +157,42 @@ fn worked_project_rows_show_only_their_own_diff(cx: &mut gpui::TestAppContext) {
     for _ in 0..20 {
         window.update(|window, cx| window.draw(cx).clear());
         window.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Drive RPC and deliver server frames on the test's own thread.
+        runtime.block_on(async {
+            tokio::task::yield_now().await;
+        });
+        while let Ok(request) = requests.try_recv() {
+            let request: zeron_rpc::ClientFrame = serde_json::from_str(&request).unwrap();
+            if request.cancel {
+                continue;
+            }
+            let mut reply = zeron_rpc::ServerFrame {
+                id: request.id,
+                ..Default::default()
+            };
+            if request.method.as_deref() == Some(methods::WATCH_CHECKOUT_DIFFS) {
+                let diff = |cwd: &str, additions, deletions| {
+                    serde_json::json!({
+                        "checkoutId": cwd, "deviceId": "local", "cwd": cwd,
+                        "patch": "", "files": [{"path":"file.txt", "status":"modified", "additions":additions, "deletions":deletions}],
+                        "additions": additions, "deletions": deletions, "truncated": false,
+                        "checksum": cwd, "updatedAt": "2026-10-11T00:00:00Z"
+                    })
+                };
+                reply.item = Some(serde_json::json!([
+                    diff("/tmp/worked-first", 17, 4),
+                    diff("/tmp/not-worked", 999, 888)
+                ]));
+            } else {
+                reply.ok = Some(serde_json::Value::Null);
+            }
+            replies
+                .try_send(serde_json::to_string(&reply).unwrap())
+                .unwrap();
+        }
+        runtime.block_on(async {
+            tokio::task::yield_now().await;
+        });
     }
     let totals = window
         .debug_bounds("worked-project-diff-0")
@@ -191,8 +210,19 @@ fn worked_project_rows_show_only_their_own_diff(cx: &mut gpui::TestAppContext) {
         "missing diff must never fall back to another checkout"
     );
     assert!(window.debug_bounds("worked-project-diff-2").is_none());
-    assert!(window.debug_bounds("worked-project-additions-0-17").is_some());
-    assert!(window.debug_bounds("worked-project-deletions-0-4").is_some());
-    assert!(window.debug_bounds("worked-project-additions-0-999").is_none());
-    server.abort();
+    assert!(
+        window
+            .debug_bounds("worked-project-additions-0-17")
+            .is_some()
+    );
+    assert!(
+        window
+            .debug_bounds("worked-project-deletions-0-4")
+            .is_some()
+    );
+    assert!(
+        window
+            .debug_bounds("worked-project-additions-0-999")
+            .is_none()
+    );
 }
