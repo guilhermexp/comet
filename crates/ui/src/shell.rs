@@ -9041,18 +9041,29 @@ impl Shell {
         match self.route {
             Route::Chat => self.render_session_title_bar(viewport_height, cx),
             Route::PullRequests | Route::Settings(_) => {
-                let titlebar_id = if matches!(self.route, Route::PullRequests) {
+                let pull_requests = matches!(self.route, Route::PullRequests);
+                let titlebar_id = if pull_requests {
                     "pull-requests-header-titlebar"
                 } else {
                     "settings-header-titlebar"
                 };
-                let inner = div()
+                let left = if pull_requests {
+                    let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+                    (self.sidebar_now() + Theme::SPACE_LG)
+                        .max(self.title_bar_content_start() + plus_inset)
+                } else {
+                    self.title_bar_content_start()
+                };
+                let mut inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
-                    .pl(px(self.title_bar_content_start()))
+                    .pl(px(left))
                     .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
+                if pull_requests && let Some(detail) = self.pull_request_detail.clone() {
+                    inner = inner.child(detail.update(cx, |page, cx| page.titlebar(cx)));
+                }
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region(titlebar_id, bar, cx)
                     .into_any_element()
@@ -9867,11 +9878,7 @@ impl Shell {
         // The footer uses the chat sidebar's theme so the account and
         // settings buttons render identically in both places.
         let footer_theme = Theme::of(cx).clone();
-        let (user_line, menu_identity) = {
-            let state = self.state.read(cx);
-            sidebar_account_identity(state.workspace_scope, self.sync_flow, state.auth_user())
-        };
-        let footer = self.render_user_menu(user_line, menu_identity, &footer_theme, cx);
+        let footer = self.render_sidebar_footer_row(&footer_theme, cx);
         // Fork: the Orchestrator/Workers switcher stays on top, so Settings
         // can still flip to the Workers catalog (`select_sidebar_mode`).
         let switcher = self.render_sidebar_mode_switcher(&footer_theme, cx);
@@ -11139,8 +11146,6 @@ impl Shell {
         {
             self.cancel_pinned_session_drag(cx);
         }
-        let workspace_scope = self.state.read(cx).workspace_scope;
-
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -11333,11 +11338,7 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let (user_line, menu_identity) = {
-            let state = self.state.read(cx);
-            sidebar_account_identity(workspace_scope, self.sync_flow, state.auth_user())
-        };
-        let user_menu = self.render_user_menu(user_line, menu_identity, theme, cx);
+        let user_menu = self.render_sidebar_footer_row(theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -11523,9 +11524,82 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The sidebar's bottom row (upstream #449): account pill on the left,
-    /// settings toggle on the right. Local runtimes advertise their storage
-    /// boundary and offer sync; synced runtimes offer sign-out.
+    /// Shared bottom row for Chat and Settings, including the account menu and
+    /// its adjacent actions.
+    fn render_sidebar_footer_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (user_line, menu_identity) = {
+            let state = self.state.read(cx);
+            sidebar_account_identity(state.workspace_scope, self.sync_flow, state.auth_user())
+        };
+        div()
+            .id("sidebar-footer-row")
+            .debug_selector(|| "sidebar-footer-row".into())
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(SIDEBAR_FOOTER_ACTION_GAP))
+            .child(div().flex_1().min_w_0().child(self.render_user_menu(
+                user_line,
+                menu_identity,
+                theme,
+                cx,
+            )))
+            .into_any_element()
+    }
+
+    fn render_pull_requests_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let selected = matches!(self.route, Route::PullRequests);
+        div()
+            .id("open-pull-requests")
+            .role(gpui::Role::Button)
+            .aria_label("Pull requests")
+            .tab_index(0)
+            .debug_selector(|| "open-pull-requests".into())
+            .focus_visible(|style| style.border_2().border_color(theme.accent))
+            .size(px(SIDEBAR_FOOTER_ACTION_SIZE))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .text_color(if selected {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .bg(if selected {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "open-pull-requests",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
+                )
+            })
+            .on_hover(motion::hover_listener("open-pull-requests"))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                // Leaving Settings through its own footer is a plain route
+                // change; nothing there should grab focus on the way out.
+                this.settings_focus_pending = false;
+                this.dismiss_pull_request_detail(cx);
+                this.open_pull_requests(cx);
+                cx.notify();
+            }))
+            .tooltip(crate::settings::widgets::text_tooltip("Pull requests"))
+            .child(
+                icon(icons::PULL_REQUEST)
+                    .size(px(15.0))
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        motion::hover_blend("open-pull-requests", theme.text_muted, theme.text)
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Account pill, identity, and Settings action within the shared footer.
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
@@ -19018,6 +19092,15 @@ mod exit_regressions {
                         title.left() >= new_session.right() + px(8.0),
                         "PR header overlaps New session: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, title={title:?}, new_session={new_session:?}"
                     );
+                    for selector in ["pr-detail-refresh", "pr-copy-url"] {
+                        let action = cx.debug_bounds(selector).unwrap();
+                        assert!(
+                            action.top() >= px(0.0)
+                                && action.bottom() <= px(Theme::TITLEBAR_HEIGHT)
+                                && action.right() <= px(width),
+                            "PR titlebar action escapes the header: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, selector={selector}, bounds={action:?}"
+                        );
+                    }
                     let external = cx.debug_bounds("pr-external").unwrap();
                     assert!(external.right() <= px(width));
                 }

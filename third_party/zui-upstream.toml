@@ -1,13 +1,13 @@
 repository = "https://github.com/zeronsh/zui"
 base_revision = "361ff20b919fdfb80199ee6d9aed725300cb7d54"
-vendored_tree = "724a81347f35767e8cd873e76c6ae5bbe306a7e1"
+vendored_tree = "2fb41aac47a06b3edd2b1b4607346e92bb476069"
 vendored_from = "working-tree"
 license = "Apache-2.0"
 
 # `vendored_tree` is the exact Git tree hash of `zui/` without `.git` or
 # `target/`. The snapshot was reconstructed in a separate source checkout at
 # `base_revision`, then the fork's existing patch set was merged and copied.
-# The reusable ignored checkout lives at `.tmp/zui-source`; its merge commit is
+# The original source reconstruction used the following merge commit:
 # `e1541c5c6d6b361437516fba63e1a5cd1cd90a42` (parents: reconstructed prior
 # snapshot `f64fda81a29145647aecf2f583f042d4f255ace0` and upstream
 # `0966d065b23e0b7c9b53c2e186705b8bce16fe2d`).
@@ -71,3 +71,4 @@ license = "Apache-2.0"
 # on dce5c1f in separate source (.tmp/zui-source), commit fd42552, then
 # merged rounded clipping 361ff20 without conflicts. Source merge: b9a039088ee1fdce42b853dddc6371696195f7ca.
 # Local glass/headless patches and both closing-punctuation rules retained.
+# Fork-toolchain formatting in the separate source checkout: bb83f55a94c13794686019b322253b1988543c77.

@@ -161,7 +161,7 @@ verification:
     IDs added, 2 removed. Not compilation evidence.
 - command: Separate zui source reconstruction and merge
   result: passed
-  observed: Source merge b9a039088ee1fdce42b853dddc6371696195f7ca; vendored tree724a81347f35767e8cd873e76c6ae5bbe306a7e1;
+  observed: Source merge b9a039088ee1fdce42b853dddc6371696195f7ca; vendored tree2fb41aac47a06b3edd2b1b4607346e92bb476069 (source formatting commit bb83f55);
     line_wrapper.rs and line_layout.rs byte-identical to fork before import.
 - command: Independent read-only review of stable engine/RPC/manifests/widgets and
     navigation
