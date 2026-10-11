@@ -273,8 +273,11 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
         assert!(s.right_pane_open(cx));
     });
     expect(settled(&shell, cx), [300.0, 0.0, 500.0, 800.0]);
-    change(&shell, cx, |s, _, cx| {
-        s.panels.update("b", |p| p.changes_open = false);
+    change(&shell, cx, |s, window, cx| {
+        // Close B through the same action as the titlebar/keyboard. The tab
+        // stays owned by B, but its pane visibility is per-chat state.
+        s.toggle_right_pane(window, cx);
+        assert!(!s.right_pane_open(cx));
         select(s, Some("a"), cx);
     });
     expect(settled(&shell, cx), [300.0, 377.0, 500.0, 423.0]);
@@ -336,7 +339,9 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     }
     expect(draw(&shell, cx, 0), [300.0, 286.0, 1014.0, 0.0]);
     change(&shell, cx, |s, _, cx| select(s, Some("b"), cx));
-    expect(settled(&shell, cx), [300.0, 0.0, 507.0, 793.0]);
+    // B's Browser tab remains live, but its pane was explicitly closed above.
+    expect(settled(&shell, cx), [300.0, 0.0, 0.0, 1300.0]);
+    assert!(!shell.read_with(cx, |s, cx| s.right_pane_open(cx)));
     assert!(!shell.read_with(cx, |s, _| s.right_pane_expanded));
     change(&shell, cx, |s, _, cx| select(s, Some("a"), cx));
     expect(draw(&shell, cx, 0), [300.0, 286.0, 1014.0, 0.0]);
