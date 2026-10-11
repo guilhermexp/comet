@@ -4345,7 +4345,24 @@ impl DocHost {
         // One drain at a time per chat. Waiters are cheap: whoever takes the
         // lock next re-reads the queue and the status, so a drain that became
         // unnecessary while it waited simply finds nothing to do.
+        let diagnostic = handle.chat_id == "chat-queue";
+        if diagnostic {
+            eprintln!(
+                "STOP-DIAG drain_queue waiting paused={} active={} rows={}",
+                handle.queue_paused.load(Ordering::Acquire),
+                sessions.turn_in_flight(&handle.chat_id),
+                handle.doc.read_queue().map_or(0, |queue| queue.len()),
+            );
+        }
         let _drain = handle.drain_lock.lock().await;
+        if diagnostic {
+            eprintln!(
+                "STOP-DIAG drain_queue acquired paused={} active={} rows={}",
+                handle.queue_paused.load(Ordering::Acquire),
+                sessions.turn_in_flight(&handle.chat_id),
+                handle.doc.read_queue().map_or(0, |queue| queue.len()),
+            );
+        }
         if handle.queue_paused.load(Ordering::Acquire) {
             // A paused queue (after Cancel/recovery) holds what the USER typed.
             // Worker lifecycle notifications are app-owned deliveries to the
@@ -4473,6 +4490,12 @@ impl DocHost {
         stop_id: &str,
     ) {
         let started = tokio::time::Instant::now();
+        if handle.chat_id == "chat-queue" {
+            eprintln!(
+                "STOP-DIAG {stop_id}: await earlier start active={}",
+                sessions.turn_in_flight(&handle.chat_id)
+            );
+        }
         loop {
             let bound = if sessions.turn_in_flight(&handle.chat_id) {
                 std::time::Duration::from_secs(2)
@@ -4480,12 +4503,25 @@ impl DocHost {
                 std::time::Duration::from_secs(15)
             };
             if started.elapsed() >= bound {
+                if handle.chat_id == "chat-queue" {
+                    eprintln!(
+                        "STOP-DIAG {stop_id}: await earlier bound elapsed={:?} active={}",
+                        started.elapsed(),
+                        sessions.turn_in_flight(&handle.chat_id)
+                    );
+                }
                 return;
             }
             let Ok(commands) = handle.doc.read_commands() else {
+                if handle.chat_id == "chat-queue" {
+                    eprintln!("STOP-DIAG {stop_id}: await earlier read_commands failed");
+                }
                 return;
             };
             let Some(at) = commands.iter().position(|c| c.id == stop_id) else {
+                if handle.chat_id == "chat-queue" {
+                    eprintln!("STOP-DIAG {stop_id}: await earlier Stop command missing");
+                }
                 return;
             };
             let earlier_prompt = commands[..at].iter().any(|c| {
@@ -4496,6 +4532,13 @@ impl DocHost {
                     )
             });
             if !earlier_prompt {
+                if handle.chat_id == "chat-queue" {
+                    eprintln!(
+                        "STOP-DIAG {stop_id}: await earlier clear elapsed={:?} active={}",
+                        started.elapsed(),
+                        sessions.turn_in_flight(&handle.chat_id)
+                    );
+                }
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -4552,7 +4595,9 @@ impl DocHost {
         stop_id: &str,
         paused_by_stop: bool,
     ) -> Result<bool, EngineError> {
+        eprintln!("STOP-DIAG {stop_id}: waiting for drain_lock");
         let _drain = handle.drain_lock.lock().await;
+        eprintln!("STOP-DIAG {stop_id}: acquired drain_lock");
         let release_own_pause = |owns_pause: bool| {
             let stopped_by = lock(&handle.stopped_by);
             let release = owns_pause && stopped_by.as_deref() == Some(stop_id);
@@ -4571,7 +4616,10 @@ impl DocHost {
             !handle.queue_paused.swap(true, Ordering::AcqRel) || paused_by_stop
         };
         self.cancel_held_sends(handle);
-        match sessions.interrupt(&handle.chat_id).await {
+        eprintln!("STOP-DIAG {stop_id}: calling sessions.interrupt");
+        let interrupted = sessions.interrupt(&handle.chat_id).await;
+        eprintln!("STOP-DIAG {stop_id}: sessions.interrupt returned {interrupted:?}");
+        match interrupted {
             Ok(true) => Ok(true),
             Ok(false) => Ok(release_own_pause(owns_pause)),
             Err(err) => {
@@ -5973,11 +6021,29 @@ impl DocHost {
                 .await
             }
             SessionCommandPayload::Interrupt {} => {
+                let stop_started = tokio::time::Instant::now();
+                if handle.chat_id == "chat-queue" {
+                    eprintln!("STOP-DIAG {}: execute entered", entry.id);
+                }
                 self.await_earlier_prompts(sessions, handle, &entry.id)
                     .await;
+                if handle.chat_id == "chat-queue" {
+                    eprintln!(
+                        "STOP-DIAG {}: await earlier returned after {:?}; active={}",
+                        entry.id,
+                        stop_started.elapsed(),
+                        sessions.turn_in_flight(chat_id)
+                    );
+                }
                 let should_pause =
                     sessions.turn_in_flight(chat_id) || sessions.holds_background_work(chat_id);
                 let paused_by_stop = Self::begin_stop(handle, &entry.id, should_pause);
+                if handle.chat_id == "chat-queue" {
+                    eprintln!(
+                        "STOP-DIAG {}: begin_stop returned; should_pause={should_pause} paused_by_stop={paused_by_stop}",
+                        entry.id
+                    );
+                }
                 // Sends before this Stop that are still on their way (a slow
                 // dispatch the wait above gave up on) are cancelled with it.
                 if let Ok(commands) = handle.doc.read_commands()
@@ -6007,6 +6073,13 @@ impl DocHost {
                 let drain = self
                     .interrupt_and_pause_queue(sessions, handle, &entry.id, paused_by_stop)
                     .await?;
+                if handle.chat_id == "chat-queue" {
+                    eprintln!(
+                        "STOP-DIAG {}: interrupt_and_pause_queue returned drain={drain} after {:?}",
+                        entry.id,
+                        stop_started.elapsed()
+                    );
+                }
                 if drain {
                     // The status watcher normally retries the paused queue on
                     // the run's Idle transition. Kick it here too: the Stop
@@ -6014,6 +6087,13 @@ impl DocHost {
                     // paused drain releases only Worker notifications, never
                     // the user's queued follow-ups.
                     self.drain_queue(handle).await;
+                    if handle.chat_id == "chat-queue" {
+                        eprintln!(
+                            "STOP-DIAG {}: post-stop drain_queue returned after {:?}",
+                            entry.id,
+                            stop_started.elapsed()
+                        );
+                    }
                 }
                 Ok((SessionCommandStatus::Applied, None))
             }
