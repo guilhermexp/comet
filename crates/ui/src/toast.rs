@@ -395,7 +395,7 @@ pub fn render_toaster(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
         targets.insert(toast.id, (bottom, clip, index));
     }
     let mut stack_height = front_height;
-    let mut moving = animating;
+    let mut moving = animating || store.expand.is_some_and(|glide| glide.moving(now));
     let mut children: Vec<AnyElement> = Vec::new();
     // Paint oldest first so the front toast lands on top.
     for &ix in order.iter().rev() {
@@ -1020,6 +1020,76 @@ mod tests {
             f32::from(expanded.size.height) > f32::from(collapsed.size.height) + 100.0,
             "the fourth toast should join the expanded stack"
         );
+    }
+
+    #[gpui::test]
+    fn settled_toasts_schedule_hover_expansion_and_collapse(cx: &mut gpui::TestAppContext) {
+        fn settle(cx: &mut gpui::VisualTestContext) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                std::thread::sleep(Duration::from_millis(16));
+                let frames = cx.update(|window, cx| window.simulate_next_frame(cx));
+                if frames == 0 {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "toast animation did not settle");
+            }
+        }
+
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            for message in ["one", "two", "three", "four"] {
+                info(cx, message);
+            }
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Host);
+        cx.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        settle(cx);
+        let collapsed = cx.debug_bounds("toaster").unwrap();
+
+        cx.simulate_mouse_move(collapsed.center(), None, gpui::Modifiers::default());
+        let remaining = cx.update(|window, cx| {
+            let store = cx.global::<ToastStore>();
+            assert!(store.hovered);
+            assert!(store.toasts.iter().all(|toast| toast.resumed.is_none()));
+            let remaining = store
+                .toasts
+                .iter()
+                .map(|toast| toast.remaining)
+                .collect::<Vec<_>>();
+            assert!(
+                window.simulate_next_frame(cx) > 0,
+                "hover must schedule expansion"
+            );
+            remaining
+        });
+        settle(cx);
+        let expanded = cx.debug_bounds("toaster").unwrap();
+        assert!(expanded.size.height > collapsed.size.height + px(100.0));
+        cx.update(|_, cx| {
+            let store = cx.global::<ToastStore>();
+            assert_eq!(
+                store
+                    .toasts
+                    .iter()
+                    .map(|toast| toast.remaining)
+                    .collect::<Vec<_>>(),
+                remaining
+            );
+            assert!(store.toasts.iter().all(|toast| toast.closing.is_none()));
+        });
+
+        cx.simulate_mouse_move(point(px(0.0), px(0.0)), None, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            assert!(!cx.global::<ToastStore>().hovered);
+            assert!(
+                window.simulate_next_frame(cx) > 0,
+                "leaving must schedule collapse"
+            );
+        });
+        settle(cx);
+        let restored = cx.debug_bounds("toaster").unwrap();
+        assert!((restored.size.height - collapsed.size.height).abs() < px(1.0));
     }
 
     #[test]
