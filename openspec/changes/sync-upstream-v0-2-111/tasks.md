@@ -1,0 +1,12 @@
+- [x] Identify starting main, PR #19 already merged, PR #20 upstream pin and PR #21 pin; reserve sync history ID.
+- [x] Read fork contracts and review the exact upstream incoming interval.
+- [x] Merge PR #21 into the isolated integration branch.
+- [ ] Format the fork before merging upstream.
+- [ ] Resolve engine/RPC conflicts while preserving authorization, Worker pins and Git execution bounds.
+- [ ] Resolve desktop shell/navigation/search/panel conflicts while preserving fork Details/Workers/steer behavior.
+- [ ] Resolve widget/settings/menu conflicts and preserve the markdown hard-break fix.
+- [ ] Reconcile manifests/lockfile and update zui in a separate source checkout with provenance and punctuation patches.
+- [ ] Compile APIs and run focused regressions; review the combined result.
+- [ ] Build/package/install macOS without auto-launch; inspect final artifacts and isolated native UI where practical.
+- [ ] Complete DOX, incoming-additions audit, sync YAML and evidence/limitations.
+- [ ] Integrate both requested heads into main, conclude requested PRs and authorized publication, archive completed OpenSpecs and clean task resources.
