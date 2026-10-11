@@ -21,7 +21,7 @@ fork:
   target_branch: main
   initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
   observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
-  result_sha: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result_sha: d000aed044b857bfd871a0362a69b871ef0ca3cd
   initial_worktree: clean
 strategy:
   operation: merge
@@ -99,6 +99,9 @@ customizations:
   - New picker retains Worker local-device restriction and registry submission.
   - New Sonner store coexists with fork Shell toast API.
   - zui361ff20 imported via separate source merge; gpui-base701ca97.
+  - Composer follows live conversation width outside takeover; right-column EASE and
+    header widths follow the actual shared layout. Tests open real surfaces and preserve
+    per-Chat closed-pane state.
   removed:
   - Superseded per-root file search lock/ranker replaced by shared upstream index.
 conflicts:
@@ -362,10 +365,55 @@ verification:
     on macOS by platform cfg and proves no link behavior. Export regression failed
     before selector repair. New patch retry is active; first diagnostic compilation
     found Context/App mismatch, corrected without runtime changes.
+- command: Local UI repair sequence and independent review
+  result: passed-after-repair
+  revision: d000aed044b857bfd871a0362a69b871ef0ca3cd
+  observed: 558 Shell executable:310pass/2fail (header geometry and cached drag row);64f
+    repaired header but fixture B lacked a live surface. b7 opened Browser B and fixed
+    same-update Sidebar cache invalidation:drag passed, full Shell311pass/1fail because
+    the fixture explicitly closed B yet expected it open later. d000 uses the normal
+    close action and asserts closed state on return; all312 Shell tests and complete
+    panel lifecycle passed. Web fixture derives the actual inline LinkRanges hitbox
+    with the shared nested_ix helper; Linux execution remains pending.
+- command: scripts/cargo-verify.py -- bash retry-driver.sh (single serial target,
+    final focused batch)
+  revision: d000aed044b857bfd871a0362a69b871ef0ca3cd
+  result: passed
+  observed: Wrapper exited0 and removed target-verify. Final workspace/all-targets
+    checks passed;312 Shell,66 picker,74 PR,202 transcript,2 hard-break,50 queue,19
+    change-request,7 toast and focused panel/metadata tests passed. RPC probe built.
+    Earlier unchanged proto96/RPC24/doc5 and engine search10/source-control58/RPC23(1existing
+    ignore) passed. Export menu actions and both Worked Project render/lifetime tests
+    passed. The Markdown rendered-link filter has0 macOS tests and proves no link
+    behavior. Saturated Stop passed twice6.21/6.19s; frozen Worker Stop3.34s; queued
+    attachments0.79s; the full37-test message_queue binary passed13.54s. These passes
+    do not establish a causal fix for previous intermittent CI timeouts; production
+    doc_host/sessions remain unchanged from initial main.
+- command: macOS CI c423 final job outcome
+  revision: c423004caa2e75f8cc1e2e877a1f79ea64db2be7
+  result: timeout
+  observed: Job annotation confirms45m execution limit at12:14:36Z while compiling
+    native browser fixtures. Application check, font geometry, notifications and attachment/composer/dropzone
+    regressions passed; browser, preview/HMR, frame-source and glass did not execute.
+    Raised only total job budget to90m for cold release compilation; short native
+    execution limits unchanged. Parsed workflow YAML; new-budget execution pending.
+  url: https://github.com/guilhermexp/comet/actions/runs/38135702304/job/114459090705
+- command: Read-only Stop and FFF initialization causal audit
+  result: inconclusive
+  observed: No shared fixture DB/channel/global lock or unbounded Stop mailbox wait
+    established. FFF index/reaper/watchers are lazy and are not started by message_queue
+    setup. Host scheduling remains an unproven hypothesis. Failure-only snapshots
+    retain the original10s deadline, polling and Applied assertions; no runtime Stop
+    change or new skip.
 limits:
-- Rendered link regression is Linux/Windows-only. Candidate now uses its actual link
-  hitbox; execution on a matching platform remains required.
-- Native product/UI and macOS install not yet exercised in this attempt.
+- Current rendered-link repair still requires Linux/Windows execution; zero macOS
+  tests are not proof.
+- Previous intermittent Stop/attachments CI failures remain recorded despite local
+  clean-source passes; no causal fix claimed.
+- Windows voice native-platform compilation has the documented preexisting Unix-only
+  Unpeel errors; current main Windows execution was not observed.
+- Final candidate macOS packaging/install and isolated native QA, fresh combined-head
+  CI and project gate are pending.
 references:
 - docs/upstream-sync.md
 - openspec/changes/sync-upstream-v0-2-111/
@@ -373,9 +421,9 @@ references:
 - https://github.com/guilhermexp/comet/pull/21
 outcome: prepared
 pending:
-- Compile/check final integrated APIs and execute focused regressions.
-- Run project gate/merged-head CI and integrate into main.
-- Package/install macOS without auto-launch, then closeout docs/history and task resources.
+- Fresh combined-head CI and no-mistakes gate; integrate into main.
+- Package/install macOS without launching installed app; isolated native QA.
+- Finalize archive/history/delivery and task-resource closeout.
 delivery:
   integration: pending
   target_branch: main

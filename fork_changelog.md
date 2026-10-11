@@ -2,12 +2,18 @@
 
 Tracks local/private fork changes against upstream.
 
-## Baseline
+## Baseline histórico
 
 - Branch: `main`
 - HEAD before sync: `6519eb68cab2298eda734ede2e72a9e019ca9421`
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
+
+## 2026-10-11 — Base upstream v0.2.111 e totais por Worked Project
+
+- Busca de arquivos/conteúdo com fff e Cmd+K em abas, painel nativo de PRs, menus pesquisáveis, navegação pelo mouse e layout responsivo entram junto dos totais exatos por checkout da PR #21.
+- Workers/OMP, notificações diretas, Enter/Steer, Details/Usage, terminal à direita e remoções anteriores do fork permanecem. O composer e o cabeçalho acompanham a largura real durante as transições.
+- Revisão congelada, decisões, provas, limites e estado de publicação: [registro do sync](.upstream-sync/history/20261011T081548Z-836aafbf.yaml).
 
 ## 2026-10-05 — Remoção da aba Files do Details
 
