@@ -87,7 +87,7 @@ impl Glide {
     }
 
     fn moving(&self, now: Instant) -> bool {
-        self.progress(now) < 1.0
+        self.from != self.to && self.progress(now) < 1.0
     }
 }
 
@@ -1090,6 +1090,86 @@ mod tests {
         settle(cx);
         let restored = cx.debug_bounds("toaster").unwrap();
         assert!((restored.size.height - collapsed.size.height).abs() < px(1.0));
+    }
+
+    #[gpui::test]
+    fn reduced_motion_toasts_stop_frames_but_keep_expiry_wakes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            cx.set_reduce_motion(true);
+            for message in ["one", "two", "three", "four"] {
+                info(cx, message);
+            }
+            let settled = Instant::now() - MOVE;
+            for toast in &mut cx.global_mut::<ToastStore>().toasts {
+                toast.created = settled;
+            }
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Host);
+        cx.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(window.is_window_active());
+            assert_eq!(window.simulate_next_frame(cx), 0);
+            let (due, _) = cx
+                .global::<ToastStore>()
+                .wake
+                .as_ref()
+                .expect("expiry wake");
+            assert!(*due > Instant::now());
+        });
+        let collapsed = cx.debug_bounds("toaster").unwrap();
+
+        cx.simulate_mouse_move(collapsed.center(), None, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            assert_eq!(
+                window.simulate_next_frame(cx),
+                0,
+                "hover snaps without animation"
+            );
+            let store = cx.global::<ToastStore>();
+            assert!(store.hovered);
+            assert!(store.wake.is_none(), "hover cancels the expiry wake");
+            assert!(store.toasts.iter().all(|toast| toast.resumed.is_none()));
+        });
+        let expanded = cx.debug_bounds("toaster").unwrap();
+        assert!(expanded.size.height > collapsed.size.height + px(100.0));
+
+        cx.simulate_mouse_move(point(px(0.0), px(0.0)), None, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            assert_eq!(
+                window.simulate_next_frame(cx),
+                0,
+                "leaving snaps without animation"
+            );
+            let store = cx.global::<ToastStore>();
+            assert!(!store.hovered);
+            assert!(store.toasts.iter().all(|toast| toast.resumed.is_some()));
+            let (due, _) = store.wake.as_ref().expect("expiry wake resumes");
+            assert!(*due > Instant::now());
+        });
+        let restored = cx.debug_bounds("toaster").unwrap();
+        assert!((restored.size.height - collapsed.size.height).abs() < px(1.0));
+    }
+
+    #[test]
+    fn glide_reports_motion_only_between_distinct_endpoints() {
+        let now = Instant::now();
+        let mut glide = Glide::new(0.0, now);
+        assert!(!glide.moving(now));
+        glide.retarget(0.0, now, false);
+        assert!(!glide.moving(now));
+        glide.retarget(100.0, now, false);
+        assert!(glide.moving(now));
+        assert!(glide.moving(now + MOVE / 2));
+        assert!(!glide.moving(now + MOVE));
+        glide.retarget(0.0, now + MOVE, false);
+        assert!(glide.moving(now + MOVE));
+        glide.retarget(50.0, now + MOVE + MOVE / 2, true);
+        assert_eq!(glide.value(now + MOVE + MOVE / 2), 50.0);
+        assert!(!glide.moving(now + MOVE + MOVE / 2));
+        glide.retarget(50.0, now + MOVE * 2, true);
+        assert!(!glide.moving(now + MOVE * 2));
     }
 
     #[test]
