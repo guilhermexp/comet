@@ -1350,6 +1350,10 @@ mod rendered_tests {
         cx: &mut gpui::TestAppContext,
         case: &str,
         markdown: &str,
+        expected_text: &str,
+        expected_label: &str,
+        link_range: Range<usize>,
+        expected_target: &str,
         roots: Option<Rc<Vec<crate::workspace_links::FileLinkRoot>>>,
         has_copy_path: bool,
     ) {
@@ -1360,18 +1364,34 @@ mod rendered_tests {
         });
         let snapshot_label = "link-fixture:0";
         let diagnostic = format!("case={case}, snapshot={snapshot_label}");
+        let activated: Rc<RefCell<Vec<LinkActivation>>> = Rc::default();
         let (_view, cx) = cx.add_window_view(|_, _| Fixture {
             markdown: markdown.into(),
             width: 320.,
-            activated: Rc::default(),
+            activated: activated.clone(),
             source_local: false,
             file_roots: roots.clone(),
         });
+        // Paint this fixture before reading its selection snapshot: the
+        // snapshot is populated by the markdown render, and its layout gives
+        // the exact hit box used by LinkRanges for right-clicks.
+        cx.update(|window, cx| window.draw(cx).clear());
         let position = cx.update(|_, _| {
-            let (_, layout, _) = super::super::render::selection_test_snapshot(snapshot_label);
-            layout.position_for_index(4).unwrap_or_else(|| {
-                panic!("{diagnostic}: link position missing from selection snapshot")
-            }) + gpui::point(px(2.), px(8.))
+            let (text, layout, _) = super::super::render::selection_test_snapshot(snapshot_label);
+            assert_eq!(
+                text.as_ref(),
+                expected_text,
+                "{diagnostic}: fixture snapshot text"
+            );
+            assert_eq!(
+                text.get(link_range.clone()),
+                Some(expected_label),
+                "{diagnostic}: link range identifies the expected label"
+            );
+            super::super::render::range_rects(&layout, &link_range, 0., 0.)
+                .first()
+                .unwrap_or_else(|| panic!("{diagnostic}: link hit box missing from snapshot"))
+                .center()
         });
         cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
         cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
@@ -1405,6 +1425,16 @@ mod rendered_tests {
             has_copy_path,
             "{diagnostic}: copy-path row matches file resolution"
         );
+        let row = cx.debug_bounds("link-menu-open-zeron").unwrap().center();
+        cx.simulate_click(row, gpui::Modifiers::default());
+        assert_eq!(
+            activated
+                .borrow()
+                .last()
+                .map(|activation| activation.target.original.as_str()),
+            Some(expected_target),
+            "{diagnostic}: Open in Zeron keeps the link target"
+        );
     }
 
     /// A root on another device resolves the file link through that chat's
@@ -1420,6 +1450,10 @@ mod rendered_tests {
             cx,
             "remote-file",
             "see [lib](src/lib.rs) here",
+            "see lib here",
+            "lib",
+            4..7,
+            "src/lib.rs",
             roots,
             true,
         );
@@ -1432,6 +1466,10 @@ mod rendered_tests {
             cx,
             "web",
             "see [docs](https://example.com/) here",
+            "see docs here",
+            "docs",
+            4..8,
+            "https://example.com/",
             None,
             false,
         );

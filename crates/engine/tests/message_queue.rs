@@ -616,15 +616,64 @@ async fn a_frozen_queue_still_delivers_worker_notifications() {
     .await;
 
     let handle = core.doc_host.open(CHAT).expect("open parent chat");
-    wait_for(
-        || {
-            handle.doc().read_commands().unwrap().iter().any(|command| {
-                command.id == stop_id && command.status == zeron_doc::SessionCommandStatus::Applied
-            })
-        },
-        "Stop to settle after releasing the Worker notice",
-    )
-    .await;
+    let stop_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if handle.doc().read_commands().unwrap().iter().any(|command| {
+            command.id == stop_id && command.status == zeron_doc::SessionCommandStatus::Applied
+        }) {
+            break;
+        }
+        if tokio::time::Instant::now() >= stop_deadline {
+            let observed_commands = handle
+                .doc()
+                .read_commands()
+                .expect("read commands for Stop timeout diagnostics")
+                .into_iter()
+                .map(|command| {
+                    let kind = match command.payload {
+                        SessionCommandPayload::Run { .. } => "Run",
+                        SessionCommandPayload::Steer { .. } => "Steer",
+                        SessionCommandPayload::Interrupt {} => "Interrupt",
+                        SessionCommandPayload::RespondInput { .. } => "RespondInput",
+                        _ => "Other",
+                    };
+                    (command.id, kind, command.status)
+                })
+                .collect::<Vec<_>>();
+            let observed_queue = handle
+                .doc()
+                .read_queue()
+                .expect("read queue for Stop timeout diagnostics")
+                .into_iter()
+                .map(|item| (item.id, item.text))
+                .collect::<Vec<_>>();
+            let observed_status = core.sessions.session_status(CHAT).map(|session| {
+                (
+                    session.status,
+                    session.started_at,
+                    session.updated_at,
+                    session.last_completed_turn,
+                )
+            });
+            let observed_prompts = prompts.lock().unwrap().clone();
+            let observed_request_prompts = harness
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.prompt.clone())
+                .collect::<Vec<_>>();
+            panic!(
+                "timed out waiting for Stop to settle after releasing the Worker notice; \
+                 phase=worker_run_started_stop_not_applied; stop_id={stop_id:?}; \
+                 commands={observed_commands:?}; queue={observed_queue:?}; \
+                 session_status={observed_status:?}; turn_in_flight={}; \
+                 prompts={observed_prompts:?}; request_prompts={observed_request_prompts:?}",
+                core.sessions.turn_in_flight(CHAT),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
     assert_eq!(
         prompts
             .lock()

@@ -915,7 +915,7 @@ impl Shell {
         let from = self.right_target(cx);
         self.panels.update(&key, |panel| panel.changes_open = true);
         if !was_open {
-            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+            self.right_tween = Some(self.clocked_tween(from, self.right_target(cx)));
         }
         let owner = (self.active_chat.clone(), self.state.clone());
         self.add_file_surface_at(owner, path, location, window, cx);

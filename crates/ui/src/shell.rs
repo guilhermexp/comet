@@ -3079,7 +3079,7 @@ impl Shell {
                 DetailsSidebarEvent::Close => {
                     let from = this.details_target(cx);
                     this.settings.details_sidebar_open = false;
-                    this.details_tween = Some(WidthTween::new(from, 0.0));
+                    this.details_tween = Some(this.clocked_tween(from, 0.0));
                     this.schedule_save(cx);
                     cx.notify();
                 }
@@ -4083,7 +4083,7 @@ impl Shell {
         // width. Avoid driving an animation clock when its target did not move.
         let to = self.right_target(cx);
         if from != to {
-            self.right_tween = Some(WidthTween::new(from, to));
+            self.right_tween = Some(self.clocked_tween(from, to));
         }
         cx.notify();
     }
@@ -4147,7 +4147,7 @@ impl Shell {
         }
         let from = self.details_target(cx);
         self.settings.details_sidebar_open = !self.settings.details_sidebar_open;
-        self.details_tween = Some(WidthTween::new(from, self.details_target(cx)));
+        self.details_tween = Some(self.clocked_tween(from, self.details_target(cx)));
         self.schedule_save(cx);
         cx.notify();
     }
@@ -8569,6 +8569,13 @@ impl Shell {
             return now;
         }
         std::time::Instant::now()
+    }
+
+    fn clocked_tween(&self, from: f32, to: f32) -> WidthTween {
+        WidthTween {
+            started: self.render_time.unwrap_or_else(|| self.motion_time()),
+            ..WidthTween::new(from, to)
+        }
     }
 
     fn panel_tween(&self, from: f32, to: f32) -> WidthTween {
@@ -16278,7 +16285,10 @@ mod tests {
     fn chat_context_menu_renders_exports_for_main_and_side_chats(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
 
-        struct OverlayHost(gpui::Entity<super::Shell>);
+        struct OverlayHost {
+            shell: gpui::Entity<super::Shell>,
+            _shell_observation: gpui::Subscription,
+        }
 
         impl gpui::Render for OverlayHost {
             fn render(
@@ -16286,7 +16296,7 @@ mod tests {
                 window: &mut gpui::Window,
                 cx: &mut gpui::Context<Self>,
             ) -> impl gpui::IntoElement {
-                self.0.update(cx, |shell, cx| {
+                self.shell.update(cx, |shell, cx| {
                     let viewport = window.viewport_size();
                     gpui::div()
                         .size_full()
@@ -16319,12 +16329,17 @@ mod tests {
             default_harness: zeron_proto::HarnessId::Mock,
         };
         let (host, cx) = cx.add_window_view(|_, cx| {
-            OverlayHost(cx.new(|cx| {
+            let shell = cx.new(|cx| {
                 let state = cx.new(|_| super::AppState::new());
                 super::test_shell(state, boot, cx)
-            }))
+            });
+            let shell_observation = cx.observe(&shell, |_, _, cx| cx.notify());
+            OverlayHost {
+                shell,
+                _shell_observation: shell_observation,
+            }
         });
-        let shell = host.read_with(cx, |host, _| host.0.clone());
+        let shell = host.read_with(cx, |host, _| host.shell.clone());
 
         let assert_exports_rendered = |cx: &mut gpui::VisualTestContext| {
             for key in [
@@ -16348,10 +16363,7 @@ mod tests {
             });
             cx.notify();
         });
-        cx.update(|window, cx| {
-            window.refresh();
-            window.draw(cx).clear()
-        });
+        cx.update(|window, cx| window.draw(cx).clear());
         assert_exports_rendered(cx);
         for key in ["chat-menu-archive", "chat-menu-copy", "chat-menu-delete"] {
             assert!(cx.debug_bounds(key).is_some(), "missing existing row {key}");
@@ -16366,10 +16378,7 @@ mod tests {
             });
             cx.notify();
         });
-        cx.update(|window, cx| {
-            window.refresh();
-            window.draw(cx).clear()
-        });
+        cx.update(|window, cx| window.draw(cx).clear());
         assert_exports_rendered(cx);
     }
 
@@ -21260,7 +21269,7 @@ mod settings_section_persistence {
             shell.splash = SplashPhase::Gone;
             shell.reduced_motion = true;
             shell.settings.sidebar_organization = SidebarOrganization::InOneList;
-            shell.state.update(cx, |state, _| {
+            shell.state.update(cx, |state, state_cx| {
                 state.workspace_scope = Some(WorkspaceScope::Local);
                 state.local_device_id = Some("local".into());
                 state.chats = ["older", "newer"]
@@ -21276,10 +21285,14 @@ mod settings_section_persistence {
                     })
                     .collect();
                 state.selected_chat = Some("newer".into());
+                // The cached sidebar reads AppState for its rows, so publish
+                // the fixture mutation as well as the Shell presentation
+                // changes below before the first measured draw.
+                state_cx.notify();
             });
             shell.active_chat = "newer".into();
-            // The sidebar is cached and observes Shell; publish the fixture
-            // state before its first measured draw.
+            // The cached sidebar also observes Shell; publish its local
+            // presentation changes before the first measured draw.
             cx.notify();
         });
         cx.run_until_parked();

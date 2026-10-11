@@ -21,7 +21,7 @@ fork:
   target_branch: main
   initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
   observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
-  result_sha: 455bc4e5e67f14c589bba967d48a9324625da7cd
+  result_sha: a2c31d79a09f51be11044f667a41957b7f1f972f
   initial_worktree: clean
 strategy:
   operation: merge
@@ -241,19 +241,71 @@ verification:
     timeout or weakening pin-release assertions.
 - command: Local engine RPC retry with canonical expected paths
   result: passed
-  observed: 23 passed, 0 failed, 1 ignored in 1.50s. Requests still use original
-    paths; returned CheckoutDiff.cwd is compared with the canonical Git roots.
-    Reconcile and drop-release assertions remain unchanged.
+  observed: 23 passed, 0 failed, 1 ignored in 1.50s. Requests still use original paths;
+    returned CheckoutDiff.cwd is compared with the canonical Git roots. Reconcile
+    and drop-release assertions remain unchanged.
 - command: Independent static review of CI455 repair candidate
   result: passed
-  observed: Duplicate hover, close-mask image lifetime, one-shot Settings focus,
-    disconnected folder path state and test fixture repairs reviewed independently.
-    All assertions retained; executable UI verification and fresh CI pending.
+  observed: Duplicate hover, close-mask image lifetime, one-shot Settings focus, disconnected
+    folder path state and test fixture repairs reviewed independently. All assertions
+    retained; executable UI verification and fresh CI pending.
 - command: CI455 platform checks
   revision: 455bc4e5e67f14c589bba967d48a9324625da7cd
   result: partial
   observed: iOS job passed. macOS application check and native diff font geometry
     steps passed; full macOS job still running. These results predate final repairs.
+- command: Linux core CI a2c31d79 without Stop diagnostics
+  revision: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result: failed
+  observed: 1712 passed, 1 failed, 22 skipped. a_frozen_queue_still_delivers_worker_notifications
+    timed out waiting for Stop to settle after releasing the Worker notice (13.066s
+    including teardown). Root-cause investigation continues; no timeout increase,
+    skips or diagnostic prints retained.
+  url: https://github.com/guilhermexp/comet/actions/runs/38133720220/job/114453237355
+- command: Linux UI CI a2c31d79
+  revision: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result: failed
+  observed: '2426 passed and 5 failed, down from 36 failures. Remaining rendered failures:
+    exports menu, web link menu, device metadata, panel geometry and cached sidebar
+    row. Explicit redraw/notify did not resolve three fixtures; causal repair pending.'
+  url: https://github.com/guilhermexp/comet/actions/runs/38133720220/job/114453223493
+- command: Voice CI a2c31d79
+  revision: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result: partial
+  observed: macOS subscription bridge, Linux offline audio/transport, both split-host
+    probes and Linux/Windows runtime packaging passed. Windows native-platform compilation
+    still fails on preexisting Unix-only Unpeel APIs.
+  url: https://github.com/guilhermexp/comet/actions/runs/38133720223
+- command: Rust workspace CI a2c31d79
+  revision: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result: failed
+  observed: queued_attachments::queued_row_waits_for_attachment_bytes_then_sends_resolved_paths
+    timed out at 10s. Both Stop regressions passed in this job; the separate core
+    job failed one of them. This is evidence of intermittent behavior, not a clean
+    regression result.
+  url: https://github.com/guilhermexp/comet/actions/runs/38133720263/job/114453158058
+- command: Linux browser CI a2c31d79
+  revision: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result: passed
+  observed: Real X11 and Wayland browser regressions passed after removing duplicate
+    tab hover ownership.
+  url: https://github.com/guilhermexp/comet/actions/runs/38133720220/job/114453237373
+- command: iOS CI a2c31d79
+  revision: a2c31d79a09f51be11044f667a41957b7f1f972f
+  result: passed
+  observed: Rust mobile core tests, generated Swift binding consistency and Xcode
+    unit tests all passed.
+  url: https://github.com/guilhermexp/comet/actions/runs/38133720220/job/114453237362
+- command: Independent static review of remaining UI repair candidate and Stop failure
+    diagnostics
+  result: passed
+  observed: Device debug selector, monotonic/injected motion-clock consistency with
+    unchanged production duration/easing, indirect OverlayHost observation and AppState
+    fixture notification reviewed. Link fixture now clicks the rendered hitbox center
+    and asserts target activation; original edge-hit cause still requires execution.
+    Stop snapshots occur only on the same 10s timeout, with polling and assertions
+    unchanged; no runtime Stop fix claimed. Focused local UI execution and fresh combined-head
+    CI pending.
 limits:
 - PR21 prior file-link menu failure predates this integration and recurred in CI455;
   frame-refresh fixture repair remains unproved until rerun.

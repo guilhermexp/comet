@@ -159,6 +159,7 @@ impl Shell {
             device,
         )
         .id("session-info-device")
+        .debug_selector(|| "session-info-device".into())
         .when(!online, |row| {
             row.child(
                 icon(icons::WIFI_OFF)
