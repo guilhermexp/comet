@@ -2784,37 +2784,36 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
-                // An optional `cwd` pins that checkout for the life of the
-                // stream. Entries are otherwise built from chat rows alone, so
-                // a pane opened on a checkout no chat points at (a Workers
-                // project) would wait on a diff that is never captured.
-                #[derive(Deserialize)]
+                // Both forms are additive. Keep every successful pin alive
+                // until this stream is dropped; a non-Git path is independent.
+                #[derive(Deserialize, Default)]
                 struct P {
                     #[serde(default)]
                     cwd: Option<String>,
+                    #[serde(default)]
+                    cwds: Vec<String>,
                 }
-                let cwd = parse_params::<P>(params).ok().and_then(|p| p.cwd);
-                let pin = match cwd {
-                    Some(cwd) => match self
+                let p = parse_params::<P>(params).unwrap_or_default();
+                let mut cwds = p.cwds;
+                cwds.extend(p.cwd);
+                cwds.sort();
+                cwds.dedup();
+                let mut pins = Vec::new();
+                for cwd in cwds {
+                    match self
                         .diff_sync
                         .pin_checkout(std::path::Path::new(&cwd))
                         .await
                     {
-                        Ok(pin) => Some(pin),
-                        Err(error) => {
-                            // Not a checkout (or git is unavailable): the
-                            // stream still carries every chat-backed diff.
-                            tracing::debug!(cwd = %cwd, %error, "diff watch: pin failed");
-                            None
-                        }
-                    },
-                    None => None,
-                };
+                        Ok(pin) => pins.push(pin),
+                        Err(error) => tracing::debug!(cwd = %cwd, %error, "diff watch: pin failed"),
+                    }
+                }
                 let stream = watch_stream(self.diff_sync.watch_diffs());
                 Ok(RpcReply::Stream(
                     stream
                         .map(move |value| {
-                            let _pin = &pin; // held for the stream's lifetime
+                            let _pins = &pins; // held for the stream's lifetime
                             value
                         })
                         .boxed(),
@@ -3845,6 +3844,87 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checkout_diff_watch_pins_multiple_paths_and_releases_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let mut paths = Vec::new();
+        for name in ["first", "second"] {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::write(path.join("new.txt"), "new line\n").unwrap();
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        let plain = temp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        core.diff_sync.shutdown().await;
+        let sync = crate::diff_sync::CheckoutDiffSync::start_with_orphan_grace(
+            core.repos.clone(),
+            core.workspace.clone(),
+            &core.device_id,
+            None,
+            std::time::Duration::from_millis(20),
+        );
+        let mut rpc = core.rpc_service();
+        Arc::get_mut(&mut rpc).unwrap().diff_sync = sync.clone();
+        let reply = rpc
+            .handle(
+                methods::WATCH_CHECKOUT_DIFFS,
+                serde_json::json!({"cwd": paths[0], "cwds": [paths[1], plain, paths[1]]}),
+            )
+            .await
+            .unwrap();
+        let RpcReply::Stream(mut stream) = reply else {
+            panic!("expected stream")
+        };
+        let mut seen = std::collections::HashSet::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while seen.len() < 2 {
+                let frame = stream.next().await.unwrap();
+                let diffs: Vec<zeron_proto::CheckoutDiff> = serde_json::from_value(frame).unwrap();
+                for diff in diffs {
+                    if paths.contains(&diff.cwd) {
+                        seen.insert(diff.cwd);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("both orphan checkouts must be captured by one stream");
+        sync.reconcile_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        sync.reconcile_now().await;
+        assert_eq!(
+            sync.watch_diffs().borrow().len(),
+            2,
+            "both pins survive reconcile beyond orphan grace"
+        );
+        drop(stream);
+        sync.reconcile_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        sync.reconcile_now().await;
+        assert!(
+            sync.watch_diffs().borrow().is_empty(),
+            "dropping the stream releases every pin; orphan diffs retire"
+        );
+        sync.shutdown().await;
+        core.sessions.shutdown().await;
+    }
 
     #[tokio::test]
     async fn voice_owner_is_shared_across_services_and_shutdown_retires_it() {
