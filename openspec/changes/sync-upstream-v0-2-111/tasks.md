@@ -7,6 +7,7 @@
 - [x] Resolve widget/settings/menu conflicts and preserve the markdown hard-break fix.
 - [x] Reconcile manifests/lockfile and update zui in a separate source checkout with provenance and punctuation patches.
 - [x] Compile APIs and run focused regressions; review the combined result.
+- [ ] Prevent stale concurrent command drains from overwriting terminal outcomes or executing a lost ledger claim; add a real Doc/ledger regression and update engine DOX.
 - [ ] Build/package/install macOS without auto-launch; inspect final artifacts and isolated native UI where practical.
 - [ ] Complete DOX, incoming-additions audit, sync YAML and evidence/limitations.
 - [ ] Integrate both requested heads into main, conclude requested PRs and authorized publication, archive the completed sync OpenSpec and clean task resources (PR #21 change remains active per its ticket).

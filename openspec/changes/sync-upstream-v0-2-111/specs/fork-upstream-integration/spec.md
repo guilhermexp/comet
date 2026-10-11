@@ -13,6 +13,11 @@ The integrated application SHALL retain the fork's Workers, orchestrator grants,
 - **WHEN** a client uses workspace search or PR inspection on the owning device
 - **THEN** the registered method and engine handler agree on request, response, forwarding and authorization
 
+#### Scenario: Concurrent command drains preserve a terminal outcome
+- **Test:** unit
+- **WHEN** two local drains hold a stale `Pending` view and one drain claims the command, executes it, and records a terminal outcome first
+- **THEN** the late drain neither executes the command again nor overwrites that outcome with crash-recovery rejection; a command left `Pending` in the processed ledger with no active claim after a process restart remains eligible for crash recovery
+
 #### Scenario: Responsive composer follows the rendered panel geometry
 - **Test:** unit
 - **WHEN** a docked chat opens or closes the Right, Files, or Sidebar column

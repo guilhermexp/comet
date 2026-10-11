@@ -21,7 +21,7 @@ fork:
   target_branch: main
   initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
   observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
-  result_sha: d000aed044b857bfd871a0362a69b871ef0ca3cd
+  result_sha: 9ca25d6d590d210cb175d618ef9154b494b6ff63
   initial_worktree: clean
 strategy:
   operation: merge
@@ -405,15 +405,42 @@ verification:
     setup. Host scheduling remains an unproven hypothesis. Failure-only snapshots
     retain the original10s deadline, polling and Applied assertions; no runtime Stop
     change or new skip.
+- command: Linux UI CI 9ca25d6d
+  revision: 9ca25d6d590d210cb175d618ef9154b494b6ff63
+  result: passed
+  observed: 2431 of2431 tests passed,0 skipped,32.804s, no flaky summary. Actual rendered
+    web link, export menu, cached drag row and complete panel lifecycle passed. Linux
+    browser and preview networking also passed.
+  url: https://github.com/guilhermexp/comet/actions/runs/38140462520/job/114473107375
+- command: Linux core CI 9ca25d6d
+  revision: 9ca25d6d590d210cb175d618ef9154b494b6ff63
+  result: failed
+  observed: 1712passed,1failed,22skipped. Saturated Stop reached terminal Rejected
+    (interrupted before completion) while Worker notice was Applied and opened a second
+    turn. Failure snapshot identifies stale dead-command sweep, not merely slow scheduling.
+    The sweep can read an old Pending snapshot after another drain resolves Applied
+    and removes executing; resolve_command overwrites status unconditionally. Also
+    found stale selection can execute when mark_processed returns false. Candidate
+    repair serializes claim with durable ledger and rereads current Pending rows before
+    crash rejection; real Doc/SQLite unit tests added, execution pending. No timeout
+    or assertion weakening.
+  url: https://github.com/guilhermexp/comet/actions/runs/38140462520/job/114473128711
+- command: Voice CI 9ca25d6d
+  revision: 9ca25d6d590d210cb175d618ef9154b494b6ff63
+  result: partial
+  observed: All six non-Windows-native jobs passed, including offline Linux on first
+    attempt and macOS native platform. Windows native-platform compilation again failed
+    on previously recorded Unix-only Unpeel APIs.
+  url: https://github.com/guilhermexp/comet/actions/runs/38140462508
 limits:
-- Current rendered-link repair still requires Linux/Windows execution; zero macOS
-  tests are not proof.
 - Previous intermittent Stop/attachments CI failures remain recorded despite local
   clean-source passes; no causal fix claimed.
 - Windows voice native-platform compilation has the documented preexisting Unix-only
   Unpeel errors; current main Windows execution was not observed.
 - Final candidate macOS packaging/install and isolated native QA, fresh combined-head
   CI and project gate are pending.
+- Linux rendered-link regression now passes on9ca; new command-claim repair still
+  requires executable validation. Windows rendered-link execution is not established.
 references:
 - docs/upstream-sync.md
 - openspec/changes/sync-upstream-v0-2-111/
@@ -421,7 +448,8 @@ references:
 - https://github.com/guilhermexp/comet/pull/21
 outcome: prepared
 pending:
-- Fresh combined-head CI and no-mistakes gate; integrate into main.
+- Validate command-claim race repair and final combined-head CI/no-mistakes; integrate
+  into main.
 - Package/install macOS without launching installed app; isolated native QA.
 - Finalize archive/history/delivery and task-resource closeout.
 delivery:

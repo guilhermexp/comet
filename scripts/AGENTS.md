@@ -49,7 +49,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 | `dev-demo.sh` | none — ferramenta de dev; validação é usar | `scripts/dev-demo.sh` |
 | `seed-demo-workers.py` | integration — fixture consumido pelo bootstrap real | `cargo test -p zeron-workers-unpeel --test dev_demo_fixture` |
 | `package-voice-runtime.py` / `codex-voice-remote-smoke.py` | integration — inventário/checksum/plataforma, protocolo, timeout e cleanup offline | `python3.12 -m unittest discover -s scripts/tests -p 'test_voice_packaging.py'` · `python3.12 -m unittest discover -s scripts/tests -p 'test_voice_remote*.py'` |
-| `package-*.sh` | none — sem suite; validação é gerar o pacote e abrir | execução manual |
+| `package-*.sh` | none — sem suite; validação é gerar/inspecionar o pacote e instalação; no macOS, QA usa cópia isolada conforme receita acima | execução manual |
 | `omp-dev` | none — wrapper de 1 decisão; validação é o handshake | `printf '{"type":"ping","id":"x"}\n' \| scripts/omp-dev --mode rpc-ui --auto-approve --allow-home --cwd "$HOME" \| head -1` (espera `"type":"ready"`) |
 
 ## Child DOX Index

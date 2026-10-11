@@ -319,11 +319,13 @@ struct DocHostInner {
     /// relay leg runs and fall back to indeterminate otherwise.
     transfers: watch::Sender<Vec<zeron_proto::TransferProgress>>,
     connectivity_grace: Mutex<DegradeGrace>,
-    /// Command ids currently BETWEEN mark-processed and their resolution in a
-    /// drain. Distinguishes "executing right now" from "consumed by the
-    /// ledger but dead" (a crash between mark and resolve): the drain
-    /// terminalizes the latter as Rejected instead of leaving a forever-
-    /// Pending entry no retry could ever reach (2026-08-19 swallowed-send).
+    /// Command ids currently claiming or holding the processed-ledger mark
+    /// through resolution in a drain. Distinguishes "executing right now" from
+    /// "consumed by the ledger but dead" (a crash between mark and resolve):
+    /// the drain terminalizes the latter as Rejected instead of leaving a
+    /// forever-Pending entry no retry could ever reach (2026-08-19
+    /// swallowed-send). Claims and dead-command recovery share this lock so a
+    /// stale snapshot cannot race a claim or overwrite its terminal outcome.
     executing: Mutex<HashSet<String>>,
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
@@ -5367,6 +5369,73 @@ impl DocHost {
         self.drain_command_kind(handle, false).await;
     }
 
+    /// Claim the command id in both the in-process execution set and the
+    /// durable processed ledger. Only the drain that inserts the ledger row
+    /// may execute; a false ledger result means another path already owns or
+    /// completed this id, even if this caller selected it from a stale doc
+    /// snapshot.
+    fn claim_command_execution(&self, command_id: &str) -> Result<bool, EngineError> {
+        let mut executing = lock(&self.inner.executing);
+        if !executing.insert(command_id.to_string()) {
+            return Ok(false);
+        }
+
+        match self.inner.store.mark_processed(command_id) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                executing.remove(command_id);
+                Ok(false)
+            }
+            Err(err) => {
+                executing.remove(command_id);
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Recover the mark-before-execute crash window only while no local drain
+    /// owns the id and every current doc row for it is still Pending. The
+    /// fresh read and rejection stay under the same lock as claims: a stale
+    /// Pending snapshot must not overwrite a terminal status written by a
+    /// drain that just finished.
+    fn reject_crashed_command_if_pending(&self, handle: &ChatDocHandle, command_id: &str) -> bool {
+        let executing = lock(&self.inner.executing);
+        if executing.contains(command_id)
+            || !self.inner.store.is_processed(command_id).unwrap_or(false)
+        {
+            return false;
+        }
+
+        let current = match handle.doc.read_commands() {
+            Ok(commands) => commands,
+            Err(err) => {
+                tracing::warn!(chat = %handle.chat_id, command = %command_id, error = %err,
+                    "command read failed during crash recovery");
+                return false;
+            }
+        };
+        let mut found = false;
+        for entry in current.iter().filter(|entry| entry.id == command_id) {
+            found = true;
+            if entry.status != SessionCommandStatus::Pending {
+                return false;
+            }
+        }
+        if !found {
+            return false;
+        }
+
+        tracing::warn!(chat = %handle.chat_id, command = %command_id,
+            "command consumed but never resolved (crash mid-execute?); rejecting");
+        self.resolve_command(
+            handle,
+            command_id,
+            SessionCommandStatus::Rejected,
+            Some("interrupted before completion — retry to send again"),
+        );
+        true
+    }
+
     async fn drain_command_kind(&self, handle: &Arc<ChatDocHandle>, controls_only: bool) {
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet (or retired); the set_sessions kick re-drains
@@ -5395,24 +5464,14 @@ impl DocHost {
             let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
             // Dead-command sweep: Pending in the doc, consumed by the ledger,
             // and NOT mid-execution in this process — the crash window
-            // between mark-processed and the outcome write. Left alone it is
-            // a send no drain or retry can ever reach ("Sending…" forever,
-            // 2026-08-19); terminalize it so the truth lands in the doc and
-            // a user retry can mint a fresh attempt.
+            // between mark-processed and the outcome write. Re-read under the
+            // claim lock before rejecting: this snapshot may have gone stale
+            // while another drain recorded the terminal outcome.
             for c in &commands {
                 if c.status == SessionCommandStatus::Pending
                     && !skipped.contains(&c.id)
-                    && is_processed(&c.id)
-                    && !lock(&self.inner.executing).contains(&c.id)
+                    && self.reject_crashed_command_if_pending(handle, &c.id)
                 {
-                    tracing::warn!(chat = %handle.chat_id, command = %c.id,
-                        "command consumed but never resolved (crash mid-execute?); rejecting");
-                    self.resolve_command(
-                        handle,
-                        &c.id,
-                        SessionCommandStatus::Rejected,
-                        Some("interrupted before completion — retry to send again"),
-                    );
                     skipped.insert(c.id.clone());
                 }
             }
@@ -5466,10 +5525,17 @@ impl DocHost {
                         self.arm_attachment_wait(handle);
                         return; // preserve order; UploadCommit / the wait timer re-kick
                     }
-                    if let Err(err) = self.inner.store.mark_processed(&entry.id) {
-                        tracing::error!(chat = %handle.chat_id, error = %err,
-                            "processed-ledger write failed; halting drain");
-                        return;
+                    match self.claim_command_execution(&entry.id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            skipped.insert(entry.id.clone());
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::error!(chat = %handle.chat_id, error = %err,
+                                "processed-ledger write failed; halting drain");
+                            return;
+                        }
                     }
                     tracing::warn!(chat = %handle.chat_id, command = %entry.id,
                         "command rejected: attachments never arrived");
@@ -5479,22 +5545,23 @@ impl DocHost {
                         SessionCommandStatus::Rejected,
                         Some("attachments never arrived"),
                     );
+                    lock(&self.inner.executing).remove(&entry.id);
                     continue;
                 }
             }
-            // In-flight claim: guards the dead-command sweep (an id in
-            // `executing` is alive, not crashed) and serializes racing
-            // drains on the same entry.
-            if !lock(&self.inner.executing).insert(entry.id.clone()) {
-                skipped.insert(entry.id.clone());
-                continue;
-            }
-            // Mark BEFORE executing: a crash mid-execution must never double-run a
-            // command whose side effect may already have happened.
-            if let Err(err) = self.inner.store.mark_processed(&entry.id) {
-                tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
-                lock(&self.inner.executing).remove(&entry.id);
-                return;
+            // In-flight claim and durable mark are one admission step. A stale
+            // selection that loses either claim must not execute the command.
+            match self.claim_command_execution(&entry.id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    skipped.insert(entry.id.clone());
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(chat = %handle.chat_id, error = %err,
+                        "processed-ledger write failed; halting drain");
+                    return;
+                }
             }
             match disposition {
                 CommandDisposition::Skip => {
@@ -7085,6 +7152,110 @@ mod stop_fenced_hold_tests {
                 .map(|row| row.id)
                 .collect::<Vec<_>>(),
             vec!["follow-up".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod command_drain_claim_tests {
+    use super::{ChatDocHandle, DocHost, DocHostConfig, lock};
+    use std::sync::Arc;
+    use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+    use zeron_proto::HarnessId;
+
+    fn fixture(chat_id: &str) -> (tempfile::TempDir, DocHost, Arc<ChatDocHandle>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store opens"));
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open(chat_id).expect("chat opens");
+        (dir, host, handle)
+    }
+
+    fn pending_interrupt(id: &str) -> SessionCommandEntry {
+        SessionCommandEntry {
+            id: id.into(),
+            payload: SessionCommandPayload::Interrupt {},
+            issued_by: "device-a".into(),
+            issued_at: 10,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_pending_snapshot_cannot_reclaim_or_reject_completed_command() {
+        let (_dir, host, handle) = fixture("chat-stale-drain");
+        let command = pending_interrupt("stop-once");
+        handle.doc().queue_command(&command).expect("queue command");
+        let stale_snapshot = handle.doc().read_commands().expect("read pending");
+        assert_eq!(stale_snapshot[0].status, SessionCommandStatus::Pending);
+
+        assert!(
+            host.claim_command_execution(&command.id)
+                .expect("first drain claims")
+        );
+        assert!(
+            !host.reject_crashed_command_if_pending(&handle, &command.id),
+            "crash recovery must not reject a command while its claim is active"
+        );
+        assert!(
+            !host
+                .claim_command_execution(&command.id)
+                .expect("concurrent drain loses active claim"),
+            "only one drain may own the id while its outcome is being written"
+        );
+
+        host.resolve_command(
+            &handle,
+            &command.id,
+            SessionCommandStatus::Applied,
+            Some("completed"),
+        );
+        lock(&host.inner.executing).remove(&command.id);
+
+        assert!(
+            !host
+                .claim_command_execution(&command.id)
+                .expect("stale selection loses durable claim"),
+            "a processed command must never execute from a stale Pending snapshot"
+        );
+        assert!(
+            !host.reject_crashed_command_if_pending(&handle, &command.id),
+            "crash recovery must re-read and preserve the completed outcome"
+        );
+        let current = handle.doc().read_commands().expect("read final status");
+        assert_eq!(current[0].status, SessionCommandStatus::Applied);
+        assert_eq!(current[0].resolution.as_deref(), Some("completed"));
+        assert_eq!(stale_snapshot[0].status, SessionCommandStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn dead_processed_pending_command_remains_recoverable_after_crash() {
+        let (_dir, host, handle) = fixture("chat-crash-recovery");
+        let command = pending_interrupt("stop-after-crash");
+        handle.doc().queue_command(&command).expect("queue command");
+        assert!(
+            host.inner
+                .store
+                .mark_processed(&command.id)
+                .expect("persist pre-execution claim")
+        );
+
+        assert!(host.reject_crashed_command_if_pending(&handle, &command.id));
+        let current = handle.doc().read_commands().expect("read recovered status");
+        assert_eq!(current[0].status, SessionCommandStatus::Rejected);
+        assert_eq!(
+            current[0].resolution.as_deref(),
+            Some("interrupted before completion — retry to send again")
         );
     }
 }

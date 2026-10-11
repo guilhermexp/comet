@@ -4,6 +4,8 @@ Use a real merge in an isolated worktree, after merging PR #21 and formatting th
 
 Source control retains authorized Worker checkout roots, bounded Git process execution and fork commit-message generation. New search and PR RPCs belong in the existing method registry, including forwarding/deadlines. The upstream session-information toggle coexists with the fork Details sidebar; it does not erase Device, Workers, usage or worked-project totals. Deleted legacy Details Files and Live Voice OMP surfaces remain deleted.
 
+Concurrent local command drains share the per-host execution claim. A drain may execute only when `mark_processed` grants the durable claim; a stale snapshot that loses that claim is re-read without running the side effect. Crash recovery may reject an already-processed command only when no local execution owns its id and every current document row for the id is still `Pending`; a fresh terminal status is preserved.
+
 ## Verification plan
 
 1. Inspect PR #21's existing Linux proof and CI failures. The current CI logs identify the documented Linux file-link menu test failure, while 2263 UI tests passed; this does not prove the merged revision.
