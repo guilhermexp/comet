@@ -4728,6 +4728,10 @@ mod tests {
         );
         assert_eq!(deadline(methods::CLONE_REPO), Duration::from_secs(15 * 60));
         assert_eq!(deadline(methods::LIST_BRANCHES), Duration::from_secs(30));
+        assert_eq!(
+            deadline(methods::LIST_CHANGE_REQUEST_PAGE),
+            Duration::from_secs(30)
+        );
         assert_eq!(deadline(methods::QUEUE_COMMAND), Duration::from_secs(30));
         assert_eq!(deadline(methods::FETCH_TOOL_INPUT), Duration::from_secs(20));
         assert_eq!(
@@ -4769,10 +4773,6 @@ mod tests {
         assert!(
             FILE_TOOL_INPUT_RESPONSE_MAX_BYTES - FILE_TOOL_INPUT_ENVELOPE_RESERVE + envelope
                 <= FILE_TOOL_INPUT_RESPONSE_MAX_BYTES
-        );
-        assert_eq!(
-            deadline(methods::LIST_CHANGE_REQUEST_PAGE),
-            Duration::from_secs(30)
         );
     }
 
