@@ -39,10 +39,6 @@ pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
     }
 }
 
-/// The session header's "+" and fork buttons (28px each, 2px gap) plus the
-/// row gap they cost the project-actions control.
-const SESSION_CONTROLS_WIDTH: f32 = 28.0 * 2.0 + 2.0 + 8.0;
-
 impl Shell {
     /// The same binding navigates the focused pane. Keep the persisted action
     /// IDs so existing user keymaps and the native browser bridge still work.
@@ -84,6 +80,7 @@ impl Shell {
             || self.delete_space_confirm.is_some()
             || self.chat_rename.is_some()
             || self.rename_space_dialog.is_some()
+            || self.discard_working_tree.is_some()
             || self.chat_menu.get().is_some()
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
@@ -178,8 +175,9 @@ impl Shell {
         // Opening any session steps the voice stage aside — including the one
         // already selected under it. The call keeps running in the background.
         self.set_voice_stage_open(false, cx);
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.focus_composer(cx);
+        self.nav.push(NavEntry::Chat(chat_id.clone()));
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -226,8 +224,9 @@ impl Shell {
         // Closing the stage only changes its visibility and focus; the voice
         // call remains owned by the engine and continues across navigation.
         self.set_voice_stage_open(false, cx);
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.focus_composer(cx);
+        self.nav.push(NavEntry::Chat(String::new()));
         let target = {
             let state = self.state.read(cx);
             project
@@ -258,46 +257,28 @@ impl Shell {
     /// `[new-session +] [harness icon + session title] … [utility controls]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, terminal and utility-panel controls, and the
-    /// project actions control).
+    /// session-information toggle).
     pub(super) fn render_session_title_bar(
         &mut self,
-        viewport_height: Pixels,
+        _viewport_height: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
-        // drag region, and buttons. A session appends its target as a muted
-        // "project @ device" tag right of the title (the composer footer no
-        // longer carries it).
-        let (title, target, harness, on_canvas): (
-            SharedString,
-            Option<SharedString>,
-            Option<zeron_proto::HarnessId>,
-            bool,
-        ) = {
+        // drag region, and buttons. Session metadata lives in the session-info
+        // card, while the Details sidebar owns overlapping Device/project data.
+        let (title, harness, on_canvas): (SharedString, Option<zeron_proto::HarnessId>, bool) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
-                Some(chat) => {
-                    let folder = chat
-                        .space_id
-                        .as_deref()
-                        .and_then(|id| state.space_row(id))
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "~".to_string());
-                    let device = state
-                        .device_name(&chat.device_id)
-                        .unwrap_or("Unknown device");
-                    (
-                        SharedString::from(transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )),
-                        Some(SharedString::from(format!("{folder} @ {device}"))),
-                        chat.config.as_ref().map(|c| c.harness),
-                        false,
-                    )
-                }
-                None => (SharedString::from(""), None, None, true),
+                Some(chat) => (
+                    SharedString::from(transcript::single_line(
+                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                    )),
+                    chat.config.as_ref().map(|c| c.harness),
+                    false,
+                ),
+                None => (SharedString::from(""), None, true),
             }
         };
         let has_space = !self.state.read(cx).spaces.is_empty();
@@ -338,8 +319,13 @@ impl Shell {
         // titlebar overlay owns this band's hit-testing: controls mounted in
         // the pane itself would sit under the drag region and never see a
         // click. Hidden on the new-session canvas — nothing to diff yet.
-        let changes_active = pane_open;
-        let takeover = changes_active && self.right_pane_expanded;
+        let fit = self.horizontal_fit();
+        let right_pane_visible = !on_canvas
+            && ((fit.right && (pane_open || self.tween_active(self.right_tween)))
+                || self.fit_exit_width(1).is_some());
+        let changes_active = right_pane_visible;
+        let takeover = right_pane_visible
+            && (self.right_pane_expanded || self.tween_active(self.main_takeover_tween));
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
         // inset would push the scope dropdown off the pane's own left gutter
@@ -483,68 +469,28 @@ impl Shell {
                 .occlude()
                 .child(self.render_files_panel_toggle(&theme, cx))
         });
-        // Project actions (upstream #project-actions) take whatever the title
-        // row leaves between the title and the trailing cluster.
-        let trailing_budget = 4.0 * 28.0 + 3.0 * 6.0;
-        let available_titlebar_width = (self.viewport_width
-            - row_left
-            - self.titlebar_right_pad(Theme::SPACE_LG)
-            - details_now
-            - right_now
-            - files_now
-            - trailing_budget
-            - row_gap * 3.0)
-            .max(0.0);
-
-        // The session's own side-chat controls: "+" mints a fresh side chat
-        // under this session, fork copies its history into one. Same pair
-        // the side-chat header carries, so a family reads the same from
-        // either end.
-        let session_controls = (!takeover && !on_canvas).then(|| {
-            let busy = self.side_chat_creating;
-            div()
-                .flex_none()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                .child(
-                    header_icon_button(
-                        "session-new-side-chat",
-                        icons::PLUS,
-                        "New side chat",
-                        false,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.create_child_chat(None, cx)),
-                    )
-                    .role(gpui::Role::Button)
-                    .aria_label("New side chat")
-                    .when(busy, |el| el.opacity(0.4)),
-                )
-                .child(
-                    header_icon_button(
-                        "session-fork",
-                        icons::FORK,
-                        "Fork this session",
-                        false,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.create_side_chat(cx)),
-                    )
-                    .role(gpui::Role::Button)
-                    .aria_label("Fork this session")
-                    .when(busy, |el| el.opacity(0.4)),
-                )
-        });
-        let available_titlebar_width = if session_controls.is_some() {
-            (available_titlebar_width - SESSION_CONTROLS_WIDTH).max(0.0)
-        } else {
-            available_titlebar_width
-        };
-        let actions = (!takeover && !on_canvas)
-            .then(|| {
-                self.render_project_actions_control(available_titlebar_width, viewport_height, cx)
+        // Session metadata and side-chat/project actions live in the card.
+        // The titlebar keeps only its toggle, so Device/project/branch rows
+        // are not duplicated beside the Details widget.
+        let session_info_toggle = (!takeover && !on_canvas).then(|| {
+            let label = if self.session_info_open() {
+                "Hide session details"
+            } else {
+                "Show session details"
+            };
+            header_icon_button_with(
+                "toggle-session-info",
+                icons::corner_card_glyph(16.0, theme.text_muted),
+                label,
+                cx.listener(|this, _, _, cx| this.toggle_session_info(cx)),
+            )
+            .role(gpui::Role::Button)
+            .aria_label(label)
+            .flex_none()
+            .when(self.session_info_open(), |button| {
+                button.bg(crate::theme::wash(0.09))
             })
-            .flatten();
+        });
         let inner = div()
             .size_full()
             .flex()
@@ -591,22 +537,11 @@ impl Shell {
                                     theme.text.opacity(0.85)
                                 })
                                 .child(title),
-                        )
-                        .when_some(target, |el, target| {
-                            el.child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
-                                    .child(target),
-                            )
-                        }),
+                        ),
                 )
             })
             .child(div().flex_1())
-            .children(session_controls)
-            .children(actions)
+            .children(session_info_toggle)
             .children(changes_trailing)
             // Stable utility controls at the right edge of the conversation
             // titlebar; hidden on the new-session canvas because neither

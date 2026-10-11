@@ -16,6 +16,10 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - SearchGitHistory e ResolveGitAvatars são unary tipados e relay-forwardable no registry. Não recriar listas de forwardable/deadlines no handler.
 
+- `SearchHomeFolders`, `SearchWorkspaceFiles`, `WarmWorkspaceSearch` e `SearchWorkspaceContent` são unary tipados e relay-forwardable; a engine de destino limita e autoriza o índice local. `WatchCheckoutChangeRequest` é stream; `ListChangeRequestPage`, `GetChangeRequestRepository`, `GetChangeRequest`, `GetChangeRequestDiff` e `PostChangeRequestComment` são unary tipados e relay-forwardable. Acesso de PR que usa um checkout exige `authorized_checkout`, inclusive para Worker ligado a projeto local. Não criar tabelas de roteamento/deadline paralelas.
+
+- Campos opcionais introduzidos em `ChangeRequestPage` (`fetchedAt`), `ChangeRequestDetail` (`reviewThreads`, `viewerLogin`) e nos itens de PR devem manter defaults de serde para aceitar engines mais antigas; limites opcionais de busca também preservam payloads legados.
+
 - `GetCheckoutStatus`, `WatchCheckoutStatus` (stream), `StageFiles`, `UnstageFiles`, `DiscardFiles`, `CommitCheckout`, `PushCheckout`, `PullCheckout` e `SyncCheckout` são tipados e relay-forwardable. `forwardable` aqui só autoriza o relay ao device dono do checkout — não autoriza cwd arbitrário. A engine de destino recusa path que não é Chat/Space local nem raiz exata de projeto Worker registrado (`authorized_checkout`) antes de qualquer git. Push/pull/sync usam deadline de 900s. Status é o stream leve; mutações são unary. Não recriar listas de forwardable/deadlines no handler.
 
 - `CreateWorktree` e `DeleteWorktree` continuam relay-forwardable e usam deadline de 1800s: o ciclo comum inclui espera pelo lock, Git, setup com orçamento total de 300s e `pre-*` com orçamento de 300s. A engine avisa após 720s, mas espera a operação bloqueante assentar antes de responder; descartar seu `JoinHandle` deixaria uma mutação em curso depois de um falso timeout. A posse do checkout continua sendo validada no device de destino.

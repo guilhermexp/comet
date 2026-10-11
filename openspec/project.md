@@ -52,7 +52,7 @@ local OAuth credential through snapshots or sync.
 
 - Branch `main`; `origin` = fork `guilhermexp/comet`; `upstream` = `zeronsh/comet`.
 - **Nunca pushar pro upstream.** `gh` precisa de `-R guilhermexp/comet` (o default resolve pro upstream).
-- Push passa pelo gate `no-mistakes` (`git push no-mistakes <branch>`).
+- Mudanças pequenas/localizadas podem ir direto à `main`, conforme `CLAUDE.md`; `no-mistakes` fica para mudanças grandes ou pedido explícito. Status do gate é consultado no checkout principal.
 - Tag `v*` dispara release no R2; push na `main` tocando `edge/` dispara deploy do Worker. Ambos herdados do upstream — não disparar sem intenção.
 
 ## Domain Context

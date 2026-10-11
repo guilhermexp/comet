@@ -18,6 +18,7 @@ use zeron_sync::DocsStore;
 pub mod agent_accounts;
 pub(crate) mod antigravity_usage;
 pub mod auth;
+mod change_request_store;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
@@ -53,6 +54,7 @@ pub mod uploads;
 pub mod voice;
 pub mod workspace_files;
 pub mod workspace_host;
+pub mod workspace_search;
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
@@ -85,6 +87,7 @@ pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, RetiredDevice, WORKSPACE_DOC_ID, WorkspaceHost,
     WorkspaceHostConfig,
 };
+pub use workspace_search::WorkspaceSearch;
 
 pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 

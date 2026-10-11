@@ -4459,6 +4459,32 @@ pub struct Transcript {
     /// Conversation column width from Appearance settings; the fork default
     /// is [`MAX_CONTENT_WIDTH`].
     content_width: f32,
+    /// Width held free at the column's right for a docked side card; the
+    /// reading column centers in what remains.
+    right_reserve: f32,
+    /// Last global code-fence layout generation applied to this transcript.
+    /// Each instance owns separate scroll handles and list measurements, so
+    /// every one must reset itself after a global Fit-mode transition.
+    code_fences_generation: u64,
+    /// Compact mode as last applied to this instance's row split. Render
+    /// polls the setting each frame; a flip rebuilds every row.
+    compact_mode: bool,
+    /// Compact work-group entry ids that were live this session — the
+    /// "Worked for" subtitle fades in only for those, not historical rows.
+    compact_live_entries: HashSet<SharedString>,
+    /// Last live elapsed (seconds) per assistant entry, used if `duration_ms`
+    /// has not landed on the doc yet when the turn settles.
+    compact_last_elapsed: HashMap<String, i64>,
+    /// When a compact work group first settled this session, so "Worked for"
+    /// can fade in without replaying on later paints.
+    compact_worked_fade_at: HashMap<SharedString, Instant>,
+    /// Natural heights of compact-fold body rows, written by each row's
+    /// prepaint probe without notifying. The work fold's TOOL_FOLD tween
+    /// clips the sibling rows against one shared budget without knowing
+    /// their layout up front.
+    compact_fold_heights: HashMap<SharedString, Rc<Cell<f32>>>,
+    /// Post-tween sweep that drops a closed work fold's retained body rows.
+    compact_fold_settle: Option<Task<()>>,
     highlights: HighlightStore,
     show_jump_button: bool,
     /// Distance from the bottom at the last observation (wheel event or spring
@@ -4941,6 +4967,14 @@ impl Transcript {
             file_link_roots: Default::default(),
             inline_code_links: Default::default(),
             content_width: crate::settings::transcript_width(cx),
+            right_reserve: 0.0,
+            code_fences_generation: crate::settings::code_fences_generation(cx),
+            compact_mode: crate::settings::transcript_compact_mode(cx),
+            compact_live_entries: HashSet::new(),
+            compact_last_elapsed: HashMap::new(),
+            compact_worked_fade_at: HashMap::new(),
+            compact_fold_heights: HashMap::new(),
+            compact_fold_settle: None,
             highlights: HighlightStore::default(),
             show_jump_button: false,
             last_scroll_distance: 0.0,
@@ -5006,6 +5040,21 @@ impl Transcript {
     // ---- rail plumbing (rendering lives in crate::rail) ----
 
     /// Shell-driven width gate: the rail hides below 48rem of container width.
+    /// Shell-driven: hold `reserve` px free on the right of the reading
+    /// column (a docked side card), so the column and card center together.
+    pub fn set_right_reserve(&mut self, reserve: f32, cx: &mut Context<Self>) {
+        let reserve = reserve.max(0.0);
+        if (self.right_reserve - reserve).abs() > 0.25 {
+            self.right_reserve = reserve;
+            // Rows rewrap at the new width, including virtual ones offscreen.
+            self.list.remeasure();
+            if self.pinned {
+                self.wake_spring();
+            }
+            cx.notify();
+        }
+    }
+
     pub fn set_rail_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.rail_enabled != enabled {
             self.rail_enabled = enabled;
@@ -11054,6 +11103,13 @@ impl Transcript {
         let target = if open { open_height } else { 0.0 };
         let summary = tool_group_summary(tools);
 
+        // The summary rolls as the group grows ("Thought 2 times" → "Thought
+        // 3 times · Ran 1 command"), like the working indicator's word.
+        let rolled_summary = crate::roll_text::rolling(
+            format!("tool-group-title-{row_id}"),
+            summary.clone(),
+            reduce_motion,
+        );
         let toggle_id = row_id.clone();
         let group_icon = crate::icons::icon(crate::icons::CHECKLIST)
             .size(px(14.0))
@@ -11091,10 +11147,20 @@ impl Transcript {
                     .h(px(render::MD_LINE_HEIGHT))
                     .flex()
                     .items_center()
-                    .truncate()
-                    .child(SharedString::from(summary)),
-            )
-            .child(stream_disclosure(open, theme));
+                    .overflow_hidden()
+                    .child(match worked_secs {
+                        Some(secs) => compact_work_title(
+                            summary.clone(),
+                            SharedString::from(worked_for_label(secs)),
+                            worked_fade_t,
+                            shimmer_phase,
+                            theme,
+                        ),
+                        None => rolled_summary.unwrap_or_else(|| {
+                            tool_group_title(summary.clone(), shimmer_phase, theme)
+                        }),
+                    }),
+            );
 
         let worker_chips: Vec<_> = {
             let state = self.state.read(cx);
@@ -13113,6 +13179,24 @@ impl Render for Transcript {
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
+        // Diagram requests are scoped to paint passes; rasters follow the
+        // reading column and display density (a no-op while both hold).
+        let released_diagrams = {
+            let mut diagrams = self.diagrams.borrow_mut();
+            let mut released = diagrams.begin_frame(crate::theme::style_generation());
+            let list_width = f32::from(self.list.viewport_bounds().size.width);
+            let column = if list_width > 0.0 {
+                self.content_width
+                    .min((list_width - self.right_reserve).max(1.0))
+            } else {
+                self.content_width
+            };
+            released.extend(diagrams.set_view((column.max(1.0), 480.0), window.scale_factor()));
+            released
+        };
+        if !released_diagrams.is_empty() {
+            crate::image_media::release_media(released_diagrams, cx);
+        }
         // Own-turn driver: measurements are only authoritative after layout,
         // so reservation sizing, the send glide, and the outgrown-handoff
         // each advance at most once per requested frame. Scheduled on every
@@ -18723,6 +18807,144 @@ mod tests {
             ],
         };
         assert_eq!(tool_chip_content(&todo), ("Todo", "1/2 done".to_string()));
+    }
+
+    #[test]
+    fn file_action_badges_show_only_the_file_name() {
+        assert_eq!(file_badge_name("/Users/me/project/src/main.rs"), "main.rs");
+        assert_eq!(
+            file_badge_name("crates/ui/src/transcript.rs"),
+            "transcript.rs"
+        );
+        assert_eq!(file_badge_name(r"C:\project\src\main.rs"), "main.rs");
+        assert_eq!(file_badge_name("src/components/"), "components");
+        assert_eq!(file_badge_name("main.rs"), "main.rs");
+        assert_eq!(file_badge_name(""), "");
+    }
+
+    #[gpui::test]
+    fn tool_file_badge_opens_linkable_files_without_toggling_the_chip(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Modifiers;
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let opened: Rc<RefCell<Vec<render::LinkActivation>>> = Rc::default();
+        let recorded = opened.clone();
+        let opener = ToolFileOpener {
+            link: render::LinkUi {
+                source_session: Some("chat".into()),
+                source_local: true,
+                file_roots: Some(Rc::new(vec![crate::workspace_links::FileLinkRoot {
+                    chat: Some("chat".into()),
+                    root: "/work/app".into(),
+                    local: true,
+                }])),
+                handler: Rc::new(move |activation, _, _| {
+                    recorded.borrow_mut().push(activation.clone());
+                    render::LinkOutcome::Internal
+                }),
+            },
+        };
+        assert!(opener.opens("/work/app/src/guard.rs"));
+        assert!(opener.opens("src/guard.rs"));
+        // An absolute file outside every root still opens, read-only.
+        assert!(opener.opens("/tmp/report.md"));
+        assert!(!opener.opens("/work/app/../secret.rs"));
+        assert!(!opener.opens("../secret.rs"));
+
+        let read = |path: &str| ToolItem {
+            part_id: "fixture".into(),
+            images: Default::default(),
+            call: ToolCall::ReadFile { path: path.into() },
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            kind: ToolItemKind::Call,
+        };
+        // The chip header inside a clickable parent, standing in for the
+        // accordion toggle that wraps it in `render_tool_group`.
+        struct ChipFixture {
+            tool: ToolItem,
+            opener: ToolFileOpener,
+            toggles: Rc<Cell<usize>>,
+        }
+        impl Render for ChipFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let toggles = self.toggles.clone();
+                div().w(px(600.0)).child(
+                    div()
+                        .id("chip-toggle")
+                        .debug_selector(|| "chip-toggle".into())
+                        .on_click(move |_, _, _| toggles.set(toggles.get() + 1))
+                        .child(chip_header(
+                            &self.tool,
+                            false,
+                            Some(&self.opener),
+                            &theme,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                )
+            }
+        }
+
+        let toggles = Rc::new(Cell::new(0));
+        let (_inside, window) = cx.add_window_view(|_, _| ChipFixture {
+            tool: read("/work/app/src/guard.rs"),
+            opener: opener.clone(),
+            toggles: toggles.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        let badge = window
+            .debug_bounds("tool-file-badge")
+            .expect("a workspace file badge is clickable");
+        window.simulate_click(badge.center(), Modifiers::default());
+        {
+            let opened = opened.borrow();
+            assert_eq!(opened.len(), 1);
+            assert_eq!(opened[0].target.original, "/work/app/src/guard.rs");
+            assert_eq!(opened[0].action, render::LinkAction::Primary);
+            assert_eq!(opened[0].source_session.as_deref(), Some("chat"));
+        }
+        assert_eq!(
+            toggles.get(),
+            0,
+            "opening the file must not toggle the chip"
+        );
+        // The rest of the header still toggles the accordion.
+        let row = window.debug_bounds("chip-toggle").unwrap();
+        window.simulate_click(
+            gpui::point(row.left() + px(2.0), row.center().y),
+            Modifiers::default(),
+        );
+        assert_eq!(toggles.get(), 1);
+        assert_eq!(opened.borrow().len(), 1);
+
+        let unlinkable_toggles = Rc::new(Cell::new(0));
+        let (_unlinkable, window) = cx.add_window_view(|_, _| ChipFixture {
+            tool: read("../secret.rs"),
+            opener: opener.clone(),
+            toggles: unlinkable_toggles.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            window.debug_bounds("tool-file-badge").is_none(),
+            "paths the link handler cannot open keep an inert badge"
+        );
     }
 
     #[test]
