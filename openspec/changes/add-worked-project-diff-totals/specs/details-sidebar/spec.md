@@ -9,6 +9,13 @@ Test: unit — GPUI TestAppContext layout and mock RPC.
 - **THEN** its row shows that checkout's additions and deletions at the right
 - **AND** unrelated checkout diffs never substitute for missing diffs
 
+#### Scenario: Monorepo subfolder or noncanonical registered path
+Test: none — existing unit fixtures cover exact cwd matching and unrelated checkouts, but do not cover a registered monorepo subfolder or symlink with a canonical Git root diff.
+- **WHEN** a Worked Project is registered below the repository root (a monorepo subfolder) or through a noncanonical path such as a symlink
+- **AND** the engine reports its checkout diff with the canonical Git root as cwd
+- **THEN** the row shows no counter because its registered path does not exactly match that cwd
+- **AND** checkout totals are not attributed to the subfolder or symlink through a fallback
+
 #### Scenario: Worktree, clean and unavailable checkouts
 Test: unit — GPUI TestAppContext with checkout frames.
 - **WHEN** a row represents a Worker worktree
