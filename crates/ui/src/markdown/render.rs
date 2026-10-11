@@ -3890,6 +3890,64 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inline_flow_hard_break_keeps_prose_on_one_baseline(cx: &mut gpui::TestAppContext) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        struct Fixture;
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let tree = super::super::parser::parse_full(
+                    "Como aproveitaria: referência de medição em `engineering-principles`, acionada por `to-execute` quando a entrega envolver performance. Sem impor benchmark a tarefas comuns.  \n[Fonte: benchmark-checklist](https://github.com/michael-denyer/pstack-claude/blob/main/plugins/pstack/skills/benchmark-checklist/SKILL.md)",
+                );
+                div()
+                    .w(px(736.0))
+                    .child(selection_frame_reset())
+                    .child(render_tree(
+                        &tree,
+                        &RenderOptions::settled("hard-break".into()),
+                        Theme::of(cx),
+                        window,
+                        &|_| None,
+                    ))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Fixture);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            REGISTRY.with(|registry| {
+                let registry = registry.borrow();
+                let bounds = |prefix: &str| {
+                    registry
+                        .iter()
+                        .find(|entry| entry.text.starts_with(prefix))
+                        .unwrap_or_else(|| panic!("missing fragment {prefix:?}"))
+                        .layout
+                        .bounds()
+                };
+                let tasks = bounds("tarefas");
+                let last = bounds("comuns.");
+                let first = bounds("Como");
+                let link = bounds("Fonte:");
+                assert_eq!(last.size.height, tasks.size.height, "one prose line");
+                assert_eq!(last.top(), tasks.top(), "same prose baseline");
+                assert_eq!(link.top(), last.bottom(), "link on the next line");
+                assert_eq!(
+                    link.left() - px(super::super::inline_chips::FAVICON_ADVANCE),
+                    first.left(),
+                    "favicon starts at the paragraph margin",
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
     fn inline_chip_layout_routes_clicks_and_selects_later_fragments(cx: &mut gpui::TestAppContext) {
         let _selection_state = crate::markdown::selection::tests::state_lock();
         struct Fixture(Rc<RefCell<Vec<String>>>);
