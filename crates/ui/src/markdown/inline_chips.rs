@@ -170,12 +170,18 @@ fn prose_segments(
     let mut at = range.start;
     for word in text[range].split_inclusive(char::is_whitespace) {
         let end = at + word.len();
+        let prose_end = end - usize::from(word.ends_with('\n'));
         let start = at;
-        for &split in breaks.iter().filter(|&&b| b > start && b < end) {
+        for &split in breaks.iter().filter(|&&b| b > start && b < prose_end) {
             out.push((at..split, false));
             at = split;
         }
-        out.push((at..end, false));
+        if at < prose_end {
+            out.push((at..prose_end, false));
+        }
+        if prose_end < end {
+            out.push((prose_end..end, false));
+        }
         at = end;
     }
 }
@@ -233,6 +239,7 @@ pub(super) fn render(
 ) -> AnyElement {
     let group = format!("{}:{ix}", opts.row_key);
     let mut flow = div().min_w_0().flex().flex_wrap().items_center();
+    let mut line_is_empty = true;
     for (range, is_chip) in segments(flat) {
         // RowVeil keys by element index, not row_key. Sharing index zero
         // rewrites the same fade baseline for every word on every frame.
@@ -250,6 +257,22 @@ pub(super) fn render(
             part_opts.row_key = format!("{}-inline-{}", group, range.start).into();
         }
         part_opts.selection_group = Some(group.clone());
+        if !is_chip && part.text.as_ref() == "\n" {
+            // A newline is a flex boundary, never part of a word's line box.
+            // Keep its text in the selection registry at zero line height so
+            // copying across the boundary preserves the source newline.
+            flow = flow.child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .h(px(if line_is_empty { line_height } else { 0.0 }))
+                    .line_height(px(0.0))
+                    .child(flat_text_element(&part, part_ix, &part_opts, theme)),
+            );
+            line_is_empty = true;
+            continue;
+        }
+        line_is_empty = false;
         let lead = web_links(flat)
             .find(|(link, _)| link.start == range.start)
             .map(|(_, url)| favicon(url, line_height, theme));

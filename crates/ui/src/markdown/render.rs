@@ -1026,6 +1026,11 @@ fn render_table(
                 let flat: &FlatText = measured.as_ref().unwrap_or(&flat);
                 let mut cell_width = 0.0f32;
                 for (range, chip) in super::inline_chips::segments(flat) {
+                    if !chip && &flat.text[range.clone()] == "\n" {
+                        *natural = cell_width.max(*natural);
+                        cell_width = 0.0;
+                        continue;
+                    }
                     let leads_link = super::inline_chips::web_links(flat)
                         .any(|(link, _)| link.start == range.start);
                     let part = super::inline_chips::fragment(&flat, range);
@@ -3945,6 +3950,137 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[gpui::test]
+    fn inline_flow_hard_break_variants_keep_layout_and_copy(cx: &mut gpui::TestAppContext) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        struct Fixture(&'static str);
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let tree = super::super::parser::parse_full(self.0);
+                div()
+                    .w(px(736.0))
+                    .child(selection_frame_reset())
+                    .child(render_tree(
+                        &tree,
+                        &RenderOptions::settled("break-variants".into()),
+                        Theme::of(cx),
+                        window,
+                        &|_| None,
+                    ))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        for (source, copied, lines, first_icon, last_icon, last_chip) in [
+            (
+                "antes  \n[depois](https://example.com)",
+                "antes\ndepois",
+                1,
+                false,
+                true,
+                false,
+            ),
+            ("antes\\\n`depois`", "antes\ndepois", 1, false, false, true),
+            (
+                "antes  \ndepois `chip`",
+                "antes\ndepois chip",
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "antes\\\n\\\n[depois](https://example.com)",
+                "antes\n\ndepois",
+                2,
+                false,
+                true,
+                false,
+            ),
+            (
+                "[antes](https://example.com)  \ndepois",
+                "antes\ndepois",
+                1,
+                true,
+                false,
+                false,
+            ),
+            (
+                "antes `chip`  \ndepois",
+                "antes chip\ndepois",
+                1,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let (_, cx) = cx.add_window_view(|_, _| Fixture(source));
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let (key, end) = REGISTRY.with(|registry| {
+                    let registry = registry.borrow();
+                    let first = registry
+                        .iter()
+                        .find(|entry| entry.text.starts_with("antes"))
+                        .unwrap();
+                    let last = registry
+                        .iter()
+                        .find(|entry| entry.text.starts_with("depois"))
+                        .unwrap();
+                    let first_bounds = first.layout.bounds();
+                    let last_bounds = last.layout.bounds();
+                    assert_eq!(first_bounds.size.height, px(24.0), "{source:?}");
+                    assert_eq!(
+                        last_bounds.size.height,
+                        px(if last_chip { 20.0 } else { 24.0 }),
+                        "{source:?}"
+                    );
+                    assert_eq!(
+                        last_bounds.top(),
+                        first_bounds.top()
+                            + px(24.0 * lines as f32 + if last_chip { 2.0 } else { 0.0 }),
+                        "{source:?}"
+                    );
+                    let margin = first_bounds.left()
+                        - px(if first_icon {
+                            super::super::inline_chips::FAVICON_ADVANCE
+                        } else {
+                            0.0
+                        });
+                    assert_eq!(
+                        last_bounds.left(),
+                        margin
+                            + px(if last_icon {
+                                super::super::inline_chips::FAVICON_ADVANCE
+                            } else if last_chip {
+                                6.0
+                            } else {
+                                0.0
+                            }),
+                        "{source:?}"
+                    );
+                    let end = registry.last().unwrap().layout.bounds();
+                    (first.key.clone(), point(end.right(), end.center().y))
+                });
+                super::super::selection::begin(&key, 0);
+                assert!(update_drag_at(end), "{source:?}");
+                assert_eq!(
+                    super::super::selection::selected_text().as_deref(),
+                    Some(copied),
+                    "{source:?}"
+                );
+                super::super::selection::end_active_drag();
+                super::super::selection::clear_if_owner(&key);
+            });
+        }
     }
 
     #[gpui::test]
