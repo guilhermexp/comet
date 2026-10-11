@@ -38,6 +38,8 @@ O workflow exige `SYNC_FORK_TOKEN` e falha antes de acessar a API se estiver aus
 
 Push/PR por essa credencial pode disparar CI. O deploy herdado só publica com `CLOUDFLARE_API_TOKEN`; na instalação esse secret não existia. Nenhuma credencial Cloudflare foi criada. Não há push de tags `v*`. Se forem adicionadas credenciais de deploy no futuro, reavalie seus efeitos antes de manter sync direto.
 
+**Bloqueio de Actions observado em 2026-10-11:** o GitHub suspendeu os workflows deste fork para reduzir computação desperdiçada. A API ainda dizia `enabled: true` e os workflows, `active`, mas o dispatch retornava 422. A reativação na interface foi autorizada pelo dono, incluindo os workflows herdados. Se repetir, confira a página Actions antes de mexer em credenciais ou no YAML; repetir PUT enabled não resolveu esse bloqueio. Após reativar, os runs [de criação da PR](https://github.com/guilhermexp/comet/actions/runs/38116962843) e [de pausa com PR aberta](https://github.com/guilhermexp/comet/actions/runs/38117040160) comprovaram o contrato. Ambos ficam vermelhos enquanto há conflito pendente; isso não equivale a CI de produto aprovado.
+
 Runs e PRs são os registros da automação; ela **não** gera um YAML de histórico a cada tick. Os registros versionados descritos acima pertencem às execuções assistidas da `upstream-sync`.
 
 ### Resolver uma PR na box, sob demanda
