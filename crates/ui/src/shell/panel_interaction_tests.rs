@@ -477,6 +477,94 @@ fn details_owns_session_location_metadata_while_session_actions_remain(cx: &mut 
 }
 
 #[gpui::test]
+fn session_info_reserves_the_rendered_transcript_column(cx: &mut TestAppContext) {
+    fn paint(shell: &Entity<Shell>, cx: &mut VisualTestContext) {
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.transcript.update(cx, |_, cx| cx.notify());
+                    cx.notify();
+                });
+                window.draw(cx).clear();
+            });
+        }
+    }
+
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |shell, _, cx| {
+        motion::set_reduced_motion(cx, true);
+        shell.settings.sidebar_collapsed = true;
+        shell.sidebar_tween = None;
+        shell.settings.details_sidebar_open = false;
+        shell.details_tween = None;
+        shell.settings.session_info_open = false;
+        shell.session_info_tween = None;
+        shell.state.update(cx, |state, cx| {
+            state.transcript = vec![SessionMessageEntry {
+                id: "session-info-geometry".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "session-info-text".into(),
+                    text: "A rendered paragraph with a hard break.  \nAnother line.\n\n| Column | Value |\n| --- | --- |\n| Content | Geometry |\n\n".repeat(12),
+                }],
+                created_at: 0,
+                device_id: "local".into(),
+                status: Some(zeron_doc::MessageStatus::Complete),
+                duration_ms: None,
+                continuation_of: None,
+            }];
+            state.transcript_replayed = true;
+            state.transcript_revision += 1;
+            cx.notify();
+        });
+    });
+
+    for (width, open_column_width, gap) in [
+        (700.0, 668.0, None),
+        (804.0, 480.0, Some(24.0)),
+        (1000.0, 676.0, Some(24.0)),
+        (1200.0, 736.0, Some(24.0)),
+        (1400.0, 736.0, Some(48.0)),
+    ] {
+        cx.simulate_resize(gpui::size(px(width), px(900.0)));
+        paint(&shell, cx);
+        let closed = cx.debug_bounds("transcript-column").unwrap();
+        let viewport = cx.debug_bounds("transcript-viewport").unwrap();
+        near(f32::from(viewport.size.width), width);
+        near(f32::from(closed.size.width), (width - 32.0).min(736.0));
+        near(f32::from(closed.center().x), f32::from(viewport.center().x));
+        assert!(cx.debug_bounds("session-info").is_none());
+
+        change(&shell, cx, |shell, _, cx| shell.toggle_session_info(cx));
+        paint(&shell, cx);
+        let column = cx.debug_bounds("transcript-column").unwrap();
+        let viewport = cx.debug_bounds("transcript-viewport").unwrap();
+        let card = cx.debug_bounds("session-info").unwrap();
+        near(f32::from(column.size.width), open_column_width);
+        near(f32::from(column.center().x), f32::from(viewport.center().x));
+        near(f32::from(card.right()), width - 12.0);
+        if let Some(gap) = gap {
+            near(f32::from(card.left() - column.right()), gap);
+        } else {
+            near(f32::from(viewport.size.width), width);
+            near(f32::from(column.left()), f32::from(closed.left()));
+        }
+        let composer = shell.read_with(cx, |shell, cx| {
+            shell.composer.read(cx).surface_bounds().get().unwrap()
+        });
+        near(f32::from(column.center().x), f32::from(composer.center().x));
+
+        change(&shell, cx, |shell, _, cx| shell.toggle_session_info(cx));
+        paint(&shell, cx);
+        let restored = cx.debug_bounds("transcript-column").unwrap();
+        near(f32::from(restored.left()), f32::from(closed.left()));
+        near(f32::from(restored.size.width), f32::from(closed.size.width));
+        assert!(cx.debug_bounds("session-info").is_none());
+    }
+}
+
+#[gpui::test]
 fn worked_project_diff_watch_tracks_effective_details_visibility(cx: &mut TestAppContext) {
     fn project(id: &str, path: &str) -> WorkersProject {
         WorkersProject {

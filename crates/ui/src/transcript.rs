@@ -8186,6 +8186,7 @@ impl Transcript {
             .px(px(COLUMN_GUTTER))
             .child(
                 div()
+                    .debug_selector(|| "transcript-column".into())
                     .w_full()
                     .max_w(px(self.content_width))
                     .min_w_0()
@@ -13302,8 +13303,17 @@ impl Render for Transcript {
             .child(crate::markdown::render::selection_frame_reset_for(
                 cx.entity_id().as_u64(),
             ))
-            .child(content)
-            .child(viewport_probe)
+            .child(
+                div()
+                    .debug_selector(|| "transcript-viewport".into())
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .right(px(self.right_reserve))
+                    .child(content)
+                    .child(viewport_probe),
+            )
             .child(rail);
         let root = root.children(self.render_image_menu(cx));
         // Full-size viewer for a clicked user-bubble thumbnail

@@ -6,14 +6,13 @@
 use super::*;
 
 use crate::project_actions::{ProjectActionsStatus, action_icon};
+use crate::transcript::COLUMN_GUTTER;
 
 /// The card's width, its inset from the column's right edge, and the
 /// least gap the reading column keeps from it.
 pub(super) const SESSION_CARD_WIDTH: f32 = 272.0;
 const SESSION_CARD_INSET: f32 = 12.0;
 const SESSION_CARD_GAP: f32 = 24.0;
-/// The transcript's own side gutters (its rows pad 48px each side).
-const TRANSCRIPT_GUTTER: f32 = 48.0;
 /// Below this reading-column width the card floats rather than docking.
 const DOCKED_MIN_COLUMN: f32 = 480.0;
 
@@ -37,9 +36,8 @@ pub(super) fn session_card_layout(main: f32, transcript: f32) -> SessionCardLayo
     let left = (main - SESSION_CARD_WIDTH - SESSION_CARD_INSET).max(0.0);
     // The most the transcript can give up: its right gutter then ends at
     // the gap before the card.
-    let max_reserve =
-        SESSION_CARD_WIDTH + SESSION_CARD_INSET + SESSION_CARD_GAP - TRANSCRIPT_GUTTER;
-    let docked = main - 2.0 * TRANSCRIPT_GUTTER - max_reserve >= DOCKED_MIN_COLUMN;
+    let max_reserve = SESSION_CARD_WIDTH + SESSION_CARD_INSET + SESSION_CARD_GAP - COLUMN_GUTTER;
+    let docked = main - 2.0 * COLUMN_GUTTER - max_reserve >= DOCKED_MIN_COLUMN;
     if !docked {
         return SessionCardLayout {
             docked: false,
@@ -416,10 +414,8 @@ impl Shell {
 mod tests {
     use super::*;
 
-    /// The reading column's right edge for a layout (rows pad 48 each side
-    /// and center in what the reserve leaves).
     fn column_right(main: f32, transcript: f32, layout: SessionCardLayout) -> f32 {
-        let column = transcript.min(main - 2.0 * TRANSCRIPT_GUTTER - layout.reserve);
+        let column = transcript.min(main - 2.0 * COLUMN_GUTTER - layout.reserve);
         (main - layout.reserve) / 2.0 + column / 2.0
     }
 
@@ -443,10 +439,9 @@ mod tests {
         assert!((right - (layout.left - SESSION_CARD_GAP)).abs() < 0.01);
         // At the docking floor the column is narrower than configured but
         // still clears the card.
-        let main =
-            2.0 * TRANSCRIPT_GUTTER + SESSION_CARD_WIDTH + SESSION_CARD_INSET + SESSION_CARD_GAP
-                - TRANSCRIPT_GUTTER
-                + DOCKED_MIN_COLUMN;
+        let main = 2.0 * COLUMN_GUTTER + SESSION_CARD_WIDTH + SESSION_CARD_INSET + SESSION_CARD_GAP
+            - COLUMN_GUTTER
+            + DOCKED_MIN_COLUMN;
         let floor = session_card_layout(main, 736.0);
         assert!(floor.docked);
         assert!(column_right(main, 736.0, floor) <= floor.left - SESSION_CARD_GAP + 0.01);
