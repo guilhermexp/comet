@@ -21318,6 +21318,24 @@ mod settings_section_persistence {
         sidebar_pane.update(cx, |_, cx| cx.notify());
         cx.update(|window, cx| window.draw(cx).clear());
         let row = cx.debug_bounds("chat-older").unwrap_or_else(|| {
+            let rendered_bounds = [
+                "sidebar-column",
+                "sidebar-sessions-section",
+                "sessions-toggle",
+                "sidebar-regular-sessions",
+                "session-slot-newer",
+                "session-slot-older",
+                "chat-newer",
+                "chat-older",
+                "sidebar-footer-row",
+                "conversation-column",
+            ]
+            .map(|selector| (selector, cx.debug_bounds(selector)));
+            let accessibility = cx.update(|window, _| {
+                window
+                    .debug_a11y_tree_json()
+                    .map(|tree| (tree.len(), tree.contains("older")))
+            });
             let diagnostic = shell.update(cx, |shell, cx| {
                 let filter = shell.settings.space_filter.clone();
                 let (no_project, selected, candidates) = {
@@ -21341,7 +21359,9 @@ mod settings_section_persistence {
                     shell.settings.sidebar_collapsed,
                 )
             });
-            panic!("sidebar row chat-older is missing; {diagnostic}");
+            panic!(
+                "sidebar row chat-older is missing; {diagnostic}; rendered_bounds={rendered_bounds:?}; accessibility={accessibility:?}"
+            );
         });
         let from = row.center();
         cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());

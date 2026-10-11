@@ -16,7 +16,7 @@ The integrated application SHALL retain the fork's Workers, orchestrator grants,
 #### Scenario: Responsive composer follows the rendered panel geometry
 - **Test:** unit
 - **WHEN** a docked chat opens or closes the Right, Files, or Sidebar column
-- **THEN** each column starts continuously and advances monotonically with less than 10% progress after 16 ms; the composer tracks the live conversation width, and right-pane takeover retains its covered layout width
+- **THEN** each column starts continuously and advances monotonically with less than 10% progress after 16 ms; the composer tracks the live conversation width; the right-titlebar strip stays aligned to the rendered right-pane bounds as neighboring columns move; and right-pane takeover retains its covered layout width
 
 #### Scenario: The requested macOS release is installed without launching
 - **Test:** none — packaging has manual native verification per scripts/AGENTS.md

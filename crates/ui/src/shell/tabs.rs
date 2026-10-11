@@ -303,6 +303,7 @@ impl Shell {
         } else {
             0.0
         };
+        let right_visible = self.right_visible_width(cx);
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
         // cluster as it collapses.
@@ -412,7 +413,7 @@ impl Shell {
                 .absolute()
                 .top_0()
                 .right(px(details_now + files_now))
-                .w(px(right_now))
+                .w(px(right_visible))
                 .h(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
                 .items_center()

@@ -223,10 +223,9 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
                 frame.widths[0] + (frame.widths[3] - composer_width) / 2.0,
             );
             if frame.widths[2] > 128.0 {
-                near(
-                    f32::from(frame.strip.unwrap().left()),
-                    frame.widths[0] + frame.widths[3],
-                );
+                let strip = frame.strip.unwrap();
+                near(f32::from(strip.left()), frame.widths[0] + frame.widths[3]);
+                near(f32::from(strip.size.width), frame.widths[2]);
             }
             previous = width;
         }
