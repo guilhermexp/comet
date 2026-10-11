@@ -236,6 +236,7 @@ const CHAT_MENU_ROW_ARCHIVE: u8 = 2;
 const CHAT_MENU_ROW_COPY: u8 = 3;
 const CHAT_MENU_ROW_DELETE: u8 = 4;
 const CHAT_MENU_ROW_TAB: u8 = 5;
+const CHAT_MENU_ROW_EXPORT: u8 = 16;
 
 #[derive(Clone, Copy)]
 enum TabCloseAction {
@@ -12498,6 +12499,31 @@ impl Shell {
                     .child(self.chat_menu_hover_row(CHAT_MENU_ROW_DELETE, delete, cx))
             };
             let mut menu = menu;
+            if !chat_id.is_empty() {
+                // Keep transcript exports available from both the main Chat
+                // row and a side-chat tab, independently of the actions that
+                // only apply to ordinary Chats above.
+                menu = menu
+                    .child(popover::menu_separator())
+                    .child(popover::menu_heading(&theme, "Export"));
+                for (ix, item) in EXPORT_MENU_ITEMS.iter().enumerate() {
+                    let export_chat_id = chat_id.clone();
+                    let format = item.format;
+                    let delivery = item.delivery;
+                    let row = popover::menu_row(&theme, false, item.label)
+                        .id(item.key)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.export_chat(export_chat_id.clone(), format, delivery, cx)
+                        }))
+                        .child(icon(item.glyph).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from(item.label));
+                    menu = menu.child(self.chat_menu_hover_row(
+                        CHAT_MENU_ROW_EXPORT + ix as u8,
+                        row,
+                        cx,
+                    ));
+                }
+            }
             if let Some((key, surface)) = menu_state.tab {
                 if !chat_id.is_empty() {
                     menu = menu.child(popover::menu_separator());
@@ -16240,6 +16266,99 @@ mod tests {
         assert_eq!(keys.len(), 6, "element ids must be unique");
     }
 
+    #[gpui::test]
+    fn chat_context_menu_renders_exports_for_main_and_side_chats(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        struct OverlayHost(gpui::Entity<super::Shell>);
+
+        impl gpui::Render for OverlayHost {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    let viewport = window.viewport_size();
+                    gpui::div()
+                        .size_full()
+                        .children(shell.render_overlays(viewport, window, cx))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(super::Theme::default());
+            crate::app_menus::init(cx);
+            super::settings::init(super::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        let boot = super::EngineBootConfig {
+            data_dir: dir.path().into(),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock,
+        };
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            OverlayHost(cx.new(|cx| {
+                let state = cx.new(|_| super::AppState::new());
+                super::test_shell(state, boot, cx)
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+
+        let assert_exports_rendered = |cx: &gpui::VisualTestContext| {
+            for key in [
+                "export-download-md",
+                "export-download-json",
+                "export-download-txt",
+                "export-copy-md",
+                "export-copy-json",
+                "export-copy-txt",
+            ] {
+                assert!(cx.debug_bounds(key).is_some(), "missing rendered row {key}");
+            }
+        };
+
+        shell.update(cx, |shell, cx| {
+            shell.chat_menu.open(super::ChatMenuState {
+                chat_id: "main".into(),
+                tab: None,
+                position: gpui::point(gpui::px(20.0), gpui::px(20.0)),
+                page: super::ChatMenuPage::Root,
+            });
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert_exports_rendered(cx);
+        for key in ["chat-menu-archive", "chat-menu-copy", "chat-menu-delete"] {
+            assert!(cx.debug_bounds(key).is_some(), "missing existing row {key}");
+        }
+
+        shell.update(cx, |shell, cx| {
+            shell.chat_menu.open(super::ChatMenuState {
+                chat_id: "side".into(),
+                tab: Some(("main-panel".into(), super::RightSurface::SideChat(1))),
+                position: gpui::point(gpui::px(20.0), gpui::px(20.0)),
+                page: super::ChatMenuPage::Root,
+            });
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert_exports_rendered(cx);
+    }
+
     #[test]
     fn sidebar_mode_switcher_uses_compact_geometry() {
         assert_eq!(SIDEBAR_MODE_SWITCHER_HEIGHT, 36.0);
@@ -18346,7 +18465,7 @@ mod exit_regressions {
             )
         });
         window
-            .update(cx, |shell, _, cx| {
+            .update(cx, |shell, window, cx| {
                 let duration = RESIZE.total().mul_f32(motion::speed_scale());
                 let started = std::time::Instant::now() - duration.mul_f32(2.);
                 let tween = Some(WidthTween {

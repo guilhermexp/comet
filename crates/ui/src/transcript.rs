@@ -4462,29 +4462,9 @@ pub struct Transcript {
     /// Width held free at the column's right for a docked side card; the
     /// reading column centers in what remains.
     right_reserve: f32,
-    /// Last global code-fence layout generation applied to this transcript.
-    /// Each instance owns separate scroll handles and list measurements, so
-    /// every one must reset itself after a global Fit-mode transition.
-    code_fences_generation: u64,
     /// Compact mode as last applied to this instance's row split. Render
     /// polls the setting each frame; a flip rebuilds every row.
     compact_mode: bool,
-    /// Compact work-group entry ids that were live this session — the
-    /// "Worked for" subtitle fades in only for those, not historical rows.
-    compact_live_entries: HashSet<SharedString>,
-    /// Last live elapsed (seconds) per assistant entry, used if `duration_ms`
-    /// has not landed on the doc yet when the turn settles.
-    compact_last_elapsed: HashMap<String, i64>,
-    /// When a compact work group first settled this session, so "Worked for"
-    /// can fade in without replaying on later paints.
-    compact_worked_fade_at: HashMap<SharedString, Instant>,
-    /// Natural heights of compact-fold body rows, written by each row's
-    /// prepaint probe without notifying. The work fold's TOOL_FOLD tween
-    /// clips the sibling rows against one shared budget without knowing
-    /// their layout up front.
-    compact_fold_heights: HashMap<SharedString, Rc<Cell<f32>>>,
-    /// Post-tween sweep that drops a closed work fold's retained body rows.
-    compact_fold_settle: Option<Task<()>>,
     highlights: HighlightStore,
     show_jump_button: bool,
     /// Distance from the bottom at the last observation (wheel event or spring
@@ -4965,13 +4945,7 @@ impl Transcript {
             inline_code_links: Default::default(),
             content_width: crate::settings::transcript_width(cx),
             right_reserve: 0.0,
-            code_fences_generation: crate::settings::code_fences_generation(cx),
             compact_mode: crate::settings::transcript_compact_mode(cx),
-            compact_live_entries: HashSet::new(),
-            compact_last_elapsed: HashMap::new(),
-            compact_worked_fade_at: HashMap::new(),
-            compact_fold_heights: HashMap::new(),
-            compact_fold_settle: None,
             highlights: HighlightStore::default(),
             show_jump_button: false,
             last_scroll_distance: 0.0,
