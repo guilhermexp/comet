@@ -382,7 +382,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Verification
 
-- GPUI `debug_bounds` indexes only elements with an explicit `.debug_selector`; `.id` alone does not expose test bounds. Cached-view paint replay omits that bounds map, so fixtures must invalidate and freshly paint a cached subtree before measuring its selectors. Fixtures that render Shell through a cached/nested view must also retain a Shell observer that forwards invalidations to the test host.
+- GPUI `debug_bounds` indexes only elements with an explicit `.debug_selector`; `.id` alone does not expose test bounds. Cached-view paint replay omits that bounds map, so fixtures must invalidate and freshly paint a cached subtree before measuring its selectors. In `TestAppContext`, a top-level `Entity::update` flushes effects and may automatically draw dirty windows; nest cache invalidation and the measured `window.draw(cx).clear()` in the same outer `cx.update` so that automatic frame cannot consume the invalidation before the measured draw. Fixtures that render Shell through a cached/nested view must also retain a Shell observer that forwards invalidations to the test host.
 
 - Comandos: `cargo test -p zeron-ui` · `scripts/dev-demo.sh`
 

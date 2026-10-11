@@ -263,10 +263,14 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     cx.simulate_mouse_up(dragged, MouseButton::Left, Default::default());
     expect(draw(&shell, cx, 0), [300.0, 377.0, 500.0, 423.0]);
     expect(draw(&shell, cx, 300), [300.0, 377.0, 500.0, 423.0]);
-    // Visiting a chat with other panels open is not a toggle.
-    change(&shell, cx, |s, _, cx| {
+    // A stored Changes flag is not a live surface in the fork. Select B first,
+    // then open a real Browser tab through the same lifecycle as the app.
+    change(&shell, cx, |s, window, cx| {
         s.panels.update("b", |p| p.changes_open = true);
         select(s, Some("b"), cx);
+        assert!(!s.right_pane_open(cx));
+        s.add_browser_surface(None, window, cx);
+        assert!(s.right_pane_open(cx));
     });
     expect(settled(&shell, cx), [300.0, 0.0, 500.0, 800.0]);
     change(&shell, cx, |s, _, cx| {
@@ -332,7 +336,7 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     }
     expect(draw(&shell, cx, 0), [300.0, 286.0, 1014.0, 0.0]);
     change(&shell, cx, |s, _, cx| select(s, Some("b"), cx));
-    expect(settled(&shell, cx), [300.0, 0.0, 0.0, 1300.0]);
+    expect(settled(&shell, cx), [300.0, 0.0, 507.0, 793.0]);
     assert!(!shell.read_with(cx, |s, _| s.right_pane_expanded));
     change(&shell, cx, |s, _, cx| select(s, Some("a"), cx));
     expect(draw(&shell, cx, 0), [300.0, 286.0, 1014.0, 0.0]);

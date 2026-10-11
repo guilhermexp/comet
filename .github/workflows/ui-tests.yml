@@ -134,7 +134,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: macos-latest
-    timeout-minutes: 45
+    # A cold release build plus the feature-enabled browser fixtures exceeds 45m.
+    # Keep the short execution timeouts on native regressions below.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Rust toolchain

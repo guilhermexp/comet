@@ -1377,8 +1377,28 @@ mod rendered_tests {
         // hitbox. Inline flow can split a paragraph into several text
         // fragments, so a text-selection snapshot is not the link's hit area.
         cx.update(|window, cx| window.draw(cx).clear());
+        let hitbox_selector: &'static str = match case {
+            // `inline_chips::segments` starts a separate fragment at the link.
+            // The fixture's plain prefix maps directly to the displayed offset;
+            // the row key and veil index are namespaced by that offset.
+            "web" => {
+                let link_marker = format!("[{expected_label}]");
+                let segment_start = markdown
+                    .find(&link_marker)
+                    .expect("fixture contains the expected Markdown link label");
+                let ix = super::super::render::nested_ix(0, usize::MAX, segment_start);
+                // TestAppContext::debug_bounds requires a static selector.
+                // Leak this one selector for the test's process lifetime so
+                // the fixture can query the actual dynamically-keyed hitbox.
+                Box::leak(
+                    format!("link-fixture:0-inline-{segment_start}-session-t{ix}-link-hitbox-0-0")
+                        .into_boxed_str(),
+                )
+            }
+            _ => "link-fixture-session-t0-link-hitbox-0-0",
+        };
         let position = cx
-            .debug_bounds("link-fixture-session-t0-link-hitbox-0-0")
+            .debug_bounds(hitbox_selector)
             .unwrap_or_else(|| panic!("{diagnostic}: rendered link hitbox is missing"))
             .center();
         cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());

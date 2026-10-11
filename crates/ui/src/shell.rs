@@ -21310,13 +21310,15 @@ mod settings_section_persistence {
             cx.notify();
         });
         cx.run_until_parked();
-        // A clean cached SidebarPane replays its scene and input handlers,
-        // but GPUI does not replay its debug_bounds map. Invalidate this
-        // cached view once so the measured frame repaints the real session
-        // rows and records their selectors.
+        // In GPUI tests, a top-level Entity::update flushes effects and draws
+        // dirty windows automatically. Keep cache invalidation and the measured
+        // draw in one outer update, or that automatic frame consumes the dirty
+        // view and the following cached replay clears debug_bounds.
         let sidebar_pane = shell.read_with(cx, |shell, _| shell.sidebar_pane.clone());
-        sidebar_pane.update(cx, |_, cx| cx.notify());
-        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| {
+            sidebar_pane.update(cx, |_, pane_cx| pane_cx.notify());
+            window.draw(cx).clear();
+        });
         let row = cx.debug_bounds("chat-older").unwrap_or_else(|| {
             let rendered_bounds = [
                 "sidebar-column",
