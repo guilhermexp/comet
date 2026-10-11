@@ -1346,65 +1346,90 @@ mod rendered_tests {
         assert_eq!(last.target.original, "/elsewhere/team/INFORME.md");
     }
 
-    /// A root on another device resolves the link (the file opens through
-    /// that chat's context) but cannot offer local system actions; a web
-    /// link shows only the web rows.
-    #[gpui::test]
-    fn file_link_menu_hides_system_rows_for_remote_and_web_links(cx: &mut gpui::TestAppContext) {
+    fn assert_remote_or_web_link_menu_rows(
+        cx: &mut gpui::TestAppContext,
+        case: &str,
+        markdown: &str,
+        roots: Option<Rc<Vec<crate::workspace_links::FileLinkRoot>>>,
+        has_copy_path: bool,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             cx.set_global(Theme::dark());
             crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
         });
-        for (markdown, roots, has_copy_path) in [
-            (
-                "see [lib](src/lib.rs) here",
-                Some(Rc::new(vec![crate::workspace_links::FileLinkRoot {
-                    chat: Some("remote".into()),
-                    root: "/far/worktree".into(),
-                    local: false,
-                }])),
-                true,
-            ),
-            ("see [docs](https://example.com/) here", None, false),
+        let snapshot_label = "link-fixture:0";
+        let diagnostic = format!("case={case}, snapshot={snapshot_label}");
+        let (_view, cx) = cx.add_window_view(|_, _| Fixture {
+            markdown: markdown.into(),
+            width: 320.,
+            activated: Rc::default(),
+            source_local: false,
+            file_roots: roots.clone(),
+        });
+        let position = cx.update(|_, _| {
+            let (_, layout, _) = super::super::render::selection_test_snapshot(snapshot_label);
+            layout.position_for_index(4).unwrap_or_else(|| {
+                panic!("{diagnostic}: link position missing from selection snapshot")
+            }) + gpui::point(px(2.), px(8.))
+        });
+        cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
+        assert!(
+            cx.debug_bounds("link-menu-open-zeron").is_some(),
+            "{diagnostic}: Open in Zeron row should be present"
+        );
+        for selector in [
+            "link-menu-open-external",
+            "link-menu-copy-address",
+            "link-menu-default-destination",
         ] {
-            let (_view, cx) = cx.add_window_view(|_, _| Fixture {
-                markdown: markdown.into(),
-                width: 320.,
-                activated: Rc::default(),
-                source_local: false,
-                file_roots: roots.clone(),
-            });
-            let position = cx.update(|_, _| {
-                let (_, layout, _) =
-                    super::super::render::selection_test_snapshot("link-fixture:0");
-                layout.position_for_index(4).unwrap() + gpui::point(px(2.), px(8.))
-            });
-            cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
-            cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
-            assert!(cx.debug_bounds("link-menu-open-zeron").is_some());
-            for selector in [
-                "link-menu-open-external",
-                "link-menu-copy-address",
-                "link-menu-default-destination",
-            ] {
-                assert_eq!(
-                    cx.debug_bounds(selector).is_some(),
-                    !has_copy_path,
-                    "{selector} mounts only for web links"
-                );
-            }
-            for selector in ["link-menu-open-default", "link-menu-show-in-folder"] {
-                assert!(
-                    cx.debug_bounds(selector).is_none(),
-                    "{selector} needs a local file root"
-                );
-            }
             assert_eq!(
-                cx.debug_bounds("link-menu-copy-path").is_some(),
-                has_copy_path,
-                "copy-path row matches file resolution"
+                cx.debug_bounds(selector).is_some(),
+                !has_copy_path,
+                "{diagnostic}: {selector} mounts only for web links"
             );
         }
+        for selector in ["link-menu-open-default", "link-menu-show-in-folder"] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{diagnostic}: {selector} needs a local file root"
+            );
+        }
+        assert_eq!(
+            cx.debug_bounds("link-menu-copy-path").is_some(),
+            has_copy_path,
+            "{diagnostic}: copy-path row matches file resolution"
+        );
+    }
+
+    /// A root on another device resolves the file link through that chat's
+    /// context but cannot offer local system actions.
+    #[gpui::test]
+    fn file_link_menu_hides_system_rows_for_remote_file_links(cx: &mut gpui::TestAppContext) {
+        let roots = Some(Rc::new(vec![crate::workspace_links::FileLinkRoot {
+            chat: Some("remote".into()),
+            root: "/far/worktree".into(),
+            local: false,
+        }]));
+        assert_remote_or_web_link_menu_rows(
+            cx,
+            "remote-file",
+            "see [lib](src/lib.rs) here",
+            roots,
+            true,
+        );
+    }
+
+    /// Web links show only web rows, with no device-local file actions.
+    #[gpui::test]
+    fn file_link_menu_hides_system_rows_for_web_links(cx: &mut gpui::TestAppContext) {
+        assert_remote_or_web_link_menu_rows(
+            cx,
+            "web",
+            "see [docs](https://example.com/) here",
+            None,
+            false,
+        );
     }
 }

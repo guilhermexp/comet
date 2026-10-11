@@ -21,7 +21,7 @@ fork:
   target_branch: main
   initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
   observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
-  result_sha: e55de7ee38fe9300420e41cb2e0a97eba27be100
+  result_sha: 2351d54b74b28ce14708851bc627854a068eb8ac
   initial_worktree: clean
 strategy:
   operation: merge
@@ -161,14 +161,25 @@ verification:
     IDs added, 2 removed. Not compilation evidence.
 - command: Separate zui source reconstruction and merge
   result: passed
-  observed: Source merge b9a039088ee1fdce42b853dddc6371696195f7ca; vendored tree2fb41aac47a06b3edd2b1b4607346e92bb476069 (source formatting commit bb83f55);
-    line_wrapper.rs and line_layout.rs byte-identical to fork before import.
+  observed: Source merge b9a039088ee1fdce42b853dddc6371696195f7ca; vendored tree2fb41aac47a06b3edd2b1b4607346e92bb476069
+    (source formatting commit bb83f55); line_wrapper.rs and line_layout.rs byte-identical
+    to fork before import.
 - command: Independent read-only review of stable engine/RPC/manifests/widgets and
     navigation
   result: passed
   observed: Independent reviewers found no material issues after five Shell repairs
     (route arms, width reset, effective metadata visibility, duplicate toast); focused
     tests and final Cargo checks pending.
+- command: scripts/cargo-verify.py -- bash check-driver.sh
+  revision: eb101bb92e47f4d13bf833b73abd85dcda3ebd11
+  result: failed
+  observed: Engine library check passed (12m15s). First workspace/all-targets check
+    failed with UI merge API/duplicate diagnostics (49 library,81 test); target cleaned.
+    Repairs4de5903e committed; serial retry active.
+- command: Linux CI core tests at eb101bb9
+  result: failed
+  observed: LIST_CHANGE_REQUEST_PAGE deadline assertion was outside deadline closure
+    scope; repaired in2351d54b. Actual repaired CI pending.
 limits:
 - PR21 prior CI Linux file-link menu failure is pre-existing and not a proved integration
   regression; merged-head CI still pending.
@@ -189,5 +200,5 @@ delivery:
   commit: 
   pr: https://github.com/guilhermexp/comet/pull/20
   publication: pending
-  record_pushed: false
+  record_pushed: true
   deploy: Local macOS packaging/install requested; edge deploy not requested.
