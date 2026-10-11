@@ -20,8 +20,16 @@ Test: unit — mock RPC requests and incremental frames.
 - **WHEN** an expanded nonempty section is visible in Orchestrator mode
 - **THEN** one local WatchCheckoutDiffs stream pins its set of paths, independently of the Chat host
 - **AND** changes update totals without polling
-- **AND** the stream restarts only when its path set or local device changes
-- **AND** collapsing, hiding or emptying the section releases its stream
+- **AND** the active stream restarts only when its path set or local device changes
+- **AND** collapsing, hiding or emptying the section, or hiding the Details panel releases its stream
+- **AND** showing Details again subscribes for the visible paths
+
+#### Scenario: Subscription failure and disconnection
+Test: unit — lifecycle mock RPC with closed outbound channel, completed stream and connection EOF.
+- **WHEN** subscription fails or its stream ends
+- **THEN** the matching watch key and stale totals are cleared, allowing a subsequent render to subscribe again
+- **AND** cleanup notifies only if totals were visible, so immediate failures without totals do not drive a redraw loop
+- **AND** an obsolete task cannot clear another watch key
 
 ### Requirement: Checkout diff watch pins multiple optional checkouts
 WatchCheckoutDiffs SHALL accept optional cwds in addition to the legacy cwd, deduplicate paths, and retain every successfully pinned checkout until the single stream is dropped. CheckoutDiff SHALL retain its existing shape.

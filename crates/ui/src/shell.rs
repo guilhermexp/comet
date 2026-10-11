@@ -14983,6 +14983,11 @@ impl Render for Shell {
                 } else {
                     Empty.into_any_element()
                 };
+                if !on_chat || !self.details_sidebar_open(cx) {
+                    self.details_sidebar.update(cx, |sidebar, cx| {
+                        sidebar.hide_worked_project_diffs(cx);
+                    });
+                }
                 let details: AnyElement = if on_chat {
                     self.render_details_sidebar(cx)
                 } else {

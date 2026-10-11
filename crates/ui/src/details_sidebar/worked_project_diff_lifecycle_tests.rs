@@ -343,4 +343,119 @@ fn worked_project_diff_updates_and_visibility_cancel_the_local_stream(
         assert!(sidebar.worked_diff_watch.is_none());
         assert!(sidebar.worked_diffs.is_empty());
     });
+    // Hidden Details uses the same cancellation boundary as section collapse.
+    let paths = vec!["/tmp/worked-first".to_string()];
+    sidebar.update(window, |sidebar, cx| {
+        sidebar.ensure_worked_project_diff_watch(paths.clone(), cx);
+    });
+    window.run_until_parked();
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+    });
+    let request: zeron_rpc::ClientFrame =
+        serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+    assert_eq!(request.params["cwds"], serde_json::json!(paths));
+    sidebar.update(window, |sidebar, cx| sidebar.hide_worked_project_diffs(cx));
+    window.run_until_parked();
+    let cancel: zeron_rpc::ClientFrame =
+        serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+    assert!(cancel.cancel);
+    assert_eq!(cancel.id, request.id);
+
+    // Showing again creates a fresh subscription. Ending it clears visible
+    // totals and the key, allowing the same paths to subscribe again.
+    sidebar.update(window, |sidebar, cx| {
+        sidebar.ensure_worked_project_diff_watch(paths.clone(), cx);
+        sidebar.worked_diffs.insert(
+            paths[0].clone(),
+            session_card::SessionDiffTotals {
+                files: 1,
+                additions: 7,
+                deletions: 2,
+            },
+        );
+    });
+    window.run_until_parked();
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+    });
+    let request: zeron_rpc::ClientFrame =
+        serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+    replies
+        .try_send(
+            serde_json::to_string(&zeron_rpc::ServerFrame {
+                id: request.id,
+                done: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+    });
+    window.run_until_parked();
+    sidebar.read_with(window, |sidebar, _| {
+        assert!(
+            sidebar.worked_diff_key.is_none(),
+            "ended stream must permit retry"
+        );
+        assert!(
+            sidebar.worked_diffs.is_empty(),
+            "ended stream removes stale totals"
+        );
+    });
+    sidebar.update(window, |sidebar, cx| {
+        sidebar.ensure_worked_project_diff_watch(paths.clone(), cx)
+    });
+    window.run_until_parked();
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+    });
+    let retry: zeron_rpc::ClientFrame =
+        serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+    assert_ne!(retry.id, request.id);
+    // Connection EOF also ends subscriptions; RpcClient does not replay them.
+    drop(replies);
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+    });
+    window.run_until_parked();
+    sidebar.read_with(window, |sidebar, _| {
+        assert!(sidebar.worked_diff_key.is_none())
+    });
+
+    // A closed outbound channel makes subscribe_scoped fail immediately.
+    // Observe notifications directly: empty failures must not request redraws.
+    drop(requests);
+    let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed = notifications.clone();
+    let _observe = sidebar.update(window, |_, cx| {
+        cx.observe(&sidebar, move |_, _, cx| {
+            observed.set(observed.get() + 1);
+            let _ = cx;
+        })
+    });
+    for _ in 0..3 {
+        sidebar.update(window, |sidebar, cx| {
+            sidebar.ensure_worked_project_diff_watch(paths.clone(), cx)
+        });
+        window.run_until_parked();
+        runtime.block_on(async {
+            tokio::task::yield_now().await;
+        });
+        window.run_until_parked();
+        sidebar.read_with(window, |sidebar, _| {
+            assert!(
+                sidebar.worked_diff_key.is_none(),
+                "failed subscription must permit retry"
+            );
+            assert!(sidebar.worked_diffs.is_empty());
+        });
+    }
+    assert_eq!(
+        notifications.get(),
+        0,
+        "empty failures must not cause a redraw loop"
+    );
 }

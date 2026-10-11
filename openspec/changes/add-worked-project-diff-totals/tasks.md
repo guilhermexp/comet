@@ -14,3 +14,5 @@
 - Implementation: `ec3317c4`; UI gate: 2263 passed, 1 intentionally filtered; engine: 577 passed, 4 ignored.
 - Native Xvfb + llvmpipe original dev-demo: `before-fixture.png` (no totals), `after-fixture.png` (+5 / −2, clean row blank), `after-live-update.png` (+6 / −2 after one added untracked line), in the same verification directory.
 - Keep this change active; do not archive (ticket instruction).
+
+- [x] Address Main lifecycle review: clear failed/ended watches without redraw loops; cancel hidden Details using Shell visibility. Focused UI: 2 passed; full UI gate: 2263 passed, 1 filtered; engine: 577 passed, 4 ignored (`review-{focused,gate,engine}.log` in the verification directory).
