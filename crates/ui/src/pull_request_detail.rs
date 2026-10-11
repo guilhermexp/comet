@@ -1098,28 +1098,19 @@ fn rich_text(
     window: &mut Window,
     owner: gpui::WeakEntity<PullRequestDetailPage>,
 ) -> AnyElement {
-    let options = crate::markdown::render::RenderOptions {
-        tasks: None,
-        media: Some(super::pull_request_media::media(
-            url,
-            Rc::new(move |source, window, cx| {
-                let _ = owner.update(cx, |page, cx| page.open_image(source, window, cx));
-            }),
-        )),
-        row_key: key.into(),
-        veil: None,
-        cache: None,
-        now: Instant::now(),
-        link: None,
-        workspace_root: None,
-        code: None,
-        copy: Some(crate::markdown::render::CopyUi {
-            handler: Rc::new(|_, code, _, cx| {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.to_string()))
-            }),
-            copied_ix: None,
+    let mut options = crate::markdown::render::RenderOptions::settled(key.into());
+    options.media = Some(super::pull_request_media::media(
+        url,
+        Rc::new(move |source, window, cx| {
+            let _ = owner.update(cx, |page, cx| page.open_image(source, window, cx));
         }),
-    };
+    ));
+    options.copy = Some(crate::markdown::render::CopyUi {
+        handler: Rc::new(|_, code, _, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.to_string()))
+        }),
+        copied_ix: None,
+    });
     div()
         .debug_selector(|| "pr-rich-text".into())
         .child(super::pull_request_media::render_description(

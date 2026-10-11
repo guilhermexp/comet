@@ -641,21 +641,11 @@ mod tests {
             window: &mut gpui::Window,
             cx: &mut gpui::Context<Self>,
         ) -> impl IntoElement {
-            let options = markdown::render::RenderOptions {
-                media: Some(media(
-                    "https://github.com/a/b/pull/1",
-                    Rc::new(|_, _, _| {}),
-                )),
-                tasks: None,
-                row_key: "media-test".into(),
-                veil: None,
-                cache: None,
-                now: std::time::Instant::now(),
-                copy: None,
-                link: None,
-                workspace_root: None,
-                code: None,
-            };
+            let mut options = markdown::render::RenderOptions::settled("media-test".into());
+            options.media = Some(media(
+                "https://github.com/a/b/pull/1",
+                Rc::new(|_, _, _| {}),
+            ));
             div().size_full().p(px(24.0)).child(render_description(
                 &parse_description(&self.description),
                 &options,

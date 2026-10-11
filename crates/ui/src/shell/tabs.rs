@@ -80,7 +80,6 @@ impl Shell {
             || self.delete_space_confirm.is_some()
             || self.chat_rename.is_some()
             || self.rename_space_dialog.is_some()
-            || self.discard_working_tree.is_some()
             || self.chat_menu.get().is_some()
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
@@ -484,6 +483,7 @@ impl Shell {
                 "toggle-session-info",
                 icons::corner_card_glyph(16.0, theme.text_muted),
                 label,
+                self.session_info_open(),
                 cx.listener(|this, _, _, cx| this.toggle_session_info(cx)),
             )
             .role(gpui::Role::Button)

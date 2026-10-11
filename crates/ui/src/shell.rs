@@ -370,12 +370,6 @@ fn titlebar_new_session_alpha(route: &Route, has_selected_chat: bool) -> f32 {
     }
 }
 
-/// Open the session at `slot` (zero-based) of the sidebar's active list. One
-/// action carrying the slot, rather than nine near-identical action types.
-#[derive(Clone, PartialEq, Action)]
-#[action(namespace = shell, no_json)]
-pub struct JumpSession(pub usize);
-
 /// Show the command palette's tab at this (zero-based) position. Bound to
 /// mod-1…4 inside the palette's key context only, where it outranks the
 /// session jumps on the same keys while the palette is open.
@@ -2664,6 +2658,8 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// Global action and Chat history search palette, `Some` while open.
     command_palette: Option<command_palette::CommandPalette>,
+    /// The overflow menu for folders folded into the add-project breadcrumb.
+    project_crumb_menu: popover::Popup<()>,
     /// The focus whose workspace search index was last warmed (see `search_warm`).
     search_warm: Option<search_warm::SearchWarm>,
     /// Per chat, the files opened in editor tabs, most recent first.
@@ -3368,6 +3364,7 @@ impl Shell {
             delete_space_confirm: None,
             add_space: None,
             command_palette: None,
+            project_crumb_menu: popover::Popup::default(),
             search_warm: None,
             recent_files: std::collections::HashMap::new(),
             pending_workspace_command: None,
@@ -6927,7 +6924,9 @@ impl Shell {
                 if !matches!(self.route, Route::Settings(_)) {
                     self.settings_return_route = self.route;
                 }
-                self.set_route(Route::Settings(section.canonical()), cx);
+                // Keep the fork's separate Agents page. Only fall back when a
+                // remembered page is unavailable on this build.
+                self.set_route(Route::Settings(section.reopenable()), cx);
                 self.remember_settings_section(section, cx);
             }
         }
@@ -7536,12 +7535,6 @@ impl Shell {
                 self.show_notice(
                     crate::toast::ToastKind::Info,
                     "Open this side chat's tab to rename it",
-                    cx,
-                );
-            } else if surface == ChatRenameSurface::Explorer {
-                self.show_notice(
-                    crate::toast::ToastKind::Info,
-                    "Open this side chat's parent to rename it",
                     cx,
                 );
             }
@@ -13070,28 +13063,27 @@ impl Shell {
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
                         let composer_opacity = self.composer_dock.borrow().opacity();
-                        el.child(
-                            crate::composer_dock::docked_composer(
-                                div()
-                                    .id("persistent-composer")
-                                    .relative()
-                                    .left(px(-session_reserve / 2.0))
-                                    .w(px(composer_width))
-                                    .opacity(composer_opacity)
-                                    .mx_auto()
-                                    .child(self.composer.clone())
-                                    .children(if has_selection {
-                                        self.render_jump_to_bottom(cx)
-                                    } else {
-                                        None
-                                    }),
-                                self.composer_dock.clone(),
-                                self.viewport_height,
-                                self.reduced_motion,
-                                frame_time,
-                            )
-                            .reserve_terminal(terminal_geometry.clone()),
-                        )
+                        // The fork hosts terminals in right-pane surface tabs;
+                        // the composer has no bottom-dock terminal geometry.
+                        el.child(crate::composer_dock::docked_composer(
+                            div()
+                                .id("persistent-composer")
+                                .relative()
+                                .left(px(-session_reserve / 2.0))
+                                .w(px(composer_width))
+                                .opacity(composer_opacity)
+                                .mx_auto()
+                                .child(self.composer.clone())
+                                .children(if has_selection {
+                                    self.render_jump_to_bottom(cx)
+                                } else {
+                                    None
+                                }),
+                            self.composer_dock.clone(),
+                            self.viewport_height,
+                            self.reduced_motion,
+                            frame_time,
+                        ))
                     })
             })
             .child(Self::attachment_drop_overlay(theme))
@@ -15816,6 +15808,7 @@ impl Render for Shell {
                 if panel_handoff {
                     self.motion_active.set(true);
                 }
+                let main_takeover = self.main_takeover_active();
                 let main_target_width = conversation_width(
                     viewport - self.files_reserved_width(cx),
                     self.sidebar_target(),
@@ -18885,7 +18878,7 @@ mod exit_regressions {
                 self.0.update(cx, |shell, cx| {
                     div()
                         .w(px(256.0))
-                        .child(shell.render_sidebar_footer(&Theme::default(), cx))
+                        .child(shell.render_sidebar_footer_row(&Theme::default(), cx))
                 })
             }
         }
@@ -18900,7 +18893,7 @@ mod exit_regressions {
         let (host, cx) = cx.add_window_view(|_, cx| {
             FooterHost(cx.new(|cx| {
                 let state = cx.new(|_| AppState::new());
-                Shell::new(
+                test_shell(
                     state,
                     EngineBootConfig {
                         data_dir: dir.path().into(),
@@ -18959,7 +18952,7 @@ mod exit_regressions {
         let (host, cx) = cx.add_window_view(|_, cx| {
             FooterRow(cx.new(|cx| {
                 let state = cx.new(|_| AppState::new());
-                Shell::new(
+                test_shell(
                     state,
                     EngineBootConfig {
                         data_dir: dir.path().into(),
@@ -19018,7 +19011,7 @@ mod exit_regressions {
                 state.connection = zeron_proto::view::ConnectionStatus::Ready;
                 state
             });
-            Shell::new(
+            test_shell(
                 state,
                 EngineBootConfig {
                     data_dir: dir.path().into(),
@@ -19128,7 +19121,7 @@ mod exit_regressions {
         });
         let window = cx.add_window(|_, cx| {
             let state = cx.new(|_| AppState::new());
-            Shell::new(
+            test_shell(
                 state,
                 EngineBootConfig {
                     data_dir: dir.path().into(),
@@ -21039,7 +21032,7 @@ mod settings_section_persistence {
         });
         let window = cx.add_window(|_, cx| {
             let state = cx.new(|_| AppState::new());
-            Shell::new(
+            test_shell(
                 state,
                 EngineBootConfig {
                     data_dir: dir.path().into(),
@@ -21059,7 +21052,7 @@ mod settings_section_persistence {
                 let selected = shell.state.read(cx).selected_chat.clone();
                 for section in SettingsSection::ALL {
                     shell.open_settings(section, cx);
-                    assert_eq!(shell.route, Route::Settings(section.canonical()));
+                    assert_eq!(shell.route, Route::Settings(section.reopenable()));
                     assert_eq!(shell.nav.current().clone(), history);
                     assert_eq!(shell.state.read(cx).selected_chat, selected);
                     shell.toggle_settings(cx);
@@ -21069,7 +21062,7 @@ mod settings_section_persistence {
                     assert_eq!(shell.route, Route::Settings(section.reopenable()));
                 }
                 shell.open_settings(SettingsSection::Agents, cx);
-                assert_eq!(shell.route, Route::Settings(SettingsSection::Harnesses));
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Agents));
                 shell.close_settings(cx);
                 assert_eq!(shell.route, Route::Chat);
                 assert_eq!(shell.nav.current().clone(), history);
@@ -21094,7 +21087,7 @@ mod settings_section_persistence {
         let saved = settings::UiSettings::load(dir.path());
         assert_eq!(saved.sidebar_width, 300.0);
         init_settings_test(saved, dir.path(), cx);
-        let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
+        let window = cx.add_window(|_, cx| settings_test_shell(dir.path(), cx));
         window
             .update(cx, |shell, _, cx| {
                 shell.toggle_settings(cx);
@@ -21119,7 +21112,7 @@ mod settings_section_persistence {
     fn a_dragged_session_leaves_the_sidebar_and_drops_as_a_chat_mention(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         init_settings_test(settings::UiSettings::default(), dir.path(), cx);
-        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        let (shell, cx) = cx.add_window_view(|_, cx| settings_test_shell(dir.path(), cx));
         cx.simulate_resize(gpui::size(px(1200.0), px(800.0)));
         shell.update(cx, |shell, cx| {
             shell.debug_gate = Some(GatePhase::Ready);

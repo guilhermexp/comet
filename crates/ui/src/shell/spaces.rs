@@ -2180,6 +2180,8 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
 pub(super) const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 pub(super) const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
+pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(120);
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
 /// The Archived shelf shows this many rows, then "Show more" pages by
@@ -4393,12 +4395,16 @@ impl Shell {
         let filter = self.settings.space_filter.clone();
         // The filtered project's artwork and name, as its dropdown row
         // draws them, plus the offline glyph when no host is reachable.
-        let (label, space, offline): (SharedString, Option<zeron_proto::Space>, bool) = {
+        let (label, space, device_tag): (
+            SharedString,
+            Option<zeron_proto::Space>,
+            Option<(SharedString, bool)>,
+        ) = {
             let state = self.state.read(cx);
             match filter.as_deref().and_then(|id| state.space_row(id)) {
                 Some(space) => {
                     let members = state.project_members(space);
-                    let (_, offline) = state.project_device_tag(&members, Utc::now());
+                    let (tag, offline) = state.project_device_tag(&members, Utc::now());
                     (
                         state
                             .representative_space(space)
@@ -4406,10 +4412,10 @@ impl Shell {
                             .to_string()
                             .into(),
                         Some(space.clone()),
-                        offline,
+                        Some((tag.into(), offline)),
                     )
                 }
-                None => (SharedString::from("All projects"), None, false),
+                None => (SharedString::from("All projects"), None, None),
             }
         };
         let art = match &space {
@@ -4639,6 +4645,7 @@ impl Shell {
             SpacesMenuRow,
             SharedString,
             Option<zeron_proto::Space>,
+            Option<SharedString>,
             bool,
             bool,
         )> = {
@@ -4649,6 +4656,7 @@ impl Shell {
                         SpacesMenuRow::All,
                         SharedString::from("All projects"),
                         None,
+                        None,
                         false,
                         filter.is_none(),
                     ),
@@ -4657,7 +4665,7 @@ impl Shell {
                             let key = zeron_proto::view::project_key(space);
                             let selected = filter_key.as_deref() == Some(key.as_str());
                             let members = state.project_members(space);
-                            let (_, offline) = state.project_device_tag(&members, Utc::now());
+                            let (tag, offline) = state.project_device_tag(&members, Utc::now());
                             (
                                 SpacesMenuRow::Space(id),
                                 state
@@ -4666,6 +4674,7 @@ impl Shell {
                                     .to_string()
                                     .into(),
                                 Some(space.clone()),
+                                Some(tag.into()),
                                 offline,
                                 selected,
                             )
@@ -4675,6 +4684,7 @@ impl Shell {
                             (
                                 SpacesMenuRow::Space(id),
                                 SharedString::from("?"),
+                                None,
                                 None,
                                 false,
                                 selected,
@@ -4693,7 +4703,7 @@ impl Shell {
         let profile = self.active_sidebar_pin_profile_key(cx);
         let icons: Vec<AnyElement> = details
             .iter()
-            .map(|(_, _, space, _, selected)| match space {
+            .map(|(_, _, space, _, _, selected)| match space {
                 Some(space) => self.project_icons.render(
                     &self.state,
                     Some(space),
@@ -4719,7 +4729,7 @@ impl Shell {
                     // Same scroll budget as the composer project menu.
                     .max_h(px(224.0))
                     .children(details.into_iter().zip(icons).enumerate().map(
-                        |(ix, ((row, label, _, offline, selected), art))| {
+                        |(ix, ((row, label, _, tag, offline, selected), art))| {
                             let menu_space = match &row {
                                 SpacesMenuRow::Space(id) => Some(id.clone()),
                                 _ => None,
@@ -6891,6 +6901,56 @@ impl Shell {
         }
     }
 
+    pub(super) fn close_project_crumb_menu(&mut self, cx: &mut Context<Self>) {
+        if self.project_crumb_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.project_crumb_menu);
+            cx.notify();
+        }
+    }
+
+    /// The folders folded into the `…` crumb, in path order.
+    fn render_project_crumb_menu(
+        &self,
+        hidden: &[(String, String)],
+        closing: Option<std::time::Instant>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = hidden.iter().enumerate().map(|(ix, (name, full))| {
+            let full = full.clone();
+            popover::menu_row(theme, false, format!("project-crumb-menu-{ix}"))
+                .id(("project-crumb-menu", ix))
+                .child(
+                    icon(icons::FOLDER)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(div().min_w_0().truncate().child(name.clone()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.project_crumb_menu = popover::Popup::default();
+                    this.add_space_descend(full.clone(), false, cx);
+                }))
+        });
+        let card = popover::popover_card(theme)
+            .id("project-crumb-menu")
+            .min_w(px(180.0))
+            .max_w(px(280.0))
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_project_crumb_menu(cx)))
+            .children(rows);
+        popover::anchored_menu_below_layer(
+            "project-crumb-menu",
+            card.into_any_element(),
+            closing,
+            6.0,
+            3,
+        )
+    }
+
     /// The palette card: ⌘K search bar (with the ⌘⏎ add / esc chips) ·
     /// breadcrumbs + folder list beside the devices rail · kbd-hint footer.
     pub(super) fn render_add_space_overlay(
@@ -7967,7 +8027,7 @@ mod project_flow_tests {
                 .unwrap();
                 state
             });
-            Shell::new(
+            crate::shell::test_shell(
                 state,
                 EngineBootConfig {
                     data_dir: data.path().into(),
@@ -8114,7 +8174,7 @@ mod home_folder_search_tests {
         let data_dir = dir.path().to_path_buf();
         let window = cx.add_window(|_, cx| {
             let state = cx.new(|_| crate::state::AppState::new());
-            Shell::new(
+            crate::shell::test_shell(
                 state,
                 crate::EngineBootConfig {
                     data_dir,

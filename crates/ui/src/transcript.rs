@@ -4563,9 +4563,6 @@ pub struct Transcript {
     /// tool id. `None` = present when this transcript attached (history) or
     /// already revealed, so replay and virtualized remounts stay still.
     tool_reveals: HashMap<SharedString, HashMap<SharedString, Option<Instant>>>,
-    /// Compact transcript mode (Settings → Appearance): every turn's work
-    /// folds into one `TurnSteps` row, live turns included.
-    compact_mode: bool,
     /// Last seen `settings::collapse_command_blocks`; a flip re-renders rows.
     collapse_commands: bool,
     mermaid_preview: Option<crate::mermaid_preview::MermaidPreview>,
@@ -5011,7 +5008,6 @@ impl Transcript {
             user_heights: HashMap::new(),
             user_folds: HashMap::new(),
             tool_reveals: HashMap::new(),
-            compact_mode: crate::settings::transcript_compact_mode(cx),
             collapse_commands: crate::settings::collapse_command_blocks(cx),
             mermaid_preview: None,
             mermaid_preview_focus: cx.focus_handle(),
@@ -11103,13 +11099,6 @@ impl Transcript {
         let target = if open { open_height } else { 0.0 };
         let summary = tool_group_summary(tools);
 
-        // The summary rolls as the group grows ("Thought 2 times" → "Thought
-        // 3 times · Ran 1 command"), like the working indicator's word.
-        let rolled_summary = crate::roll_text::rolling(
-            format!("tool-group-title-{row_id}"),
-            summary.clone(),
-            reduce_motion,
-        );
         let toggle_id = row_id.clone();
         let group_icon = crate::icons::icon(crate::icons::CHECKLIST)
             .size(px(14.0))
@@ -11147,20 +11136,10 @@ impl Transcript {
                     .h(px(render::MD_LINE_HEIGHT))
                     .flex()
                     .items_center()
-                    .overflow_hidden()
-                    .child(match worked_secs {
-                        Some(secs) => compact_work_title(
-                            summary.clone(),
-                            SharedString::from(worked_for_label(secs)),
-                            worked_fade_t,
-                            shimmer_phase,
-                            theme,
-                        ),
-                        None => rolled_summary.unwrap_or_else(|| {
-                            tool_group_title(summary.clone(), shimmer_phase, theme)
-                        }),
-                    }),
-            );
+                    .truncate()
+                    .child(SharedString::from(summary)),
+            )
+            .child(stream_disclosure(open, theme));
 
         let worker_chips: Vec<_> = {
             let state = self.state.read(cx);
@@ -13179,24 +13158,6 @@ impl Render for Transcript {
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
-        // Diagram requests are scoped to paint passes; rasters follow the
-        // reading column and display density (a no-op while both hold).
-        let released_diagrams = {
-            let mut diagrams = self.diagrams.borrow_mut();
-            let mut released = diagrams.begin_frame(crate::theme::style_generation());
-            let list_width = f32::from(self.list.viewport_bounds().size.width);
-            let column = if list_width > 0.0 {
-                self.content_width
-                    .min((list_width - self.right_reserve).max(1.0))
-            } else {
-                self.content_width
-            };
-            released.extend(diagrams.set_view((column.max(1.0), 480.0), window.scale_factor()));
-            released
-        };
-        if !released_diagrams.is_empty() {
-            crate::image_media::release_media(released_diagrams, cx);
-        }
         // Own-turn driver: measurements are only authoritative after layout,
         // so reservation sizing, the send glide, and the outgrown-handoff
         // each advance at most once per requested frame. Scheduled on every
@@ -18809,19 +18770,6 @@ mod tests {
         assert_eq!(tool_chip_content(&todo), ("Todo", "1/2 done".to_string()));
     }
 
-    #[test]
-    fn file_action_badges_show_only_the_file_name() {
-        assert_eq!(file_badge_name("/Users/me/project/src/main.rs"), "main.rs");
-        assert_eq!(
-            file_badge_name("crates/ui/src/transcript.rs"),
-            "transcript.rs"
-        );
-        assert_eq!(file_badge_name(r"C:\project\src\main.rs"), "main.rs");
-        assert_eq!(file_badge_name("src/components/"), "components");
-        assert_eq!(file_badge_name("main.rs"), "main.rs");
-        assert_eq!(file_badge_name(""), "");
-    }
-
     #[gpui::test]
     fn tool_file_badge_opens_linkable_files_without_toggling_the_chip(
         cx: &mut gpui::TestAppContext,
@@ -18859,7 +18807,10 @@ mod tests {
         assert!(!opener.opens("../secret.rs"));
 
         let read = |path: &str| ToolItem {
-            part_id: "fixture".into(),
+            subagent_batch: None,
+            id: "fixture".into(),
+            execution: None,
+            file_preview: None,
             images: Default::default(),
             call: ToolCall::ReadFile { path: path.into() },
             is_error: false,
@@ -18872,7 +18823,6 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
-            kind: ToolItemKind::Call,
         };
         // The chip header inside a clickable parent, standing in for the
         // accordion toggle that wraps it in `render_tool_group`.
@@ -18893,6 +18843,8 @@ mod tests {
                         .child(chip_header(
                             &self.tool,
                             false,
+                            None,
+                            None,
                             Some(&self.opener),
                             &theme,
                             cx.entity_id(),

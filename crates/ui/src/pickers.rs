@@ -471,6 +471,12 @@ pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
     hits.next().is_none().then_some(ix)
 }
 
+/// Whether a palette query is path-shaped (absolute, home-relative or
+/// drive-rooted) rather than a folder name to filter by.
+pub fn is_typed_path(query: &str) -> bool {
+    query.starts_with(['/', '~']) || is_windows_path(query)
+}
+
 /// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`)
 /// or home-relative (`~`, `~/github`). Returns the absolute path to browse,
 /// trailing slash trimmed. `home` is the device's resolved home — `None`

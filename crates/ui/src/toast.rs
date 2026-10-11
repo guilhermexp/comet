@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Global, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, point, px,
+    AnyElement, App, Context, Global, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, point,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::icons;

@@ -371,7 +371,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   `docs/verification/2026-09-18-workers-project-identity.md`.
 
 - "Não atualizou na tela" começa em `zeron-doc` (mirror), não aqui.
-- Não há harness de render: mudança visual se valida rodando `scripts/dev-demo.sh` e olhando. Screenshot antes de dizer pronto.
+- GPUI TestAppContext cobre layout e interação nos testes de render existentes; aparência final e caminhos AppKit exigem QA nativo isolado. Registre a captura antes de dizer pronto.
 - Recuperação de foco do Shell verifica o dispatch tree montado após layout: prefere o composer quando presente e usa a raiz focável quando o handle anterior ficou desmontado. Não substitui o retorno de first responder AppKit do preview nativo. Seleção no transcript suspende o follow já no mouse-down, cancelando animação e viewport pendente antes de arrastar.
 - Toda raiz de `track_focus` precisa de `.id()` + `.role()` (mais `aria_label` / `aria_value` quando o controle carrega texto). Sem role o gpui deixa o elemento fora da árvore AccessKit, loga `a11y: focused element … has no accessibility node` a cada mudança de foco, e a tecnologia assistiva anuncia a janela inteira em vez do controle focado.
 
@@ -408,7 +408,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/markdown/render.rs` (clique em link) | unit — GPUI TestWindow, press/release sem draw intermediário, clique com repaint, botão secundário e arraste | `cargo test -p zeron-ui markdown_link_opens_without_a_frame` |
 | `src/transcript.rs` (links para arquivos fora do checkout) | unit — parser Markdown → alvo do Chat → leitura real em pasta externa; HTML/MD/TXT, espaços/acentos e arquivo homônimo no checkout | `cargo test -p zeron-ui chat_file_links_load_reports_from_another_directory` |
 | `src/transcript.rs` (mensagem de usuário inline, recolhimento e posição de leitura) | unit — estado/fold/runway; alinhamento, clipping e rolagem são QA nativo | `cargo test -p zeron-ui --lib transcript` · janela isolada com prompts curtos/longos, tema opaco/frosted |
-| `src/transcript.rs` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
+| `src/transcript.rs` (render gpui) | unit nos fixtures de layout/interação; aparência final é QA nativo | `cargo test -p zeron-ui --lib transcript` · `scripts/dev-demo.sh` |
 | `src/markdown_decor.rs` + mapping em `src/composer.rs` | unit — scanner, exact-cover/projeção, IME/cap e estabilidade do flip | `cargo test -p zeron-ui markdown_decor && cargo test -p zeron-ui composer` |
 | `src/{attachments,composer}.rs` (paste/drop e rail staged) | unit — precedência/cap, classificação de path, persistência e restore | `cargo test -p zeron-ui attachments && cargo test -p zeron-ui composer` |
 | `src/shell/chat_dropzone_tests.rs` (drop de paths e recusa combinada síncrona/assíncrona) | unit — GPUI TestAppContext em composer principal e side chat | `cargo test -p zeron-ui --lib external_file_drops_stage_files_and_refuse_folders_and_oversize_files` |
@@ -442,7 +442,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/terminal/emulator.rs` (ANSI, seleção e retenção opt-in da tela alternativa) | unit — controle dividido entre chunks, tela principal e tela viva preservadas | `cargo test -p zeron-ui --lib terminal::emulator` |
 | `src/shell.rs` (divisores, orçamento responsivo e preservação da coluna vizinha) | unit — geometria pura; arraste nativo é visual | `cargo test -p zeron-ui --lib shell::tests` |
 | `src/shell/{panel_layout,session_info,panel_interaction_tests}.rs` (reset isolado de Details e visibilidade de metadata quando a largura responsiva zera) | unit — GPUI TestAppContext com layout e resize reais | `cargo test -p zeron-ui resetting_details_width_restores_default_and_preserves_right_preference` · `cargo test -p zeron-ui details_owns_session_location_metadata_while_session_actions_remain` · `cargo test -p zeron-ui panels_share_space_and_keep_rendered_geometry_through_their_lifecycle` |
-| `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
+| `src/{shell,settings,terminal}/**` (render gpui) | unit nos fixtures existentes; caminhos sem fixture e aparência final exigem QA nativo | testes focados da surface · `scripts/dev-demo.sh` |
 | `src/workers/workspace.rs` (ordem por atividade da sidebar, subtree de projeto, cap de rows com a selecionada garantida, ramo de `session_sort`, confirmação de remoção sem hooks e faixa advisory) | unit (projeções puras); render gpui é visual | `cargo test -p zeron-ui workers::workspace` |
 | `src/workers/project_menu.rs` (elegibilidade de remoção comum e override sem hooks por posse/availability) | unit | `cargo test -p zeron-ui workers::project_menu` |
 | `src/details_sidebar/widgets.rs` (foco de aba do widget Workers: ganho, esvaziamento, baseline, lista ausente) | unit — derivações puras sobre contagens e conjuntos injetados | `cargo test -p zeron-ui details_sidebar::widgets` |

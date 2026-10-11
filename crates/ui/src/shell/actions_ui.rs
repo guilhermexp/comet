@@ -16,6 +16,21 @@ struct ProjectActionContext {
     target_device_id: Option<String>,
 }
 
+/// Reserve the titlebar, trigger gap and window margin even on short windows.
+fn project_actions_menu_surface(
+    theme: &Theme,
+    viewport_height: Pixels,
+    scroll: &gpui::ScrollHandle,
+) -> gpui::Stateful<gpui::Div> {
+    popover::popover_card(theme)
+        .id("project-actions-scroll")
+        .w(px(280.0))
+        .max_h((viewport_height - px(Theme::TITLEBAR_HEIGHT + 6.0 + 16.0)).max(px(0.0)))
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+}
+
 /// A skipped-copy advisory stays visible whether or not setup failed.
 fn worktree_setup_notice(setup_error: Option<&str>, setup_warning: Option<&str>) -> Option<String> {
     let notices = [

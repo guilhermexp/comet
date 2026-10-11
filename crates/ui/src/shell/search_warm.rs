@@ -81,7 +81,7 @@ mod tests {
         });
         cx.add_window(|_, cx| {
             let state = cx.new(|_| AppState::new());
-            Shell::new(
+            crate::shell::test_shell(
                 state,
                 crate::EngineBootConfig {
                     data_dir: path.into(),

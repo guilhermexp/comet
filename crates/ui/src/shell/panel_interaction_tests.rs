@@ -38,7 +38,7 @@ fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut Vis
                 .collect();
             state
         });
-        let mut shell = Shell::new(
+        let mut shell = test_shell(
             state,
             EngineBootConfig {
                 data_dir: dir.path().into(),
@@ -87,7 +87,7 @@ impl Panel {
         match self {
             Self::Sidebar => shell.toggle_sidebar(cx),
             Self::Files => shell.toggle_files_panel(window, cx),
-            Self::Right => shell.toggle_right_pane(cx),
+            Self::Right => shell.toggle_right_pane(window, cx),
         }
     }
 }
@@ -228,9 +228,9 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     expect(settled(&shell, cx), wide.widths);
 
     // Mid-flight reversal, then a different panel interrupting the return.
-    change(&shell, cx, |s, _, cx| s.toggle_right_pane(cx));
+    change(&shell, cx, |s, window, cx| s.toggle_right_pane(window, cx));
     let closing = draw(&shell, cx, 75);
-    change(&shell, cx, |s, _, cx| s.toggle_right_pane(cx));
+    change(&shell, cx, |s, window, cx| s.toggle_right_pane(window, cx));
     continuous(closing, draw(&shell, cx, 0));
     let reopening = draw(&shell, cx, 40);
     change(&shell, cx, |s, _, cx| s.toggle_sidebar(cx));
@@ -324,7 +324,7 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     expect(settled(&shell, cx), ordinary.widths);
 
     // Navigation interrupts a close and lands directly on the destination.
-    change(&shell, cx, |s, _, cx| s.toggle_right_pane(cx));
+    change(&shell, cx, |s, window, cx| s.toggle_right_pane(window, cx));
     draw(&shell, cx, 75);
     change(&shell, cx, |s, _, cx| select(s, None, cx));
     expect(draw(&shell, cx, 0), [300.0, 0.0, 0.0, 1300.0]);
@@ -364,7 +364,7 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     };
     let resting = side_composer(cx);
     for _ in 0..2 {
-        change(&shell, cx, |s, _, cx| s.toggle_right_pane(cx));
+        change(&shell, cx, |s, window, cx| s.toggle_right_pane(window, cx));
         draw(&shell, cx, 75);
         let moving = side_composer(cx);
         near(f32::from(moving.size.width), f32::from(resting.size.width));
@@ -374,7 +374,7 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
         );
         settled(&shell, cx);
     }
-    change(&shell, cx, |s, _, cx| s.toggle_right_pane(cx));
+    change(&shell, cx, |s, window, cx| s.toggle_right_pane(window, cx));
     settled(&shell, cx);
     cx.update(|_, cx| motion::set_reduced_motion(cx, true));
     for panel in [
