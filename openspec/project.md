@@ -45,7 +45,7 @@ local OAuth credential through snapshots or sync.
 - Unit co-located (`mod tests`) em toda crate; integration e e2e em `crates/*/tests/`.
 - Edge: vitest (`npm -C edge run test`) + `typecheck` obrigatório.
 - Convergência Rust↔edge se prova em `crates/sync/tests/registry_edge.rs`.
-- **Render gpui não tem harness**: mudança visual se valida rodando `scripts/dev-demo.sh` e olhando a tela. Suite verde não é evidência de UI correta.
+- Os testes gpui existentes cobrem layout e interação em harness; mudanças visuais também exigem observação nativa isolada conforme `scripts/AGENTS.md`. Suite verde sozinha não prova a aparência nem os caminhos AppKit.
 - O tier exigido por camada é o da **Test Coverage Matrix** do `AGENTS.md` da subárvore tocada — cada `Scenario` carimba `Test:` a partir dela.
 
 ### Git Workflow

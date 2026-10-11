@@ -3,7 +3,7 @@ schema_version: 1
 id: 20261011T081548Z-836aafbf
 skill_version: 1.1.0
 started_at: '2026-10-11T08:15:48.471399+00:00'
-finished_at: 
+finished_at:
 finished_at_reason: Execution still active; final checks, publication and installation
   pending.
 request: Trazer novidades upstream e as duas PRs abertas de hoje, depois compilar/instalar
@@ -21,7 +21,7 @@ fork:
   target_branch: main
   initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
   observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
-  result_sha: 2351d54b74b28ce14708851bc627854a068eb8ac
+  result_sha: 45702a8d0949dd21b6480325792594768ec012f5
   initial_worktree: clean
 strategy:
   operation: merge
@@ -180,6 +180,30 @@ verification:
   result: failed
   observed: LIST_CHANGE_REQUEST_PAGE deadline assertion was outside deadline closure
     scope; repaired in2351d54b. Actual repaired CI pending.
+- command: Protected all-targets check attempts 2 and 3
+  revision: 45702a8d0949dd21b6480325792594768ec012f5
+  result: failed
+  observed: Attempt2 compiled UI library but found two WindowHandle/Window fixture
+    mismatches; corrected45702a8d. Attempt3 found one mutable VisualTestContext mismatch
+    in the new rendered export-menu regression; source corrected, next check pending.
+- command: Combined fork-preservation review
+  result: passed
+  observed: Restored all six Chat/side-chat export menu actions after auditing missing
+    fork additions; added rendered-row regression. Removed orphan declarations from
+    intentionally excluded old upstream Transcript infrastructure, retaining fork
+    compact rows and Mermaid cache. Static review is not runtime evidence.
+- command: Linux UI core CI339411c2
+  revision: 339411c285fb67291da231f7ef82390acc7d6066
+  result: failed
+  observed: 1713 tests attempted; pending_worker_notification_survives_stop_and_keeps_user_queue_paused
+    timed out waiting for Stop to bypass saturated prompt drain. Root-cause investigation
+    active; no timeout/skip weakening.
+- command: Windows voice CI baseline comparison
+  result: failed
+  observed: PR21 head61803952 (run38120879327/job114415177787) and eb101bb9 (run38127247187/job114434110626)
+    have identical51 unpeel-core compiler errors from Unix-only APIs. Source/workflow
+    unchanged from initial main; main Windows execution not observed. Latest revision
+    Windows CI pending.
 limits:
 - PR21 prior CI Linux file-link menu failure is pre-existing and not a proved integration
   regression; merged-head CI still pending.
@@ -197,7 +221,7 @@ pending:
 delivery:
   integration: pending
   target_branch: main
-  commit: 
+  commit:
   pr: https://github.com/guilhermexp/comet/pull/20
   publication: pending
   record_pushed: true

@@ -16318,7 +16318,7 @@ mod tests {
         });
         let shell = host.read_with(cx, |host, _| host.0.clone());
 
-        let assert_exports_rendered = |cx: &gpui::VisualTestContext| {
+        let assert_exports_rendered = |cx: &mut gpui::VisualTestContext| {
             for key in [
                 "export-download-md",
                 "export-download-json",
