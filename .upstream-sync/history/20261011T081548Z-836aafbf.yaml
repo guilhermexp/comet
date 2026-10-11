@@ -1,0 +1,193 @@
+---
+schema_version: 1
+id: 20261011T081548Z-836aafbf
+skill_version: 1.1.0
+started_at: '2026-10-11T08:15:48.471399+00:00'
+finished_at: 
+finished_at_reason: Execution still active; final checks, publication and installation
+  pending.
+request: Trazer novidades upstream e as duas PRs abertas de hoje, depois compilar/instalar
+  release macOS sem abrir o app.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: refs/heads/main
+  target_sha: 54954e4d22bd4d78b2e2c7160a913b1af548dc79
+  previous_integrated_sha: 1074bc540b995d6b7e5a6fa5431f1a2420df8d91
+  target_label: v0.2.111
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: main
+  target_branch: main
+  initial_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
+  observed_target_sha: e80142973ec72fcf7ed7297d7a0eb7c453485241
+  result_sha: e55de7ee38fe9300420e41cb2e0a97eba27be100
+  initial_worktree: clean
+strategy:
+  operation: merge
+  reason: Shared fork history preserved; PR21 merged first, then frozen PR20/upstream
+    snapshot in an isolated worktree.
+changes:
+  incoming_range: 1074bc540b995d6b7e5a6fa5431f1a2420df8d91..54954e4d22bd4d78b2e2c7160a913b1af548dc79
+  incoming_count: 19
+  summary: Native PR board/inspection, shared fff workspace path/content search and
+    tabbed Cmd+K, searchable project picker/menus, responsive panels/session information,
+    queue chat mentions, navigation history mouse buttons, quieter Providers, Spanish
+    README. Fork PR21 adds exact per-worked-checkout totals.
+  imported:
+  - sha: 54954e4d22bd4d78b2e2c7160a913b1af548dc79
+    subject: 'Settings: quieter Providers page, stable rows when toggling'
+  - sha: 488c0358252f0d542894ee6152c3a9d3bdc48ede
+    subject: 'Shell: mouse back/forward buttons walk the route history (#872)'
+  - sha: 057522d2318d7be05d311eb0bd491b975b248b66
+    subject: 'Docs: add Spanish README and link it from the language switchers (#870)'
+  - sha: 40091d469aa8a3f1ab1ec7cb404957b742940278
+    subject: Bump version to v0.2.111
+  - sha: 3487b507fa8920ab829339f3e3ad72a4bdb45036
+    subject: Unified workspace search on fff, content search, and a tabbed cmd+K palette
+      (#856)
+  - sha: ec28627ce2e28304d01751d3462302ce7fd3d57a
+    subject: Bump version to v0.2.110
+  - sha: 73051ec7198088f28d49bfdfdd159179387a0e4e
+    subject: 'Engine: fall back to the fetch URL when a remote''s push URL is disabled
+      (#863)'
+  - sha: 6774a37a03ad473732566f056f7ba6c00297e4f6
+    subject: 'Titlebar: frame-style session card toggle and folder-tree explorer toggle'
+  - sha: dace1a8ce515be33a0d14d59fc56d65d57f7fe06
+    subject: 'Panels: content columns share the width, continuous transitions (#677)'
+  - sha: ac4acbc21fd6f7cf7977e6bb7816385b8a7d98bb
+    subject: 'Session card: project, device, side chats and actions behind one toggle'
+  - sha: d84ef73af667dde3cc1c8ec72ec0041112f48203
+    subject: Drop focus rings from the pull request views
+  - sha: 9e17e401710412adca91fe485886d65aa2d7e3eb
+    subject: Bump version to v0.2.109
+  - sha: ae19fe31b1e3bd06da0e6bfe08600e5e2e94d196
+    subject: Widen the sidebar minimum so its options button fits beside the titlebar
+      controls
+  - sha: 344436efb28298a8b122ad1a970aff6be3880524
+    subject: Bump version to v0.2.108
+  - sha: a408a81402e6ce1cafce8b39d3da6cde2e877ac1
+    subject: Sonner-style toasts, a nested Copy menu, and picker-style repository
+      menu
+  - sha: 05f5f2bff482539824394bd88aad0991ebffb8ea
+    subject: Drop the ellipsis from New project in project menus
+  - sha: 672cc1444b8d7c51ff6b82c661c0757d650fd105
+    subject: Searchable popovers, ordered sidebar sections, and titlebar sidebar options
+  - sha: b65b47536727c92e2a4f8b8c1aeaa683bf4b0abe
+    subject: Queue polish, and drag a chat from the sidebar to mention it (#855)
+  - sha: afca583c12db7ca315b0429445106b6de73ba02c
+    subject: Add a repository-scoped PR board and native inspection (#484)
+  fork_prs:
+  - number: 20
+    head_sha: 54954e4d22bd4d78b2e2c7160a913b1af548dc79
+  - number: 21
+    head_sha: 618039526fcdad81321afded849f95f66702d730
+customizations:
+  preserved:
+  - Fork identity/version 0.2.18, own release feed and vendored gpui/zui.
+  - Workers/OMP/Kimi, root MCP grants, direct genuine Worker mailbox notifications
+    and Enter/Steer.
+  - Device-local managed usage, Details Device/Workers/Usage, exact local worked-project
+    totals and watch lifetime.
+  - PR19 Markdown hard-break fix; compact transcript; deleted legacy Details Files
+    and OMP Live Voice remain deleted.
+  - Both punctuation rule files remain byte-identical through zui source import.
+  adapted:
+  - New PR/search RPCs in the typed registry, no duplicate forwarding tables.
+  - SessionInfo actions retained with metadata hidden only while Details has effective
+    visible width.
+  - New picker retains Worker local-device restriction and registry submission.
+  - New Sonner store coexists with fork Shell toast API.
+  - zui361ff20 imported via separate source merge; gpui-base701ca97.
+  removed:
+  - Superseded per-root file search lock/ranker replaced by shared upstream index.
+conflicts:
+- area: manifests
+  files:
+  - Cargo.lock
+  - Cargo.toml
+  - crates/ui/Cargo.toml
+  decision: Retained fork identity/version and path gpui dependencies; updated gpui-base
+    and imported new fff/html dependencies with real Cargo lock reconciliation.
+- area: engine/rpc
+  files:
+  - crates/engine/src/lib.rs
+  - crates/engine/src/repos.rs
+  - crates/engine/src/rpc.rs
+  - crates/engine/src/source_control.rs
+  - crates/engine/src/workspace_files.rs
+  - crates/rpc/src/lib.rs
+  decision: Combined upstream search/PR capabilities with unique typed RPC registry,
+    bounded ProcessRunner, local Chat/Space plus linked Worker root authorization,
+    and PR21 multi-cwd pin lifetime.
+- area: widgets
+  files:
+  - crates/ui/src/change_requests.rs
+  - crates/ui/src/files/sections.rs
+  - crates/ui/src/icons.rs
+  - crates/ui/src/lib.rs
+  - crates/ui/src/pickers.rs
+  - crates/ui/src/popover.rs
+  - crates/ui/src/settings.rs
+  - crates/ui/src/toast.rs
+  - crates/ui/src/transcript.rs
+  decision: Kept Sonner and legacy Shell toast APIs, device-aware PR badges, settings
+    union, compact transcript and deleted legacy Details Files.
+- area: shell/navigation
+  files:
+  - crates/ui/src/shell.rs
+  - crates/ui/src/shell/actions_ui.rs
+  - crates/ui/src/shell/command_palette.rs
+  - crates/ui/src/shell/files_panel.rs
+  - crates/ui/src/shell/files_panel_workspace_tests.rs
+  - crates/ui/src/shell/side_chats.rs
+  - crates/ui/src/shell/spaces.rs
+  - crates/ui/src/shell/tabs.rs
+  decision: Preserve Workers, Details/Usage, local Worker picker, Enter/Steer and
+    live-tab right-pane rule while adopting upstream tabbed search, PR routes, session
+    information and responsive panel layout; integrated read-only review passed after
+    repairs.
+verification:
+- command: git fetch --no-tags upstream refs/heads/main; git fetch --no-tags origin
+  result: passed
+  observed: Frozen upstream54954e4d, starting origin/main e8014297; PR21 head61803952.
+- command: cargo fmt --all before merge
+  revision: e80142973ec72fcf7ed7297d7a0eb7c453485241
+  result: passed
+  observed: No formatting delta.
+- command: cargo metadata --format-version 1
+  result: passed
+  observed: Resolved reconciled manifests and lockfile in integration tree; 54 package
+    IDs added, 2 removed. Not compilation evidence.
+- command: Separate zui source reconstruction and merge
+  result: passed
+  observed: Source merge b9a039088ee1fdce42b853dddc6371696195f7ca; vendored tree724a81347f35767e8cd873e76c6ae5bbe306a7e1;
+    line_wrapper.rs and line_layout.rs byte-identical to fork before import.
+- command: Independent read-only review of stable engine/RPC/manifests/widgets and
+    navigation
+  result: passed
+  observed: Independent reviewers found no material issues after five Shell repairs
+    (route arms, width reset, effective metadata visibility, duplicate toast); focused
+    tests and final Cargo checks pending.
+limits:
+- PR21 prior CI Linux file-link menu failure is pre-existing and not a proved integration
+  regression; merged-head CI still pending.
+- Native product/UI and macOS install not yet exercised in this attempt.
+references:
+- docs/upstream-sync.md
+- openspec/changes/sync-upstream-v0-2-111/
+- https://github.com/guilhermexp/comet/pull/20
+- https://github.com/guilhermexp/comet/pull/21
+outcome: prepared
+pending:
+- Compile/check final integrated APIs and execute focused regressions.
+- Run project gate/merged-head CI and integrate into main.
+- Package/install macOS without auto-launch, then closeout docs/history and task resources.
+delivery:
+  integration: pending
+  target_branch: main
+  commit: 
+  pr: https://github.com/guilhermexp/comet/pull/20
+  publication: pending
+  record_pushed: false
+  deploy: Local macOS packaging/install requested; edge deploy not requested.
