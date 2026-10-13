@@ -10,6 +10,43 @@ fn pause_hook_wait_codex_hooks_review_footer_is_a_menu_prompt() {
 }
 
 #[test]
+fn pause_hook_wait_hook_review_detail_footer_is_a_menu() {
+    let screen = "\
+             SessionStart hooks\n\
+             1 hook needs review before it can run.\n\
+             › [!]  1  Unnamed hook · new\n\
+             Event     SessionStart\n\
+             Source    User config - /private/tmp/cwg-j6y27kk6/h/.codex/hooks.json\n\
+             Command   /usr/bin/true\n\
+             Mode      Sync\n\
+             Timeout   600s\n\
+             Trust     New hook - review required\n\
+             t trust · esc back";
+    assert_eq!(viewport_has_menu_prompt(screen), true);
+}
+
+#[test]
+fn pause_hook_wait_trusted_detail_and_trust_prose_are_not_menus() {
+    let trusted = "\
+             SessionStart hooks\n\
+             1 hook needs review before it can run.\n\
+             Command   /usr/bin/true\n\
+             Trust     Trusted";
+    assert_eq!(viewport_has_menu_prompt(trusted), false);
+    let warning_with_label = "\
+             SessionStart hooks\n\
+             1 hook needs review before it can run.\n\
+             Command   /usr/bin/true\n\
+             Trust     New hook - review required";
+    assert_eq!(viewport_has_menu_prompt(warning_with_label), false);
+    assert_eq!(
+        viewport_has_menu_prompt("Please trust this hook, then go back to the list."),
+        false
+    );
+    assert_eq!(viewport_has_menu_prompt("do not trust · esc back"), false);
+}
+
+#[test]
 fn pause_hook_wait_hook_warning_prose_and_passive_list_are_not_menus() {
     assert_eq!(
         viewport_has_menu_prompt("1 hook needs review before it can run"),

@@ -430,8 +430,9 @@ apps/zeron (host-mode dispatch at startup).
   `ui_prompt_end` (nunca `Stop` no fim do prompt).
   `derive_activity` projeta isso como `blocked` sem `menu_prompt_active`.
   O footer de revisão de hooks do Codex (`enter review`/`trust all` com
-  `esc close`) é o terceiro par de `viewport_has_menu_prompt` e também vira
-  `blocked`. A row `■ Conversation interrupted` do turno atual, só com sufixo
+  `esc close`, e o detalhe `t trust · esc back`) é menu em
+  `viewport_has_menu_prompt` e também vira `blocked`. O rótulo `Trust` e a
+  palavra trust em prosa não bloqueiam. A row `■ Conversation interrupted` do turno atual, só com sufixo
   conhecido do CLI (nenhum, ou `- use /feedback if something went wrong`), o
   composer abaixo (vazio, placeholder ou draft ainda não enviado) e sem footer
   de trabalho nem user row já enviada, grava `turn_settled_by_interrupt`. A row

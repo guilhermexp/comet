@@ -2,7 +2,7 @@
 
 ### Requirement: Revisão interativa de hooks bloqueia o worker
 
-O sistema SHALL tratar como menu à espera de input um footer com ação de revisão ou confiança junto com fechar, na mesma linha ou na adjacente. Aviso, prosa ou lista passiva sem esse par MUST NOT bloquear. Fechar o menu MUST restaurar o estado do latch.
+O sistema SHALL tratar como menu à espera de input um footer com ação de revisão ou confiança junto com fechar, na mesma linha ou na adjacente. O detalhe aberto por Enter, com o footer exato `t trust · esc back`, também SHALL bloquear. Aviso, o rótulo `Trust`, um detalhe já confiado ou passivo sem esse footer, e prosa com a palavra trust MUST NOT bloquear. Fechar o menu MUST restaurar o estado do latch.
 
 #### Scenario: Footer real de revisão de hooks bloqueia
 - Test: unit — `viewport_has_menu_prompt` com o footer `t trust all · enter review · esc close`.
@@ -10,6 +10,12 @@ O sistema SHALL tratar como menu à espera de input um footer com ação de revi
 - **WHEN** o viewport mostra o footer interativo de revisão de hooks
 - **THEN** o detector de menu é verdadeiro
 - **AND** a atividade derivada de um worker ocupado ou ocioso é `blocked`
+
+#### Scenario: Detalhe da revisão com `t trust · esc back` bloqueia
+- Test: unit — `viewport_has_menu_prompt` com `SessionStart hooks`, o aviso, `Command /usr/bin/true` e o footer `t trust · esc back`.
+
+- **WHEN** o viewport mostra o detalhe interno da revisão com esse footer
+- **THEN** o detector de menu é verdadeiro
 
 #### Scenario: Aviso isolado, prosa e lista passiva não bloqueiam
 - Test: unit — `viewport_has_menu_prompt` com aviso "1 hook needs review before it can run", prosa e uma lista sem o footer de ação.

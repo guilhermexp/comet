@@ -2774,6 +2774,10 @@ final class RemoteGhosttyRenderer: ObservableObject {
     private static let menuReviewActionMarkers = ["enter review", "trust all"]
     /// Dismiss phrases paired with `menuReviewActionMarkers`.
     private static let menuReviewDismissMarkers = ["esc close", "escape to close"]
+    /// Inner hook-review footer, observed as `t trust · esc back`. The leading
+    /// `t ` is the key hint. Bare "trust" is not this phrase. Twin of
+    /// `REVIEW_DETAIL_FOOTER` in `menu_prompt.rs`.
+    private static let hookReviewDetailFooter = "t trust · esc back"
     /// Phrases marking a hint row as a passive status footer, not an
     /// answerable menu — Claude Code's subagent list pins
     /// "↑/↓ to select · Enter to view" for the whole run.
@@ -2843,8 +2847,26 @@ final class RemoteGhosttyRenderer: ObservableObject {
             let hasCancel = menuCancelMarkers.contains { window.contains($0) }
             let hasReviewAction = menuReviewActionMarkers.contains { window.contains($0) }
             let hasReviewDismiss = menuReviewDismissMarkers.contains { window.contains($0) }
+            let detailFooter = Self.hasHookReviewDetailFooter(window)
             let passive = menuPassiveMarkers.contains { window.contains($0) }
-            if ((hasNav && hasSelect) || (hasConfirm && hasCancel) || (hasReviewAction && hasReviewDismiss)) && !passive { return true }
+            if ((hasNav && hasSelect) || (hasConfirm && hasCancel) || (hasReviewAction && hasReviewDismiss) || detailFooter) && !passive { return true }
+        }
+        return false
+    }
+
+    /// Left boundary matches the Rust scan: a letter or digit before
+    /// `t trust · esc back` is prose (`not trust`), not the key hint.
+    private static func hasHookReviewDetailFooter(_ window: String) -> Bool {
+        var rest = window.startIndex
+        while let range = window.range(of: hookReviewDetailFooter, range: rest..<window.endIndex) {
+            if range.lowerBound == window.startIndex {
+                return true
+            }
+            let previous = window[window.index(before: range.lowerBound)]
+            if !previous.isLetter && !previous.isNumber {
+                return true
+            }
+            rest = window.index(after: range.lowerBound)
         }
         return false
     }

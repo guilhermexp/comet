@@ -118,7 +118,8 @@ base_revision_resolves_upstream = false
 # global nem starts_with lexical). Same-commit local form; no upstream patch.
 
 # 2026-10-13 — Codex pause and hook-review wait. menu_prompt.rs recognizes
-# the hook-review footer and a settled interrupt. The scan stops at the newest
+# the hook-review list footer and the inner `t trust · esc back` detail footer.
+# The scan stops at the newest
 # interrupt-shaped row; an unknown suffix does not fall through to an older
 # known row. The bottom prompt row is the composer, draft included. An earlier
 # prompt row below that interrupt is a sent user row and is not settled.
