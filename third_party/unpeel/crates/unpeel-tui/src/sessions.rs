@@ -274,7 +274,12 @@ fn derive_status(
             distrust_stops_while_output_grows,
             now,
         );
-        match engine.hook_owned_state(id) {
+        match engine.hook_owned_state(id).map(|state| {
+            crate::activity::report_state_for_settled_interrupt(
+                state,
+                manifest.turn_settled_by_interrupt,
+            )
+        }) {
             Some(HookState::Busy) => Status::Busy,
             Some(HookState::Attention) => Status::Attention,
             // Pre-latch output heuristics are suppressed for hook-capable
@@ -1833,6 +1838,10 @@ fn hostname_short() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod pause_hook_wait {
+        include!("sessions_pause_hook_wait.rs");
+    }
 
     #[test]
     fn local_resume_agent_requires_session_host_protocol_v3() {

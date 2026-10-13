@@ -2755,10 +2755,10 @@ final class RemoteGhosttyRenderer: ObservableObject {
     @Published private(set) var menuOptionCount = 0
 
     /// Footer phrases a select menu prints to advertise its keys. Detection
-    /// requires a marker pair on the same or adjacent rows — nav + select, or
-    /// confirm + cancel — so ordinary transcript prose mentioning "select"
-    /// can't trip it. Kept in sync with the host-side twin
-    /// (`crates/unpeel-core/src/menu_prompt.rs`).
+    /// requires a marker pair on the same or adjacent rows — nav + select,
+    /// confirm + cancel, or hook-review action + dismiss — so ordinary
+    /// transcript prose mentioning "select" can't trip it. Kept in sync with
+    /// the host-side twin (`crates/unpeel-core/src/menu_prompt.rs`).
     private static let menuNavMarkers = ["to navigate", "↑/↓", "↑ ↓", "▲/▼", "arrow keys"]
     private static let menuSelectMarkers = [
         "to select", "to confirm", "to choose", "enter to", "esc to cancel", "return to",
@@ -2769,6 +2769,11 @@ final class RemoteGhosttyRenderer: ObservableObject {
     private static let menuConfirmMarkers = ["enter to confirm", "return to confirm"]
     /// Cancel-key phrases paired with `menuConfirmMarkers`.
     private static let menuCancelMarkers = ["esc to cancel", "escape to cancel"]
+    /// Hook-review action phrases. Paired with `menuReviewDismissMarkers`.
+    /// Kept in sync with `REVIEW_ACTION_MARKERS` in `menu_prompt.rs`.
+    private static let menuReviewActionMarkers = ["enter review", "trust all"]
+    /// Dismiss phrases paired with `menuReviewActionMarkers`.
+    private static let menuReviewDismissMarkers = ["esc close", "escape to close"]
     /// Phrases marking a hint row as a passive status footer, not an
     /// answerable menu — Claude Code's subagent list pins
     /// "↑/↓ to select · Enter to view" for the whole run.
@@ -2812,11 +2817,12 @@ final class RemoteGhosttyRenderer: ObservableObject {
 
     /// True when the viewport text contains a select-menu footer on the same
     /// or adjacent rows (menu footers are one hint line, two when wrapped),
-    /// excluding passive status footers whose Enter action is "view". Two
+    /// excluding passive status footers whose Enter action is "view". Three
     /// footer shapes qualify: a nav hint plus a select hint (Claude-style),
-    /// or a confirm key named next to a cancel key (Codex-style, which
-    /// prints no nav hint). Twin of the Rust `viewport_has_menu_prompt` in
-    /// `menu_prompt.rs` — keep aligned.
+    /// a confirm key named next to a cancel key (Codex-style, which prints
+    /// no nav hint), or a hook-review action next to its dismiss key. Twin
+    /// of the Rust `viewport_has_menu_prompt` in `menu_prompt.rs` — keep
+    /// aligned.
     static func viewportHasMenuPrompt(_ text: String) -> Bool {
         let lines = text
             .split(separator: "\n", omittingEmptySubsequences: false)
@@ -2835,8 +2841,10 @@ final class RemoteGhosttyRenderer: ObservableObject {
             let hasSelect = menuSelectMarkers.contains { window.contains($0) }
             let hasConfirm = menuConfirmMarkers.contains { window.contains($0) }
             let hasCancel = menuCancelMarkers.contains { window.contains($0) }
+            let hasReviewAction = menuReviewActionMarkers.contains { window.contains($0) }
+            let hasReviewDismiss = menuReviewDismissMarkers.contains { window.contains($0) }
             let passive = menuPassiveMarkers.contains { window.contains($0) }
-            if ((hasNav && hasSelect) || (hasConfirm && hasCancel)) && !passive { return true }
+            if ((hasNav && hasSelect) || (hasConfirm && hasCancel) || (hasReviewAction && hasReviewDismiss)) && !passive { return true }
         }
         return false
     }

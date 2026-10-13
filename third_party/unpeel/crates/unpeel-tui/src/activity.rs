@@ -34,6 +34,18 @@ pub enum HookState {
     Attention,
 }
 
+/// Report-only overlay. A settled interrupt drops a Busy spinner to Idle
+/// without writing `stopped_at`, so [`ActivityEngine::hook_confirmed_idle`]
+/// stays false and the next derivation without the evidence shows Busy again.
+/// Explicit attention is left alone. Callers apply menu blocking after this.
+pub fn report_state_for_settled_interrupt(state: HookState, settled: bool) -> HookState {
+    if settled && state == HookState::Busy {
+        HookState::Idle
+    } else {
+        state
+    }
+}
+
 #[derive(Default)]
 struct Entry {
     /// Host-owned generation of the managed runtime inside this PTY. An

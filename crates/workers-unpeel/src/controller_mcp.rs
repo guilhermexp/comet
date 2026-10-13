@@ -212,6 +212,7 @@ pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
 /// receives `[worker-task-notification]` when the worker finishes. Short repeated
 /// waits are polling and burn a full model turn each.
 pub const WAIT_TIMED_OUT_NEXT: &str = "Worker still running. Either call wait_for_status again with a timeout_seconds sized to the remaining work (up to limits.wait_seconds), or end your turn: a [worker-task-notification] arrives in this chat when the worker finishes. Do not poll with short waits.";
+pub const WAIT_BLOCKED_NEEDS_INPUT_NEXT: &str = "Worker is blocked waiting for input. Read the worker output and respond in that session. This is not completion, nothing was approved, and the episode is still open.";
 
 /// Closed set of status strings accepted by `wait_for_status`.
 pub const ACCEPTED_WAIT_STATUSES: &[&str] = &[
@@ -1979,11 +1980,28 @@ pub fn wait_until_matching(
             initial_completion = Some(is_completed);
         }
 
+        let activity_blocked = session.activity.eq_ignore_ascii_case("blocked");
+        let wants_terminal =
+            wanted.eq_ignore_ascii_case("completed") || wanted.eq_ignore_ascii_case("exited");
         if wanted.eq_ignore_ascii_case("completed") {
-            let matched = session.activity.eq_ignore_ascii_case(wanted)
-                || session.state.eq_ignore_ascii_case(wanted)
-                || is_completed;
-            if matched {
+            let status_matched = session.activity.eq_ignore_ascii_case(wanted)
+                || session.state.eq_ignore_ascii_case(wanted);
+            if status_matched {
+                return Ok(json!({ "matched": true, "worker": session_json(&session) }));
+            }
+            if activity_blocked {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("wait_for_status cancelled by the host".into());
+                }
+                return Ok(json!({
+                    "matched": false,
+                    "needs_input": true,
+                    "blocked": true,
+                    "worker": session_json(&session),
+                    "next": WAIT_BLOCKED_NEEDS_INPUT_NEXT
+                }));
+            }
+            if is_completed {
                 return Ok(json!({ "matched": true, "worker": session_json(&session) }));
             }
         } else {
@@ -1991,6 +2009,18 @@ pub fn wait_until_matching(
                 || session.state.eq_ignore_ascii_case(wanted);
             if matched {
                 return Ok(json!({ "matched": true, "worker": session_json(&session) }));
+            }
+            if wants_terminal && activity_blocked {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("wait_for_status cancelled by the host".into());
+                }
+                return Ok(json!({
+                    "matched": false,
+                    "needs_input": true,
+                    "blocked": true,
+                    "worker": session_json(&session),
+                    "next": WAIT_BLOCKED_NEEDS_INPUT_NEXT
+                }));
             }
             if !initial_completion.unwrap_or(false) && is_completed {
                 return Ok(json!({

@@ -73,6 +73,7 @@ fn manifest(session_id: &str, pid: u32) -> HostedSessionManifest {
         browser_client_registered: false,
         computer_client_registered: false,
         menu_prompt_active: false,
+        turn_settled_by_interrupt: false,
         screen_changed_at: None,
         detected_local_urls: Vec::new(),
         heartbeat_at: 1,

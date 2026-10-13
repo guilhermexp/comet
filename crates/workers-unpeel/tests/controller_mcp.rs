@@ -2904,3 +2904,69 @@ fn wait_for_status_prior_completion_does_not_end_new_lifecycle_wait() {
         "must wait for the timeout instead of returning early"
     );
 }
+
+#[test]
+fn pause_hook_wait_blocked_status_still_matches() {
+    use std::sync::atomic::AtomicBool;
+
+    let cancel = AtomicBool::new(false);
+    let mut session = worker_with_state("running");
+    session.activity = "blocked".into();
+    let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+        30,
+        "blocked",
+        &cancel,
+        || Ok(session.clone()),
+        |_| false,
+    )
+    .expect("blocked wait");
+    assert_eq!(result["matched"], true);
+    assert_eq!(result["worker"]["activity"], "blocked");
+}
+
+#[test]
+fn pause_hook_wait_completed_or_exited_returns_needs_input_when_blocked() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    let cancel = AtomicBool::new(false);
+    for wanted in ["completed", "exited"] {
+        let mut session = worker_with_state("running");
+        session.activity = "blocked".into();
+        let started = Instant::now();
+        let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+            2,
+            wanted,
+            &cancel,
+            || Ok(session.clone()),
+            |_| false,
+        )
+        .expect("blocked progress wait");
+        assert_eq!(
+            result["needs_input"], true,
+            "{wanted} while blocked must need input, got {result}"
+        );
+        assert_eq!(result["matched"], false, "{wanted}: {result}");
+        assert_eq!(result["blocked"], true, "{wanted}: {result}");
+        assert_ne!(
+            result["completed"], true,
+            "{wanted} must not declare completed"
+        );
+        assert_ne!(
+            result["episode_completed"], true,
+            "{wanted} must not declare the episode completed"
+        );
+        assert_ne!(result["timed_out"], true, "{wanted}: {result}");
+        assert_eq!(result["worker"]["activity"], "blocked");
+        let next = result["next"].as_str().unwrap_or("");
+        assert!(
+            next.contains("output") || next.contains("input"),
+            "{wanted} next must tell Main how to act: {next}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{wanted} must return before the timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+}

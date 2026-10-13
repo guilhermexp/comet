@@ -429,6 +429,16 @@ apps/zeron (host-mode dispatch at startup).
   `PermissionRequest` em `ui_prompt_start` e `UserPromptSubmit` em
   `ui_prompt_end` (nunca `Stop` no fim do prompt).
   `derive_activity` projeta isso como `blocked` sem `menu_prompt_active`.
+  O footer de revisão de hooks do Codex (`enter review`/`trust all` com
+  `esc close`) é o terceiro par de `viewport_has_menu_prompt` e também vira
+  `blocked`. A row `■ Conversation interrupted` do turno atual, só com sufixo
+  conhecido do CLI (nenhum, ou `- use /feedback if something went wrong`), o
+  composer ocioso abaixo (vazio ou o placeholder exato `Ask Codex to do anything`
+  / `Ask a follow-up question`) e sem footer de trabalho depois, grava
+  `turn_settled_by_interrupt`. `report_state_for_settled_interrupt` só degrada
+  `Busy` reportado para `Idle`: não confirma `Stop`. Submissão digitada e footer
+  de trabalho vencem o placeholder. `wait_for_status` de `completed`/`exited`
+  solta no mesmo tick com `needs_input` quando a atividade é `blocked`.
   `parent_notifications` emite `WaitingForInput` uma vez por episódio de
   bloqueio, chaveado pela sequência do último `Start`/`UserPromptSubmit`,
   não por cada `PermissionRequest`; `unread` no snapshot é overlay das

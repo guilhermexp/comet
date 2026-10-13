@@ -117,6 +117,15 @@ base_revision_resolves_upstream = false
 # latch-only; transcript omp casa stem exato no diretório da sessão (sem walk
 # global nem starts_with lexical). Same-commit local form; no upstream patch.
 
+# 2026-10-13 — Codex pause and hook-review wait. menu_prompt.rs recognizes
+# the hook-review footer and a settled interrupt row only with a known CLI
+# suffix plus an idle composer (empty or an exact placeholder). session_host
+# edge-writes turn_settled_by_interrupt beside menu_prompt_active; activity.rs
+# report_state_for_settled_interrupt drops a Busy spinner to Idle without
+# confirming Stop. The iOS viewport twin gained the same review markers.
+# Local patch only; vendored_tree and local_modifications_count stay the
+# unrecomputed historical values above.
+
 # 2026-10-09 — OMP child-agent classification decides from the parent side:
 # `<dirname(child)>.jsonl` must be a trusted JSONL under the OMP sessions root,
 # while the child transcript is resolved only when it already exists. A child

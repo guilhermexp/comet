@@ -62,15 +62,78 @@ const INTERACTIVE_QUALIFIERS: &[&str] = &[
     "escape to cancel",
 ];
 
+/// Action phrases on Codex's hook-review footer. Paired with
+/// [`REVIEW_DISMISS_MARKERS`]. A warning that merely says "needs review" is
+/// not this pair.
+const REVIEW_ACTION_MARKERS: &[&str] = &["enter review", "trust all"];
+
+/// Dismiss phrases paired with [`REVIEW_ACTION_MARKERS`].
+const REVIEW_DISMISS_MARKERS: &[&str] = &["esc close", "escape to close"];
+
+/// Live working footer that means the turn after an interrupt is running
+/// again. Only lines after the structured interrupt row count; an older
+/// footer above that row is history.
+const LIVE_WORKING_FOOTERS: &[&str] = &["esc to interrupt", "escape to interrupt"];
+
+/// Phrase Codex paints on its own status row. Anything after it has to be one
+/// of [`CODEX_INTERRUPT_SUFFIXES`]; a different tail is not this row.
+const CODEX_INTERRUPT_PHRASE: &str = "conversation interrupted";
+
+/// Closed set of tails the CLI appends to the interrupt status row. Empty is
+/// the short form. The long form is the string in the Codex binary:
+/// `■ Conversation interrupted - use /feedback if something went wrong`.
+const CODEX_INTERRUPT_SUFFIXES: &[&str] = &["", "- use /feedback if something went wrong"];
+
+/// Composer text the CLI paints when the prompt is idle. Exact match only, so
+/// a typed line that merely starts with the same words stays a submission.
+const CODEX_IDLE_COMPOSER_PLACEHOLDERS: &[&str] =
+    &["Ask Codex to do anything", "Ask a follow-up question"];
+
+/// Codex paints the settled interrupt as its own status row: a `■` glyph and
+/// the phrase, plus only a known CLI suffix. The words inside prose, a quote,
+/// or tool output are not this row.
+fn codex_interrupt_row(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix('■') else {
+        return false;
+    };
+    let lower = rest.trim().to_ascii_lowercase();
+    let Some(suffix) = lower.strip_prefix(CODEX_INTERRUPT_PHRASE) else {
+        return false;
+    };
+    let suffix = suffix.trim();
+    CODEX_INTERRUPT_SUFFIXES
+        .iter()
+        .any(|known| suffix.eq_ignore_ascii_case(known))
+}
+
+/// Body of a composer row under the interrupt. `None` when the line is not a
+/// prompt glyph. An empty body or a known CLI placeholder is idle; any other
+/// text is a new submission, even before the working footer paints.
+fn composer_body(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let rest = ['›', '❯', '>']
+        .iter()
+        .find_map(|glyph| trimmed.strip_prefix(*glyph))?;
+    Some(rest.trim())
+}
+
+fn composer_is_idle(body: &str) -> bool {
+    body.is_empty()
+        || CODEX_IDLE_COMPOSER_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| body == *placeholder)
+}
+
 /// True when the visible screen text looks like an interactive select menu
 /// waiting for a keyboard choice. `screen_text` is the rendered viewport
 /// (visible rows only), newline-separated.
 ///
 /// The hints must appear on the same or adjacent rows — menu footers are one
 /// hint line (two when wrapped), while a nav phrase in transcript prose plus
-/// an unrelated select phrase elsewhere on screen is not a menu. Two footer
-/// shapes qualify: a nav hint plus a select hint (Claude-style), or a confirm
-/// key named next to a cancel key (Codex-style, which prints no nav hint).
+/// an unrelated select phrase elsewhere on screen is not a menu. Three footer
+/// shapes qualify: a nav hint plus a select hint (Claude-style), a confirm
+/// key named next to a cancel key (Codex approval, which prints no nav hint),
+/// or a hook-review action next to its dismiss key.
 pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
     let lines: Vec<String> = screen_text
         .lines()
@@ -91,6 +154,12 @@ pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
         let has_select = SELECT_MARKERS.iter().any(|marker| window.contains(marker));
         let has_confirm = CONFIRM_MARKERS.iter().any(|marker| window.contains(marker));
         let has_cancel = CANCEL_MARKERS.iter().any(|marker| window.contains(marker));
+        let has_review_action = REVIEW_ACTION_MARKERS
+            .iter()
+            .any(|marker| window.contains(marker));
+        let has_review_dismiss = REVIEW_DISMISS_MARKERS
+            .iter()
+            .any(|marker| window.contains(marker));
         let passive_action = PASSIVE_MARKERS.iter().any(|marker| window.contains(marker));
         let passive_selector_prefix = PASSIVE_SELECTOR_PREFIXES
             .iter()
@@ -99,16 +168,62 @@ pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
             .iter()
             .any(|marker| window.contains(marker));
         let passive = passive_action || (passive_selector_prefix && !interactive_qualifier);
-        if ((has_nav && has_select) || (has_confirm && has_cancel)) && !passive {
+        if ((has_nav && has_select)
+            || (has_confirm && has_cancel)
+            || (has_review_action && has_review_dismiss))
+            && !passive
+        {
             return true;
         }
     }
     false
 }
 
+/// True when the current viewport shows Codex's settled interrupt for this
+/// turn. The latest interrupt must be Codex's own status row (`■ Conversation
+/// interrupted`, with only a known CLI suffix), not the phrase inside prose,
+/// a blockquote, or tool output. The idle composer (`›`, `❯`, or `>`) has to
+/// sit below that row, empty or showing a known placeholder. A prompt only
+/// above it, a live shell with no composer under the row, typed text in the
+/// composer, or a working footer after the row is not settled. The footer and
+/// any typed submission take precedence over a placeholder.
+pub fn viewport_shows_settled_interrupt(screen_text: &str) -> bool {
+    let lines: Vec<&str> = screen_text.lines().collect();
+    let Some(marker) = lines.iter().rposition(|line| codex_interrupt_row(line)) else {
+        return false;
+    };
+    let after = &lines[marker + 1..];
+    if after.iter().any(|line| {
+        let lower = line.to_lowercase();
+        LIVE_WORKING_FOOTERS
+            .iter()
+            .any(|footer| lower.contains(footer))
+    }) {
+        return false;
+    }
+    let mut saw_idle_composer = false;
+    for line in after {
+        if let Some(body) = composer_body(line) {
+            if !composer_is_idle(body) {
+                return false;
+            }
+            saw_idle_composer = true;
+        }
+    }
+    saw_idle_composer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod pause_hook_wait {
+        include!("menu_prompt_pause_hook_wait.rs");
+    }
+
+    mod pause_hook_wait_rows {
+        include!("menu_prompt_interrupt_rows.rs");
+    }
 
     #[test]
     fn detects_claude_style_menu_footer() {

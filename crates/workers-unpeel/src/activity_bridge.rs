@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
-use upstream_activity::{ActivityEngine, HookState};
+use upstream_activity::{ActivityEngine, HookState, report_state_for_settled_interrupt};
 
 use crate::WorkersSession;
 
@@ -128,6 +128,7 @@ impl ActivityBridge {
                     command: &manifest.session.command,
                     active_runtime_id: session.active_runtime_id.as_deref(),
                     menu_prompt_active: manifest.menu_prompt_active,
+                    turn_settled_by_interrupt: manifest.turn_settled_by_interrupt,
                     runtime_launch_generation: manifest.runtime_launch_generation,
                     runtime_launched_at: manifest.runtime_launched_at,
                     activity_signal: manifest.screen_changed_at.unwrap_or_else(|| {
@@ -281,6 +282,9 @@ struct ActivityInput<'a> {
     command: &'a str,
     active_runtime_id: Option<&'a str>,
     menu_prompt_active: bool,
+    /// Current viewport shows a settled Codex interrupt. Report-only: it must
+    /// not confirm a Stop.
+    turn_settled_by_interrupt: bool,
     runtime_launch_generation: u64,
     runtime_launched_at: Option<u64>,
     activity_signal: u64,
@@ -340,9 +344,12 @@ fn derive_activity(
         distrust_stops,
         now,
     );
-    let state = engine
-        .hook_owned_state(input.session_id)
-        .unwrap_or(HookState::Idle);
+    let state = report_state_for_settled_interrupt(
+        engine
+            .hook_owned_state(input.session_id)
+            .unwrap_or(HookState::Idle),
+        input.turn_settled_by_interrupt,
+    );
 
     if input.menu_prompt_active && matches!(state, HookState::Busy | HookState::Idle) {
         return Some("blocked");
@@ -710,6 +717,10 @@ mod tests {
     use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
 
+    mod pause_hook_wait {
+        include!("activity_bridge_pause_hook_wait.rs");
+    }
+
     #[test]
     fn registering_seventeenth_listener_preserves_older_listeners() {
         let dir = std::env::temp_dir().join(format!(
@@ -815,6 +826,7 @@ mod tests {
             command,
             active_runtime_id: None,
             menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
             runtime_launch_generation: 1,
             runtime_launched_at: None,
             activity_signal: signal,
@@ -954,6 +966,7 @@ mod tests {
             browser_client_registered: false,
             computer_client_registered: false,
             menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
             screen_changed_at: None,
             detected_local_urls: Vec::new(),
             heartbeat_at: 1,

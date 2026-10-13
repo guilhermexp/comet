@@ -2,6 +2,11 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-10-13 — Spinner do Codex interrompido e espera bloqueada
+
+- O footer de revisão de hooks (`enter review`/`trust all` com `esc close`) passa a ser menu. A row `■ Conversation interrupted` do turno atual, com sufixo conhecido do CLI (nenhum ou `- use /feedback if something went wrong`), composer ocioso (vazio ou placeholder exato) e sem footer de trabalho, derruba o spinner sem confirmar `Stop`. `wait_for_status` de `completed`/`exited` devolve `needs_input` quando a atividade é `blocked`, antes do timeout.
+- Change: `openspec/changes/fix-codex-pause-hook-wait/`.
+
 ## Baseline
 
 - Branch: `main`
