@@ -84,11 +84,6 @@ const CODEX_INTERRUPT_PHRASE: &str = "conversation interrupted";
 /// `■ Conversation interrupted - use /feedback if something went wrong`.
 const CODEX_INTERRUPT_SUFFIXES: &[&str] = &["", "- use /feedback if something went wrong"];
 
-/// Composer text the CLI paints when the prompt is idle. Exact match only, so
-/// a typed line that merely starts with the same words stays a submission.
-const CODEX_IDLE_COMPOSER_PLACEHOLDERS: &[&str] =
-    &["Ask Codex to do anything", "Ask a follow-up question"];
-
 /// ASCII substring match for a fixed footer phrase. Byte windows keep the
 /// periodic scan from allocating a lowercased `String`. A matching window is
 /// entirely bytes below 128, so it cannot split a non-ASCII scalar.
@@ -102,41 +97,35 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
             .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-/// Codex paints the settled interrupt as its own status row: a `■` glyph and
-/// the phrase, plus only a known CLI suffix. The words inside prose, a quote,
-/// or tool output are not this row.
-fn codex_interrupt_row(line: &str) -> bool {
-    let Some(rest) = line.trim().strip_prefix('■') else {
-        return false;
-    };
+/// Suffix after Codex's interrupt phrase when `line` is that status row.
+/// `None` means the line is not the row. The returned suffix may be unknown:
+/// callers still have to stop on this row instead of reading an older one.
+fn interrupt_row_suffix(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix('■')?;
     let rest = rest.trim_start();
     let phrase = CODEX_INTERRUPT_PHRASE.as_bytes();
     let bytes = rest.as_bytes();
     if bytes.len() < phrase.len() || !bytes[..phrase.len()].eq_ignore_ascii_case(phrase) {
-        return false;
+        return None;
     }
-    let suffix = rest[phrase.len()..].trim();
+    Some(rest[phrase.len()..].trim())
+}
+
+fn known_interrupt_suffix(suffix: &str) -> bool {
     CODEX_INTERRUPT_SUFFIXES
         .iter()
         .any(|known| suffix.eq_ignore_ascii_case(known))
 }
 
-/// Body of a composer row under the interrupt. `None` when the line is not a
-/// prompt glyph. An empty body or a known CLI placeholder is idle; any other
-/// text is a new submission, even before the working footer paints.
+/// Body of a prompt-glyph row. `None` when the line is not one. The bottom
+/// prompt row under an interrupt is the composer, draft included. An earlier
+/// prompt row under that same interrupt is a user row already sent.
 fn composer_body(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     let rest = ['›', '❯', '>']
         .iter()
         .find_map(|glyph| trimmed.strip_prefix(*glyph))?;
     Some(rest.trim())
-}
-
-fn composer_is_idle(body: &str) -> bool {
-    body.is_empty()
-        || CODEX_IDLE_COMPOSER_PLACEHOLDERS
-            .iter()
-            .any(|placeholder| body == *placeholder)
 }
 
 /// True when the visible screen text looks like an interactive select menu
@@ -195,24 +184,30 @@ pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
 }
 
 /// True when the current viewport shows Codex's settled interrupt for this
-/// turn. The latest interrupt must be Codex's own status row (`■ Conversation
-/// interrupted`, with only a known CLI suffix), not the phrase inside prose,
-/// a blockquote, or tool output. The idle composer (`›`, `❯`, or `>`) has to
-/// sit below that row, empty or showing a known placeholder. A prompt only
-/// above it, a live shell with no composer under the row, typed text in the
-/// composer, or a working footer after the row is not settled. The footer and
-/// any typed submission take precedence over a placeholder.
+/// turn. The latest interrupt-shaped row (`■` plus the phrase, whatever the
+/// suffix) ends the walk. An unknown suffix is not settled, so an older known
+/// row above it cannot count. Below that latest row, the bottom prompt glyph
+/// (`›`, `❯`, or `>`) is the composer: empty, a placeholder, or a draft that
+/// was not sent. An earlier prompt glyph still below the interrupt is a user
+/// row already sent and is not settled, even before the working footer paints.
+/// A prompt only above the row, a live shell with no composer under it, or a
+/// working footer under it is not settled. Prose, a blockquote, and tool
+/// output are not the row.
 ///
 /// `lines()` is double-ended, so the walk starts at the bottom and stops at
-/// the latest structured row. Composer and working-footer state accumulate
-/// only for the lines already seen below that row; nothing above it is read.
-/// Footer matching stays on ASCII byte windows and does not allocate.
+/// the latest interrupt-shaped row. Composer and working-footer state
+/// accumulate only for the lines already seen below that row. Footer matching
+/// stays on ASCII byte windows and does not allocate.
 pub fn viewport_shows_settled_interrupt(screen_text: &str) -> bool {
-    let mut saw_idle_composer = false;
+    let mut saw_composer = false;
+    let mut saw_submitted_user_row = false;
     let mut disqualified = false;
     for line in screen_text.lines().rev() {
-        if codex_interrupt_row(line) {
-            return saw_idle_composer && !disqualified;
+        if let Some(suffix) = interrupt_row_suffix(line) {
+            return !disqualified
+                && saw_composer
+                && !saw_submitted_user_row
+                && known_interrupt_suffix(suffix);
         }
         if disqualified {
             continue;
@@ -224,11 +219,11 @@ pub fn viewport_shows_settled_interrupt(screen_text: &str) -> bool {
             disqualified = true;
             continue;
         }
-        if let Some(body) = composer_body(line) {
-            if composer_is_idle(body) {
-                saw_idle_composer = true;
+        if composer_body(line).is_some() {
+            if saw_composer {
+                saw_submitted_user_row = true;
             } else {
-                disqualified = true;
+                saw_composer = true;
             }
         }
     }

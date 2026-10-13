@@ -96,8 +96,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   `last_hook_at`.
   `report_state_for_settled_interrupt` (patch local) só muda o estado
   reportado: `Busy` vira `Idle` quando o host viu a interrupção assentada do
-  turno atual (`■ Conversation interrupted` com sufixo conhecido do CLI,
-  composer ocioso ou placeholder exato, sem footer de trabalho). Não escreve
+  turno atual (a row mais nova `■ Conversation interrupted` com sufixo
+  conhecido do CLI, composer abaixo inclusive draft, sem user row já enviada
+  e sem footer de trabalho). Não escreve
   `stopped_at`. O scan do host grava `turn_settled_by_interrupt` junto de
   `menu_prompt_active`; o footer de revisão de hooks é o terceiro par do
   detector, espelhado no iOS vendorizado.

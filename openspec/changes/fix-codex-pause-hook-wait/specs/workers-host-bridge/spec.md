@@ -25,7 +25,7 @@ O sistema SHALL tratar como menu à espera de input um footer com ação de revi
 
 ### Requirement: Interrupção observável derruba o spinner sem concluir
 
-Quando o viewport atual mostra a row de status `■ Conversation interrupted`, com somente um sufixo conhecido do CLI (`- use /feedback if something went wrong` ou nenhum), o composer ocioso do CLI abaixo dela e sem footer de trabalho depois, o sistema SHALL reportar `idle`. Composer ocioso é vazio ou um placeholder exato do CLI (`Ask Codex to do anything`, `Ask a follow-up question`). Essa ociosidade MUST NOT confirmar `Stop` nem casar `completed`. A frase dentro de prosa, blockquote ou saída de ferramenta MUST NOT contar. Um sufixo diferente, um prompt só acima da row, um shell vivo sem composer embaixo, texto digitado no composer (mesmo que comece como o placeholder) antes do footer pintar, ou um footer de trabalho depois da row MUST NOT derrubar o spinner. Footer de trabalho e submissão digitada têm precedência sobre o placeholder. Um footer de trabalho novo MUST rearmar `working`.
+Quando a row de status mais nova do viewport é `■ Conversation interrupted`, com somente um sufixo conhecido do CLI (`- use /feedback if something went wrong` ou nenhum), com o composer abaixo dela e sem footer de trabalho depois, o sistema SHALL reportar `idle`. A row mais nova com esse glifo e essa frase encerra a varredura: um sufixo desconhecido nela MUST NOT deixar uma row válida mais antiga contar. O composer é a row de prompt mais de baixo (`›`, `❯` ou `>`). Vazio, placeholder do CLI ou draft ainda não enviado contam como composer. Uma única row `› texto` MUST NOT ser lida como Enter. Uma row de prompt anterior, ainda abaixo da interrupção e seguida do composer atual, é user row já enviada e MUST NOT derrubar o spinner, mesmo antes do footer de trabalho. Essa ociosidade MUST NOT confirmar `Stop` nem casar `completed`. A frase dentro de prosa, blockquote ou saída de ferramenta MUST NOT contar. Um prompt só acima da row, um shell vivo sem composer embaixo, ou um footer de trabalho depois da row MUST NOT derrubar o spinner. Um footer de trabalho novo MUST rearmar `working`.
 
 #### Scenario: Interrupção do turno atual derruba o spinner
 - Test: unit — derivação de atividade após `Start`, com a evidência de interrupção do viewport atual.
@@ -42,9 +42,27 @@ Quando o viewport atual mostra a row de status `■ Conversation interrupted`, c
 - **AND** a atividade do turno iniciado continua `working`
 
 #### Scenario: Prosa, citação, prompt acima e shell vivo não são a row
-- Test: unit — `viewport_shows_settled_interrupt` com a frase em prosa ou blockquote, com o prompt só acima da row, com um shell vivo sem composer embaixo, e com submissão nova no composer antes do footer.
+- Test: unit — `viewport_shows_settled_interrupt` com a frase em prosa ou blockquote, com o prompt só acima da row, e com um shell vivo sem composer embaixo.
 
-- **WHEN** a frase não é a row `■ Conversation interrupted` com sufixo conhecido seguida do composer ocioso
+- **WHEN** a frase não é a row `■ Conversation interrupted` com sufixo conhecido seguida do composer
+- **THEN** a evidência de interrupção assentada é falsa
+
+#### Scenario: Draft no composer não rearma
+- Test: unit — `viewport_shows_settled_interrupt` com `› fix the spinner` como única row de prompt abaixo da interrupção, inclusive com `1 background terminal running` no meio.
+
+- **WHEN** o texto está só no composer e não há user row enviada nem footer de trabalho
+- **THEN** a evidência de interrupção assentada permanece verdadeira
+
+#### Scenario: User row enviada e o composer de volta não é pausa
+- Test: unit — `viewport_shows_settled_interrupt` com `› fix the spinner` seguido de `› Ask Codex to do anything`, antes de `esc to interrupt`.
+
+- **WHEN** uma row de prompt já enviada fica abaixo da interrupção e o composer atual está de novo visível
+- **THEN** a evidência de interrupção assentada é falsa
+
+#### Scenario: Sufixo desconhecido na row mais nova não revive a row antiga
+- Test: unit — `viewport_shows_settled_interrupt` com uma row `■ Conversation interrupted` válida acima de uma row mais nova `■ Conversation interrupted - the agent kept going`.
+
+- **WHEN** a row de interrupção mais nova não tem sufixo conhecido
 - **THEN** a evidência de interrupção assentada é falsa
 
 ### Requirement: Espera por conclusão ou saída solta quando o worker precisa de input

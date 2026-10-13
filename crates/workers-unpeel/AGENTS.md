@@ -433,11 +433,13 @@ apps/zeron (host-mode dispatch at startup).
   `esc close`) é o terceiro par de `viewport_has_menu_prompt` e também vira
   `blocked`. A row `■ Conversation interrupted` do turno atual, só com sufixo
   conhecido do CLI (nenhum, ou `- use /feedback if something went wrong`), o
-  composer ocioso abaixo (vazio ou o placeholder exato `Ask Codex to do anything`
-  / `Ask a follow-up question`) e sem footer de trabalho depois, grava
-  `turn_settled_by_interrupt`. `report_state_for_settled_interrupt` só degrada
-  `Busy` reportado para `Idle`: não confirma `Stop`. Submissão digitada e footer
-  de trabalho vencem o placeholder. `wait_for_status` de `completed`/`exited`
+  composer abaixo (vazio, placeholder ou draft ainda não enviado) e sem footer
+  de trabalho nem user row já enviada, grava `turn_settled_by_interrupt`. A row
+  mais nova com sufixo desconhecido não cai para uma row antiga. Uma única
+  `› texto` não é Enter; a user row enviada é uma row de prompt anterior ainda
+  abaixo da interrupção, com o composer de volta. `report_state_for_settled_interrupt`
+  só degrada `Busy` reportado para `Idle`: não confirma `Stop`. Footer de
+  trabalho rearma. `wait_for_status` de `completed`/`exited`
   solta no mesmo tick com `needs_input` quando a atividade é `blocked`.
   `parent_notifications` emite `WaitingForInput` uma vez por episódio de
   bloqueio, chaveado pela sequência do último `Start`/`UserPromptSubmit`,
