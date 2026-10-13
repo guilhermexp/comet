@@ -24,7 +24,7 @@ Codex usa hooks e desconfia de `Stop` (`distrust_stops_while_output_grows`, gra�
 
 ## Decisions
 
-1. **Footer de revisão é o terceiro par do detector de menu.** Na lista, ação (`enter review` ou `trust all`) e fechar (`esc close` ou `escape to close`) na mesma janela de duas linhas já usada pelos outros pares. No detalhe aberto por Enter, a linha inteira, sem os espaços ASCII das bordas, tem de ser `t trust · esc back`. A comparação é ASCII, sem distinção de caixa, e não aloca no scan Rust. O espelho Swift usa o mesmo corte e a mesma dobra. Citação, sufixo, prefixo Unicode, `not trust` e o rótulo `Trust` não bloqueiam. Aviso, detalhe já confiado ou passivo sem essa linha, e prosa continuam negativos. Não aprova o hook.
+1. **Footer de revisão é o terceiro par do detector de menu.** Na lista, ação (`enter review` ou `trust all`) e fechar (`esc close` ou `escape to close`) na mesma janela de duas linhas já usada pelos outros pares. No detalhe aberto por Enter, a linha inteira tem de ser `t trust · esc back`. A quebra é LF ou CRLF; CR isolado não separa linha. Das bordas saem só os bytes 0x09, 0x0A, 0x0C, 0x0D e 0x20. Tab vertical não sai. A comparação é ASCII, sem distinção de caixa, e não aloca no scan Rust. O pré-scan Swift desse footer usa essa mesma regra de linha e de corte. O restante do detector Swift não fica coberto por essa frase. Citação, sufixo, prefixo Unicode, `not trust` e o rótulo `Trust` não bloqueiam. Aviso, detalhe já confiado ou passivo sem essa linha, e prosa continuam negativos. Não aprova o hook.
 
 2. **Interrupção é a row de status do Codex, não um substring.** A varredura sobe com `lines().rev()` e para na row mais nova com `■` e a frase, seja qual for o sufixo. Sufixo conhecido é só vazio ou `- use /feedback if something went wrong`. Sufixo desconhecido nessa row mais nova é falso; uma row válida mais antiga não conta. Abaixo dela, a row de prompt mais de baixo (`›`, `❯` ou `>`) é o composer: vazio, placeholder ou draft. Uma única `› texto` não é Enter. Uma row de prompt anterior, ainda abaixo da interrupção, é user row já enviada e rearma mesmo antes do footer de trabalho. Prosa, blockquote, prompt só acima da row, shell vivo sem composer e `esc to interrupt` / `escape to interrupt` não contam. O host grava `turn_settled_by_interrupt` no manifesto, no mesmo scan de borda do menu. Não há flag global, timer de silêncio nem segundo detector na UI.
 
@@ -36,7 +36,7 @@ Codex usa hooks e desconfia de `Stop` (`distrust_stops_while_output_grows`, gra�
 
 - Frase citada, prosa, blockquote ou saída de ferramenta não é a row de status e não conta como pausa. A evidência é a row mais nova `■ Conversation interrupted` com sufixo conhecido, composer abaixo (draft inclusive) e sem footer de trabalho nem user row já enviada. Uma única row de texto no composer não prova Enter. Um turno novo pinta `esc to interrupt`, ou a user row enviada seguida do composer, e a evidência cai.
 - Campo novo no manifesto exige literais de teste. `#[serde(default)]` mantém manifestos antigos.
-- O espelho Swift não roda no gate Rust. O contrato fica no detector Rust; o Swift só copia os marcadores.
+- O espelho Swift não roda no gate Rust. O contrato do detalhe é LF/CRLF e o corte sem U+000B. Isso não torna o restante do detector Swift igual ao Rust.
 
 ## Migration Plan
 

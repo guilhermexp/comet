@@ -2774,9 +2774,9 @@ final class RemoteGhosttyRenderer: ObservableObject {
     private static let menuReviewActionMarkers = ["enter review", "trust all"]
     /// Dismiss phrases paired with `menuReviewActionMarkers`.
     private static let menuReviewDismissMarkers = ["esc close", "escape to close"]
-    /// Inner hook-review footer. The whole line, after ASCII whitespace is
-    /// removed from both ends, must equal this phrase. ASCII case only.
-    /// Twin of `REVIEW_DETAIL_FOOTER` in `menu_prompt.rs`.
+    /// Inner hook-review footer. A line equals this phrase only after the
+    /// bytes 0x09, 0x0A, 0x0C, 0x0D and 0x20 are removed from both ends.
+    /// Vertical tab 0x0B stays. Same phrase as `REVIEW_DETAIL_FOOTER`.
     private static let hookReviewDetailFooter = "t trust · esc back"
     /// Phrases marking a hint row as a passive status footer, not an
     /// answerable menu — Claude Code's subagent list pins
@@ -2826,10 +2826,11 @@ final class RemoteGhosttyRenderer: ObservableObject {
     /// a confirm key named next to a cancel key (Codex-style, which prints
     /// no nav hint), or a hook-review action next to its dismiss key. The
     /// hook-detail footer is a whole line, checked before this window scan.
-    /// Twin of the Rust `viewport_has_menu_prompt` in `menu_prompt.rs`. Keep
-    /// aligned.
+    /// Lines split on LF only. CRLF leaves a trailing CR for the trim below.
+    /// An isolated CR does not split a line. The window scan under this
+    /// check is unchanged.
     static func viewportHasMenuPrompt(_ text: String) -> Bool {
-        if text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).contains(where: lineIsHookReviewDetailFooter) {
+        if text.split(separator: "\n", omittingEmptySubsequences: false).contains(where: lineIsHookReviewDetailFooter) {
             return true
         }
         let lines = text
@@ -2857,8 +2858,9 @@ final class RemoteGhosttyRenderer: ObservableObject {
         return false
     }
 
-    /// Whole-line twin of Rust `line_is_review_detail_footer`. ASCII whitespace
-    /// is 0x09, 0x0A, 0x0B, 0x0C, 0x0D and 0x20. ASCII case folds A–Z only.
+    /// Whole line equals `hookReviewDetailFooter` after bytes 0x09, 0x0A,
+    /// 0x0C, 0x0D and 0x20 are removed from both ends. Vertical tab 0x0B is
+    /// kept. ASCII case folds A–Z only.
     private static func lineIsHookReviewDetailFooter(_ line: Substring) -> Bool {
         let utf8 = line.utf8
         var start = utf8.startIndex
@@ -2886,7 +2888,7 @@ final class RemoteGhosttyRenderer: ObservableObject {
 
     private static func isAsciiWhitespace(_ byte: UInt8) -> Bool {
         switch byte {
-        case 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20:
+        case 0x09, 0x0A, 0x0C, 0x0D, 0x20:
             return true
         default:
             return false

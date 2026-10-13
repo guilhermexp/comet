@@ -2,7 +2,7 @@
 
 ### Requirement: Revisão interativa de hooks bloqueia o worker
 
-O sistema SHALL tratar como menu à espera de input um footer com ação de revisão ou confiança junto com fechar, na mesma linha ou na adjacente. O detalhe aberto por Enter também SHALL bloquear quando uma linha, depois de removidos os espaços ASCII das duas bordas, é exatamente `t trust · esc back`, sem distinção de caixa ASCII. Citação dessa frase no meio de outra linha, sufixo desconhecido, prefixo e o rótulo `Trust` MUST NOT bloquear. Aviso, um detalhe já confiado ou passivo sem essa linha, e prosa com a palavra trust MUST NOT bloquear. Fechar o menu MUST restaurar o estado do latch.
+O sistema SHALL tratar como menu à espera de input um footer com ação de revisão ou confiança junto com fechar, na mesma linha ou na adjacente. O detalhe aberto por Enter também SHALL bloquear quando uma linha, separada por LF ou CRLF, é exatamente `t trust · esc back` depois de removidos das duas bordas só os bytes 0x09, 0x0A, 0x0C, 0x0D e 0x20, sem distinção de caixa ASCII. U+000B não é removido. Um CR isolado MUST NOT separar a linha. Citação dessa frase no meio de outra linha, sufixo desconhecido, prefixo e o rótulo `Trust` MUST NOT bloquear. Aviso, um detalhe já confiado ou passivo sem essa linha, e prosa com a palavra trust MUST NOT bloquear. Fechar o menu MUST restaurar o estado do latch.
 
 #### Scenario: Footer real de revisão de hooks bloqueia
 - Test: unit — `viewport_has_menu_prompt` com o footer `t trust all · enter review · esc close`.
