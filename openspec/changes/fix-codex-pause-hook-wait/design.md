@@ -34,7 +34,7 @@ Codex usa hooks e desconfia de `Stop` (`distrust_stops_while_output_grows`, gra�
 
 ## Risks / Trade-offs
 
-- Frase de interrupção citada no prompt, sem footer de trabalho, conta como pausa. Aceito: é a evidência observável; um turno novo volta a pintar `esc to interrupt`.
+- Frase citada, prosa, blockquote ou saída de ferramenta não é a row de status e não conta como pausa. A evidência é só `■ Conversation interrupted` com sufixo conhecido, composer ocioso abaixo e sem footer de trabalho. Um turno novo pinta `esc to interrupt` e a evidência cai.
 - Campo novo no manifesto exige literais de teste. `#[serde(default)]` mantém manifestos antigos.
 - O espelho Swift não roda no gate Rust. O contrato fica no detector Rust; o Swift só copia os marcadores.
 
