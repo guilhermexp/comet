@@ -2774,9 +2774,9 @@ final class RemoteGhosttyRenderer: ObservableObject {
     private static let menuReviewActionMarkers = ["enter review", "trust all"]
     /// Dismiss phrases paired with `menuReviewActionMarkers`.
     private static let menuReviewDismissMarkers = ["esc close", "escape to close"]
-    /// Inner hook-review footer, observed as `t trust · esc back`. The leading
-    /// `t ` is the key hint. Bare "trust" is not this phrase. Twin of
-    /// `REVIEW_DETAIL_FOOTER` in `menu_prompt.rs`.
+    /// Inner hook-review footer. The whole line, after ASCII whitespace is
+    /// removed from both ends, must equal this phrase. ASCII case only.
+    /// Twin of `REVIEW_DETAIL_FOOTER` in `menu_prompt.rs`.
     private static let hookReviewDetailFooter = "t trust · esc back"
     /// Phrases marking a hint row as a passive status footer, not an
     /// answerable menu — Claude Code's subagent list pins
@@ -2824,10 +2824,14 @@ final class RemoteGhosttyRenderer: ObservableObject {
     /// excluding passive status footers whose Enter action is "view". Three
     /// footer shapes qualify: a nav hint plus a select hint (Claude-style),
     /// a confirm key named next to a cancel key (Codex-style, which prints
-    /// no nav hint), or a hook-review action next to its dismiss key. Twin
-    /// of the Rust `viewport_has_menu_prompt` in `menu_prompt.rs` — keep
+    /// no nav hint), or a hook-review action next to its dismiss key. The
+    /// hook-detail footer is a whole line, checked before this window scan.
+    /// Twin of the Rust `viewport_has_menu_prompt` in `menu_prompt.rs`. Keep
     /// aligned.
     static func viewportHasMenuPrompt(_ text: String) -> Bool {
+        if text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).contains(where: lineIsHookReviewDetailFooter) {
+            return true
+        }
         let lines = text
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { $0.lowercased() }
@@ -2847,28 +2851,51 @@ final class RemoteGhosttyRenderer: ObservableObject {
             let hasCancel = menuCancelMarkers.contains { window.contains($0) }
             let hasReviewAction = menuReviewActionMarkers.contains { window.contains($0) }
             let hasReviewDismiss = menuReviewDismissMarkers.contains { window.contains($0) }
-            let detailFooter = Self.hasHookReviewDetailFooter(window)
             let passive = menuPassiveMarkers.contains { window.contains($0) }
-            if ((hasNav && hasSelect) || (hasConfirm && hasCancel) || (hasReviewAction && hasReviewDismiss) || detailFooter) && !passive { return true }
+            if ((hasNav && hasSelect) || (hasConfirm && hasCancel) || (hasReviewAction && hasReviewDismiss)) && !passive { return true }
         }
         return false
     }
 
-    /// Left boundary matches the Rust scan: a letter or digit before
-    /// `t trust · esc back` is prose (`not trust`), not the key hint.
-    private static func hasHookReviewDetailFooter(_ window: String) -> Bool {
-        var rest = window.startIndex
-        while let range = window.range(of: hookReviewDetailFooter, range: rest..<window.endIndex) {
-            if range.lowerBound == window.startIndex {
-                return true
-            }
-            let previous = window[window.index(before: range.lowerBound)]
-            if !previous.isLetter && !previous.isNumber {
-                return true
-            }
-            rest = window.index(after: range.lowerBound)
+    /// Whole-line twin of Rust `line_is_review_detail_footer`. ASCII whitespace
+    /// is 0x09, 0x0A, 0x0B, 0x0C, 0x0D and 0x20. ASCII case folds A–Z only.
+    private static func lineIsHookReviewDetailFooter(_ line: Substring) -> Bool {
+        let utf8 = line.utf8
+        var start = utf8.startIndex
+        var end = utf8.endIndex
+        while start < end, isAsciiWhitespace(utf8[start]) {
+            start = utf8.index(after: start)
         }
-        return false
+        while end > start {
+            let previous = utf8.index(before: end)
+            if !isAsciiWhitespace(utf8[previous]) { break }
+            end = previous
+        }
+        let needle = hookReviewDetailFooter.utf8
+        var cursor = start
+        var needleCursor = needle.startIndex
+        while cursor < end, needleCursor < needle.endIndex {
+            if asciiLower(utf8[cursor]) != asciiLower(needle[needleCursor]) {
+                return false
+            }
+            cursor = utf8.index(after: cursor)
+            needleCursor = needle.index(after: needleCursor)
+        }
+        return cursor == end && needleCursor == needle.endIndex
+    }
+
+    private static func isAsciiWhitespace(_ byte: UInt8) -> Bool {
+        switch byte {
+        case 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func asciiLower(_ byte: UInt8) -> UInt8 {
+        if byte >= 65 && byte <= 90 { return byte &+ 32 }
+        return byte
     }
 
     /// Highest leading "N." option number in the viewport (menu items look

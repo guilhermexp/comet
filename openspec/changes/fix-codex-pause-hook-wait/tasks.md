@@ -10,5 +10,5 @@
 
 ## 3. Contrato e prova
 
-- [x] 3.1 Atualizar DOX dono, changelog do fork e `vendored_tree`.
+- [x] 3.1 Atualizar DOX dono, changelog do fork e `vendored_tree`. O campo é o tree git de `third_party/unpeel`, não um snapshot upstream. `local_modifications_count` permanece 32: a ferramenta que o produziu não está no repositório.
 - [ ] 3.2 Rodar o gate do ticket, capturar o build do wrapper e o smoke isolado de CLI.

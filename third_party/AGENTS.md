@@ -101,7 +101,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   e sem footer de trabalho). Não escreve
   `stopped_at`. O scan do host grava `turn_settled_by_interrupt` junto de
   `menu_prompt_active`; o footer de revisão de hooks é o terceiro par do
-  detector, mais a frase `t trust · esc back` no detalhe, espelhado no iOS vendorizado.
+  detector, mais a linha inteira `t trust · esc back` no detalhe, espelhada no iOS vendorizado.
   `ResumeAdapter::embedded_conversation_id` (patch local, um
   callback por runtime) expõe o id de conversa que o comando já fixa, para a
   sonda de retomada do Comet não depender de comparar receitas.

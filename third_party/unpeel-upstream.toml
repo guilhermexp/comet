@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "7c917b141d5180d29e29b0c609e6d734ed8704f9"
+vendored_tree = "b39530598881bc743c25aea469e4a8eb671a13d1"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -118,16 +118,18 @@ base_revision_resolves_upstream = false
 # global nem starts_with lexical). Same-commit local form; no upstream patch.
 
 # 2026-10-13 — Codex pause and hook-review wait. menu_prompt.rs recognizes
-# the hook-review list footer and the inner `t trust · esc back` detail footer.
+# the hook-review list footer. The inner detail footer matches only when the
+# whole line, after ASCII edge whitespace, is `t trust · esc back`.
 # The scan stops at the newest
 # interrupt-shaped row; an unknown suffix does not fall through to an older
 # known row. The bottom prompt row is the composer, draft included. An earlier
 # prompt row below that interrupt is a sent user row and is not settled.
 # session_host edge-writes turn_settled_by_interrupt beside menu_prompt_active;
 # activity.rs report_state_for_settled_interrupt drops a Busy spinner to Idle
-# without confirming Stop. The iOS viewport twin gained the same review markers.
-# Local patch only; vendored_tree and local_modifications_count stay the
-# unrecomputed historical values above.
+# without confirming Stop. The iOS viewport twin uses the same whole-line
+# comparison. Local patch only. `vendored_tree` is the git tree of
+# `third_party/unpeel` after this patch, not an upstream commit.
+# `local_modifications_count` stays 32: the tool that produced it is unknown.
 
 # 2026-10-09 — OMP child-agent classification decides from the parent side:
 # `<dirname(child)>.jsonl` must be a trusted JSONL under the OMP sessions root,

@@ -2,7 +2,7 @@
 
 ### Requirement: Revisão interativa de hooks bloqueia o worker
 
-O sistema SHALL tratar como menu à espera de input um footer com ação de revisão ou confiança junto com fechar, na mesma linha ou na adjacente. O detalhe aberto por Enter, com o footer exato `t trust · esc back`, também SHALL bloquear. Aviso, o rótulo `Trust`, um detalhe já confiado ou passivo sem esse footer, e prosa com a palavra trust MUST NOT bloquear. Fechar o menu MUST restaurar o estado do latch.
+O sistema SHALL tratar como menu à espera de input um footer com ação de revisão ou confiança junto com fechar, na mesma linha ou na adjacente. O detalhe aberto por Enter também SHALL bloquear quando uma linha, depois de removidos os espaços ASCII das duas bordas, é exatamente `t trust · esc back`, sem distinção de caixa ASCII. Citação dessa frase no meio de outra linha, sufixo desconhecido, prefixo e o rótulo `Trust` MUST NOT bloquear. Aviso, um detalhe já confiado ou passivo sem essa linha, e prosa com a palavra trust MUST NOT bloquear. Fechar o menu MUST restaurar o estado do latch.
 
 #### Scenario: Footer real de revisão de hooks bloqueia
 - Test: unit — `viewport_has_menu_prompt` com o footer `t trust all · enter review · esc close`.
@@ -16,6 +16,12 @@ O sistema SHALL tratar como menu à espera de input um footer com ação de revi
 
 - **WHEN** o viewport mostra o detalhe interno da revisão com esse footer
 - **THEN** o detector de menu é verdadeiro
+
+#### Scenario: Citação, sufixo e prefixo não são o detalhe
+- Test: unit — `viewport_has_menu_prompt` com `Log: "t trust · esc back"`, `t trust · esc backwards` e `ét trust · esc back`.
+
+- **WHEN** a frase aparece citada, com sufixo desconhecido, ou com prefixo
+- **THEN** o detector de menu é falso
 
 #### Scenario: Aviso isolado, prosa e lista passiva não bloqueiam
 - Test: unit — `viewport_has_menu_prompt` com aviso "1 hook needs review before it can run", prosa e uma lista sem o footer de ação.

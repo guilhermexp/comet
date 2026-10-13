@@ -70,10 +70,11 @@ const REVIEW_ACTION_MARKERS: &[&str] = &["enter review", "trust all"];
 /// Dismiss phrases paired with [`REVIEW_ACTION_MARKERS`].
 const REVIEW_DISMISS_MARKERS: &[&str] = &["esc close", "escape to close"];
 
-/// Footer Codex paints inside the hook review, after Enter on the overview.
-/// Observed exactly as `t trust · esc back` (middle dot U+00B7). The leading
-/// `t ` is the key hint. Bare "trust", including the field label
-/// `Trust  New hook - review required`, is not this footer.
+/// Footer Codex paints as its own line inside the hook review, after Enter
+/// on the overview. Observed as `t trust · esc back` (middle dot U+00B7),
+/// with spaces at the edges of the row. The whole line, after those spaces
+/// are removed, must match. A quoted line, an unknown suffix, or any prefix
+/// is not this footer, and neither is the field label `Trust`.
 const REVIEW_DETAIL_FOOTER: &[u8] = b"t trust \xc2\xb7 esc back";
 
 /// Live working footer that means the turn after an interrupt is running
@@ -90,18 +91,13 @@ const CODEX_INTERRUPT_PHRASE: &str = "conversation interrupted";
 /// `■ Conversation interrupted - use /feedback if something went wrong`.
 const CODEX_INTERRUPT_SUFFIXES: &[&str] = &["", "- use /feedback if something went wrong"];
 
-/// True when `window` contains the hook-detail footer on a key boundary.
-/// A preceding ASCII letter or digit rejects prose such as `not trust · esc back`.
-fn review_detail_footer(window: &str) -> bool {
-    let bytes = window.as_bytes();
-    let needle = REVIEW_DETAIL_FOOTER;
-    if bytes.len() < needle.len() {
-        return false;
-    }
-    bytes.windows(needle.len()).enumerate().any(|(index, candidate)| {
-        let boundary = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
-        boundary && candidate.eq_ignore_ascii_case(needle)
-    })
+/// True when `line`, once ASCII whitespace is removed from both ends, is
+/// exactly [`REVIEW_DETAIL_FOOTER`]. ASCII case only. `trim_ascii` and
+/// `eq_ignore_ascii_case` borrow the line; this check allocates nothing.
+fn line_is_review_detail_footer(line: &str) -> bool {
+    line.trim_ascii()
+        .as_bytes()
+        .eq_ignore_ascii_case(REVIEW_DETAIL_FOOTER)
 }
 
 /// ASCII substring match for a fixed footer phrase. Byte windows keep the
@@ -157,8 +153,12 @@ fn composer_body(line: &str) -> Option<&str> {
 /// an unrelated select phrase elsewhere on screen is not a menu. Three footer
 /// shapes qualify: a nav hint plus a select hint (Claude-style), a confirm
 /// key named next to a cancel key (Codex approval, which prints no nav hint),
-/// or a hook-review action next to its dismiss key.
+/// or a hook-review action next to its dismiss key. The hook-detail footer
+/// is not one of those windows: it is a whole line, checked before this scan.
 pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
+    if screen_text.lines().any(line_is_review_detail_footer) {
+        return true;
+    }
     let lines: Vec<String> = screen_text
         .lines()
         .map(|line| line.to_lowercase())
@@ -184,7 +184,6 @@ pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
         let has_review_dismiss = REVIEW_DISMISS_MARKERS
             .iter()
             .any(|marker| window.contains(marker));
-        let detail_footer = review_detail_footer(&window);
         let passive_action = PASSIVE_MARKERS.iter().any(|marker| window.contains(marker));
         let passive_selector_prefix = PASSIVE_SELECTOR_PREFIXES
             .iter()
@@ -195,8 +194,7 @@ pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
         let passive = passive_action || (passive_selector_prefix && !interactive_qualifier);
         if ((has_nav && has_select)
             || (has_confirm && has_cancel)
-            || (has_review_action && has_review_dismiss)
-            || detail_footer)
+            || (has_review_action && has_review_dismiss))
             && !passive
         {
             return true;
