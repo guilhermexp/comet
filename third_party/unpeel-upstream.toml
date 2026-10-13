@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "0ca10e85c59ca78b7d0b811e08f5a9b4ad298c69"
+vendored_tree = "903ee42e98607a17c632938bdcadfef9793e8fc2"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -126,10 +126,11 @@ base_revision_resolves_upstream = false
 # prompt row below that interrupt is a sent user row and is not settled.
 # session_host edge-writes turn_settled_by_interrupt beside menu_prompt_active;
 # activity.rs report_state_for_settled_interrupt drops a Busy spinner to Idle
-# without confirming Stop. The iOS detail-footer pre-scan splits on LF or
-# CRLF and trims 0x09, 0x0A, 0x0C, 0x0D and 0x20. It does not trim U+000B
-# and does not split on a lone CR. That is not a claim that the rest of
-# the Swift scan matches Rust. Local patch only. `vendored_tree` is the
+# without confirming Stop. The iOS detail-footer pre-scan splits on the LF
+# character or the CRLF character, including a footer between other lines.
+# `"\r\n"` is one Character. It trims 0x09, 0x0A, 0x0C, 0x0D and 0x20. It
+# does not trim U+000B and does not split on a lone CR. That is not a claim
+# that the rest of the Swift scan matches Rust. Local patch only. `vendored_tree` is the
 # git tree of `third_party/unpeel` after this patch, not an upstream commit.
 # `local_modifications_count` stays 32: the tool that produced it is unknown.
 

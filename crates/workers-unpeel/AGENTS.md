@@ -431,8 +431,9 @@ apps/zeron (host-mode dispatch at startup).
   `derive_activity` projeta isso como `blocked` sem `menu_prompt_active`.
   O footer de revisão de hooks do Codex (`enter review`/`trust all` com
   `esc close`, e a linha inteira `t trust · esc back` no detalhe) é menu em
-  `viewport_has_menu_prompt` e também vira `blocked`. A linha quebra em LF ou
-  CRLF; das bordas saem 0x09, 0x0A, 0x0C, 0x0D e 0x20. Tab vertical e CR
+  `viewport_has_menu_prompt` e também vira `blocked`. No pré-scan Swift a
+  linha quebra no caractere LF ou no caractere CRLF, também no meio do
+  viewport. Das bordas saem 0x09, 0x0A, 0x0C, 0x0D e 0x20. Tab vertical e CR
   isolado não contam. Citação, sufixo, prefixo, o rótulo `Trust` e a palavra trust em
   prosa não bloqueiam. A row `■ Conversation interrupted` do turno atual, só com sufixo
   conhecido do CLI (nenhum, ou `- use /feedback if something went wrong`), o

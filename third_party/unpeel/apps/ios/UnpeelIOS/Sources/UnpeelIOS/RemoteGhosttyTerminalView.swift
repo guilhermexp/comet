@@ -2826,11 +2826,12 @@ final class RemoteGhosttyRenderer: ObservableObject {
     /// a confirm key named next to a cancel key (Codex-style, which prints
     /// no nav hint), or a hook-review action next to its dismiss key. The
     /// hook-detail footer is a whole line, checked before this window scan.
-    /// Lines split on LF only. CRLF leaves a trailing CR for the trim below.
-    /// An isolated CR does not split a line. The window scan under this
-    /// check is unchanged.
+    /// The separator is the LF character or the CRLF character. `"\r\n"` is
+    /// one Character, so a split on `"\n"` alone leaves a CRLF row intact.
+    /// An isolated CR is not a separator, and neither is vertical tab. The
+    /// window scan under this check is unchanged.
     static func viewportHasMenuPrompt(_ text: String) -> Bool {
-        if text.split(separator: "\n", omittingEmptySubsequences: false).contains(where: lineIsHookReviewDetailFooter) {
+        if text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }).contains(where: lineIsHookReviewDetailFooter) {
             return true
         }
         let lines = text

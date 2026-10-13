@@ -4,7 +4,7 @@ Tracks local/private fork changes against upstream.
 
 ## 2026-10-13 — Spinner do Codex interrompido e espera bloqueada
 
-- O footer de revisão de hooks (`enter review`/`trust all` com `esc close`, e a linha inteira `t trust · esc back` no detalhe) passa a ser menu. Citação, sufixo e prefixo dessa frase não bloqueiam. O pré-scan Swift do detalhe separa por LF ou CRLF e corta só 0x09, 0x0A, 0x0C, 0x0D e 0x20; tab vertical e CR isolado não entram. A row mais nova `■ Conversation interrupted`, com sufixo conhecido do CLI (nenhum ou `- use /feedback if something went wrong`), derruba o spinner sem confirmar `Stop`. Draft no composer não rearma. User row já enviada seguida do composer, sufixo desconhecido nessa row mais nova, ou footer de trabalho, rearmam. `wait_for_status` de `completed`/`exited` devolve `needs_input` quando a atividade é `blocked`, antes do timeout.
+- O footer de revisão de hooks (`enter review`/`trust all` com `esc close`, e a linha inteira `t trust · esc back` no detalhe) passa a ser menu. Citação, sufixo e prefixo dessa frase não bloqueiam. O pré-scan Swift do detalhe separa o caractere LF ou o caractere CRLF, porque `"\r\n"` é um Character, e corta só 0x09, 0x0A, 0x0C, 0x0D e 0x20; tab vertical e CR isolado não entram. A row mais nova `■ Conversation interrupted`, com sufixo conhecido do CLI (nenhum ou `- use /feedback if something went wrong`), derruba o spinner sem confirmar `Stop`. Draft no composer não rearma. User row já enviada seguida do composer, sufixo desconhecido nessa row mais nova, ou footer de trabalho, rearmam. `wait_for_status` de `completed`/`exited` devolve `needs_input` quando a atividade é `blocked`, antes do timeout.
 - Change: `openspec/changes/fix-codex-pause-hook-wait/`.
 
 ## Baseline
