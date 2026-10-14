@@ -127,7 +127,8 @@ pub const COLUMN_GUTTER: f32 = 16.0;
 pub const TABLE_MAX_WIDTH: f32 = 900.0;
 /// Tool stream row height / gap — analytic, so fold heights need no measurement.
 /// Event headers share a compact 28px slot and one label baseline.
-/// Details expand only on request; no nested cards or connector spines.
+/// Details expand only on request; a folded group hangs its calls off the
+/// header with tree connectors (`with_tool_branch`).
 pub const CHIP_HEIGHT: f32 = 28.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = CHIP_HEIGHT;
@@ -541,10 +542,39 @@ fn chip_has_images(tool: &ToolItem) -> bool {
     !tool.images.is_empty() && !is_spawn_link(tool)
 }
 
-/// Aggregate counts belong only to the completed TurnSteps summary.
-/// Every intermediate call stays directly visible; payloads fold independently.
-fn tool_group_collapses(_tools: &[ToolItem]) -> bool {
-    false
+/// Ordinary tool runs fold behind a summary header with their calls as a
+/// tree beneath it (upstream); agent/spawn links render as their own
+/// always-open rows.
+fn tool_group_collapses(tools: &[ToolItem]) -> bool {
+    tools.iter().any(|t| !is_agent_tool(t))
+}
+
+/// Whether a group's calls show: agent-only groups always; a folded group
+/// by the user's explicit choice, else open only while the live turn writes
+/// into it.
+fn tool_group_open(collapses: bool, explicit: Option<bool>, auto_open: bool) -> bool {
+    !collapses || explicit.unwrap_or(auto_open)
+}
+
+/// A successful Write/Edit: a plain row of its group whose fork diff card
+/// opens beneath it on click (a failed one keeps the ordinary error row).
+fn is_file_row(tool: &ToolItem) -> bool {
+    file_change_path(&tool.call).is_some() && !tool.is_error
+}
+
+/// Disclosure/fetch key of a file row inside group `row_id`.
+fn file_row_key(row_id: &str, tool: &ToolItem) -> SharedString {
+    format!("{row_id}{FILE_ROW_KEY_SEP}{}", tool.id).into()
+}
+
+const FILE_ROW_KEY_SEP: &str = "#file:";
+
+/// The group row owning a file row key (itself for any other id).
+fn file_row_owner(key: &SharedString) -> SharedString {
+    match key.rsplit_once(FILE_ROW_KEY_SEP) {
+        Some((owner, _)) => owner.to_owned().into(),
+        None => key.clone(),
+    }
 }
 
 /// A chip's expandable detail payload.
@@ -856,12 +886,6 @@ pub enum RowKind {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
         detail_auto_open: bool,
-    },
-    FileChange {
-        tool: ToolItem,
-        /// The owning entry is still streaming, so the card shows its diff at
-        /// the expanded budget without a click (mirrors `detail_auto_open`).
-        auto_open: bool,
     },
     TurnSteps {
         rows: Arc<Vec<Row>>,
@@ -1236,8 +1260,10 @@ fn prune_turn_steps_state(state: &mut HashMap<SharedString, bool>, rows: &[Row])
 
 fn collect_file_change_ids(row: &Row, live: &mut std::collections::HashSet<SharedString>) {
     match &row.kind {
-        RowKind::FileChange { .. } => {
-            live.insert(row.id.clone());
+        RowKind::ToolGroup { tools, .. } => {
+            for tool in tools.iter().filter(|tool| is_file_row(tool)) {
+                live.insert(file_row_key(&row.id, tool));
+            }
         }
         RowKind::TurnSteps { rows, .. } => {
             for child in rows.iter() {
@@ -1637,7 +1663,6 @@ fn settle_turn_steps_child(row: &mut Row) {
             *auto_open = false;
             *detail_auto_open = false;
         }
-        RowKind::FileChange { auto_open, .. } => *auto_open = false,
         _ => {}
     }
 }
@@ -1967,6 +1992,13 @@ fn rows_for_entry_with_todo_history(
     let mut pending_group: Vec<ToolItem> = Vec::new();
     let mut group_first_part_ix = 0usize;
     let mut group_last_part_ix = 0usize;
+    // The last part that can render: the live group is the one ending there.
+    // Durable workflow activity never renders, so it cannot close the tail.
+    let last_visible_part_ix = entry
+        .parts
+        .iter()
+        .rposition(|part| !matches!(part, MessagePart::WorkflowTask { .. }))
+        .unwrap_or(0);
 
     let flush_group = |rows: &mut Vec<ProjectedRow>,
                        group: &mut Vec<ToolItem>,
@@ -1978,12 +2010,12 @@ fn rows_for_entry_with_todo_history(
         }
         let tools = std::mem::take(group);
         let image_paths = tool_image_paths(&tools);
-        // Groups never collapse (`tool_group_collapses`), so the group flag has
-        // no job. The DETAIL flag does: while the turn is live, the command
-        // output the run is producing now must be readable without a click.
-        // Per ENTRY, not per group — the trailing-group clause this replaces
-        // re-hid every command as soon as the next one started.
-        let auto_open = false;
+        // Upstream's disclosure: the group the live turn is writing into
+        // opens; finished groups fold to their summary. The DETAIL flag is
+        // separate: while the turn is live, the command output the run is
+        // producing now must be readable without a click — per ENTRY, not
+        // per group.
+        let auto_open = streaming && last_ix == last_visible_part_ix;
         let detail_auto_open = streaming;
         let current_group = *group_ix;
         rows.push(ProjectedRow {
@@ -2228,38 +2260,6 @@ fn rows_for_entry_with_todo_history(
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
                     images: crate::tool_images::image_paths(call, output.as_deref()),
                 };
-                let is_file_change =
-                    matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. });
-                if is_file_change && !item.is_error {
-                    flush_group(
-                        &mut rows,
-                        &mut pending_group,
-                        &mut group_ix,
-                        group_first_part_ix,
-                        group_last_part_ix,
-                    );
-                    // Reuses the detail bit: it is the same "auto-opened
-                    // because the turn is live" fact, and the version must
-                    // flip when streaming ends or the card would stay open.
-                    let version = tool_fingerprint(std::slice::from_ref(&item), false, streaming);
-                    rows.push(ProjectedRow {
-                        source_start: part_ix,
-                        source_end: part_ix,
-                        row: Row {
-                            id: format!("{}#{}", entry.id, tool_id).into(),
-                            version,
-                            turn_start: false,
-                            kind: RowKind::FileChange {
-                                tool: item,
-                                auto_open: streaming,
-                            },
-                            entry_id: entry.id.clone().into(),
-                            timestamp: None,
-                            copy_text: None,
-                        },
-                    });
-                    continue;
-                }
                 // Agent chips don't share a fold with ordinary tools: flush
                 // whenever the genus flips so each group is uniform.
                 if pending_group.first().is_some_and(|head| {
@@ -2603,11 +2603,10 @@ fn flat_rows(rows: &[Row]) -> impl Iterator<Item = &Row> {
     })
 }
 
-/// The tools a row reveals: its group's calls, or a file-change card's one.
+/// The tools a row reveals: its group's calls (file edits included).
 fn revealable_tools(row: &Row) -> Option<Vec<&ToolItem>> {
     match &row.kind {
         RowKind::ToolGroup { tools, .. } => Some(tools.iter().collect()),
-        RowKind::FileChange { tool, .. } => Some(vec![tool]),
         _ => None,
     }
 }
@@ -2687,7 +2686,6 @@ fn compact_entry_rows(entry: &SessionMessageEntry, rows: Vec<Row>) -> Vec<Row> {
             row.kind,
             RowKind::Reasoning { .. }
                 | RowKind::ToolGroup { .. }
-                | RowKind::FileChange { .. }
                 | RowKind::TaskSnapshot { .. }
                 | RowKind::SubagentEnd(..)
         )
@@ -3360,6 +3358,180 @@ fn with_tool_rail(
                     .bottom_0(),
             )
         })
+        .into_any_element()
+}
+
+/// Tree under a folded group's summary header (upstream's activity tree):
+/// children sit in a gutter as wide as the header's icon slot plus its gap,
+/// so their own fork glyphs line up where the flat rows used to start.
+const TREE_GUTTER_WIDTH: f32 = STREAM_ICON + 8.0;
+/// The trunk runs under the header icon's center.
+const TREE_TRUNK_X: f32 = STREAM_ICON / 2.0;
+const TREE_BEND_RADIUS: f32 = 6.0;
+/// The branch stops just short of the child's icon.
+const TREE_BRANCH_END_X: f32 = TREE_GUTTER_WIDTH - 3.0;
+/// The connector draws briskly, then eases into the branch tip so its arrival
+/// remains visible without feeling mechanically linear (upstream timing).
+const TOOL_CONNECTOR_REVEAL: motion::MotionSpec =
+    motion::MotionSpec::new(480, motion::EASE_OUT_QUINT);
+
+fn tool_connector_reveal_progress(
+    start: Option<Instant>,
+    now: Instant,
+    reduce_motion: bool,
+) -> f32 {
+    let Some(start) = start.filter(|_| !reduce_motion) else {
+        return 1.0;
+    };
+    let elapsed = now.checked_duration_since(start).unwrap_or_default();
+    let raw = elapsed.as_secs_f32() / TOOL_CONNECTOR_REVEAL.total().as_secs_f32();
+    TOOL_CONNECTOR_REVEAL.curve.eval(raw.clamp(0.0, 1.0))
+}
+
+/// Split one arrival into a continuous tree draw. For child rows, the previous
+/// row grows its continuation to the boundary first, then this row draws its
+/// incoming trunk and elbow. The branch slightly overlaps the end of the
+/// incoming phase so there is no dead frame at the bend.
+fn tool_connector_parts(progress: f32, has_predecessor: bool) -> (f32, f32) {
+    let progress = progress.clamp(0.0, 1.0);
+    let (incoming_start, incoming_end, branch_start) = if has_predecessor {
+        (0.45, 0.72, 0.68)
+    } else {
+        (0.0, 0.62, 0.58)
+    };
+    let incoming = ((progress - incoming_start) / (incoming_end - incoming_start)).clamp(0.0, 1.0);
+    let branch = ((progress - branch_start) / (1.0 - branch_start)).clamp(0.0, 1.0);
+    (incoming, branch)
+}
+
+/// The outgoing trunk belongs visually to the row that is already present,
+/// but its timing belongs to the next row's arrival.
+fn tool_connector_continuation(next_progress: Option<f32>) -> f32 {
+    next_progress
+        .map(|progress| (progress / 0.45).clamp(0.0, 1.0))
+        .unwrap_or(0.0)
+}
+
+/// Elbow then straight leg, relative to the bend start, revealed by distance
+/// so the speed does not jump at their junction.
+fn tree_branch_points(progress: f32) -> Vec<Point<f32>> {
+    let mut path: Vec<_> = (0..=24)
+        .map(|step| {
+            let t = step as f32 / 24.0;
+            point(
+                TREE_BEND_RADIUS * t * t,
+                TREE_BEND_RADIUS * (2.0 * t - t * t),
+            )
+        })
+        .collect();
+    path.push(point(TREE_BRANCH_END_X - TREE_TRUNK_X, TREE_BEND_RADIUS));
+    if progress >= 1.0 {
+        return path;
+    }
+    let lengths: Vec<_> = path
+        .windows(2)
+        .map(|pair| (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y))
+        .collect();
+    let mut remaining = lengths.iter().sum::<f32>() * progress.clamp(0.0, 1.0);
+    let mut visible = vec![path[0]];
+    for (pair, length) in path.windows(2).zip(lengths) {
+        if remaining <= 0.0 {
+            break;
+        }
+        let t = (remaining / length).min(1.0);
+        visible.push(point(
+            motion::lerp(pair[0].x, pair[1].x, t),
+            motion::lerp(pair[0].y, pair[1].y, t),
+        ));
+        remaining -= length;
+    }
+    visible
+}
+
+/// A clockwise 1px ribbon contour. Nonzero fill unions intersecting contours,
+/// so the fork of trunk and branch keeps one alpha contribution.
+fn tree_ribbon(path: &mut gpui::PathBuilder, points: &[Point<Pixels>]) {
+    if points.len() < 2 {
+        return;
+    }
+    let mut left = Vec::with_capacity(points.len());
+    let mut right = Vec::with_capacity(points.len());
+    for (ix, p) in points.iter().enumerate() {
+        let a = points[ix.saturating_sub(1)];
+        let b = points[(ix + 1).min(points.len() - 1)];
+        let dx = f32::from(b.x - a.x);
+        let dy = f32::from(b.y - a.y);
+        let length = dx.hypot(dy).max(0.0001);
+        let normal = point(px(-dy / length * 0.5), px(dx / length * 0.5));
+        left.push(*p + normal);
+        right.push(*p - normal);
+    }
+    path.move_to(left[0]);
+    for p in left.iter().skip(1).chain(right.iter().rev()) {
+        path.line_to(*p);
+    }
+    path.close();
+}
+
+/// One child of a folded group with its tree connector in the left gutter:
+/// trunk from the row top, rounded elbow into a branch at `branch_y` (the
+/// child's icon center), and — when a sibling follows — the trunk continuing
+/// to the row's bottom. The child keeps its own fork glyph and chrome.
+fn with_tool_branch(
+    row: AnyElement,
+    branch_y: f32,
+    has_predecessor: bool,
+    continues: bool,
+    reveal: f32,
+    continuation_reveal: f32,
+    theme: &Theme,
+) -> AnyElement {
+    let color = theme.border;
+    let (incoming_reveal, branch_reveal) = tool_connector_parts(reveal, has_predecessor);
+    let gutter = div().relative().w(px(TREE_GUTTER_WIDTH)).flex_none().child(
+        canvas(
+            move |_, _, _| (),
+            move |bounds, _, window, _| {
+                let x = bounds.origin.x + px(TREE_TRUNK_X);
+                let bend_y = bounds.origin.y + px(branch_y - TREE_BEND_RADIUS);
+                let mut tree = gpui::PathBuilder::fill().with_style(gpui::PathStyle::Fill(
+                    gpui::FillOptions::default().with_fill_rule(gpui::FillRule::NonZero),
+                ));
+                if incoming_reveal > 0.0 {
+                    let mut bottom = point(
+                        x,
+                        bounds.origin.y
+                            + px((branch_y - TREE_BEND_RADIUS).max(0.0) * incoming_reveal),
+                    );
+                    if incoming_reveal >= 1.0 && continues && continuation_reveal > 0.0 {
+                        let rest = (f32::from(bounds.size.height) - (branch_y - TREE_BEND_RADIUS))
+                            .max(0.0);
+                        bottom = point(x, bend_y + px(rest * continuation_reveal));
+                    }
+                    tree_ribbon(&mut tree, &[point(x, bounds.origin.y), bottom]);
+                }
+                if branch_reveal > 0.0 {
+                    let points: Vec<_> = tree_branch_points(branch_reveal)
+                        .into_iter()
+                        .map(|p| point(x + px(p.x), bend_y + px(p.y)))
+                        .collect();
+                    tree_ribbon(&mut tree, &points);
+                }
+                if let Ok(path) = tree.build() {
+                    window.paint_path(path, color);
+                }
+            },
+        )
+        .absolute()
+        .inset_0(),
+    );
+    div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .child(gutter)
+        .child(div().min_w_0().flex_1().child(row))
         .into_any_element()
 }
 
@@ -6648,7 +6820,7 @@ impl Transcript {
                     .insert(row_id.clone(), FileInputLoad::Failed);
             }
         }
-        self.remeasure_row_containing(&row_id);
+        self.remeasure_row_containing(&file_row_owner(&row_id));
         cx.notify();
     }
 
@@ -8591,11 +8763,6 @@ impl Transcript {
                 auto_open,
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
-            RowKind::FileChange { tool, auto_open } => {
-                let reveal = self.tool_reveal_progress(&row.id, std::slice::from_ref(tool), cx)[0];
-                let card = self.render_file_change(&row.id, tool, *auto_open, &theme, cx);
-                reveal_tool_row(card, reveal, None)
-            }
             RowKind::TurnSteps {
                 rows,
                 summary,
@@ -10880,7 +11047,7 @@ impl Transcript {
         // Calls stay directly visible. Only TurnSteps owns an aggregate header;
         // each invocation/output below still has its own detail disclosure.
         let collapses = tool_group_collapses(tools);
-        let open = !collapses || fold.open.unwrap_or(auto_open);
+        let open = tool_group_open(collapses, fold.open, auto_open);
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
@@ -10996,7 +11163,9 @@ impl Transcript {
             .zip(&detail_defaults)
             .zip(tools.iter())
             .map(|((((detail, invocation), fold), default_open), tool)| {
-                (detail.is_some() || invocation.is_some() || chip_has_images(tool))
+                // A file row's payload is its diff card, keyed separately.
+                !is_file_row(tool)
+                    && (detail.is_some() || invocation.is_some() || chip_has_images(tool))
                     && fold.open.unwrap_or(*default_open)
             })
             .collect();
@@ -11116,6 +11285,24 @@ impl Transcript {
             )
             .child(stream_disclosure(open, theme));
 
+        // Fold body: 200ms committed-height tween on a USER toggle only — and
+        // only within a short window of the click. Auto-open (streaming) and
+        // content growth never tween, and a SETTLED fold renders at its
+        // natural height: leaving the tween armed replayed it on every
+        // remount, which in a virtualized list means every
+        // scroll-back-into-view. Agent groups skip the fold entirely (always
+        // open, no header).
+        let animating = collapses
+            && fold.epoch > 0
+            && fold
+                .toggled_at
+                .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
+        // A settled collapsed group has no visible body: skip building chips
+        // that would only be clipped to zero height (upstream).
+        if collapses && !open && !animating {
+            return div().flex().flex_col().child(header).into_any_element();
+        }
+
         let worker_chips: Vec<_> = {
             let state = self.state.read(cx);
             let chat_id = self.journal_chat_id.as_ref().or(self.chat_id.as_ref());
@@ -11188,6 +11375,66 @@ impl Transcript {
                         theme,
                         cx,
                     );
+                }
+                if is_file_row(tool) {
+                    let key = file_row_key(row_id, tool);
+                    if self.file_change_open.get(&key).copied().unwrap_or(false) {
+                        // Opened: the fork's diff card, its header in the
+                        // same frame (as an opened command's).
+                        return self.render_file_change(&key, tool, false, theme, cx);
+                    }
+                    let can_expand = crate::file_change::file_card_can_expand(
+                        tool.resolved,
+                        tool.file_preview.is_some()
+                            || matches!(
+                                self.file_change_inputs.get(&key),
+                                Some(FileInputLoad::Ready(_))
+                            ),
+                    );
+                    let kind = tool
+                        .file_preview
+                        .as_ref()
+                        .map(|preview| preview.kind)
+                        .unwrap_or(match tool.call {
+                            ToolCall::EditFile { .. } => zeron_doc::FileChangeKind::Edit,
+                            _ => zeron_doc::FileChangeKind::Write,
+                        });
+                    let tool_id = tool.id.to_string();
+                    let preview = tool.file_preview.clone();
+                    let toggle_key = key.clone();
+                    return div()
+                        .w_full()
+                        .flex_none()
+                        .child(
+                            div()
+                                .id(key)
+                                .h(px(CHIP_HEADER_HEIGHT))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .when(can_expand, |row| row.cursor_pointer())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_file_change(
+                                        toggle_key.clone(),
+                                        tool_id.clone(),
+                                        can_expand,
+                                        kind,
+                                        preview.clone(),
+                                        cx,
+                                    )
+                                }))
+                                .child(chip_header(
+                                    tool,
+                                    false,
+                                    worker_chips[ix].as_ref(),
+                                    self.read_file_chip(tool, theme, cx),
+                                    file_opener.as_ref(),
+                                    theme,
+                                    cx.entity_id(),
+                                    cx,
+                                )),
+                        )
+                        .into_any_element();
                 }
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
@@ -11379,13 +11626,59 @@ impl Transcript {
                     .into_any_element()
             })
             .collect();
+        let file_opens: Vec<bool> = tools
+            .iter()
+            .map(|tool| {
+                is_file_row(tool)
+                    && self
+                        .file_change_open
+                        .get(&file_row_key(row_id, tool))
+                        .copied()
+                        .unwrap_or(false)
+            })
+            .collect();
+        let connector_progress: Vec<f32> = {
+            let reduce_motion = cx.reduce_motion();
+            let now = Instant::now();
+            let starts = self.tool_reveals.get(row_id);
+            tools
+                .iter()
+                .map(|tool| {
+                    let start = starts
+                        .and_then(|starts| starts.get(&tool.id))
+                        .copied()
+                        .flatten();
+                    tool_connector_reveal_progress(start, now, reduce_motion)
+                })
+                .collect()
+        };
+        if connector_progress.iter().any(|p| *p < 1.0) {
+            motion::pulse_lease(cx.entity_id(), cx);
+        }
         let chips = div()
-            .when(collapses, |column| column.pl(px(STREAM_ICON + 8.0)))
             .pt(px(CHIPS_TOP_PAD))
             .flex()
             .flex_col()
             .gap(px(CHIP_GAP))
             .children(rendered_chips.into_iter().enumerate().map(|(ix, chip)| {
+                // Closed one-line rows also grow into place; an open payload
+                // has no analytic height, so it only fades and lifts.
+                let grows = !detail_opens[ix] && !file_opens[ix] && !is_spawn_link(&tools[ix]);
+                if collapses {
+                    // Folded group: the call hangs off the header's tree.
+                    // The connector stays at full contrast while the row's
+                    // content fades in (upstream).
+                    let chip = reveal_tool_row(chip, reveals[ix], grows.then_some(CHIP_HEIGHT));
+                    return with_tool_branch(
+                        chip,
+                        CHIP_HEIGHT / 2.0,
+                        ix > 0,
+                        ix + 1 < tools.len(),
+                        connector_progress[ix],
+                        tool_connector_continuation(connector_progress.get(ix + 1).copied()),
+                        theme,
+                    );
+                }
                 // Consecutive calls share the guide rail the Thought body
                 // draws, at the same x. Spawn cards and framed command cards
                 // carry their own chrome there, so they break the rail.
@@ -11402,27 +11695,10 @@ impl Transcript {
                     STREAM_ICON / 2.0
                 };
                 let chip = with_tool_rail(chip, up, down, icon_half, theme);
-                // Closed one-line rows also grow into place; an open payload
-                // has no analytic height, so it only fades and lifts.
-                let grows = !detail_opens[ix] && !is_spawn_link(&tools[ix]);
                 reveal_tool_row(chip, reveals[ix], grows.then_some(CHIP_HEIGHT))
             }));
 
-        // Fold body: 200ms committed-height tween on a USER toggle only — and
-        // only within a short window of the click. Auto-open (streaming) and
-        // content growth never tween, and a SETTLED fold renders at its static
-        // height: leaving the tween armed replayed it on every remount, which
-        // in a virtualized list means every scroll-back-into-view (only `open`
-        // toggles animate — composes with the stick spring). Agent groups skip
-        // the fold entirely (always open, no header).
-        let animating = collapses
-            && fold.epoch > 0
-            && fold
-                .toggled_at
-                .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
-        let body: AnyElement = if !collapses {
-            chips.into_any_element()
-        } else if animating {
+        let body: AnyElement = if animating {
             let from = fold.from;
             div()
                 .overflow_hidden()
@@ -11434,11 +11710,9 @@ impl Transcript {
                 )
                 .into_any_element()
         } else {
-            div()
-                .overflow_hidden()
-                .h(px(target))
-                .child(chips)
-                .into_any_element()
+            // Open payloads wrap at layout time; a fixed analytic height
+            // would clip them, so a settled open group sizes naturally.
+            chips.into_any_element()
         };
 
         div()
@@ -14771,13 +15045,13 @@ mod tests {
         );
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0].kind, RowKind::LiveMarkdown { .. }));
-        // Without a fold there is no split boundary either: the settled read
-        // and both live tools share one open group.
+        // No split boundary either: the settled read and both live tools
+        // share one group, open because the live turn writes into it.
         assert!(matches!(
             &rows[1].kind,
             RowKind::ToolGroup {
                 tools,
-                auto_open: false,
+                auto_open: true,
                 ..
             } if tools.len() == 3 && tools.iter().filter(|tool| !tool.resolved).count() == 2
         ));
@@ -14998,6 +15272,29 @@ mod tests {
         }
     }
 
+    fn exec_part(id: &str, resolved: bool) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Exec {
+                command: "ls".into(),
+            },
+            is_error: false,
+            resolved,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            subagent_end: None,
+        }
+    }
+
     fn two_line_write_preview() -> zeron_doc::FileChangePreview {
         zeron_doc::FileChangePreview {
             kind: zeron_doc::FileChangeKind::Write,
@@ -15018,8 +15315,15 @@ mod tests {
         }
     }
 
+    fn group_tools(row: &Row) -> &[ToolItem] {
+        match &row.kind {
+            RowKind::ToolGroup { tools, .. } => tools.as_slice(),
+            _ => panic!("tool group expected"),
+        }
+    }
+
     #[test]
-    fn file_change_projects_one_stable_specialized_row_across_live_refreshes() {
+    fn file_change_is_a_stable_group_row_across_live_refreshes() {
         let first = assistant(
             "file-change-live",
             MessageStatus::Streaming,
@@ -15046,14 +15350,40 @@ mod tests {
         let second_rows = rows_for_entry(&second, false, &mut parse);
         assert_eq!(first_rows.len(), 1);
         assert_eq!(second_rows.len(), 1);
-        assert_eq!(first_rows[0].id.as_ref(), "file-change-live#write-1");
         assert_eq!(first_rows[0].id, second_rows[0].id);
-        assert_ne!(first_rows[0].version, second_rows[0].version);
-        assert!(matches!(
-            &second_rows[0].kind,
-            RowKind::FileChange { tool, .. }
-                if tool.file_preview.as_ref().is_some_and(|preview| preview.total_lines == 3)
-        ));
+        assert_ne!(
+            first_rows[0].version, second_rows[0].version,
+            "a growing live preview re-splices its group"
+        );
+        let tools = group_tools(&second_rows[0]);
+        assert!(is_file_row(&tools[0]));
+        assert_eq!(
+            tools[0]
+                .file_preview
+                .as_ref()
+                .map(|preview| preview.total_lines),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn file_edits_do_not_split_a_run_of_commands() {
+        let entry = assistant(
+            "edit-run",
+            MessageStatus::Streaming,
+            vec![
+                exec_part("cmd-1", true),
+                write_file_part("write-1", true, Some(two_line_write_preview())),
+                exec_part("cmd-2", true),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1, "one group, the edit included");
+        let tools = group_tools(&rows[0]);
+        assert_eq!(tools.len(), 3);
+        assert!(is_file_row(&tools[1]));
+        assert!(tool_group_collapses(tools));
+        assert_eq!(tool_group_summary(tools), "1 edit, 2 commands");
     }
 
     #[test]
@@ -15077,17 +15407,17 @@ mod tests {
         );
 
         let live_rows = rows_for_entry(&live, false, &mut parse);
-        assert!(matches!(live_rows[0].kind, RowKind::FileChange { .. }));
+        assert!(is_file_row(&group_tools(&live_rows[0])[0]));
         let done_rows = rows_for_entry(&done, false, &mut parse);
         let RowKind::TurnSteps { rows, .. } = &done_rows[0].kind else {
             panic!("resolved file change should be folded with completed work")
         };
         assert_eq!(rows[0].id, live_rows[0].id);
-        assert!(matches!(rows[0].kind, RowKind::FileChange { .. }));
+        assert!(is_file_row(&group_tools(&rows[0])[0]));
     }
 
     #[test]
-    fn file_cards_open_while_the_turn_is_live_and_close_on_settle() {
+    fn the_live_group_opens_and_settled_groups_fold() {
         let parts = vec![write_file_part(
             "write-1",
             true,
@@ -15095,10 +15425,10 @@ mod tests {
         )];
         let live = assistant("file-auto", MessageStatus::Streaming, parts.clone());
         let live_rows = rows_for_entry(&live, false, &mut parse);
-        let RowKind::FileChange { auto_open, .. } = live_rows[0].kind else {
-            panic!("file card expected")
+        let RowKind::ToolGroup { auto_open, .. } = live_rows[0].kind else {
+            panic!("tool group expected")
         };
-        assert!(auto_open, "a live turn shows the diff without a click");
+        assert!(auto_open, "the group the live turn writes into is open");
 
         let mut settled_parts = parts;
         settled_parts.push(text_part("answer", "Done."));
@@ -15107,17 +15437,36 @@ mod tests {
         let RowKind::TurnSteps { rows: children, .. } = &done_rows[0].kind else {
             panic!("settled work folds into turn steps")
         };
-        let RowKind::FileChange { auto_open, .. } = children[0].kind else {
-            panic!("file card expected")
+        let RowKind::ToolGroup { auto_open, .. } = children[0].kind else {
+            panic!("tool group expected")
         };
-        assert!(
-            !auto_open,
-            "settling returns the card to its bounded preview"
-        );
+        assert!(!auto_open, "a finished group folds to its summary");
         // Same row id across the transition, so only the version can force the
         // repaint that closes it.
         assert_eq!(children[0].id, live_rows[0].id);
         assert_ne!(children[0].version, live_rows[0].version);
+    }
+
+    #[test]
+    fn only_the_trailing_group_of_a_live_turn_opens() {
+        let entry = assistant(
+            "live-groups",
+            MessageStatus::Streaming,
+            vec![
+                exec_part("cmd-1", true),
+                text_part("between", "Next step."),
+                exec_part("cmd-2", false),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let opens: Vec<bool> = rows
+            .iter()
+            .filter_map(|row| match row.kind {
+                RowKind::ToolGroup { auto_open, .. } => Some(auto_open),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opens, vec![false, true]);
     }
 
     #[test]
@@ -15128,24 +15477,20 @@ mod tests {
             vec![write_file_part("write-1", false, None)],
         );
         let rows = rows_for_entry(&entry, false, &mut parse);
-        assert!(matches!(
-            &rows[0].kind,
-            RowKind::FileChange { tool, .. } if tool.file_preview.is_none()
-        ));
+        let tools = group_tools(&rows[0]);
+        assert!(is_file_row(&tools[0]) && tools[0].file_preview.is_none());
     }
 
     #[test]
-    fn completed_path_only_write_keeps_the_file_card_without_inventing_a_body() {
+    fn completed_path_only_write_keeps_its_row_without_inventing_a_body() {
         let entry = assistant(
             "legacy-file-change",
             MessageStatus::Complete,
             vec![write_file_part("write-1", true, None)],
         );
         let rows = rows_for_entry(&entry, false, &mut parse);
-        assert!(matches!(
-            &rows[0].kind,
-            RowKind::FileChange { tool, .. } if tool.file_preview.is_none()
-        ));
+        let tools = group_tools(&rows[0]);
+        assert!(is_file_row(&tools[0]) && tools[0].file_preview.is_none());
     }
 
     #[test]
@@ -15159,16 +15504,61 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("settled work folds into turn steps")
+        };
+        let key = file_row_key(&children[0].id, &group_tools(&children[0])[0]);
+        assert_eq!(file_row_owner(&key), children[0].id);
         let live = live_file_change_ids(&rows);
-        assert!(live.contains("file-change-state#write-1"));
+        assert!(live.contains(&key));
 
         let mut open = HashMap::from([
-            (SharedString::from("file-change-state#write-1"), true),
-            (SharedString::from("removed#write-2"), true),
+            (key.clone(), true),
+            (SharedString::from("removed#g0#file:write-2"), true),
         ]);
         open.retain(|id, _| live.contains(id));
         assert_eq!(open.len(), 1);
-        assert_eq!(open.get("file-change-state#write-1"), Some(&true));
+        assert_eq!(open.get(&key), Some(&true));
+    }
+
+    #[test]
+    fn group_fold_choice_beats_the_live_default() {
+        // Agent-only groups never fold.
+        assert!(tool_group_open(false, Some(false), false));
+        // Live default, finished default.
+        assert!(tool_group_open(true, None, true));
+        assert!(!tool_group_open(true, None, false));
+        // An explicit choice wins in both phases.
+        assert!(!tool_group_open(true, Some(false), true));
+        assert!(tool_group_open(true, Some(true), false));
+    }
+
+    #[test]
+    fn connector_parts_draw_trunk_then_branch() {
+        // A first child draws from the header: trunk first, branch overlapping.
+        assert_eq!(tool_connector_parts(0.0, false), (0.0, 0.0));
+        let (incoming, branch) = tool_connector_parts(0.6, false);
+        assert!(incoming > 0.9 && branch > 0.0);
+        assert_eq!(tool_connector_parts(1.0, false), (1.0, 1.0));
+        // A later child waits for its predecessor's continuation.
+        assert_eq!(tool_connector_parts(0.4, true), (0.0, 0.0));
+        assert_eq!(tool_connector_parts(1.0, true), (1.0, 1.0));
+        // The continuation belongs to the NEXT arrival's timing.
+        assert_eq!(tool_connector_continuation(None), 0.0);
+        assert_eq!(tool_connector_continuation(Some(0.0)), 0.0);
+        assert_eq!(tool_connector_continuation(Some(1.0)), 1.0);
+        // Reduced motion and absent starts draw the tree complete.
+        let now = Instant::now();
+        assert_eq!(tool_connector_reveal_progress(Some(now), now, true), 1.0);
+        assert_eq!(tool_connector_reveal_progress(None, now, false), 1.0);
+        assert_eq!(
+            tool_connector_reveal_progress(Some(now), now + TOOL_CONNECTOR_REVEAL.total(), false),
+            1.0
+        );
+        // The branch path ends at the child's icon.
+        let tip = *tree_branch_points(1.0).last().unwrap();
+        assert_eq!(tip.x, TREE_BRANCH_END_X - TREE_TRUNK_X);
+        assert_eq!(tip.y, TREE_BEND_RADIUS);
     }
 
     #[test]
@@ -15621,7 +16011,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_workflow_activity_keeps_tool_group_compact() {
+    fn trailing_workflow_activity_keeps_the_live_group_open() {
         let workflow = MessagePart::WorkflowTask {
             id: "workflow-wf-1".into(),
             task: zeron_proto::WorkflowTaskUpdate {
@@ -15642,11 +16032,14 @@ mod tests {
             vec![tool_part("tool-1", "pwd"), workflow],
         );
 
+        // Durable workflow activity never renders, so it neither splits the
+        // group nor ends the live tail it is still writing into.
         let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
         assert!(matches!(
             &rows[0].kind,
             RowKind::ToolGroup {
-                auto_open: false,
+                auto_open: true,
                 ..
             }
         ));
@@ -16812,21 +17205,21 @@ mod tests {
             panic!("ordinary group expected")
         };
         assert_eq!(tools.len(), 2);
-        assert!(!tool_group_collapses(tools));
+        assert!(tool_group_collapses(tools), "ordinary runs fold");
         assert!(!*auto_open);
 
         let RowKind::ToolGroup { tools, .. } = &rows[2].kind else {
             panic!("agent group expected")
         };
         assert_eq!(tools.len(), 1);
-        assert!(!tool_group_collapses(tools));
+        assert!(!tool_group_collapses(tools), "agent links never fold");
         assert!(is_agent_tool(&tools[0]));
 
         let RowKind::ToolGroup { tools, .. } = &rows[3].kind else {
             panic!("ordinary group expected")
         };
         assert_eq!(tools.len(), 1);
-        assert!(!tool_group_collapses(tools));
+        assert!(tool_group_collapses(tools));
 
         let RowKind::ToolGroup { tools, .. } = &rows[4].kind else {
             panic!("consecutive agents share a group")
@@ -16983,13 +17376,13 @@ mod tests {
             panic!("tool group expected")
         };
         assert_eq!(tools.len(), 3);
-        assert!(!tool_group_collapses(tools));
+        assert!(tool_group_collapses(tools));
         assert!(tools.iter().all(|t| !is_agent_tool(t)));
         assert!(tools.iter().all(|t| !is_spawn_link(t)));
     }
 
     #[test]
-    fn command_counts_appear_only_in_the_completed_turn_summary() {
+    fn command_runs_fold_behind_their_group_summary() {
         for status in [MessageStatus::Streaming, MessageStatus::Complete] {
             let entry = assistant(
                 "counts",
@@ -17026,7 +17419,11 @@ mod tests {
                     ..
                 } = &row.kind
                 {
-                    assert!(!tool_group_collapses(tools), "no intermediate count header");
+                    assert!(
+                        tool_group_collapses(tools),
+                        "each run folds behind a summary"
+                    );
+                    assert_eq!(tool_group_summary(tools), "2 commands");
                     assert_eq!(
                         *detail_auto_open,
                         status == MessageStatus::Streaming,
@@ -17043,7 +17440,7 @@ mod tests {
     }
 
     #[test]
-    fn single_tool_has_no_redundant_group_disclosure() {
+    fn single_tool_folds_like_upstream() {
         for status in [MessageStatus::Streaming, MessageStatus::Complete] {
             let entry = assistant("single", status, vec![tool_part("a", "ls")]);
             let rows = rows_for_entry(&entry, false, &mut parse);
@@ -17051,8 +17448,8 @@ mod tests {
                 panic!("expected tool row");
             };
             assert!(
-                !tool_group_collapses(tools),
-                "single tool is directly visible"
+                tool_group_collapses(tools),
+                "a lone ordinary tool still hangs off its summary (upstream)"
             );
             assert!(tools[0].invocation.is_some(), "detail remains accessible");
         }
@@ -17106,7 +17503,7 @@ mod tests {
         let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
             panic!()
         };
-        assert!(!tool_group_collapses(tools));
+        assert!(tool_group_collapses(tools));
         let RowKind::ToolGroup { tools, .. } = &rows[1].kind else {
             panic!()
         };
@@ -17127,7 +17524,7 @@ mod tests {
         else {
             panic!()
         };
-        assert!(!auto_open, "the group fold itself stays compact");
+        assert!(auto_open, "the group the live turn writes into is open");
         assert!(detail_auto_open, "the live command shows its output");
 
         let complete = assistant("m3", MessageStatus::Complete, parts);

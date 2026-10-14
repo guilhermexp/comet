@@ -8,13 +8,13 @@ are expanded, without opening each card's invocation, output, or diff details.
 ## Requirements
 
 ### Requirement: Show tool cards inside expanded turn steps
-The transcript SHALL expose individual tool rows directly inside expanded `TurnSteps`, without intermediate count headers. Recorded reasoning SHALL remain available through its own compact disclosure.
+The transcript SHALL expose the turn's tool groups inside expanded `TurnSteps`, each behind its summary header; opening a group reveals its individual tool rows. Recorded reasoning SHALL remain available through its own compact disclosure.
 
 #### Scenario: A completed prefix contains several tool groups
 Test: unit — deterministic transcript projection; headed GPUI smoke.
 - **WHEN** the outer TurnSteps disclosure is expanded
-- **THEN** each individual call is visible directly without a group counter
-- **AND** expanding an event reveals its recorded details
+- **THEN** each tool group shows its summary header, collapsed by default
+- **AND** opening a group shows its calls, and expanding a call reveals its recorded details
 
 ### Requirement: Keep card details independently compact
 
@@ -30,7 +30,7 @@ Test: deterministic projection test asserting independent group and detail defau
 - **AND** its output and invocation bodies remain closed until the user opens the card
 
 ### Requirement: Preserve explicit disclosure choices
-The transcript SHALL preserve explicit turn, tool-detail and reasoning fold choices across rerenders and virtualized remounts. Default compact presentation SHALL apply to both settled and streaming events without hiding subagent links.
+The transcript SHALL preserve explicit turn, tool-group, tool-detail and reasoning fold choices across rerenders and virtualized remounts. Default compact presentation SHALL apply to both settled and streaming events without hiding subagent links.
 
 #### Scenario: The user expands a compact group
 Test: unit — fold-state precedence and virtualized remount regression suite.
@@ -40,24 +40,9 @@ Test: unit — fold-state precedence and virtualized remount regression suite.
 
 #### Scenario: The user collapses an open nested group
 Test: unit — fold-state precedence and virtualized remount regression suite.
-- **WHEN** the user collapses a tool detail they previously opened
-- **THEN** the group remains collapsed across rerenders and virtualized remounts
-- **AND** top-level tool calls outside TurnSteps remain directly visible without aggregate headers
+- **WHEN** the user collapses a tool group or a tool detail they previously opened
+- **THEN** it remains collapsed across rerenders and virtualized remounts
 - **AND** independent Reasoning and subagent events remain in their established transcript positions
-
-### Requirement: Single tools render directly
-The transcript SHALL render a single tool without an additional group summary, preserving access to invocation, output and diff details. Groups containing multiple ordinary tools SHALL also render their calls directly without aggregate disclosures.
-
-#### Scenario: One tool between narrative events
-Test: unit — transcript projection and group-disclosure policy; native render checked visually.
-- **WHEN** a streaming or completed turn contains a group with one ordinary tool
-- **THEN** the tool row is visible without a redundant group header
-- **AND** its details remain independently expandable
-
-#### Scenario: Several consecutive tools
-Test: unit — transcript group-disclosure policy.
-- **WHEN** a group contains multiple ordinary tools
-- **THEN** every call is directly visible and only the completed TurnSteps summary displays aggregate counts
 
 ### Requirement: Compact consistent event typography
 The transcript SHALL use compact event rows and regular sans typography consistent with narrative text. Command headers SHALL use Ran command or Running command and a bounded summary in a quieter tone. Full invocation and output SHALL remain monospaced in the expanded payload. Failure colors SHALL remain semantic. Expanded command headers and payloads SHALL share a single frame. Reasoning bodies SHALL have an inset left rule distinct from narrative.
@@ -70,12 +55,12 @@ Test: unit — command projection and full invocation retention; none — native
 - **AND** reasoning has a left rule, respects explicit disclosure choices and shows the working dot spinner only while active
 
 ### Requirement: Operational events default to compact summaries
-The transcript SHALL start tool payloads closed and reasoning disclosures open, including during streaming and inside expanded turn steps. It SHALL preserve explicit user disclosure choices and expose all recorded details by expansion. Reasoning SHALL use the fixed label Thinking while active and Thought when complete. Its content SHALL appear in the body, open by default with explicit user collapse preserved. The reasoning arrow SHALL remain visible at rest.
+The transcript SHALL start tool payloads closed and reasoning disclosures open, including during streaming and inside expanded turn steps; tool groups follow the live-open, finished-collapsed default. It SHALL preserve explicit user disclosure choices and expose all recorded details by expansion. Reasoning SHALL use the fixed label Thinking while active and Thought when complete. Its content SHALL appear in the body, open by default with explicit user collapse preserved. The reasoning arrow SHALL remain visible at rest.
 
 #### Scenario: Interleaved reasoning and tools
 Test: unit — transcript disclosure defaults and content preview; native render acceptance.
 - **WHEN** a turn contains repeated reasoning and ordinary multi-tool groups
-- **THEN** individual tool rows display directly without group counters, while tool payloads stay closed and reasoning details start open
+- **THEN** each tool run displays behind its group summary, while tool payloads stay closed and reasoning details start open
 - **AND** opening an event reveals its existing detail content
 - **AND** explicit fold choices remain authoritative
 
@@ -304,7 +289,7 @@ Test: none — native GPUI visual validation.
 - **THEN** their neutral backgrounds match without a black fill
 
 ### Requirement: File edits show a bounded live typing preview
-Write/Edit cards SHALL display progressive generated content in a 72px collapsed viewport, with at most 15 recent lines, bottom aligned after three lines. Text SHALL wrap with no horizontal scrolling. Partial input refreshes SHALL be time gated at 100ms after initial semantic previews, preserving bounded decoding and final content delivery. Active cards SHALL omit syntax highlighting and show filename shimmer and a spinner. Completion SHALL replace activity with line statistics and expansion affordances, requesting syntax highlighting after 50ms. Header and collapsed body SHALL expand the final file up to 200px with vertical scrolling. Errors SHALL remain visible.
+A Write/Edit row SHALL show filename shimmer and a spinner while its content is generated, and line statistics once complete. Opening the row SHALL show its diff card: progressive generated content in a 72px viewport with at most 15 recent lines, bottom aligned after three lines, while active; the authoritative diff, expandable up to 200px with vertical scrolling, once complete. Text SHALL wrap with no horizontal scrolling. Partial input refreshes SHALL be time gated at 100ms after initial semantic previews, preserving bounded decoding and final content delivery. Active previews SHALL omit syntax highlighting; completion SHALL request syntax highlighting after 50ms. Errors SHALL remain visible.
 
 #### Scenario: Small incremental input chunks
 Test: unit — harness partial input decoder.
@@ -314,7 +299,7 @@ Test: unit — harness partial input decoder.
 
 #### Scenario: Compact generated tail
 Test: unit — ui file_change projection; none — native GPUI layout and shimmer.
-- **WHEN** Write or Edit generates more than three lines
+- **WHEN** an opened Write or Edit row generates more than three lines
 - **THEN** at most 15 generated lines are bottom aligned in a 72px viewport
 - **AND** completion restores the authoritative diff and permits expansion to 200px
 
@@ -371,3 +356,18 @@ Test: unit — transcript viewport regressions; none — native streaming review
 - **WHEN** a file card below the current user row changes height
 - **THEN** the virtualized list updates its measured layout while preserving the reading position
 - **AND** no sticky user-message geometry is required
+
+### Requirement: Ordinary tool runs fold into a tree group
+The transcript SHALL render each run of consecutive ordinary tools as one group with a collapsible summary header that counts the calls by kind and failures (for example "Ran 6 commands · 1 failed"). Beneath an open header each call SHALL render as a child row connected by tree branches: a trunk under the header icon, a rounded elbow and a branch to each child. Connector branches SHALL reveal with each arriving row and SHALL appear complete under reduced motion. The group that a streaming turn is writing into SHALL default open; finished groups and groups inside TurnSteps SHALL default collapsed. An explicit toggle SHALL persist across rerenders and virtualized remounts. Agent and spawn links SHALL never fold behind a header. File Write/Edit calls SHALL be rows of the same group and SHALL NOT split a run of tools.
+
+#### Scenario: A live turn runs several commands and edits a file
+Test: unit — transcript projection (one group, summary, live default open); none — native GPUI visual acceptance of connectors.
+- **WHEN** a streaming turn runs commands, edits a file and runs more commands without narrative between them
+- **THEN** one group shows a summary header with every call, the edit included, as tree children
+- **AND** the group stays open while the turn writes into it
+
+#### Scenario: A finished group
+Test: unit — group disclosure defaults and fold precedence.
+- **WHEN** the turn moves past a group or completes
+- **THEN** the group shows only its summary header until the user opens it
+- **AND** a group the user opened or closed keeps that choice
