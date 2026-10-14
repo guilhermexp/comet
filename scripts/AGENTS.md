@@ -4,13 +4,15 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-Os scripts de execução, verificação e distribuição, incluindo `cargo-verify.py` (target temporário e limite de disco para testes Cargo locais), o runner nativo `cargo-macos-runner` (identidade macOS), `dev-demo.sh` (demo local offline), `e2e-smoke.sh` (smoke multi-device), `package-linux.sh`/`package-macos.sh` (distribuição) e `omp-dev` (launcher de OMP para desenvolvimento).
+Os scripts de execução, verificação e distribuição, incluindo `cargo-verify.py` (target temporário e limite de disco para testes Cargo locais), o runner nativo `cargo-macos-runner` (identidade macOS), `ui-sharpness-monitor.py` / `ui_sharpness.py` (observação nativa e classificação relativa de nitidez), `dev-demo.sh` (demo local offline), `e2e-smoke.sh` (smoke multi-device), `package-linux.sh`/`package-macos.sh` (distribuição) e `omp-dev` (launcher de OMP para desenvolvimento).
 
 ## Ownership
 
 Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto — se um script começou a decidir comportamento, o lugar é uma crate.
 
 ## Local Contracts
+
+- `ui-sharpness-monitor.py` observa somente uma janela Zeron já aberta: não lança o app, não altera providers, preferências ou renderer e não envia capturas à rede. CoreGraphics identifica/valida a janela e `screencapture` produz PNG sem perdas; metadata registra bounds e razão observada entre pixels e pontos, não `contentsScale` interno nem contagem de repaints. Pillow/NumPy são dependências explícitas, sem instalação automática. `--analyze` reprocessa PNGs sem APIs nativas. O detector separa contraste, movimento/conteúdo e candidatos a blur espacial; pixels estáveis não comprovam ausência de desfoque constante. Enter marca incidente percebido. Logs e imagens ficam locais, privados e limitados por duração, disco e orçamento; não sobrescrever uma rodada existente. Uso e limites em [`../docs/ui-sharpness-monitor.md`](../docs/ui-sharpness-monitor.md).
 
 - `.cargo/config.toml` usa `cargo-macos-runner` somente no macOS. O headed `zeron` sem argumentos ou com URL `zeron://` executa de `Zeron.app` ao lado do artefato Cargo, com manifest/ícone de `dist/macos`. Isso evita que cmux reconheça o binário cru como instância duplicada do terminal e o encerre. O runner faz exec direto, preserva perfil, cwd, ambiente, stdio, argumentos e sinais; CLI, fixtures e testes passam diretamente. Não usa `open`, não intercepta SIGTERM e não altera OMP. Requer Python 3 e ferramentas macOS `sips`/`iconutil`.
 
@@ -53,6 +55,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 | `test-browser-storage.py` | integration — WebKit real, HTTP sintético, cookies/IndexedDB/localStorage, reabertura, perfis isolados, lock e permissões | `xvfb-run -a python3 scripts/test-browser-storage.py --helper <zeron-webkit>` (Linux) · `python3 scripts/test-browser-storage.py --fixture <browser-fixture>` (fixtures Linux/macOS isoladas) |
 | `cargo-macos-runner` | integration + QA nativo: bundle, argumentos, cwd/env/stdio/status, CLI/test passthrough, rebuild e sinais | `python3 scripts/test-cargo-macos-runner.py` · `cargo run` no cmux |
 | `cargo-verify.py` | integration — target descartado no sucesso/falha/sinal, filho morto junto com wrapper em SIGKILL, recusa por falta de disco e exclusão mútua entre verificações | `python3 scripts/test-cargo-verify.py` (sem compilar Rust) |
+| `ui_sharpness.py` / `ui-sharpness-monitor.py` | unit + integration — Gaussian conhecido, contraste afim, movimento/conteúdo, PNGs reais, marcas, limites, perda do alvo e relatório; smoke nativo observa apenas o app já aberto | `python3 -m unittest discover -s scripts/tests -p 'test_ui_sharpness*.py' -v` · `python3 scripts/ui-sharpness-monitor.py --duration 5` |
 | `dev-demo.sh` | none — ferramenta de dev; validação é usar | `scripts/dev-demo.sh` |
 | `seed-demo-workers.py` | integration — fixture consumido pelo bootstrap real | `cargo test -p zeron-workers-unpeel --test dev_demo_fixture` |
 | `package-voice-runtime.py` / `codex-voice-remote-smoke.py` | integration — inventário/checksum/plataforma, protocolo, timeout e cleanup offline | `python3.12 -m unittest discover -s scripts/tests -p 'test_voice_packaging.py'` · `python3.12 -m unittest discover -s scripts/tests -p 'test_voice_remote*.py'` |

@@ -23,6 +23,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 |---|---|
 | Build do app (membro padrão do workspace) | `cargo build` |
 | Dev nativo (macOS com identidade Zeron) | `cargo run` |
+| Monitor de nitidez nativa (macOS, app já aberto) | `python3 scripts/ui-sharpness-monitor.py` · [guia](docs/ui-sharpness-monitor.md) |
 | Suite completa | `cargo test --workspace` |
 | Testes de uma crate | `cargo test -p zeron-ui` |
 | Verificação Cargo local no macOS/Linux | `scripts/cargo-verify.py -- cargo test -p zeron-ui` |
