@@ -171,6 +171,15 @@ fn start(session_id: &str, session_dir: &Path) -> Result<SessionHookJournalIngre
                 Err(_) => break,
             }
         }
+        // Shutdown can arrive during the accept backoff, after the grace has
+        // already elapsed. Drop joins this thread, so an eligible snapshot is
+        // written before the caller observes the journal.
+        let _ = reconcile_last_hook_snapshot(
+            &path,
+            &mut sequence,
+            &mut last_entry,
+            &mut reconciled_snapshot_identity,
+        );
     });
     Ok(SessionHookJournalIngress {
         port,
