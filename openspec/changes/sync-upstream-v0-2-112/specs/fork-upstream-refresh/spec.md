@@ -24,6 +24,16 @@ The application SHALL support device-local worktree location preferences while p
 - **WHEN** a Chat creates a worktree with a device location preference
 - **THEN** creation uses that location and still follows the shared worktree lifecycle and reports setup errors without abandoning ownership
 
+#### Scenario: Ancestor location does not falsely imply a nested checkout
+- **Test:** unit
+- **WHEN** the chosen location contains the repository but the common hashed destination is outside that repository
+- **THEN** creation is allowed, while a destination inside the repository is refused before any checkout or branch is created
+
+#### Scenario: Changing the destination does not skip historical preparation
+- **Test:** integration
+- **WHEN** setup failed for an owned checkout and the device's location preference changes before retry
+- **THEN** retry prepares that same registered checkout through the ownership journal rather than treating it as external
+
 ### Requirement: Accepted desktop features coexist with fork surfaces
 
 The application SHALL expose PR side panes, adaptive Session information, file multiselect, overscroll and idle harness icons without removing Details/Workers/Usage, the right-side terminal or Enter/Steer.

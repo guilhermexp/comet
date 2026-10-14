@@ -50,6 +50,14 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   do composer não retorna. Worktree location vive no card de Settings → General
   dirigido ao device por Get/SetWorktreeSettings. `apply_shell_settings` salva
   largura de PR pane e ocultação explícita de Session information.
+- Session information aparece ao lado do Chat somente quando a coluna de
+  leitura configurada cabe sem estreitar. Na coluna estreita, abre como overlay
+  efêmero dismissível por clique fora. Reserva considera as larguras animadas de
+  Sidebar/Files/Right/Details e `COLUMN_GUTTER`; reveal usa o relógio do Shell.
+- PRs abertos no Chat ou contexto Worker selecionado são abas vivas no right
+  host daquele contexto. O board possui pane próprio com histórico, ciclo de
+  teclado, reorder e menu de fechar. Trocar conta/perfil fecha browser views e
+  limpa caches/views de PR sem restaurar terminal no rodapé.
 
 - A coluna Details tem só a view Details (sem faixa de abas). Árvore de arquivos e Changes vivem em uma única instância do explorer Files (`files/`); não restaurar `files/sections.rs` nem uma segunda lista Subagents/Chats nessa surface. New File/New Folder do explorer usam `files/create.rs` (pai do novo item, validação do nome) e o ícone Material de arquivo é `material_icons.rs`. O Details só abre arquivo pelos Context sources do Session card (`DetailsSidebarEvent::OpenFile`).
 - **Shell divide metadata e larguras pelo que está efetivamente visível**: Details substitui as rows de device/projeto/branch do SessionInfo somente enquanto recebe largura maior que zero; quando a janela comprime Details a zero, SessionInfo conserva essas rows. O divisor de Details restaura sua própria largura preferida; o reset de Right mantém o comportamento de rebalancear as colunas. Transições genéricas de largura de painel usam `clocked_tween` (duração/curva de `WidthTween::new`) e as animações de coluna usam `panel_tween`; ambos pegam `render_time`/`motion_time`, que usam relógio monotônico em produção e `test_time` nos testes GPUI. Não recriar a transição de um painel com `WidthTween::new` depois do primeiro frame, pois isso mistura relógios e pode pular a geometria inicial na fixture determinística. Pull Requests compartilha General ao alternar o catálogo de Settings e usa uma região de arrasto própria na titlebar. `show_notice` entrega a notificação pelo toaster atual e marca a ponte legada do Render como entregue, evitando uma segunda notificação.

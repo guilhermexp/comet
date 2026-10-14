@@ -1,0 +1,309 @@
+---
+schema_version: 1
+id: 20261014T134207Z-2e747f25
+skill_version: 1.1.0
+started_at: '2026-10-14T13:42:07Z'
+finished_at: '2026-10-14T15:09:48.624010+00:00'
+request: Integrar PR23/upstream v0.2.112 por merge real no worktree sync/upstream-v0.2.112, preservar
+  contratos do fork, validar gate Linux direto e entregar commits locais/report sem push.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: origin
+  requested_ref: sync-fork/0d6e4079e367/75b72602a0348f5697c7affc9f84afe367b763fb
+  target_sha: 75b72602a0348f5697c7affc9f84afe367b763fb
+  previous_integrated_sha: 54954e4d22bd4d78b2e2c7160a913b1af548dc79
+  target_label: v0.2.112
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: main
+  target_branch: sync/upstream-v0.2.112
+  initial_sha: eefb5e02e53c76ec6c8adf853adf05513bc89842
+  observed_target_sha: eefb5e02e53c76ec6c8adf853adf05513bc89842
+  result_sha: 2965a58b3ad0190a3e52064ad3cdd6e1c9386935
+  result_sha_note: Validated source revision; subsequent documentary/archive commits and final HEAD gate
+    are recorded in the local report, avoiding self-referential record hashes.
+  initial_worktree: clean
+strategy:
+  operation: merge
+  reason: Preserve shared ancestry; fixed upstream snapshot, per-file three-way resolution, no global
+    ours/theirs.
+  planning_sha: e81fea005d7deed5ba6945ceb5fa01007e0f3b5c
+  merge_sha: b0c76e48e61e801ab815df0c7dd39a0c35bcb59c
+  merge_parents:
+  - e81fea005d7deed5ba6945ceb5fa01007e0f3b5c
+  - 75b72602a0348f5697c7affc9f84afe367b763fb
+  repair_commits:
+  - 074c53efa0e1176f9dd5f3c0abd9cfd59ce05e0e
+  - 2965a58b3ad0190a3e52064ad3cdd6e1c9386935
+changes:
+  incoming_range: 54954e4d22bd4d78b2e2c7160a913b1af548dc79..75b72602a0348f5697c7affc9f84afe367b763fb
+  incoming_count: 14
+  summary: Scratch/home names-only, device Chat worktree preferences, responsive Session information,
+    PR panes, persistent isolated browser, Files multiselect, bounce, quota reset tooltips and iOS grouping.
+  imported:
+  - sha: edb23db4b409df035808e38c44180d1c7a2d2d7e
+    subject: 'iOS: Group by Project setting for the Sessions page (#875)'
+    decision: TAKE
+    reason: iOS device-local Project grouping
+  - sha: 1bc74d5dad3aad4579e5c40ab996bbacb5e927db
+    subject: Projectless chats get their own folder; home is never indexed by fff (#876)
+    decision: ADAPT
+    reason: Scratch/home-index with fork grants and host-owned paths
+  - sha: 50e33711afb0ba76cf797409c151a0948a39decd
+    subject: Run the MCP bridge on two worker threads instead of one per core (#843)
+    decision: TAKE
+    reason: MCP bridge uses two worker threads; grants unchanged
+  - sha: 9d943019ff15dc9c544be85932ea1565a593d17a
+    subject: Opt out of macOS one-time-code AutoFill (#842)
+    decision: ADAPT
+    reason: AutoFill opt-out; fork microphone/identity wording retained
+  - sha: e54c3a8610d73d522421766f159a16e67c65d13c
+    subject: Let dropped files from any folder attach on macOS (#812)
+    decision: TAKE
+    reason: Unified unsandboxed entitlements; own packaging policy retained
+  - sha: b40ac5ee31b59e98f283fc10d1132895afdae566
+    subject: Bump version to v0.2.112
+    decision: SKIP
+    reason: Fork remains0.2.18
+  - sha: c8c717862ddf3170288bffefb9a5153c8b2954ed
+    subject: 'Session card: show beside a roomy transcript, float over a tight one (#867)'
+    decision: ADAPT
+    reason: Responsive card with live Details,16px gutters and Shell clock
+  - sha: 09beace00fbd4d521bf1e7fd4f591e5ab13162fb
+    subject: 'Composer: show usage reset times on hover (#873)'
+    decision: ADAPT
+    reason: Deleted Usage ring stays absent; resets ported to Details/Accounts
+  - sha: 053ce2eac0da83a008f99f79acc365468e7d6831
+    subject: Persist embedded browser sessions across tabs and app restarts (#573)
+    decision: ADAPT
+    reason: Persistent identity-isolated browser stores; coverage in own CI
+  - sha: 66524017f01fd383f61843b77fc34bd9dfd5b332
+    subject: Open pull requests in side panes beside the board and the chat (#866)
+    decision: ADAPT
+    reason: PR panes/registries preserve canonical device and credential scope
+  - sha: 2d40f8df6f06c72199eb8177a18cd06e47824573
+    subject: Overscroll bounce effect for the transcript, sidebar and file tree at their ends (#821)
+    decision: TAKE
+    reason: Paint-only bounce on existing surfaces
+  - sha: 2c2963aaeea9dcd787994bdc629b64c91af053c8
+    subject: Select several entries in the file tree (#774)
+    decision: TAKE
+    reason: Multiselect and ordered guarded mutations in shared Files explorer
+  - sha: 01a399db18ea03105acbd55732038764dae83172
+    subject: Add per-device custom worktree locations (#530)
+    decision: ADAPT
+    reason: Engine Chat preferences use common hashed lifecycle/journal; Windows two-step refused; actual
+      nesting validation
+  - sha: 75b72602a0348f5697c7affc9f84afe367b763fb
+    subject: Show harness icons in idle side chat and subagent tabs (#725)
+    decision: ADAPT
+    reason: Idle side-chat harness icons retain doc-keyed subagent avatar/spinner
+  fork_prs:
+  - number: 23
+    head_sha: 75b72602a0348f5697c7affc9f84afe367b763fb
+customizations:
+  preserved:
+  - Version0.2.18, own updater feed, fork identity and vendored zui/punctuation rules.
+  - Workers/OMP/Kimi, root MCP grants, RunRequest.mcpNone, Enter/Steer and attachment transfers.
+  - Details Device/Workers/Usage, worked-project totals, independent Details width and right-only terminal.
+  - Credential/device-scoped PR routing/cache, bounded ProcessRunner, common worktree ownership/preparation/hooks.
+  - Deleted usage ring, legacy Details Files and OMP Live Voice remain absent.
+  adapted:
+  - iOS device-local Project grouping
+  - Scratch/home-index with fork grants and host-owned paths
+  - MCP bridge uses two worker threads; grants unchanged
+  - AutoFill opt-out; fork microphone/identity wording retained
+  - Unified unsandboxed entitlements; own packaging policy retained
+  - Fork remains0.2.18
+  - Responsive card with live Details,16px gutters and Shell clock
+  - Deleted Usage ring stays absent; resets ported to Details/Accounts
+  - Persistent identity-isolated browser stores; coverage in own CI
+  - PR panes/registries preserve canonical device and credential scope
+  - Paint-only bounce on existing surfaces
+  - Multiselect and ordered guarded mutations in shared Files explorer
+  - Engine Chat preferences use common hashed lifecycle/journal; Windows two-step refused; actual nesting
+    validation
+  - Idle side-chat harness icons retain doc-keyed subagent avatar/spinner
+  removed:
+  - Obsolete single-PR-detail state replaced by device-keyed pane/tab registries.
+  - Incoming duplicate forwarding/method tables refused; methods live only in rpc_methods!.
+  - Windows-only two-step creation and dependent long-file workaround test refused under existing platform
+    policy.
+conflicts:
+- files:
+  - .github/workflows/macos.yml
+  decision: 'SKIP: mantém deletado; storage smoke portado ao CI próprio do fork.'
+- files:
+  - .github/workflows/ui-tests.yml
+  decision: 'ADAPT: união aditiva dos filtros/gates do fork; storage smoke Linux e macOS nas lanes existentes.'
+- files:
+  - Cargo.lock
+  decision: 'ADAPT: regenerado por cargo após manifestos; mantém0.2.18 e mesmas versões de pacotes; adiciona
+    dependência engine→same-file já locked.'
+- files:
+  - Cargo.toml
+  decision: 'SKIP versão: mantém0.2.18, path gpui/zui e feed do fork.'
+- files:
+  - crates/engine/src/lib.rs
+  decision: 'TAKE: módulo worktree_settings junto de home_index e boot scratch; módulos Workers/OMP preservados.'
+- files:
+  - crates/engine/src/repos.rs
+  decision: 'ADAPT: preferências/scratch no manager existente; ProcessRunner, hash de repo, journal, hooks
+    e settlement comuns; recusa algoritmo Windows paralelo.'
+- files:
+  - crates/engine/src/rpc.rs
+  decision: 'ADAPT: handlers novos no registry único; mantém chatId xor cwd/canvas, resolver scratch e
+    autorização local/Worker.'
+- files:
+  - crates/engine/src/sessions.rs
+  decision: 'ADAPT: resolver scratch emprestado do OnceLock; preserva grants raiz, admissão/restart e
+    parent Worker.'
+- files:
+  - crates/engine/tests/workspace_files.rs
+  decision: 'ADAPT: integra home legado/scratch no helper isolado do fork; corrige nome exato do subprocesso
+    para executar1 teste real.'
+- files:
+  - crates/engine/tests/worktree_on_run.rs
+  decision: 'ADAPT: settings RPC, isolamento de ambiente e lifecycle comum; mantém setup/copy/retry/reuse
+    e rejeição de path Windows; recusa só teste dependente do algoritmo não suportado.'
+- files:
+  - crates/proto/src/lib.rs
+  decision: 'TAKE: device_paths/projectless coexistem com chat_mentions do fork.'
+- files:
+  - crates/rpc/src/lib.rs
+  decision: 'ADAPT: declarações Get/SetWorktreeSettings só em rpc_methods! de method.rs; não duplica forwarding.'
+- files:
+  - crates/ui/examples/browser-fixture.rs
+  decision: 'ADAPT: storage runner novo + fixture test_shell/Linux do fork; preserva foco/geometria/transcript
+    links.'
+- files:
+  - crates/ui/src/account_usage.rs
+  decision: 'SKIP presenter: mantém deletado; #873 portado a Details Usage/Accounts.'
+- files:
+  - crates/ui/src/composer.rs
+  decision: 'ADAPT: cwd scratch no helper create_chat_mutation do fork; Enter/Steer, attachments e mcpNone
+    preservados.'
+- files:
+  - crates/ui/src/pull_request_detail.rs
+  decision: 'ADAPT: toolbar/pane novos com target device, cache por credencial/device e erros sanitizados.'
+- files:
+  - crates/ui/src/settings.rs
+  decision: 'ADAPT: General Worktrees e persistência de PR width/card hidden; preserva Projects/Accounts
+    e Details widths.'
+- files:
+  - crates/ui/src/shell.rs
+  decision: 'ADAPT: registries/panes PR, card responsivo e browser identity; preserva Workers, live tabs,
+    Details, clocks, composer vivo e terminal à direita.'
+- files:
+  - crates/ui/src/shell/navigation_focus.rs
+  decision: 'ADAPT: PR pane no fallback de foco; mantém lifecycle de Settings e terminal do fork.'
+- files:
+  - crates/ui/src/shell/panel_layout.rs
+  decision: 'ADAPT: resize PR com Details independente; não restaura Terminal footer.'
+- files:
+  - crates/ui/src/shell/session_info.rs
+  decision: 'ADAPT: auto-fit/overlay com Details vivo e gutter16px; clocked_tween e metadata só quando
+    efetivamente visível.'
+- files:
+  - dist/macos/Info-dev.plist
+  decision: TAKE AutoFill opt-out; mantém texto de microfone e identidade do fork.
+- files:
+  - dist/macos/Info.plist
+  decision: TAKE AutoFill opt-out; mantém texto de microfone e versão/identidade do fork.
+verification:
+- command: git fetch --no-tags origin sync-fork/0d6e4079e367/75b72602a0348f5697c7affc9f84afe367b763fb
+  result: passed
+  observed: FETCH_HEAD equals fixed upstream; no tag fetch.
+- command: cargo fmt --all before merge
+  revision: e81fea005d7deed5ba6945ceb5fa01007e0f3b5c
+  result: passed
+  observed: No pre-merge formatting delta.
+- command: cargo update --workspace --offline
+  result: passed
+  observed: Locking0 packages; package IDs/versions unchanged, existing same-file added to engine dependencies.
+- command: cargo check --workspace --all-targets at initial merge
+  revision: b0c76e48e61e801ab815df0c7dd39a0c35bcb59c
+  result: failed
+  exit: 101
+  observed: E0425 live_main_width lost with card refactor; E0061 two new PR header calls lacked fork active-state
+    bool. Repaired074c53ef.
+- command: cargo check --workspace --all-targets in detached /tmp baseline
+  revision: eefb5e02e53c76ec6c8adf853adf05513bc89842
+  result: passed
+  exit: 0
+  observed: Same check0 in482.55s; compiler errors are merge regressions.
+- command: Isolated real Repos worktree executable before/after nesting repair
+  result: passed_after_repair
+  observed: Before074c53ef runtime1 rejects safe ancestor root; after2965a58b runtime0 passes persistence,
+    failed setup ownership, retry after setting change, idempotence and deletion. Private HOME/XDG/UNPEEL/journal/hooks,
+    no provider/app runtime.
+- command: cargo test -p zeron-engine --lib repos::tests::worktree_location_rejects_only_nested_destinations
+    -- --exact
+  revision: 2965a58b3ad0190a3e52064ad3cdd6e1c9386935
+  result: passed
+  exit: 0
+  observed: 1 passed; original no-mutation rejection assertions retained on actually nested root, plus
+    sibling/ancestor real Git registration.
+- command: cargo fmt --all -- --check && cargo check --workspace --all-targets && cargo test -p zeron-ui
+    --lib && cargo test -p zeron-engine --lib && cargo test -p zeron-proto -p zeron-rpc
+  revision: 2965a58b3ad0190a3e52064ad3cdd6e1c9386935
+  result: passed
+  exit: 0
+  observed: All5 commands0. UI2478 passed/1 inherited native ignore (explicit Xvfb test separately passed);
+    engine657 passed/4 external ignores; proto102, RPC24+15 integration passed/1 live edge ignore.
+- command: cargo test -p zeron-engine --test projectless --test worktree_on_run --test device_routing
+    --test workspace_files
+  revision: 2965a58b3ad0190a3e52064ad3cdd6e1c9386935
+  result: passed
+  exit: 0
+  observed: '25 passed: device routing11, projectless4, workspace files8, worktree-on-run2; zero ignored.'
+- command: xvfb-run -a python3 scripts/test-browser-storage.py --helper <private compiled helper>
+  result: passed
+  exit: 0
+  observed: All7 real WebKit storage persistence/isolation/delete/locking/permissions groups pass; no
+    app launch.
+- command: xvfb-run -a cargo test -p zeron-ui --lib browser::linux::storage_tests::profile_contexts_share_a_live_helper_and_release_its_lock_on_shutdown
+    -- --ignored --exact
+  revision: 2965a58b3ad0190a3e52064ad3cdd6e1c9386935
+  result: passed
+  exit: 0
+  observed: 1 passed,0 ignored; real helper PID sharing/drop/reopen lock release under private cache.
+- command: bun x @fission-ai/openspec validate sync-upstream-v0-2-112 --strict; bun x @fission-ai/openspec
+    validate --specs
+  result: passed
+  exit: 0
+  observed: Change valid;63 main specs passed0 failed; existing long-requirement warnings remain.
+- command: Incoming final-upstream blame/three-way semantic audit
+  result: passed
+  observed: 9943 attributed lines,9645 normalized present;298 inspected candidates:69 formatting,229 intentional
+    adaptations/refusals,0 unclassified.
+- command: bash -n scripts/package-macos.sh && bash -n scripts/run-macos-dev.sh; plistlib metadata parse
+  result: passed
+  exit: 0
+  observed: Scripts syntax and plists0, fork version0.2.18/refused workflow absence checked; not macOS
+    runtime proof.
+limits:
+- No app build, packaging/install or native visual AppKit/focus/clipping/AutoFill/cloud-placeholder/iOS
+  runtime proof.
+- No remote CI/workflow/deploy/PR/main integration or publication; inherited live-provider/private-snapshot/npm-install/live-edge
+  ignored scenarios not executed.
+- Windows-specific two-step/long-file behavior intentionally refused; no native Windows execution.
+- Graft command/index unavailable; exact Git incoming/stage spans used and context graph not refreshed.
+references:
+- docs/upstream-sync.md
+- openspec/changes/archive/2026-10-14-sync-upstream-v0-2-112/
+- openspec/specs/fork-upstream-refresh/spec.md
+- https://github.com/guilhermexp/comet/pull/23
+- .tmp/verify/WT-20261014-comet-integra-upstream-v0-2-112-pr-23-preservando-contratos/report.md
+- .tmp/verify/WT-20261014-comet-integra-upstream-v0-2-112-pr-23-preservando-contratos/gate.log
+outcome: prepared
+pending:
+- Main publishes local commits and merges PR23; final integration SHA/delivery updated by Main.
+delivery:
+  integration: pending
+  target_branch: main
+  commit: null
+  pr: https://github.com/guilhermexp/comet/pull/23
+  publication: not_requested
+  record_pushed: false
+  deploy: not_requested

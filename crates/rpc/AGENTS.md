@@ -15,6 +15,9 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - `GenerateCommitMessage` é unary tipado, forwardable, deadline de relay 100s; a engine aplica budget próprio de 90s também no IPC. Geração usa a autorização de checkout de Changes e devolve só um rascunho editável.
 
 - SearchGitHistory e ResolveGitAvatars são unary tipados e relay-forwardable no registry. Não recriar listas de forwardable/deadlines no handler.
+- GetWorktreeSettings e SetWorktreeSettings são unary tipados e forwardable no
+  registry único, com deadline de relay de 30s. Só o host destino valida e
+  persiste a preferência device-local; não criar tabela paralela de forwarding.
 
 - `SearchHomeFolders`, `SearchWorkspaceFiles`, `WarmWorkspaceSearch` e `SearchWorkspaceContent` são unary tipados e relay-forwardable; a engine de destino limita e autoriza o índice local. `WatchCheckoutChangeRequest` é stream; `ListChangeRequestPage`, `GetChangeRequestRepository`, `GetChangeRequest`, `GetChangeRequestDiff` e `PostChangeRequestComment` são unary tipados e relay-forwardable. Acesso de PR que usa um checkout exige `authorized_checkout`, inclusive para Worker ligado a projeto local. Não criar tabelas de roteamento/deadline paralelas.
 
