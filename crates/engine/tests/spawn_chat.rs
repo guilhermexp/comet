@@ -409,7 +409,14 @@ async fn projectless_parent_spawns_a_projectless_child_and_no_endpoint_drops_ses
     let child = core.workspace.chat(child_id).unwrap().unwrap();
     assert_eq!(child.space_id, None);
     assert_eq!(child.device_id, core.device_id);
-    assert_eq!(child.cwd.as_deref(), Some("~"));
+    // A projectless parent now runs in its own scratch folder (upstream #876);
+    // the spawned child keeps working in the parent's folder, as it did when
+    // both ran in `~`.
+    let parent = core.workspace.chat("loose").unwrap().unwrap();
+    assert!(zeron_proto::projectless::is_scratch_cwd(
+        parent.cwd.as_deref().unwrap()
+    ));
+    assert_eq!(child.cwd, parent.cwd);
     assert_eq!(child.origin_chat_id.as_deref(), Some("loose"));
     core.shutdown().await;
 }

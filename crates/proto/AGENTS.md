@@ -44,6 +44,10 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - `Session.running_subagents` é aditivo, default zero em peers antigos. `view::running_subagents` aplica a mesma janela de staleness de status; contagem expirada nunca mantém badge de execução. Contexto e estatísticas do fork continuam campos independentes.
 
 - `Session.last_completed_turn` is optional/defaulted completion evidence. Interrupts, errors and liveness expiry do not advance it; subsequent Working and heartbeat rows retain it.
+- `projectless` e `device_paths` são helpers puros de naming/capability e paths
+  do device destino. `WorktreeSettings`/`WorktreeSettingsStatus` são preferências
+  device-local, com defaults em `WorktreeSettings`, não entidades CRDT; o cwd scratch
+  portátil é resolvido somente pelo host proprietário.
 
 ## Work Guidance
 

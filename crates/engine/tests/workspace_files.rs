@@ -734,7 +734,7 @@ mod upstream_write {
             let output = tokio::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "projectless_home_is_required_for_files_catalogs_and_terminal",
+                    "upstream_write::projectless_home_is_required_for_files_catalogs_and_terminal",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
@@ -749,6 +749,10 @@ mod upstream_write {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the isolated fixture must execute its test, not match zero tests"
+            );
             return;
         }
 
@@ -756,6 +760,13 @@ mod upstream_write {
         let core = assemble(&temp.path().join("data"), "device-missing-home");
         core.workspace
             .create_chat("chat-missing-home", None, Some(&core.device_id), None, None)
+            .unwrap();
+        // Legacy chats still require home; new scratch chats do not.
+        core.workspace
+            .set_chat_cwd("chat-missing-home", "~")
+            .unwrap();
+        core.workspace
+            .create_chat("chat-scratch", None, Some(&core.device_id), None, None)
             .unwrap();
         let explicit = temp.path().join("explicit-folder");
         std::fs::create_dir(&explicit).unwrap();
@@ -799,6 +810,13 @@ mod upstream_write {
             )
             .await
             .expect("an explicit folder remains usable without a home variable");
+        client
+            .call(
+                methods::LIST_WORKSPACE_DIRECTORY,
+                serde_json::json!({ "chatId": "chat-scratch" }),
+            )
+            .await
+            .expect("a scratch folder needs no home variable");
         core.shutdown().await;
     }
 }

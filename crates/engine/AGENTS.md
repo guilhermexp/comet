@@ -36,7 +36,26 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 - Git History pesquisa apenas refs públicas em ordem topológica, com paginação e pontas de branches independentes da página. Comparação ahead/behind consulta refs locais e nunca faz fetch implícito. Toda chamada Git continua no ProcessRunner. Metadados/avatar GitHub são best-effort, com timeout e limites durante a leitura; RPC de imagens limita o total bruto a 512 KiB.
 
-- A busca de nomes e conteúdo usa um único `WorkspaceSearch` compartilhado por `Repos`: indexa a home e workspaces, com leases e limites próprios; `SearchFiles` e `WorkspaceFiles` não mantêm índices paralelos. A busca de workspace autoriza o alvo antes de consultar o índice e revalida escapes por symlink nos resultados.
+- Workspaces compartilham um único `WorkspaceSearch` de nomes/conteúdo em
+  `Repos`; `SearchFiles` e `WorkspaceFiles` não criam índices paralelos. Home
+  usa `HomeIndex` limitado e names-only com exclusões cloud/machine/dependency:
+  fff nunca indexa a home e não existe busca de conteúdo nela. Workspace search
+  autoriza o alvo antes da consulta e revalida escapes por symlink nos resultados.
+- Chats sem Project usam `projectless-scratch-v1` quando o host oferece a
+  capability: o cwd portátil resolve em `data_dir/scratch` do host. Chats
+  legados com `~` conservam a home para resume. Runs, Files, catálogos e
+  terminais compartilham o resolvedor do device dono.
+- Preferências de destino de novos worktrees de Chat vivem em
+  `data_dir/worktree-settings.json`; `ZERON_WORKTREES_DIR` vence custom/default.
+  Criação captura o destino uma vez e usa o serviço comum de Workers, diretório
+  de repo com hash, journal e hooks/preparo. Não move cwd existente nem muda
+  destinos de Workers standalone. Retry valida registro Git e consulta journal
+  independentemente do destino atual; ausência de registro é no-op externo e
+  journal malformado falha fechado. O algoritmo Windows de criação em duas
+  etapas permanece recusado pela política de plataforma do fork.
+  A proteção de nesting valida o destino real com hash: uma raiz ancestral do
+  repo é válida quando esse destino fica fora dele, sem usar o antigo basename
+  do upstream como proxy.
 
 - A integração GitHub de Change Requests vive em `source_control.rs` e `source_control_review_threads.rs`. Continua usando o `ProcessRunner` compartilhado (timeout, teto de stdout/stderr, `kill_on_drop` e grupos de processo); cache persistido e coalescing de leituras ficam em `change_request_store.rs`. Os RPCs de checkout passam por `authorized_checkout`, que admite somente Chat/Space local ou raiz exata de Worker linkada a um projeto local.
 
@@ -136,6 +155,9 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/chat2_host.rs` + `tests/session_publication.rs` (outbox, replay, checkpoint rejection) | unit / integration — SQLite/Loro temporários | `cargo test -p zeron-engine --test session_publication` |
 | `src/workspace_files.rs` + `tests/workspace_files.rs` + `tests/workspace_files_mutations.rs` + `tests/workspace_files_hardening.rs` + Files em `tests/device_routing.rs` | unit / integration — filesystem temporário, memória, mutação RPC, hardening (nomes Windows) e relay entre engines | `cargo test -p zeron-engine workspace_files` · `cargo test -p zeron-engine --test workspace_files_mutations` · `cargo test -p zeron-engine --test workspace_files_hardening` · `cargo test -p zeron-engine --test device_routing workspace_file_surface` |
 | `src/workspace_search.rs` + busca em `src/repos.rs` / `src/workspace_files.rs` | unit — índice compartilhado, limites e segurança de symlink | `cargo test -p zeron-engine workspace_search` · `cargo test -p zeron-engine search_files` |
+| `src/home_index.rs` + `src/worktree_settings.rs` (home names-only e preferências device-local) | unit | `cargo test -p zeron-engine --lib home_index` · `cargo test -p zeron-engine --lib worktree_settings` |
+| `src/repos.rs::worktree_location_rejects_only_nested_destinations` (recusa nesting sem criar branch; aceita sibling/ancestor hashed e registro Git real) | unit | `cargo test -p zeron-engine --lib repos::tests::worktree_location_rejects_only_nested_destinations -- --exact` |
+| `tests/{projectless,worktree_on_run,device_routing}.rs` (scratch, custom root, reuse e preparo após troca de destino) | integration — filesystem/Git e engine reais isolados | `cargo test -p zeron-engine --test projectless --test worktree_on_run --test device_routing` |
 | `src/commit_message.rs` + `recap::collect_isolated_text` | unit — staged real, isolamento, JSON inválido, limites e ausência de mutação; gate RPC em `tests/source_control_hardening.rs` é integration | `cargo test -p zeron-engine commit_message` · `cargo test -p zeron-engine recap` |
 | `src/process.rs` (teto de saída, kill de grupo, stdin e spawn) | unit | `cargo test -p zeron-engine process::` |
 | `src/rpc.rs::checkout_diff_watch_pins_multiple_paths_and_releases_on_drop` (cwd + cwds, deduplicação, pasta sem Git, retenção e liberação de todos os pins) | unit — dois repositórios temporários sem Chats, stream único e reconciliação com orphan grace curta | `cargo test --locked -p zeron-engine --lib rpc::tests::checkout_diff_watch_pins_multiple_paths_and_releases_on_drop -- --exact` |

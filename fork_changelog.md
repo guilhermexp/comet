@@ -9,6 +9,17 @@ Tracks local/private fork changes against upstream.
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
 
+## 2026-10-14 — Base upstream v0.2.112 preparada
+
+- Scratch por Chat sem Project, home names-only, worktrees de Chat com destino
+  por device, PRs em panes/abas, Session information responsiva, browser
+  persistente isolado, Files multiselect e bounce. iOS ganha Group by Project.
+- Preservados Workers/OMP/Kimi, grants MCP, Enter/Steer, Details/Usage, terminal
+  à direita, ownership/hooks comuns e versão 0.2.18. Reset de quota fica em
+  Details/Accounts; o anel removido não retorna. CI macOS continua o do fork.
+- Commits locais preparados, sem publicação:
+  [registro](.upstream-sync/history/20261014T134207Z-2e747f25.yaml).
+
 ## 2026-10-13 — Spinner do Codex interrompido e espera bloqueada
 
 - O footer de revisão de hooks (`enter review`/`trust all` com `esc close`, e a linha inteira `t trust · esc back` no detalhe) passa a ser menu. Citação, sufixo e prefixo dessa frase não bloqueiam. O pré-scan Swift do detalhe separa o caractere LF ou o caractere CRLF, porque `"\r\n"` é um Character, e corta só 0x09, 0x0A, 0x0C, 0x0D e 0x20; tab vertical e CR isolado não entram. A row mais nova `■ Conversation interrupted`, com sufixo conhecido do CLI (nenhum ou `- use /feedback if something went wrong`), derruba o spinner sem confirmar `Stop`. Draft no composer não rearma. User row já enviada seguida do composer, sufixo desconhecido nessa row mais nova, ou footer de trabalho, rearmam. `wait_for_status` de `completed`/`exited` devolve `needs_input` quando a atividade é `blocked`, antes do timeout.

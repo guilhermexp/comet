@@ -138,6 +138,7 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Ignorar `.agents`, `.claude` e `CLAUDE.md` no `.gitignore` | 7d454cfe | v0.2.102 | O fork versiona os três (skills, comandos OpenSpec, CLAUDE.md); a regra escondia arquivos novos ali |
 | Workflow macOS separado, pins de action por SHA, Dependabot | CI | v0.2.102 | O fork mantém os próprios workflows (gate por path). `macos.yml`, `dependabot.yml`, `run-macos-fixture.sh`, `cursor-sdk-update.yml` e `testflight.yml` ficam fora |
 | Instalador Linux com updater em `~/.zeron/app` | #627 | v0.2.102 | Fork sem feed próprio. Entraram só as licenças das fontes e do Parakeet |
+| Criação de worktree Windows em duas etapas e workaround de arquivos >300 unidades UTF-16 | #530 | v0.2.112 | Fork mantém o lifecycle comum Chat/Workers e ProcessRunner; algoritmo específico Windows não entra. Validação lexical de paths e rejeição de cwd não lançável foram mantidas |
 
 ## Aceito com adaptação
 
@@ -180,6 +181,9 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Busca unificada fff, conteúdo e paleta com abas | #856 | v0.2.111 | Índice único de `Repos` para home/path/content, `fff-search` pinado; métodos novos no registry tipado do fork. O picker de projetos conserva o alvo Worker restrito ao device local e libera o índice transitório ao fechar |
 | Board e inspeção nativa de Pull Requests | #484 | v0.2.111 | RPCs no registry único, erros de capability estáveis e runner Git/GitHub limitado do fork. Lookup/watch por cwd aceita Chat/Space local e checkout Worker vinculado, sem sondar paths arbitrários; badge passa o device dono |
 | Session information, painéis e menus | #677/#855 | v0.2.111 | Toggle e ações do card novos preservados; Device/Project/Branch do card ficam ocultos quando Details está aberto para evitar duplicação. Details mantém Workers, Usage e totais por Worked Project; Sonner e avisos legados do Shell coexistem. Queue drag/mentions não removem Enter/Steer |
+| Scratch de Chat sem Project e home names-only | #876 | v0.2.112 | Capability do host conserva resume legado em `~`; novo cwd resolve em `data_dir/scratch`. Home usa índice bounded separado, nunca fff/content; grants e autorização de Files/terminal permanecem |
+| Localização customizada de worktree por device | #530 | v0.2.112 | Preferência da engine entra no lifecycle comum de Chat/Workers; criação usa hash de repo e journal já existente, não outro manager. Destinos de Workers standalone não mudam. Retry consulta posse independente da preferência atual |
+| PRs em panes/abas e Session information responsiva | #866/#867 | v0.2.112 | Registros novos de abas preservam URL + device/cache de credencial. Fit usa gutters de 16px e largura efetiva de Details; utility tabs conservam 118px, avatar de subagente e terminal à direita |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
 ## Armadilhas conhecidas
@@ -202,6 +206,9 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 - **Testes do fork que o upstream reescreveu por cima.** Quando o upstream acrescenta testes num arquivo que o fork reescreveu (ex.: `engine/tests/workspace_files.rs`), os helpers dele não existem do nosso lado. Mover os testes novos para um arquivo próprio (`workspace_entry_mutations.rs`) com o cabeçalho de helpers do upstream.
 - **Auditoria de additions:** compare sempre o intervalo incoming do merge-base até o pin upstream. Comparar o fork inteiro contra o upstream confunde divergências antigas com omissões e pode apagar código exclusivo do fork.
 - **Resolver com agentes:** eles podem apagar código "morto" que outro arquivo ainda usa (por exemplo `motion::fast_tier`). A etapa de compilação precisa reconciliar isso.
+- **Trocar destino de worktree não muda a posse de checkouts existentes.** Nunca usar prefixo da raiz atual ou formato do basename para pular preparo: valide registro Git e consulte o journal comum; ausência de registro é no-op externo, estado malformado falha fechado.
+- **Session information responsiva usa o gutter do fork.** O upstream calcula com 48px; o transcript compacto usa `COLUMN_GUTTER` (16px), e Details também consome o orçamento real. Portar só o card sem essas duas alocações produz geometria errada.
+- **Guards de nesting dependem do layout real.** O root ancestral de um repo era recusado porque o upstream concatena seu basename; o serviço comum do fork cria diretório com hash fora desse repo. Valide o destino real, recuse roots internos antes de mutar e teste também a raiz ancestral válida.
 
 ## Integração v0.2.107
 

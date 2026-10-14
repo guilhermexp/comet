@@ -25,10 +25,39 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 - History tem aba própria no painel de utilitários: busca com debounce e geração, navegação/colapso no grafo, pontas de branches e colunas persistidas (visibilidade, largura, ordem e autor). Preservar âncora/seleção ao trocar visualização. Perder foco na busca não limpa o filtro: o clique deve selecionar a mesma linha que estava visível. Workers usam cwd local explícito; Chat remoto mantém targetDeviceId. Preferências são gravadas no store atual, nunca por cópia stale do Shell.
 
-- `browser/` é uma surface própria de páginas HTTP(S), com WebKit no macOS e abertura externa nos demais sistemas. Abas pertencem ao Chat, compartilham store efêmero só dentro do perfil e liberam páginas/subscriptions ao fechar. Browser não substitui `file_preview/`: documentos continuam no loader nativo existente. Browser usa proxy local apenas para hosts de preview registrados e conserva atalhos personalizados. Geometria da animação é avaliada uma vez por frame para o native clip acompanhar o painel.
+- `browser/` é a surface HTTP(S), separada de `file_preview/`. Perfis resolvidos
+  persistem website data device-local entre abas e reinícios, chaveados pela
+  instalação, workspace scope e identidade local ou usuário/organização;
+  identidade não resolvida usa store efêmero. macOS usa named WebKit stores
+  isolados quando suportados e aviso de login temporário em sistemas antigos,
+  nunca o store persistente default compartilhado. Linux inicia o helper em
+  background com diretórios privados e lock por perfil. Fechar abas libera
+  páginas/subscriptions, não a storage persistida. Preservar proxy somente para
+  hosts de preview, atalhos, native clip fracionário, uma geometria por frame e
+  retorno de foco.
 
 - Changes compartilha a mesma aba nos modos Orchestrator e Workers; o contexto Worker usa o checkout do projeto selecionado e a engine autoriza pelo link do checkout com um Space deste device.
 - `surface_chrome::tab` já define o hover dos chips inativos; consumidores não reaplicam `.hover()` no mesmo elemento, pois GPUI rejeita uma segunda configuração de hover.
+- A strip de pane usa `surface_chrome::tab_chip`; rename inline de side Chat
+  fornece `title_override` sem duplicar a geometria de close/drag. PR panes
+  preservam a identidade URL + device, inclusive cache e credencial de leitura.
+- Files multiseleção distingue cursor/âncora das raízes selecionadas. Mutações
+  revalidam cada item e seguem uma fila ordenada com holds de autosave por
+  vetor de paths, parando no primeiro outcome não aplicado. Overscroll é paint-only.
+- Details Usage mostra resets absolutos de todas as janelas no header do
+  provider, pelo formatter compartilhado com Accounts. Badge/countdown, ordem
+  de providers gerenciados e `usage_lines` permanecem; o anel de Usage removido
+  do composer não retorna. Worktree location vive no card de Settings → General
+  dirigido ao device por Get/SetWorktreeSettings. `apply_shell_settings` salva
+  largura de PR pane e ocultação explícita de Session information.
+- Session information aparece ao lado do Chat somente quando a coluna de
+  leitura configurada cabe sem estreitar. Na coluna estreita, abre como overlay
+  efêmero dismissível por clique fora. Reserva considera as larguras animadas de
+  Sidebar/Files/Right/Details e `COLUMN_GUTTER`; reveal usa o relógio do Shell.
+- PRs abertos no Chat ou contexto Worker selecionado são abas vivas no right
+  host daquele contexto. O board possui pane próprio com histórico, ciclo de
+  teclado, reorder e menu de fechar. Trocar conta/perfil fecha browser views e
+  limpa caches/views de PR sem restaurar terminal no rodapé.
 
 - A coluna Details tem só a view Details (sem faixa de abas). Árvore de arquivos e Changes vivem em uma única instância do explorer Files (`files/`); não restaurar `files/sections.rs` nem uma segunda lista Subagents/Chats nessa surface. New File/New Folder do explorer usam `files/create.rs` (pai do novo item, validação do nome) e o ícone Material de arquivo é `material_icons.rs`. O Details só abre arquivo pelos Context sources do Session card (`DetailsSidebarEvent::OpenFile`).
 - **Shell divide metadata e larguras pelo que está efetivamente visível**: Details substitui as rows de device/projeto/branch do SessionInfo somente enquanto recebe largura maior que zero; quando a janela comprime Details a zero, SessionInfo conserva essas rows. O divisor de Details restaura sua própria largura preferida; o reset de Right mantém o comportamento de rebalancear as colunas. Transições genéricas de largura de painel usam `clocked_tween` (duração/curva de `WidthTween::new`) e as animações de coluna usam `panel_tween`; ambos pegam `render_time`/`motion_time`, que usam relógio monotônico em produção e `test_time` nos testes GPUI. Não recriar a transição de um painel com `WidthTween::new` depois do primeiro frame, pois isso mistura relógios e pode pular a geometria inicial na fixture determinística. Pull Requests compartilha General ao alternar o catálogo de Settings e usa uma região de arrasto própria na titlebar. `show_notice` entrega a notificação pelo toaster atual e marca a ponte legada do Render como entregue, evitando uma segunda notificação.
@@ -157,7 +186,13 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - **Preview Markdown virtualiza blocos de topo via `ListState`**, com overscan de 200px e o `RenderCache` compartilhado do Markdown. Estado de rolagem pertence ao par contexto/path e é liberado ao fechar a aba; recarregar limpa texto preparado e medidas, preservando a posição lógica limitada ao documento atual. Troca de tema remede a lista; mudança de largura invalida as alturas no GPUI. Não voltar a montar `render_tree` inteiro a cada repaint. Um único bloco enorme ainda tem custo proporcional ao seu conteúdo.
 - **Preview de CSV e TSV segue RFC 4180**: `parse_delimited_table` decodifica delimitadores (vírgula ou tab), preserva separadores e quebras de linha (inclusive CRLF) dentro de campos entre aspas, desescapa estritamente aspas duplas (`""`) sem tratar backslash como escape, preservando conteúdo de campos malformados sem falha catastrófica, limitando a visualização a 2.000 linhas e 100 colunas sem dependências novas.
 - Tabs de preview de subagente usam o mesmo avatar SVG derivado de `doc_id` que o link no transcript; atividade tem spinner separado, sem substituir a identidade.
-- A banda de tabs do pane tem altura fixa (`TAB_BAR_HEIGHT`, `flex_none`) e as chips têm largura natural com `min_w_0`; `size_full`/`flex_1` na banda rouba a altura do conteúdo (superfície em branco) ou divide a largura com a drag region (strip cortada no meio). Chips rolam, `+` e chevron ficam fora do scroller, e a tab recém-selecionada é revelada uma vez via `scroll_to_item`.
+- A banda de tabs do pane tem altura fixa (`TAB_BAR_HEIGHT`, `flex_none`);
+  a região do scroller conserva largura natural/shrinking (`min_w_0`, `h_full`),
+  e as chips usam slots uniformes de 118px para quantizar drag/reorder. A
+  documentação antiga atribuía erroneamente a largura natural às chips, que já
+  eram fixas no fork. `size_full`/`flex_1` na banda rouba altura do conteúdo ou
+  divide largura com a drag region. `+` e chevron ficam fora do scroller; a tab
+  recém-selecionada é revelada uma vez via `scroll_to_item`.
 - O gesto de captura (menu nativo de modo → `screencapture` → cancelamento) mora em `workers::session_gallery::pick_and_capture`, usado pela galeria de sessão dos Workers; `Ok(None)` é cancelamento, não erro. O titlebar do Orchestrator não tem mais botão de captura (removido a pedido do dono em 2026-09-27; anexar imagem é pelo composer/appshots).
 - **Hibernação decide no frontier e dispara no refresh do painel.** `WorkersModel::refresh` chama `zeron_workers_unpeel::hibernation_candidates` logo após `apply_snapshot` e emite `Hibernate` para cada candidato numa task solta — fire-and-forget de propósito: o próximo refresh lê o resultado no disco e refaz o que falhou, então não existe estado local de "já tentei" para divergir do host. A política em si é pura e mora no frontier, nunca aqui: a UI só passa o snapshot, as settings de Resources, a sessão selecionada e o relógio. O clock de ociosidade é `WorkersSession::idle_since_unix_ms`, não `updated_at_unix_ms` — este último anda com o heartbeat do host e com repaint idêntico da TUI, então um Worker parado há 24 h parecia recém-ativo. Sem o app aberto ninguém dispara a política.
 - **A UI rebusca bootstrap e seleção por Worker antes de hiberná-lo.** `hibernate_idle_workers` faz um `client.bootstrap()` novo para cada candidato, relê `selected_session_id` depois desse I/O, reavalia com `confirmed_hibernation_candidates` e envia `Hibernate` com o token mintado pelo Host. O Host serializa input/output com a comparação e recusa divergência antes do Stop; o frontier grava Archive somente depois do manifest `exited`. `Archive` manual mantém a semântica existente.
@@ -389,6 +424,9 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/**` (estado, derivações, parse de markdown) | unit | `cargo test -p zeron-ui` |
+| `src/browser/profile.rs` + `src/browser/linux/startup_tests.rs` (isolamento/persistência e startup) | unit; storage real é integration separado | `cargo test -p zeron-ui --lib browser` · `scripts/test-browser-storage.py --helper <zeron-webkit>` sob Xvfb no Linux |
+| `src/files/{model,drag,mutations,tree}.rs` (multiseleção e mutação ordenada) | unit / GPUI | `cargo test -p zeron-ui --lib files` |
+| `src/shell/{session_info,pull_request_pane,chat_pull_requests}.rs` + PR detail (painéis, metadata e device) | unit / GPUI; aparência nativa separada | `cargo test -p zeron-ui --lib pull_request` · `cargo test -p zeron-ui --lib session_info` |
 | `src/theme.rs` (frost alpha, blur e shell plano por variante) | unit | `cargo test -p zeron-ui --lib monocode_glass_follows_variant` |
 | `src/theme.rs` (raio de blur da janela vs declaração do variante) | unit | `cargo test -p zeron-ui --lib window_blur_` |
 | `src/theme.rs` (wash autoral sobrevive ao frost) | unit | `cargo test -p zeron-ui --lib monocode_wash_survives_frost` |

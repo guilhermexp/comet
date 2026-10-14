@@ -83,6 +83,7 @@ mod actions_ui;
 mod chat_dropzone;
 #[cfg(test)]
 mod chat_dropzone_tests;
+mod chat_pull_requests;
 #[cfg(test)]
 mod chat_rename_tests;
 mod command_palette;
@@ -97,6 +98,7 @@ use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_
 #[cfg(test)]
 mod panel_interaction_tests;
 pub(crate) mod project_icon;
+mod pull_request_pane;
 mod search_warm;
 mod session_info;
 mod side_chats;
@@ -1008,6 +1010,8 @@ pub enum RightSurface {
     /// A side chat forked from the conversation (`shell/side_chats.rs`). The
     /// handle keys [`Shell::side_chats`].
     SideChat(u64),
+    /// A pull request opened from the chat — keys [`Shell::chat_pull_requests`].
+    PullRequest(u64),
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1543,6 +1547,7 @@ enum PaneResizeKind {
     Right,
     Files,
     Details,
+    PullRequests,
 }
 
 /// Resolve one pointer sample while keeping the persisted width legal. The
@@ -2425,6 +2430,7 @@ struct OrgGateUi {
 /// read-only transcript entity whose drop tears the view down.
 struct SubagentTab {
     doc_id: String,
+    harness: Option<zeron_proto::HarnessId>,
     title: SharedString,
     transcript: Entity<Transcript>,
     /// Keeps a frozen-blob fetch alive (it falls back to a live doc watch).
@@ -2568,8 +2574,11 @@ pub struct Shell {
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
+    /// Pull request tabs in session panes, keyed like the other surfaces.
+    chat_pull_requests: std::collections::HashMap<u64, chat_pull_requests::ChatPullRequest>,
+    chat_pull_request_seq: u64,
     browser_context: crate::browser::BrowserContext,
-    browser_profile: Option<String>,
+    browser_profile: Option<crate::browser::profile::BrowserProfile>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -2609,8 +2618,8 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     pull_requests_page: Option<Entity<PullRequestsPage>>,
-    pull_request_detail: Option<Entity<crate::pull_request_detail::PullRequestDetailPage>>,
-    pull_request_detail_subscription: Option<Subscription>,
+    /// Opened pull requests, as tabs in a pane beside the board.
+    pull_request_pane: pull_request_pane::PullRequestPane,
     /// A detail view a history step landed on, opened by the next render
     /// (creating it needs the window).
     pending_pull_request: Option<(String, Option<String>)>,
@@ -2785,6 +2794,18 @@ pub struct Shell {
     files_tween: Option<WidthTween>,
     /// The session card's reveal (0 closed → 1 open).
     session_info_tween: Option<WidthTween>,
+    /// Whether the card showed last frame; a change starts the reveal tween.
+    session_info_shown: bool,
+    /// The card opened over a transcript too narrow to show it beside.
+    session_info_overlay: bool,
+    /// Whether the card showed at the toggle's press (see
+    /// `note_session_info_press`).
+    session_info_pressed_open: Option<bool>,
+    /// The card last showed docked beside the transcript (else over it).
+    session_info_docked: bool,
+    /// The room the transcript last held free for the docked card, eased
+    /// back from as the card hides because the column stopped fitting it.
+    session_info_last_reserve: f32,
     files_content_tween: Option<WidthTween>,
     /// The last tracked frame: its chat, the window fit, and for each of
     /// `[sidebar, surface host, Files]` the width painted and the width its
@@ -3298,6 +3319,8 @@ impl Shell {
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
+            chat_pull_requests: std::collections::HashMap::new(),
+            chat_pull_request_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
             browser_profile: None,
             right_tabs: std::collections::HashMap::new(),
@@ -3329,8 +3352,7 @@ impl Shell {
             settings_return_route: Route::Chat,
             nav,
             pull_requests_page: None,
-            pull_request_detail: None,
-            pull_request_detail_subscription: None,
+            pull_request_pane: Default::default(),
             pending_pull_request: None,
             pull_request_cache: Default::default(),
             devices_page: None,
@@ -3433,6 +3455,11 @@ impl Shell {
             sidebar_tween: None,
             files_tween: None,
             session_info_tween: None,
+            session_info_shown: false,
+            session_info_overlay: false,
+            session_info_pressed_open: None,
+            session_info_docked: false,
+            session_info_last_reserve: 0.0,
             files_content_tween: None,
             painted_columns: None,
             fit_exits: [None; 3],
@@ -4494,6 +4521,9 @@ impl Shell {
                         browser.page.url.clone().map(Into::into),
                     )
                 }),
+                RightSurface::PullRequest(id) => self
+                    .chat_pull_request_title(*id, cx)
+                    .map(|(title, detail)| (*surface, title, false, Some(detail))),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -4527,7 +4557,9 @@ impl Shell {
             });
         if valid {
             composer.update(cx, |composer, cx| {
-                composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
+                for item in payload.items() {
+                    composer.add_workspace_path(&item.path, item.is_directory, window, cx)
+                }
             });
         }
     }
@@ -4546,7 +4578,8 @@ impl Shell {
             | RightSurface::Subagent(_)
             | RightSurface::Browser(_)
             | RightSurface::Preview(_)
-            | RightSurface::Worker(_) => {
+            | RightSurface::Worker(_)
+            | RightSurface::PullRequest(_) => {
                 return None;
             }
         };
@@ -4709,7 +4742,8 @@ impl Shell {
                     });
                 }
             }
-            RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
+            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::PullRequest(_) => {
+            }
             RightSurface::Worker(id) => {
                 if let Some(tab) = self.worker_terminal_tabs.get(&id) {
                     tab.view
@@ -4870,6 +4904,24 @@ impl Shell {
                 LinkOutcome::Rejected
             };
         }
+        // A pull request link opens Zeron's own view in this session's pane,
+        // unless Settings sends pull requests to the browser.
+        if matches!(
+            activation.action,
+            LinkAction::Primary | LinkAction::Internal
+        ) && crate::pull_request_detail::opens_natively(cx)
+            && self.chat_pull_requests_available(cx)
+            && let Some(url) = activation
+                .target
+                .navigation
+                .as_deref()
+                .ok()
+                .and_then(crate::pull_request_detail::pull_request_link)
+        {
+            let target = self.chat_pull_request_device(None, cx);
+            self.open_chat_pull_request(url, target, window, cx);
+            return LinkOutcome::Internal;
+        }
         let mut resolved = activation.clone();
         if resolved.action == LinkAction::Primary {
             resolved.action = if crate::settings::current(cx).open_web_links_in_zeron {
@@ -4888,6 +4940,35 @@ impl Shell {
         outcome
     }
 
+    fn sync_browser_profile(&mut self, cx: &mut Context<Self>) {
+        let browser_profile = {
+            let state = self.state.read(cx);
+            crate::browser::profile::BrowserProfile::for_workspace(
+                &self.data_dir,
+                state.workspace_scope,
+                state.auth.as_ref(),
+                state.local_device_id.as_deref(),
+            )
+        };
+        if browser_profile != self.browser_profile {
+            for browser in self.browsers.values() {
+                browser.update(cx, |browser, cx| browser.close(cx));
+            }
+            self.browsers.clear();
+            self.browser_subs.clear();
+            self.browser_context = browser_profile
+                .clone()
+                .map(crate::browser::BrowserContext::for_profile)
+                .unwrap_or_default();
+            self.pull_request_cache = Default::default();
+            self.pull_requests_page = None;
+            self.reset_pull_request_pane();
+            // Their tabs read as closed; rows skip a missing surface.
+            self.chat_pull_requests.clear();
+            self.browser_profile = browser_profile;
+        }
+    }
+
     /// Browser tabs are independent instances owned by the current session.
     fn add_browser_surface(
         &mut self,
@@ -4898,6 +4979,7 @@ impl Shell {
         if self.active_chat.is_empty() {
             return;
         }
+        self.sync_browser_profile(cx);
         let key = self.panel_key(cx);
         let from = self.eval_tween(self.right_tween, self.right_target(cx));
         self.panels.show(&key);
@@ -5063,7 +5145,7 @@ impl Shell {
                     return;
                 }
                 match event {
-                    FilesEvent::HoldMutation { origin, path } => {
+                    FilesEvent::HoldMutation { origin, paths } => {
                         let surfaces = this
                             .files
                             .values()
@@ -5072,7 +5154,7 @@ impl Shell {
                             .cloned()
                             .collect::<Vec<_>>();
                         for surface in surfaces {
-                            surface.update(cx, |files, cx| files.hold_mutation(path.clone(), cx));
+                            surface.update(cx, |files, cx| files.hold_mutation(paths.clone(), cx));
                         }
                     }
                     FilesEvent::AddToChat {
@@ -5091,6 +5173,9 @@ impl Shell {
                     }
                     FilesEvent::Mutate(intent) => {
                         this.start_file_mutation(source.clone(), intent.clone(), cx)
+                    }
+                    FilesEvent::MutateMany(intents) => {
+                        this.start_file_mutations(source.clone(), intents.clone(), cx)
                     }
                     // Navigation from an editor stays in its own chat.
                     FilesEvent::OpenFile(path) => {
@@ -5556,6 +5641,29 @@ impl Shell {
         }
         self.subagent_seq += 1;
         let id = self.subagent_seq;
+        let harness = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+            .or_else(|| {
+                self.side_chats.values().find_map(|tab| {
+                    tab.state
+                        .read(cx)
+                        .selected_chat_row()
+                        .filter(|chat| chat.id == chat_id)
+                        .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+                })
+            })
+            .or_else(|| {
+                // Nested spawn chips identify their parent subagent doc.
+                self.subagent_tabs
+                    .values()
+                    .find(|tab| tab.doc_id == chat_id)
+                    .and_then(|tab| tab.harness)
+            });
         // A live subagent follows its streaming end (main-transcript feel);
         // a frozen one reads top-down.
         let transcript_chat_id = chat_id.clone();
@@ -5587,6 +5695,7 @@ impl Shell {
             id,
             SubagentTab {
                 doc_id,
+                harness,
                 title: title.into(),
                 transcript,
                 _fetch: fetch,
@@ -5740,6 +5849,11 @@ impl Shell {
                 self.diffs.remove(&id);
                 self.diff_subs.remove(&id);
             }
+            RightSurface::PullRequest(id) => {
+                // A comment being posted outlives its view; see
+                // `PullRequestCache::submissions`.
+                self.chat_pull_requests.remove(&id);
+            }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
                 if self.sidebar_mode == SidebarMode::Workers {
@@ -5837,6 +5951,10 @@ impl Shell {
     /// closes — the same cascade browsers use. The native traffic-light close
     /// deliberately skips this rung: it always closes the window.
     pub fn close_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // The Pull requests route's pane holds pull request tabs instead.
+        if matches!(self.route, Route::PullRequests) {
+            return self.close_active_pull_request_tab(cx);
+        }
         let Some(surface) = self.closable_right_surface(cx) else {
             return false;
         };
@@ -6104,6 +6222,7 @@ impl Shell {
         match kind {
             PaneResizeKind::Sidebar => self.sidebar_resize_edge = None,
             PaneResizeKind::Right => self.right_resize_edge = None,
+            PaneResizeKind::PullRequests => self.pull_request_pane.resize_edge = None,
             PaneResizeKind::Files | PaneResizeKind::Details => {}
         }
     }
@@ -6774,12 +6893,20 @@ impl Shell {
         }
     }
 
+    /// The Pull requests entry: from elsewhere, return to the board as it
+    /// was left, its pane included; on the board already, show it alone.
     fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.route, Route::PullRequests) {
-            return;
-        }
+        let entry = if matches!(self.route, Route::PullRequests) {
+            self.dismiss_pull_request_detail(cx);
+            NavEntry::PullRequests
+        } else {
+            self.pull_request_pane_entry()
+        };
         self.enter_pull_requests_route(cx);
-        self.nav.push(NavEntry::PullRequests);
+        if self.nav.current() != &entry {
+            self.nav.push(entry);
+        }
+        cx.notify();
     }
 
     /// Show the board's route without recording a navigation.
@@ -6798,70 +6925,6 @@ impl Shell {
         }
         if self.space_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.space_menu);
-        }
-        cx.notify();
-    }
-
-    /// Open `url`'s detail view over the board without recording a
-    /// navigation. Re-showing the open pull request keeps its view state.
-    fn show_pull_request_detail(
-        &mut self,
-        url: String,
-        target: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_pull_request = None;
-        let local_device_id = self.state.read(cx).local_device_id.clone();
-        let target = target.filter(|device| Some(device.as_str()) != local_device_id.as_deref());
-        if self.pull_requests_page.is_none() {
-            self.pull_requests_page =
-                Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
-        }
-        if let Some(page) = &self.pull_requests_page {
-            page.update(cx, |page, cx| page.select_url(Some(url.clone()), cx));
-        }
-        if self.pull_request_detail.as_ref().is_some_and(|detail| {
-            let detail = detail.read(cx);
-            detail.url == url && detail.target_device() == target.as_deref()
-        }) {
-            cx.notify();
-            return;
-        }
-        let preview = self.pull_requests_page.as_ref().and_then(|page| {
-            let page = page.read(cx);
-            let page_target = page
-                .target_device()
-                .filter(|device| Some(device.as_str()) != local_device_id.as_deref());
-            (page_target.as_deref() == target.as_deref())
-                .then(|| page.preview(&url))
-                .flatten()
-        });
-        self.pull_request_detail = Some(cx.new(|cx| {
-            crate::pull_request_detail::PullRequestDetailPage::new(
-                self.state.clone(),
-                url,
-                target,
-                self.pull_request_cache.clone(),
-                preview,
-                window,
-                cx,
-            )
-        }));
-        self.pull_request_detail_subscription = self
-            .pull_request_detail
-            .as_ref()
-            .map(|detail| cx.observe(detail, |_, _, cx| cx.notify()));
-        cx.notify();
-    }
-
-    /// Return to the board without recording a navigation.
-    fn dismiss_pull_request_detail(&mut self, cx: &mut Context<Self>) {
-        self.pending_pull_request = None;
-        self.pull_request_detail = None;
-        self.pull_request_detail_subscription = None;
-        if let Some(page) = &self.pull_requests_page {
-            page.update(cx, |page, cx| page.select_url(None, cx));
         }
         cx.notify();
     }
@@ -7997,6 +8060,9 @@ impl Shell {
                     }
                     self.browser_subs.remove(id);
                 }
+                if let RightSurface::PullRequest(id) = surface {
+                    self.chat_pull_requests.remove(id);
+                }
             }
         }
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -8801,6 +8867,7 @@ impl Shell {
         cluster + CLUSTER_BUTTONS_WIDTH + TITLEBAR_IDENTITY_GAP
     }
 
+    /// The unified window titlebar keeps Workers chrome and PR pane tabs.
     /// The unified window titlebar: chat → the session tab strip; settings →
     /// the section label. Full-width on the glass shell; the traffic lights
     /// and control cluster overlay its left end.
@@ -9066,32 +9133,17 @@ impl Shell {
         }
         match self.route {
             Route::Chat => self.render_session_title_bar(viewport_height, cx),
-            Route::PullRequests | Route::Settings(_) => {
-                let pull_requests = matches!(self.route, Route::PullRequests);
-                let titlebar_id = if pull_requests {
-                    "pull-requests-header-titlebar"
-                } else {
-                    "settings-header-titlebar"
-                };
-                let left = if pull_requests {
-                    let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
-                    (self.sidebar_now() + Theme::SPACE_LG)
-                        .max(self.title_bar_content_start() + plus_inset)
-                } else {
-                    self.title_bar_content_start()
-                };
-                let mut inner = div()
+            Route::PullRequests => self.render_pull_request_title_bar(cx),
+            Route::Settings(_) => {
+                let inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
-                    .pl(px(left))
+                    .pl(px(self.title_bar_content_start()))
                     .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
-                if pull_requests && let Some(detail) = self.pull_request_detail.clone() {
-                    inner = inner.child(detail.update(cx, |page, cx| page.titlebar(cx)));
-                }
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
-                self.titlebar_drag_region(titlebar_id, bar, cx)
+                self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
             }
         }
@@ -11484,50 +11536,56 @@ impl Shell {
             SIDEBAR_GLASS_FADE_BAND,
             true,
             true,
-            div().relative().flex_1().min_h_0().child(
-                div()
-                    .id("sidebar-lists")
-                    .relative()
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.sidebar_scroll)
-                    .on_drag_move::<SidebarSessionDrag>(cx.listener(
-                        move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                            if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
-                                transfer.viewport = Some(event.bounds);
-                            }
-                            if !event.bounds.contains(&event.event.position) {
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(crate::overscroll::overscroll(
+                    "sidebar-overscroll",
+                    crate::overscroll::OverscrollSource::Handle(self.sidebar_scroll.clone()),
+                    div()
+                        .id("sidebar-lists")
+                        .relative()
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.sidebar_scroll)
+                        .on_drag_move::<SidebarSessionDrag>(cx.listener(
+                            move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
                                 if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
-                                    transfer.preview = None;
+                                    transfer.viewport = Some(event.bounds);
                                 }
-                                return;
-                            }
-                            let payload = event.drag(cx).clone();
-                            this.track_pinned_session_drag_pointer(
-                                payload,
-                                f32::from(event.event.position.y),
-                                f32::from(event.bounds.top()),
-                                f32::from(event.bounds.bottom()),
-                                cx,
-                            );
-                        },
-                    ))
-                    // Empty space and Archived are not transfer targets.
-                    .on_drop::<SidebarSessionDrag>(cx.listener(
-                        |this, _: &SidebarSessionDrag, _, cx| {
-                            this.cancel_sidebar_session_transfer(cx);
-                        },
-                    ))
-                    .px(px(Theme::SPACE_SM))
-                    .flex()
-                    .flex_col()
-                    // No "Sessions" header (user request) — the list
-                    // is the whole column; a little air stands in.
-                    .pt(px(SIDEBAR_LIST_PAD_TOP))
-                    .child(active_list)
-                    .children(archived_section)
-                    .children(moving_row),
-            ),
+                                if !event.bounds.contains(&event.event.position) {
+                                    if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
+                                        transfer.preview = None;
+                                    }
+                                    return;
+                                }
+                                let payload = event.drag(cx).clone();
+                                this.track_pinned_session_drag_pointer(
+                                    payload,
+                                    f32::from(event.event.position.y),
+                                    f32::from(event.bounds.top()),
+                                    f32::from(event.bounds.bottom()),
+                                    cx,
+                                );
+                            },
+                        ))
+                        // Empty space and Archived are not transfer targets.
+                        .on_drop::<SidebarSessionDrag>(cx.listener(
+                            |this, _: &SidebarSessionDrag, _, cx| {
+                                this.cancel_sidebar_session_transfer(cx);
+                            },
+                        ))
+                        .px(px(Theme::SPACE_SM))
+                        .flex()
+                        .flex_col()
+                        // No "Sessions" header (user request) — the list
+                        // is the whole column; a little air stands in.
+                        .pt(px(SIDEBAR_LIST_PAD_TOP))
+                        .child(active_list)
+                        .children(archived_section)
+                        .children(moving_row),
+                )),
         )
         .fade_overflow_y(&self.sidebar_scroll);
 
@@ -11608,9 +11666,7 @@ impl Shell {
                 // Leaving Settings through its own footer is a plain route
                 // change; nothing there should grab focus on the way out.
                 this.settings_focus_pending = false;
-                this.dismiss_pull_request_detail(cx);
                 this.open_pull_requests(cx);
-                cx.notify();
             }))
             .tooltip(crate::settings::widgets::text_tooltip("Pull requests"))
             .child(
@@ -12600,6 +12656,9 @@ impl Shell {
                 chat_menu_closing,
             ));
         }
+        if let Some(menu) = self.render_pull_request_tab_menu(cx) {
+            overlays.push(menu);
+        }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         overlays.extend(self.render_section_overlays(viewport, window, cx));
@@ -12743,9 +12802,6 @@ impl Shell {
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
         if matches!(self.route, Route::PullRequests) {
-            if let Some((url, device)) = self.pending_pull_request.take() {
-                self.show_pull_request_detail(url, device, window, cx);
-            }
             if self.pull_requests_page.is_none() {
                 self.pull_requests_page =
                     Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
@@ -12756,15 +12812,6 @@ impl Shell {
                 .cloned()
                 .map(IntoElement::into_any_element)
                 .unwrap_or_else(|| Empty.into_any_element());
-            if let Some(detail) = self.pull_request_detail.clone() {
-                return div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .child(div().flex_1().min_w_0().h_full().child(detail))
-                    .into_any_element();
-            }
             return div()
                 .flex_1()
                 .min_w_0()
@@ -12824,30 +12871,10 @@ impl Shell {
         self.composer
             .update(cx, |composer, cx| composer.set_dock_frame(dock_frame, cx));
         // The session card: docked, the transcript holds its room free on
-        // the right and the composer follows the column left by half of it,
-        // so column and card center together.
-        let session_reveal = if has_selection {
-            self.session_info_reveal()
-        } else {
-            0.0
-        };
-        // The column's LIVE width: while the sidebar or a pane animates,
-        // `main_content_width` already holds the end width, and a reserve or
-        // card placed from it would jump ahead of the column and wait.
-        let details_now = if self.details_sidebar_open(cx) {
-            self.eval_tween(self.details_tween, self.details_target(cx))
-        } else {
-            0.0
-        };
-        let right_now = self.right_visible_width(cx);
-        let live_main_width = (self.viewport_width
-            - self.sidebar_now()
-            - right_columns_width(right_now > 0.0, right_now, details_now > 0.0, details_now)
-            - self.files_visible_width(cx))
-        .max(0.0);
-        let session_layout =
-            session_info::session_card_layout(live_main_width, ui_settings.transcript_width);
-        let session_reserve = session_layout.reserve * session_reveal;
+        // the right and the composer follows the column left by half of it;
+        // over a column too tight for that, it floats once opened.
+        let (session_docked, session_reveal, session_reserve) =
+            self.session_info_frame(has_selection, cx);
         self.transcript.update(cx, |transcript, cx| {
             transcript.set_right_reserve(session_reserve, cx)
         });
@@ -12859,6 +12886,17 @@ impl Shell {
         // column. Size the composer from that same painted width instead of
         // jumping to the column's endpoint; takeover keeps its retained layout
         // width while the conversation is covered.
+        let details_now = if self.details_sidebar_open(cx) {
+            self.eval_tween(self.details_tween, self.details_target(cx))
+        } else {
+            0.0
+        };
+        let right_now = self.right_visible_width(cx);
+        let live_main_width = (self.viewport_width
+            - self.sidebar_now()
+            - right_columns_width(right_now > 0.0, right_now, details_now > 0.0, details_now)
+            - self.files_visible_width(cx))
+        .max(0.0);
         let composer_panel_width = if self.main_takeover_active() {
             main_content_width
         } else {
@@ -13011,7 +13049,7 @@ impl Shell {
             .left(px(-session_reserve / 2.0))
             .child(self.render_status_strip(composer_width, cx));
         let session_card = self.render_session_info(
-            session_layout,
+            session_docked,
             session_reveal,
             self.viewport_height - Theme::TITLEBAR_HEIGHT - self.bottom_stack.get() - 24.0,
             cx,
@@ -13132,27 +13170,28 @@ impl Shell {
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
                         let composer_opacity = self.composer_dock.borrow().opacity();
-                        // The fork hosts terminals in right-pane surface tabs;
-                        // the composer has no bottom-dock terminal geometry.
-                        el.child(crate::composer_dock::docked_composer(
-                            div()
-                                .id("persistent-composer")
-                                .relative()
-                                .left(px(-session_reserve / 2.0))
-                                .w(px(composer_width))
-                                .opacity(composer_opacity)
-                                .mx_auto()
-                                .child(self.composer.clone())
-                                .children(if has_selection {
-                                    self.render_jump_to_bottom(cx)
-                                } else {
-                                    None
-                                }),
-                            self.composer_dock.clone(),
-                            self.viewport_height,
-                            self.reduced_motion,
-                            frame_time,
-                        ))
+                        // Terminals remain right-pane surfaces, not a footer dock.
+                        el.child(
+                            crate::composer_dock::docked_composer(
+                                div()
+                                    .id("persistent-composer")
+                                    .relative()
+                                    .w(px(composer_width))
+                                    .opacity(composer_opacity)
+                                    .mx_auto()
+                                    .child(self.composer.clone())
+                                    .children(if has_selection {
+                                        self.render_jump_to_bottom(cx)
+                                    } else {
+                                        None
+                                    }),
+                                self.composer_dock.clone(),
+                                self.viewport_height,
+                                self.reduced_motion,
+                                frame_time,
+                            )
+                            .shift_x(-session_reserve / 2.0),
+                        )
                     })
             })
             .child(Self::attachment_drop_overlay(theme))
@@ -13532,8 +13571,6 @@ impl Shell {
                 .unwrap_or_else(|| gpui::Empty.into_any_element()),
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                // Keep the embedded panel's own active tab aligned with the
-                // resolved surface (fallbacks can move it).
                 let resize_suspended = self.tween_active(self.right_tween)
                     || self.tween_active(self.files_tween)
                     || self.tween_active(self.sidebar_tween);
@@ -13544,6 +13581,9 @@ impl Shell {
                 panel.into_any_element()
             }
             RightSurface::SideChat(id) => self.render_side_chat(id, cx),
+            RightSurface::PullRequest(id) => self
+                .render_chat_pull_request(id, cx)
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
             RightSurface::Preview(_) => self.file_preview.clone().into_any_element(),
             RightSurface::Subagent(id) => {
                 let transcript = self
@@ -13722,12 +13762,9 @@ impl Shell {
     /// (icon · title · ✕) plus the `+` menu — the t3code RightPanelTabs bar,
     /// living in the top row; the diff options moved into the pane below.
     pub(crate) fn render_right_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        /// Fixed chip slot — the terminal drawer's drag mechanics (drop-index
-        /// quantisation + slide offsets) assume uniform widths. Same width as
-        /// the utility strip's chips: both bands host the same pane, so a file
-        /// surface must not open looking different from Changes/Terminal.
-        const CHIP_W: f32 = crate::terminal::panel::TAB_WIDTH;
-        const CHIP_SLOT: f32 = CHIP_W + 4.0; // + the strip's own gap
+        use crate::surface_chrome::{
+            TAB_CHIP_HEIGHT as CHIP_H, TAB_CHIP_SLOT as CHIP_SLOT, TAB_CHIP_WIDTH as CHIP_W,
+        };
 
         let theme = Theme::of(cx).clone();
         // Heal drag state if the pointer was released outside the strip.
@@ -13752,14 +13789,6 @@ impl Shell {
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
 
-        // Fade flags from the LAST frame's scroll state (invisible lag).
-        // The EdgeFade scope below fades per-pixel on x for glyphs AND
-        // quads/images (fork 5d1f83d) — washes dissolve across the band.
-        const FADE_WIDTH: f32 = 36.0;
-        let scrolled = -f32::from(self.right_tab_scroll.offset().x);
-        let max_scroll = f32::from(self.right_tab_scroll.max_offset().x);
-        let fade_left = scrolled > 1.0;
-        let fade_right = scrolled < max_scroll - 1.0;
         // The old session-tab strip's proven scroll shape: the flex row IS
         // the scroller (id + overflow_x_scroll + track_scroll), wrapped in a
         // relative min_w_0 region below; drop math runs in CONTENT
@@ -13812,25 +13841,20 @@ impl Shell {
             }));
         for (ix, (surface, title, dirty, detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
-            let surface_icon: AnyElement = match surface {
-                RightSurface::Diff(id) => icon(
-                    if self
-                        .diffs
-                        .get(&id)
-                        .is_some_and(|changes| changes.read(cx).is_history())
-                    {
-                        icons::GIT_BRANCH
-                    } else {
-                        icons::LIST
-                    },
-                )
-                .size(px(12.0))
-                .text_color(theme.text_muted)
-                .into_any_element(),
-                RightSurface::Terminal(_) => icon(icons::TERMINAL)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
+            let harness_icon = match surface {
+                RightSurface::SideChat(id) => self.side_chats.get(&id).and_then(|tab| {
+                    tab.state
+                        .read(cx)
+                        .selected_chat_row()
+                        .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+                }),
+                RightSurface::Subagent(id) => {
+                    self.subagent_tabs.get(&id).and_then(|tab| tab.harness)
+                }
+                _ => None,
+            }
+            .map(crate::pickers::harness_brand_icon);
+            let preview_icon = match surface {
                 RightSurface::Preview(id) => self
                     .preview_surfaces
                     .get(&id)
@@ -13848,70 +13872,52 @@ impl Shell {
                             .size(px(13.0))
                             .object_fit(ObjectFit::Contain)
                             .into_any_element()
-                    })
-                    .unwrap_or_else(|| {
-                        icon(icons::DOCUMENT)
-                            .size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .into_any_element()
                     }),
-                RightSurface::Subagent(id) => self
-                    .subagent_tabs
-                    .get(&id)
-                    .map(|tab| {
-                        img(
-                            crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path(
-                                &tab.doc_id,
-                            ),
-                        )
-                        .size(px(18.0))
-                        .object_fit(ObjectFit::Contain)
-                        .into_any_element()
-                    })
-                    .unwrap_or_else(|| gpui::Empty.into_any_element()),
-                RightSurface::SideChat(_) => icon(icons::CHAT_ROUND_LINE)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
-                RightSurface::Worker(_) => icon(icons::TERMINAL)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
-                RightSurface::Browser(id) => self
-                    .browsers
-                    .get(&id)
-                    .and_then(|b| b.read(cx).favicon.clone())
-                    .map(|favicon| gpui::img(favicon).size(px(12.0)).into_any_element())
-                    .unwrap_or_else(|| {
-                        icon(icons::GLOBE)
-                            .size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .into_any_element()
-                    }),
-                // Upstream workspace-file editor tabs keep the fork's Material
-                // icon set, keyed by the file's basename.
+                _ => None,
+            };
+            let icon_path = match surface {
+                RightSurface::File(_) | RightSurface::Preview(_) => icons::DOCUMENT,
+                RightSurface::Diff(id) => {
+                    if self
+                        .diffs
+                        .get(&id)
+                        .is_some_and(|changes| changes.read(cx).is_history())
+                    {
+                        icons::GIT_BRANCH
+                    } else {
+                        icons::LIST
+                    }
+                }
+                RightSurface::SideChat(_) => icons::CHAT_ROUND_LINE,
+                RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::Terminal(_) | RightSurface::Worker(_) => icons::TERMINAL,
+                RightSurface::Browser(_) => icons::GLOBE,
+                RightSurface::PullRequest(_) => icons::PULL_REQUEST,
+                RightSurface::Picker => icons::PLUS,
+            };
+            // File and preview tabs retain the fork's Material identities.
+            let file_icon = match surface {
                 RightSurface::File(_) => {
                     let identity: &str = detail.as_deref().unwrap_or(&title);
                     let name = identity.rsplit('/').next().unwrap_or(identity);
                     let path = crate::material_icons::material_icon_path(name, false, false);
-                    icons::material_file_icon_image(path.as_ref())
-                        .map(|image| {
-                            img(image)
-                                .size(px(13.0))
-                                .object_fit(ObjectFit::Contain)
-                                .when(!is_active, |icon| icon.opacity(0.78))
-                                .into_any_element()
-                        })
-                        .unwrap_or_else(|| {
-                            icon(icons::DOCUMENT)
-                                .size(px(12.0))
-                                .text_color(theme.text_muted)
-                                .into_any_element()
-                        })
+                    icons::material_file_icon_image(path.as_ref()).map(|image| {
+                        img(image)
+                            .size(px(13.0))
+                            .object_fit(ObjectFit::Contain)
+                            .when(!is_active, |icon| icon.opacity(0.78))
+                            .into_any_element()
+                    })
                 }
-                RightSurface::Picker => gpui::Empty.into_any_element(),
+                _ => preview_icon,
             };
-            // Keep the doc-keyed avatar visible; activity has its own trailing slot.
+            let browser_favicon = match surface {
+                RightSurface::Browser(id) => self
+                    .browsers
+                    .get(&id)
+                    .and_then(|browser| browser.read(cx).favicon.clone()),
+                _ => None,
+            };
             let subagent_running = match surface {
                 RightSurface::SideChat(id) => self.side_chats.get(&id).is_some_and(|tab| {
                     let state = tab.state.read(cx);
@@ -13924,6 +13930,7 @@ impl Shell {
                     .browsers
                     .get(&id)
                     .is_some_and(|b| b.read(cx).page.loading),
+                RightSurface::PullRequest(id) => self.chat_pull_request_loading(id, cx),
                 RightSurface::Subagent(id) => self.subagent_tabs.get(&id).is_some_and(|tab| {
                     self.state
                         .read(cx)
@@ -13933,9 +13940,6 @@ impl Shell {
                 }),
                 _ => false,
             };
-            // Upstream #587: the close ✕ lives in its own trailing slot (the
-            // unsaved dot swaps for it on tab hover); the surface icon stays.
-            let group: SharedString = format!("right-surface-tab-{ix}").into();
             let ghost_title = title.clone();
             let workspace_path = self.workspace_path_for_surface(surface, cx);
             // A side chat's title is renamed in place on its tab (double-click
@@ -13956,147 +13960,146 @@ impl Shell {
             } else {
                 accessible_name.to_string()
             };
-            let chip = crate::surface_chrome::tab(("right-surface-tab", ix), is_active, &theme)
-                .debug_selector(|| format!("right-surface-tab-{ix}"))
-                .group(group.clone())
-                .h(px(24.0))
-                .w(px(CHIP_W))
-                .flex_none()
-                .px(px(4.0))
-                .rounded(px(6.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(3.0))
-                .cursor_pointer()
-                .role(gpui::Role::Button)
-                .aria_label(accessible_label)
-                .when_some(detail, |chip, detail| {
-                    chip.tooltip(move |_, cx| {
-                        cx.new(|_| SurfaceTabTooltip {
-                            text: detail.clone(),
-                        })
-                        .into()
+            let leading = if let RightSurface::Subagent(id) = surface {
+                let tab = self.subagent_tabs.get(&id).expect("resolved subagent tab");
+                img(
+                    crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path(
+                        &tab.doc_id,
+                    ),
+                )
+                .size(px(18.0))
+                .object_fit(ObjectFit::Contain)
+                .into_any_element()
+            } else if subagent_running {
+                loaders::mini_glyph_spinner(
+                    format!("subagent-tab-{ix}"),
+                    2.0,
+                    theme.glyph,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element()
+            } else if let Some(favicon) = browser_favicon {
+                gpui::img(favicon).size(px(12.0)).into_any_element()
+            } else if let Some(file_icon) = file_icon {
+                file_icon
+            } else if let Some((icon_path, Some(brand_color))) = harness_icon {
+                icon(icon_path)
+                    .size(px(12.0))
+                    .text_color(brand_color.opacity(if is_active { 1.0 } else { 0.7 }))
+                    .into_any_element()
+            } else {
+                let icon_path = harness_icon.map_or(icon_path, |(path, _)| path);
+                crate::surface_chrome::tab_chip_icon(icon_path, is_active, &theme)
+            };
+            let chip = crate::surface_chrome::tab_chip(
+                crate::surface_chrome::TabChip {
+                    id: "right-surface-tab",
+                    close_id: "right-surface-close",
+                    ix,
+                    active: is_active,
+                    title,
+                    title_override: rename_input.map(|input| {
+                        chat_title_editor(
+                            format!("right-surface-tab-title-editor-{ix}").into(),
+                            input,
+                            &theme,
+                        )
+                    }),
+                    dirty,
+                    leading,
+                },
+                &theme,
+                cx.listener(move |this, _, window, cx| {
+                    this.close_right_surface(surface, window, cx);
+                }),
+            )
+            .aria_label(accessible_label)
+            .when_some(detail, |chip, detail| {
+                chip.tooltip(move |_, cx| {
+                    cx.new(|_| SurfaceTabTooltip {
+                        text: detail.clone(),
                     })
-                    .tooltip_show_delay(Duration::from_millis(350))
+                    .into()
                 })
-                // The old session-tab strip's solved carve-out: NOT
-                // `.occlude()` — a BlockMouse hitbox ends the hit test,
-                // so the scroll container behind the tabs never saw
-                // wheel events and an overflowing strip could not be
-                // scrolled (tabs tile the whole region). ExceptScroll
-                // keeps the titlebar drag-region carve-out and lets the
-                // strip scroll.
-                .block_mouse_except_scroll()
-                .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                    window.prevent_default()
-                })
-                .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
-                .on_click(
-                    cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        if event.click_count() >= 2
-                            && let Some(chat_id) = side_chat_id.clone()
-                        {
-                            this.open_rename_chat(chat_id, cx);
-                            return;
-                        }
-                        this.activate_right_surface(surface, window, cx);
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        let chat_id = match surface {
-                            RightSurface::SideChat(id) => this
-                                .side_chats
-                                .get(&id)
-                                .and_then(|tab| tab.state.read(cx).selected_chat.clone())
-                                .unwrap_or_default(),
-                            _ => String::new(),
-                        };
-                        this.chat_menu.open(ChatMenuState {
-                            chat_id,
-                            tab: Some((this.panel_key(cx), surface)),
-                            position: event.position,
-                            page: ChatMenuPage::Root,
-                        });
-                        cx.notify();
-                    }),
-                )
-                // Middle-click closes, like every tab strip.
-                .on_mouse_down(
-                    gpui::MouseButton::Middle,
-                    cx.listener(move |this, _, window, cx| {
-                        this.close_right_surface(surface, window, cx);
-                    }),
-                )
-                .on_drag(
-                    RightTabDrag {
-                        panel_key: self.panel_key(cx),
-                        from: ix,
-                        title: ghost_title,
-                        workspace_path,
-                    },
-                    |payload, _point, _, cx| {
-                        let title = payload.title.clone();
-                        cx.stop_propagation();
-                        cx.new(|_| SurfaceTabGhost { title })
-                    },
-                )
-                // The chip's BlockMouse hitbox (the titlebar/scroll carve-out
-                // below) cuts the strip out of the hover stack, so the
-                // strip's own on_drop can never fire while the pointer is
-                // over a chip — tabs tile the strip. Receiving the drop on
-                // the chip itself keeps drag-reorder working without giving
-                // up the carve-out. The bubble dispatch reaches the chip
-                // before the strip, and the handler consumes the drag, so
-                // the two never double-apply.
-                .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
-                    if payload.panel_key != this.panel_key(cx) {
-                        this.right_tab_drag = None;
-                        cx.notify();
+                .tooltip_show_delay(Duration::from_millis(350))
+            })
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if event.click_count() >= 2
+                        && let Some(chat_id) = side_chat_id.clone()
+                    {
+                        this.open_rename_chat(chat_id, cx);
                         return;
                     }
-                    let to = this
-                        .right_tab_drag
-                        .as_ref()
-                        .map(|d| d.over)
-                        .unwrap_or(payload.from);
+                    this.activate_right_surface(surface, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    let chat_id = match surface {
+                        RightSurface::SideChat(id) => this
+                            .side_chats
+                            .get(&id)
+                            .and_then(|tab| tab.state.read(cx).selected_chat.clone())
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    this.chat_menu.open(ChatMenuState {
+                        chat_id,
+                        tab: Some((this.panel_key(cx), surface)),
+                        position: event.position,
+                        page: ChatMenuPage::Root,
+                    });
+                    cx.notify();
+                }),
+            )
+            // Middle-click closes, like every tab strip.
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(move |this, _, window, cx| {
+                    this.close_right_surface(surface, window, cx);
+                }),
+            )
+            .on_drag(
+                RightTabDrag {
+                    panel_key: self.panel_key(cx),
+                    from: ix,
+                    title: ghost_title,
+                    workspace_path,
+                },
+                |payload, _point, _, cx| {
+                    let title = payload.title.clone();
+                    cx.stop_propagation();
+                    cx.new(|_| SurfaceTabGhost { title })
+                },
+            )
+            // The chip's BlockMouse hitbox (the titlebar/scroll carve-out)
+            // cuts the strip out of the hover stack, so the strip's own
+            // on_drop can never fire while the pointer is over a chip — tabs
+            // tile the strip. Receiving the drop on the chip itself keeps
+            // drag-reorder working without giving up the carve-out. The
+            // bubble dispatch reaches the chip before the strip, and the
+            // handler consumes the drag, so the two never double-apply.
+            .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                if payload.panel_key != this.panel_key(cx) {
                     this.right_tab_drag = None;
-                    this.reorder_right_tabs(payload.from, to, cx);
-                }))
-                .child(
-                    // Leading slot: the surface's icon (fork icon set: Material
-                    // file icons, doc-keyed subagent avatars, Worker).
-                    div()
-                        .flex_none()
-                        .size(px(18.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(surface_icon),
-                )
-                .child(match rename_input {
-                    Some(input) => chat_title_editor(
-                        format!("right-surface-tab-title-editor-{ix}").into(),
-                        input,
-                        &theme,
-                    ),
-                    None => div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .text_color(if is_active {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(title)
-                        .into_any_element(),
-                })
-                .when(subagent_running, |chip| {
+                    cx.notify();
+                    return;
+                }
+                let to = this
+                    .right_tab_drag
+                    .as_ref()
+                    .map(|d| d.over)
+                    .unwrap_or(payload.from);
+                this.right_tab_drag = None;
+                this.reorder_right_tabs(payload.from, to, cx);
+            }))
+            .when(
+                subagent_running && matches!(surface, RightSurface::Subagent(_)),
+                |chip| {
                     chip.child(loaders::mini_glyph_spinner(
                         format!("subagent-tab-{ix}"),
                         2.0,
@@ -14104,61 +14107,9 @@ impl Shell {
                         cx.entity_id(),
                         cx,
                     ))
-                })
-                .child(
-                    // Trailing slot: the unsaved dot normally, ✕ on tab
-                    // hover — two stacked layers opacity-swapped by the
-                    // group hover.
-                    div()
-                        .id(("right-surface-close", ix))
-                        .debug_selector(|| format!("right-surface-close-{ix}"))
-                        .flex_none()
-                        .size(px(18.0))
-                        .rounded(px(4.0))
-                        .relative()
-                        .role(gpui::Role::Button)
-                        .aria_label("Close tab")
-                        .tooltip(crate::settings::widgets::text_tooltip("Close tab"))
-                        .hover(|s| s.bg(crate::theme::wash(0.12)))
-                        // The tab owns a drag payload. Claim the close press
-                        // before it reaches that parent or GPUI starts a tab
-                        // drag instead of delivering the close click.
-                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
-                            window.prevent_default();
-                            cx.stop_propagation();
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.close_right_surface(surface, window, cx);
-                        }))
-                        .when(dirty, |slot| {
-                            slot.child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .group_hover(group.clone(), |s| s.opacity(0.0))
-                                    .child(div().size(px(6.0)).rounded_full().bg(theme.text_muted)),
-                            )
-                        })
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .opacity(0.0)
-                                .group_hover(group.clone(), |s| s.opacity(1.0))
-                                .child(
-                                    icon(icons::CLOSE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        ),
-                );
+                },
+            );
+
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -14179,7 +14130,7 @@ impl Shell {
                 }
                 Some((from, ..)) if ix == from => div()
                     .w(px(CHIP_W))
-                    .h(px(24.0))
+                    .h(px(CHIP_H))
                     .flex_none()
                     .into_any_element(),
                 _ => chip.into_any_element(),
@@ -14309,67 +14260,8 @@ impl Shell {
                 10.0,
             ));
         }
-        // Edge fades on whichever side hides tabs (flags computed above).
-        // Glass: per-glyph EdgeFade scope over the chips' own opacity ramps;
-        // opaque: painted gradients in the shell surface tone.
-        let glass = theme.is_glass();
-        let bar_bg = theme.surface;
-        // A fixed band, like the utility strip: `size_full` here made the
-        // strip claim the whole column height inside the pane's flex_col, so
-        // the chips centred vertically and the surface below got zero height -
-        // every non-picker surface (preview, diff tab) opened blank.
-        // Natural width, shrinking when the chips outgrow the band: `flex_1`
-        // here split the leftover space with the drag region below, so the
-        // strip stopped halfway across the pane and the rest of the band was
-        // dead space (user report).
-        let region = div()
-            .relative()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .items_center()
-            .child(strip)
-            .when(fade_left && !glass, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(FADE_WIDTH))
-                        .bg(gpui::linear_gradient(
-                            90.0,
-                            gpui::linear_color_stop(bar_bg, 0.0),
-                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
-                        )),
-                )
-            })
-            .when(fade_right && !glass, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(FADE_WIDTH))
-                        .bg(gpui::linear_gradient(
-                            270.0,
-                            gpui::linear_color_stop(bar_bg, 0.0),
-                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
-                        )),
-                )
-            });
-        let chips: AnyElement = if glass {
-            crate::edge_fade::edge_faded(FADE_WIDTH, false, false, region)
-                .fade_left(fade_left)
-                .fade_right(fade_right)
-                .into_any_element()
-        } else {
-            region.into_any_element()
-        };
-        // Same band the utility strip had: scrolling chips, then `+`, then the
-        // window-drag gap, then the collapse chevron. `+` sits OUTSIDE the
-        // scroller so a full strip can never push it out of reach.
+        // Keep the fork utility band: add stays reachable outside the scroller.
+        let chips = crate::surface_chrome::tab_strip_region(strip, &self.right_tab_scroll, &theme);
         div()
             .h(px(TAB_BAR_HEIGHT))
             .flex_none()
@@ -15327,29 +15219,7 @@ impl Render for Shell {
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
 
-        let browser_profile = {
-            let state = self.state.read(cx);
-            crate::links::workspace_locator(
-                state.workspace_scope,
-                state.auth.as_ref(),
-                state.local_device_id.as_deref(),
-            )
-        };
-        if browser_profile.is_some() && browser_profile != self.browser_profile {
-            if self.browser_profile.is_some() {
-                for browser in self.browsers.values() {
-                    browser.update(cx, |browser, cx| browser.close(cx));
-                }
-                self.browsers.clear();
-                self.browser_subs.clear();
-                self.browser_context = crate::browser::BrowserContext::default();
-                self.pull_request_cache = Default::default();
-                self.pull_requests_page = None;
-                self.pull_request_detail = None;
-                self.pull_request_detail_subscription = None;
-            }
-            self.browser_profile = browser_profile;
-        }
+        self.sync_browser_profile(cx);
         // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
@@ -15530,6 +15400,7 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
+            .on_drag_move(cx.listener(Self::on_pull_request_pane_drag))
             .on_drag_move(cx.listener(Self::on_files_panel_drag))
             .on_drag_move(cx.listener(Self::on_details_sidebar_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
@@ -15562,6 +15433,14 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(
                 |this, action: &crate::pull_request_detail::OpenPullRequest, window, cx| {
+                    // From a chat (a sidebar badge, the composer's badge), the
+                    // pull request opens beside the focused session, so
+                    // several can be compared in one conversation.
+                    if this.chat_pull_requests_available(cx) {
+                        let target = this.chat_pull_request_device(action.1.clone(), cx);
+                        this.open_chat_pull_request(action.0.clone(), target, window, cx);
+                        return;
+                    }
                     let target = if let Some(device) = action.1.clone() {
                         (Some(device.as_str()) != this.state.read(cx).local_device_id.as_deref())
                             .then_some(device)
@@ -15588,15 +15467,9 @@ impl Render for Shell {
             ))
             .on_action(cx.listener(
                 |this, _: &crate::pull_request_detail::ClosePullRequest, _, cx| {
-                    // Closing the detail view is Back when the board is
-                    // behind it, so history doesn't grow a loop.
-                    if this.nav.previous() == Some(&NavEntry::PullRequests) {
-                        this.navigate_back(cx);
-                    } else {
-                        this.dismiss_pull_request_detail(cx);
-                        this.nav.push(NavEntry::PullRequests);
+                    if let Some(ix) = this.pull_request_pane.active_index() {
+                        this.close_pull_request_tab(ix, cx);
                     }
-                    cx.notify();
                 },
             ))
             .on_action(cx.listener(
@@ -15655,7 +15528,9 @@ impl Render for Shell {
                 this.cycle_navigation(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
-                if matches!(this.route, Route::Chat) {
+                if matches!(this.route, Route::PullRequests) {
+                    this.toggle_pull_request_pane(cx);
+                } else if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(window, cx);
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
@@ -15861,11 +15736,17 @@ impl Render for Shell {
                         .child(sidebar_tone)
                         .child(motion::fade_in("phase-app", page));
                 }
-                // The Pull requests route shares this layout without the
-                // chat's side pane.
+                // The Pull requests route shares this layout with its own
+                // side pane: opened pull requests as tabs beside the board.
                 let on_chat = matches!(self.route, Route::Chat);
+                let on_pull_requests = matches!(self.route, Route::PullRequests);
+                if on_pull_requests && let Some((url, device)) = self.pending_pull_request.take() {
+                    self.show_pull_request_detail(url, device, window, cx);
+                }
                 let right_target_width = if on_chat {
                     self.right_visible_width(cx)
+                } else if on_pull_requests {
+                    self.pull_request_pane_visible_width()
                 } else {
                     0.0
                 };
@@ -15959,9 +15840,16 @@ impl Render for Shell {
                     // A forgiving transparent hit target centered on the
                     // seam; the panel's 1px border remains the visual divider.
                     .left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))
+                })
+                .or_else(|| {
+                    on_pull_requests
+                        .then(|| self.pull_request_pane_handle(cx))
+                        .flatten()
                 });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(window, cx)
+                } else if on_pull_requests {
+                    self.render_pull_request_pane(window, cx)
                 } else {
                     Empty.into_any_element()
                 };
@@ -19166,6 +19054,273 @@ mod exit_regressions {
         });
     }
 
+    /// A ready Shell with no engine, for the Pull requests route.
+    fn pull_request_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Shell>,
+        &mut gpui::VisualTestContext,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let data_dir = dir.path().to_path_buf();
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                state
+            });
+            test_shell(
+                state,
+                EngineBootConfig {
+                    data_dir,
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        shell.update(cx, |shell, _| shell.debug_gate = Some(GatePhase::Ready));
+        (shell, cx, dir)
+    }
+
+    fn open_pull_request(cx: &mut gpui::VisualTestContext, number: u32) {
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(crate::pull_request_detail::OpenPullRequest(
+                    format!("https://github.com/a/b/pull/{number}"),
+                    None,
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn pull_request_pane_follows_history_shortcuts_and_its_tab_menu(cx: &mut TestAppContext) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        shell.update(cx, |shell, cx| shell.open_pull_requests(cx));
+        cx.run_until_parked();
+        for number in 1..=3 {
+            open_pull_request(cx, number);
+        }
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear());
+        };
+        let pane = |cx: &mut gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, _| {
+                (
+                    shell.pull_request_pane_open(),
+                    shell.pull_request_pane.active_index(),
+                    shell.pull_request_pane.tabs.len(),
+                )
+            })
+        };
+        let back = |cx: &mut gpui::VisualTestContext, forward: bool| {
+            shell.update(cx, |shell, cx| {
+                if forward {
+                    shell.navigate_forward(cx)
+                } else {
+                    shell.navigate_back(cx)
+                }
+            });
+            redraw(cx);
+        };
+
+        // Back steps through the pull requests viewed, then to the board
+        // alone with the tabs kept; Forward reopens the pane.
+        back(cx, false);
+        assert_eq!(pane(cx), (true, Some(1), 3));
+        back(cx, false);
+        assert_eq!(pane(cx), (true, Some(0), 3));
+        back(cx, false);
+        assert_eq!(pane(cx).0, false);
+        assert_eq!(pane(cx).2, 3);
+        back(cx, true);
+        assert_eq!(pane(cx), (true, Some(0), 3));
+
+        // Picking a tab is a step Back can undo.
+        redraw(cx);
+        let tab = cx.debug_bounds("pull-request-tab-2").unwrap();
+        cx.simulate_click(tab.center(), gpui::Modifiers::default());
+        assert_eq!(pane(cx).1, Some(2));
+        back(cx, false);
+        assert_eq!(pane(cx).1, Some(0));
+
+        // The right sidebar shortcut hides and shows the pane.
+        for open in [false, true] {
+            cx.update(|window, cx| window.dispatch_action(Box::new(ToggleChanges), cx));
+            redraw(cx);
+            assert_eq!(pane(cx).0, open);
+        }
+
+        // Next tab cycles the pane's tabs while it has focus.
+        cx.update(|window, cx| {
+            let focus = shell.read(cx).navigation_focus.right.clone();
+            window.focus(&focus, cx);
+            window.dispatch_action(Box::new(NextSession), cx);
+        });
+        redraw(cx);
+        assert_eq!(pane(cx).1, Some(1));
+
+        // ⌘W closes the active tab first.
+        shell.update_in(cx, |shell, window, cx| {
+            assert!(shell.close_active_surface(window, cx))
+        });
+        assert_eq!(pane(cx).2, 2);
+
+        // The tab menu closes the others.
+        redraw(cx);
+        let tab = cx.debug_bounds("pull-request-tab-0").unwrap();
+        cx.simulate_mouse_down(
+            tab.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            tab.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        redraw(cx);
+        let others = cx
+            .debug_bounds("pull-request-tab-menu-Close other tabs")
+            .unwrap();
+        cx.simulate_click(others.center(), gpui::Modifiers::default());
+        redraw(cx);
+        let urls: Vec<_> = shell.read_with(cx, |shell, _| {
+            shell
+                .pull_request_pane
+                .tabs
+                .iter()
+                .map(|tab| tab.url.clone())
+                .collect()
+        });
+        assert_eq!(urls, ["https://github.com/a/b/pull/1"]);
+    }
+
+    #[gpui::test]
+    fn pull_request_tab_cycling_keeps_focus_after_leaving_content(cx: &mut TestAppContext) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        shell.update(cx, |shell, cx| shell.open_pull_requests(cx));
+        cx.run_until_parked();
+        open_pull_request(cx, 1);
+        open_pull_request(cx, 2);
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        // Focus a descendant that is unmounted when its PR tab is hidden,
+        // rather than the pane's stable focus handle used by the other test.
+        let content = cx.debug_bounds("pr-detail-scroll").unwrap();
+        cx.simulate_click(
+            gpui::point(content.left() + px(24.0), content.top() + px(100.0)),
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            let shell = shell.read(cx);
+            assert!(!shell.right_pane_open(cx), "the chat pane is closed");
+            assert!(shell.navigation_focus.in_right(window, cx));
+            assert!(!shell.navigation_focus.right.is_focused(window));
+        });
+
+        for (key, expected) in [("ctrl-tab", 0), ("ctrl-tab", 1), ("ctrl-shift-tab", 0)] {
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear());
+            cx.update(|window, cx| {
+                let shell = shell.read(cx);
+                assert!(matches!(shell.route, Route::PullRequests));
+                assert_eq!(shell.pull_request_pane.active_index(), Some(expected));
+                assert!(
+                    shell.navigation_focus.in_right(window, cx),
+                    "focus after {key}"
+                );
+            });
+        }
+
+        // History switches pages without explicit tab activation, so focus
+        // recovery must also recognize the PR pane independently of the chat.
+        let content = cx.debug_bounds("pr-detail-scroll").unwrap();
+        cx.simulate_click(
+            gpui::point(content.left() + px(24.0), content.top() + px(100.0)),
+            gpui::Modifiers::default(),
+        );
+        shell.update(cx, |shell, cx| shell.navigate_back(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| {
+            let shell = shell.read(cx);
+            assert_eq!(shell.pull_request_pane.active_index(), Some(1));
+            assert!(shell.navigation_focus.in_right(window, cx));
+        });
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.route, Route::PullRequests));
+            assert_eq!(shell.pull_request_pane.active_index(), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn pull_request_tabs_reorder_by_dragging(cx: &mut TestAppContext) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        shell.update(cx, |shell, cx| shell.open_pull_requests(cx));
+        cx.run_until_parked();
+        open_pull_request(cx, 1);
+        open_pull_request(cx, 2);
+        cx.update(|window, cx| window.draw(cx).clear());
+        let from = cx.debug_bounds("pull-request-tab-0").unwrap().center();
+        let to = cx.debug_bounds("pull-request-tab-1").unwrap().center();
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        // The first move starts the drag; the next one reports its slot.
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "tab drag never started"));
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, _| {
+            let urls: Vec<_> = shell
+                .pull_request_pane
+                .tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect();
+            assert_eq!(
+                urls,
+                [
+                    "https://github.com/a/b/pull/2",
+                    "https://github.com/a/b/pull/1"
+                ]
+            );
+            // The active pull request stays active in its new slot.
+            assert_eq!(shell.pull_request_pane.active_index(), Some(0));
+        });
+    }
+
     #[gpui::test]
     fn pull_request_route_uses_full_window_without_titlebar_overlap(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -19231,7 +19386,85 @@ mod exit_regressions {
             "the board keeps the room the pane would take"
         );
 
-        // The PR header and the persistent controls share the titlebar even
+        // Opening pull requests adds tabs to a pane beside the board.
+        let open = |cx: &mut gpui::VisualTestContext, number: u32| {
+            cx.update(|window, cx| {
+                window.dispatch_action(
+                    Box::new(crate::pull_request_detail::OpenPullRequest(
+                        format!("https://github.com/a/b/pull/{number}"),
+                        None,
+                    )),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        };
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        open(cx, 1);
+        open(cx, 2);
+        open(cx, 1);
+        shell.read_with(cx, |shell, _| {
+            let tabs: Vec<_> = shell
+                .pull_request_pane
+                .tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect();
+            assert_eq!(
+                tabs,
+                [
+                    "https://github.com/a/b/pull/1",
+                    "https://github.com/a/b/pull/2"
+                ],
+                "reopening a pull request reuses its tab"
+            );
+            assert_eq!(shell.pull_request_pane.active_index(), Some(0));
+            assert!(shell.pull_request_pane_open());
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let pane = cx.debug_bounds("pull-request-pane").unwrap();
+        let board = cx.debug_bounds("pull-requests-column").unwrap();
+        assert!(
+            board.right() <= pane.left(),
+            "the board stays beside the pane"
+        );
+        assert!(pane.right() <= px(1400.0));
+        // Expand covers the board; collapsing gives it back.
+        let click = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear());
+        };
+        click(cx, "expand-pull-request-pane");
+        let covering = cx.debug_bounds("pull-request-pane").unwrap();
+        assert!(covering.size.width > pane.size.width);
+        assert!(covering.left() <= board.left());
+        click(cx, "expand-pull-request-pane");
+        assert_eq!(cx.debug_bounds("pull-request-pane").unwrap(), pane);
+        // The toggle hides the pane and keeps its tabs.
+        click(cx, "toggle-pull-request-pane");
+        assert!(cx.debug_bounds("pull-request-pane").is_none());
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.pull_request_pane.tabs.len(), 2)
+        });
+        click(cx, "toggle-pull-request-pane");
+        assert_eq!(cx.debug_bounds("pull-request-pane").unwrap(), pane);
+        // Closing the last tab collapses the pane; the board fills back in.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(crate::pull_request_detail::ClosePullRequest), cx);
+            });
+            cx.run_until_parked();
+        }
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.pull_request_pane.tabs.is_empty());
+            assert!(!shell.pull_request_pane_open());
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("pull-request-pane").is_none());
+
+        // The pane's tabs and the persistent controls share the titlebar even
         // with the sidebar collapsed and the macOS traffic lights hidden.
         cx.update(|window, cx| {
             motion::set_reduced_motion(cx, true);
@@ -19246,16 +19479,14 @@ mod exit_regressions {
         cx.run_until_parked();
         let device_a_detail = shell.read_with(cx, |shell, _| {
             shell
-                .pull_request_detail
-                .as_ref()
+                .active_pull_request_page()
                 .expect("the PR action opens a detail")
                 .entity_id()
         });
         shell.read_with(cx, |shell, cx| {
             assert_eq!(
                 shell
-                    .pull_request_detail
-                    .as_ref()
+                    .active_pull_request_page()
                     .unwrap()
                     .read(cx)
                     .target_device(),
@@ -19275,8 +19506,7 @@ mod exit_regressions {
         cx.run_until_parked();
         assert_eq!(
             shell.read_with(cx, |shell, _| shell
-                .pull_request_detail
-                .as_ref()
+                .active_pull_request_page()
                 .unwrap()
                 .entity_id()),
             device_a_detail,
@@ -19294,7 +19524,7 @@ mod exit_regressions {
         });
         cx.run_until_parked();
         let device_b_detail = shell.read_with(cx, |shell, cx| {
-            let detail = shell.pull_request_detail.as_ref().unwrap();
+            let detail = shell.active_pull_request_page().unwrap();
             assert_eq!(detail.read(cx).target_device(), Some("device-b"));
             detail.entity_id()
         });
@@ -19312,7 +19542,7 @@ mod exit_regressions {
         cx.update(|window, cx| window.draw(cx).clear());
         cx.run_until_parked();
         let local_detail = shell.read_with(cx, |shell, cx| {
-            let detail = shell.pull_request_detail.as_ref().unwrap();
+            let detail = shell.active_pull_request_page().unwrap();
             assert_eq!(detail.read(cx).target_device(), None);
             detail.entity_id()
         });
@@ -19331,8 +19561,7 @@ mod exit_regressions {
         cx.run_until_parked();
         assert_eq!(
             shell.read_with(cx, |shell, _| shell
-                .pull_request_detail
-                .as_ref()
+                .active_pull_request_page()
                 .unwrap()
                 .entity_id()),
             local_detail,
@@ -19355,20 +19584,19 @@ mod exit_regressions {
                     });
                     cx.run_until_parked();
                     let new_session = cx.debug_bounds("titlebar-new-session").unwrap();
-                    let title = cx.debug_bounds("pr-detail-title").unwrap();
+                    let tab = cx.debug_bounds("pull-request-tab-0").unwrap();
+                    // Covering the board, the tabs sit just past the cluster
+                    // like the chat pane's in takeover.
                     assert!(
-                        title.left() >= new_session.right() + px(8.0),
-                        "PR header overlaps New session: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, title={title:?}, new_session={new_session:?}"
+                        tab.left() >= new_session.right(),
+                        "PR tab overlaps New session: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, tab={tab:?}, new_session={new_session:?}"
                     );
-                    for selector in ["pr-detail-refresh", "pr-copy-url"] {
-                        let action = cx.debug_bounds(selector).unwrap();
-                        assert!(
-                            action.top() >= px(0.0)
-                                && action.bottom() <= px(Theme::TITLEBAR_HEIGHT)
-                                && action.right() <= px(width),
-                            "PR titlebar action escapes the header: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, selector={selector}, bounds={action:?}"
-                        );
-                    }
+                    let toggle = cx.debug_bounds("toggle-pull-request-pane").unwrap();
+                    assert!(toggle.left() >= tab.right() && toggle.right() <= px(width));
+                    // The pull request's own header is the pane's toolbar,
+                    // below the titlebar band.
+                    let title = cx.debug_bounds("pr-toolbar-title").unwrap();
+                    assert!(title.top() >= px(Theme::TITLEBAR_HEIGHT));
                     let external = cx.debug_bounds("pr-external").unwrap();
                     assert!(external.right() <= px(width));
                 }
@@ -20208,6 +20436,90 @@ mod exit_regressions {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn browser_profile_changes_clear_tabs_and_reselect_the_stable_identity(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            test_shell(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                shell.active_chat = "session".into();
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                    state.local_device_id = Some("device-a".into());
+                });
+                // Selecting the identity happens before navigation, without requiring a render.
+                shell.add_browser_surface(None, window, cx);
+                let original = shell.browser_profile.clone().unwrap();
+                let original_cache = shell.pull_request_cache.clone();
+                shell.pull_requests_page =
+                    Some(cx.new(|cx| PullRequestsPage::new(shell.state.clone(), cx)));
+                shell.active_chat = "another-chat".into();
+                shell.add_browser_surface(None, window, cx);
+                assert_eq!(shell.browsers.len(), 2);
+                assert_eq!(shell.browser_profile.as_ref(), Some(&original));
+                assert!(std::rc::Rc::ptr_eq(
+                    &shell.pull_request_cache,
+                    &original_cache
+                ));
+                assert!(shell.pull_requests_page.is_some());
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("device-b".into())
+                });
+                shell.sync_browser_profile(cx);
+                assert!(shell.browsers.is_empty());
+                assert!(shell.browser_subs.is_empty());
+                assert_ne!(shell.browser_profile.as_ref(), Some(&original));
+                assert!(!std::rc::Rc::ptr_eq(
+                    &shell.pull_request_cache,
+                    &original_cache
+                ));
+                assert!(shell.pull_requests_page.is_none());
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("device-a".into())
+                });
+                shell.sync_browser_profile(cx);
+                assert_eq!(shell.browser_profile.as_ref(), Some(&original));
+                shell.add_browser_surface(None, window, cx);
+                let restored_cache = shell.pull_request_cache.clone();
+                shell.pull_requests_page =
+                    Some(cx.new(|cx| PullRequestsPage::new(shell.state.clone(), cx)));
+                shell
+                    .state
+                    .update(cx, |state, _| state.workspace_scope = None);
+                shell.sync_browser_profile(cx);
+                assert!(shell.browser_profile.is_none());
+                assert!(shell.browsers.is_empty());
+                assert!(!std::rc::Rc::ptr_eq(
+                    &shell.pull_request_cache,
+                    &restored_cache
+                ));
+                assert!(shell.pull_requests_page.is_none());
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -21617,7 +21929,19 @@ impl Shell {
     pub fn fixture_pull_request_detail(
         &self,
     ) -> Option<Entity<crate::pull_request_detail::PullRequestDetailPage>> {
-        self.pull_request_detail.clone()
+        self.active_pull_request_page()
+    }
+
+    /// Size the pull request pane by hand, without the open animation.
+    pub fn fixture_pull_request_pane_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.settings.pull_request_pane_width = width;
+        self.pull_request_pane.tween = None;
+        cx.notify();
+    }
+
+    pub fn fixture_toggle_pull_request_pane_expand(&mut self, cx: &mut Context<Self>) {
+        self.toggle_pull_request_pane_expand(cx);
+        self.pull_request_pane.tween = None;
     }
 
     pub fn fixture_pull_request_settings(&mut self, open: bool, cx: &mut Context<Self>) {
