@@ -403,6 +403,30 @@ mod tests {
     }
 
     #[test]
+    fn worktree_settings_are_typed_forwardable_unary_methods() {
+        fn check_set<
+            M: RpcMethod<
+                    Params = zeron_proto::WorktreeSettings,
+                    Reply = zeron_proto::WorktreeSettingsStatus,
+                >,
+        >() {
+        }
+        fn check_get<M: RpcMethod<Reply = zeron_proto::WorktreeSettingsStatus>>() {}
+        check_get::<GetWorktreeSettings>();
+        check_set::<SetWorktreeSettings>();
+        for method in [
+            methods::GET_WORKTREE_SETTINGS,
+            methods::SET_WORKTREE_SETTINGS,
+        ] {
+            let method = info(method).unwrap();
+            assert!(method.forwardable);
+            assert!(!method.stream);
+            assert!(!method.local_only);
+            assert_eq!(method.deadline, Duration::from_secs(30));
+        }
+    }
+
+    #[test]
     fn retired_omp_voice_methods_are_absent_and_codex_voice_remains() {
         for name in [
             "ProbeLiveVoice",
