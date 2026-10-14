@@ -1135,9 +1135,11 @@ mod tests {
                 });
                 let scroll = host.read_with(cx, |host, _| {
                     let font = gpui::font(family);
+                    // Diff rows paint at the diff text size, not the raw code font size.
+                    let painted_size = px(crate::changes::diff_text_size(&host.theme));
                     let column = host
                         .text_system
-                        .ch_advance(host.text_system.resolve_font(&font), px(size))
+                        .ch_advance(host.text_system.resolve_font(&font), painted_size)
                         .unwrap()
                         .as_f32();
                     let mut painted_max = 0.0f32;
@@ -1153,7 +1155,7 @@ mod tests {
                         );
                         let painted = host
                             .text_system
-                            .shape_line(row.text.clone(), px(size), &runs, None)
+                            .shape_line(row.text.clone(), painted_size, &runs, None)
                             .width()
                             .as_f32();
                         if family == "Geist" {

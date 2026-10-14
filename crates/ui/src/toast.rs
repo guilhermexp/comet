@@ -1107,6 +1107,8 @@ mod tests {
         });
         let (_, cx) = cx.add_window_view(|_, _| Host);
         cx.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        // Expiry only runs in the focused window; the test platform starts unfocused.
+        cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
         cx.update(|window, cx| {
             assert!(window.is_window_active());
