@@ -19,6 +19,6 @@
 
 - [x] 3.1 Run fmt check, all-targets workspace check, UI lib, engine lib and proto/RPC tests in order; compare failures to eefb5e02 in an isolated disposable worktree and fix causes without weakening tests.
 - [x] 3.2 Exercise changed real paths through an isolated smoke command; document unavailable native visual/macOS/iOS proof.
-- [ ] 3.3 Reconcile DOX and validate/archive completed integration artifacts.
+- [x] 3.3 Reconcile DOX and validate/archive completed integration artifacts.
 - [x] 3.4 Commit prepared history and short fork changelog; update sync recipe only for new durable decisions.
-- [ ] 3.5 Produce final report/gate log, prove merge ancestry/clean state and remove only task-created temporary worktrees; no push or app build/install.
+- [x] 3.5 Produce final report/gate log, prove merge ancestry/clean state and remove only task-created temporary worktrees; no push or app build/install.
