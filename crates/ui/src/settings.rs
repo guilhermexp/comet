@@ -31,6 +31,7 @@ pub mod thread_naming;
 pub mod wallpaper;
 pub mod wallpaper_colors;
 pub mod widgets;
+mod worktrees;
 
 /// Sidebar drag-resize bounds (px). The minimum keeps the sidebar options
 /// button inside the sidebar beside the titlebar controls: 88 (past the
@@ -49,6 +50,9 @@ pub const FILES_PANEL_MAX: f32 = 440.0;
 /// for the conversation and any docked file explorer.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
+/// The Pull requests route's side pane defaults wider than the chat's: the
+/// detail's Code tab needs room beside the board.
+pub const PULL_REQUEST_PANE_DEFAULT: f32 = 640.0;
 /// Minimum width retained for the conversation when the right pane is open.
 pub const CHAT_PANEL_MIN: f32 = 300.0;
 
@@ -667,6 +671,7 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.agent_update_notifications = shell.agent_update_notifications;
     current.files_panel_width = shell.files_panel_width;
     current.right_pane_width = shell.right_pane_width;
+    current.pull_request_pane_width = shell.pull_request_pane_width;
     current.details_sidebar_width = shell.details_sidebar_width;
     current.details_sidebar_open = shell.details_sidebar_open;
     current.details_sidebar_preferences = shell.details_sidebar_preferences.clone();
@@ -680,6 +685,7 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.files_autosave_delay_ms = shell.files_autosave_delay_ms;
     current.files_word_wrap = shell.files_word_wrap;
     current.files_show_all = shell.files_show_all;
+    current.session_info_hidden = shell.session_info_hidden;
     current.settings_section = shell.settings_section;
 }
 
@@ -976,6 +982,8 @@ pub struct UiSettings {
     /// remain enabled independently of this preference.
     pub agent_update_notifications: bool,
     pub right_pane_width: f32,
+    /// Width of the pull request pane beside the board.
+    pub pull_request_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
@@ -1066,9 +1074,9 @@ pub struct UiSettings {
     pub files_word_wrap: bool,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
-    /// The session card (project, device, side chats, actions) beside the
-    /// transcript.
-    pub session_info_open: bool,
+    /// The user hid the session card (project, device, side chats, actions)
+    /// that otherwise shows beside a transcript with room for it.
+    pub session_info_hidden: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
@@ -1138,6 +1146,7 @@ impl Default for UiSettings {
             files_panel_width: FILES_PANEL_DEFAULT,
             agent_update_notifications: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
+            pull_request_pane_width: PULL_REQUEST_PANE_DEFAULT,
             right_pane_open: false,
             details_sidebar_width: DETAILS_SIDEBAR_DEFAULT,
             details_sidebar_open: false,
@@ -1183,7 +1192,7 @@ impl Default for UiSettings {
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_show_all: false,
-            session_info_open: false,
+            session_info_hidden: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             new_thread_composer_background: None,
@@ -1795,6 +1804,7 @@ impl UiSettings {
             files_panel_width,
             agent_update_notifications,
             right_pane_width,
+            pull_request_pane_width,
             right_pane_open,
             terminal_height,
             terminal_open,
@@ -1826,7 +1836,7 @@ impl UiSettings {
             files_autosave_delay_ms,
             files_word_wrap,
             files_show_all,
-            session_info_open,
+            session_info_hidden,
             accent,
             surface,
             new_thread_composer_background,
@@ -1880,6 +1890,11 @@ impl UiSettings {
             DETAILS_SIDEBAR_MIN,
             DETAILS_SIDEBAR_MAX,
             DETAILS_SIDEBAR_DEFAULT,
+        );
+        self.pull_request_pane_width = min_or(
+            self.pull_request_pane_width,
+            RIGHT_PANE_MIN,
+            PULL_REQUEST_PANE_DEFAULT,
         );
         self.terminal_height = clamp_or(
             self.terminal_height,
@@ -2890,6 +2905,7 @@ mod tests {
             files_panel_width: 310.0,
             agent_update_notifications: false,
             right_pane_width: 700.0,
+            pull_request_pane_width: 820.0,
             right_pane_open: true,
             details_sidebar_width: 540.0,
             details_sidebar_open: true,
@@ -2962,7 +2978,7 @@ mod tests {
             code_font_family: crate::typography::UiFontFamily::Geist,
             code_font_size: 11.0,
             files_show_all: true,
-            session_info_open: true,
+            session_info_hidden: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             new_thread_composer_background: Some(NewThreadComposerBackground {

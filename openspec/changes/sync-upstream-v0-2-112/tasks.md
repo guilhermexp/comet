@@ -4,14 +4,14 @@
 
 - [x] 1.1 Fetch the fixed upstream without tags and verify base/common ancestor and all 14 incoming commits.
 - [x] 1.2 Read fork contracts, prior sync artifacts and write decisions before resolution.
-- [ ] 1.3 Format the fork before the real merge and commit any resulting changes.
+- [x] 1.3 Format the fork before the real merge and commit any resulting changes.
 
 ## 2. Integration
 
 - [ ] 2.1 Resolve engine/proto/RPC/client and tests with fork grants, ProcessRunner and common worktree lifecycle preserved.
-- [ ] 2.2 Resolve shell/navigation/panels while retaining Details/Workers/Usage and Enter/Steer.
-- [ ] 2.3 Resolve browser/settings/Usage, preserving profile isolation and refusing the deleted usage ring.
-- [ ] 2.4 Resolve manifests/platform workflows/metadata; regenerate Cargo.lock, retain version 0.2.18 and vendored zui.
+- [x] 2.2 Resolve shell/navigation/panels while retaining Details/Workers/Usage and Enter/Steer.
+- [x] 2.3 Resolve browser/settings/Usage, preserving profile isolation and refusing the deleted usage ring.
+- [x] 2.4 Resolve manifests/platform workflows/metadata; regenerate Cargo.lock, retain version 0.2.18 and vendored zui.
 - [ ] 2.5 Commit the two-parent merge and put subsequent compile repairs in separate commits.
 - [ ] 2.6 Audit every surviving addition from all 14 incoming commits, recording adaptations/refusals.
 

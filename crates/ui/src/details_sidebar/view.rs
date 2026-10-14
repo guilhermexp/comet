@@ -3485,6 +3485,9 @@ impl DetailsSidebar {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .when_some(row.reset_tooltip, |header, resets| {
+                        header.tooltip(crate::settings::widgets::text_tooltip(resets))
+                    })
                     .when(expandable, |header| {
                         header
                             .cursor_pointer()

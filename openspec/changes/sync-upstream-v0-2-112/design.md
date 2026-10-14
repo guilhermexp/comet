@@ -20,6 +20,29 @@ Fork base `eefb5e02e53c76ec6c8adf853adf05513bc89842`; common ancestor `54954e4d2
 6. **Manifests — SKIP b40ac5ee version bump.** Version remains 0.2.18; cargo regenerates the reconciled lockfile from resolved manifests, without broad dependency updates or replacing path zui dependencies.
 7. **Verification/delivery.** Commit real merge before compile repairs. Audit additions per each incoming commit against upstream final, classifying adapted/missing lines rather than comparing whole divergent trees. Run the specified gate directly on Linux, record exits, compare failures in a disposable detached base worktree, fix causes without weakening assertions. Final history uses `outcome: prepared`, `delivery.integration: pending`; final report and gate logs are ignored local artifacts.
 
+### Incoming commit classification
+
+| Commit | Decision | Scope / reason |
+|---|---|---|
+| `edb23db4` | TAKE | iOS device-local Project grouping; no changes to Chat/session wire semantics |
+| `1bc74d5d` | ADAPT | Scratch folders and home exclusion, preserving fork grants and workspace authorization |
+| `50e33711` | TAKE | Two workers in each MCP stdio bridge; grant admission remains engine-owned |
+| `9d943019` | ADAPT | AutoFill opt-out accepted in both bundle templates; fork microphone wording retained |
+| `e54c3a86` | TAKE | Unified unsandboxed entitlements for dropped attachments; fork packaging/install policy unchanged |
+| `b40ac5ee` | SKIP | Fork package version is 0.2.18; no upstream release bump |
+| `c8c71786` | ADAPT | Responsive card without duplicating visible Details location metadata |
+| `09beace0` | ADAPT | Reset hover information in Details Usage/Accounts, never restoring the removed usage ring |
+| `053ce2ea` | ADAPT | Persistent isolated browser profiles; refused macos.yml remains deleted, storage checks port to fork ui-tests lanes |
+| `66524017` | ADAPT | PR panes retain owning-device credentials and fork panel/navigation state |
+| `2d40f8df` | TAKE | Overscroll applied to existing compact transcript/sidebar/Files |
+| `2c2963aa` | TAKE | Multi-entry selection, drag and mutation in the single shared Files explorer |
+| `01a399db` | ADAPT | Engine Chat location preferences feed the common lifecycle; standalone Workers defaults remain unchanged; bespoke Windows creation is refused under the existing fork platform policy |
+| `75b72602` | ADAPT | Idle harness icons retain fork side-chat/subagent tab behavior |
+
+The #530 preference applies to new engine-owned Chat worktrees, as in upstream.
+It does not introduce a second preference service or change standalone Worker launch
+destinations. Both callers continue sharing creation, ownership and preparation.
+
 ## Risks / Trade-offs
 
 - Common worktree lifecycle is a fork seam; upstream location preferences must not bypass ownership/setup hooks.

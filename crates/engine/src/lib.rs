@@ -30,6 +30,7 @@ mod fd_limit;
 mod fs_watch;
 pub(crate) mod grok_usage;
 pub mod harness_updates;
+pub(crate) mod home_index;
 mod http_error;
 pub mod instance_lock;
 pub(crate) mod kimi_usage;
@@ -55,6 +56,8 @@ pub mod voice;
 pub mod workspace_files;
 pub mod workspace_host;
 pub mod workspace_search;
+mod worktree_settings;
+
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
@@ -279,6 +282,7 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(journal_root);
         let repos = Repos::new(data_dir, &device_id);
+        sessions.set_scratch_root(repos.scratch_root());
         doc_host.set_repos(repos.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
         let workspace_files =

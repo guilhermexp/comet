@@ -474,7 +474,7 @@ impl Shell {
                 let to = self.files_settled_width(cx);
                 self.transition_files(before.files, before.files_content, to);
             }
-            PaneResizeKind::Right => {}
+            PaneResizeKind::Right | PaneResizeKind::PullRequests => {}
             PaneResizeKind::Details => {
                 let from = self.eval_tween(self.details_tween, self.details_target(cx));
                 self.settings.details_sidebar_width = DETAILS_SIDEBAR_DEFAULT;

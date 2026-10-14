@@ -58,6 +58,8 @@ pub struct ProviderUsageRow {
     /// Collapsed-header badge for a weekly window about to roll over
     /// (`Reset 12h 16m`) or when remaining quota is exhausted (`Reset 5d 0h`).
     pub weekly_reset_badge: Option<String>,
+    /// Absolute reset moments for all windows, including when the row is collapsed.
+    pub reset_tooltip: Option<String>,
     pub usage_lines: Vec<AgentUsageLine>,
     /// The engine warning for this harness, carried only by rows that have no
     /// quota of their own to show — "No usage yet" names the wrong cause when
@@ -257,6 +259,7 @@ fn placeholder_usage_row(harness: HarnessId, warning: Option<String>) -> Provide
         weekly_tone: UsageTone::Neutral,
         windows: Vec::new(),
         weekly_reset_badge: None,
+        reset_tooltip: None,
         usage_lines: Vec::new(),
         warning,
     }
@@ -343,6 +346,8 @@ fn account_usage_row(
         weekly_tone,
         windows,
         weekly_reset_badge,
+        reset_tooltip: (!account.usage_windows.is_empty())
+            .then(|| crate::settings::accounts::usage_resets(&account.usage_windows, now)),
         usage_lines: account.usage_lines.clone(),
         // A provider already showing quota must not double as an error channel.
         warning: (state != ProviderUsageState::Ready)

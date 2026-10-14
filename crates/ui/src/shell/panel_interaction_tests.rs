@@ -21,6 +21,9 @@ fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut Vis
         let mut config = UiSettings::default();
         config.sidebar_width = 300.0;
         config.files_panel_width = 377.0;
+        // The session card shifts the composer while it fits; these panels
+        // measure the composer centered in its column.
+        config.session_info_hidden = true;
         settings::init(config, dir.path(), cx);
     });
     let (shell, cx) = cx.add_window_view(|_, cx| {
@@ -442,8 +445,10 @@ fn resetting_details_width_restores_default_and_preserves_right_preference(
 #[gpui::test]
 fn details_owns_session_location_metadata_while_session_actions_remain(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);
+    cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+    cx.simulate_resize(gpui::size(px(2000.0), px(900.0)));
     shell.update(cx, |shell, cx| {
-        shell.settings.session_info_open = true;
+        shell.settings.session_info_hidden = false;
         shell.settings.details_sidebar_open = true;
         shell.session_info_tween = None;
         shell.details_tween = None;
@@ -461,8 +466,10 @@ fn details_owns_session_location_metadata_while_session_actions_remain(cx: &mut 
     cx.simulate_resize(gpui::size(px(620.0), px(900.0)));
     shell.read_with(cx, |shell, cx| assert_eq!(shell.details_target(cx), 0.0));
     cx.update(|window, cx| window.draw(cx).clear());
+    shell.update(cx, |shell, cx| shell.toggle_session_info(cx));
+    cx.update(|window, cx| window.draw(cx).clear());
     assert!(cx.debug_bounds("session-info-device").is_some());
-    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    cx.simulate_resize(gpui::size(px(2000.0), px(900.0)));
     cx.update(|window, cx| window.draw(cx).clear());
     assert!(cx.debug_bounds("session-info-device").is_none());
 
@@ -498,7 +505,7 @@ fn session_info_reserves_the_rendered_transcript_column(cx: &mut TestAppContext)
         shell.sidebar_tween = None;
         shell.settings.details_sidebar_open = false;
         shell.details_tween = None;
-        shell.settings.session_info_open = false;
+        shell.settings.session_info_hidden = true;
         shell.session_info_tween = None;
         shell.state.update(cx, |state, cx| {
             state.transcript = vec![SessionMessageEntry {
@@ -522,8 +529,8 @@ fn session_info_reserves_the_rendered_transcript_column(cx: &mut TestAppContext)
 
     for (width, open_column_width, gap) in [
         (700.0, 668.0, None),
-        (804.0, 480.0, Some(24.0)),
-        (1000.0, 676.0, Some(24.0)),
+        (804.0, 736.0, None),
+        (1000.0, 736.0, None),
         (1200.0, 736.0, Some(24.0)),
         (1400.0, 736.0, Some(48.0)),
     ] {

@@ -297,8 +297,11 @@ impl WorkspaceFiles {
                     // The chat's cwd is the browsing boundary, even when it
                     // happens to be a subdirectory of a Git checkout.
                     let cwd = PathBuf::from(
-                        crate::repos::expand_home(chat.cwd.as_deref().unwrap_or("~"))
-                            .map_err(|error| WorkspaceFilesError::NotFound(error.to_string()))?,
+                        crate::repos::resolve_chat_cwd(
+                            chat.cwd.as_deref().unwrap_or("~"),
+                            &self.inner.repos.scratch_root(),
+                        )
+                        .map_err(|error| WorkspaceFilesError::NotFound(error.to_string()))?,
                     );
                     if !cwd.is_absolute() {
                         return Err(WorkspaceFilesError::BadParams(

@@ -10143,6 +10143,18 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        // A host that predates scratch folders runs a projectless chat in `~`.
+        let scratch_folders = {
+            let state = self.state.read(cx);
+            let host = if device_id == "local" {
+                local_device_id.as_deref()
+            } else {
+                Some(device_id.as_str())
+            };
+            host.is_some_and(|host| {
+                state.device_supports(host, zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
+            })
+        };
         let create_side_chat = self.state.update(cx, |state, _| {
             if state.side_chat_unsaved()
                 && let Some(mut config) = resolved.chat_config()
@@ -10554,9 +10566,16 @@ impl Composer {
                 // picked base ref (CreateWorktree on send, targeted at the
                 // space's device; the RPC relay-forwards).
                 let mut cwd = if is_new {
-                    // Project-less sessions run from the host's home dir —
-                    // "~" is expanded on the host when the run spawns.
-                    space_path.clone().or_else(|| Some("~".to_string()))
+                    // Project-less sessions run in their own folder under the
+                    // host's home, expanded and created on the host when the
+                    // run spawns.
+                    space_path.clone().or_else(|| {
+                        Some(if scratch_folders {
+                            zeron_proto::projectless::scratch_cwd(&chat_id, chrono::Utc::now())
+                        } else {
+                            "~".to_string()
+                        })
+                    })
                 } else {
                     existing_cwd
                 }
@@ -10621,7 +10640,9 @@ impl Composer {
                         &chat_id,
                         space_id.as_deref(),
                         &device_id,
-                        worktree_cwd.as_deref(),
+                        worktree_cwd
+                            .as_deref()
+                            .or_else(|| space_id.is_none().then_some(cwd.as_str())),
                         chat_branch.as_deref(),
                         chat_config.as_ref(),
                     );
@@ -13648,6 +13669,22 @@ mod tests {
                 "op": "createChat",
                 "chatId": "chat-2",
                 "deviceId": "local-device",
+            })
+        );
+        assert_eq!(
+            create_chat_mutation(
+                "chat-scratch",
+                None,
+                "remote-device",
+                Some("~/.zeron/scratch/2026-10-14-chat-scratch"),
+                None,
+                None,
+            ),
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": "chat-scratch",
+                "deviceId": "remote-device",
+                "cwd": "~/.zeron/scratch/2026-10-14-chat-scratch",
             })
         );
     }

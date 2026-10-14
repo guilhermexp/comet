@@ -6,7 +6,8 @@
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
 //! created under `~/.zeron/worktrees/<repo-slug>-<hash>/<worktreeName>` (NOT the data
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
+//! matching `zeron/<name>` branch. Device preferences can choose another root;
+//! `ZERON_WORKTREES_DIR` takes precedence over those preferences.
 //!
 //! All git access is via subprocess, never libgit2 — and every spawn goes
 //! through [`crate::process::ProcessRunner`], which is also the seam a test
@@ -120,12 +121,16 @@ pub struct WorktreeCreationOutcome {
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .filter(|s| !s.is_empty())
+    let variables = if cfg!(windows) {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    variables
+        .into_iter()
+        .find_map(|name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -142,6 +147,24 @@ pub(crate) fn expand_home(cwd: &str) -> Result<String, &'static str> {
             .into_owned()),
         _ => Ok(cwd.to_string()),
     }
+}
+
+/// A chat cwd on this host: [`expand_home`], or a projectless chat's scratch
+/// folder under `scratch_root`, created on first use — createChat only names
+/// it, possibly on another device.
+pub(crate) fn resolve_chat_cwd(cwd: &str, scratch_root: &Path) -> Result<String, String> {
+    if !zeron_proto::projectless::is_scratch_cwd(cwd) {
+        return expand_home(cwd).map_err(str::to_string);
+    }
+    let name = cwd.trim().rsplit('/').next().unwrap_or_default();
+    let folder = scratch_root.join(name);
+    std::fs::create_dir_all(&folder).map_err(|error| {
+        format!(
+            "could not create the chat's folder {}: {error}",
+            folder.display()
+        )
+    })?;
+    Ok(folder.to_string_lossy().into_owned())
 }
 
 /// Resolve the host user's home for a session that explicitly uses `~`.
@@ -169,20 +192,10 @@ fn session_home_dir_with(
     Err("User home directory unavailable on this device")
 }
 
-/// Where new worktrees live. Deliberately NOT under the backend data dir —
-/// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
-/// (test isolation); empty reads as unset.
-fn default_worktrees_root() -> PathBuf {
-    std::env::var_os("ZERON_WORKTREES_DIR")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".zeron").join("worktrees"))
-}
-
 struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
-    worktrees_root: PathBuf,
+    worktrees: crate::worktree_settings::WorktreePreferences,
     ownership_journal_path: Result<PathBuf, String>,
     runner: std::sync::Arc<dyn ProcessRunner>,
     mutation_locks: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -214,36 +227,45 @@ impl Repos {
             .map_err(|error| EngineError::Other(format!("worktree ownership journal: {error}")))
     }
 
+    /// Host-local projectless folders, created on first use.
+    pub(crate) fn scratch_root(&self) -> PathBuf {
+        self.inner.data_dir.join("scratch")
+    }
+
     pub fn workspace_search(&self) -> &WorkspaceSearch {
         &self.inner.workspace_search
     }
 
-    /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
+    /// Device preferences live in `data_dir`. New worktrees use the custom
+    /// location or `~/.zeron/worktrees`; a nonempty `$ZERON_WORKTREES_DIR`
+    /// overrides both (including test isolation).
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
         Self::build(
             data_dir,
             device_id,
-            default_worktrees_root(),
+            home_dir().join(".zeron").join("worktrees"),
+            std::env::var_os("ZERON_WORKTREES_DIR")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
             zeron_workers_unpeel::worktree_ownership::current_journal_path()
                 .map_err(|error| error.to_string()),
             std::sync::Arc::new(SystemProcessRunner),
         )
     }
 
-    /// Explicit worktree root (tests).
+    /// Explicit default worktree root, without the environment override (tests).
     pub fn with_worktrees_root(data_dir: &Path, device_id: &str, worktrees_root: PathBuf) -> Self {
         Self::build(
             data_dir,
             device_id,
             worktrees_root,
+            None,
             Ok(data_dir.join("worktree-ownership.json")),
             std::sync::Arc::new(SystemProcessRunner),
         )
     }
 
-    /// Explicit process runner (tests): every git invocation this instance
-    /// makes goes to `runner` instead of a real child process.
+    /// Explicit process runner (tests): covers every Git invocation.
     #[cfg(test)]
     pub(crate) fn with_runner(
         data_dir: &Path,
@@ -253,7 +275,8 @@ impl Repos {
         Self::build(
             data_dir,
             device_id,
-            default_worktrees_root(),
+            home_dir().join(".zeron").join("worktrees"),
+            None,
             Ok(data_dir.join("worktree-ownership.json")),
             runner,
         )
@@ -263,6 +286,7 @@ impl Repos {
         data_dir: &Path,
         device_id: &str,
         worktrees_root: PathBuf,
+        environment_override: Option<PathBuf>,
         ownership_journal_path: Result<PathBuf, String>,
         runner: std::sync::Arc<dyn ProcessRunner>,
     ) -> Self {
@@ -270,7 +294,11 @@ impl Repos {
             inner: std::sync::Arc::new(ReposInner {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
-                worktrees_root,
+                worktrees: crate::worktree_settings::WorktreePreferences::open(
+                    data_dir,
+                    worktrees_root,
+                    environment_override,
+                ),
                 ownership_journal_path,
                 runner,
                 mutation_locks: std::sync::Mutex::new(HashMap::new()),
@@ -287,10 +315,20 @@ impl Repos {
         }
     }
 
-    /// The runner this instance spawns git through — the diff capture borrows
-    /// it so an injected fake covers those paths too.
+    /// Shared bounded Git runner, also borrowed by diff capture.
     pub(crate) fn runner(&self) -> &dyn ProcessRunner {
         self.inner.runner.as_ref()
+    }
+
+    pub fn worktree_settings(&self) -> zeron_proto::WorktreeSettingsStatus {
+        self.inner.worktrees.status()
+    }
+
+    pub async fn set_worktree_settings(
+        &self,
+        settings: zeron_proto::WorktreeSettings,
+    ) -> Result<zeron_proto::WorktreeSettingsStatus, EngineError> {
+        self.inner.worktrees.set(settings).await
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -1846,10 +1884,22 @@ impl Repos {
             .into_iter()
             .collect();
         let repo = repo_path.to_path_buf();
-        let root = self.inner.worktrees_root.clone();
+        // Snapshot once; later preference changes affect only future checkouts.
+        let root = self.inner.worktrees.root();
         let journal = self.ownership_journal_path()?;
         let base_ref = base_ref.to_owned();
         let worker = tokio::task::spawn_blocking(move || {
+            let canonical_repo = std::fs::canonicalize(&repo)?;
+            let repo_name = canonical_repo.file_name().unwrap_or_default();
+            if let Ok(canonical_root) = std::fs::canonicalize(&root)
+                && (canonical_root.starts_with(&canonical_repo)
+                    || canonical_root.join(repo_name).starts_with(&canonical_repo))
+            {
+                return Err(EngineError::Other(format!(
+                    "Worktrees would be created inside the repository at {}. Choose a different worktree location in Settings.",
+                    repo.display()
+                )));
+            }
             for attempt in 0..50u64 {
                 let seed = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1868,6 +1918,14 @@ impl Repos {
                 let candidate_path =
                     zeron_workers_unpeel::worktree_ownership::worktree_path(&root, &repo, &name)
                         .map_err(|error| EngineError::Other(error.to_string()))?;
+                if candidate_path.starts_with(&canonical_repo) {
+                    return Err(EngineError::Other(format!(
+                        "Worktrees would be created inside the repository at {}. Choose a different worktree location in Settings.",
+                        repo.display()
+                    )));
+                }
+                #[cfg(windows)]
+                validate_windows_worktree_path(&candidate_path.to_string_lossy())?;
                 if candidate_path.exists() {
                     continue;
                 }
@@ -1924,38 +1982,14 @@ impl Repos {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<WorktreeCreationOutcome, EngineError> {
-        // Only paths that could have been created by either generation of the
-        // app need the ownership journal. An external checkout outside all
-        // those roots is a no-op even if the local journal is unreadable.
-        if let Some((path, branch)) = self
+        // Registration authorizes the exact checkout; the journal, not a
+        // location prefix, decides whether preparation remains pending.
+        let (path, _) = self
             .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
             .await
-            .filter(|(path, _)| definitely_external_checkout(path, &self.inner.worktrees_root))
-        {
-            let branch = branch.unwrap_or_default();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("worktree")
-                .to_owned();
-            return self
-                .chat_worktree_outcome(
-                    repo_path,
-                    name,
-                    zeron_workers_unpeel::ChatWorktreeCreation {
-                        path,
-                        branch,
-                        setup_failed_command: None,
-                        setup_failed_reason: None,
-                        hook_warning: None,
-                        copy_warning: None,
-                    },
-                )
-                .await;
-        }
+            .ok_or_else(|| EngineError::Other("not a linked worktree of this repository".into()))?;
         let repo = repo_path.to_path_buf();
-        let path = worktree_path.to_path_buf();
-        let root = self.inner.worktrees_root.clone();
+        let root = self.inner.worktrees.root();
         let journal = self.ownership_journal_path()?;
         let worker = tokio::task::spawn_blocking(move || {
             zeron_workers_unpeel::prepare_checkout_for_chat(&repo, &path, &root, &journal)
@@ -2073,7 +2107,7 @@ impl Repos {
         match self.ownership_journal_path() {
             Ok(journal) => {
                 let checkout = worktree_path.to_path_buf();
-                let root = self.inner.worktrees_root.clone();
+                let root = self.inner.worktrees.root();
                 let (from, to) = (current.clone(), target.clone());
                 let recorded = tokio::task::spawn_blocking(move || {
                     zeron_workers_unpeel::record_checkout_branch_rename(
@@ -2123,7 +2157,7 @@ impl Repos {
         // journal ownership, and the missing leaf under its action lock.
         let prune_missing = Self::checkout_leaf_missing_with_parent(&path).await;
         let repo = repo_path.to_path_buf();
-        let root = self.inner.worktrees_root.clone();
+        let root = self.inner.worktrees.root();
         let journal = self.ownership_journal_path()?;
         let worker = tokio::task::spawn_blocking(move || {
             let result = if prune_missing {
@@ -3100,24 +3134,6 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
     }
 }
 
-/// A negative ownership check only. Paths beneath any current or historical
-/// app root still require the journal to prove whether setup is pending.
-/// `path` must already be canonical: it is never touched on disk here.
-fn definitely_external_checkout(path: &Path, configured_root: &Path) -> bool {
-    let home = home_dir();
-    let unpeel_home = std::env::var_os("UNPEEL_HOME")
-        .filter(|value| !value.to_string_lossy().trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".unpeel"));
-    [
-        configured_root.to_path_buf(),
-        home.join(".zeron/worktrees"),
-        unpeel_home.join("worktrees"),
-    ]
-    .iter()
-    .all(|root| !path.starts_with(canonicalize_lossy(root)))
-}
-
 /// Absolute form of a possibly-relative path (no filesystem access).
 fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -3137,27 +3153,64 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::process::ProcessOutput;
-
-    #[test]
-    fn only_checkouts_outside_all_app_roots_skip_the_ownership_journal() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("managed");
-        let external = temp.path().join("external");
-        std::fs::create_dir_all(root.join("repo/feature")).unwrap();
-        std::fs::create_dir_all(&external).unwrap();
-        assert!(!definitely_external_checkout(
-            &std::fs::canonicalize(root.join("repo/feature")).unwrap(),
-            &root
-        ));
-        assert!(definitely_external_checkout(
-            &std::fs::canonicalize(&external).unwrap(),
-            &root
+/// Win32 process working directories remain limited to MAX_PATH even when
+/// file I/O supports extended paths. A usable worktree must be able to launch
+/// Git, hooks, and agents, not merely be created on disk. Count UTF-16 units,
+/// excluding the verbatim prefix and reserving the terminating NUL.
+#[cfg(any(windows, test))]
+pub(crate) fn validate_windows_worktree_path(path: &str) -> Result<(), EngineError> {
+    if windows_git_worktree_path(path).encode_utf16().count() >= 260 {
+        return Err(EngineError::Other(
+            "This worktree path is too long to start tools on Windows. Choose a shorter location, such as C:\\worktrees.".into(),
         ));
     }
+    Ok(())
+}
+
+/// Git's worktree command normalizes backslashes to slashes, which breaks
+/// Win32 verbatim prefixes (`\\?\` becomes `//?/`). Keep native paths for
+/// filesystem access, but pass drive/UNC paths without that prefix to Git.
+#[cfg(any(windows, test))]
+fn windows_git_worktree_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    if let Some(unc) = path.strip_prefix("//?/UNC/") {
+        return format!("//{unc}");
+    }
+    if let Some(drive) = path.strip_prefix("//?/") {
+        let bytes = drive.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":/" {
+            return drive.to_owned();
+        }
+    }
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn git_worktree_paths_strip_only_drive_and_unc_verbatim_prefixes() {
+        for (native, expected) in [
+            (
+                r"\\?\C:\other disk\日本語\repo",
+                "C:/other disk/日本語/repo",
+            ),
+            (r"\\?\UNC\server\share\repo", "//server/share/repo"),
+            (r"C:\worktrees\repo", "C:/worktrees/repo"),
+            (r"\\server\share\repo", "//server/share/repo"),
+            ("//?/C:/worktrees/repo", "C:/worktrees/repo"),
+            ("//?/UNC/server/share/repo", "//server/share/repo"),
+        ] {
+            assert_eq!(super::windows_git_worktree_path(native), expected);
+        }
+        let suffix = "folder/".repeat(50);
+        assert_eq!(
+            super::windows_git_worktree_path(&format!("//?/C:/{suffix}")),
+            format!("C:/{suffix}")
+        );
+    }
+
+    use super::*;
+    use crate::process::ProcessOutput;
 
     #[tokio::test]
     async fn checkout_mutation_deadline_waits_for_authoritative_result() {
@@ -3449,6 +3502,249 @@ prunable gitdir file points to non-existent location
 
         std::fs::write(parent.join("present"), "not missing").unwrap();
         assert!(!Repos::checkout_leaf_missing_with_parent(&parent.join("present")).await);
+    }
+
+    #[test]
+    fn windows_worktree_limit_counts_utf16_without_verbatim_prefix() {
+        for prefix in ["C:/", "//?/C:/", "//server/share/", "//?/UNC/server/share/"] {
+            let prefix_len = windows_git_worktree_path(prefix).encode_utf16().count();
+            let path = format!("{prefix}{}", "a".repeat(259 - prefix_len));
+            assert!(validate_windows_worktree_path(&path).is_ok());
+            assert!(validate_windows_worktree_path(&format!("{path}a")).is_err());
+        }
+        assert!(validate_windows_worktree_path(&format!("C:/{}", "日本語".repeat(80))).is_ok());
+        assert!(validate_windows_worktree_path(&format!("C:/{}", "😀".repeat(129))).is_err());
+    }
+
+    #[tokio::test]
+    async fn worktree_location_containing_the_repository_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("code");
+        let repo = code.join("comet");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repos = Repos::with_worktrees_root(&tmp.path().join("data"), "test", code.clone());
+        repos
+            .git(&["init", "-b", "main"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+                Some(&repo),
+            )
+            .await
+            .unwrap();
+        let error = repos.create_worktree(&repo, "main").await.unwrap_err();
+        assert!(
+            error.to_string().contains("inside the repository"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&repo).unwrap().count(), 1, "only .git");
+        assert!(
+            repos
+                .branches(&repo)
+                .await
+                .unwrap()
+                .iter()
+                .all(|b| !b.starts_with("zeron/"))
+        );
+
+        // A sibling location for the same parent is fine.
+        let sibling =
+            Repos::with_worktrees_root(&tmp.path().join("data2"), "test", code.join("wt"));
+        let worktree = sibling.create_worktree(&repo, "main").await.unwrap();
+        let expected = zeron_workers_unpeel::worktree_ownership::repository_worktrees_dir(
+            &code.join("wt"),
+            &repo,
+        )
+        .unwrap();
+        assert!(Path::new(&worktree.path).starts_with(expected));
+    }
+
+    async fn common_worktree_fixture(hook_exit: u8) -> (tempfile::TempDir, Repos, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repos = Repos::with_worktrees_root(
+            &tmp.path().join("data"),
+            "test",
+            tmp.path().join("worktrees"),
+        );
+        repos
+            .git(&["init", "-b", "main"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "user.name", "Test"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "core.autocrlf", "false"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "user.email", "test@example.com"], Some(&repo))
+            .await
+            .unwrap();
+        std::fs::write(repo.join("README.txt"), "original checkout\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=fixture\n").unwrap();
+        std::fs::create_dir(repo.join(".githooks")).unwrap();
+        let hook = repo.join(".githooks/post-checkout");
+        std::fs::write(&hook, format!(
+            "#!/bin/sh\ntest -f README.txt || exit 42\nprintf '%s\\n' \"$1\" \"$2\" \"$3\" >> hook-arguments\nprintf ran >> hook-count\nexit {hook_exit}\n"
+        )).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        repos.git(&["add", "."], Some(&repo)).await.unwrap();
+        repos
+            .git(&["commit", "-m", "fixture"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "core.hooksPath", ".githooks"], Some(&repo))
+            .await
+            .unwrap();
+        (tmp, repos, repo)
+    }
+
+    #[tokio::test]
+    async fn common_worktree_runs_configured_hook_once_after_checkout() {
+        let (tmp, repos, repo) = common_worktree_fixture(0).await;
+        let root = tmp.path().join("worktrees");
+        let path =
+            zeron_workers_unpeel::worktree_ownership::worktree_path(&root, &repo, "test").unwrap();
+        let repository = repo.clone();
+        let journal = repos.ownership_journal_path().unwrap();
+        tokio::task::spawn_blocking(move || {
+            zeron_workers_unpeel::create_new_checkout_for_chat_unprepared(
+                &repository,
+                "zeron/test",
+                Some("main"),
+                &root,
+                &journal,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let head = repos
+            .git(&["rev-parse", "HEAD"], Some(&repo))
+            .await
+            .unwrap();
+        let arguments = std::fs::read_to_string(path.join("hook-arguments")).unwrap();
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            ["0".repeat(head.len()), head, "1".into()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("hook-count")).unwrap(),
+            "ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("README.txt")).unwrap(),
+            "original checkout\n"
+        );
+        assert!(!repo.join("hook-count").exists());
+        assert_eq!(repos.current_branch(&repo).await.unwrap(), "main");
+        assert!(repos.refs(&repo).await.unwrap().iter().any(|entry| {
+            entry
+                .worktree_path
+                .as_ref()
+                .is_some_and(|listed| same_file::is_same_file(listed, &path).unwrap_or(false))
+        }));
+    }
+
+    #[tokio::test]
+    async fn common_worktree_removes_partial_checkout_when_creation_fails() {
+        let (tmp, repos, repo) = common_worktree_fixture(0).await;
+        repos
+            .git(&["config", "filter.fixture.smudge", "exit 1"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "filter.fixture.required", "true"], Some(&repo))
+            .await
+            .unwrap();
+        let root = tmp.path().join("worktrees");
+        let path = zeron_workers_unpeel::worktree_ownership::worktree_path(&root, &repo, "failed")
+            .unwrap();
+        let repository = repo.clone();
+        let journal = repos.ownership_journal_path().unwrap();
+        let error = tokio::task::spawn_blocking(move || {
+            zeron_workers_unpeel::create_new_checkout_for_chat_unprepared(
+                &repository,
+                "zeron/failed",
+                Some("main"),
+                &root,
+                &journal,
+            )
+            .err()
+            .expect("smudge fails")
+        })
+        .await
+        .unwrap();
+        assert!(error.to_string().contains("smudge"), "{error}");
+        assert!(!path.exists());
+        assert!(repos.refs(&repo).await.unwrap().iter().all(|entry| {
+            entry
+                .worktree_path
+                .as_ref()
+                .is_none_or(|listed| same_file::is_same_file(listed, &repo).unwrap_or(false))
+        }));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.txt")).unwrap(),
+            "original checkout\n"
+        );
+        assert_eq!(repos.current_branch(&repo).await.unwrap(), "main");
+    }
+
+    #[tokio::test]
+    async fn common_worktree_keeps_completed_checkout_when_hook_fails() {
+        let (tmp, repos, repo) = common_worktree_fixture(1).await;
+        let root = tmp.path().join("worktrees");
+        let path =
+            zeron_workers_unpeel::worktree_ownership::worktree_path(&root, &repo, "hook-failure")
+                .unwrap();
+        let repository = repo.clone();
+        let journal = repos.ownership_journal_path().unwrap();
+        assert!(
+            tokio::task::spawn_blocking(move || {
+                zeron_workers_unpeel::create_new_checkout_for_chat_unprepared(
+                    &repository,
+                    "zeron/hook-failure",
+                    Some("main"),
+                    &root,
+                    &journal,
+                )
+                .is_err()
+            })
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("hook-count")).unwrap(),
+            "ran"
+        );
+        assert!(path.join("README.txt").is_file());
+        assert!(repos.refs(&repo).await.unwrap().iter().any(|entry| {
+            entry
+                .worktree_path
+                .as_ref()
+                .is_some_and(|listed| same_file::is_same_file(listed, &path).unwrap_or(false))
+        }));
+        assert_eq!(repos.current_branch(&repo).await.unwrap(), "main");
     }
 
     #[test]
@@ -4107,7 +4403,7 @@ tmpfs /run tmpfs rw 0 0
     }
 
     #[tokio::test]
-    async fn external_checkout_preparation_ignores_a_broken_local_ownership_journal() {
+    async fn external_checkout_preparation_uses_the_journal_and_fails_closed_if_broken() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let external = temp.path().join("external");
@@ -4126,12 +4422,12 @@ tmpfs /run tmpfs rw 0 0
             ],
         );
         let journal_path = temp.path().join("ownership.json");
-        std::fs::write(&journal_path, "not valid JSON").unwrap();
         let repos = Repos::build(
             temp.path(),
             "device",
             managed,
-            Ok(journal_path),
+            None,
+            Ok(journal_path.clone()),
             std::sync::Arc::new(SystemProcessRunner),
         );
         let outcome = repos
@@ -4144,6 +4440,14 @@ tmpfs /run tmpfs rw 0 0
         );
         assert_eq!(outcome.worktree.branch, "feature");
         assert!(outcome.setup_error.is_none());
+        std::fs::write(&journal_path, "not valid JSON").unwrap();
+        assert!(
+            repos
+                .prepare_worktree_for_chat(&repo, &external)
+                .await
+                .is_err(),
+            "malformed ownership cannot certify that preparation is unnecessary"
+        );
 
         let unrelated = temp.path().join("unrelated");
         std::fs::create_dir(&unrelated).unwrap();

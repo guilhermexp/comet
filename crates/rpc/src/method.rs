@@ -241,6 +241,8 @@ rpc_methods! {
     /// Update remote-tracking refs without changing HEAD, the index, or files.
     FETCH_ALL / FetchAll = "FetchAll" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
     SWITCH_REF / SwitchRef = "SwitchRef" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    GET_WORKTREE_SETTINGS / GetWorktreeSettings = "GetWorktreeSettings" { params: serde_json::Value, reply: zeron_proto::WorktreeSettingsStatus, forwardable: true },
+    SET_WORKTREE_SETTINGS / SetWorktreeSettings = "SetWorktreeSettings" { params: zeron_proto::WorktreeSettings, reply: zeron_proto::WorktreeSettingsStatus, forwardable: true },
     LIST_FOLDERS / ListFolders = "ListFolders" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// The device's browse roots: home plus mounted drives/volumes.
     LIST_DRIVES / ListDrives = "ListDrives" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
@@ -398,6 +400,30 @@ mod tests {
             info(methods::NEGOTIATE_VOICE_V2).unwrap().deadline,
             std::time::Duration::from_secs(95)
         );
+    }
+
+    #[test]
+    fn worktree_settings_are_typed_forwardable_unary_methods() {
+        fn check_set<
+            M: RpcMethod<
+                    Params = zeron_proto::WorktreeSettings,
+                    Reply = zeron_proto::WorktreeSettingsStatus,
+                >,
+        >() {
+        }
+        fn check_get<M: RpcMethod<Reply = zeron_proto::WorktreeSettingsStatus>>() {}
+        check_get::<GetWorktreeSettings>();
+        check_set::<SetWorktreeSettings>();
+        for method in [
+            methods::GET_WORKTREE_SETTINGS,
+            methods::SET_WORKTREE_SETTINGS,
+        ] {
+            let method = info(method).unwrap();
+            assert!(method.forwardable);
+            assert!(!method.stream);
+            assert!(!method.local_only);
+            assert_eq!(method.deadline, Duration::from_secs(30));
+        }
     }
 
     #[test]
