@@ -1095,19 +1095,52 @@ mod tests {
             while !thread_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // The listener is nonblocking, and macOS inherits that
+                        // on the accepted socket. One read can return before
+                        // curl finishes the request line.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("hook endpoint waits for the request line");
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .expect("set notifier read timeout");
-                        let mut request = [0u8; 4096];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let line = String::from_utf8_lossy(&request[..read])
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let line_end = loop {
+                            if let Some(position) =
+                                request.windows(2).position(|window| window == b"\r\n")
+                            {
+                                break Some(position);
+                            }
+                            if request.len() > 8192 {
+                                break None;
+                            }
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break None,
+                                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::WouldBlock
+                                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    break None;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(_) => break None,
+                            }
+                        };
+                        let Some(line_end) = line_end else {
+                            continue;
+                        };
+                        let line = String::from_utf8_lossy(&request[..line_end])
                             .split_whitespace()
                             .nth(1)
                             .unwrap_or_default()
                             .to_owned();
+                        // The installed app probes new loopback listeners with
+                        // `HEAD /`. Only hook deliveries are asserted below.
+                        if !line.starts_with("/hook/") {
+                            continue;
+                        }
                         thread_requests.lock().unwrap().push(line.clone());
                         let status = if line.ends_with("?validate=1") {
                             validation_status
