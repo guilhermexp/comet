@@ -1354,6 +1354,7 @@ impl WorkersSidebar {
         } else {
             project.name.clone().into()
         };
+        let local_device_id = self.model.read(cx).state().read(cx).local_device_id.clone();
         let change_request = self.model.read(cx).change_request_for(&project, cx);
         let is_child_folder = project.parent_project_id.is_some();
         let folder_tint = project_folder_tint(
@@ -1587,6 +1588,7 @@ impl WorkersSidebar {
                             format!("workers-project-pr-{index}").into(),
                             summary,
                             crate::change_requests::ChangeRequestBadgeSurface::SidebarIcon,
+                            local_device_id.clone(),
                             theme,
                         ))
                     })

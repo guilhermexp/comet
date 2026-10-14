@@ -177,6 +177,9 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Entrega remota durável | #777 | v0.2.107 | Handoff autenticado antes do ACK e retry por alarme limitado a 1.440 tentativas; expirar wake não apaga comandos aceitos. iOS usa background task limitada e cancela no foreground/signout |
 | Imagens, seleção e badges de arquivo nas tools | #813/#522 | v0.2.107 | Portados ao transcript compacto do fork; previews limitados/liberados no collapse, texto selecionável e abertura de arquivo sem toggle; editor padrão só para arquivo local |
 | Subagentes concluídos e contagem ativa | #647 | v0.2.107 | Dentro de Details › Workers › Subagents: Running visível, Finished recolhido, Completed/Failed/Cancelled separados e páginas independentes de 10. Preserva idade dos Workers e telemetria do provider primário |
+| Busca unificada fff, conteúdo e paleta com abas | #856 | v0.2.111 | Índice único de `Repos` para home/path/content, `fff-search` pinado; métodos novos no registry tipado do fork. O picker de projetos conserva o alvo Worker restrito ao device local e libera o índice transitório ao fechar |
+| Board e inspeção nativa de Pull Requests | #484 | v0.2.111 | RPCs no registry único, erros de capability estáveis e runner Git/GitHub limitado do fork. Lookup/watch por cwd aceita Chat/Space local e checkout Worker vinculado, sem sondar paths arbitrários; badge passa o device dono |
+| Session information, painéis e menus | #677/#855 | v0.2.111 | Toggle e ações do card novos preservados; Device/Project/Branch do card ficam ocultos quando Details está aberto para evitar duplicação. Details mantém Workers, Usage e totais por Worked Project; Sonner e avisos legados do Shell coexistem. Queue drag/mentions não removem Enter/Steer |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
 ## Armadilhas conhecidas

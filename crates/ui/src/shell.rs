@@ -3,7 +3,7 @@
 //! Details/Files sidebar, plus the boot splash and connection gate.
 //!
 //! Layout is zeron's: collapsible drag-resizable sidebar (224–400px, default
-//! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
+//! 256) with a gentle 180–240ms width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
 //! shifts; right utility surface (360px floor, default 520) and Details/Files
 //! sidebar (300–700px, default 500), both hidden by default. Widths/collapsed
@@ -21,8 +21,8 @@ use chrono::{DateTime, Utc};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window,
-    WindowControlArea, actions, div, img, prelude::*, px,
+    MouseUpEvent, NavigationDirection, ObjectFit, Pixels, Point, Render, SharedString,
+    Subscription, Task, Window, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -39,11 +39,16 @@ use crate::details_sidebar::{
     view::{DetailsSidebar, DetailsSidebarEvent},
 };
 use crate::file_preview::view::{FilePreview, FilePreviewEvent};
-use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
+use crate::files::{
+    FileColumn, FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag,
+};
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
+use crate::motion::{
+    self, AnimationExt as _, MotionSpec, PANEL_RESIZE, RESIZE, SPLASH_OUT, TAB_SLIDE,
+};
 use crate::popover::{self, Loadable};
+use crate::pull_requests::PullRequestsPage;
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
@@ -56,9 +61,10 @@ use crate::settings::projects::{ProjectsPage, ProjectsPageEvent};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX,
-    DETAILS_SIDEBAR_MIN, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId, SidebarOrganization,
-    SidebarSort, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
+    DETAILS_SIDEBAR_MIN, FILES_PANEL_MIN, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
+    RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
+    SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, TERMINAL_MAX_VH,
+    TERMINAL_MIN_HEIGHT, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
     platform_combo, sidebar_pin_profile_key,
 };
 use crate::state::{
@@ -86,11 +92,18 @@ mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
-mod project_icon;
+mod panel_layout;
+use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
+#[cfg(test)]
+mod panel_interaction_tests;
+pub(crate) mod project_icon;
+mod search_warm;
+mod session_info;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
 pub(crate) mod spaces;
+mod thread_search;
 use side_chats::SideChatTab;
 mod tabs;
 mod voice_stage;
@@ -183,11 +196,47 @@ pub(crate) fn restore_mounted_focus(
     }
 }
 
-#[derive(Clone, Copy)]
+/// Tab groups order their descendants but do not trap focus. The trailing
+/// non-tab-stop handle gives reverse traversal a stable end boundary even
+/// when a page adds or removes controls.
+fn move_settings_focus(
+    start: &FocusHandle,
+    end: &FocusHandle,
+    reverse: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if reverse {
+        window.focus_prev(cx);
+    } else {
+        window.focus_next(cx);
+    }
+    if !start.contains_focused(window, cx) {
+        if reverse {
+            window.focus(end, cx);
+            window.focus_prev(cx);
+        } else {
+            window.focus(start, cx);
+            window.focus_next(cx);
+        }
+    }
+}
+
+/// Whether the chat menu's Copy submenu is open beside it.
+#[derive(Clone, Copy, PartialEq)]
 enum ChatMenuPage {
     Root,
     Copy,
 }
+
+/// Hover-intent keys for the chat menu's rows; only Copy owns a submenu.
+const CHAT_MENU_ROW_RENAME: u8 = 0;
+const CHAT_MENU_ROW_PIN: u8 = 1;
+const CHAT_MENU_ROW_ARCHIVE: u8 = 2;
+const CHAT_MENU_ROW_COPY: u8 = 3;
+const CHAT_MENU_ROW_DELETE: u8 = 4;
+const CHAT_MENU_ROW_TAB: u8 = 5;
+const CHAT_MENU_ROW_EXPORT: u8 = 16;
 
 #[derive(Clone, Copy)]
 enum TabCloseAction {
@@ -314,13 +363,20 @@ fn composer_target_width(panel_width: f32, content_width: f32, docked: bool) -> 
     (content_width + 2.0 * Theme::SPACE_LG).min(panel_width)
 }
 
-fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f32 {
-    if is_chat_route && has_selected_chat {
+fn titlebar_new_session_alpha(route: &Route, has_selected_chat: bool) -> f32 {
+    if matches!(route, Route::PullRequests) || (matches!(route, Route::Chat) && has_selected_chat) {
         1.0
     } else {
         0.0
     }
 }
+
+/// Show the command palette's tab at this (zero-based) position. Bound to
+/// mod-1…4 inside the palette's key context only, where it outranks the
+/// session jumps on the same keys while the palette is open.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct SelectPaletteTab(pub usize);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -552,32 +608,21 @@ pub fn apply_keymap(
         crate::inspector::ToggleInspector,
         None,
     )]);
-}
-
-/// Tab groups order their descendants but do not trap focus. The trailing
-/// non-tab-stop handle gives reverse traversal a stable end boundary even
-/// when a page adds or removes controls.
-fn move_settings_focus(
-    start: &FocusHandle,
-    end: &FocusHandle,
-    reverse: bool,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    if reverse {
-        window.focus_prev(cx);
-    } else {
-        window.focus_next(cx);
-    }
-    if !start.contains_focused(window, cx) {
-        if reverse {
-            window.focus(end, cx);
-            window.focus_prev(cx);
-        } else {
-            window.focus(start, cx);
-            window.focus_next(cx);
-        }
-    }
+    // Context-free bindings (the jumps above) match at the full focus depth,
+    // so a palette binding must too: one for the palette's focused search
+    // input, one for the card itself. Bound after the jumps, they win the tie.
+    let palette_input = format!("{} > PaletteSearch", command_palette::KEY_CONTEXT);
+    cx.bind_keys((0..command_palette::Tab::ALL.len()).flat_map(|ix| {
+        let combo = platform_combo(&format!("mod-{}", ix + 1));
+        [
+            KeyBinding::new(&combo, SelectPaletteTab(ix), Some(&palette_input)),
+            KeyBinding::new(
+                &combo,
+                SelectPaletteTab(ix),
+                Some(command_palette::KEY_CONTEXT),
+            ),
+        ]
+    }));
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -732,13 +777,16 @@ fn settings_open_route(route: &str, remembered: SettingsSection) -> Option<Setti
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Chat,
+    PullRequests,
     Settings(SettingsSection),
 }
 
 /// Shared visible budget for the right columns. Drag constraints and passive
 /// window layout must reserve the same main-column floor and gutter, so the
 /// fork's callers pass [`FORK_CHAT_FLOOR`]; the upstream Files explorer
-/// passes its own (possibly scaled) chat floor.
+/// passes its own (possibly scaled) chat floor. The horizontal fit policy
+/// evicts lower-priority columns before this budget can fall below their
+/// minimum at rest.
 fn right_pane_max_width(viewport: f32, sidebar: f32, chat_floor: f32) -> f32 {
     (viewport - sidebar - chat_floor).max(0.0)
 }
@@ -817,7 +865,7 @@ fn settings_catalog_for_mode(
     match mode {
         SidebarMode::Orchestrator => SettingsCatalog::Orchestrator(match app_route {
             Route::Settings(section) => section,
-            Route::Chat => SettingsSection::General,
+            Route::Chat | Route::PullRequests => SettingsSection::General,
         }),
         SidebarMode::Workers => SettingsCatalog::Workers(match workers_route {
             WorkersRoute::Settings(tab) => tab,
@@ -1083,18 +1131,25 @@ fn remove_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatPanelState {
     /// The surface host portion of the right pane is visible.
-    visible: bool,
+    changes_open: bool,
     /// The workspace explorer (`files_panel`) is docked beside the surfaces.
     files_open: bool,
     right_active: RightSurface,
+    /// Recency used when a narrow window cannot fit every open panel.
+    changes_opened_at: u64,
+    files_opened_at: u64,
+    right_expanded: bool,
 }
 
 impl Default for ChatPanelState {
     fn default() -> Self {
         Self {
-            visible: false,
+            changes_open: false,
             files_open: false,
             right_active: RightSurface::Picker,
+            changes_opened_at: 0,
+            files_opened_at: 0,
+            right_expanded: false,
         }
     }
 }
@@ -1118,19 +1173,19 @@ impl SessionPanels {
     }
 
     pub fn is_visible(&self, key: &str) -> bool {
-        self.get(key).visible
+        self.get(key).changes_open
     }
 
     fn show(&mut self, key: &str) {
-        self.map.entry(key.to_string()).or_default().visible = true;
+        self.map.entry(key.to_string()).or_default().changes_open = true;
     }
 
     fn hide(&mut self, key: &str) -> bool {
         let Some(state) = self.map.get_mut(key) else {
             return false;
         };
-        let was_visible = state.visible;
-        state.visible = false;
+        let was_visible = state.changes_open;
+        state.changes_open = false;
         was_visible
     }
 
@@ -1185,6 +1240,13 @@ impl SessionPanels {
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
+    PullRequests,
+    /// One pull request's detail view over the board, and the device whose
+    /// `gh` reads it (`None` = this device).
+    PullRequest {
+        url: String,
+        device: Option<String>,
+    },
     Settings(SettingsSection),
 }
 
@@ -1231,6 +1293,11 @@ impl NavHistory {
 
     pub fn can_back(&self) -> bool {
         self.index > 0
+    }
+
+    /// The entry Back would land on.
+    pub fn previous(&self) -> Option<&NavEntry> {
+        self.index.checked_sub(1).map(|index| &self.entries[index])
     }
 
     /// Memory history keeps every entry, so "behind the last entry" is exactly
@@ -1415,6 +1482,10 @@ pub(crate) fn sidebar_faded_label(
     .fade_right(true)
     .fade_label_overflow(&overflow)
 }
+/// Square action beside the account trigger in the sidebar footer.
+const SIDEBAR_FOOTER_ACTION_SIZE: f32 = SIDEBAR_FOOTER_BUTTON_SIZE;
+/// Breathing room between the account trigger and its adjacent action.
+const SIDEBAR_FOOTER_ACTION_GAP: f32 = 4.0;
 
 /// A chat row's inline title editor, swapped in for its faded title while
 /// the chat is renamed in place: the title's 13/17 type in an accent-ringed
@@ -1531,7 +1602,9 @@ struct SidebarSessionTransfer {
     cursor_offset: Point<Pixels>,
     pointer: Point<Pixels>,
     viewport: Option<gpui::Bounds<Pixels>>,
+    /// The lifted row's window position: `slide` its top, `slide_x` its left.
     slide: SidebarSessionSlide,
+    slide_x: SidebarSessionSlide,
     preview: Option<SidebarSessionGap>,
     source_group: String,
     source_index: usize,
@@ -1666,7 +1739,7 @@ impl Render for DragGhost {
     }
 }
 
-/// A oneshot width tween (200ms ease-out), driven MANUALLY from render via
+/// A oneshot width tween, driven MANUALLY from render via
 /// [`Shell::eval_tween`] — never through a `with_animation` wrapper. gpui keys
 /// an animation element's start time by its full global element-id path, so a
 /// wrapper that mounts/remounts (route swap, or an ancestor animation keyed by
@@ -1678,6 +1751,8 @@ struct WidthTween {
     from: f32,
     to: f32,
     started: std::time::Instant,
+    duration: Duration,
+    curve: motion::CubicBezier,
 }
 
 impl WidthTween {
@@ -1686,6 +1761,25 @@ impl WidthTween {
             from,
             to,
             started: std::time::Instant::now(),
+            duration: RESIZE.total().mul_f32(motion::speed_scale()),
+            curve: RESIZE.curve,
+        }
+    }
+
+    /// A panel column moving from `from` to `to`. Longer moves take longer,
+    /// so a wide pane travels at about the pace of the sidebar instead of
+    /// covering twice the distance in the same time: 180ms up to the
+    /// sidebar's width, growing with the square root of the distance to
+    /// 240ms. The dialog entrance curve eases into the movement and settles
+    /// without overshoot, rather than starting a large column at full speed.
+    fn panel(from: f32, to: f32) -> Self {
+        let scale = ((to - from).abs() / SIDEBAR_DEFAULT)
+            .sqrt()
+            .clamp(1.0, 4.0 / 3.0);
+        Self {
+            duration: PANEL_RESIZE.total().mul_f32(motion::speed_scale() * scale),
+            curve: PANEL_RESIZE.curve,
+            ..Self::new(from, to)
         }
     }
 }
@@ -2493,6 +2587,7 @@ pub struct Shell {
     file_preview: Entity<FilePreview>,
     _file_preview_sub: Subscription,
     /// Chat outlet vs settings pages.
+    /// Chat outlet, pull request dashboard, or settings pages.
     route: Route,
     /// Settings keyboard scope (upstream #449): the page root holds focus on
     /// entry, Tab cycles inside it, and the trailing handle bounds reverse
@@ -2509,8 +2604,18 @@ pub struct Shell {
     workers_settings_open: bool,
     workers_sidebar: Entity<WorkersSidebar>,
     workers_content: Entity<WorkersContent>,
+    settings_restore_pending: bool,
+    settings_return_route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
+    pull_requests_page: Option<Entity<PullRequestsPage>>,
+    pull_request_detail: Option<Entity<crate::pull_request_detail::PullRequestDetailPage>>,
+    pull_request_detail_subscription: Option<Subscription>,
+    /// A detail view a history step landed on, opened by the next render
+    /// (creating it needs the window).
+    pending_pull_request: Option<(String, Option<String>)>,
+    pull_request_cache:
+        std::rc::Rc<std::cell::RefCell<crate::pull_request_detail::PullRequestCache>>,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
@@ -2528,6 +2633,12 @@ pub struct Shell {
     appearance_settings_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
+    /// The Copy submenu's hover grace, its painted bounds, and which side
+    /// of the menu it opens on (the sidebar options menu's recipe).
+    chat_copy_intent: popover::HoverIntent<u8>,
+    chat_copy_bounds: Option<gpui::Bounds<Pixels>>,
+    chat_copy_left: bool,
+    /// The chat title being edited in place on its row.
     chat_rename: Option<ChatRename>,
     /// Chat id awaiting delete confirmation.
     /// Chat id awaiting inline delete confirmation on its sidebar row.
@@ -2548,6 +2659,12 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// Global action and Chat history search palette, `Some` while open.
     command_palette: Option<command_palette::CommandPalette>,
+    /// The overflow menu for folders folded into the add-project breadcrumb.
+    project_crumb_menu: popover::Popup<()>,
+    /// The focus whose workspace search index was last warmed (see `search_warm`).
+    search_warm: Option<search_warm::SearchWarm>,
+    /// Per chat, the files opened in editor tabs, most recent first.
+    recent_files: std::collections::HashMap<String, std::collections::VecDeque<String>>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// A Changes surface asked to open a file in Files (#311); drained by
     /// `render`, which owns the window the editor subscription needs.
@@ -2562,8 +2679,7 @@ pub struct Shell {
     sidebar_view_trigger_focus: gpui::FocusHandle,
     /// Current pinned-row metrics shared by hit testing and displacement animations.
     sidebar_pinned_heights: Vec<f32>,
-    project_icons:
-        std::cell::RefCell<std::collections::HashMap<String, Entity<project_icon::ProjectIcon>>>,
+    project_icons: project_icon::ProjectIcons,
     /// Hovered row whose status is replaced by the archive control.
     chat_status_hover: Option<String>,
     /// Set by an archive-pill click until the pointer next moves. gpui only
@@ -2641,6 +2757,8 @@ pub struct Shell {
     settings_base: UiSettings,
     /// Session-scoped right utility pane (Terminal or Changes).
     panels: SessionPanels,
+    panel_open_sequence: u64,
+    sidebar_opened_at: u64,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
     /// Last Chat that received an Appshot, used by the Last Chat target. It
@@ -2665,6 +2783,27 @@ pub struct Shell {
     debug_upload: Option<String>,
     sidebar_tween: Option<WidthTween>,
     files_tween: Option<WidthTween>,
+    /// The session card's reveal (0 closed → 1 open).
+    session_info_tween: Option<WidthTween>,
+    files_content_tween: Option<WidthTween>,
+    /// The last tracked frame: its chat, the window fit, and for each of
+    /// `[sidebar, surface host, Files]` the width painted and the width its
+    /// content laid out at.
+    painted_columns: Option<(String, HorizontalPanelFit, [(f32, f32); 3])>,
+    /// Columns the fit just hid while still open, easing out from the width
+    /// they last painted with their content held at its layout width (same
+    /// order).
+    fit_exits: [Option<(WidthTween, f32)>; 3],
+    /// The window width the surface host's share was last split for. Seeded
+    /// by the first frame, so a saved divider survives a relaunch.
+    split_viewport: Option<f32>,
+    /// The last window fit and the inputs it was computed from, one slot
+    /// per `closing` flag of `fit`: layout helpers ask for both many times
+    /// per frame while a close runs. Not a per-frame value, since handlers
+    /// re-read the fit right after changing what it depends on.
+    fit_memo: [std::cell::Cell<Option<(FitInputs, HorizontalPanelFit)>>; 2],
+    /// The closed surface host already released its image previews.
+    right_images_suspended: bool,
     sidebar_edge_bounce: Option<motion::ResizeEdgeBounce>,
     /// Boundary currently held during a sidebar drag. Cleared on re-entry or
     /// release so the next genuine edge crossing can acknowledge the limit.
@@ -2674,20 +2813,27 @@ pub struct Shell {
     /// a constrained edge takes over with its bounce cue.
     pane_resize_active: Option<PaneResizeKind>,
     pane_resize_dragging: Option<PaneResizeKind>,
+    /// The window changed width since the previous frame. Live window
+    /// resizing moves layout directly instead of through motion springs.
+    viewport_resized: bool,
     right_tween: Option<WidthTween>,
     details_tween: Option<WidthTween>,
     right_edge_bounce: Option<motion::ResizeEdgeBounce>,
     right_resize_edge: Option<motion::ResizeEdge>,
-    /// Mirrors `right_tween` only for takeover entry/exit, allowing the visible
-    /// right-panel contents to resize with their outer frame in that mode.
-    right_takeover_content_tween: Option<WidthTween>,
-    /// Conversation-width tween used only while entering/leaving right-pane
-    /// takeover. Normal right-pane open/close keeps the normal flex behavior.
+    /// Holds content geometry during masked open/close (including reversals),
+    /// or resizes it during takeover. The outer mask has its own tween.
+    right_content_tween: Option<WidthTween>,
+    /// Takeover mask transition. `from` also retains the conversation's content
+    /// width while covered, even after expansion settles. Ordinary panel
+    /// open/close keeps the upstream flex behavior.
     main_takeover_tween: Option<WidthTween>,
     /// Surface-host takeover (the header's expand button): the host fills
     /// everything right of the sidebar and the conversation column collapses
     /// to zero. Session-local view state — never persisted, reset on close.
     right_pane_expanded: bool,
+    /// The latest device/project-scoped panel key, including Worker context.
+    /// Layout helpers without an `App` use this to fit the active panel state.
+    layout_panel_key: std::cell::RefCell<String>,
     /// Viewport width stamped each frame at render — the expanded panel's
     /// width target ([`Self::right_target`] has no `Window`).
     viewport_width: f32,
@@ -2720,6 +2866,9 @@ pub struct Shell {
     /// All pane masks and chrome evaluate animation at the same frame time.
     /// A slow render must not give the native page and its titlebar different widths.
     render_time: Option<std::time::Instant>,
+    /// A deterministic clock for rendered integration tests.
+    #[cfg(test)]
+    test_time: Option<std::time::Instant>,
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
@@ -2930,7 +3079,7 @@ impl Shell {
                 DetailsSidebarEvent::Close => {
                     let from = this.details_target(cx);
                     this.settings.details_sidebar_open = false;
-                    this.details_tween = Some(WidthTween::new(from, 0.0));
+                    this.details_tween = Some(this.clocked_tween(from, 0.0));
                     this.schedule_save(cx);
                     cx.notify();
                 }
@@ -3030,9 +3179,10 @@ impl Shell {
         // `ZERON_UI_CAPTURE`: a normal run always boots into the chat, however
         // stale the shell's exports are. Bare `settings` reopens the
         // remembered section; a named one is remembered like any other link
-        // to a section.
+        // to a section. Pull requests is also available as an isolated UI route.
         let capture_route = crate::capture::knob("ZERON_OPEN_ROUTE");
         let route = match capture_route.as_deref() {
+            Some("pull-requests") => Route::PullRequests,
             Some(route) if route == "settings" || route.starts_with("settings/") => {
                 match settings_open_route(route, settings.settings_section) {
                     Some(section) => {
@@ -3074,6 +3224,7 @@ impl Shell {
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
+            Route::PullRequests => NavEntry::PullRequests,
             Route::Settings(section) => NavEntry::Settings(section),
         });
         // Parent notifications carry presentation changes (session status,
@@ -3174,7 +3325,14 @@ impl Shell {
             workers_settings_open,
             workers_sidebar,
             workers_content,
+            settings_restore_pending: false,
+            settings_return_route: Route::Chat,
             nav,
+            pull_requests_page: None,
+            pull_request_detail: None,
+            pull_request_detail_subscription: None,
+            pending_pull_request: None,
+            pull_request_cache: Default::default(),
             devices_page: None,
             archived_page: None,
             appearance_page: None,
@@ -3191,6 +3349,9 @@ impl Shell {
             files_settings_sub: None,
             appearance_settings_sub: None,
             chat_menu: popover::Popup::default(),
+            chat_copy_intent: Default::default(),
+            chat_copy_bounds: None,
+            chat_copy_left: false,
             chat_rename: None,
             delete_confirm: None,
             space_menu: popover::Popup::default(),
@@ -3204,6 +3365,9 @@ impl Shell {
             delete_space_confirm: None,
             add_space: None,
             command_palette: None,
+            project_crumb_menu: popover::Popup::default(),
+            search_warm: None,
+            recent_files: std::collections::HashMap::new(),
             pending_workspace_command: None,
             pending_diff_file_open: None,
             spaces_menu: popover::Popup::default(),
@@ -3254,6 +3418,8 @@ impl Shell {
             settings_base: settings::current(cx),
             settings,
             panels: SessionPanels::default(),
+            panel_open_sequence: 0,
+            sidebar_opened_at: 0,
             active_chat: String::new(),
             last_appshot_chat: None,
             sidebar_prev_order: Vec::new(),
@@ -3266,17 +3432,26 @@ impl Shell {
             debug_upload,
             sidebar_tween: None,
             files_tween: None,
+            session_info_tween: None,
+            files_content_tween: None,
+            painted_columns: None,
+            fit_exits: [None; 3],
+            split_viewport: None,
+            fit_memo: Default::default(),
+            right_images_suspended: false,
             sidebar_edge_bounce: None,
             sidebar_resize_edge: None,
             pane_resize_active: None,
             pane_resize_dragging: None,
+            viewport_resized: false,
             right_tween: None,
             details_tween: None,
             right_edge_bounce: None,
             right_resize_edge: None,
-            right_takeover_content_tween: None,
+            right_content_tween: None,
             main_takeover_tween: None,
             right_pane_expanded: false,
+            layout_panel_key: std::cell::RefCell::new(String::new()),
             viewport_width: 1280.0,
             viewport_height: 880.0,
             fullscreen: None,
@@ -3288,6 +3463,8 @@ impl Shell {
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             render_time: None,
+            #[cfg(test)]
+            test_time: None,
             splash,
             splash_task: None,
             focus_sub: None,
@@ -3351,12 +3528,13 @@ impl Shell {
         }
         self.prune_file_explorers(cx);
         self.refresh_harness_update_watch(cx);
+        self.sync_search_warm(cx);
         if state.read(cx).engine().is_none() {
             self.side_chats.clear();
             self.side_chat_creating = false;
         }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.push_toast(crate::toast::Toast::error(notice), cx);
+            self.show_notice(crate::toast::ToastKind::Info, notice, cx);
         }
         self.start_registry_migration(state, cx);
         let next_sync_flow = {
@@ -3709,6 +3887,14 @@ impl Shell {
             self.last_appshot_chat = Some(selected.clone());
         }
         if selected != self.active_chat {
+            // Persist takeover on the panel key that was actually mounted
+            // (including a Worker context) before changing the selected chat.
+            let old_key = self.layout_panel_key.borrow().clone();
+            let was_expanded = self.right_pane_expanded;
+            if !old_key.is_empty() {
+                self.panels
+                    .update(&old_key, |panels| panels.right_expanded = was_expanded);
+            }
             self.utility_add_menu_open = false;
             self.utility_add_menu_dismissed_at = None;
             self.right_pane_expanded = false;
@@ -3727,12 +3913,16 @@ impl Shell {
                     self.nav.push(entry);
                 }
             }
-            self.files_tween = None;
-            self.right_tween = None;
-            self.right_takeover_content_tween = None;
-            self.main_takeover_tween = None;
-            // One registry: whatever tab this chat had picked is what reloads.
-            if let RightSurface::Diff(id) = self.resolved_right_active(cx)
+            self.clear_panel_transitions();
+            self.fit_exits = [None; 3];
+            let key = self.panel_key(cx);
+            if self.active_chat.is_empty() {
+                self.panels.update(&key, |panels| panels.files_open = false);
+            }
+            let panels = self.panels.get(&key);
+            self.right_pane_expanded = !self.active_chat.is_empty() && panels.right_expanded;
+            if panels.changes_open
+                && let RightSurface::Diff(id) = self.resolved_right_active(cx)
                 && let Some(changes) = self.diffs.get(&id).cloned()
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
@@ -3763,10 +3953,11 @@ impl Shell {
     // ---- layout state ----
 
     fn sidebar_target(&self) -> f32 {
-        if self.settings.sidebar_collapsed {
+        let fit = self.horizontal_fit();
+        if self.settings.sidebar_collapsed || !fit.sidebar {
             0.0
         } else {
-            self.settings.sidebar_width
+            fit.sidebar_limit
         }
     }
 
@@ -3807,17 +3998,17 @@ impl Shell {
     /// The per-session panel key. The new-chat canvas (no selection) keys per
     /// space so its state is not shared across workspaces.
     fn panel_key(&self, cx: &App) -> String {
-        if self.sidebar_mode == SidebarMode::Workers {
-            return self
-                .worker_panel_context(cx)
+        let key = if self.sidebar_mode == SidebarMode::Workers {
+            self.worker_panel_context(cx)
                 .map(|context| context.key)
-                .unwrap_or_else(|| "workers:none".into());
-        }
-        if self.active_chat.is_empty() {
+                .unwrap_or_else(|| "workers:none".into())
+        } else if self.active_chat.is_empty() {
             crate::state::canvas_panel_key(self.state.read(cx).selected_space.as_deref())
         } else {
             self.active_chat.clone()
-        }
+        };
+        *self.layout_panel_key.borrow_mut() = key.clone();
+        key
     }
 
     /// The pane is open when the column is visible AND it still hosts a tab:
@@ -3833,8 +4024,24 @@ impl Shell {
             && !self.right_surface_rows(cx).is_empty()
     }
 
+    /// Open and on screen: the window fit is not hiding the pane.
+    fn right_pane_shown(&self, cx: &App) -> bool {
+        self.right_pane_open(cx) && self.horizontal_fit().right
+    }
+
     fn right_target(&self, cx: &App) -> f32 {
-        if !self.right_pane_open(cx) {
+        self.right_target_for_columns(cx, self.sidebar_now(), self.files_reserved_width(cx))
+    }
+
+    /// The surface host's width once every running transition has landed.
+    /// The initial target uses the sidebar and Files' settled allocation;
+    /// the painted pane follows its live target while its neighbours move.
+    fn right_settled_target(&self, cx: &App) -> f32 {
+        self.right_target_for_columns(cx, self.sidebar_target(), self.files_settled_width(cx))
+    }
+
+    fn right_target_for_columns(&self, cx: &App, sidebar: f32, files: f32) -> f32 {
+        if !self.right_pane_shown(cx) {
             0.0
         } else if self.right_pane_expanded {
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
@@ -3868,15 +4075,15 @@ impl Shell {
         self.utility_add_menu_open = false;
         if !self.right_pane_open(cx) {
             self.right_pane_expanded = false;
+            let key = self.panel_key(cx);
+            self.panels
+                .update(&key, |panels| panels.right_expanded = false);
         }
         // A Terminal↔Changes switch inside an open column keeps the same
-        // width. Arming the tween anyway held `motion_active` for the full
-        // 200 ms, and Render answers that with a request_animation_frame per
-        // frame — the whole shell tree re-rendered for nothing.
-        // `on_terminal_panel_event` already guards this the same way.
+        // width. Avoid driving an animation clock when its target did not move.
         let to = self.right_target(cx);
         if from != to {
-            self.right_tween = Some(WidthTween::new(from, to));
+            self.right_tween = Some(self.panel_tween(from, to));
         }
         cx.notify();
     }
@@ -3940,7 +4147,7 @@ impl Shell {
         }
         let from = self.details_target(cx);
         self.settings.details_sidebar_open = !self.settings.details_sidebar_open;
-        self.details_tween = Some(WidthTween::new(from, self.details_target(cx)));
+        self.details_tween = Some(self.clocked_tween(from, self.details_target(cx)));
         self.schedule_save(cx);
         cx.notify();
     }
@@ -3968,64 +4175,113 @@ impl Shell {
         }
         self.details_tween = None;
         self.right_tween = None;
-        self.right_takeover_content_tween = None;
+        self.right_content_tween = None;
         self.main_takeover_tween = None;
         self.schedule_save(cx);
         cx.notify();
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.sidebar_collapsed
+            && self.promote_hidden_panel(AuxiliaryPanel::Sidebar, cx)
+        {
+            return;
+        }
         let from = self.sidebar_now();
+        let before = self.painted_panels(cx);
         self.sidebar_edge_bounce = None;
         self.sidebar_resize_edge = None;
         self.pane_resize_active = None;
         self.pane_resize_dragging = None;
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
-        self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
+        // Record the open before targeting: the fit ranks columns by recency,
+        // and an unrecorded sidebar would target the width of a hidden one.
+        if !self.settings.sidebar_collapsed {
+            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.panel_key(cx));
+        }
+        self.sidebar_tween = Some(self.panel_tween(from, self.sidebar_target()));
         self.schedule_save(cx);
+        self.resplit_panels(before, None, cx);
         cx.notify();
+    }
+
+    /// Closing the last surface tab closes the surface host; a docked
+    /// explorer keeps the pane open on its own.
+    fn collapse_surfaces_if_empty(&mut self, panel_key: &str, cx: &mut Context<Self>) {
+        if panel_key == self.panel_key(cx)
+            && self.right_tabs.get(panel_key).is_none_or(Vec::is_empty)
+        {
+            self.set_surfaces_open(false, cx);
+        }
     }
 
     /// Show or hide the surface host portion of the right pane. A no-op when
     /// already in the requested state, so programmatic opens (a file, a
     /// browser link, a subagent chip) never close a pane the user has open.
+    /// An open pane the window fit hides is brought forward instead, so the
+    /// requested content is reachable.
     fn set_surfaces_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.sidebar_mode == SidebarMode::Orchestrator && self.active_chat.is_empty() {
+            return;
+        }
+        if self.sidebar_mode == SidebarMode::Workers && self.worker_panel_context(cx).is_none() {
+            return;
+        }
         if self.right_pane_open(cx) == open {
+            if open {
+                self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
+            }
             return;
         }
         // Reverse from the visible width when toggled during an animation.
-        let from = self.right_visible_width(cx);
+        let before = self.painted_panels(cx);
+        let from = before.right;
+        let content_from = before.right_content;
         self.right_edge_bounce = None;
         self.right_resize_edge = None;
         self.finish_pane_resize(PaneResizeKind::Right);
         let sidebar_now = self.sidebar_now();
-        let from_main = conversation_width(
-            self.viewport_width - self.files_reserved_width(cx),
-            sidebar_now,
-            from,
-        );
-        let was_expanded = self.right_pane_expanded;
+        let from_main = self.main_content_width(self.main_target_width(from, cx), cx);
+        let was_expanded = self.right_pane_expanded || self.tween_active(self.main_takeover_tween);
         let key = self.panel_key(cx);
         if open {
             self.panels.show(&key);
+            self.record_panel_open(AuxiliaryPanel::Right, &key);
+            self.right_images_suspended = false;
         } else {
             self.panels.hide(&key);
-            self.suspend_file_images(cx);
+            // Let the render-time visibility check release images after the
+            // close mask lands. Suspending here would blank file content on
+            // the first closing frame.
             // Closing always leaves takeover mode — reopening at full bleed
             // with the conversation gone read as a broken chat.
             self.right_pane_expanded = false;
         }
-        let to = self.right_target(cx);
-        self.right_takeover_content_tween = None;
-        self.main_takeover_tween = was_expanded.then(|| {
-            WidthTween::new(
-                from_main,
-                conversation_width(
-                    self.viewport_width - self.files_reserved_width(cx),
-                    sidebar_now,
-                    to,
-                ),
-            )
+        if !open {
+            // Closing always leaves takeover mode — reopening at full bleed
+            // with the conversation gone reads as a broken chat.
+            self.right_pane_expanded = false;
+            self.panels
+                .update(&key, |panels| panels.right_expanded = false);
+        }
+        self.resplit_panels(before, Some(AuxiliaryPanel::Right), cx);
+        let to = self.right_settled_target(cx);
+        let pane = self.panel_tween(from, to);
+        self.right_tween = Some(pane);
+        let (content_start, content_end) = panel_content_tween(content_from, from, to);
+        self.right_content_tween = Some(WidthTween {
+            from: content_start,
+            to: content_end,
+            ..pane
+        });
+        self.main_takeover_tween = was_expanded.then(|| WidthTween {
+            from: from_main,
+            to: conversation_width(
+                self.viewport_width - self.files_reserved_width(cx),
+                sidebar_now,
+                to,
+            ),
+            ..pane
         });
         if open
             && let RightSurface::Diff(id) = self.resolved_right_active(cx)
@@ -4094,6 +4350,9 @@ impl Shell {
     /// own toggle undocks it). With nothing to show it opens Changes.
     fn toggle_right_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_pane_open(cx) {
+            if self.promote_hidden_panel(AuxiliaryPanel::Right, cx) {
+                return;
+            }
             self.set_surfaces_open(false, cx);
         } else if self.resolved_right_active(cx) != RightSurface::Picker {
             self.set_surfaces_open(true, cx);
@@ -4367,6 +4626,22 @@ impl Shell {
         }
     }
 
+    /// Release image previews once the surface host stops painting: after
+    /// its close mask lands, while the window fit hides it, or off the chat
+    /// route. Once per hide, so a quick reversal never unloads the frame.
+    fn suspend_hidden_right_images(&mut self, cx: &mut Context<Self>) {
+        let painting = matches!(self.route, Route::Chat)
+            && ((self.horizontal_fit().right
+                && (self.right_pane_open(cx) || self.tween_active(self.right_tween)))
+                || self.fit_exit_width(1).is_some());
+        if painting {
+            self.right_images_suspended = false;
+        } else if !self.right_images_suspended {
+            self.suspend_file_images(cx);
+            self.right_images_suspended = true;
+        }
+    }
+
     fn set_right_active(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
         if let RightSurface::Subagent(id) = surface
             && let Some(tab) = self.subagent_tabs.get(&id)
@@ -4380,10 +4655,17 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
+        if self.right_pane_open(cx) {
+            self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
+        }
         match surface {
             RightSurface::File(id) => {
                 if let Some(file) = self.file_surfaces.get(&id).cloned() {
                     file.update(cx, |file, cx| file.ensure_loaded(cx));
+                    if let Some(path) = self.file_surface_paths.get(&id).cloned() {
+                        let chat_id = file.read(cx).chat_id().to_owned();
+                        self.note_recent_file(&chat_id, &path);
+                    }
                 }
             }
             RightSurface::Terminal(tab) => {
@@ -4730,7 +5012,7 @@ impl Shell {
         &mut self,
         owner: (String, Entity<AppState>),
         path: String,
-        location: Option<(u32, Option<u32>)>,
+        location: Option<(u32, Option<FileColumn>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4917,11 +5199,12 @@ impl Shell {
             return false;
         };
 
-        // `add_file_surface_at` opens the pane and arms its width tween.
+        self.set_surfaces_open(true, cx);
         self.add_file_surface_at(
             owner,
             link.path,
-            link.line.map(|line| (line, link.column)),
+            link.line
+                .map(|line| (line, link.column.map(FileColumn::Character))),
             window,
             cx,
         );
@@ -5565,7 +5848,7 @@ impl Shell {
     /// active surface while the pane is open, or `None` on the picker empty
     /// state / a closed pane / the new-session canvas.
     fn closable_right_surface(&self, cx: &App) -> Option<RightSurface> {
-        if !self.right_pane_open(cx) {
+        if !self.right_pane_shown(cx) {
             return None;
         }
         match self.resolved_right_active(cx) {
@@ -5617,10 +5900,16 @@ impl Shell {
         dirty.sort_by_key(|(key, _)| (key != &current, key.clone()));
         if let Some((key, surface)) = dirty.into_iter().next() {
             self.panels.update(&key, |panel| {
-                panel.visible = true;
+                panel.changes_open = true;
                 panel.right_active = surface;
             });
-            self.apply_nav(NavEntry::Chat(key), cx);
+            if key == current {
+                self.apply_nav(NavEntry::Chat(key), cx);
+                self.set_surfaces_open(true, cx);
+            } else {
+                self.record_panel_open(AuxiliaryPanel::Right, &key);
+                self.apply_nav(NavEntry::Chat(key), cx);
+            }
         }
     }
 
@@ -5677,6 +5966,10 @@ impl Shell {
         if self.right_pane_open(cx)
             && matches!(self.resolved_right_active(cx), RightSurface::Terminal(_))
         {
+            if self.promote_hidden_panel(AuxiliaryPanel::Right, cx) {
+                self.focus_right_terminal(window, cx);
+                return;
+            }
             self.panels.hide(&key);
             window.focus(&self.composer.focus_handle(cx), cx);
             self.finish_right_transition(from, cx);
@@ -5720,6 +6013,9 @@ impl Shell {
 
     fn toggle_utility_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_pane_open(cx) {
+            if self.promote_hidden_panel(AuxiliaryPanel::Right, cx) {
+                return;
+            }
             self.close_utility_pane(window, cx);
             return;
         }
@@ -5734,6 +6030,7 @@ impl Shell {
             cx.notify();
             return;
         }
+        self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
         self.finish_right_transition(from, cx);
     }
 
@@ -5755,6 +6052,7 @@ impl Shell {
     ) {
         let x = f32::from(event.event.position.x);
         let sample = sidebar_drag_sample(x, self.sidebar_resize_edge, self.reduced_motion);
+        let was_collapsed = self.settings.sidebar_collapsed;
         self.settings.sidebar_width = sample.width;
         self.settings.sidebar_collapsed = false;
         self.pane_resize_dragging = Some(PaneResizeKind::Sidebar);
@@ -5767,6 +6065,9 @@ impl Shell {
         self.pane_resize_active = sample.edge.is_none().then_some(PaneResizeKind::Sidebar);
         self.sidebar_resize_edge = sample.edge;
         self.schedule_save(cx);
+        if was_collapsed {
+            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.panel_key(cx));
+        }
         cx.notify();
     }
 
@@ -5784,7 +6085,7 @@ impl Shell {
         let pointer_x = f32::from(event.event.position.x);
         let sidebar_left = f32::from(event.bounds.left());
         let inside_sidebar =
-            pointer_x >= sidebar_left && pointer_x <= sidebar_left + self.settings.sidebar_width;
+            pointer_x >= sidebar_left && pointer_x <= sidebar_left + self.sidebar_now();
         if !inside_window || !inside_sidebar {
             if let Some(transfer) = self.sidebar_session_transfer.as_mut() {
                 transfer.preview = None;
@@ -5830,7 +6131,7 @@ impl Shell {
         }
         self.details_tween = None;
         self.right_tween = None;
-        self.right_takeover_content_tween = None;
+        self.right_content_tween = None;
         self.main_takeover_tween = None;
         self.schedule_save(cx);
         cx.notify();
@@ -5866,6 +6167,23 @@ impl Shell {
 
     // ---- routes / settings ----
 
+    fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        let was_pull_requests = matches!(self.route, Route::PullRequests);
+        let will_show_pull_requests = matches!(route, Route::PullRequests);
+        if was_pull_requests && !will_show_pull_requests {
+            if let Some(page) = self.pull_requests_page.as_ref().cloned() {
+                page.update(cx, |page, _| page.on_hidden());
+            }
+        }
+        self.route = route;
+        if !was_pull_requests && will_show_pull_requests {
+            if let Some(page) = self.pull_requests_page.as_ref().cloned() {
+                page.update(cx, |page, cx| page.on_visible(cx));
+            }
+        }
+    }
+
     /// Close the user menu through the exit animation (no-op when closed).
     fn close_user_menu(&mut self, cx: &mut Context<Self>) {
         if self.user_menu.begin_close() {
@@ -5876,17 +6194,277 @@ impl Shell {
 
     /// Close the session-row context menu through the exit animation.
     fn close_chat_menu(&mut self, cx: &mut Context<Self>) {
+        self.chat_copy_intent.reset();
         if self.chat_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.chat_menu);
             cx.notify();
         }
     }
 
-    fn open_chat_copy_menu(&mut self, cx: &mut Context<Self>) {
-        if let Some(menu) = self.chat_menu.open_mut() {
-            menu.page = ChatMenuPage::Copy;
+    /// A sidebar-level notice (a failed mutation, a copied link) as a toast.
+    /// The latest message is kept so a pin-write failure can be matched later.
+    /// Mark it delivered here so the legacy Render bridge does not toast it again.
+    pub(super) fn show_notice(
+        &mut self,
+        kind: crate::toast::ToastKind,
+        message: impl Into<SharedString>,
+        cx: &mut App,
+    ) {
+        let message = message.into();
+        self.sidebar_notice = Some(message.clone());
+        self.sidebar_notice_toasted = Some(message.clone());
+        crate::toast::show(cx, kind, message);
+    }
+
+    fn set_chat_copy_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let page = if open {
+            ChatMenuPage::Copy
+        } else {
+            ChatMenuPage::Root
+        };
+        if let Some(menu) = self.chat_menu.open_mut()
+            && menu.page != page
+        {
+            menu.page = page;
+            if !open {
+                self.chat_copy_bounds = None;
+            }
             cx.notify();
         }
+    }
+
+    /// Pointer intent over a chat-menu row: hovering Copy opens its submenu,
+    /// any other row closes it — after a grace while the pointer is heading
+    /// into the open submenu.
+    fn hover_chat_menu_row(
+        &mut self,
+        key: u8,
+        pointer: Point<Pixels>,
+        moved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .chat_menu
+            .as_open()
+            .filter(|menu| menu.page == ChatMenuPage::Copy)
+            .map(|_| CHAT_MENU_ROW_COPY);
+        let (bounds, left) = (self.chat_copy_bounds, self.chat_copy_left);
+        let action = if moved {
+            self.chat_copy_intent
+                .moved(current.as_ref(), &key, pointer, bounds, left)
+        } else {
+            self.chat_copy_intent
+                .enter(current.as_ref(), &key, pointer, bounds, left)
+        };
+        match action {
+            popover::HoverAction::None => {}
+            popover::HoverAction::Open => {
+                self.set_chat_copy_open(key == CHAT_MENU_ROW_COPY, cx);
+                self.chat_copy_intent.record_origin(pointer);
+            }
+            popover::HoverAction::Defer => {
+                self.chat_copy_intent.defer(cx, move |this, cx| {
+                    if this.chat_menu.is_open() && this.chat_copy_intent.pending() == Some(&key) {
+                        this.chat_copy_intent.cancel();
+                        this.set_chat_copy_open(key == CHAT_MENU_ROW_COPY, cx);
+                        this.chat_copy_intent.record_origin(pointer);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Wrap a chat-menu row in the hover surface that feeds
+    /// [`Self::hover_chat_menu_row`]. The row keeps its own hover fade.
+    fn chat_menu_hover_row(
+        &self,
+        key: u8,
+        row: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(("chat-menu-hover", key as usize))
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.hover_chat_menu_row(key, window.mouse_position(), false, cx);
+                } else {
+                    this.chat_copy_intent.leave(&key);
+                }
+            }))
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    this.hover_chat_menu_row(key, event.position, true, cx);
+                }),
+            )
+            .child(row)
+            .into_any_element()
+    }
+
+    /// The chat menu's Copy row: opens its submenu beside the menu on hover
+    /// (or click), on whichever side has room.
+    fn render_chat_copy_trigger(
+        &mut self,
+        chat_id: &str,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity().downgrade();
+        let exit_entity = entity.clone();
+        let mut row =
+            popover::menu_row_nav(theme, open, false, format!("chat-menu-copy-{chat_id}"))
+                .id("chat-menu-copy")
+                .debug_selector(|| "chat-menu-copy".to_owned())
+                .relative()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.chat_copy_intent.reset();
+                    this.set_chat_copy_open(true, cx);
+                    cx.stop_propagation();
+                }))
+                .child(
+                    icon(icons::COPY)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(div().flex_1().child(SharedString::from("Copy")))
+                .child(
+                    icon(icons::ALT_ARROW_RIGHT)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    gpui::canvas(
+                        move |bounds, window, cx| {
+                            let left = bounds.right() + px(244.0) > window.viewport_size().width;
+                            let _ = entity.update(cx, |this, cx| {
+                                if this.chat_copy_left != left {
+                                    this.chat_copy_left = left;
+                                    cx.notify();
+                                }
+                            });
+                        },
+                        move |trigger, _, window, _| {
+                            if !open {
+                                return;
+                            }
+                            // Leaving the trigger anywhere but toward the submenu
+                            // closes it, as in the sidebar options menu.
+                            window.on_mouse_event(
+                                move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                                    if phase != gpui::DispatchPhase::Bubble {
+                                        return;
+                                    }
+                                    let _ = exit_entity.update(cx, |this, cx| {
+                                        let (bounds, left) =
+                                            (this.chat_copy_bounds, this.chat_copy_left);
+                                        if this.chat_copy_intent.contains_pointer(
+                                            trigger,
+                                            bounds,
+                                            event.position,
+                                            left,
+                                        ) {
+                                            return;
+                                        }
+                                        this.chat_copy_intent.reset();
+                                        this.set_chat_copy_open(false, cx);
+                                    });
+                                },
+                            );
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                );
+        if open {
+            let submenu = self.render_chat_copy_submenu(chat_id, theme, cx);
+            row = row.child(popover::nested_menu(
+                format!("chat-copy-submenu-{chat_id}"),
+                submenu,
+                self.chat_copy_left,
+            ));
+        }
+        row.into_any_element()
+    }
+
+    /// The Copy submenu's card: what can be copied for this chat.
+    fn render_chat_copy_submenu(
+        &mut self,
+        chat_id: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .cloned();
+        let harness_link = chat
+            .as_ref()
+            .and_then(crate::links::harness_conversation_link);
+        let session_id = chat
+            .as_ref()
+            .and_then(|chat| chat.harness_session_id.as_deref())
+            .is_some_and(|id| !id.trim().is_empty());
+        let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
+        let zeron_id = chat_id.to_owned();
+        let harness_id = chat_id.to_owned();
+        let session_chat_id = chat_id.to_owned();
+        let path_chat_id = chat_id.to_owned();
+        let item = |id: &'static str, label: SharedString| {
+            popover::menu_row(theme, false, format!("{id}-{chat_id}"))
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .child(
+                    icon(icons::COPY)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(label)
+        };
+        let entity = cx.entity().downgrade();
+        popover::popover_card(theme)
+            .w(px(232.0))
+            .relative()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .when(has_path, |menu| {
+                menu.child(item("chat-copy-path", "Path".into()).on_click(
+                    cx.listener(move |this, _, _, cx| this.copy_chat_path(&path_chat_id, cx)),
+                ))
+            })
+            .child(
+                item("chat-copy-zeron", "Zeron conversation link".into()).on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_zeron_conversation_link(&zeron_id, cx),
+                )),
+            )
+            .when_some(harness_link, |menu, link| {
+                menu.child(
+                    item("chat-copy-harness", link.label.into()).on_click(cx.listener(
+                        move |this, _, _, cx| this.copy_harness_conversation_link(&harness_id, cx),
+                    )),
+                )
+            })
+            .when(session_id, |menu| {
+                menu.child(
+                    item("chat-copy-session", "Harness session ID".into()).on_click(cx.listener(
+                        move |this, _, _, cx| this.copy_harness_session_id(&session_chat_id, cx),
+                    )),
+                )
+            })
+            .child(
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        let _ = entity.update(cx, |this, _| this.chat_copy_bounds = Some(bounds));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .into_any_element()
     }
 
     fn copy_zeron_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
@@ -5901,9 +6479,15 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
+            self.show_notice(
+                crate::toast::ToastKind::Success,
+                "Zeron conversation link copied",
+                cx,
+            );
         } else {
-            self.push_toast(
-                crate::toast::Toast::error("Conversation link is not ready yet"),
+            self.show_notice(
+                crate::toast::ToastKind::Error,
+                "Conversation link is not ready yet",
                 cx,
             );
         }
@@ -5921,6 +6505,11 @@ impl Shell {
             .and_then(crate::links::harness_conversation_link);
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link.url));
+            self.show_notice(
+                crate::toast::ToastKind::Success,
+                format!("{} copied", link.label),
+                cx,
+            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -5936,6 +6525,11 @@ impl Shell {
             .and_then(|chat| chat.harness_session_id.clone());
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
+            self.show_notice(
+                crate::toast::ToastKind::Success,
+                "Harness session ID copied",
+                cx,
+            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -5954,6 +6548,7 @@ impl Shell {
         // toasts in this fork.
         if let Some(path) = path {
             cx.write_to_clipboard(ClipboardItem::new_string(path));
+            self.show_notice(crate::toast::ToastKind::Success, "Path copied", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -6006,9 +6601,9 @@ impl Shell {
         }
         if !matches!(self.route, Route::Settings(_)) {
             self.settings_focus_pending = true;
+            self.settings_return_route = self.route;
         }
-        self.route = Route::Settings(section);
-        self.nav.push(NavEntry::Settings(section));
+        self.set_route(Route::Settings(section), cx);
         self.remember_settings_section(section, cx);
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
@@ -6066,7 +6661,7 @@ impl Shell {
         // while that surface was visible.
         self.sidebar_mode = SidebarMode::Orchestrator;
         let key = if let Some(chat_id) = target {
-            self.route = Route::Chat;
+            self.set_route(Route::Chat, cx);
             if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
                 self.state
                     .update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
@@ -6096,7 +6691,7 @@ impl Shell {
     ) {
         self.sidebar_mode = SidebarMode::Orchestrator;
         let key = if let Some(chat_id) = target {
-            self.route = Route::Chat;
+            self.set_route(Route::Chat, cx);
             if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
                 self.state
                     .update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
@@ -6179,11 +6774,103 @@ impl Shell {
         }
     }
 
+    fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::PullRequests) {
+            return;
+        }
+        self.enter_pull_requests_route(cx);
+        self.nav.push(NavEntry::PullRequests);
+    }
+
+    /// Show the board's route without recording a navigation.
+    fn enter_pull_requests_route(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::PullRequests) {
+            return;
+        }
+        self.set_route(Route::PullRequests, cx);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        // Through `close_add_space`, so the host's home index is released.
+        self.close_add_space(cx);
+        self.close_right_plus(cx);
+        if self.spaces_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.spaces_menu);
+        }
+        if self.space_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.space_menu);
+        }
+        cx.notify();
+    }
+
+    /// Open `url`'s detail view over the board without recording a
+    /// navigation. Re-showing the open pull request keeps its view state.
+    fn show_pull_request_detail(
+        &mut self,
+        url: String,
+        target: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_pull_request = None;
+        let local_device_id = self.state.read(cx).local_device_id.clone();
+        let target = target.filter(|device| Some(device.as_str()) != local_device_id.as_deref());
+        if self.pull_requests_page.is_none() {
+            self.pull_requests_page =
+                Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
+        }
+        if let Some(page) = &self.pull_requests_page {
+            page.update(cx, |page, cx| page.select_url(Some(url.clone()), cx));
+        }
+        if self.pull_request_detail.as_ref().is_some_and(|detail| {
+            let detail = detail.read(cx);
+            detail.url == url && detail.target_device() == target.as_deref()
+        }) {
+            cx.notify();
+            return;
+        }
+        let preview = self.pull_requests_page.as_ref().and_then(|page| {
+            let page = page.read(cx);
+            let page_target = page
+                .target_device()
+                .filter(|device| Some(device.as_str()) != local_device_id.as_deref());
+            (page_target.as_deref() == target.as_deref())
+                .then(|| page.preview(&url))
+                .flatten()
+        });
+        self.pull_request_detail = Some(cx.new(|cx| {
+            crate::pull_request_detail::PullRequestDetailPage::new(
+                self.state.clone(),
+                url,
+                target,
+                self.pull_request_cache.clone(),
+                preview,
+                window,
+                cx,
+            )
+        }));
+        self.pull_request_detail_subscription = self
+            .pull_request_detail
+            .as_ref()
+            .map(|detail| cx.observe(detail, |_, _, cx| cx.notify()));
+        cx.notify();
+    }
+
+    /// Return to the board without recording a navigation.
+    fn dismiss_pull_request_detail(&mut self, cx: &mut Context<Self>) {
+        self.pending_pull_request = None;
+        self.pull_request_detail = None;
+        self.pull_request_detail_subscription = None;
+        if let Some(page) = &self.pull_requests_page {
+            page.update(cx, |page, cx| page.select_url(None, cx));
+        }
+        cx.notify();
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_focus_pending = false;
-        self.route = Route::Chat;
-        self.focus_composer(cx);
-        self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        self.settings_restore_pending = true;
+        let route = self.settings_return_route;
+        self.set_route(route, cx);
         self.workers_model.update(cx, |model, cx| {
             if matches!(model.route, WorkersRoute::Settings(_)) {
                 model.close_settings(cx);
@@ -6241,15 +6928,29 @@ impl Shell {
         self.suspend_file_images(cx);
         match entry {
             NavEntry::Chat(chat_id) => {
-                self.route = Route::Chat;
+                self.set_route(Route::Chat, cx);
                 self.focus_composer(cx);
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
             }
+            NavEntry::PullRequests => {
+                self.enter_pull_requests_route(cx);
+                self.dismiss_pull_request_detail(cx);
+            }
+            NavEntry::PullRequest { url, device } => {
+                self.enter_pull_requests_route(cx);
+                // The detail view needs the window; the next render opens it.
+                self.pending_pull_request = Some((url, device));
+            }
             NavEntry::Settings(section) => {
-                self.route = Route::Settings(section);
+                if !matches!(self.route, Route::Settings(_)) {
+                    self.settings_return_route = self.route;
+                }
+                // Keep the fork's separate Agents page. Only fall back when a
+                // remembered page is unavailable on this build.
+                self.set_route(Route::Settings(section.reopenable()), cx);
                 self.remember_settings_section(section, cx);
             }
         }
@@ -6803,13 +7504,15 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.push_toast(crate::toast::Toast::error("Engine not connected"), cx);
+            self.show_notice(crate::toast::ToastKind::Error, "Engine not connected", cx);
+            cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.push_toast(crate::toast::Toast::error(format!("{err}")), cx);
+                    shell.show_notice(crate::toast::ToastKind::Error, format!("{err}"), cx);
+                    cx.notify();
                 })
                 .ok();
             }
@@ -6853,7 +7556,11 @@ impl Shell {
         if !revealed {
             // The sidebar explains its own refusals.
             if surface == ChatRenameSurface::Tab {
-                self.sidebar_notice = Some("Open this side chat's tab to rename it".into());
+                self.show_notice(
+                    crate::toast::ToastKind::Info,
+                    "Open this side chat's tab to rename it",
+                    cx,
+                );
             }
             cx.notify();
             return;
@@ -7103,7 +7810,7 @@ impl Shell {
             zeron_proto::validate_sidebar_pin_update(&current, pins)
         };
         if let Err(message) = result {
-            self.sidebar_notice = Some(message.into());
+            self.show_notice(crate::toast::ToastKind::Error, message, cx);
             cx.notify();
             return false;
         }
@@ -7360,7 +8067,7 @@ impl Shell {
                         // boot-time fallback from a signed-out synced runtime
                         // keeps an open Settings page (and `ZERON_OPEN_ROUTE`).
                         if sign_out {
-                            shell.route = Route::Chat;
+                            shell.set_route(Route::Chat, cx);
                         }
                         shell.space_boot_applied = false;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
@@ -7413,8 +8120,9 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.push_toast(
-                            crate::toast::Toast::error(format!("Could not cancel sign-in: {err}")),
+                        shell.show_notice(
+                            crate::toast::ToastKind::Error,
+                            format!("Could not cancel sign-in: {err}"),
                             cx,
                         );
                     }
@@ -7497,7 +8205,7 @@ impl Shell {
                         // the replacement runtime reach Ready and advances the
                         // wizard from there.
                         shell.org = None;
-                        shell.route = Route::Chat;
+                        shell.set_route(Route::Chat, cx);
                         shell.space_boot_applied = false;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
                         AppState::bootstrap(state.clone(), boot, cx);
@@ -7745,10 +8453,12 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.push_toast(
-                        crate::toast::Toast::error(format!("Sign in failed: {err}")),
+                    shell.show_notice(
+                        crate::toast::ToastKind::Error,
+                        format!("Sign in failed: {err}"),
                         cx,
                     );
+                    cx.notify();
                 }
             })
             .ok();
@@ -7874,30 +8584,72 @@ impl Shell {
 
     // ---- render pieces ----
 
+    fn motion_time(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_time {
+            return now;
+        }
+        std::time::Instant::now()
+    }
+
+    fn clocked_tween(&self, from: f32, to: f32) -> WidthTween {
+        WidthTween {
+            started: self.render_time.unwrap_or_else(|| self.motion_time()),
+            ..WidthTween::new(from, to)
+        }
+    }
+
+    fn panel_tween(&self, from: f32, to: f32) -> WidthTween {
+        WidthTween {
+            started: self.render_time.unwrap_or_else(|| self.motion_time()),
+            ..WidthTween::panel(from, to)
+        }
+    }
+
     fn tween_elapsed(&self, started: std::time::Instant) -> Duration {
         self.render_time
-            .unwrap_or_else(std::time::Instant::now)
+            .unwrap_or_else(|| self.motion_time())
             .saturating_duration_since(started)
     }
 
     /// Evaluate a width tween at the frame time (see [`WidthTween`]).
-    /// Mid-flight: eased 200ms lerp, and `motion_active` is flagged so render
-    /// schedules the next animation frame. Finished, stale, absent, or under
+    /// Mid-flight: lerp on the tween's curve, flagging `motion_active` so
+    /// render schedules the next frame. Finished, stale, absent, or under
     /// reduced motion: exactly `target`. Honors `ZERON_MOTION_SCALE`.
     fn eval_tween(&self, tween: Option<WidthTween>, target: f32) -> f32 {
-        let Some(WidthTween { from, to, started }) = tween else {
+        let Some(WidthTween {
+            from,
+            to,
+            started,
+            duration,
+            curve,
+        }) = tween
+        else {
             return target;
         };
         if self.reduced_motion {
             return target;
         }
-        let total = RESIZE.total().mul_f32(motion::speed_scale());
-        let raw = self.tween_elapsed(started).as_secs_f32() / total.as_secs_f32();
+        let raw = self.tween_elapsed(started).as_secs_f32() / duration.as_secs_f32();
         if raw >= 1.0 {
             return target;
         }
         self.motion_active.set(true);
-        motion::lerp(from, to, RESIZE.progress(raw))
+        motion::lerp(from, to, curve.eval(raw))
+    }
+
+    /// [`Self::eval_tween`] heading for `target` as it is this frame, not
+    /// the endpoint the tween saw when it started. A column's target follows
+    /// its neighbours while they move; easing toward it lands there instead
+    /// of snapping to it as the tween ends.
+    fn ease_toward(&self, tween: Option<WidthTween>, target: f32) -> f32 {
+        self.eval_tween(
+            tween.map(|tween| WidthTween {
+                to: target,
+                ..tween
+            }),
+            target,
+        )
     }
 
     fn eval_resize_edge_bounce(
@@ -7922,13 +8674,28 @@ impl Shell {
     }
 
     pub(super) fn sidebar_now(&self) -> f32 {
-        self.eval_tween(self.sidebar_tween, self.sidebar_target())
-            + self
-                .eval_resize_edge_bounce(self.sidebar_edge_bounce, !self.settings.sidebar_collapsed)
+        let fit = self.horizontal_fit();
+        if !fit.sidebar {
+            return self.fit_exit_width(0).unwrap_or(0.0);
+        }
+        let limit = self.sidebar_tween_limit(fit.sidebar_limit);
+        // The edge bounce applies past the limit so the drag cue at the
+        // maximum width stays visible.
+        (self
+            .ease_toward(self.sidebar_tween, self.sidebar_target())
+            .min(limit)
+            + self.eval_resize_edge_bounce(
+                self.sidebar_edge_bounce,
+                !self.settings.sidebar_collapsed,
+            ))
+        .max(0.0)
     }
 
-    fn right_now(&self, cx: &App) -> f32 {
-        self.eval_tween(self.right_tween, self.right_target(cx))
+    /// The surface host's eased width within `max`, plus its edge bounce,
+    /// which may cross `max` like the sidebar's.
+    fn right_now(&self, max: f32, cx: &App) -> f32 {
+        self.ease_toward(self.right_tween, self.right_target(cx))
+            .min(max)
             + self.eval_resize_edge_bounce(
                 self.right_edge_bounce,
                 self.right_pane_open(cx) && !self.right_pane_expanded,
@@ -7937,17 +8704,14 @@ impl Shell {
 
     fn tween_active(&self, tween: Option<WidthTween>) -> bool {
         tween.is_some_and(|tween| {
-            !self.reduced_motion
-                && self.tween_elapsed(tween.started) < RESIZE.total().mul_f32(motion::speed_scale())
+            !self.reduced_motion && self.tween_elapsed(tween.started) < tween.duration
         })
     }
 
     fn active_tween_endpoints(&self, tween: Option<WidthTween>) -> Option<(f32, f32)> {
         tween
             .filter(|transition| {
-                !self.reduced_motion
-                    && self.tween_elapsed(transition.started)
-                        < RESIZE.total().mul_f32(motion::speed_scale())
+                !self.reduced_motion && self.tween_elapsed(transition.started) < transition.duration
             })
             .map(|transition| (transition.from, transition.to))
     }
@@ -7959,6 +8723,8 @@ impl Shell {
         inner: AnyElement,
     ) -> AnyElement {
         div()
+            .id("sidebar-column")
+            .debug_selector(|| "sidebar-column".into())
             .h_full()
             .flex_none()
             .overflow_hidden()
@@ -7969,24 +8735,20 @@ impl Shell {
 
     /// Right-anchored variant for the changes pane. The outer width follows the
     /// existing shell tween, while descendants retain the larger endpoint's
-    /// geometry for that 200ms transition. This mirrors the sidebar's stable
+    /// geometry throughout the transition. This mirrors the sidebar's stable
     /// inner/clipped outer behavior without changing the center column's
     /// upstream flex layout.
     fn right_pane_container(
         &self,
-        tween: Option<WidthTween>,
         target: f32,
         visible: f32,
         edge_offset: f32,
         inner: AnyElement,
     ) -> AnyElement {
-        let takeover_width = self
-            .active_tween_endpoints(self.right_takeover_content_tween)
-            .map(|_| self.eval_tween(self.right_takeover_content_tween, target));
-        let content_width =
-            right_panel_content_width(target, self.active_tween_endpoints(tween), takeover_width)
-                + edge_offset;
+        let content_width = self.right_content_width(target) + edge_offset;
         div()
+            .id("right-panel")
+            .debug_selector(|| "right-panel".into())
             .h_full()
             .flex_none()
             .relative()
@@ -8304,16 +9066,32 @@ impl Shell {
         }
         match self.route {
             Route::Chat => self.render_session_title_bar(viewport_height, cx),
-            Route::Settings(_) => {
-                let inner = div()
+            Route::PullRequests | Route::Settings(_) => {
+                let pull_requests = matches!(self.route, Route::PullRequests);
+                let titlebar_id = if pull_requests {
+                    "pull-requests-header-titlebar"
+                } else {
+                    "settings-header-titlebar"
+                };
+                let left = if pull_requests {
+                    let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+                    (self.sidebar_now() + Theme::SPACE_LG)
+                        .max(self.title_bar_content_start() + plus_inset)
+                } else {
+                    self.title_bar_content_start()
+                };
+                let mut inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
-                    .pl(px(self.title_bar_content_start()))
+                    .pl(px(left))
                     .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
+                if pull_requests && let Some(detail) = self.pull_request_detail.clone() {
+                    inner = inner.child(detail.update(cx, |page, cx| page.titlebar(cx)));
+                }
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
-                self.titlebar_drag_region("settings-header-titlebar", bar, cx)
+                self.titlebar_drag_region(titlebar_id, bar, cx)
                     .into_any_element()
             }
         }
@@ -8611,13 +9389,46 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The titlebar owns new-session creation regardless of sidebar state. It
-    /// is useful only while an existing session is selected.
-    pub(super) fn titlebar_plus_alpha(&self, cx: &App) -> f32 {
-        titlebar_new_session_alpha(
-            matches!(self.route, Route::Chat),
-            self.state.read(cx).selected_chat.is_some(),
+    /// The sidebar's view options ride the titlebar at the sidebar's trailing
+    /// edge, sliding and fading with it as it collapses. They never cross
+    /// back over the control cluster on a narrow sidebar.
+    fn render_sidebar_options_titlebar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sidebar = self.sidebar_now();
+        let reveal = (sidebar / self.sidebar_content_width().max(1.0)).clamp(0.0, 1.0);
+        if reveal <= 0.01 {
+            return None;
+        }
+        let cluster_end = self.eval_tween(
+            self.titlebar_tween,
+            cluster_buttons_start(
+                cfg!(target_os = "macos"),
+                self.fullscreen.unwrap_or(false),
+                self.linux_left_caption_count(),
+            ),
+        ) + CLUSTER_BUTTONS_WIDTH
+            + TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+        let left = (sidebar - Theme::SPACE_SM - 24.0).max(cluster_end + TITLEBAR_GROUP_GAP);
+        let theme = Theme::of(cx).clone();
+        let trigger = self.render_sidebar_view_trigger(&theme, cx);
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(left))
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .flex()
+                .items_center()
+                .opacity(reveal)
+                .child(trigger)
+                .into_any_element(),
         )
+    }
+
+    /// The titlebar owns new-session creation regardless of sidebar state. It
+    /// remains available on PR screens, even without a selected session.
+    pub(super) fn titlebar_plus_alpha(&self, cx: &App) -> f32 {
+        titlebar_new_session_alpha(&self.route, self.state.read(cx).selected_chat.is_some())
     }
 
     /// Native Windows caption controls integrated into Zeron's unified
@@ -9093,11 +9904,7 @@ impl Shell {
         // The footer uses the chat sidebar's theme so the account and
         // settings buttons render identically in both places.
         let footer_theme = Theme::of(cx).clone();
-        let (user_line, menu_identity) = {
-            let state = self.state.read(cx);
-            sidebar_account_identity(state.workspace_scope, self.sync_flow, state.auth_user())
-        };
-        let footer = self.render_user_menu(user_line, menu_identity, &footer_theme, cx);
+        let footer = self.render_sidebar_footer_row(&footer_theme, cx);
         // Fork: the Orchestrator/Workers switcher stays on top, so Settings
         // can still flip to the Workers catalog (`select_sidebar_mode`).
         let switcher = self.render_sidebar_mode_switcher(&footer_theme, cx);
@@ -9428,16 +10235,13 @@ impl Shell {
         } else {
             format!("chat-{id}")
         };
-        // Activity, not position (t3code Sidebar): status is a small colored
-        // word + glyph in the row's top-right corner — Working animates the
-        // composer-strip spinner, Done wears a check; Idle rows show the
-        // relative time instead. Hovering the ROW swaps the corner for the
-        // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
-        // accordion), t3code's settle-on-hover. Compact rows keep status first
-        // and elapsed time last; their archive control occupies the
-        // remote-icon slot on hover. A chat can appear on both surfaces at
-        // once: every hover key and child id is namespaced by `row_id` so the
-        // palette never animates the sidebar copy.
+        let pr_device = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == id)
+            .map(|chat| chat.device_id.clone());
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
         let remote = self
@@ -9550,30 +10354,16 @@ impl Shell {
         let compact_jump_label = compact.then(|| jump_label.clone()).flatten();
         let corner_body: AnyElement = if let Some(label) = jump_label.filter(|_| !compact) {
             // The jump hint replaces the status/time corner while the modifier
-            // is held, cut to the sidebar PR badge's exact cloth
-            // (`pull_request_badge`, Sidebar surface): pinned 16px, px 4,
-            // rounded 4, borderless 0.08-fill with 0.85 text of one tone —
-            // neutral here — and the label in the badge's mono at 10 MEDIUM.
-            // Any other geometry reads as a second badge system on the row.
-            {
-                let tone = theme.text_muted;
-                div()
-                    .h(px(16.0))
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .px(px(4.0))
-                    .rounded(px(4.0))
-                    .bg(tone.opacity(0.08))
-                    .whitespace_nowrap()
-                    .text_size(crate::typography::ui_rems(10.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(tone.opacity(0.85))
-                    .font_family(theme.font_mono.clone())
-                    .child(label)
-                    .into_any_element()
-            }
+            // is held, in the shared legend voice (the compact rows' plain
+            // muted text, `popover::kbd_hint`).
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .font_family(crate::popover::KEY_GLYPH_FONT)
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted.opacity(0.5))
+                .child(label)
+                .into_any_element()
         } else if corner_hovered {
             div()
                 .flex()
@@ -10040,6 +10830,7 @@ impl Shell {
                                     format!("{row_id}-compact-pr").into(),
                                     summary,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                    pr_device.clone(),
                                     theme,
                                 )
                             }
@@ -10158,6 +10949,7 @@ impl Shell {
                                     summary,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                                     search_query,
+                                    pr_device.clone(),
                                     theme,
                                 )
                             })
@@ -10380,8 +11172,6 @@ impl Shell {
         {
             self.cancel_pinned_session_drag(cx);
         }
-        let workspace_scope = self.state.read(cx).workspace_scope;
-
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -10574,11 +11364,7 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let (user_line, menu_identity) = {
-            let state = self.state.read(cx);
-            sidebar_account_identity(workspace_scope, self.sync_flow, state.auth_user())
-        };
-        let user_menu = self.render_user_menu(user_line, menu_identity, theme, cx);
+        let user_menu = self.render_sidebar_footer_row(theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -10746,7 +11532,7 @@ impl Shell {
         .fade_overflow_y(&self.sidebar_scroll);
 
         div()
-            .w(px(self.settings.sidebar_width))
+            .w(px(self.sidebar_content_width()))
             .h_full()
             .flex()
             .flex_col()
@@ -10764,9 +11550,82 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The sidebar's bottom row (upstream #449): account pill on the left,
-    /// settings toggle on the right. Local runtimes advertise their storage
-    /// boundary and offer sync; synced runtimes offer sign-out.
+    /// Shared bottom row for Chat and Settings, including the account menu and
+    /// its adjacent actions.
+    fn render_sidebar_footer_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (user_line, menu_identity) = {
+            let state = self.state.read(cx);
+            sidebar_account_identity(state.workspace_scope, self.sync_flow, state.auth_user())
+        };
+        div()
+            .id("sidebar-footer-row")
+            .debug_selector(|| "sidebar-footer-row".into())
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(SIDEBAR_FOOTER_ACTION_GAP))
+            .child(div().flex_1().min_w_0().child(self.render_user_menu(
+                user_line,
+                menu_identity,
+                theme,
+                cx,
+            )))
+            .into_any_element()
+    }
+
+    fn render_pull_requests_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let selected = matches!(self.route, Route::PullRequests);
+        div()
+            .id("open-pull-requests")
+            .role(gpui::Role::Button)
+            .aria_label("Pull requests")
+            .tab_index(0)
+            .debug_selector(|| "open-pull-requests".into())
+            .focus_visible(|style| style.border_2().border_color(theme.accent))
+            .size(px(SIDEBAR_FOOTER_ACTION_SIZE))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .text_color(if selected {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .bg(if selected {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "open-pull-requests",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
+                )
+            })
+            .on_hover(motion::hover_listener("open-pull-requests"))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                // Leaving Settings through its own footer is a plain route
+                // change; nothing there should grab focus on the way out.
+                this.settings_focus_pending = false;
+                this.dismiss_pull_request_detail(cx);
+                this.open_pull_requests(cx);
+                cx.notify();
+            }))
+            .tooltip(crate::settings::widgets::text_tooltip("Pull requests"))
+            .child(
+                icon(icons::PULL_REQUEST)
+                    .size(px(15.0))
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        motion::hover_blend("open-pull-requests", theme.text_muted, theme.text)
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Account pill, identity, and Settings action within the shared footer.
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
@@ -10774,6 +11633,8 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Pull requests sits just left of Settings, in the same action group.
+        let pull_requests = self.render_pull_requests_button(theme, cx);
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
@@ -10798,6 +11659,7 @@ impl Shell {
             .h(px(SIDEBAR_FOOTER_BUTTON_SIZE))
             .min_w_0()
             .flex_shrink_1()
+            .w_full()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
             .flex()
@@ -10863,8 +11725,12 @@ impl Shell {
             ));
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
+
             let menu = popover::popover_card(theme)
-                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
+                .w(px(self.sidebar_content_width()
+                    - 2.0 * Theme::SPACE_SM
+                    - SIDEBAR_FOOTER_ACTION_SIZE
+                    - SIDEBAR_FOOTER_ACTION_GAP))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_user_menu(cx);
                 }))
@@ -10967,6 +11833,7 @@ impl Shell {
                     .items_center()
                     .gap(px(2.0))
                     .children(voice_trigger)
+                    .child(pull_requests)
                     .child(
                         div()
                             .id("settings-trigger")
@@ -11401,7 +12268,7 @@ impl Shell {
     }
 
     fn active_changes(&self, cx: &App) -> Option<Entity<Changes>> {
-        if !self.right_pane_open(cx) {
+        if !self.right_pane_shown(cx) {
             return None;
         }
         let RightSurface::Diff(id) = self.resolved_right_active(cx) else {
@@ -11439,8 +12306,7 @@ impl Shell {
             return true;
         }
         if self.add_space.is_some() {
-            self.add_space = None;
-            cx.notify();
+            self.close_add_space(cx);
             return true;
         }
         if self.spaces_menu.is_open() {
@@ -11584,44 +12450,53 @@ impl Shell {
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
-                // Sized for the longest EXPORT label, not for "Rename…".
-                .w(px(226.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .w(px(216.0))
+                .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    // The Copy submenu floats outside this card: a press on
+                    // it is inside the menu.
+                    if this
+                        .chat_copy_bounds
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
                     this.close_chat_menu(cx);
                 }))
                 .flex()
                 .flex_col();
-            let menu = match menu_state.page {
-                _ if chat_id.is_empty() => menu,
-                ChatMenuPage::Root => menu
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
-                            .id("chat-menu-rename")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // A side chat's title is edited in place on
-                                // its surface tab; a session's on its row.
-                                this.open_rename_chat(rename_id.clone(), cx)
-                            }))
-                            .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                            .child(SharedString::from("Rename")),
-                    )
-                    .when(!is_side_chat, |menu| {
-                        menu.child(
-                            popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
-                                .id("chat-menu-pin")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
-                                }))
-                                .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
-                                .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
-                        )
-                        .child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-menu-archive-{chat_id}"),
-                            )
+            let copy_open = menu_state.page == ChatMenuPage::Copy;
+            let menu = if chat_id.is_empty() {
+                menu
+            } else {
+                let rename =
+                    popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
+                        .id("chat-menu-rename")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // A side chat's title is edited on its row under the
+                            // file tree: dock the explorer when the menu came
+                            // from its tab.
+                            if is_side_chat && !this.files_panel_open(cx) {
+                                this.add_files_surface(window, cx);
+                            }
+                            this.open_rename_chat(rename_id.clone(), cx)
+                        }))
+                        .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from("Rename"));
+                let menu = menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_RENAME, rename, cx));
+                let menu = if is_side_chat {
+                    menu
+                } else {
+                    let pin = popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                        .id("chat-menu-pin")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
+                        }))
+                        .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" }));
+                    let archive =
+                        popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
+                            .debug_selector(|| "chat-menu-archive".to_owned())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.archive_chat(archive_id.clone(), cx)
                             }))
@@ -11630,197 +12505,91 @@ impl Shell {
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Archive")),
-                        )
-                        .child(
-                            popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
-                                .id("chat-menu-copy")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)),
-                                )
-                                .child(
-                                    icon(icons::COPY)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(div().flex_1().child(SharedString::from("Copy")))
-                                .child(
-                                    icon(icons::ALT_ARROW_RIGHT)
-                                        .size(px(14.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        )
-                    })
-                    .child(popover::menu_separator())
-                    .child(popover::menu_heading(&theme, "Export"))
-                    .children(EXPORT_MENU_ITEMS.iter().map(|item| {
-                        let export_id = chat_id.clone();
-                        popover::menu_row(
-                            &theme,
-                            false,
-                            format!("chat-menu-{}-{chat_id}", item.key),
-                        )
-                        .id(item.key)
+                            .child(SharedString::from("Archive"));
+                    let copy = self.render_chat_copy_trigger(&chat_id, copy_open, &theme, cx);
+                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
+                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
+                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_COPY, copy, cx))
+                };
+                let delete =
+                    popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
+                        .id("chat-menu-delete")
+                        .debug_selector(|| "chat-menu-delete".to_owned())
+                        .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.export_chat(export_id.clone(), item.format, item.delivery, cx)
+                            this.close_chat_menu(cx);
+                            this.delete_confirm = Some(delete_id.clone());
+                            cx.notify();
                         }))
-                        .child(icon(item.glyph).size(px(16.0)).text_color(theme.text_muted))
-                        .child(SharedString::from(item.label))
-                    }))
-                    .child(popover::menu_separator())
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
-                            .id("chat-menu-delete")
-                            .text_color(theme.danger)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_chat_menu(cx);
-                                this.delete_confirm = Some(delete_id.clone());
-                                cx.notify();
-                            }))
-                            .child(
-                                icon(icons::TRASH_BIN_MINIMALISTIC)
-                                    .size(px(16.0))
-                                    .text_color(theme.danger),
-                            )
-                            .child(SharedString::from("Delete…")),
-                    ),
-                ChatMenuPage::Copy => {
-                    let chat = self
-                        .state
-                        .read(cx)
-                        .chats
-                        .iter()
-                        .find(|chat| chat.id == chat_id)
-                        .cloned();
-                    let harness_link = chat
-                        .as_ref()
-                        .and_then(crate::links::harness_conversation_link);
-                    let session_id = chat
-                        .as_ref()
-                        .and_then(|chat| chat.harness_session_id.as_deref())
-                        .is_some_and(|id| !id.trim().is_empty());
-                    let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
-                    let zeron_id = chat_id.clone();
-                    let harness_id = chat_id.clone();
-                    let session_chat_id = chat_id.clone();
-                    let path_chat_id = chat_id.clone();
-                    menu.child(
-                        popover::menu_row(&theme, false, format!("chat-copy-back-{chat_id}"))
-                            .id("chat-copy-back")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(menu) = this.chat_menu.open_mut() {
-                                    menu.page = ChatMenuPage::Root;
-                                    cx.notify();
-                                }
-                            }))
-                            .child(
-                                icon(icons::ALT_ARROW_LEFT)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Back")),
-                    )
-                    .child(popover::menu_separator())
-                    .when(has_path, |menu| {
-                        menu.child(
-                            popover::menu_row(&theme, false, format!("chat-copy-path-{chat_id}"))
-                                .id("chat-copy-path")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_chat_path(&path_chat_id, cx)
-                                }))
-                                .child(
-                                    icon(icons::COPY)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Path")),
+                        .child(
+                            icon(icons::TRASH_BIN_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.danger),
                         )
-                    })
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-copy-zeron-{chat_id}"))
-                            .id("chat-copy-zeron")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_zeron_conversation_link(&zeron_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Zeron conversation link")),
-                    )
-                    .when_some(harness_link, |menu, link| {
-                        menu.child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-copy-harness-{chat_id}"),
-                            )
-                            .id("chat-copy-harness")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_harness_conversation_link(&harness_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from(link.label)),
-                        )
-                    })
-                    .when(session_id, |menu| {
-                        menu.child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-copy-session-{chat_id}"),
-                            )
-                            .id("chat-copy-session")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_harness_session_id(&session_chat_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Harness session ID")),
-                        )
-                    })
-                }
+                        .child(SharedString::from("Delete…"));
+                menu.child(popover::menu_separator())
+                    .child(self.chat_menu_hover_row(CHAT_MENU_ROW_DELETE, delete, cx))
             };
             let mut menu = menu;
-            if let Some((key, surface)) = menu_state.tab
-                && matches!(menu_state.page, ChatMenuPage::Root)
-            {
+            if !chat_id.is_empty() {
+                // Keep transcript exports available from both the main Chat
+                // row and a side-chat tab, independently of the actions that
+                // only apply to ordinary Chats above.
+                menu = menu
+                    .child(popover::menu_separator())
+                    .child(popover::menu_heading(&theme, "Export"));
+                for (ix, item) in EXPORT_MENU_ITEMS.iter().enumerate() {
+                    let export_chat_id = chat_id.clone();
+                    let format = item.format;
+                    let delivery = item.delivery;
+                    let selector = item.key;
+                    let row = popover::menu_row(&theme, false, item.label)
+                        .id(item.key)
+                        .debug_selector(move || selector.to_owned())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.export_chat(export_chat_id.clone(), format, delivery, cx)
+                        }))
+                        .child(icon(item.glyph).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from(item.label));
+                    menu = menu.child(self.chat_menu_hover_row(
+                        CHAT_MENU_ROW_EXPORT + ix as u8,
+                        row,
+                        cx,
+                    ));
+                }
+            }
+            if let Some((key, surface)) = menu_state.tab {
                 if !chat_id.is_empty() {
                     menu = menu.child(popover::menu_separator());
                 }
-                for (action, label) in [
+                for (ix, (action, label)) in [
                     (TabCloseAction::This, "Close tab"),
                     (TabCloseAction::Others, "Close other tabs"),
                     (TabCloseAction::Left, "Close tabs to the left"),
                     (TabCloseAction::Right, "Close tabs to the right"),
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     let enabled = !self.tabs_to_close(surface, action, cx).is_empty();
                     let key = key.clone();
-                    menu = menu.child(
-                        popover::menu_row(&theme, false, label)
-                            .id(SharedString::from(label))
-                            .when(!enabled, |el| el.opacity(0.4).cursor_default())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if !enabled {
-                                    return;
+                    let row = popover::menu_row(&theme, false, label)
+                        .id(SharedString::from(label))
+                        .when(!enabled, |el| el.opacity(0.4).cursor_default())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if !enabled {
+                                return;
+                            }
+                            this.close_chat_menu(cx);
+                            if this.panel_key(cx) == key {
+                                for tab in this.tabs_to_close(surface, action, cx) {
+                                    this.close_right_surface(tab, window, cx);
                                 }
-                                this.close_chat_menu(cx);
-                                if this.panel_key(cx) == key {
-                                    for tab in this.tabs_to_close(surface, action, cx) {
-                                        this.close_right_surface(tab, window, cx);
-                                    }
-                                }
-                            }))
-                            .child(label),
-                    );
+                            }
+                        }))
+                        .child(label);
+                    menu =
+                        menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_TAB + ix as u8, row, cx));
                 }
             }
             let menu = menu.into_any_element();
@@ -11973,8 +12742,39 @@ impl Shell {
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
-        // Orchestrator Settings never reaches here: it takes over the whole
-        // window in the Ready render (`render_settings_page`).
+        if matches!(self.route, Route::PullRequests) {
+            if let Some((url, device)) = self.pending_pull_request.take() {
+                self.show_pull_request_detail(url, device, window, cx);
+            }
+            if self.pull_requests_page.is_none() {
+                self.pull_requests_page =
+                    Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
+            }
+            let outlet = self
+                .pull_requests_page
+                .as_ref()
+                .cloned()
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| Empty.into_any_element());
+            if let Some(detail) = self.pull_request_detail.clone() {
+                return div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .child(div().flex_1().min_w_0().h_full().child(detail))
+                    .into_any_element();
+            }
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
+
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
@@ -12023,13 +12823,54 @@ impl Shell {
         }
         self.composer
             .update(cx, |composer, cx| composer.set_dock_frame(dock_frame, cx));
+        // The session card: docked, the transcript holds its room free on
+        // the right and the composer follows the column left by half of it,
+        // so column and card center together.
+        let session_reveal = if has_selection {
+            self.session_info_reveal()
+        } else {
+            0.0
+        };
+        // The column's LIVE width: while the sidebar or a pane animates,
+        // `main_content_width` already holds the end width, and a reserve or
+        // card placed from it would jump ahead of the column and wait.
+        let details_now = if self.details_sidebar_open(cx) {
+            self.eval_tween(self.details_tween, self.details_target(cx))
+        } else {
+            0.0
+        };
+        let right_now = self.right_visible_width(cx);
+        let live_main_width = (self.viewport_width
+            - self.sidebar_now()
+            - right_columns_width(right_now > 0.0, right_now, details_now > 0.0, details_now)
+            - self.files_visible_width(cx))
+        .max(0.0);
+        let session_layout =
+            session_info::session_card_layout(live_main_width, ui_settings.transcript_width);
+        let session_reserve = session_layout.reserve * session_reveal;
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.set_right_reserve(session_reserve, cx)
+        });
+        // Panel open/close glides the composer width; a window resize or a
+        // seam drag is direct manipulation, so the width tracks the pointer.
+        let direct_width =
+            self.reduced_motion || self.viewport_resized || self.pane_resize_dragging.is_some();
+        // Ordinary panel transitions already animate the live conversation
+        // column. Size the composer from that same painted width instead of
+        // jumping to the column's endpoint; takeover keeps its retained layout
+        // width while the conversation is covered.
+        let composer_panel_width = if self.main_takeover_active() {
+            main_content_width
+        } else {
+            live_main_width
+        };
         let composer_width = self.composer_dock.borrow_mut().layout_width(
             composer_target_width(
-                main_content_width,
+                composer_panel_width - session_reserve,
                 ui_settings.transcript_width,
                 has_selection,
             ),
-            self.reduced_motion,
+            direct_width,
             frame_time,
         );
         self.composer.update(cx, |composer, cx| {
@@ -12165,7 +13006,16 @@ impl Shell {
         } else {
             None
         };
-        let status = self.render_status_strip(composer_width, cx);
+        let status = div()
+            .relative()
+            .left(px(-session_reserve / 2.0))
+            .child(self.render_status_strip(composer_width, cx));
+        let session_card = self.render_session_info(
+            session_layout,
+            session_reveal,
+            self.viewport_height - Theme::TITLEBAR_HEIGHT - self.bottom_stack.get() - 24.0,
+            cx,
+        );
         self.chat_dropzone("chat-dropzone", self.composer.clone(), cx)
             .debug_selector(|| "chat-dropzone".into())
             .track_focus(&self.navigation_focus.main)
@@ -12222,6 +13072,7 @@ impl Shell {
                         .children(self.render_transcript_stall_notice(cx))
                 },
             )
+            .children(session_card)
             .when_some(harness_update_card, |column, chip| {
                 // Home notices stay anchored to the window bottom, behind the
                 // dock (upstream #620). The fork has no footer terminal, so
@@ -12281,10 +13132,13 @@ impl Shell {
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
                         let composer_opacity = self.composer_dock.borrow().opacity();
+                        // The fork hosts terminals in right-pane surface tabs;
+                        // the composer has no bottom-dock terminal geometry.
                         el.child(crate::composer_dock::docked_composer(
                             div()
                                 .id("persistent-composer")
                                 .relative()
+                                .left(px(-session_reserve / 2.0))
                                 .w(px(composer_width))
                                 .opacity(composer_opacity)
                                 .mx_auto()
@@ -12302,6 +13156,7 @@ impl Shell {
                     })
             })
             .child(Self::attachment_drop_overlay(theme))
+            .child(Self::mention_drop_overlay(theme))
             .into_any_element()
     }
 
@@ -12640,6 +13495,10 @@ impl Shell {
     /// terminal, diff, file preview, subagent, worker - hidden by default,
     /// glass-friendly, drag-resizable from its left seam.
     fn render_right_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let exiting = self.fit_exit_width(1).is_some();
+        if !self.horizontal_fit().right && !exiting {
+            return Empty.into_any_element();
+        }
         let theme = Theme::of(cx).clone();
         let surface = self.resolved_right_active(cx);
         let content: AnyElement = match surface {
@@ -12738,6 +13597,7 @@ impl Shell {
         };
         let column = div()
             .id("right-pane-focus")
+            .debug_selector(|| "right-pane".into())
             .track_focus(&self.navigation_focus.right)
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
                 this.capture_navigation_focus(true, false, window, cx);
@@ -12784,7 +13644,6 @@ impl Shell {
             self.right_pane_open(cx) && !self.right_pane_expanded,
         );
         self.right_pane_container(
-            self.right_tween,
             target,
             self.right_visible_width(cx),
             edge_offset,
@@ -12793,7 +13652,8 @@ impl Shell {
     }
 
     fn render_details_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if !self.details_sidebar_open(cx) {
+        let target = self.details_target(cx);
+        if target <= 0.5 {
             return gpui::Empty.into_any_element();
         }
         let context = self.details_context(cx);
@@ -12811,7 +13671,6 @@ impl Shell {
             .top_0()
             .bottom_0()
             .left_0();
-        let target = self.details_target(cx);
         // Animated width container: tweens on collapse/expand and clips the
         // inner so content never reflows mid-transition.
         div()
@@ -12831,10 +13690,11 @@ impl Shell {
     }
 
     fn render_details_header_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.details_sidebar_open(cx) {
+        let target = self.details_target(cx);
+        if target <= 0.5 {
             return None;
         }
-        let width = self.eval_tween(self.details_tween, self.details_target(cx));
+        let width = self.eval_tween(self.details_tween, target);
         let header = self
             .details_sidebar
             .update(cx, |sidebar, cx| sidebar.render_shell_header(cx));
@@ -13096,8 +13956,7 @@ impl Shell {
             } else {
                 accessible_name.to_string()
             };
-            let chip = div()
-                .id(("right-surface-tab", ix))
+            let chip = crate::surface_chrome::tab(("right-surface-tab", ix), is_active, &theme)
                 .debug_selector(|| format!("right-surface-tab-{ix}"))
                 .group(group.clone())
                 .h(px(24.0))
@@ -13133,9 +13992,6 @@ impl Shell {
                     window.prevent_default()
                 })
                 .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
-                .when(!is_active, |el| {
-                    el.hover(|s| s.bg(crate::theme::wash(0.06)))
-                })
                 .on_click(
                     cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                         cx.stop_propagation();
@@ -13542,7 +14398,15 @@ impl Shell {
     /// hiding the conversation column; toggling back restores the saved
     /// width. Rides the same width tween as open/close so the jump glides.
     fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
-        let from = self.right_target(cx);
+        // The outgoing header stays painted during close, but it must not
+        // turn an already closed surface into a zero-width takeover.
+        if !self.right_pane_shown(cx) {
+            return;
+        }
+        // A second click during the first expansion starts at the painted
+        // seam, not the previous destination.
+        let from = self.right_visible_width(cx);
+        let content_from = self.right_content_width(self.right_target(cx));
         self.right_edge_bounce = None;
         self.right_resize_edge = None;
         self.finish_pane_resize(PaneResizeKind::Right);
@@ -13552,24 +14416,24 @@ impl Shell {
         } else {
             0.0
         };
-        let from_main = conversation_width(
-            self.viewport_width - self.files_reserved_width(cx),
-            sidebar_now,
-            from + details_now,
-        );
+        let from_main = self.main_content_width(self.main_target_width(from, cx), cx);
         self.right_pane_expanded = !self.right_pane_expanded;
         let to = self.right_target(cx);
-        let right_transition = WidthTween::new(from, to);
+        let right_transition = self.panel_tween(from, to);
         self.right_tween = Some(right_transition);
-        self.right_takeover_content_tween = Some(right_transition);
-        self.main_takeover_tween = Some(WidthTween::new(
-            from_main,
-            conversation_width(
+        self.right_content_tween = Some(WidthTween {
+            from: content_from,
+            ..right_transition
+        });
+        self.main_takeover_tween = Some(WidthTween {
+            from: from_main,
+            to: conversation_width(
                 self.viewport_width - self.files_reserved_width(cx),
                 sidebar_now,
                 to + details_now,
             ),
-        ));
+            ..right_transition
+        });
         cx.notify();
     }
 
@@ -14117,6 +14981,7 @@ fn window_control_button_with(
     let fade_key = format!("window-control-{id}");
     div()
         .id(id)
+        .debug_selector(move || id.to_owned())
         .size(px(24.0))
         .flex_none()
         .flex()
@@ -14149,8 +15014,8 @@ fn window_control_button_with(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
-        .tooltip(crate::settings::widgets::text_tooltip(label))
         .child(glyph)
+        .tooltip(crate::settings::widgets::text_tooltip(label))
 }
 
 const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
@@ -14325,6 +15190,7 @@ fn header_icon_button_with(
     };
     div()
         .id(id)
+        .debug_selector(|| id.into())
         .size(px(28.0))
         .flex_none()
         .flex()
@@ -14414,7 +15280,7 @@ impl Render for Shell {
         }
         self.focus_rename_chat(window, cx);
 
-        self.render_time = Some(std::time::Instant::now());
+        self.render_time = Some(self.motion_time());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()
         {
@@ -14438,14 +15304,7 @@ impl Render for Shell {
             });
         }
         crate::transcript::record_view_frame("shell");
-        let viewport = f32::from(window.viewport_size().width);
-        if (self.viewport_width - viewport).abs() > 1.0 {
-            self.files_tween = None;
-            self.right_tween = None;
-            self.right_takeover_content_tween = None;
-            self.main_takeover_tween = None;
-        }
-        self.viewport_width = viewport;
+        self.observe_viewport_width(f32::from(window.viewport_size().width), cx);
         // Appearance actions persist independently of the shell. Mirror the
         // globals before any later debounced settings save can overwrite them.
         self.settings.appearance = crate::appearance::mode(cx);
@@ -14484,12 +15343,24 @@ impl Render for Shell {
                 self.browsers.clear();
                 self.browser_subs.clear();
                 self.browser_context = crate::browser::BrowserContext::default();
+                self.pull_request_cache = Default::default();
+                self.pull_requests_page = None;
+                self.pull_request_detail = None;
+                self.pull_request_detail_subscription = None;
             }
             self.browser_profile = browser_profile;
         }
+        // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
+        self.reduced_motion = motion::reduced_motion(cx);
+        self.motion_active.set(false);
+        self.track_horizontal_fit(cx);
+        self.suspend_hidden_right_images(cx);
+        // After the fit tracking, which starts a fit exit this frame.
         let browser_active = matches!(gate, GatePhase::Ready)
             && !restart_required
             && matches!(self.route, Route::Chat)
+            // A pane the fit evicts keeps painting while it slides out.
+            && (self.horizontal_fit().right || self.fit_exit_width(1).is_some())
             && (self.right_pane_open(cx) || self.tween_active(self.right_tween));
         // Native clipping follows the animated GPUI mask. Drags only transfer
         // pointer ownership; the browser continues rendering and reflowing.
@@ -14547,9 +15418,6 @@ impl Render for Shell {
             self.button_layout_sub =
                 Some(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
         }
-        // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
-        self.reduced_motion = motion::reduced_motion(cx);
-        self.motion_active.set(false);
 
         if self.activation_sub.is_none() {
             self.activation_sub = Some(cx.observe_window_activation(
@@ -14581,6 +15449,15 @@ impl Render for Shell {
                 });
                 cx.notify();
             }));
+        }
+        if self.settings_restore_pending {
+            self.settings_restore_pending = false;
+            if matches!(self.route, Route::Chat) {
+                // Settings replaces the Chat tree. Request its composer focus
+                // after the restored route has mounted, using the same
+                // one-shot path as ordinary session navigation.
+                self.focus_composer(cx);
+            }
         }
         let shortcut_focus = self.shortcut_focus.clone();
         let (preferred_focus, unfocused) = self.navigation_focus_fallback(cx);
@@ -14639,6 +15516,16 @@ impl Render for Shell {
                     }
                 }),
             )
+            // Mouse side buttons walk the same history as the titlebar
+            // back/forward arrows (the browser surface keeps them to itself).
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.navigate_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
+            )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
@@ -14673,6 +15560,86 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &RandomWallpaper, _, cx| {
                 this.random_wallpaper(cx);
             }))
+            .on_action(cx.listener(
+                |this, action: &crate::pull_request_detail::OpenPullRequest, window, cx| {
+                    let target = if let Some(device) = action.1.clone() {
+                        (Some(device.as_str()) != this.state.read(cx).local_device_id.as_deref())
+                            .then_some(device)
+                    } else if matches!(this.route, Route::PullRequests) {
+                        this.pull_requests_page
+                            .as_ref()
+                            .and_then(|page| page.read(cx).target_device())
+                    } else {
+                        let state = this.state.read(cx);
+                        state.selected_chat_row().and_then(|chat| {
+                            (Some(chat.device_id.as_str()) != state.local_device_id.as_deref())
+                                .then(|| chat.device_id.clone())
+                        })
+                    };
+                    // Back from a pull request returns to wherever it was
+                    // opened from: a chat, the board, or another pull request.
+                    this.enter_pull_requests_route(cx);
+                    this.nav.push(NavEntry::PullRequest {
+                        url: action.0.clone(),
+                        device: target.clone(),
+                    });
+                    this.show_pull_request_detail(action.0.clone(), target, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::pull_request_detail::ClosePullRequest, _, cx| {
+                    // Closing the detail view is Back when the board is
+                    // behind it, so history doesn't grow a loop.
+                    if this.nav.previous() == Some(&NavEntry::PullRequests) {
+                        this.navigate_back(cx);
+                    } else {
+                        this.dismiss_pull_request_detail(cx);
+                        this.nav.push(NavEntry::PullRequests);
+                    }
+                    cx.notify();
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &crate::pull_request_detail::AddPullRequestProject, _, cx| {
+                    this.open_add_space_on_device(&action.0, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &crate::pull_request_detail::StartPullRequestSession, _, cx| {
+                    // A handoff must never inherit the sidebar or canvas target.
+                    if !this
+                        .state
+                        .read(cx)
+                        .space_row(&action.project_id)
+                        .is_some_and(|space| space.device_id == action.device)
+                    {
+                        this.open_add_space_on_device(&action.device, cx);
+                        return;
+                    }
+                    this.open_new_session(Some(action.project_id.clone()), cx);
+                    // Stage after the composer has swapped to the new
+                    // session's draft, which runs on the state observation
+                    // `open_new_session` just queued. A draft already waiting
+                    // there stays, above the prompt.
+                    let composer = this.composer.clone();
+                    let prompt = action.prompt.clone();
+                    cx.defer(move |cx| {
+                        composer.update(cx, |composer, cx| {
+                            composer.input.update(cx, |input, cx| {
+                                let draft = input.text().trim_end();
+                                let text = if draft.is_empty() {
+                                    prompt
+                                } else {
+                                    format!("{draft}\n\n{prompt}")
+                                };
+                                input.set_text(text, cx)
+                            });
+                            composer.focus_pending = true;
+                            cx.notify();
+                        });
+                    });
+                },
+            ))
             // New session works from anywhere — `open_new_session` routes back
             // to chat itself, so Settings is not a dead spot.
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(None, cx)))
@@ -14782,8 +15749,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
                 if this.add_space.is_some() {
-                    this.add_space = None;
-                    cx.notify();
+                    this.close_add_space(cx);
                 } else {
                     this.open_add_space(cx);
                 }
@@ -14794,6 +15760,16 @@ impl Render for Shell {
         } else {
             gate.clone()
         };
+        // Decide before the Settings early exit and all non-ready gates:
+        // retained sidebar entities must not retain watches while unmounted.
+        if !matches!(render_gate, GatePhase::Ready)
+            || !matches!(self.route, Route::Chat)
+            || self.details_target(cx) <= 0.5
+        {
+            self.details_sidebar.update(cx, |sidebar, cx| {
+                sidebar.hide_worked_project_diffs(cx);
+            });
+        }
         let root = match &render_gate {
             GatePhase::Ready => 'ready: {
                 // Focus is a sync signal: on the rising edge of window
@@ -14885,34 +15861,41 @@ impl Render for Shell {
                         .child(sidebar_tone)
                         .child(motion::fade_in("phase-app", page));
                 }
+                // The Pull requests route shares this layout without the
+                // chat's side pane.
                 let on_chat = matches!(self.route, Route::Chat);
                 let right_target_width = if on_chat {
                     self.right_visible_width(cx)
                 } else {
                     0.0
                 };
-                let panel_handoff = self.composer_dock.borrow_mut().observe_pane(
+                let main_target_width = self.main_target_width(right_target_width, cx);
+                // Navigation can change either edge: Files and responsive
+                // sidebar fitting matter just as much as the right surface.
+                self.composer_dock
+                    .borrow_mut()
+                    .observe_conversation(&self.panel_key(cx));
+                let panel_handoff = self.composer_dock.borrow_mut().observe_column(
                     self.state.read(cx).selected_chat.is_some(),
-                    right_target_width,
+                    (self.sidebar_now(), main_target_width),
                     on_chat && !self.reduced_motion,
                     self.render_time.unwrap_or_else(std::time::Instant::now),
                 );
                 if panel_handoff {
                     self.motion_active.set(true);
                 }
+                let main_takeover = self.main_takeover_active();
                 let main_target_width = conversation_width(
                     viewport - self.files_reserved_width(cx),
                     self.sidebar_target(),
                     right_columns_width(
-                        self.right_pane_open(cx),
+                        self.right_pane_shown(cx),
                         self.right_target(cx),
                         self.details_sidebar_open(cx),
                         self.details_target(cx),
                     ),
                 );
-                let main_transition = self.active_tween_endpoints(self.main_takeover_tween);
-                let main_content_width =
-                    stable_panel_content_width(main_target_width, main_transition);
+                let main_content_width = self.main_content_width(main_target_width, cx);
                 let transcript_width = self.composer_dock.borrow_mut().transcript_width(
                     main_content_width,
                     self.state.read(cx).selected_chat.is_some(),
@@ -14939,24 +15922,26 @@ impl Render for Shell {
                 });
 
                 let sidebar = self.render_sidebar(cx);
-                let sidebar_handle = self.resize_handle(
-                    "sidebar-resize",
-                    PaneResizeKind::Sidebar,
-                    || SidebarResize,
-                    |shell, _| {
-                        shell.settings.sidebar_width = SIDEBAR_DEFAULT;
-                        shell.sidebar_edge_bounce = None;
-                    },
-                    cx,
-                );
+                // A collapsed or fit-hidden sidebar has no seam: the window's
+                // own left edge sits there, and a press must resize the window
+                // rather than drag the sidebar open.
+                let sidebar_handle = (self.sidebar_now() > 0.5).then(|| {
+                    self.resize_handle(
+                        "sidebar-resize",
+                        PaneResizeKind::Sidebar,
+                        || SidebarResize,
+                        |shell, cx| shell.reset_panel_widths(PaneResizeKind::Sidebar, cx),
+                        cx,
+                    )
+                });
                 let main = self.render_main(window, main_content_width, transcript_width, cx);
                 // The right utility surface is chat-scoped chrome: the Settings
                 // route never renders it — the per-session open flags stay
                 // intact for the return trip.
                 let in_settings =
                     settings_layer_open(self.route, self.workers_model.read(cx).route);
-                let on_chat = !in_settings;
-                let right_open = on_chat && self.right_pane_open(cx);
+                let on_chat = matches!(self.route, Route::Chat) && !in_settings;
+                let right_open = on_chat && self.right_pane_shown(cx);
                 // Takeover mode derives its width from the viewport, so a
                 // manual drag handle would fight the expanded target.
                 let right_handle = (right_open
@@ -14968,10 +15953,7 @@ impl Render for Shell {
                         "right-pane-resize",
                         PaneResizeKind::Right,
                         || RightPaneResize,
-                        |shell, _| {
-                            shell.settings.right_pane_width = RIGHT_PANE_DEFAULT;
-                            shell.right_edge_bounce = None;
-                        },
+                        |shell, cx| shell.reset_panel_widths(PaneResizeKind::Right, cx),
                         cx,
                     )
                     // A forgiving transparent hit target centered on the
@@ -14999,7 +15981,7 @@ impl Render for Shell {
                 // flush and unbordered, the transcript directly on the frost
                 // glass; the utility surface is a flush left-bordered glass panel
                 // (built inside `render_right_pane`).
-                let main = if main_transition.is_some() {
+                let main = if main_takeover {
                     div()
                         .h_full()
                         .w(px(main_content_width))
@@ -15011,6 +15993,8 @@ impl Render for Shell {
                     main
                 };
                 let card: AnyElement = div()
+                    .id("conversation-column")
+                    .debug_selector(|| "conversation-column".into())
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -15027,12 +16011,9 @@ impl Render for Shell {
                 // (zero layout width, same idiom as the changes-pane grabber)
                 // so the sidebar's right gutter stays exactly as wide as its
                 // left one — a 5px flex child here read as lopsided spacing.
-                let sidebar_seam = div()
-                    .w(px(0.0))
-                    .h_full()
-                    .flex_none()
-                    .relative()
-                    .child(sidebar_handle.left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH)));
+                let sidebar_seam = div().w(px(0.0)).h_full().flex_none().relative().children(
+                    sidebar_handle.map(|handle| handle.left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))),
+                );
                 // Keep the right resize target outside the pane's
                 // overflow-hidden width container. This mirrors the sidebar
                 // seam and lets the target straddle both adjacent panes.
@@ -15143,6 +16124,7 @@ impl Render for Shell {
                     )
                     .children(voice_stage)
                     .child(self.render_titlebar_cluster(cx))
+                    .children(self.render_sidebar_options_titlebar(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
@@ -15163,6 +16145,8 @@ impl Render for Shell {
         } else {
             root
         };
+        // Toasts float over every phase and route.
+        let root = root.children(crate::toast::render_toaster(window, cx));
 
         // A manually-driven tween is mid-flight: keep frames coming (the same
         // scheduling `with_animation` would have requested). Hover color fades
@@ -15332,6 +16316,107 @@ mod tests {
         assert_eq!(keys.len(), 6, "element ids must be unique");
     }
 
+    #[gpui::test]
+    fn chat_context_menu_renders_exports_for_main_and_side_chats(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        struct OverlayHost {
+            shell: gpui::Entity<super::Shell>,
+            _shell_observation: gpui::Subscription,
+        }
+
+        impl gpui::Render for OverlayHost {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.shell.update(cx, |shell, cx| {
+                    let viewport = window.viewport_size();
+                    gpui::div()
+                        .size_full()
+                        .children(shell.render_overlays(viewport, window, cx))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(super::Theme::default());
+            crate::app_menus::init(cx);
+            super::settings::init(super::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        let boot = super::EngineBootConfig {
+            data_dir: dir.path().into(),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock,
+        };
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            let shell = cx.new(|cx| {
+                let state = cx.new(|_| super::AppState::new());
+                super::test_shell(state, boot, cx)
+            });
+            let shell_observation = cx.observe(&shell, |_, _, cx| cx.notify());
+            OverlayHost {
+                shell,
+                _shell_observation: shell_observation,
+            }
+        });
+        let shell = host.read_with(cx, |host, _| host.shell.clone());
+
+        let assert_exports_rendered = |cx: &mut gpui::VisualTestContext| {
+            for key in [
+                "export-download-md",
+                "export-download-json",
+                "export-download-txt",
+                "export-copy-md",
+                "export-copy-json",
+                "export-copy-txt",
+            ] {
+                assert!(cx.debug_bounds(key).is_some(), "missing rendered row {key}");
+            }
+        };
+
+        shell.update(cx, |shell, cx| {
+            shell.chat_menu.open(super::ChatMenuState {
+                chat_id: "main".into(),
+                tab: None,
+                position: gpui::point(gpui::px(20.0), gpui::px(20.0)),
+                page: super::ChatMenuPage::Root,
+            });
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert_exports_rendered(cx);
+        for key in ["chat-menu-archive", "chat-menu-copy", "chat-menu-delete"] {
+            assert!(cx.debug_bounds(key).is_some(), "missing existing row {key}");
+        }
+
+        shell.update(cx, |shell, cx| {
+            shell.chat_menu.open(super::ChatMenuState {
+                chat_id: "side".into(),
+                tab: Some(("main-panel".into(), super::RightSurface::SideChat(1))),
+                position: gpui::point(gpui::px(20.0), gpui::px(20.0)),
+                page: super::ChatMenuPage::Root,
+            });
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert_exports_rendered(cx);
+    }
+
     #[test]
     fn sidebar_mode_switcher_uses_compact_geometry() {
         assert_eq!(SIDEBAR_MODE_SWITCHER_HEIGHT, 36.0);
@@ -15389,6 +16474,15 @@ mod tests {
                 SidebarMode::Orchestrator,
                 Route::Chat,
                 WorkersRoute::Settings(WorkersSettingsTab::Resources),
+            ),
+            Some(SettingsCatalog::Orchestrator(SettingsSection::General))
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Orchestrator,
+                Route::PullRequests,
+                WorkersRoute::Workspace,
             ),
             Some(SettingsCatalog::Orchestrator(SettingsSection::General))
         );
@@ -15570,6 +16664,20 @@ mod tests {
         );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+    }
+
+    #[test]
+    fn narrowest_sidebar_keeps_its_options_button_beside_the_titlebar_controls() {
+        for is_macos in [true, false] {
+            let cluster_end = cluster_buttons_start(is_macos, false, 0)
+                + CLUSTER_BUTTONS_WIDTH
+                + TITLEBAR_ACTION_SLOT_WIDTH;
+            let options_right = cluster_end + TITLEBAR_GROUP_GAP + 24.0;
+            assert!(
+                options_right + Theme::SPACE_SM <= SIDEBAR_MIN,
+                "options button ends at {options_right} in a {SIDEBAR_MIN} sidebar"
+            );
+        }
     }
 
     #[test]
@@ -15983,10 +17091,18 @@ mod tests {
 
     #[test]
     fn new_session_action_lives_in_the_titlebar_only_when_useful() {
-        assert_eq!(titlebar_new_session_alpha(true, true), 1.0);
-        assert_eq!(titlebar_new_session_alpha(true, false), 0.0);
-        assert_eq!(titlebar_new_session_alpha(false, true), 0.0);
-        assert_eq!(titlebar_new_session_alpha(false, false), 0.0);
+        assert_eq!(titlebar_new_session_alpha(&Route::Chat, true), 1.0);
+        assert_eq!(titlebar_new_session_alpha(&Route::Chat, false), 0.0);
+        assert_eq!(titlebar_new_session_alpha(&Route::PullRequests, false), 1.0);
+        assert_eq!(titlebar_new_session_alpha(&Route::PullRequests, true), 1.0);
+        assert_eq!(
+            titlebar_new_session_alpha(&Route::Settings(SettingsSection::Devices), true),
+            0.0
+        );
+        assert_eq!(
+            titlebar_new_session_alpha(&Route::Settings(SettingsSection::Devices), false),
+            0.0
+        );
     }
 
     #[test]
@@ -16781,7 +17897,7 @@ mod tests {
             RightSurface::Picker
         );
         // Changing visibility or showing the picker is not a surface visit.
-        panels.update("first", |p| p.visible = true);
+        panels.update("first", |p| p.changes_open = true);
         panels.update("first", |p| p.right_active = RightSurface::Picker);
         assert_eq!(panels.right_tab_history["first"], vec![a, b, stale]);
         for surface in [a, b, stale] {
@@ -17195,6 +18311,27 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_route_participates_in_browser_history() {
+        let mut nav = NavHistory::new(chat("a"));
+        nav.push(NavEntry::PullRequests);
+        assert_eq!(nav.back(), Some(chat("a")));
+        assert_eq!(nav.forward(), Some(NavEntry::PullRequests));
+
+        nav.push(NavEntry::PullRequests);
+        assert_eq!(nav.len(), 2, "reopening the active dashboard deduplicates");
+        nav.push(chat("a"));
+        assert_eq!(nav.back(), Some(NavEntry::PullRequests));
+    }
+
+    #[test]
+    fn pull_request_route_can_open_from_and_return_to_settings() {
+        let settings = NavEntry::Settings(SettingsSection::Devices);
+        let mut nav = NavHistory::new(settings.clone());
+        nav.push(NavEntry::PullRequests);
+        assert_eq!(nav.back(), Some(settings));
+    }
+
+    #[test]
     fn sidebar_disclosure_motion_lands_exactly_on_its_target() {
         let mut tween = SidebarDisclosureMotion::new(1, 240.0, 0.0);
         tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
@@ -17393,6 +18530,8 @@ mod exit_regressions {
                     from: 520.,
                     to: 0.,
                     started,
+                    duration,
+                    curve: RESIZE.curve,
                 });
                 shell.reduced_motion = false;
                 // The frame started halfway through the transition but rendering
@@ -17441,14 +18580,17 @@ mod exit_regressions {
                 assert!(!shell.right_pane_open(cx));
                 assert!(shell.tween_active(shell.right_tween));
                 assert!(
-                    !files.read(cx).test_images_visible(),
-                    "closing suspends image resources immediately"
+                    files.read(cx).test_images_visible(),
+                    "file content stays painted through the closing mask"
                 );
-                let _ = shell.render_right_pane(window, cx);
+                let frame_time = shell.render_time;
+                shell.render_time = Some(shell.right_tween.unwrap().started + duration);
+                shell.suspend_hidden_right_images(cx);
                 assert!(
                     !files.read(cx).test_images_visible(),
-                    "closing animation must not reactivate images"
+                    "image resources suspend once the close animation ends"
                 );
+                shell.render_time = frame_time;
                 shell.settings.sidebar_collapsed = true;
                 shell.sidebar_tween = tween;
                 shell.toggle_sidebar(cx);
@@ -17532,6 +18674,10 @@ mod exit_regressions {
                             vec![dir.path().join("wallpapers/current.png")];
                         settings.window_geometry = geometry;
                         settings.open_web_links_in_zeron = open_links_in_zeron;
+                        settings.pull_request_destination =
+                            settings::PullRequestDestination::External;
+                        settings.last_pull_request_repository = Some("acme/zeron".into());
+                        settings.last_pull_request_device = Some("remote-pr-device".into());
                         settings.terminal_font_family = terminal_family.clone();
                         settings.terminal_font_size = terminal_size;
                         settings.code_font_family = code_family.clone();
@@ -17562,9 +18708,21 @@ mod exit_regressions {
                             current.wallpaper_source,
                             Some(dir.path().join("wallpapers/current.png"))
                         );
+                        assert_eq!(
+                            current.last_pull_request_repository.as_deref(),
+                            Some("acme/zeron")
+                        );
+                        assert_eq!(
+                            current.last_pull_request_device.as_deref(),
+                            Some("remote-pr-device")
+                        );
                         assert_eq!(current.window_geometry, geometry);
                         assert_eq!(current.new_thread_background_effect, effect);
                         assert_eq!(current.open_web_links_in_zeron, open_links_in_zeron);
+                        assert_eq!(
+                            current.pull_request_destination,
+                            settings::PullRequestDestination::External
+                        );
                         assert_eq!(current.terminal_font_family, terminal_family);
                         assert_eq!(current.terminal_font_size, terminal_size);
                         assert_eq!(current.code_font_family, code_family);
@@ -17584,6 +18742,14 @@ mod exit_regressions {
                     }
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
+                    assert_eq!(
+                        loaded.last_pull_request_repository.as_deref(),
+                        Some("acme/zeron")
+                    );
+                    assert_eq!(
+                        loaded.last_pull_request_device.as_deref(),
+                        Some("remote-pr-device")
+                    );
                     assert_eq!(loaded.window_geometry, geometry);
                     assert_eq!(
                         loaded.wallpaper_history,
@@ -17596,6 +18762,10 @@ mod exit_regressions {
                     );
                     assert_eq!(loaded.new_thread_background_effect, effect);
                     assert_eq!(loaded.open_web_links_in_zeron, open_links_in_zeron);
+                    assert_eq!(
+                        loaded.pull_request_destination,
+                        settings::PullRequestDestination::External
+                    );
                     assert_eq!(loaded.terminal_font_family, terminal_family);
                     assert_eq!(loaded.terminal_font_size, terminal_size);
                     assert_eq!(loaded.code_font_family, code_family);
@@ -17877,6 +19047,437 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn sidebar_settings_trigger_toggles_the_settings_route(cx: &mut TestAppContext) {
+        // Just the footer row: the full shell's settings modal would cover it.
+        struct FooterHost(Entity<Shell>);
+        impl Render for FooterHost {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    div()
+                        .w(px(256.0))
+                        .child(shell.render_sidebar_footer_row(&Theme::default(), cx))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            FooterHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                test_shell(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                )
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+        for expect_open in [true, false] {
+            cx.update(|window, cx| window.draw(cx).clear());
+            assert!(cx.debug_bounds("user-menu-label").is_some());
+            let trigger = cx.debug_bounds("settings-trigger").unwrap().center();
+            cx.simulate_click(trigger, gpui::Modifiers::default());
+            shell.read_with(cx, |shell, _| {
+                if expect_open {
+                    assert!(matches!(
+                        shell.route,
+                        Route::Settings(SettingsSection::General)
+                    ));
+                } else {
+                    assert!(matches!(shell.route, Route::Chat));
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn settings_footer_keeps_the_pull_requests_entry(cx: &mut TestAppContext) {
+        // Chat and Settings both render this row; host it alone so the full
+        // shell's pages don't cover it.
+        struct FooterRow(Entity<Shell>);
+        impl Render for FooterRow {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    div()
+                        .w(px(256.0))
+                        .child(shell.render_sidebar_footer_row(&Theme::default(), cx))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            FooterRow(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                test_shell(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                )
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+        shell.update(cx, |shell, cx| {
+            shell.open_settings(SettingsSection::General, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let row = cx.debug_bounds("sidebar-footer-row").unwrap();
+        let entry = cx
+            .debug_bounds("open-pull-requests")
+            .expect("Settings keeps the Pull requests entry");
+        let gear = cx.debug_bounds("settings-trigger").unwrap();
+        // Just left of Settings, in the same action group.
+        assert!(entry.right() <= gear.left() && entry.left() >= row.left());
+        assert!((entry.center().y - gear.center().y).abs() < px(1.0));
+        cx.simulate_click(entry.center(), gpui::Modifiers::default());
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                matches!(shell.route, Route::PullRequests),
+                "it opens the board straight from Settings"
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn pull_request_route_uses_full_window_without_titlebar_overlap(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                state.local_device_id = Some("device-local".into());
+                state
+            });
+            test_shell(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.debug_gate = Some(GatePhase::Ready);
+                shell.active_chat = "chat".into();
+                // The fork renders the right column only while it owns a real
+                // surface tab; exercise the live pane, not the empty Picker.
+                shell.add_browser_surface(None, window, cx);
+                assert!(shell.right_pane_open(cx));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("right-pane").is_some(),
+            "the chat shows its side pane"
+        );
+        shell.update(cx, |shell, cx| {
+            shell.open_pull_requests(cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("right-pane").is_none());
+        let board = cx.debug_bounds("pull-requests-column").unwrap();
+        assert!(
+            board.size.width > px(300.0),
+            "the board keeps the room the pane would take"
+        );
+
+        // The PR header and the persistent controls share the titlebar even
+        // with the sidebar collapsed and the macOS traffic lights hidden.
+        cx.update(|window, cx| {
+            motion::set_reduced_motion(cx, true);
+            window.dispatch_action(
+                Box::new(crate::pull_request_detail::OpenPullRequest(
+                    "https://github.com/a/b/pull/1".into(),
+                    Some("device-a".into()),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let device_a_detail = shell.read_with(cx, |shell, _| {
+            shell
+                .pull_request_detail
+                .as_ref()
+                .expect("the PR action opens a detail")
+                .entity_id()
+        });
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(
+                shell
+                    .pull_request_detail
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .target_device(),
+                Some("device-a")
+            );
+        });
+
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(crate::pull_request_detail::OpenPullRequest(
+                    "https://github.com/a/b/pull/1".into(),
+                    Some("device-a".into()),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |shell, _| shell
+                .pull_request_detail
+                .as_ref()
+                .unwrap()
+                .entity_id()),
+            device_a_detail,
+            "the same URL and device retain view state"
+        );
+
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(crate::pull_request_detail::OpenPullRequest(
+                    "https://github.com/a/b/pull/1".into(),
+                    Some("device-b".into()),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let device_b_detail = shell.read_with(cx, |shell, cx| {
+            let detail = shell.pull_request_detail.as_ref().unwrap();
+            assert_eq!(detail.read(cx).target_device(), Some("device-b"));
+            detail.entity_id()
+        });
+        assert_ne!(device_b_detail, device_a_detail);
+
+        shell.update(cx, |shell, cx| {
+            shell.apply_nav(
+                NavEntry::PullRequest {
+                    url: "https://github.com/a/b/pull/1".into(),
+                    device: Some("device-local".into()),
+                },
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.run_until_parked();
+        let local_detail = shell.read_with(cx, |shell, cx| {
+            let detail = shell.pull_request_detail.as_ref().unwrap();
+            assert_eq!(detail.read(cx).target_device(), None);
+            detail.entity_id()
+        });
+        assert_ne!(local_detail, device_b_detail);
+
+        shell.update(cx, |shell, cx| {
+            shell.apply_nav(
+                NavEntry::PullRequest {
+                    url: "https://github.com/a/b/pull/1".into(),
+                    device: None,
+                },
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |shell, _| shell
+                .pull_request_detail
+                .as_ref()
+                .unwrap()
+                .entity_id()),
+            local_detail,
+            "the local device ID and no target share one canonical target"
+        );
+        for width in [600.0, 1400.0] {
+            cx.simulate_resize(gpui::size(px(width), px(800.0)));
+            for collapsed in [true, false] {
+                shell.update(cx, |shell, cx| {
+                    shell.settings.sidebar_collapsed = collapsed;
+                    shell.sidebar_tween = None;
+                    cx.notify();
+                });
+                for fullscreen in [false, true] {
+                    cx.update(|window, cx| {
+                        if window.is_fullscreen() != fullscreen {
+                            window.toggle_fullscreen();
+                        }
+                        window.draw(cx).clear();
+                    });
+                    cx.run_until_parked();
+                    let new_session = cx.debug_bounds("titlebar-new-session").unwrap();
+                    let title = cx.debug_bounds("pr-detail-title").unwrap();
+                    assert!(
+                        title.left() >= new_session.right() + px(8.0),
+                        "PR header overlaps New session: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, title={title:?}, new_session={new_session:?}"
+                    );
+                    for selector in ["pr-detail-refresh", "pr-copy-url"] {
+                        let action = cx.debug_bounds(selector).unwrap();
+                        assert!(
+                            action.top() >= px(0.0)
+                                && action.bottom() <= px(Theme::TITLEBAR_HEIGHT)
+                                && action.right() <= px(width),
+                            "PR titlebar action escapes the header: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, selector={selector}, bounds={action:?}"
+                        );
+                    }
+                    let external = cx.debug_bounds("pr-external").unwrap();
+                    assert!(external.right() <= px(width));
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn pull_request_handoff_stages_its_prompt_in_a_new_session(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            test_shell(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                let space = |id: &str, device: &str| zeron_proto::Space {
+                    id: id.into(),
+                    device_id: device.into(),
+                    path: format!("/{id}"),
+                    name: None,
+                    git_detected: true,
+                    git_checked_at: None,
+                    checkout_id: None,
+                    repository_id: None,
+                    created_at: Utc::now(),
+                };
+                shell.state.update(cx, |state, cx| {
+                    state.local_device_id = Some("local".into());
+                    state.apply_spaces(vec![
+                        space("unrelated", "local"),
+                        space("pr-project", "remote"),
+                    ]);
+                    state.select_space(Some("unrelated".into()), cx);
+                });
+                shell.settings.space_filter = Some("unrelated".into());
+                shell.composer.update(cx, |composer, cx| {
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text("half-written reply", cx))
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(crate::pull_request_detail::StartPullRequestSession {
+                        prompt: "Review pull request #7".into(),
+                        project_id: "pr-project".into(),
+                        device: "remote".into(),
+                        repository: "a/b".into(),
+                    }),
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    shell.state.read(cx).selected_chat.is_none(),
+                    "a new session opens"
+                );
+                assert_eq!(
+                    shell.state.read(cx).selected_space.as_deref(),
+                    Some("pr-project")
+                );
+                assert_eq!(
+                    shell.state.read(cx).effective_device_id().as_deref(),
+                    Some("remote")
+                );
+                let composer = shell.composer.read(cx);
+                assert_eq!(
+                    composer.input.read(cx).text(),
+                    "half-written reply\n\nReview pull request #7",
+                    "a draft already on the canvas stays above the prompt"
+                );
+                assert!(composer.focus_pending);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn opening_terminals_focuses_the_terminal_once(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
@@ -17987,6 +19588,14 @@ mod exit_regressions {
                     _ => {}
                 })
                 .unwrap();
+            // The shell owns the settings-return transition; let its render
+            // request one-shot composer focus before mounting the same
+            // Composer in the isolated test window below.
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
             cx.update_window(composer_window.into(), |composer, window, cx| {
                 window.draw(cx).clear();
                 // The fork's settings route closes back into the composer.
@@ -19687,6 +21296,235 @@ mod settings_section_persistence {
     }
 
     #[gpui::test]
+    fn settings_visits_preserve_conversation_and_navigation_history(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            test_shell(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                let history = shell.nav.current().clone();
+                let selected = shell.state.read(cx).selected_chat.clone();
+                for section in SettingsSection::ALL {
+                    shell.open_settings(section, cx);
+                    assert_eq!(shell.route, Route::Settings(section.reopenable()));
+                    assert_eq!(shell.nav.current().clone(), history);
+                    assert_eq!(shell.state.read(cx).selected_chat, selected);
+                    shell.toggle_settings(cx);
+                    assert_eq!(shell.route, Route::Chat);
+                    assert!(!shell.settings_focus_pending);
+                    shell.toggle_settings(cx);
+                    assert_eq!(shell.route, Route::Settings(section.reopenable()));
+                }
+                shell.open_settings(SettingsSection::Agents, cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Agents));
+                shell.close_settings(cx);
+                assert_eq!(shell.route, Route::Chat);
+                assert_eq!(shell.nav.current().clone(), history);
+                assert!(shell.settings_restore_pending);
+                shell.open_pull_requests(cx);
+                shell.open_settings(SettingsSection::General, cx);
+                shell.close_settings(cx);
+                assert_eq!(shell.route, Route::PullRequests);
+                assert_eq!(shell.nav.current(), &NavEntry::PullRequests);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn unknown_or_hidden_remembered_sections_reopen_general(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings::UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "settingsSection": "billing"}"#,
+        )
+        .unwrap();
+        let saved = settings::UiSettings::load(dir.path());
+        assert_eq!(saved.sidebar_width, 300.0);
+        init_settings_test(saved, dir.path(), cx);
+        let window = cx.add_window(|_, cx| settings_test_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::General));
+                shell.close_settings(cx);
+                // A remembered section this build hides falls back as well.
+                shell.settings.settings_section = SettingsSection::Appshots;
+                shell.toggle_settings(cx);
+                assert_eq!(
+                    shell.route,
+                    Route::Settings(SettingsSection::Appshots.reopenable())
+                );
+            })
+            .unwrap();
+    }
+
+    /// The full shell draws its sidebar as a cached view after its own
+    /// render, so the lifted row must be built and drawn within one frame.
+    /// Carried out of the sidebar it follows the pointer, and dropped on a
+    /// conversation it becomes a chat chip in that composer.
+    #[gpui::test]
+    fn a_dragged_session_leaves_the_sidebar_and_drops_as_a_chat_mention(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| settings_test_shell(dir.path(), cx));
+        cx.simulate_resize(gpui::size(px(1200.0), px(800.0)));
+        shell.update(cx, |shell, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.splash = SplashPhase::Gone;
+            shell.reduced_motion = true;
+            shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+            shell.state.update(cx, |state, state_cx| {
+                state.workspace_scope = Some(WorkspaceScope::Local);
+                state.local_device_id = Some("local".into());
+                state.chats = ["older", "newer"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, id)| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "title": format!("Chat {id}"), "deviceId": "local",
+                            "archived": false,
+                            "createdAt": Utc::now() - chrono::Duration::minutes(10 - ix as i64),
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                state.selected_chat = Some("newer".into());
+                // The cached sidebar reads AppState for its rows, so publish
+                // the fixture mutation as well as the Shell presentation
+                // changes below before the first measured draw.
+                state_cx.notify();
+            });
+            shell.active_chat = "newer".into();
+            // The cached sidebar also observes Shell; publish its local
+            // presentation changes before the first measured draw.
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // In GPUI tests, a top-level Entity::update flushes effects and draws
+        // dirty windows automatically. Keep cache invalidation and the measured
+        // draw in one outer update, or that automatic frame consumes the dirty
+        // view and the following cached replay clears debug_bounds.
+        let sidebar_pane = shell.read_with(cx, |shell, _| shell.sidebar_pane.clone());
+        cx.update(|window, cx| {
+            sidebar_pane.update(cx, |_, pane_cx| pane_cx.notify());
+            window.draw(cx).clear();
+        });
+        let row = cx.debug_bounds("chat-older").unwrap_or_else(|| {
+            let rendered_bounds = [
+                "sidebar-column",
+                "sidebar-sessions-section",
+                "sessions-toggle",
+                "sidebar-regular-sessions",
+                "session-slot-newer",
+                "session-slot-older",
+                "chat-newer",
+                "chat-older",
+                "sidebar-footer-row",
+                "conversation-column",
+            ]
+            .map(|selector| (selector, cx.debug_bounds(selector)));
+            let accessibility = cx.update(|window, _| {
+                window
+                    .debug_a11y_tree_json()
+                    .map(|tree| (tree.len(), tree.contains("older")))
+            });
+            let diagnostic = shell.update(cx, |shell, cx| {
+                let filter = shell.settings.space_filter.clone();
+                let (no_project, selected, candidates) = {
+                    let state = shell.state.read(cx);
+                    (
+                        state.no_project,
+                        state.selected_chat.clone(),
+                        state
+                            .sidebar_chats(Utc::now(), filter.as_deref())
+                            .into_iter()
+                            .map(|(_, chat)| chat.id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let visible = shell.sidebar_visible_order(cx);
+                format!(
+                    "route={:?}, sidebar_mode={:?}, sessions_open={}, sidebar_collapsed={}, filter={filter:?}, no_project={no_project}, selected={selected:?}, candidates={candidates:?}, visible={visible:?}",
+                    shell.route,
+                    shell.sidebar_mode,
+                    shell.sessions_open,
+                    shell.settings.sidebar_collapsed,
+                )
+            });
+            panic!(
+                "sidebar row chat-older is missing; {diagnostic}; rendered_bounds={rendered_bounds:?}; accessibility={accessibility:?}"
+            );
+        });
+        let from = row.center();
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        // Several frames of dragging, inside the sidebar and then out of it.
+        for step in 1..=6 {
+            let x = from.x + px(4.0 + 120.0 * step as f32);
+            cx.simulate_mouse_move(
+                gpui::point(x, from.y + px(40.0)),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear());
+        }
+        // The sidebar is a cached view, whose contents tests can't query by
+        // selector; the lifted row's own window position is the check.
+        let sidebar_width = shell.read_with(cx, |shell, _| shell.settings.sidebar_width);
+        shell.read_with(cx, |shell, _| {
+            let transfer = shell
+                .sidebar_session_transfer
+                .as_ref()
+                .expect("still dragging");
+            let left = transfer.slide_x.to;
+            let expected = f32::from(transfer.pointer.x - transfer.cursor_offset.x);
+            assert!(
+                left > sidebar_width,
+                "outside the sidebar the row follows the pointer"
+            );
+            assert!((left - expected).abs() < 0.5);
+        });
+        let drop = gpui::point(from.x + px(724.0), from.y + px(40.0));
+        cx.simulate_mouse_up(drop, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            let text = shell.composer.read(cx).input.read(cx).text().to_owned();
+            assert!(
+                text.contains("[Chat older](zeron-chat:older)"),
+                "the drop mentions the chat: {text:?}"
+            );
+            assert!(shell.sidebar_session_transfer.is_none());
+        });
+    }
+
+    #[gpui::test]
     fn voice_stage_opens_over_settings(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         init_settings_test(settings::UiSettings::default(), dir.path(), cx);
@@ -19771,32 +21609,22 @@ mod settings_section_persistence {
             assert_eq!(shell.settings.settings_section, SettingsSection::Devices);
         });
     }
+}
 
-    #[gpui::test]
-    fn unknown_or_hidden_remembered_sections_reopen_general(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            settings::UiSettings::path(dir.path()),
-            r#"{"sidebarWidth": 300, "settingsSection": "billing"}"#,
-        )
-        .unwrap();
-        let saved = settings::UiSettings::load(dir.path());
-        assert_eq!(saved.sidebar_width, 300.0);
-        init_settings_test(saved, dir.path(), cx);
-        let window = cx.add_window(|_, cx| settings_test_shell(dir.path(), cx));
-        window
-            .update(cx, |shell, _, cx| {
-                shell.open_last_settings(cx);
-                assert_eq!(shell.route, Route::Settings(SettingsSection::General));
-                shell.close_settings(cx);
-                // A remembered section this build hides falls back as well.
-                shell.settings.settings_section = SettingsSection::Appshots;
-                shell.open_last_settings(cx);
-                assert_eq!(
-                    shell.route,
-                    Route::Settings(SettingsSection::Appshots.reopenable())
-                );
-            })
-            .unwrap();
+/// Native visual QA of the pull request board and detail with isolated data.
+#[cfg(feature = "pull-request-fixture")]
+impl Shell {
+    pub fn fixture_pull_request_detail(
+        &self,
+    ) -> Option<Entity<crate::pull_request_detail::PullRequestDetailPage>> {
+        self.pull_request_detail.clone()
+    }
+
+    pub fn fixture_pull_request_settings(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open {
+            self.open_settings(SettingsSection::General, cx);
+        } else {
+            self.close_settings(cx);
+        }
     }
 }

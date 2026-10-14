@@ -39,7 +39,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `crates/*/src/**` (lógica pura) | unit (`mod tests` co-located) | `cargo test -p <crate>` |
 | `crates/{engine,harness,rpc,workers-unpeel,doc,sync}/tests/**` | integration | `cargo test -p <crate>` |
 | `crates/ui/src/**` (estado, derivações) | unit | `cargo test -p zeron-ui` |
-| `crates/ui` (render gpui) | none — sem harness de render; validação é visual no `scripts/dev-demo.sh` | — |
+| `crates/ui` (render gpui) | unit — fixtures `gpui::TestAppContext` de layout/render; QA visual nativo continua separado | `cargo test -p zeron-ui` · `scripts/dev-demo.sh` |
 | `crates/update` | unit (versão/manifest, swap symlink, shutdown, restart gate) | `cargo test -p zeron-update` |
 
 ## Child DOX Index

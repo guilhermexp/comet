@@ -244,10 +244,18 @@ rpc_methods! {
     LIST_FOLDERS / ListFolders = "ListFolders" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// The device's browse roots: home plus mounted drives/volumes.
     LIST_DRIVES / ListDrives = "ListDrives" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    /// Folders under the host's home for the new-project picker.
+    SEARCH_HOME_FOLDERS / SearchHomeFolders = "SearchHomeFolders" { params: zeron_proto::SearchHomeFoldersRequest, reply: zeron_proto::HomeFolderSearchResult, forwardable: true },
+    /// Release the transient home index when the project picker closes.
+    RELEASE_HOME_FOLDER_SEARCH / ReleaseHomeFolderSearch = "ReleaseHomeFolderSearch" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     SEARCH_FILES / SearchFiles = "SearchFiles" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_WORKSPACE_DIRECTORY / ListWorkspaceDirectory = "ListWorkspaceDirectory" { params: zeron_proto::ListWorkspaceDirectoryRequest, reply: zeron_proto::WorkspaceDirectoryPage, forwardable: true },
     SEARCH_WORKSPACE_FILES / SearchWorkspaceFiles = "SearchWorkspaceFiles" { params: zeron_proto::SearchWorkspaceFilesRequest, reply: Vec<zeron_proto::WorkspaceFileSearchMatch>, forwardable: true },
+    /// Warm the owning device's shared index for a workspace.
+    WARM_WORKSPACE_SEARCH / WarmWorkspaceSearch = "WarmWorkspaceSearch" { params: zeron_proto::WarmWorkspaceSearchRequest, reply: zeron_proto::WarmWorkspaceSearchResult, forwardable: true },
+    /// Search text within files in an authorized workspace.
+    SEARCH_WORKSPACE_CONTENT / SearchWorkspaceContent = "SearchWorkspaceContent" { params: zeron_proto::SearchWorkspaceContentRequest, reply: zeron_proto::WorkspaceContentSearchResult, forwardable: true },
     READ_WORKSPACE_FILE / ReadWorkspaceFile = "ReadWorkspaceFile" { params: zeron_proto::ReadWorkspaceFileRequest, reply: zeron_proto::WorkspaceFileText, forwardable: true },
     WATCH_WORKSPACE_FILES / WatchWorkspaceFiles = "WatchWorkspaceFiles" { params: zeron_proto::WatchWorkspaceFilesRequest, reply: zeron_proto::WorkspaceFileChanges, forwardable: true, stream: true },
     CREATE_WORKSPACE_ENTRY / CreateWorkspaceEntry = "CreateWorkspaceEntry" { params: zeron_proto::CreateWorkspaceEntryRequest, reply: zeron_proto::WorkspaceEntryMutation, forwardable: true },
@@ -267,6 +275,15 @@ rpc_methods! {
     WATCH_CHECKOUT_DIFFS / WatchCheckoutDiffs = "WatchCheckoutDiffs" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
     /// Current pull request for one checkout, resolved on the checkout's host device.
     WATCH_CHECKOUT_CHANGE_REQUEST / WatchCheckoutChangeRequest = "WatchCheckoutChangeRequest" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
+    /// One page of pull requests for one repository and viewer relationship.
+    LIST_CHANGE_REQUEST_PAGE / ListChangeRequestPage = "ListChangeRequestPage" { params: serde_json::Value, reply: zeron_proto::ChangeRequestPage, forwardable: true },
+    /// Resolve a repository slug from a locally authorized checkout.
+    GET_CHANGE_REQUEST_REPOSITORY / GetChangeRequestRepository = "GetChangeRequestRepository" { params: serde_json::Value, reply: Option<String>, forwardable: true },
+    GET_CHANGE_REQUEST / GetChangeRequest = "GetChangeRequest" { params: serde_json::Value, reply: zeron_proto::ChangeRequestDetail, forwardable: true },
+    /// Load provider diff and details for one pull request.
+    GET_CHANGE_REQUEST_DIFF / GetChangeRequestDiff = "GetChangeRequestDiff" { params: serde_json::Value, reply: zeron_proto::ChangeRequestDetail, forwardable: true },
+    /// Post a GitHub conversation comment.
+    POST_CHANGE_REQUEST_COMMENT / PostChangeRequestComment = "PostChangeRequestComment" { params: serde_json::Value, reply: zeron_proto::ChangeRequestComment, forwardable: true },
     GET_CHECKOUT_DIFF / GetCheckoutDiff = "GetCheckoutDiff" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     GET_CHECKOUT_FILE_DIFF_TEXT / GetCheckoutFileDiffText = "GetCheckoutFileDiffText" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     GET_CHECKOUT_STATUS / GetCheckoutStatus = "GetCheckoutStatus" { params: zeron_proto::GetCheckoutStatusRequest, reply: zeron_proto::CheckoutStatus, forwardable: true },

@@ -101,6 +101,7 @@ impl ThreadNamingCard {
 
 impl Render for ThreadNamingCard {
     fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let follows_session = self
             .settings
@@ -142,25 +143,19 @@ impl Render for ThreadNamingCard {
         } else {
             "A small model keeps titles fast and cheap."
         };
-        widgets::section_card(&theme)
-            .child(
-                widgets::card_row(&theme, true)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.0))
-                            .child(widgets::row_title(&theme, "Chat titles"))
-                            .child(widgets::meta_line(
-                                &theme,
-                                vec![div().child(description).into_any_element()],
-                            )),
-                    )
-                    .child(control),
-            )
-            .when_some(self.error.clone(), |card, error| {
-                card.child(
-                    widgets::card_row(&theme, false).child(widgets::error_strip(&theme, error)),
+        widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .child(widgets::row_title(&theme, "Chat titles"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![div().child(description).into_any_element()],
+                        )),
                 )
-            })
+                .child(control),
+        )
     }
 }

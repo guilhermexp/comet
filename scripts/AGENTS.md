@@ -39,6 +39,9 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 
 - Comandos: `bash -n scripts/<script>.sh` (sintaxe) · execução real do script
 
+- **QA nativo por lançamento de uma cópia do app está indisponível até existir isolamento comprovado das configurações de todos os providers. Não repetir essa receita.** `ZERON_DATA_DIR`, `ZERON_IPC_PORT`, `UNPEEL_HOME` e `COMET_WORKERS_HOOKS_DIR` exclusivos separam dados/IPC e assets de hooks, mas não redirecionam as configurações reais sob o home. O bootstrap de `LocalWorkersClient` e a migração de hooks podem modificá-las antes de qualquer interação, mesmo sem iniciar agentes reais. Copiar/renomear/assinar o bundle, usar harness mock, fazer backups ou comparar digest/mtime depois não constitui isolamento. Não abrir `/Applications/Zeron.app` como alternativa; registrar a observação visual como `notProven`.
+- O incidente de QA de 2026-10-11 expôs configurações de Claude, Codex, Cursor, Gemini, Kiro e KimiCode. Os recibos `native-qa-observations.json`, `native-qa-additional-config-repairs.json` e `native-qa-resource-cleanup.json` da rodada sync-20261011 registram restauração exata somente dos três arquivos previamente capturados (`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.codex/config.toml`) e reparos semânticos de caminhos pertencentes ao QA em sete configurações adicionais; não provam restauração byte a byte dessas sete. Os processos de QA foram encerrados, o bundle desregistrado e a cópia/perfil removidos. Esses recibos documentam recuperação e limites, não autorizam novo lançamento.
+
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `e2e-smoke.sh` | e2e — é o próprio teste | `scripts/e2e-smoke.sh` |
@@ -47,7 +50,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 | `dev-demo.sh` | none — ferramenta de dev; validação é usar | `scripts/dev-demo.sh` |
 | `seed-demo-workers.py` | integration — fixture consumido pelo bootstrap real | `cargo test -p zeron-workers-unpeel --test dev_demo_fixture` |
 | `package-voice-runtime.py` / `codex-voice-remote-smoke.py` | integration — inventário/checksum/plataforma, protocolo, timeout e cleanup offline | `python3.12 -m unittest discover -s scripts/tests -p 'test_voice_packaging.py'` · `python3.12 -m unittest discover -s scripts/tests -p 'test_voice_remote*.py'` |
-| `package-*.sh` | none — sem suite; validação é gerar o pacote e abrir | execução manual |
+| `package-*.sh` | none — sem suite; validação é gerar/inspecionar o pacote e instalação; no macOS, lançamento da cópia para QA está indisponível conforme limite acima | execução manual |
 | `omp-dev` | none — wrapper de 1 decisão; validação é o handshake | `printf '{"type":"ping","id":"x"}\n' \| scripts/omp-dev --mode rpc-ui --auto-approve --allow-home --cwd "$HOME" \| head -1` (espera `"type":"ready"`) |
 
 ## Child DOX Index
