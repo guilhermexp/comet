@@ -1,13 +1,13 @@
 repository = "https://github.com/zeronsh/zui"
-base_revision = "dce5c1f737a834b32c2b531d552ea78035e54093"
-vendored_tree = "7e0cdc6185ee4f71274883b686010f2283dac6ed"
+base_revision = "361ff20b919fdfb80199ee6d9aed725300cb7d54"
+vendored_tree = "1bb62f8c1c84db914c44e106f17e031f80475911"
 vendored_from = "working-tree"
 license = "Apache-2.0"
 
 # `vendored_tree` is the exact Git tree hash of `zui/` without `.git` or
 # `target/`. The snapshot was reconstructed in a separate source checkout at
 # `base_revision`, then the fork's existing patch set was merged and copied.
-# The reusable ignored checkout lives at `.tmp/zui-source`; its merge commit is
+# The original source reconstruction used the following merge commit:
 # `e1541c5c6d6b361437516fba63e1a5cd1cd90a42` (parents: reconstructed prior
 # snapshot `f64fda81a29145647aecf2f583f042d4f255ace0` and upstream
 # `0966d065b23e0b7c9b53c2e186705b8bce16fe2d`).
@@ -66,3 +66,14 @@ license = "Apache-2.0"
 # Source merge: 53cd299ab333c94ccab11ada6add7cdf5cd1adcb.
 # Adds borrowed native-composition handles and Windows image/blur composition;
 # macOS glass/headless and both punctuation patches remain unchanged.
+
+# Sync 2026-10-11: reconstructed snapshot 7e0cdc6185ee4f71274883b686010f2283dac6ed
+# on dce5c1f in separate source (.tmp/zui-source), commit fd42552, then
+# merged rounded clipping 361ff20 without conflicts. Source merge: b9a039088ee1fdce42b853dddc6371696195f7ca.
+# Local glass/headless patches and both closing-punctuation rules retained.
+# Local shader-test cleanup (2026-10-11): reconstructed current vendored tree
+# 2fb41aac47a06b3edd2b1b4607346e92bb476069 as source commit
+# 090b4e3392316ee6c528b53204dafab6c57f074c, then removed source-text HLSL
+# layout assertions while retaining Rust ABI checks. Source patch commit:
+# 55ccec6c9cc913665f67035cd57d358a4aa66623.
+# Fork-toolchain formatting in the separate source checkout: bb83f55a94c13794686019b322253b1988543c77.

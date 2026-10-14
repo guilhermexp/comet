@@ -2,17 +2,25 @@
 
 Tracks local/private fork changes against upstream.
 
-## 2026-10-13 — Spinner do Codex interrompido e espera bloqueada
-
-- O footer de revisão de hooks (`enter review`/`trust all` com `esc close`, e a linha inteira `t trust · esc back` no detalhe) passa a ser menu. Citação, sufixo e prefixo dessa frase não bloqueiam. O pré-scan Swift do detalhe separa o caractere LF ou o caractere CRLF, porque `"\r\n"` é um Character, e corta só 0x09, 0x0A, 0x0C, 0x0D e 0x20; tab vertical e CR isolado não entram. A row mais nova `■ Conversation interrupted`, com sufixo conhecido do CLI (nenhum ou `- use /feedback if something went wrong`), derruba o spinner sem confirmar `Stop`. Draft no composer não rearma. User row já enviada seguida do composer, sufixo desconhecido nessa row mais nova, ou footer de trabalho, rearmam. `wait_for_status` de `completed`/`exited` devolve `needs_input` quando a atividade é `blocked`, antes do timeout.
-- Change: `openspec/changes/fix-codex-pause-hook-wait/`.
-
-## Baseline
+## Baseline histórico
 
 - Branch: `main`
 - HEAD before sync: `6519eb68cab2298eda734ede2e72a9e019ca9421`
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
+
+## 2026-10-13 — Spinner do Codex interrompido e espera bloqueada
+
+- O footer de revisão de hooks (`enter review`/`trust all` com `esc close`, e a linha inteira `t trust · esc back` no detalhe) passa a ser menu. Citação, sufixo e prefixo dessa frase não bloqueiam. O pré-scan Swift do detalhe separa o caractere LF ou o caractere CRLF, porque `"\r\n"` é um Character, e corta só 0x09, 0x0A, 0x0C, 0x0D e 0x20; tab vertical e CR isolado não entram. A row mais nova `■ Conversation interrupted`, com sufixo conhecido do CLI (nenhum ou `- use /feedback if something went wrong`), derruba o spinner sem confirmar `Stop`. Draft no composer não rearma. User row já enviada seguida do composer, sufixo desconhecido nessa row mais nova, ou footer de trabalho, rearmam. `wait_for_status` de `completed`/`exited` devolve `needs_input` quando a atividade é `blocked`, antes do timeout.
+- O journal de hooks grava, ao encerrar o ingress, um snapshot cuja folga já venceu, em vez de deixá-lo para o próximo início. Os doubles HTTP dos testes ignoram o `HEAD /` que o Zeron instalado manda a listeners novos em loopback.
+- Change: `openspec/changes/fix-codex-pause-hook-wait/`.
+
+## 2026-10-11 — Base upstream v0.2.111 e totais por Worked Project
+
+- Busca de arquivos/conteúdo com fff e Cmd+K em abas, painel nativo de PRs, menus pesquisáveis, navegação pelo mouse e layout responsivo entram junto dos totais exatos por checkout da PR #21.
+- Workers/OMP, notificações diretas, Enter/Steer, Details/Usage, terminal à direita e remoções anteriores do fork permanecem. O composer e o cabeçalho acompanham a largura real durante as transições.
+- O painel de PRs passa a separar o cache pela credencial do `gh` usada em cada leitura e abre o detalhe no device do badge clicado. Isso evita que um PR privado de uma conta apareça em outra e que um comentário saia com a credencial do device errado. A revisão também corrigiu toasts, SessionInfo, painéis pedidos e o toggle de providers.
+- Revisão congelada, decisões, provas, limites e estado de publicação: [registro do sync](.upstream-sync/history/20261011T081548Z-836aafbf.yaml).
 
 ## 2026-10-05 — Remoção da aba Files do Details
 

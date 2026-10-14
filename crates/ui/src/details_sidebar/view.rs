@@ -234,6 +234,9 @@ use zeron_rpc::methods;
 #[path = "session_card.rs"]
 mod session_card;
 
+#[path = "worked_project_diffs.rs"]
+mod worked_project_diffs;
+
 use crate::{
     composer::{Composer, ComposerInput, ComposerInputEvent},
     details_sidebar::{
@@ -468,6 +471,9 @@ pub struct DetailsSidebar {
     session_diff: Option<session_card::SessionDiffTotals>,
     session_diff_watch: Option<Task<()>>,
     session_diff_key: Option<String>,
+    worked_diff_key: Option<(Option<String>, Vec<String>)>,
+    worked_diff_watch: Option<Task<()>>,
+    worked_diffs: HashMap<String, session_card::SessionDiffTotals>,
     context_sources: Option<session_card::ContextSources>,
     context_sources_task: Option<Task<()>>,
     context_sources_pending: Option<String>,
@@ -559,6 +565,9 @@ impl DetailsSidebar {
             session_diff: None,
             session_diff_watch: None,
             session_diff_key: None,
+            worked_diff_key: None,
+            worked_diff_watch: None,
+            worked_diffs: HashMap::new(),
             context_sources: None,
             context_sources_task: None,
             context_sources_pending: None,
@@ -3050,6 +3059,7 @@ impl DetailsSidebar {
 
     fn render_details(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let Some(context) = self.sidebar.context().cloned() else {
+            self.ensure_worked_project_diff_watch(Vec::new(), cx);
             return div()
                 .p(px(16.0))
                 .text_color(theme.text_muted)
@@ -3085,14 +3095,25 @@ impl DetailsSidebar {
         let mut workspace_body = div();
         let mut workspace_extra = false;
 
-        if context.mode == super::context::DetailsMode::Orchestrator {
+        let worked = if context.mode == super::context::DetailsMode::Orchestrator && !hide_workspace
+        {
             let home = dirs_home();
-            let worked = self.sidebar.worked_projects(
+            self.sidebar.worked_projects(
                 &context,
                 &self.app_state.read(cx).transcript,
                 self.workers_model.read(cx).projects(),
                 home.as_deref(),
-            );
+            )
+        } else {
+            Vec::new()
+        };
+        let paths = if self.sidebar.projects_worked_collapsed() {
+            Vec::new()
+        } else {
+            worked.iter().map(|project| project.path.clone()).collect()
+        };
+        self.ensure_worked_project_diff_watch(paths, cx);
+        if context.mode == super::context::DetailsMode::Orchestrator {
             if !worked.is_empty() {
                 let collapsed = self.sidebar.projects_worked_collapsed();
                 let count = worked.len();
@@ -3155,6 +3176,7 @@ impl DetailsSidebar {
                             let path = project.path.clone();
                             div()
                                 .id(("worked-project", index))
+                                .debug_selector(move || format!("worked-project-row-{index}"))
                                 .h(px(super::worked_projects::WORKED_PROJECTS_ROW_HEIGHT))
                                 .px(px(10.0))
                                 .flex()
@@ -3188,6 +3210,17 @@ impl DetailsSidebar {
                                         .text_color(theme.text)
                                         .child(zeron_proto::view::single_line(&project.name)),
                                 )
+                                .children(self.worked_diffs.get(&project.path).filter(|diff| diff.files > 0).map(|diff| {
+                                    let additions = diff.additions;
+                                    let deletions = diff.deletions;
+                                    div().debug_selector(move || format!("worked-project-diff-{index}"))
+                                        .ml_auto().flex_none().flex().items_center().gap(px(4.0)).text_size(px(12.0))
+                                        .child(div().debug_selector(move || format!("worked-project-additions-{index}-{additions}"))
+                                            .text_color(theme.success).child(format!("+{additions}")))
+                                        .child(div().text_color(theme.text_faint).child("/"))
+                                        .child(div().debug_selector(move || format!("worked-project-deletions-{index}-{deletions}"))
+                                            .text_color(theme.danger).child(format!("−{deletions}")))
+                                }))
                         }));
 
                     worked_section = worked_section.child(
@@ -4331,3 +4364,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "worked_project_diffs_tests.rs"]
+mod worked_project_diffs_tests;
+
+#[cfg(test)]
+#[path = "worked_project_diff_lifecycle_tests.rs"]
+mod worked_project_diff_lifecycle_tests;

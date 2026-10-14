@@ -71,7 +71,9 @@ use zeron_proto::{
     ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, HarnessUpdatePolicy,
     ProjectActionDraft, Space, ToolCall, WorkspaceScope,
 };
-use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, info, methods, parse_params};
+use zeron_rpc::{
+    LinkCache, RpcError, RpcReply, RpcService, capability_errors, info, methods, parse_params,
+};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
@@ -83,6 +85,7 @@ use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, session_home_dir};
 use crate::run_journal::RunJournal;
 use crate::sessions::SessionsEngine;
+use crate::source_control::{ChangeRequestError, GitHubCli};
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
@@ -685,6 +688,7 @@ pub struct EngineRpc {
     project_actions: ProjectActionsStore,
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
+    github: GitHubCli,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -720,6 +724,7 @@ impl EngineRpc {
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
             capabilities: zeron_proto::capabilities::current(),
         };
+        let github = GitHubCli::new().with_store(repos.data_dir());
         Self {
             worker_checkouts_state: zeron_workers_unpeel::space_links::workers_state_path(),
             voice: sessions.voice_manager(),
@@ -733,6 +738,7 @@ impl EngineRpc {
             project_actions,
             previews: None,
             change_requests,
+            github,
             diff_sync,
             uploads,
             agent_accounts,
@@ -796,6 +802,12 @@ impl EngineRpc {
     /// Attach the local→synced profile importer (synced runtimes only).
     pub fn with_local_import(mut self, importer: crate::local_import::LocalImporter) -> Self {
         self.local_import = Some(importer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_github(mut self, github: GitHubCli) -> Self {
+        self.github = github;
         self
     }
 
@@ -1617,6 +1629,19 @@ fn git_rpc_error(error: crate::EngineError) -> RpcError {
     }
 }
 
+fn change_request_rpc_error(error: ChangeRequestError) -> RpcError {
+    let code = match error {
+        ChangeRequestError::CliUnavailable => capability_errors::PULL_REQUESTS_CLI_UNAVAILABLE,
+        ChangeRequestError::Authentication => capability_errors::PULL_REQUESTS_AUTHENTICATION,
+        ChangeRequestError::RateLimited => capability_errors::PULL_REQUESTS_RATE_LIMITED,
+        ChangeRequestError::Timeout => capability_errors::PULL_REQUESTS_TIMEOUT,
+        ChangeRequestError::Decode => capability_errors::PULL_REQUESTS_DECODE,
+        ChangeRequestError::RepositoryUnavailable
+        | ChangeRequestError::UnsupportedRepository
+        | ChangeRequestError::CommandFailed => capability_errors::PULL_REQUESTS_COMMAND_FAILED,
+    };
+    RpcError::Capability(code.into())
+}
 #[derive(Default)]
 pub(crate) struct Installations(
     std::sync::Mutex<std::collections::HashMap<HarnessId, zeron_harness::CancellationToken>>,
@@ -2784,37 +2809,36 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
-                // An optional `cwd` pins that checkout for the life of the
-                // stream. Entries are otherwise built from chat rows alone, so
-                // a pane opened on a checkout no chat points at (a Workers
-                // project) would wait on a diff that is never captured.
-                #[derive(Deserialize)]
+                // Both forms are additive. Keep every successful pin alive
+                // until this stream is dropped; a non-Git path is independent.
+                #[derive(Deserialize, Default)]
                 struct P {
                     #[serde(default)]
                     cwd: Option<String>,
+                    #[serde(default)]
+                    cwds: Vec<String>,
                 }
-                let cwd = parse_params::<P>(params).ok().and_then(|p| p.cwd);
-                let pin = match cwd {
-                    Some(cwd) => match self
+                let p = parse_params::<P>(params).unwrap_or_default();
+                let mut cwds = p.cwds;
+                cwds.extend(p.cwd);
+                cwds.sort();
+                cwds.dedup();
+                let mut pins = Vec::new();
+                for cwd in cwds {
+                    match self
                         .diff_sync
                         .pin_checkout(std::path::Path::new(&cwd))
                         .await
                     {
-                        Ok(pin) => Some(pin),
-                        Err(error) => {
-                            // Not a checkout (or git is unavailable): the
-                            // stream still carries every chat-backed diff.
-                            tracing::debug!(cwd = %cwd, %error, "diff watch: pin failed");
-                            None
-                        }
-                    },
-                    None => None,
-                };
+                        Ok(pin) => pins.push(pin),
+                        Err(error) => tracing::debug!(cwd = %cwd, %error, "diff watch: pin failed"),
+                    }
+                }
                 let stream = watch_stream(self.diff_sync.watch_diffs());
                 Ok(RpcReply::Stream(
                     stream
                         .map(move |value| {
-                            let _pin = &pin; // held for the stream's lifetime
+                            let _pins = &pins; // held for the stream's lifetime
                             value
                         })
                         .boxed(),
@@ -2855,7 +2879,7 @@ impl RpcService for EngineRpc {
             }
             methods::WATCH_CHECKOUT_CHANGE_REQUEST => {
                 let p: CheckoutChangeRequestParams = parse_params(params)?;
-                let cwd = self.change_request_root(&p.cwd).await?;
+                let cwd = self.authorized_checkout(&p.cwd).await?.root;
                 let stream = self
                     .change_requests
                     .watch_for_branch(&cwd, p.branch.as_deref())
@@ -2864,8 +2888,115 @@ impl RpcService for EngineRpc {
                     .filter_map(|status| async move { serde_json::to_value(status).ok() });
                 Ok(RpcReply::Stream(stream.boxed()))
             }
-            // One-shot scoped capture for the Changes pane; the scopes live in
-            // `diff_sync::DiffMode`.
+            methods::GET_CHANGE_REQUEST_REPOSITORY => {
+                #[derive(Deserialize)]
+                struct P {
+                    cwd: String,
+                    #[serde(default)]
+                    repository: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                // Only a chat or project checkout on this device: a caller
+                // never probes arbitrary directories for their remotes.
+                let cwd = self.authorized_checkout(&p.cwd).await?.root;
+                let cwd = cwd.as_path();
+                let resolver = crate::source_control::ChangeRequestResolver::new();
+                let repository = match p.repository {
+                    Some(repository) => {
+                        resolver
+                            .matching_repository_for_checkout(cwd, &repository, &self.github)
+                            .await
+                    }
+                    None => resolver.repository_for_checkout(cwd).await,
+                };
+                RpcReply::value(&repository)
+            }
+            methods::LIST_CHANGE_REQUEST_PAGE => {
+                #[derive(Deserialize)]
+                struct P {
+                    repository: String,
+                    #[serde(default)]
+                    filter: zeron_proto::ChangeRequestFilter,
+                    #[serde(default)]
+                    after: Option<String>,
+                    #[serde(default)]
+                    refresh: bool,
+                    /// Serve the first page's on-disk copy when there is one.
+                    #[serde(default)]
+                    cached: bool,
+                }
+                let p: P = parse_params(params)?;
+                if !crate::source_control::valid_pr_repository(&p.repository) {
+                    return Err(RpcError::BadParams("repository must be owner/repo".into()));
+                }
+                if p.after
+                    .as_deref()
+                    .is_some_and(|cursor| !crate::source_control::valid_page_cursor(cursor))
+                {
+                    return Err(RpcError::BadParams("invalid page cursor".into()));
+                }
+                let page = self
+                    .github
+                    .list_page(
+                        &p.repository,
+                        p.filter,
+                        p.after.as_deref(),
+                        p.refresh,
+                        p.cached,
+                    )
+                    .await
+                    .map_err(change_request_rpc_error)?;
+                RpcReply::value(&page)
+            }
+            methods::POST_CHANGE_REQUEST_COMMENT => {
+                #[derive(Deserialize)]
+                struct P {
+                    url: String,
+                    body: String,
+                }
+                let p: P = parse_params(params)?;
+                if p.body.trim().is_empty() || p.body.len() > 60_000 {
+                    return Err(RpcError::BadParams(
+                        "Comment must contain 1–60000 bytes".into(),
+                    ));
+                }
+                let comment = self
+                    .github
+                    .post_comment(&p.url, &p.body)
+                    .await
+                    .map_err(change_request_rpc_error)?;
+                RpcReply::value(&comment)
+            }
+            methods::GET_CHANGE_REQUEST | methods::GET_CHANGE_REQUEST_DIFF => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    url: String,
+                    #[serde(default)]
+                    refresh: bool,
+                    #[serde(default)]
+                    head_ref_oid: Option<String>,
+                    #[serde(default)]
+                    base_ref_oid: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                let value = self
+                    .github
+                    .detail_request(
+                        &p.url,
+                        method == methods::GET_CHANGE_REQUEST_DIFF,
+                        p.refresh,
+                        p.head_ref_oid.as_deref(),
+                        p.base_ref_oid.as_deref(),
+                    )
+                    .await
+                    .map_err(change_request_rpc_error)?;
+                RpcReply::value(&value)
+            }
+            // One-shot scoped capture for the Changes pane: `branch` diffs the
+            // working tree against merge-base(baseRef, HEAD); `turn` diffs the
+            // turn-start tree snapshot against the current tree; anything else
+            // is the plain working-tree capture.
             methods::GET_CHECKOUT_DIFF => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
@@ -3312,6 +3443,28 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
+            methods::SEARCH_HOME_FOLDERS => {
+                let request: zeron_proto::SearchHomeFoldersRequest = parse_params(params)?;
+                if request.query.chars().count() > 256 {
+                    return Err(RpcError::BadParams(
+                        "SearchHomeFolders query must not exceed 256 characters".into(),
+                    ));
+                }
+                let limit = request
+                    .limit
+                    .map_or(crate::repos::HOME_FOLDER_RESULTS, usize::from)
+                    .min(crate::repos::HOME_FOLDER_MAX_RESULTS);
+                let result = self
+                    .repos
+                    .search_home_folders(request.query, limit)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&result)
+            }
+            methods::RELEASE_HOME_FOLDER_SEARCH => {
+                self.repos.release_home_folder_search();
+                RpcReply::value(&serde_json::json!({}))
+            }
             methods::LIST_DRIVES => {
                 let drives = self
                     .repos
@@ -3365,6 +3518,28 @@ impl RpcService for EngineRpc {
                 .map_err(|_| RpcError::Failed("workspace file search timed out".into()))?
                 .map_err(RpcError::from)?;
                 RpcReply::value(&matches)
+            }
+            methods::SEARCH_WORKSPACE_CONTENT => {
+                let request: zeron_proto::SearchWorkspaceContentRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.search_content(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace content search timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
+            }
+            methods::WARM_WORKSPACE_SEARCH => {
+                let request: zeron_proto::WarmWorkspaceSearchRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.warm_search(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace search warm-up timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
             }
             methods::READ_WORKSPACE_IMAGE => {
                 let request: zeron_proto::ReadWorkspaceImageRequest = parse_params(params)?;
@@ -3845,6 +4020,97 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checkout_diff_watch_pins_multiple_paths_and_releases_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let mut paths = Vec::new();
+        let mut canonical_paths = Vec::new();
+        for name in ["first", "second"] {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::write(path.join("new.txt"), "new line\n").unwrap();
+            paths.push(path.to_string_lossy().into_owned());
+            // CheckoutDiff publishes the canonical Git root. On macOS,
+            // tempfile may return /var/... while canonicalization resolves to
+            // /private/var/..., so keep request paths and expected paths apart.
+            canonical_paths.push(
+                std::fs::canonicalize(&path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        let plain = temp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        core.diff_sync.shutdown().await;
+        let sync = crate::diff_sync::CheckoutDiffSync::start_with_orphan_grace(
+            core.repos.clone(),
+            core.workspace.clone(),
+            &core.device_id,
+            None,
+            std::time::Duration::from_millis(20),
+        );
+        let mut rpc = core.rpc_service();
+        Arc::get_mut(&mut rpc).unwrap().diff_sync = sync.clone();
+        let reply = rpc
+            .handle(
+                methods::WATCH_CHECKOUT_DIFFS,
+                serde_json::json!({"cwd": paths[0], "cwds": [paths[1], plain, paths[1]]}),
+            )
+            .await
+            .unwrap();
+        let RpcReply::Stream(mut stream) = reply else {
+            panic!("expected stream")
+        };
+        let mut seen = std::collections::HashSet::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while seen.len() < 2 {
+                let frame = stream.next().await.unwrap();
+                let diffs: Vec<zeron_proto::CheckoutDiff> = serde_json::from_value(frame).unwrap();
+                for diff in diffs {
+                    if canonical_paths.contains(&diff.cwd) {
+                        seen.insert(diff.cwd);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("both orphan checkouts must be captured by one stream");
+        sync.reconcile_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        sync.reconcile_now().await;
+        assert_eq!(
+            sync.watch_diffs().borrow().len(),
+            2,
+            "both pins survive reconcile beyond orphan grace"
+        );
+        drop(stream);
+        sync.reconcile_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        sync.reconcile_now().await;
+        assert!(
+            sync.watch_diffs().borrow().is_empty(),
+            "dropping the stream releases every pin; orphan diffs retire"
+        );
+        sync.shutdown().await;
+        core.sessions.shutdown().await;
+    }
 
     #[tokio::test]
     async fn voice_owner_is_shared_across_services_and_shutdown_retires_it() {
@@ -4436,6 +4702,20 @@ mod tests {
         assert!(info(methods::WATCH_HARNESS_UPDATES).unwrap().stream);
         assert!(is_forwardable(methods::CHECK_HARNESS_UPDATES));
         assert!(is_forwardable(methods::APPLY_HARNESS_UPDATE));
+        for method in [
+            methods::SEARCH_HOME_FOLDERS,
+            methods::RELEASE_HOME_FOLDER_SEARCH,
+            methods::WARM_WORKSPACE_SEARCH,
+            methods::SEARCH_WORKSPACE_CONTENT,
+            methods::LIST_CHANGE_REQUEST_PAGE,
+            methods::GET_CHANGE_REQUEST_REPOSITORY,
+            methods::GET_CHANGE_REQUEST,
+            methods::GET_CHANGE_REQUEST_DIFF,
+            methods::POST_CHANGE_REQUEST_COMMENT,
+        ] {
+            assert!(is_forwardable(method), "{method} must be relay-forwardable");
+            assert!(!stream(method), "{method} is unary");
+        }
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —
@@ -4458,6 +4738,10 @@ mod tests {
         );
         assert_eq!(deadline(methods::CLONE_REPO), Duration::from_secs(15 * 60));
         assert_eq!(deadline(methods::LIST_BRANCHES), Duration::from_secs(30));
+        assert_eq!(
+            deadline(methods::LIST_CHANGE_REQUEST_PAGE),
+            Duration::from_secs(30)
+        );
         assert_eq!(deadline(methods::QUEUE_COMMAND), Duration::from_secs(30));
         assert_eq!(deadline(methods::FETCH_TOOL_INPUT), Duration::from_secs(20));
         assert_eq!(
@@ -4500,6 +4784,41 @@ mod tests {
             FILE_TOOL_INPUT_RESPONSE_MAX_BYTES - FILE_TOOL_INPUT_ENVELOPE_RESERVE + envelope
                 <= FILE_TOOL_INPUT_RESPONSE_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn pull_request_errors_are_stable_and_sanitized() {
+        for (error, expected) in [
+            (
+                ChangeRequestError::CliUnavailable,
+                capability_errors::PULL_REQUESTS_CLI_UNAVAILABLE,
+            ),
+            (
+                ChangeRequestError::Authentication,
+                capability_errors::PULL_REQUESTS_AUTHENTICATION,
+            ),
+            (
+                ChangeRequestError::RateLimited,
+                capability_errors::PULL_REQUESTS_RATE_LIMITED,
+            ),
+            (
+                ChangeRequestError::Timeout,
+                capability_errors::PULL_REQUESTS_TIMEOUT,
+            ),
+            (
+                ChangeRequestError::Decode,
+                capability_errors::PULL_REQUESTS_DECODE,
+            ),
+            (
+                ChangeRequestError::CommandFailed,
+                capability_errors::PULL_REQUESTS_COMMAND_FAILED,
+            ),
+        ] {
+            assert!(matches!(
+                change_request_rpc_error(error),
+                RpcError::Capability(code) if code == expected
+            ));
+        }
     }
 
     #[test]

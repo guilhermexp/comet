@@ -45,14 +45,14 @@ local OAuth credential through snapshots or sync.
 - Unit co-located (`mod tests`) em toda crate; integration e e2e em `crates/*/tests/`.
 - Edge: vitest (`npm -C edge run test`) + `typecheck` obrigatório.
 - Convergência Rust↔edge se prova em `crates/sync/tests/registry_edge.rs`.
-- **Render gpui não tem harness**: mudança visual se valida rodando `scripts/dev-demo.sh` e olhando a tela. Suite verde não é evidência de UI correta.
+- Os testes gpui existentes cobrem layout e interação em harness; suite verde sozinha não prova a aparência nem os caminhos AppKit. QA nativo por lançamento de uma cópia do app está indisponível até existir isolamento comprovado das configurações de todos os providers, conforme `scripts/AGENTS.md`; registrar a observação visual como `notProven` e não repetir o lançamento. `ZERON_DATA_DIR`, IPC, `UNPEEL_HOME` e roots privados de assets de hooks não redirecionam configurações reais dos providers; backups e digest checks não são isolamento. O incidente de 2026-10-11 expôs Claude/Codex/Cursor/Gemini/Kiro/KimiCode: os recibos comprovam restauração exata de três arquivos capturados e reparos semânticos de caminhos de QA em sete configurações adicionais, não restauração exata de todas. Processos, registro do bundle e cópia/perfil de QA já foram encerrados/removidos; a recuperação não torna a receita segura.
 - O tier exigido por camada é o da **Test Coverage Matrix** do `AGENTS.md` da subárvore tocada — cada `Scenario` carimba `Test:` a partir dela.
 
 ### Git Workflow
 
 - Branch `main`; `origin` = fork `guilhermexp/comet`; `upstream` = `zeronsh/comet`.
 - **Nunca pushar pro upstream.** `gh` precisa de `-R guilhermexp/comet` (o default resolve pro upstream).
-- Push passa pelo gate `no-mistakes` (`git push no-mistakes <branch>`).
+- Mudanças pequenas/localizadas podem ir direto à `main`, conforme `CLAUDE.md`; `no-mistakes` fica para mudanças grandes ou pedido explícito. Status do gate é consultado no checkout principal.
 - Tag `v*` dispara release no R2; push na `main` tocando `edge/` dispara deploy do Worker. Ambos herdados do upstream — não disparar sem intenção.
 
 ## Domain Context

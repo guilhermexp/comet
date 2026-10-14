@@ -36,7 +36,7 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 
 Para baterias pesadas, prefira o CI existente e confira revisão, plataforma, jobs e etapas realmente executados conforme a skill `implement` do harness. Considere também a compilação: mesmo um filtro de `cargo test -p zeron-ui` pode criar gigabytes de dependências. Checks locais baratos e validação nativa específica continuam úteis; quando Cargo local for necessário, use a proteção abaixo. No `no-mistakes`, `test` é validação focada da mudança/uso real; a regressão ampla fica no CI. Não repetir a bateria local apenas para espelhar CI nem dispensar etapas genericamente.
 
-Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml` contém jobs Linux, macOS e iOS; `preview-tests.yml` testa networking em Linux/macOS e coordinator em Linux. Isso descreve a receita, não garante sucesso: confira os logs da revisão avaliada. Linux não cobre o teste AppKit `native_preview_focus`, que requer sessão gráfica macOS, nem substitui outros caminhos macOS/iOS exigidos pela entrega.
+Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml` contém jobs Linux, macOS e iOS; `preview-tests.yml` testa networking em Linux/macOS e coordinator em Linux. Isso descreve a receita, não garante sucesso: confira os logs da revisão avaliada. O job nativo macOS tem orçamento de 90 minutos para compilações release frias e fixtures; os limites curtos de execução das regressões continuam separados. Linux não cobre o teste AppKit `native_preview_focus`, que requer sessão gráfica macOS, nem substitui outros caminhos macOS/iOS exigidos pela entrega.
 
 ## Remotes e publicação
 
