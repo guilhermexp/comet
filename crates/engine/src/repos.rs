@@ -1890,10 +1890,8 @@ impl Repos {
         let base_ref = base_ref.to_owned();
         let worker = tokio::task::spawn_blocking(move || {
             let canonical_repo = std::fs::canonicalize(&repo)?;
-            let repo_name = canonical_repo.file_name().unwrap_or_default();
             if let Ok(canonical_root) = std::fs::canonicalize(&root)
-                && (canonical_root.starts_with(&canonical_repo)
-                    || canonical_root.join(repo_name).starts_with(&canonical_repo))
+                && canonical_root.starts_with(&canonical_repo)
             {
                 return Err(EngineError::Other(format!(
                     "Worktrees would be created inside the repository at {}. Choose a different worktree location in Settings.",
@@ -3517,12 +3515,12 @@ prunable gitdir file points to non-existent location
     }
 
     #[tokio::test]
-    async fn worktree_location_containing_the_repository_is_refused() {
+    async fn worktree_location_rejects_only_nested_destinations() {
         let tmp = tempfile::tempdir().unwrap();
         let code = tmp.path().join("code");
         let repo = code.join("comet");
         std::fs::create_dir_all(&repo).unwrap();
-        let repos = Repos::with_worktrees_root(&tmp.path().join("data"), "test", code.clone());
+        let repos = Repos::with_worktrees_root(&tmp.path().join("data"), "test", repo.clone());
         repos
             .git(&["init", "-b", "main"], Some(&repo))
             .await
@@ -3568,6 +3566,22 @@ prunable gitdir file points to non-existent location
         )
         .unwrap();
         assert!(Path::new(&worktree.path).starts_with(expected));
+
+        // The common service hashes the repository directory, so an ancestor
+        // root is safe: unlike the upstream basename layout it does not nest.
+        let parent = Repos::with_worktrees_root(&tmp.path().join("data3"), "test", code.clone());
+        let worktree = parent.create_worktree(&repo, "main").await.unwrap();
+        let expected =
+            zeron_workers_unpeel::worktree_ownership::repository_worktrees_dir(&code, &repo)
+                .unwrap();
+        let checkout = Path::new(&worktree.path);
+        assert!(checkout.starts_with(expected));
+        assert!(!checkout.starts_with(&repo));
+        let (registered, _) = parent
+            .resolve_checkout(&repo, checkout, CheckoutQuery::Registration)
+            .await
+            .unwrap();
+        assert_eq!(registered, checkout);
     }
 
     async fn common_worktree_fixture(hook_exit: u8) -> (tempfile::TempDir, Repos, PathBuf) {
