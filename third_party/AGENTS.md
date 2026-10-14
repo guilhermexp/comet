@@ -94,6 +94,15 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   Start/`UserPromptSubmit`, marker de input do controller, Stop, ou o teto
   `HOOK_IDLE_TIMEOUT` (crescimento não rearma). Evento latch-only não avança
   `last_hook_at`.
+  `report_state_for_settled_interrupt` (patch local) só muda o estado
+  reportado: `Busy` vira `Idle` quando o host viu a interrupção assentada do
+  turno atual (a row mais nova `■ Conversation interrupted` com sufixo
+  conhecido do CLI, composer abaixo inclusive draft, sem user row já enviada
+  e sem footer de trabalho). Não escreve
+  `stopped_at`. O scan do host grava `turn_settled_by_interrupt` junto de
+  `menu_prompt_active`; o footer de revisão de hooks é o terceiro par do
+  detector, mais a linha inteira `t trust · esc back` no detalhe. O pré-scan
+  desse footer no iOS vendorizado separa o caractere LF ou o caractere CRLF e corta os mesmos cinco bytes, sem U+000B.
   `ResumeAdapter::embedded_conversation_id` (patch local, um
   callback por runtime) expõe o id de conversa que o comando já fixa, para a
   sonda de retomada do Comet não depender de comparar receitas.

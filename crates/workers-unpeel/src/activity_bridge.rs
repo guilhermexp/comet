@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
-use upstream_activity::{ActivityEngine, HookState};
+use upstream_activity::{ActivityEngine, HookState, report_state_for_settled_interrupt};
 
 use crate::WorkersSession;
 
@@ -128,6 +128,7 @@ impl ActivityBridge {
                     command: &manifest.session.command,
                     active_runtime_id: session.active_runtime_id.as_deref(),
                     menu_prompt_active: manifest.menu_prompt_active,
+                    turn_settled_by_interrupt: manifest.turn_settled_by_interrupt,
                     runtime_launch_generation: manifest.runtime_launch_generation,
                     runtime_launched_at: manifest.runtime_launched_at,
                     activity_signal: manifest.screen_changed_at.unwrap_or_else(|| {
@@ -281,6 +282,9 @@ struct ActivityInput<'a> {
     command: &'a str,
     active_runtime_id: Option<&'a str>,
     menu_prompt_active: bool,
+    /// Current viewport shows a settled Codex interrupt. Report-only: it must
+    /// not confirm a Stop.
+    turn_settled_by_interrupt: bool,
     runtime_launch_generation: u64,
     runtime_launched_at: Option<u64>,
     activity_signal: u64,
@@ -340,9 +344,12 @@ fn derive_activity(
         distrust_stops,
         now,
     );
-    let state = engine
-        .hook_owned_state(input.session_id)
-        .unwrap_or(HookState::Idle);
+    let state = report_state_for_settled_interrupt(
+        engine
+            .hook_owned_state(input.session_id)
+            .unwrap_or(HookState::Idle),
+        input.turn_settled_by_interrupt,
+    );
 
     if input.menu_prompt_active && matches!(state, HookState::Busy | HookState::Idle) {
         return Some("blocked");
@@ -710,6 +717,10 @@ mod tests {
     use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
 
+    mod pause_hook_wait {
+        include!("activity_bridge_pause_hook_wait.rs");
+    }
+
     #[test]
     fn registering_seventeenth_listener_preserves_older_listeners() {
         let dir = std::env::temp_dir().join(format!(
@@ -815,6 +826,7 @@ mod tests {
             command,
             active_runtime_id: None,
             menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
             runtime_launch_generation: 1,
             runtime_launched_at: None,
             activity_signal: signal,
@@ -954,6 +966,7 @@ mod tests {
             browser_client_registered: false,
             computer_client_registered: false,
             menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
             screen_changed_at: None,
             detected_local_urls: Vec::new(),
             heartbeat_at: 1,
@@ -1082,19 +1095,52 @@ mod tests {
             while !thread_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // The listener is nonblocking, and macOS inherits that
+                        // on the accepted socket. One read can return before
+                        // curl finishes the request line.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("hook endpoint waits for the request line");
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .expect("set notifier read timeout");
-                        let mut request = [0u8; 4096];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let line = String::from_utf8_lossy(&request[..read])
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let line_end = loop {
+                            if let Some(position) =
+                                request.windows(2).position(|window| window == b"\r\n")
+                            {
+                                break Some(position);
+                            }
+                            if request.len() > 8192 {
+                                break None;
+                            }
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break None,
+                                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::WouldBlock
+                                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    break None;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(_) => break None,
+                            }
+                        };
+                        let Some(line_end) = line_end else {
+                            continue;
+                        };
+                        let line = String::from_utf8_lossy(&request[..line_end])
                             .split_whitespace()
                             .nth(1)
                             .unwrap_or_default()
                             .to_owned();
+                        // The installed app probes new loopback listeners with
+                        // `HEAD /`. Only hook deliveries are asserted below.
+                        if !line.starts_with("/hook/") {
+                            continue;
+                        }
                         thread_requests.lock().unwrap().push(line.clone());
                         let status = if line.ends_with("?validate=1") {
                             validation_status
@@ -1143,7 +1189,8 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let mut responses = Vec::new();
-            for _ in 0..2 {
+            let mut hook_requests = 0;
+            while hook_requests < 2 {
                 let (mut stream, _) = listener.accept().expect("accept delayed request");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1159,6 +1206,23 @@ mod tests {
                     }
                 };
                 let headers = String::from_utf8_lossy(&request[..header_end]);
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default();
+                // The installed app probes new loopback listeners with `HEAD /`.
+                // Only the two hook deliveries decide response order.
+                if !path.starts_with("/hook/") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
+                hook_requests += 1;
                 let content_length = headers
                     .lines()
                     .find_map(|line| {

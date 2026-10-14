@@ -429,6 +429,22 @@ apps/zeron (host-mode dispatch at startup).
   `PermissionRequest` em `ui_prompt_start` e `UserPromptSubmit` em
   `ui_prompt_end` (nunca `Stop` no fim do prompt).
   `derive_activity` projeta isso como `blocked` sem `menu_prompt_active`.
+  O footer de revisão de hooks do Codex (`enter review`/`trust all` com
+  `esc close`, e a linha inteira `t trust · esc back` no detalhe) é menu em
+  `viewport_has_menu_prompt` e também vira `blocked`. No pré-scan Swift a
+  linha quebra no caractere LF ou no caractere CRLF, também no meio do
+  viewport. Das bordas saem 0x09, 0x0A, 0x0C, 0x0D e 0x20. Tab vertical e CR
+  isolado não contam. Citação, sufixo, prefixo, o rótulo `Trust` e a palavra trust em
+  prosa não bloqueiam. A row `■ Conversation interrupted` do turno atual, só com sufixo
+  conhecido do CLI (nenhum, ou `- use /feedback if something went wrong`), o
+  composer abaixo (vazio, placeholder ou draft ainda não enviado) e sem footer
+  de trabalho nem user row já enviada, grava `turn_settled_by_interrupt`. A row
+  mais nova com sufixo desconhecido não cai para uma row antiga. Uma única
+  `› texto` não é Enter; a user row enviada é uma row de prompt anterior ainda
+  abaixo da interrupção, com o composer de volta. `report_state_for_settled_interrupt`
+  só degrada `Busy` reportado para `Idle`: não confirma `Stop`. Footer de
+  trabalho rearma. `wait_for_status` de `completed`/`exited`
+  solta no mesmo tick com `needs_input` quando a atividade é `blocked`.
   `parent_notifications` emite `WaitingForInput` uma vez por episódio de
   bloqueio, chaveado pela sequência do último `Start`/`UserPromptSubmit`,
   não por cada `PermissionRequest`; `unread` no snapshot é overlay das

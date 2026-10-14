@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "7c917b141d5180d29e29b0c609e6d734ed8704f9"
+vendored_tree = "903ee42e98607a17c632938bdcadfef9793e8fc2"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -116,6 +116,23 @@ base_revision_resolves_upstream = false
 # HOOK_IDLE_TIMEOUT sem rearmar por crescimento; last_hook_at não avança em
 # latch-only; transcript omp casa stem exato no diretório da sessão (sem walk
 # global nem starts_with lexical). Same-commit local form; no upstream patch.
+
+# 2026-10-13 — Codex pause and hook-review wait. menu_prompt.rs recognizes
+# the hook-review list footer. The inner detail footer matches only when the
+# whole line, after ASCII edge whitespace, is `t trust · esc back`.
+# The scan stops at the newest
+# interrupt-shaped row; an unknown suffix does not fall through to an older
+# known row. The bottom prompt row is the composer, draft included. An earlier
+# prompt row below that interrupt is a sent user row and is not settled.
+# session_host edge-writes turn_settled_by_interrupt beside menu_prompt_active;
+# activity.rs report_state_for_settled_interrupt drops a Busy spinner to Idle
+# without confirming Stop. The iOS detail-footer pre-scan splits on the LF
+# character or the CRLF character, including a footer between other lines.
+# `"\r\n"` is one Character. It trims 0x09, 0x0A, 0x0C, 0x0D and 0x20. It
+# does not trim U+000B and does not split on a lone CR. That is not a claim
+# that the rest of the Swift scan matches Rust. Local patch only. `vendored_tree` is the
+# git tree of `third_party/unpeel` after this patch, not an upstream commit.
+# `local_modifications_count` stays 32: the tool that produced it is unknown.
 
 # 2026-10-09 — OMP child-agent classification decides from the parent side:
 # `<dirname(child)>.jsonl` must be a trusted JSONL under the OMP sessions root,

@@ -2755,10 +2755,10 @@ final class RemoteGhosttyRenderer: ObservableObject {
     @Published private(set) var menuOptionCount = 0
 
     /// Footer phrases a select menu prints to advertise its keys. Detection
-    /// requires a marker pair on the same or adjacent rows — nav + select, or
-    /// confirm + cancel — so ordinary transcript prose mentioning "select"
-    /// can't trip it. Kept in sync with the host-side twin
-    /// (`crates/unpeel-core/src/menu_prompt.rs`).
+    /// requires a marker pair on the same or adjacent rows — nav + select,
+    /// confirm + cancel, or hook-review action + dismiss — so ordinary
+    /// transcript prose mentioning "select" can't trip it. Kept in sync with
+    /// the host-side twin (`crates/unpeel-core/src/menu_prompt.rs`).
     private static let menuNavMarkers = ["to navigate", "↑/↓", "↑ ↓", "▲/▼", "arrow keys"]
     private static let menuSelectMarkers = [
         "to select", "to confirm", "to choose", "enter to", "esc to cancel", "return to",
@@ -2769,6 +2769,15 @@ final class RemoteGhosttyRenderer: ObservableObject {
     private static let menuConfirmMarkers = ["enter to confirm", "return to confirm"]
     /// Cancel-key phrases paired with `menuConfirmMarkers`.
     private static let menuCancelMarkers = ["esc to cancel", "escape to cancel"]
+    /// Hook-review action phrases. Paired with `menuReviewDismissMarkers`.
+    /// Kept in sync with `REVIEW_ACTION_MARKERS` in `menu_prompt.rs`.
+    private static let menuReviewActionMarkers = ["enter review", "trust all"]
+    /// Dismiss phrases paired with `menuReviewActionMarkers`.
+    private static let menuReviewDismissMarkers = ["esc close", "escape to close"]
+    /// Inner hook-review footer. A line equals this phrase only after the
+    /// bytes 0x09, 0x0A, 0x0C, 0x0D and 0x20 are removed from both ends.
+    /// Vertical tab 0x0B stays. Same phrase as `REVIEW_DETAIL_FOOTER`.
+    private static let hookReviewDetailFooter = "t trust · esc back"
     /// Phrases marking a hint row as a passive status footer, not an
     /// answerable menu — Claude Code's subagent list pins
     /// "↑/↓ to select · Enter to view" for the whole run.
@@ -2812,12 +2821,19 @@ final class RemoteGhosttyRenderer: ObservableObject {
 
     /// True when the viewport text contains a select-menu footer on the same
     /// or adjacent rows (menu footers are one hint line, two when wrapped),
-    /// excluding passive status footers whose Enter action is "view". Two
+    /// excluding passive status footers whose Enter action is "view". Three
     /// footer shapes qualify: a nav hint plus a select hint (Claude-style),
-    /// or a confirm key named next to a cancel key (Codex-style, which
-    /// prints no nav hint). Twin of the Rust `viewport_has_menu_prompt` in
-    /// `menu_prompt.rs` — keep aligned.
+    /// a confirm key named next to a cancel key (Codex-style, which prints
+    /// no nav hint), or a hook-review action next to its dismiss key. The
+    /// hook-detail footer is a whole line, checked before this window scan.
+    /// The separator is the LF character or the CRLF character. `"\r\n"` is
+    /// one Character, so a split on `"\n"` alone leaves a CRLF row intact.
+    /// An isolated CR is not a separator, and neither is vertical tab. The
+    /// window scan under this check is unchanged.
     static func viewportHasMenuPrompt(_ text: String) -> Bool {
+        if text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }).contains(where: lineIsHookReviewDetailFooter) {
+            return true
+        }
         let lines = text
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { $0.lowercased() }
@@ -2835,10 +2851,54 @@ final class RemoteGhosttyRenderer: ObservableObject {
             let hasSelect = menuSelectMarkers.contains { window.contains($0) }
             let hasConfirm = menuConfirmMarkers.contains { window.contains($0) }
             let hasCancel = menuCancelMarkers.contains { window.contains($0) }
+            let hasReviewAction = menuReviewActionMarkers.contains { window.contains($0) }
+            let hasReviewDismiss = menuReviewDismissMarkers.contains { window.contains($0) }
             let passive = menuPassiveMarkers.contains { window.contains($0) }
-            if ((hasNav && hasSelect) || (hasConfirm && hasCancel)) && !passive { return true }
+            if ((hasNav && hasSelect) || (hasConfirm && hasCancel) || (hasReviewAction && hasReviewDismiss)) && !passive { return true }
         }
         return false
+    }
+
+    /// Whole line equals `hookReviewDetailFooter` after bytes 0x09, 0x0A,
+    /// 0x0C, 0x0D and 0x20 are removed from both ends. Vertical tab 0x0B is
+    /// kept. ASCII case folds A–Z only.
+    private static func lineIsHookReviewDetailFooter(_ line: Substring) -> Bool {
+        let utf8 = line.utf8
+        var start = utf8.startIndex
+        var end = utf8.endIndex
+        while start < end, isAsciiWhitespace(utf8[start]) {
+            start = utf8.index(after: start)
+        }
+        while end > start {
+            let previous = utf8.index(before: end)
+            if !isAsciiWhitespace(utf8[previous]) { break }
+            end = previous
+        }
+        let needle = hookReviewDetailFooter.utf8
+        var cursor = start
+        var needleCursor = needle.startIndex
+        while cursor < end, needleCursor < needle.endIndex {
+            if asciiLower(utf8[cursor]) != asciiLower(needle[needleCursor]) {
+                return false
+            }
+            cursor = utf8.index(after: cursor)
+            needleCursor = needle.index(after: needleCursor)
+        }
+        return cursor == end && needleCursor == needle.endIndex
+    }
+
+    private static func isAsciiWhitespace(_ byte: UInt8) -> Bool {
+        switch byte {
+        case 0x09, 0x0A, 0x0C, 0x0D, 0x20:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func asciiLower(_ byte: UInt8) -> UInt8 {
+        if byte >= 65 && byte <= 90 { return byte &+ 32 }
+        return byte
     }
 
     /// Highest leading "N." option number in the viewport (menu items look

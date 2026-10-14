@@ -1,6 +1,6 @@
 use crate::app_paths::app_sessions_root as unpeel_sessions_root;
 use crate::integrations::{self, shared};
-use crate::menu_prompt::viewport_has_menu_prompt;
+use crate::menu_prompt::{viewport_has_menu_prompt, viewport_shows_settled_interrupt};
 use crate::runtime_observer::ActiveRuntimeObservation;
 use crate::state::{current_timestamp_ms, SessionInfo};
 use crate::terminal_viewport::{TerminalViewportSnapshot, TerminalViewportState};
@@ -317,6 +317,12 @@ pub struct HostedSessionManifest {
     /// and default false.
     #[serde(default)]
     pub menu_prompt_active: bool,
+    /// True while the current viewport shows Codex's settled interrupt for
+    /// this turn: the latest `Conversation interrupted` still has the composer
+    /// prompt and no later live working footer. Report-only — it drops the
+    /// spinner without confirming Stop. Legacy manifests default false.
+    #[serde(default)]
+    pub turn_settled_by_interrupt: bool,
     /// Wall-clock ms when the parsed screen TEXT last changed, written by the
     /// same viewport scan (coalesced to at most one manifest write per ~2s).
     /// This is the "really doing something" signal: idle repaint loops that
@@ -1412,6 +1418,7 @@ fn resume_agent_in_place(
         manifest.browser_client_registered = automatic_mcp_registration.browser;
         manifest.computer_client_registered = automatic_mcp_registration.computer;
         manifest.menu_prompt_active = false;
+        manifest.turn_settled_by_interrupt = false;
     });
     // Wake/reset the observer only after the clearing manifest write. If this
     // edge came first, a fast new runtime could be observed and then erased by
@@ -4712,6 +4719,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             browser_client_registered: false,
             computer_client_registered: false,
             menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
             screen_changed_at: None,
             detected_local_urls: Vec::new(),
             heartbeat_at: current_timestamp_ms(),
@@ -5196,6 +5204,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         let screen_change_for_menu = Arc::clone(&last_screen_change_ms);
         let menu_thread = thread::spawn(move || {
             let mut last_active = false;
+            let mut last_settled = false;
             let mut url_tracker = crate::local_urls::LocalUrlTracker::default();
             let mut screen_tracker = ScreenChangeTracker::default();
             let mut ticks_since_probe: u32 = 0;
@@ -5220,10 +5229,13 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                     });
                 }
                 let active = viewport_has_menu_prompt(&screen);
-                if active != last_active {
+                let settled = viewport_shows_settled_interrupt(&screen);
+                if active != last_active || settled != last_settled {
                     last_active = active;
+                    last_settled = settled;
                     let _ = update_manifest_session(&menu_session_id, |manifest| {
                         manifest.menu_prompt_active = active;
+                        manifest.turn_settled_by_interrupt = settled;
                     });
                 }
                 let saw_new_url = url_tracker.observe_screen(&screen);
@@ -5453,6 +5465,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             manifest.runtime = None;
             manifest.runtime_launch_pending = false;
             manifest.menu_prompt_active = false;
+            manifest.turn_settled_by_interrupt = false;
             manifest.screen_changed_at = None;
             manifest.detected_local_urls.clear();
             manifest.heartbeat_at = current_timestamp_ms();
@@ -6226,6 +6239,7 @@ exit "${UNPEEL_FAKE_PROVIDER_STATUS:-0}"
             browser_client_registered: false,
             computer_client_registered: false,
             menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
             screen_changed_at: None,
             detected_local_urls: Vec::new(),
             heartbeat_at,
@@ -6339,6 +6353,7 @@ exit "${UNPEEL_FAKE_PROVIDER_STATUS:-0}"
             browser_client_registered: false,
             computer_client_registered: false,
             menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
             screen_changed_at: None,
             detected_local_urls: Vec::new(),
             heartbeat_at: 1,
