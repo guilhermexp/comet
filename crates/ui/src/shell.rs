@@ -12886,6 +12886,17 @@ impl Shell {
         // column. Size the composer from that same painted width instead of
         // jumping to the column's endpoint; takeover keeps its retained layout
         // width while the conversation is covered.
+        let details_now = if self.details_sidebar_open(cx) {
+            self.eval_tween(self.details_tween, self.details_target(cx))
+        } else {
+            0.0
+        };
+        let right_now = self.right_visible_width(cx);
+        let live_main_width = (self.viewport_width
+            - self.sidebar_now()
+            - right_columns_width(right_now > 0.0, right_now, details_now > 0.0, details_now)
+            - self.files_visible_width(cx))
+        .max(0.0);
         let composer_panel_width = if self.main_takeover_active() {
             main_content_width
         } else {

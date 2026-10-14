@@ -923,6 +923,7 @@ impl Shell {
                                 } else {
                                     "Expand panel"
                                 },
+                                expanded,
                                 &theme,
                                 cx.listener(|this, _, _, cx| {
                                     this.toggle_pull_request_pane_expand(cx)
@@ -949,6 +950,7 @@ impl Shell {
                         theme.text_muted,
                     ),
                     ShortcutId::ToggleChanges.label(),
+                    open,
                     cx.listener(|this, _, _, cx| this.toggle_pull_request_pane(cx)),
                 )
                 .debug_selector(|| "toggle-pull-request-pane".into()),
