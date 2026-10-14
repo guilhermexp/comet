@@ -2792,7 +2792,12 @@ impl DocHost {
             .await
             .map_err(|e| format!("seed checkpoint POST: {}", describe_http_error(e)))?;
         if !res.status().is_success() {
-            return Err(format!("seed checkpoint HTTP {}", res.status()));
+            // The edge names the refusal (`floor_regression`, `ahead_of_head`,
+            // `empty`, ...) in the body; a bare status hides which one.
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            let body: String = body.chars().take(200).collect();
+            return Err(format!("seed checkpoint HTTP {status}: {body}"));
         }
         // PINNED RE-CHECK before anything irreversible (review B1): if a
         // run/watcher attached during the rebuild+POST, abort — everything

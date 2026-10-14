@@ -61,10 +61,9 @@ use crate::settings::projects::{ProjectsPage, ProjectsPageEvent};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX,
-    DETAILS_SIDEBAR_MIN, FILES_PANEL_MIN, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
-    RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
-    SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, TERMINAL_MAX_VH,
-    TERMINAL_MIN_HEIGHT, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
+    DETAILS_SIDEBAR_MIN, FILES_PANEL_MIN, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_MIN,
+    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId, SidebarOrganization,
+    SidebarSort, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
     platform_combo, sidebar_pin_profile_key,
 };
 use crate::state::{
@@ -4067,7 +4066,9 @@ impl Shell {
         self.right_target_for_columns(cx, self.sidebar_target(), self.files_settled_width(cx))
     }
 
-    fn right_target_for_columns(&self, cx: &App, sidebar: f32, files: f32) -> f32 {
+    /// Upstream's signature; the fork's split sizes from the live sidebar
+    /// tween and Files' reserved width, so the column arguments go unread.
+    fn right_target_for_columns(&self, cx: &App, _sidebar: f32, _files: f32) -> f32 {
         if !self.right_pane_shown(cx) {
             0.0
         } else if self.right_pane_expanded {
@@ -4230,16 +4231,6 @@ impl Shell {
         self.schedule_save(cx);
         self.resplit_panels(before, None, cx);
         cx.notify();
-    }
-
-    /// Closing the last surface tab closes the surface host; a docked
-    /// explorer keeps the pane open on its own.
-    fn collapse_surfaces_if_empty(&mut self, panel_key: &str, cx: &mut Context<Self>) {
-        if panel_key == self.panel_key(cx)
-            && self.right_tabs.get(panel_key).is_none_or(Vec::is_empty)
-        {
-            self.set_surfaces_open(false, cx);
-        }
     }
 
     /// Show or hide the surface host portion of the right pane. A no-op when

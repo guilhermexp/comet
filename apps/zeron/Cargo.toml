@@ -71,3 +71,9 @@ tempfile.workspace = true
 
 [build-dependencies]
 embed-resource = "3.0.11"
+
+[lints.rust]
+# The unoptimized macOS binary carries >16MB of __eh_frame, so ld64 notes it
+# cannot use compact unwind for every frame. Informational only: it affects
+# panic-unwind speed in debug builds, not correctness.
+linker_messages = "allow"

@@ -13721,7 +13721,7 @@ mod tests {
     fn folding_releases_sent_turn_hold_without_removing_reservation(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         let view = cx.new(|cx| Transcript::new(state, cx));
-        view.update(cx, |view, cx| {
+        view.update(cx, |view, _cx| {
             view.rows = vec![viewport_row("prompt", "prompt")];
             view.list.reset(1);
             for reduced_motion in [false, true] {

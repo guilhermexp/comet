@@ -7,6 +7,9 @@ publish.workspace = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+# Same ld64 compact-unwind note as apps/zeron: debug test/example binaries
+# exceed 16MB of __eh_frame. Informational only.
+linker_messages = "allow"
 
 [features]
 voice-experimental = [] # Compatibility flag; native subscription voice uses Codex's packaged helper.

@@ -55,8 +55,6 @@ pub fn is_attachment_only_text(text: &str) -> bool {
     text == ATTACHMENT_ONLY_TEXT || text == FILE_ATTACHMENT_ONLY_TEXT
 }
 
-const LEGACY_ATTACHMENT_ONLY_TEXT: &str = ATTACHMENT_ONLY_TEXT;
-
 /// The placeholder body for an attachments-only send of `paths`.
 pub fn attachment_only_text(paths: &[String]) -> &'static str {
     if paths.iter().all(|path| is_image_path(path)) {

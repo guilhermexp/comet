@@ -272,7 +272,6 @@ fn stop_failure_snapshot(
                 SessionCommandPayload::Steer { .. } => "Steer",
                 SessionCommandPayload::Interrupt {} => "Interrupt",
                 SessionCommandPayload::RespondInput { .. } => "RespondInput",
-                _ => "Other",
             };
             (command.id, kind, command.status, command.resolution)
         })

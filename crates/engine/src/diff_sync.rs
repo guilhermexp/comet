@@ -2379,16 +2379,6 @@ impl DiffMode {
     }
 }
 
-/// The turn-start tree recorded for `chat_id`, rejected when it belongs to a
-/// different checkout than the one being captured.
-fn turn_tree(
-    diff_sync: &CheckoutDiffSync,
-    root: &Path,
-    chat_id: &str,
-) -> Result<String, EngineError> {
-    turn_snapshot(diff_sync, root, chat_id).map(|snapshot| snapshot.tree().to_string())
-}
-
 fn turn_snapshot(
     diff_sync: &CheckoutDiffSync,
     root: &Path,

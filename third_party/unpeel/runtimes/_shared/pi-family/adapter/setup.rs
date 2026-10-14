@@ -44,10 +44,8 @@ pub(crate) fn with_lifecycle_extension(command: &str) -> String {
         let legacy_raw = legacy_path.to_string_lossy();
         if let Some(updated) = replace_extension_argument(
             trimmed,
-            legacy_raw.as_ref(),
-            raw_path.as_ref(),
-            &quoted_path,
-        ) {
+            legacy_raw.as_ref(), &quoted_path)
+        {
             return updated;
         }
     }
@@ -159,7 +157,6 @@ fn has_extension_argument(command: &str, expected_path: &str) -> bool {
 fn replace_extension_argument(
     command: &str,
     old_path: &str,
-    new_path: &str,
     quoted_new_path: &str,
 ) -> Option<String> {
     let tokens = shell_tokens(command);
@@ -303,27 +300,27 @@ await handlers.get("agent_end")({{}}, context);
         let prompt = crate::integrations::shared::shell_quote(&format!("inspect {old_path}"));
         let command = format!("omp --extension {quoted_old} --prompt {prompt}");
 
-        let migrated = replace_extension_argument(&command, old_path, new_path, &quoted_new)
+        let migrated = replace_extension_argument(&command, old_path, &quoted_new)
             .expect("replace the exact extension option");
         assert!(has_extension_argument(&migrated, new_path));
         assert!(migrated.contains(&format!("--prompt {prompt}")));
         assert!(!has_extension_argument(&migrated, old_path));
 
         let equals = format!("omp --extension={quoted_old} --prompt {prompt}");
-        let migrated_equals = replace_extension_argument(&equals, old_path, new_path, &quoted_new)
+        let migrated_equals = replace_extension_argument(&equals, old_path, &quoted_new)
             .expect("replace an equals-form extension option");
         assert!(has_extension_argument(&migrated_equals, new_path));
         assert!(migrated_equals.contains(&format!("--prompt {prompt}")));
 
         let backup = format!("omp --extension {old_path}.backup --prompt {prompt}");
-        assert!(replace_extension_argument(&backup, old_path, new_path, &quoted_new).is_none());
+        assert!(replace_extension_argument(&backup, old_path, &quoted_new).is_none());
         assert!(!has_extension_argument(
             &format!("omp --prompt {prompt}"),
             old_path
         ));
 
         let positional = format!("omp --prompt inspect -- --extension {quoted_old}");
-        assert!(replace_extension_argument(&positional, old_path, new_path, &quoted_new).is_none());
+        assert!(replace_extension_argument(&positional, old_path, &quoted_new).is_none());
         assert!(!has_extension_argument(&positional, old_path));
         let appended = with_lifecycle_extension(&positional);
         let current_path = lifecycle_extension_path();

@@ -102,7 +102,6 @@ impl Panel {
 struct Frame {
     // Sidebar, Files, surface host, visible conversation.
     widths: [f32; 4],
-    columns: [Option<Bounds<Pixels>>; 4],
     composer: Bounds<Pixels>,
     strip: Option<Bounds<Pixels>>,
 }
@@ -123,7 +122,6 @@ fn draw(shell: &Entity<Shell>, cx: &mut VisualTestContext, millis: u64) -> Frame
     .map(|id| cx.debug_bounds(id));
     Frame {
         widths: columns.map(|bounds| bounds.map_or(0.0, |b| f32::from(b.size.width))),
-        columns,
         composer: shell.read_with(cx, |s, cx| {
             s.composer.read(cx).surface_bounds().get().unwrap()
         }),

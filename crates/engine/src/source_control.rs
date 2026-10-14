@@ -4160,7 +4160,14 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             ],
         );
         assert!(
-            Path::new(&default_worktree.path).starts_with(temp.path().join("default-worktrees"))
+            Path::new(&default_worktree.path).starts_with(
+                temp.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("default-worktrees")
+            ),
+            "default worktree landed at {}",
+            default_worktree.path
         );
         assert_eq!(
             repos

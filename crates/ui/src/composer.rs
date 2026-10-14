@@ -969,23 +969,6 @@ fn restore_failed_attachment_mentions(
     restored_text
 }
 
-fn remove_staged_attachment(
-    attachments: &mut HashMap<String, Vec<StagedAttachment>>,
-    key: &str,
-    id: &str,
-) -> bool {
-    let Some(list) = attachments.get_mut(key) else {
-        return false;
-    };
-    let before = list.len();
-    list.retain(|attachment| attachment.id != id);
-    let removed = list.len() != before;
-    if list.is_empty() {
-        attachments.remove(key);
-    }
-    removed
-}
-
 #[derive(Debug, Clone, PartialEq)]
 struct StagedTextChip {
     title: String,
@@ -7381,9 +7364,10 @@ impl Composer {
                 && let Some(first) = staged.first()
                 && let Some(image) = first.image()
             {
-                composer.preview = first
-                    .image()
-                    .map(|image| attachments::PreviewImage::new(first.name.clone(), image.clone()));
+                composer.preview = Some(attachments::PreviewImage::new(
+                    first.name.clone(),
+                    image.clone(),
+                ));
                 composer.preview_focus_pending = true;
             }
             if !staged.is_empty() {
@@ -13798,22 +13782,6 @@ mod tests {
 
         assert_eq!(format_attachment_size(999), "999 B");
         assert_eq!(format_attachment_size(1_048_576), "1.0 MB");
-    }
-
-    #[test]
-    fn removing_one_staged_chip_preserves_its_sibling_and_other_chat() {
-        let first = attachments::stage_text_file("first.txt".into(), vec![1], "first".into());
-        let second = attachments::stage_text_file("second.txt".into(), vec![2], "second".into());
-        let other = attachments::stage_text_file("other.txt".into(), vec![3], "other".into());
-        let mut by_chat = HashMap::from([
-            ("chat-a".to_string(), vec![first.clone(), second.clone()]),
-            ("chat-b".to_string(), vec![other.clone()]),
-        ]);
-
-        assert!(remove_staged_attachment(&mut by_chat, "chat-a", &first.id));
-        assert_eq!(by_chat["chat-a"].len(), 1);
-        assert_eq!(by_chat["chat-a"][0].id, second.id);
-        assert_eq!(by_chat["chat-b"][0].id, other.id);
     }
 
     #[test]
