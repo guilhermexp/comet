@@ -282,11 +282,29 @@ verification:
   exit: 0
   observed: Scripts syntax and plists0, fork version0.2.18/refused workflow absence checked; not macOS
     runtime proof.
+- command: Main review-pair eefb5e02..de81246b and b0c76e48..811ca8bc
+  result: passed-after-repair
+  observed: CodeRabbit raised 6 minors, all in code kept byte-identical to upstream 75b72602; recorded,
+    not fixed here. OpenQodex on the post-merge repairs found that 074c53ef deleted the
+    worktree_settings_are_typed_forwardable_unary_methods test without reason; restored in 2fdcb934 and
+    passing on agents-us.
+- command: CI 811ca8bc rust workspace; agents-us cargo test --workspace --no-fail-fast
+  result: passed-after-repair
+  observed: The only failure was the fork test spawn_chat projectless_parent_spawns_a_projectless_child,
+    which still expected the literal ~ after upstream 876 gave projectless chats their own scratch cwd.
+    The child keeps inheriting the parent's location; assertion updated in 0e4237d0 and passing.
+    The ticket gate ran engine --lib only and missed it.
+- command: CI 0e4237d0
+  revision: 0e4237d00d33d372f2bbd734c94990dd9815a8aa
+  result: passed
+  observed: test, ui-tests, core, iOS, Linux browser, macOS frame recovery and voice jobs passed; coordinator
+    (edge device-nudges 5s timeout, edge untouched by this sync) passed on rerun; Windows native-platform
+    still fails on the preexisting unpeel-core Unix-only APIs.
+  url: https://github.com/guilhermexp/comet/pull/23/checks
 limits:
 - No app build, packaging/install or native visual AppKit/focus/clipping/AutoFill/cloud-placeholder/iOS
   runtime proof.
-- No remote CI/workflow/deploy/PR/main integration or publication; inherited live-provider/private-snapshot/npm-install/live-edge
-  ignored scenarios not executed.
+- No deploy; inherited live-provider/private-snapshot/npm-install/live-edge ignored scenarios not executed.
 - Windows-specific two-step/long-file behavior intentionally refused; no native Windows execution.
 - Graft command/index unavailable; exact Git incoming/stage spans used and context graph not refreshed.
 references:
@@ -296,14 +314,14 @@ references:
 - https://github.com/guilhermexp/comet/pull/23
 - .tmp/verify/WT-20261014-comet-integra-upstream-v0-2-112-pr-23-preservando-contratos/report.md
 - .tmp/verify/WT-20261014-comet-integra-upstream-v0-2-112-pr-23-preservando-contratos/gate.log
-outcome: prepared
+outcome: integrated
 pending:
-- Main publishes local commits and merges PR23; final integration SHA/delivery updated by Main.
+- Package/install macOS and native visual QA remain at the owner's request.
 delivery:
-  integration: pending
+  integration: merged
   target_branch: main
-  commit: null
+  commit: e84a65f36b5af09538d75dbc4036b86c460c0bc0
   pr: https://github.com/guilhermexp/comet/pull/23
   publication: not_requested
-  record_pushed: false
+  record_pushed: true
   deploy: not_requested
