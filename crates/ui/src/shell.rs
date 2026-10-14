@@ -10813,10 +10813,21 @@ impl Shell {
                         None => sidebar_faded_label(
                             format!("chat-title-{content_id}").into(),
                             true,
-                            div()
-                                .text_size(px(13.0))
-                                .line_height(px(17.0))
-                                .child(popover::search_highlight(title, search_query, theme)),
+                            div().text_size(px(13.0)).line_height(px(17.0)).child(
+                                // Mention links in a title render as the
+                                // composer's chips, not raw markdown.
+                                if search_query.is_some_and(|q| !q.trim().is_empty()) {
+                                    popover::search_highlight(
+                                        crate::composer::title_mention_plain(&title).into(),
+                                        search_query,
+                                        theme,
+                                    )
+                                } else {
+                                    let (display, spans) =
+                                        crate::composer::title_mention_display(&title);
+                                    crate::composer::chip_text(display.into(), spans, theme)
+                                },
+                            ),
                         )
                         .into_any_element(),
                     })

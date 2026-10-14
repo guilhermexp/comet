@@ -2264,6 +2264,61 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
     Some((projection.display, spans))
 }
 
+/// A chat title as the sidebar shows it: complete mention links become chips
+/// (`display` + `spans`, as [`sent_mention_display`]), and a link an older
+/// title cut short (`[label](zeron-…` with no `)`) keeps only its label.
+pub fn title_mention_display(raw: &str) -> (String, Vec<SentMentionSpan>) {
+    let repaired = repair_cut_mention(raw);
+    sent_mention_display(&repaired).unwrap_or_else(|| (repaired, Vec::new()))
+}
+
+/// `raw` with every mention link replaced by its label, for plain-text uses
+/// of a title (search highlighting).
+pub fn title_mention_plain(raw: &str) -> String {
+    let mut text = repair_cut_mention(raw);
+    while let Some((start, label, end)) = find_mention_link(&text, true) {
+        text.replace_range(start..end, &label);
+    }
+    text
+}
+
+fn repair_cut_mention(raw: &str) -> String {
+    let mut text = raw.to_owned();
+    while let Some((start, label, end)) = find_mention_link(&text, false) {
+        text.replace_range(start..end, &label);
+    }
+    text
+}
+
+/// The first mention link in `text` as `(start, label, end)`: a complete one
+/// (`[label](zeron-…)`) when `complete`, otherwise one cut before its `)`.
+fn find_mention_link(text: &str, complete: bool) -> Option<(usize, String, usize)> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("](zeron-") {
+        let mid = from + rel;
+        from = mid + 2;
+        let Some(start) = text[..mid].rfind('[') else {
+            continue;
+        };
+        let label = text[start + 1..mid].to_owned();
+        if label.contains(']') {
+            continue;
+        }
+        let tail = &text[mid + 2..];
+        let close = tail
+            .find(')')
+            .filter(|close| !tail[..*close].contains(char::is_whitespace));
+        match (complete, close) {
+            (true, Some(close)) => return Some((start, label, mid + 2 + close + 1)),
+            (false, None) if !tail.contains(char::is_whitespace) => {
+                return Some((start, label, text.len()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Direction of the last edit — a run only merges with edits of its own kind.
 #[derive(Clone, Copy, PartialEq)]
 enum EditKind {
@@ -5544,10 +5599,10 @@ impl Render for ContextUsageTooltip {
                 .gap(px(3.0))
                 .rounded(px(10.0))
                 .border_1()
-                // Same tokens as the composer pill / user bubble: the shared
-                // glass fill and hairline, shadow only off frost.
+                // Same tokens as the composer pill: the shared fill and
+                // hairline, shadow only off frost.
                 .border_color(theme.border)
-                .bg(theme.composer_glass_bg())
+                .bg(crate::queue::panel_fill(theme))
                 .when(!theme.is_frost(), |el| el.shadow_md())
                 .text_center()
                 .child(
@@ -11286,7 +11341,7 @@ impl Composer {
             .rounded(px(COMPOSER_RADIUS))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.composer_glass_bg())
+            .bg(crate::queue::panel_fill(&theme))
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .flex()
             .flex_col()
@@ -12763,10 +12818,9 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Attach and the
         // send circle live inside; model/effort now belong to the footer.
-        // Shared with the sent user-message bubble (theme.composer_glass_bg):
-        // thinned to ~half the theme fill so the pill reads as a transparent,
-        // hairline-outlined input rather than a solid grey plate (user request).
-        let pill_bg = theme.composer_glass_bg();
+        // Same fill as the todo/queue trays docked above it, so the stack
+        // reads as one surface (user request, 2026-10-14).
+        let pill_bg = crate::queue::panel_fill(&theme);
         // No drop shadow on glass: it paints BEHIND the translucent fill and
         // shows through as an inner glow (theme.rs's card_selected_shadows
         // lesson; user report).
@@ -17050,6 +17104,32 @@ mod tests {
         assert_eq!(
             projection.normalize_range(link.range.start + 2..link.range.end - 2),
             link.range
+        );
+    }
+
+    #[test]
+    fn chat_titles_render_mentions_as_chips_and_repair_cut_links() {
+        let link = project_mention_link("infisical-fork", "/Users/me/infisical-fork");
+        let (display, spans) = title_mention_display(&format!("qual situacao do {link} hoje"));
+        assert!(!display.contains(PROJECT_MENTION_SCHEME));
+        assert_eq!(spans.len(), 1);
+        assert!(display[spans[0].range.clone()].contains("infisical-fork"));
+        assert_eq!(
+            title_mention_plain(&format!("qual situacao do {link} hoje")),
+            "qual situacao do infisical-fork hoje"
+        );
+
+        // A title saved before links were kept whole: the cut link keeps
+        // only its label, never the raw markdown.
+        let cut = "qual situacao do [infisical-fork](zeron-project:";
+        let (display, spans) = title_mention_display(cut);
+        assert_eq!(display, "qual situacao do infisical-fork");
+        assert!(spans.is_empty());
+        assert_eq!(title_mention_plain(cut), "qual situacao do infisical-fork");
+
+        assert_eq!(
+            title_mention_plain("plain [title] (x)"),
+            "plain [title] (x)"
         );
     }
 

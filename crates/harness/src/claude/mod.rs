@@ -864,7 +864,6 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         chat_id: _,
-        generate_native_title: _,
         turn,
     } = controls;
     let request_input = Arc::new(request_input);

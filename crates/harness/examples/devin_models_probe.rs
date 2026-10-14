@@ -29,7 +29,6 @@ async fn main() -> anyhow::Result<()> {
     let controls = RunControls {
         realtime: None,
         chat_id: String::new(),
-        generate_native_title: false,
         execution_lease: None,
         request_input: Box::new(|_| {
             let (tx, rx) = tokio::sync::oneshot::channel();

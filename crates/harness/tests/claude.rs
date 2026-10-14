@@ -80,7 +80,6 @@ fn controls(
         steering: steer_rx,
         interrupt: token.clone(),
         chat_id: String::new(),
-        generate_native_title: false,
         turn: Default::default(),
     };
     (controls, steer_tx, token)
@@ -320,7 +319,6 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         steering: steer_rx,
         interrupt: token.clone(),
         chat_id: String::new(),
-        generate_native_title: false,
         turn: Default::default(),
     };
     let events = run_to_end(&harness(), request("scenario:askuser"), controls).await;

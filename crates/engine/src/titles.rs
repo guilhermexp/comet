@@ -1,11 +1,8 @@
-//! Chat auto-titling — use OMP's native session title, or generate a title
-//! through the configured isolated title harness for other runtimes.
+//! Chat auto-titling through the configured isolated title harness, for every
+//! runtime (OMP included).
 //!
 //! Applying the title is detached from the run task; failures are traced and
 //! never turn a successful coding response into a failed run:
-//! OMP supplies native title metadata at completion; it never enters the model
-//! selection below. Missing native titles use only the textual fallback.
-//! The isolated title-generation path for other runtimes:
 //! 1. skip when the chat already has a title (or has no workspace row);
 //! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
 //!    last listed model — zeron's `cheapestModel`);
@@ -62,20 +59,7 @@ impl TitleGenerator {
 
     /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
     /// task after a completed exchange; runs detached so it never delays anything.
-    pub fn maybe_generate(
-        &self,
-        chat_id: &str,
-        harness: HarnessId,
-        prompt: &str,
-        cwd: &str,
-        native_title: Option<&str>,
-    ) {
-        if harness == HarnessId::Omp
-            && self.inner.registry.title_settings().harness.is_none()
-            && native_title.is_none()
-        {
-            return;
-        }
+    pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
         if !self
             .inner
             .in_flight
@@ -89,12 +73,8 @@ impl TitleGenerator {
         let chat_id = chat_id.to_string();
         let prompt = prompt.to_string();
         let cwd = cwd.to_string();
-        let native_title = native_title.map(str::to_owned);
         tokio::spawn(async move {
-            if let Err(err) = this
-                .generate(&chat_id, harness, &prompt, &cwd, native_title.as_deref())
-                .await
-            {
+            if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
                 tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
             }
             this.inner
@@ -111,7 +91,6 @@ impl TitleGenerator {
         harness_id: HarnessId,
         prompt: &str,
         cwd: &str,
-        native_title: Option<&str>,
     ) -> Result<(), EngineError> {
         let chat = self
             .inner
@@ -122,24 +101,9 @@ impl TitleGenerator {
             return Ok(()); // already named
         }
 
-        let generated = if harness_id == HarnessId::Omp
-            && self.inner.registry.title_settings().harness.is_none()
-        {
-            native_title
-                .map(clean_title)
-                .filter(|title| !title.is_empty())
-        } else {
-            self.run_title_model(chat_id, harness_id, prompt, cwd).await
-        };
+        let generated = self.run_title_model(chat_id, harness_id, prompt, cwd).await;
         // Fallback so a chat is always named even if the model run produced nothing.
-        let fallback: String = prompt
-            .split_whitespace()
-            .take(7)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(48)
-            .collect();
+        let fallback = fallback_title(prompt);
         let title = generated.unwrap_or(fallback);
         if title.is_empty() {
             return Ok(());
@@ -323,7 +287,7 @@ pub(crate) async fn cheapest_model_before(
 ///
 /// Curated catalogs (claude, codex) carry one row per tier. Raw provider
 /// inventories can include every historical model in alphabetical order.
-/// Before native OMP titles, a plain first-match picked
+/// A plain first-match once picked
 /// `anthropic/claude-3-haiku-20240307`, retired at Anthropic, so every titling
 /// attempt 404'd and fell back to the prompt's first words. So the first
 /// small-tier row only decides the FAMILY (provider prefix + tier word) and the
@@ -402,6 +366,45 @@ fn generation_rank(id: &str) -> (Vec<u32>, bool) {
     (version, !dated)
 }
 
+/// The first words of `prompt`, capped near 48 visible chars. A mention link
+/// (`[label](zeron-…)`) is one word whose width is its label, and it is kept
+/// whole or dropped: a cut link shows as raw markdown in the sidebar.
+fn fallback_title(prompt: &str) -> String {
+    const WORDS: usize = 7;
+    const CHARS: usize = 48;
+    let mut words: Vec<&str> = Vec::new();
+    let mut visible = 0usize;
+    let mut rest = prompt.trim_start();
+    while words.len() < WORDS && !rest.is_empty() {
+        let (word, label_len, len) = match mention_link_len(rest) {
+            Some((len, label_len)) => (&rest[..len], label_len, len),
+            None => {
+                let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                (&rest[..len], rest[..len].chars().count(), len)
+            }
+        };
+        let gap = usize::from(!words.is_empty());
+        if visible + gap + label_len > CHARS {
+            if words.is_empty() && mention_link_len(rest).is_none() {
+                // A single overlong word still names the chat.
+                words.push(&rest[..rest.char_indices().nth(CHARS).map_or(len, |(i, _)| i)]);
+            }
+            break;
+        }
+        visible += gap + label_len;
+        words.push(word);
+        rest = rest[len..].trim_start();
+    }
+    words.join(" ")
+}
+
+/// Byte length and label char count of a mention link at the start of `text`.
+fn mention_link_len(text: &str) -> Option<(usize, usize)> {
+    let label_end = text.strip_prefix('[')?.find("](zeron-")? + 1;
+    let close = text[label_end..].find(')')? + label_end;
+    Some((close + 1, text[1..label_end].chars().count()))
+}
+
 /// First line, stripped of quote/heading dressing, capped at 60 chars.
 fn clean_title(raw: &str) -> String {
     let first = raw.trim().lines().next().unwrap_or("");
@@ -435,7 +438,6 @@ async fn collect_text(
         steering: steer_rx,
         interrupt: interrupt.clone(),
         chat_id: chat_id.to_string(),
-        generate_native_title: false,
         turn: Default::default(),
     };
     let mut stream = harness.run_title(request, controls).await?;
@@ -477,6 +479,27 @@ async fn collect_text(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_title_keeps_mention_links_whole() {
+        let prompt = "qual situacao do [infisical-fork](zeron-project:/Users/me/code/infisical-fork) hoje e amanha";
+        assert_eq!(
+            super::fallback_title(prompt),
+            "qual situacao do [infisical-fork](zeron-project:/Users/me/code/infisical-fork) hoje e amanha"
+        );
+        let image = "[Image 1](zeron-image:1) é impressao minha ou o layout quebrou de vez aqui";
+        let title = super::fallback_title(image);
+        assert!(title.starts_with("[Image 1](zeron-image:1) é"));
+        // 41 visible chars of words leave no room for a 12-char label: the
+        // link is dropped whole rather than cut.
+        let tight = "palavra palavra palavra palavra palavra x [long-project](zeron-project:/x)";
+        assert_eq!(
+            super::fallback_title(tight),
+            "palavra palavra palavra palavra palavra x"
+        );
+        assert_eq!(super::fallback_title("a b c d e f g h"), "a b c d e f g");
+        assert_eq!(super::fallback_title(&"x".repeat(60)).chars().count(), 48);
+    }
+
     #[tokio::test]
     async fn tool_use_rejects_the_title_instead_of_accepting_coding_output() {
         let harness = zeron_harness::mock::MockHarness {
@@ -517,94 +540,6 @@ mod tests {
                 .to_string()
                 .contains("attempted to use a tool")
         );
-    }
-
-    #[tokio::test]
-    async fn omp_native_title_needs_no_model_or_title_harness() {
-        let dir = tempfile::tempdir().unwrap();
-        // No harness is registered: using native metadata must never resolve
-        // another provider or query a model catalog.
-        let registry = Arc::new(HarnessRegistry::new());
-        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
-            .unwrap();
-        core.workspace
-            .create_chat("native", None, Some(&core.device_id), None, None)
-            .unwrap();
-        let generator = TitleGenerator::new(core.workspace.clone(), registry, core.repos.clone());
-        generator.maybe_generate("native", HarnessId::Omp, "Primeiro pedido", ".", None);
-        assert!(generator.inner.in_flight.lock().unwrap().is_empty());
-        generator
-            .generate(
-                "native",
-                HarnessId::Omp,
-                "Primeiro pedido",
-                ".",
-                Some("Título da CLI"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            core.workspace
-                .chat("native")
-                .unwrap()
-                .unwrap()
-                .title
-                .as_deref(),
-            Some("Título da CLI")
-        );
-        core.workspace.rename_chat("native", "Nome manual").unwrap();
-        generator
-            .generate(
-                "native",
-                HarnessId::Omp,
-                "Primeiro pedido",
-                ".",
-                Some("Outro título da CLI"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            core.workspace
-                .chat("native")
-                .unwrap()
-                .unwrap()
-                .title
-                .as_deref(),
-            Some("Nome manual")
-        );
-        core.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn omp_missing_native_title_uses_only_prompt_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = Arc::new(HarnessRegistry::new());
-        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
-            .unwrap();
-        core.workspace
-            .create_chat("native", None, Some(&core.device_id), None, None)
-            .unwrap();
-        let generator = TitleGenerator::new(core.workspace.clone(), registry, core.repos.clone());
-        generator
-            .generate(
-                "native",
-                HarnessId::Omp,
-                "Pedido original em português",
-                ".",
-                Some(""),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            core.workspace
-                .chat("native")
-                .unwrap()
-                .unwrap()
-                .title
-                .as_deref(),
-            Some("Pedido original em português")
-        );
-        core.shutdown().await;
     }
 
     struct RecordingTitleHarness(std::sync::Mutex<Vec<RunRequest>>);

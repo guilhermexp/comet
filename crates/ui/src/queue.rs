@@ -285,17 +285,21 @@ fn queue_hidden_attachments_label(labels: &[String], shown: usize) -> Option<Str
 /// workspace paths and chats dropped on it reach the conversation's drop zone
 /// beneath (and land in this composer); otherwise it keeps clicks and hover
 /// from falling through to the transcript behind it.
+/// The fill shared by the trays above the composer and the composer pill, so
+/// the stack reads as one surface.
+pub(crate) fn panel_fill(theme: &Theme) -> gpui::Hsla {
+    if theme.is_frost() && matches!(theme.appearance, crate::theme::Appearance::Dark) {
+        theme.composer_sidebar_tint()
+    } else {
+        theme.input_glass_bg()
+    }
+}
+
 pub(crate) fn queue_panel_surface(theme: &Theme, dragging: bool) -> gpui::Div {
     div()
         .when(!dragging, |el| el.occlude())
         .rounded_t(px(PANEL_RADIUS))
-        .bg(
-            if theme.is_frost() && matches!(theme.appearance, crate::theme::Appearance::Dark) {
-                theme.composer_sidebar_tint()
-            } else {
-                theme.input_glass_bg()
-            },
-        )
+        .bg(panel_fill(theme))
         .border_1()
         .border_color(theme.border)
         .when(!theme.is_frost(), |el| el.shadow_lg())

@@ -36,7 +36,6 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     (
         RunControls {
             chat_id: String::new(),
-            generate_native_title: false,
             realtime: None,
             execution_lease: None,
             steering: rx,

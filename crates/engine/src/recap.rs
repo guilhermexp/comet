@@ -278,7 +278,6 @@ pub(crate) async fn collect_isolated_text(
         steering: steer_rx,
         interrupt,
         chat_id: request_id.to_string(),
-        generate_native_title: false,
         turn: Default::default(),
     };
     let mut stream = harness

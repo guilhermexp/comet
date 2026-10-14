@@ -164,9 +164,6 @@ pub struct RunControls {
     /// hand the agent (the comet MCP server's `--chat`, whose terminal RPCs
     /// are chat-scoped).
     pub chat_id: String,
-    /// Ask native OMP runs to use the provider's built-in session title flow.
-    /// Host-side only; other harnesses ignore this control.
-    pub generate_native_title: bool,
     /// Turn-level stop and background-work reporting (see [`TurnControl`]).
     pub turn: TurnControl,
 }
@@ -753,7 +750,6 @@ mod tests {
                     steering,
                     interrupt: CancellationToken::new(),
                     chat_id: "chat-1".into(),
-                    generate_native_title: false,
                     turn: TurnControl::default(),
                 },
             )

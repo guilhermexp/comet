@@ -12,8 +12,6 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
-- `AgentEvent::NativeTitle` transporta metadata local de título da CLI para a engine. É consumido antes de journal/broadcast; somente o título resultante do Chat sincroniza pelo contrato existente.
-
 - `ContextUsage` conserva `tokens`/`contextWindow` numéricos no fio; `tokensReported: false` é aditivo e distingue tokens ausentes de zero (ausência do flag mantém semântica legada). `reported_tokens`/`reported_window` e `merge` são a fonte compartilhada para snapshots parciais. Contexto do Chat é distinto de Managed Provider Usage e continua sincronizado nas rows de Session.
 - `RunRequest.mcp` continua campo opcional do request serializado, independente dos controles realtime host-local da harness. `voice` define mídia e signaling efêmeros: áudio, leases e partial transcripts nunca entram em documento; só o `VoiceTranscript` final pode ser reduzido pelo contrato de `zeron-doc`. Remote media v1 usa envelopes estritos, chave de tentativa aleatória e SDP limitado.
 

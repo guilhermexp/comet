@@ -695,9 +695,9 @@ impl Toast {
     }
 }
 
-/// Shared with the composer pill / ContextUsageTooltip: thinned glass fill.
+/// Shared with the composer pill / ContextUsageTooltip (`queue::panel_fill`).
 pub(crate) fn toast_card_background(theme: &Theme) -> gpui::Hsla {
-    theme.composer_glass_bg()
+    crate::queue::panel_fill(theme)
 }
 
 /// Render a single toast card matching Orchestrator.dev's styling.
@@ -1205,7 +1205,10 @@ mod legacy_tests {
     #[test]
     fn toast_card_matches_the_context_tooltip_glass() {
         for theme in [Theme::dark(), Theme::light()] {
-            assert_eq!(toast_card_background(&theme), theme.composer_glass_bg());
+            assert_eq!(
+                toast_card_background(&theme),
+                crate::queue::panel_fill(&theme)
+            );
         }
     }
 }

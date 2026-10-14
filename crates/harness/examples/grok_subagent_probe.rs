@@ -34,7 +34,6 @@ async fn main() {
         steering,
         interrupt: CancellationToken::new(),
         chat_id: String::new(),
-        generate_native_title: false,
         turn: Default::default(),
     };
     let request = RunRequest {

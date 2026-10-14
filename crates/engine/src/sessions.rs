@@ -1082,19 +1082,6 @@ impl SessionsEngine {
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
             chat_id: chat_id.to_string(),
-            generate_native_title: harness_id == HarnessId::Omp
-                && self.inner.titles.get().is_some()
-                && self.inner.registry.title_settings().harness.is_none()
-                && self
-                    .inner
-                    .workspace()
-                    .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
-                    .is_some_and(|chat| {
-                        !chat
-                            .title
-                            .as_deref()
-                            .is_some_and(|title| !title.trim().is_empty())
-                    }),
             turn: turn.clone(),
         };
 
@@ -1136,7 +1123,7 @@ impl SessionsEngine {
 
         if !idle {
             if let Some(titles) = self.inner.titles.get() {
-                titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd, None);
+                titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
             }
         }
 
@@ -3561,14 +3548,6 @@ async fn drive_run(
         };
         turn.observe(&event);
 
-        // Native titles are host-local metadata, not transcript/journal events.
-        if let AgentEvent::NativeTitle { title } = &event {
-            if let Some(titles) = inner.titles.get() {
-                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd, Some(title));
-            }
-            continue;
-        }
-
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
         // into the subagent's own doc, and the parent keeps only the spawn
@@ -4153,7 +4132,7 @@ async fn drive_run(
             if *status == DoneStatus::Completed
                 && let Some(titles) = inner.titles.get()
             {
-                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd, Some(""));
+                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
             }
             // A turn stopped in place: the runtime lives on, parked like a
             // completed turn. Steers it had accepted but not yet delivered

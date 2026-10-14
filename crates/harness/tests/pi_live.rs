@@ -70,7 +70,6 @@ async fn real_pi_mock_lifecycle() {
         let controls = RunControls {
             realtime: None,
             chat_id: String::new(),
-            generate_native_title: false,
             execution_lease: None,
             steering,
             interrupt: interrupt.clone(),
@@ -184,7 +183,6 @@ async fn real_pi_mock_lifecycle() {
     let controls = RunControls {
         realtime: None,
         chat_id: String::new(),
-        generate_native_title: false,
         execution_lease: None,
         steering,
         interrupt: CancellationToken::new(),
@@ -262,7 +260,6 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
     let controls = RunControls {
         realtime: None,
         chat_id: String::new(),
-        generate_native_title: false,
         execution_lease: None,
         steering,
         interrupt: CancellationToken::new(),

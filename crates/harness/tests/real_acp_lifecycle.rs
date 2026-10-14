@@ -16,7 +16,6 @@ async fn live_run(cancel: bool) {
     let controls = RunControls {
         realtime: None,
         chat_id: String::new(),
-        generate_native_title: false,
         execution_lease: None,
         steering,
         interrupt: interrupt.clone(),
