@@ -1189,7 +1189,8 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let mut responses = Vec::new();
-            for _ in 0..2 {
+            let mut hook_requests = 0;
+            while hook_requests < 2 {
                 let (mut stream, _) = listener.accept().expect("accept delayed request");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1205,6 +1206,23 @@ mod tests {
                     }
                 };
                 let headers = String::from_utf8_lossy(&request[..header_end]);
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default();
+                // The installed app probes new loopback listeners with `HEAD /`.
+                // Only the two hook deliveries decide response order.
+                if !path.starts_with("/hook/") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
+                hook_requests += 1;
                 let content_length = headers
                     .lines()
                     .find_map(|line| {
