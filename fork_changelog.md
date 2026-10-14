@@ -13,6 +13,7 @@ Tracks local/private fork changes against upstream.
 
 - Busca de arquivos/conteúdo com fff e Cmd+K em abas, painel nativo de PRs, menus pesquisáveis, navegação pelo mouse e layout responsivo entram junto dos totais exatos por checkout da PR #21.
 - Workers/OMP, notificações diretas, Enter/Steer, Details/Usage, terminal à direita e remoções anteriores do fork permanecem. O composer e o cabeçalho acompanham a largura real durante as transições.
+- O painel de PRs passa a separar o cache pela credencial do `gh` usada em cada leitura e abre o detalhe no device do badge clicado. Isso evita que um PR privado de uma conta apareça em outra e que um comentário saia com a credencial do device errado. A revisão também corrigiu toasts, SessionInfo, painéis pedidos e o toggle de providers.
 - Revisão congelada, decisões, provas, limites e estado de publicação: [registro do sync](.upstream-sync/history/20261011T081548Z-836aafbf.yaml).
 
 ## 2026-10-05 — Remoção da aba Files do Details

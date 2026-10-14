@@ -432,28 +432,61 @@ verification:
     attempt and macOS native platform. Windows native-platform compilation again failed
     on previously recorded Unix-only Unpeel APIs.
   url: https://github.com/guilhermexp/comet/actions/runs/38140462508
+- command: Combined-head CI d53a7510
+  revision: d53a75101b13db9c88df1decbe89b765d4aa2f47
+  result: passed
+  observed: UI, core, Rust workspace, iOS, Linux browser, macOS frame recovery (90m
+    budget) and voice jobs passed; only the preexisting Windows native-platform compile
+    (51 unpeel-core errors) failed.
+  url: https://github.com/guilhermexp/comet/actions/runs/38142064310
+- command: no-mistakes run 01M4NJYCHCB6HFAERK7RC80ERV on d53a7510
+  result: failed
+  observed: Review step found two errors (PR cache account contamination, PR detail
+    reusing another device's credentials) and seven warnings across six rounds; it
+    committed fixes up to d3c5ca26, then the daemon shut down before Test. Fixes
+    adopted by fast-forward; gate-generated Graft wiring removed in c079bb04 (ask-user
+    finding accepted). Unused upstream DisclosureMotion kept to avoid upstream divergence
+    (ask-user finding refuted).
+- command: review-pair e55de7ee..d53a7510 and d53a7510..c079bb04
+  result: passed
+  observed: OpenQodex and CodeRabbit found nothing in the post-merge repairs. On the
+    no-mistakes fixes, one OpenQodex minor (gh auth token per cached read) refuted as
+    the accepted cost of binding cache ownership to the credential actually used.
+- command: Linux UI CI c079bb04
+  revision: c079bb04b911d7f7ec56bb77cd32a57211989cc8
+  result: failed
+  observed: Two new no-mistakes tests failed. The PR diff extent test measured painted
+    rows at the raw code font size although rows paint at diff_text_size; the reduced-motion
+    toast test asserted a focused window that the test platform does not focus by default.
+    Both reproduced on agents-us and were repaired in the tests only (6515f8df). The
+    Rust workspace job also hit the recorded queued_attachments timeout once.
+  url: https://github.com/guilhermexp/comet/actions/runs/38487679620
+- command: Combined-head CI 6515f8df
+  revision: 6515f8df9375c6250cb0989044b14fcb911778e8
+  result: passed
+  observed: All UI, core, Rust workspace (first attempt), iOS, Linux browser, macOS
+    and voice jobs passed; only the preexisting Windows native-platform compile failed.
+    agents-us ran the full zeron-ui lib, 2429 passed; its one failure (embedded engine
+    IPC port) is box-specific and passed in Linux CI.
+  url: https://github.com/guilhermexp/comet/actions/runs/38494887281
 limits:
 - Previous intermittent Stop/attachments CI failures remain recorded despite local
   clean-source passes; no causal fix claimed.
 - Windows voice native-platform compilation has the documented preexisting Unix-only
   Unpeel errors; current main Windows execution was not observed.
-- Final candidate macOS packaging/install and isolated native QA, fresh combined-head
-  CI and project gate are pending.
-- Linux rendered-link regression now passes on9ca; new command-claim repair still
-  requires executable validation. Windows rendered-link execution is not established.
+- macOS packaging/install and isolated native QA were not run; they need the owner's
+  go-ahead because installing replaces the running app's binary.
 references:
 - docs/upstream-sync.md
 - openspec/changes/sync-upstream-v0-2-111/
 - https://github.com/guilhermexp/comet/pull/20
 - https://github.com/guilhermexp/comet/pull/21
-outcome: prepared
+outcome: integrated
 pending:
-- Validate command-claim race repair and final combined-head CI/no-mistakes; integrate
-  into main.
 - Package/install macOS without launching installed app; isolated native QA.
-- Finalize archive/history/delivery and task-resource closeout.
+- Archive the sync OpenSpec change after packaging is decided.
 delivery:
-  integration: pending
+  integration: PR #20 merge into main
   target_branch: main
   commit:
   pr: https://github.com/guilhermexp/comet/pull/20
