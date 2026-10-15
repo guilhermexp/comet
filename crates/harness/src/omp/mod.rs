@@ -111,10 +111,20 @@ struct InteractiveResolution {
     cancel_host_input: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum InteractiveMethod {
     Confirm,
     Value,
+    /// OMP's ask dialog: every question of one `ask` call in a single request,
+    /// so the wizard can page back and forth before anything is answered.
+    Ask(Vec<AskQuestion>),
+}
+
+#[derive(Clone)]
+struct AskQuestion {
+    id: String,
+    options: Vec<String>,
+    multi: bool,
 }
 
 pub struct OmpHarness {
@@ -344,6 +354,12 @@ impl Harness for OmpHarness {
         process
             .request(json!({ "type": "set_subagent_subscription", "level": "events" }))
             .await?;
+        // Multi-question `ask` arrives as one request instead of a chain of
+        // selects, so the wizard can go back to an earlier question. An OMP
+        // without the command keeps the select chain.
+        let _ = process
+            .request(json!({ "type": "set_ask_dialog", "enabled": true }))
+            .await;
         if let Some(session_path) = request.resume.as_deref() {
             let response = process
                 .request(json!({ "type": "switch_session", "sessionPath": session_path }))
@@ -1120,9 +1136,9 @@ async fn run_session(
                             answers: None,
                                 }).await;
                             }
-                        } else if matches!(method, "select" | "confirm" | "input" | "editor") {
+                        } else if matches!(method, "select" | "confirm" | "input" | "editor" | "ask") {
                             match interactive_question(&frame) {
-                                Ok((id, method, question, timeout)) => {
+                                Ok((id, method, questions, timeout)) => {
                                     if let Some(previous) = pending_interactive.remove(&id) {
                                         previous.cancel();
                                         let message = "OMP interactive request used a duplicate id".to_owned();
@@ -1137,7 +1153,7 @@ async fn run_session(
                                         let _ = process.send_control(cancelled_interactive_response(&id, false));
                                         let _ = emit(&event_tx, AgentEvent::Error { message }).await;
                                     } else {
-                                        let answers = (request_input)(vec![question]);
+                                        let answers = (request_input)(questions);
                                         let cancellation = tokio_util::sync::CancellationToken::new();
                                         pending_interactive.insert(id.clone(), cancellation.clone());
                                         spawn_interactive_answer(
@@ -1312,7 +1328,7 @@ async fn emit(
 
 fn interactive_question(
     frame: &Value,
-) -> Result<(String, InteractiveMethod, UserInputQuestion, Duration), String> {
+) -> Result<(String, InteractiveMethod, Vec<UserInputQuestion>, Duration), String> {
     let id = frame
         .get("id")
         .and_then(Value::as_str)
@@ -1326,6 +1342,25 @@ fn interactive_question(
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("OMP question");
+    let timeout = frame
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .filter(|milliseconds| milliseconds.is_finite() && *milliseconds > 0.0)
+        .map(|milliseconds| {
+            let milliseconds = milliseconds.clamp(1.0, MAX_INTERACTIVE_TIMEOUT.as_millis() as f64);
+            Duration::from_secs_f64(milliseconds / 1_000.0)
+        })
+        .unwrap_or(MAX_INTERACTIVE_TIMEOUT)
+        .clamp(Duration::from_millis(1), MAX_INTERACTIVE_TIMEOUT);
+    if method == "ask" {
+        let (specs, questions) = ask_questions(frame)?;
+        return Ok((
+            id.to_owned(),
+            InteractiveMethod::Ask(specs),
+            questions,
+            timeout,
+        ));
+    }
     let question_text = frame
         .get("message")
         .or_else(|| frame.get("placeholder"))
@@ -1354,16 +1389,6 @@ fn interactive_question(
     if method == "select" && (options.is_empty() || options.len() > 100) {
         return Err("OMP interactive select options are missing or invalid".into());
     }
-    let timeout = frame
-        .get("timeout")
-        .and_then(Value::as_f64)
-        .filter(|milliseconds| milliseconds.is_finite() && *milliseconds > 0.0)
-        .map(|milliseconds| {
-            let milliseconds = milliseconds.clamp(1.0, MAX_INTERACTIVE_TIMEOUT.as_millis() as f64);
-            Duration::from_secs_f64(milliseconds / 1_000.0)
-        })
-        .unwrap_or(MAX_INTERACTIVE_TIMEOUT)
-        .clamp(Duration::from_millis(1), MAX_INTERACTIVE_TIMEOUT);
     let question = UserInputQuestion {
         id: id.to_owned(),
         header: truncate_text(title, 80),
@@ -1373,7 +1398,116 @@ fn interactive_question(
         multiline: false,
         prefill: None,
     };
-    Ok((id.to_owned(), kind, question, timeout))
+    Ok((id.to_owned(), kind, vec![question], timeout))
+}
+
+/// The questions of an `ask` dialog request, as OMP's `ask` tool sent them.
+fn ask_questions(frame: &Value) -> Result<(Vec<AskQuestion>, Vec<UserInputQuestion>), String> {
+    let invalid = || "OMP ask dialog questions are missing or invalid".to_owned();
+    let questions = frame
+        .get("questions")
+        .and_then(Value::as_array)
+        .filter(|questions| !questions.is_empty() && questions.len() <= 20)
+        .ok_or_else(invalid)?;
+    let mut specs = Vec::with_capacity(questions.len());
+    let mut host = Vec::with_capacity(questions.len());
+    for question in questions {
+        let id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+            .ok_or_else(invalid)?;
+        if specs.iter().any(|spec: &AskQuestion| spec.id == id) {
+            return Err(invalid());
+        }
+        let options: Vec<String> = question
+            .get("options")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?
+            .iter()
+            .filter_map(|option| option.get("label").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        if options.len() > 100 {
+            return Err(invalid());
+        }
+        let multi = question.get("multi").and_then(Value::as_bool) == Some(true);
+        let text = question
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let header = question
+            .get("header")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|header| !header.is_empty())
+            .unwrap_or("Question");
+        host.push(UserInputQuestion {
+            id: id.to_owned(),
+            header: truncate_text(header, 80),
+            question: truncate_text(text, 4_096),
+            options: options.clone(),
+            multi_select: multi,
+            multiline: false,
+            prefill: None,
+        });
+        specs.push(AskQuestion {
+            id: id.to_owned(),
+            options,
+            multi,
+        });
+    }
+    Ok((specs, host))
+}
+
+/// OMP's ask-dialog answer: one entry per question, in question order. A
+/// label that is one of the question's options is a pick; anything else is
+/// the typed answer. No answer at all (Skip) cancels the dialog.
+fn ask_response(id: &str, questions: &[AskQuestion], answers: &[UserInputAnswer]) -> Option<Value> {
+    if answers
+        .iter()
+        .all(|answer| answer.labels.iter().all(|label| label.trim().is_empty()))
+    {
+        return None;
+    }
+    let answers = questions
+        .iter()
+        .map(|question| {
+            let labels = answers
+                .iter()
+                .find(|answer| answer.question_id == question.id)
+                .map(|answer| answer.labels.as_slice())
+                .unwrap_or_default();
+            let mut selected: Vec<&str> = Vec::new();
+            let mut typed: Vec<&str> = Vec::new();
+            for label in labels.iter().map(String::as_str) {
+                if question.options.iter().any(|option| option == label) {
+                    if !selected.contains(&label) {
+                        selected.push(label);
+                    }
+                } else if !label.trim().is_empty() {
+                    typed.push(label.trim());
+                }
+            }
+            if !question.multi {
+                if !typed.is_empty() {
+                    selected.clear();
+                }
+                selected.truncate(1);
+                typed.truncate(1);
+            }
+            let mut answer = json!({ "id": question.id, "selectedOptions": selected });
+            if !typed.is_empty() {
+                answer["customInput"] = json!(truncate_text(&typed.join("\n"), 20_000));
+            }
+            answer
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "type": "extension_ui_response",
+        "id": id,
+        "answers": answers
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1389,9 +1523,16 @@ fn spawn_interactive_answer(
     tokio::spawn(async move {
         let (response, cancel_host_input) = tokio::select! {
             answer = &mut answers => {
-                let label = answer
-                    .ok()
-                    .and_then(|answers| answers.into_iter().next())
+                let answers = answer.ok().unwrap_or_default();
+                if let InteractiveMethod::Ask(questions) = &method {
+                    match ask_response(&id, questions, &answers) {
+                        Some(response) => (response, false),
+                        None => (cancelled_interactive_response(&id, false), true),
+                    }
+                } else {
+                let label = answers
+                    .into_iter()
+                    .next()
                     .and_then(|answer| answer.labels.into_iter().next());
                 match (method, label) {
                     (InteractiveMethod::Confirm, Some(label)) => (json!({
@@ -1405,6 +1546,7 @@ fn spawn_interactive_answer(
             "value": truncate_text(&label, 20_000)
                     }), false),
                     _ => (cancelled_interactive_response(&id, false), true),
+                }
                 }
             }
             _ = tokio::time::sleep(timeout) => (cancelled_interactive_response(&id, true), true),
@@ -1703,5 +1845,64 @@ mod tests {
             dir.path().join("gone.png").to_string_lossy().into_owned(),
         ];
         assert!(load_images(&paths, "", "prompt").await.unwrap().is_empty());
+    }
+
+    /// OMP manda as perguntas de um `ask` juntas (set_ask_dialog), e o wizard
+    /// pode voltar a uma pergunta anterior antes de responder qualquer uma.
+    #[test]
+    fn ask_dialog_is_one_request_answered_in_question_order() {
+        let frame = json!({
+            "type": "extension_ui_request", "id": "req", "method": "ask",
+            "questions": [
+                {"id": "scope", "question": "Qual escopo?", "header": "Escopo",
+                 "options": [{"label": "Tudo"}, {"label": "Só UI", "description": "x"}]},
+                {"id": "tools", "question": "Quais?", "multi": true,
+                 "options": [{"label": "A"}, {"label": "B"}]},
+                {"id": "free", "question": "Algo mais?", "options": []}
+            ]
+        });
+        let (id, method, questions, _) = interactive_question(&frame).unwrap();
+        assert_eq!(id, "req");
+        assert_eq!(questions.len(), 3);
+        assert_eq!(questions[0].header, "Escopo");
+        assert_eq!(questions[1].header, "Question");
+        assert!(questions[1].multi_select);
+        assert_eq!(questions[0].options, ["Tudo", "Só UI"]);
+        let InteractiveMethod::Ask(specs) = method else {
+            panic!("ask must stay one dialog");
+        };
+        let answer = |id: &str, labels: &[&str]| UserInputAnswer {
+            question_id: id.into(),
+            labels: labels.iter().map(|label| (*label).into()).collect(),
+        };
+        let response = ask_response(
+            "req",
+            &specs,
+            &[
+                answer("free", &["texto livre"]),
+                answer("scope", &["Só UI"]),
+                answer("tools", &["B", "A", "B"]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            json!({
+                "type": "extension_ui_response", "id": "req",
+                "answers": [
+                    {"id": "scope", "selectedOptions": ["Só UI"]},
+                    {"id": "tools", "selectedOptions": ["B", "A"]},
+                    {"id": "free", "selectedOptions": [], "customInput": "texto livre"}
+                ]
+            })
+        );
+        assert_eq!(
+            ask_response("req", &specs, &[answer("scope", &[]), answer("tools", &[])]),
+            None,
+            "Skip cancela o dialog"
+        );
+        assert!(
+            interactive_question(&json!({"id": "x", "method": "ask", "questions": []})).is_err()
+        );
     }
 }
