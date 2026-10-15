@@ -3006,8 +3006,9 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 
 /// Same call categories and units in streaming groups and settled TurnSteps.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
-    let mut summary =
-        crate::turn_steps::activity_breakdown_for_calls(tools.iter().map(|tool| &tool.call));
+    let mut summary = crate::turn_steps::activity_breakdown_for_calls(
+        tools.iter().map(|tool| (tool.id.as_ref(), &tool.call)),
+    );
     let pending = tools.iter().filter(|tool| !tool.resolved).count();
     let failed = tools.iter().filter(|tool| tool.is_error).count();
     if pending > 0 {

@@ -12,6 +12,7 @@ pub struct TurnStepsPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActivityBucket {
     Agent,
+    Worker,
     Skill,
     Read,
     Search,
@@ -114,16 +115,34 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
 
 pub fn activity_breakdown(parts: &[MessagePart]) -> String {
     activity_breakdown_for_calls(parts.iter().filter_map(|part| match part {
-        MessagePart::Tool { call, .. } => Some(call),
+        MessagePart::Tool { id, call, .. } => Some((id.as_str(), call)),
         _ => None,
     }))
 }
 
 /// Shared categories and units for both live tool groups and settled turns.
-pub fn activity_breakdown_for_calls<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> String {
+pub fn activity_breakdown_for_calls<'a>(
+    calls: impl IntoIterator<Item = (&'a str, &'a ToolCall)>,
+) -> String {
+    let calls = calls.into_iter().collect::<Vec<_>>();
+    // O OMP abre um chip sintetico `Agent: ...` com id `<task>--<filho>` para
+    // cada subagente que o `task` dispara. O chip ja e o agente; contar o
+    // `task` pai tambem dobrava a conta (1 subagente virava "2 agents").
+    let spawned_by = |parent: &str| {
+        calls.iter().any(|(id, call)| {
+            activity_bucket(call) == ActivityBucket::Agent
+                && id
+                    .strip_prefix(parent)
+                    .is_some_and(|suffix| suffix.len() > 2 && suffix.starts_with("--"))
+        })
+    };
     let mut counts = HashMap::<ActivityBucket, usize>::new();
-    for call in calls {
-        *counts.entry(activity_bucket(call)).or_default() += 1;
+    for (id, call) in &calls {
+        let bucket = activity_bucket(call);
+        if bucket == ActivityBucket::Agent && spawned_by(id) {
+            continue;
+        }
+        *counts.entry(bucket).or_default() += 1;
     }
 
     ActivityBucket::ORDER
@@ -211,9 +230,8 @@ fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> Activ
         {
             Some("wait_for_status") => ActivityBucket::Wait,
             Some("send_text" | "send_keys") => ActivityBucket::Message,
-            Some("launch_worker" | "stop_worker" | "restart_worker" | "archive_worker") => {
-                ActivityBucket::Command
-            }
+            Some("launch_worker") => ActivityBucket::Worker,
+            Some("stop_worker" | "restart_worker" | "archive_worker") => ActivityBucket::Command,
             Some("read_output" | "read_transcript" | "inspect_worker" | "list_workers") => {
                 ActivityBucket::Read
             }
@@ -231,7 +249,8 @@ fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> Activ
         "websearch" | "web_search" | "webfetch" | "web_fetch" => ActivityBucket::Search,
         "edit" | "write" | "multiedit" | "notebookedit" | "apply_patch" => ActivityBucket::Edit,
         "bash" | "exec" | "eval" | "create_terminal" => ActivityBucket::Command,
-        "wait_for_agent" => ActivityBucket::Wait,
+        // `wait` e a espera nativa do OMP pelos subagentes/jobs em background.
+        "wait" | "wait_for_agent" => ActivityBucket::Wait,
         "send_agent_prompt" | "send_terminal_keys" => ActivityBucket::Message,
         "list_terminals" => ActivityBucket::Terminal,
         "capture_terminal" => ActivityBucket::Capture,
@@ -240,8 +259,9 @@ fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> Activ
 }
 
 impl ActivityBucket {
-    const ORDER: [Self; 11] = [
+    const ORDER: [Self; 12] = [
         Self::Agent,
+        Self::Worker,
         Self::Skill,
         Self::Read,
         Self::Search,
@@ -257,6 +277,7 @@ impl ActivityBucket {
     const fn singular(self) -> &'static str {
         match self {
             Self::Agent => "agent",
+            Self::Worker => "worker",
             Self::Skill => "skill",
             Self::Read => "read",
             Self::Search => "search",
@@ -273,6 +294,7 @@ impl ActivityBucket {
     const fn plural(self) -> &'static str {
         match self {
             Self::Agent => "agents",
+            Self::Worker => "workers",
             Self::Skill => "skills",
             Self::Read => "reads",
             Self::Search => "searches",
@@ -679,6 +701,26 @@ mod tests {
     }
 
     #[test]
+    fn omp_task_and_its_spawn_chips_count_each_subagent_once() {
+        let single = vec![
+            tool("call_1", unknown("task", None), true),
+            tool("call_1--0", unknown("Agent: Verify Comma", None), true),
+        ];
+        assert_eq!(activity_breakdown(&single), "1 agent");
+
+        let fan_out = vec![
+            tool("call_2", unknown("task", None), true),
+            tool("call_2--0", unknown("Agent: A", None), true),
+            tool("call_2--1", unknown("Agent: B", None), true),
+        ];
+        assert_eq!(activity_breakdown(&fan_out), "2 agents");
+
+        // Sem chip (o subagente nunca reportou), o `task` segue contando.
+        let chipless = vec![tool("call_3", unknown("task", None), true)];
+        assert_eq!(activity_breakdown(&chipless), "1 agent");
+    }
+
+    #[test]
     fn activity_breakdown_classifies_each_hub_operation() {
         let parts = ["start", "restart", "stop", "wait", "send", "inspect"]
             .into_iter()
@@ -724,7 +766,7 @@ mod tests {
 
         assert_eq!(
             activity_breakdown(&parts),
-            "1 read, 1 command, 1 wait, 1 message, 1 tool"
+            "1 worker, 1 read, 1 wait, 1 message, 1 tool"
         );
     }
 
@@ -737,6 +779,10 @@ mod tests {
         ];
 
         assert_eq!(activity_breakdown(&parts), "1 agent, 1 skill, 1 command");
+        assert_eq!(
+            activity_breakdown(&[tool("wait", unknown("wait", None), true)]),
+            "1 wait"
+        );
     }
 
     #[test]
