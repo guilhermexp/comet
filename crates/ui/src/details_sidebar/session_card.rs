@@ -257,18 +257,42 @@ impl DetailsSidebar {
             Some(folder.into_any_element()),
             theme,
         ));
-        let device_name: SharedString = {
+        let (device_name, device_online): (SharedString, bool) = {
             let state = self.app_state.read(cx);
-            context
+            let device_id = context
                 .target_device_id
                 .as_deref()
-                .or(state.local_device_id.as_deref())
+                .or(state.local_device_id.as_deref());
+            let name = device_id
                 .and_then(|device_id| state.device_name(device_id))
                 .unwrap_or("Unknown device")
                 .to_owned()
-                .into()
+                .into();
+            // Mesma presenca de Settings -> Devices (heartbeat do engine).
+            let online = device_id.is_none_or(|id| state.device_online(id, chrono::Utc::now()));
+            (name, online)
         };
-        let device_tooltip = device_name.clone();
+        let device_tooltip: SharedString = format!(
+            "{device_name} · {}",
+            if device_online { "Online" } else { "Offline" }
+        )
+        .into();
+        // Presenca como glifo, nao palavra: ponto verde online, wifi-off
+        // amarelo offline (o mesmo dos pickers de space).
+        let device_presence = if device_online {
+            div()
+                .flex_none()
+                .size(px(6.0))
+                .rounded_full()
+                .bg(theme.success)
+                .into_any_element()
+        } else {
+            icons::icon(icons::WIFI_OFF)
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.warning.opacity(0.8))
+                .into_any_element()
+        };
         card = card.child(
             div()
                 .h(px(28.0))
@@ -291,21 +315,30 @@ impl DetailsSidebar {
                 )
                 .child(
                     div()
-                        .id("session-device-name")
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .text_size(px(12.5))
-                        .text_color(theme.text_muted)
-                        .text_right()
-                        .aria_label(device_name.clone())
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| ActionTooltip {
-                                label: device_tooltip.clone(),
-                            })
-                            .into()
-                        })
-                        .child(device_name),
+                        .flex()
+                        .justify_end()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(device_presence)
+                        .child(
+                            div()
+                                .id("session-device-name")
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .text_color(theme.text_muted)
+                                .text_right()
+                                .aria_label(device_name.clone())
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| ActionTooltip {
+                                        label: device_tooltip.clone(),
+                                    })
+                                    .into()
+                                })
+                                .child(device_name),
+                        ),
                 ),
         );
         if has_git {
