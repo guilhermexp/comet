@@ -1097,8 +1097,12 @@ impl Tools {
                     .clone()
                     .or_else(|| space.map(|s| s.path.clone()))
                     .unwrap_or_else(|| "~".into());
+                // Same grant as a run the user starts from the composer: the
+                // engine stamps Workers and, for a root chat, `zeron` +
+                // `comet-sessions`. Without it the target ran with no way to
+                // answer the `send_message` the attribution asks for.
                 let request = RunRequest {
-                    enable_workers_mcp: false,
+                    enable_workers_mcp: true,
                     workers_parent_chat_id: None,
                     sessions: None,
                     mcp: None,
@@ -1467,6 +1471,10 @@ mod tests {
         assert_eq!(params["command"]["request"]["cwd"], "/repo/comet");
         assert_eq!(params["command"]["request"]["harness"], "claude-code");
         assert_eq!(params["command"]["request"]["model"], "opus");
+        assert_eq!(
+            params["command"]["request"]["enableWorkersMcp"], true,
+            "the run must carry the tools the reply instructions name"
+        );
     }
 
     #[tokio::test]
