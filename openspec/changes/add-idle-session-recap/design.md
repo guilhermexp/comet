@@ -102,3 +102,7 @@ pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
     IdleRecapAction::Arm { delay_ms: clamped_seconds * 1000 }
 }
 ```
+
+## Revisão 2026-10-15: recap persistente
+
+O esboço acima apagava o recap (`Clear`) em streaming, draft e falha de geração, e o `prune_idle_recaps` expirava entradas com mais de 24h. Na prática a linha sumia a cada turno novo (inclusive aviso de worker) e só voltava após 4 min ociosos com o chat selecionado. Agora: o recap salvo fica até ser substituído; `Clear` só quando o recurso é desligado; sem expiração por idade; chave sem o `:root:<cwd>` (`recap_key`), com migração das chaves antigas (`migrate_recap_keys`).

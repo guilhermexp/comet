@@ -12,9 +12,6 @@ pub const IDLE_RECAP_MIN_SECONDS: u64 = 60;
 pub const IDLE_RECAP_MAX_SECONDS: u64 = 600;
 /// Default seconds of idle before generating a recap.
 pub const IDLE_RECAP_DEFAULT_SECONDS: u64 = 240;
-
-/// Maximum age of a stored recap before it is pruned (24 hours in milliseconds).
-pub const IDLE_RECAP_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 /// Bound on the persisted map (newest wins).
 pub const IDLE_RECAP_MAX_ENTRIES: usize = 50;
 
@@ -55,11 +52,12 @@ pub struct IdleRecapState<'a> {
 pub enum IdleRecapAction {
     /// Nothing to do and nothing stored.
     None,
-    /// Drop the stored recap (superseded epoch, live turn, or feature disabled).
+    /// Drop the stored recap (feature disabled).
     Clear,
     /// A recap for the current epoch exists — show it, do not re-arm.
     Keep,
     /// Idle with no recap for this epoch — arm the timer with clamped milliseconds.
+    /// A stored older recap stays visible until the new one replaces it.
     Arm { delay_ms: u64 },
 }
 
@@ -67,8 +65,16 @@ pub enum IdleRecapAction {
 pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
     let has_entry = state.entry.is_some();
 
-    // Feature off or this epoch already failed to generate: never render, never arm.
-    if !state.enabled || !state.can_generate {
+    // A stored recap stays until a newer one replaces it: every path below
+    // that cannot generate keeps it on screen. Only turning the feature off
+    // removes it.
+    let hold = if has_entry {
+        IdleRecapAction::Keep
+    } else {
+        IdleRecapAction::None
+    };
+
+    if !state.enabled {
         return if has_entry {
             IdleRecapAction::Clear
         } else {
@@ -76,13 +82,10 @@ pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
         };
     }
 
-    // A turn in flight is replacing the state the line describes.
-    if state.is_streaming {
-        return if has_entry {
-            IdleRecapAction::Clear
-        } else {
-            IdleRecapAction::None
-        };
+    // This epoch already failed to generate, or a turn is in flight: the
+    // line is behind, but losing it would leave nothing to read.
+    if !state.can_generate || state.is_streaming {
+        return hold;
     }
 
     // Fresh recap for this exact epoch: show it, don't regenerate.
@@ -96,11 +99,7 @@ pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
     // No transcript: chat mounted before messages hydrated from storage.
     // Preserves persisted recaps across app launch.
     if state.message_count == 0 {
-        return if has_entry {
-            IdleRecapAction::Keep
-        } else {
-            IdleRecapAction::None
-        };
+        return hold;
     }
 
     // Compaction is rewriting the transcript under the line: never arm.
@@ -111,21 +110,12 @@ pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
     // that chat. Compaction's own transcript marker bumps the epoch, which is
     // what supersedes the entry.
     if state.is_compacting {
-        return if has_entry {
-            IdleRecapAction::Keep
-        } else {
-            IdleRecapAction::None
-        };
+        return hold;
     }
 
     // Draft text: user is actively composing, don't arm.
-    // Stored entry for a different epoch is stale and dropped.
     if state.has_draft {
-        return if has_entry {
-            IdleRecapAction::Clear
-        } else {
-            IdleRecapAction::None
-        };
+        return hold;
     }
 
     let clamped_seconds = state
@@ -208,15 +198,41 @@ pub fn should_dispatch_idle_recap(dispatch: &IdleRecapDispatch) -> bool {
         && dispatch.is_active_chat
 }
 
-/// Read/write boundary for the persisted recap map: drops expired and malformed entries,
+/// Read/write boundary for the persisted recap map: drops malformed entries,
 /// then retains the newest [`IDLE_RECAP_MAX_ENTRIES`].
+/// The part of a context key that names the chat. Context keys end in
+/// `:root:<cwd>`; a recap belongs to the chat, so a chat whose cwd changes
+/// (worktree, symlinked workspace) keeps finding it.
+pub fn recap_key(context_key: &str) -> &str {
+    context_key
+        .split_once(":root:")
+        .map_or(context_key, |(chat, _)| chat)
+}
+
+/// Re-keys entries persisted under the older rooted key, keeping the newest
+/// per chat.
+pub fn migrate_recap_keys(entries: &mut HashMap<String, IdleRecapEntry>) {
+    if !entries.keys().any(|key| key.contains(":root:")) {
+        return;
+    }
+    let mut migrated: HashMap<String, IdleRecapEntry> = HashMap::with_capacity(entries.len());
+    for (key, entry) in entries.drain() {
+        let key = recap_key(&key).to_owned();
+        match migrated.get(&key) {
+            Some(existing) if existing.generated_at >= entry.generated_at => {}
+            _ => {
+                migrated.insert(key, entry);
+            }
+        }
+    }
+    *entries = migrated;
+}
+
 pub fn prune_idle_recaps(entries: &mut HashMap<String, IdleRecapEntry>, now: u64) {
-    // 1. Drop malformed or expired entries (older than 24h or future timestamps)
+    // 1. Drop malformed entries (future timestamps included). No age limit:
+    //    a recap is where the chat stopped, however long ago that was.
     entries.retain(|_, entry| {
-        !entry.text.trim().is_empty()
-            && entry.epoch > 0
-            && entry.generated_at <= now
-            && now.saturating_sub(entry.generated_at) <= IDLE_RECAP_MAX_AGE_MS
+        !entry.text.trim().is_empty() && entry.epoch > 0 && entry.generated_at <= now
     });
 
     // 2. Bound to IDLE_RECAP_MAX_ENTRIES newest
@@ -309,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_idle_recap_clears_on_streaming_or_draft() {
+    fn test_evaluate_idle_recap_keeps_through_streaming_draft_and_failure() {
         let entry = sample_entry(4, 1000, 10_000);
         let state_streaming = IdleRecapState {
             enabled: true,
@@ -321,17 +337,28 @@ mod tests {
             entry: Some(&entry),
             delay_seconds: 240,
         };
-        assert_eq!(
-            evaluate_idle_recap(&state_streaming),
-            IdleRecapAction::Clear
-        );
+        assert_eq!(evaluate_idle_recap(&state_streaming), IdleRecapAction::Keep);
 
         let state_draft = IdleRecapState {
             is_streaming: false,
             has_draft: true,
             ..state_streaming
         };
-        assert_eq!(evaluate_idle_recap(&state_draft), IdleRecapAction::Clear);
+        assert_eq!(evaluate_idle_recap(&state_draft), IdleRecapAction::Keep);
+
+        let state_failed = IdleRecapState {
+            can_generate: false,
+            has_draft: false,
+            ..state_draft
+        };
+        assert_eq!(evaluate_idle_recap(&state_failed), IdleRecapAction::Keep);
+
+        // Only turning the feature off removes it.
+        let state_disabled = IdleRecapState {
+            enabled: false,
+            ..state_failed
+        };
+        assert_eq!(evaluate_idle_recap(&state_disabled), IdleRecapAction::Clear);
     }
 
     #[test]
@@ -477,7 +504,7 @@ mod tests {
 
         // Valid recent entry
         map.insert("chat-1".to_string(), sample_entry(2, 3600 * 1000, now));
-        // Expired entry (25h old)
+        // Old entry (25h): recaps do not expire by age.
         map.insert("chat-2".to_string(), sample_entry(2, 25 * 3600 * 1000, now));
         // Future timestamp entry
         map.insert(
@@ -499,7 +526,41 @@ mod tests {
         );
 
         prune_idle_recaps(&mut map, now);
-        assert_eq!(map.len(), 1);
+        assert_eq!(map.len(), 2);
         assert!(map.contains_key("chat-1"));
+        assert!(map.contains_key("chat-2"));
+    }
+
+    #[test]
+    fn recap_key_drops_the_working_directory() {
+        assert_eq!(
+            recap_key("orchestrator-chat:c1:device:d1:root:/work/a"),
+            "orchestrator-chat:c1:device:d1"
+        );
+        assert_eq!(recap_key("orchestrator-chat:c1"), "orchestrator-chat:c1");
+    }
+
+    #[test]
+    fn migrate_recap_keys_rekeys_rooted_entries_keeping_the_newest() {
+        let now = 100_000_000;
+        let mut map = HashMap::new();
+        map.insert(
+            "orchestrator-chat:c1:device:d1:root:/old".to_string(),
+            sample_entry(3, 5000, now),
+        );
+        map.insert(
+            "orchestrator-chat:c1:device:d1:root:/new".to_string(),
+            sample_entry(7, 1000, now),
+        );
+        map.insert(
+            "orchestrator-chat:c2:device:d1".to_string(),
+            sample_entry(2, 1000, now),
+        );
+
+        migrate_recap_keys(&mut map);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["orchestrator-chat:c1:device:d1"].epoch, 7);
+        assert!(map.contains_key("orchestrator-chat:c2:device:d1"));
     }
 }

@@ -86,6 +86,7 @@ impl DetailsSidebarState {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        super::idle_recap::migrate_recap_keys(&mut preferences.idle_recaps);
         super::idle_recap::prune_idle_recaps(&mut preferences.idle_recaps, now);
         // Builds that had a Files tree also stored its expanded file paths here.
         for markers in preferences.expanded.values_mut() {
@@ -144,7 +145,9 @@ impl DetailsSidebarState {
     }
 
     pub fn idle_recap_for(&self, context_key: &str) -> Option<&super::idle_recap::IdleRecapEntry> {
-        self.preferences.idle_recaps.get(context_key)
+        self.preferences
+            .idle_recaps
+            .get(super::idle_recap::recap_key(context_key))
     }
 
     pub fn set_idle_recap(
@@ -156,12 +159,16 @@ impl DetailsSidebarState {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.preferences.idle_recaps.insert(context_key, entry);
+        self.preferences
+            .idle_recaps
+            .insert(super::idle_recap::recap_key(&context_key).to_owned(), entry);
         super::idle_recap::prune_idle_recaps(&mut self.preferences.idle_recaps, now);
     }
 
     pub fn clear_idle_recap(&mut self, context_key: &str) {
-        self.preferences.idle_recaps.remove(context_key);
+        self.preferences
+            .idle_recaps
+            .remove(super::idle_recap::recap_key(context_key));
     }
 
     pub fn widget_hidden(&self, widget_id: &str) -> bool {

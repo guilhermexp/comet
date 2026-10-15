@@ -35,13 +35,14 @@ If no clean content remains, it SHALL return `None`.
 - **THEN** it SHALL return "Fixed the leak; next is running the test suite.".
 
 ### Requirement: Idle Arming Policy
-The UI recap evaluator SHALL decide whether to arm, keep, clear, or ignore based on session idle state:
-- If disabled or cannot generate, it SHALL clear any existing entry.
-- If streaming or compacting, it SHALL clear any existing entry.
+The UI recap evaluator SHALL decide whether to arm, keep, clear, or ignore based on session idle state. A stored recap SHALL stay visible until a newer recap replaces it; the only path that removes it is the feature being disabled.
+- If disabled, it SHALL clear any existing entry.
+- If the current epoch already failed to generate, it SHALL keep any existing entry and not arm.
+- If streaming or compacting, it SHALL keep any existing entry and not arm.
 - If the entry's epoch matches the current message count, it SHALL keep the existing entry without re-arming.
 - If message count is zero, it SHALL preserve an existing entry to prevent startup hydration races.
-- If composer has draft text, it SHALL clear any stale entry.
-- Otherwise, it SHALL arm a timer with delay clamped between 60 and 600 seconds.
+- If composer has draft text, it SHALL keep any existing entry and not arm.
+- Otherwise, it SHALL arm a timer with delay clamped between 60 and 600 seconds, leaving the existing entry visible until the new recap replaces it.
 
 #### Scenario: Epoch matching keeps entry
 - **GIVEN** an existing recap generated at epoch 12
@@ -49,16 +50,29 @@ The UI recap evaluator SHALL decide whether to arm, keep, clear, or ignore based
 - **WHEN** `evaluate_idle_recap` evaluates the state
 - **THEN** it SHALL return `IdleRecapAction::Keep`.
 
+#### Scenario: A new turn does not erase the recap
+- **GIVEN** an existing recap generated at epoch 12
+- **WHEN** the chat starts streaming, or the composer holds a draft, or generation for the new epoch fails
+- **THEN** `evaluate_idle_recap` SHALL return `IdleRecapAction::Keep`.
+
 ### Requirement: Retention and Pruning
 Persisted recaps SHALL be pruned on read and write.
-Entries older than 24 hours (`IDLE_RECAP_MAX_AGE_MS`) SHALL be dropped.
-Entries with timestamps in the future SHALL be dropped.
+Recaps SHALL NOT expire by age.
+Entries with empty text, a zero epoch, or a timestamp in the future SHALL be dropped.
 The map SHALL be capped at the 50 newest entries.
 
-#### Scenario: Expired entry dropped
+#### Scenario: Old entry survives
 - **GIVEN** a recap entry generated 25 hours ago
 - **WHEN** `prune_idle_recaps` runs
-- **THEN** the entry SHALL be removed from the map.
+- **THEN** the entry SHALL remain in the map.
+
+### Requirement: Recap key ignores the working directory
+A recap SHALL be stored under the chat's identity (kind, chat id and device), not under its working directory, so a chat whose cwd changes still finds its recap. Entries persisted under the older rooted key SHALL be migrated on load, keeping the newest one per chat.
+
+#### Scenario: Rooted key migrated
+- **GIVEN** a persisted entry keyed `orchestrator-chat:c1:device:d1:root:/work`
+- **WHEN** the sidebar preferences load
+- **THEN** the entry SHALL be found for the context key `orchestrator-chat:c1:device:d1:root:/other`.
 
 ### Requirement: Isolated recap execution
 Recaps SHALL reuse the tool-free isolated execution used by automatic titles, with recap-specific instructions and the original recap prompt. The process SHALL run in a temporary directory with autoapproval and Workers MCP disabled. An unsupported harness SHALL use an enabled compatible harness or return no recap. Tool events, incomplete streams and timeout SHALL never yield a successful recap.
