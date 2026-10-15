@@ -63,6 +63,9 @@ pub(crate) struct Artifact {
     pub(crate) subagent_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
+    /// Worker only: its last known activity (`done`, `working`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +203,7 @@ impl ExportDoc {
                                 output_bytes: None,
                                 subagent_ref: None,
                                 session_id: None,
+                                status: None,
                             });
                         }
 
@@ -213,6 +217,7 @@ impl ExportDoc {
                                 output_bytes: None,
                                 subagent_ref: Some(subagent_ref.clone()),
                                 session_id: None,
+                                status: None,
                             });
                         }
 
@@ -226,6 +231,7 @@ impl ExportDoc {
                                 output_bytes: *output_bytes,
                                 subagent_ref: None,
                                 session_id: None,
+                                status: None,
                             });
                         }
                     }
@@ -244,15 +250,25 @@ impl ExportDoc {
         }
 
         for worker in workers {
+            // The `launch_worker` call that started it, when its result names
+            // the session: places the worker in the transcript like the
+            // other artifacts instead of floating at the end.
+            let launch = launch_position(entries, &worker.session_id);
+            let status = [&worker.activity, &worker.state]
+                .into_iter()
+                .map(|value| value.trim())
+                .find(|value| !value.is_empty())
+                .map(str::to_owned);
             artifacts.push(Artifact {
                 kind: ArtifactKind::Worker,
-                message_ix: None,
-                part_ix: None,
+                message_ix: launch.map(|(message_ix, _)| message_ix),
+                part_ix: launch.map(|(_, part_ix)| part_ix),
                 tool: worker.title.clone(),
                 path: None,
                 output_bytes: None,
                 subagent_ref: None,
                 session_id: Some(worker.session_id.clone()),
+                status,
             });
         }
 
@@ -262,6 +278,45 @@ impl ExportDoc {
             artifacts,
         }
     }
+}
+
+/// `(message, part)` of the `workers` `launch_worker` call whose result
+/// carries `session_id`.
+fn launch_position(entries: &[SessionMessageEntry], session_id: &str) -> Option<(usize, usize)> {
+    if session_id.is_empty() {
+        return None;
+    }
+    entries
+        .iter()
+        .enumerate()
+        .find_map(|(message_ix, message)| {
+            message
+                .parts
+                .iter()
+                .enumerate()
+                .find_map(|(part_ix, part)| {
+                    let MessagePart::Tool {
+                        call,
+                        output: Some(output),
+                        ..
+                    } = part
+                    else {
+                        return None;
+                    };
+                    let (name, input) = match call {
+                        ToolCall::Mcp { tool, input, .. } => (tool, input),
+                        ToolCall::Unknown { name, input } => (name, input),
+                        _ => return None,
+                    };
+                    let launches = name.rsplit("__").next() == Some("workers")
+                        && input
+                            .as_ref()
+                            .and_then(|input| input.get("action"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("launch_worker");
+                    (launches && output.contains(session_id)).then_some((message_ix, part_ix))
+                })
+        })
 }
 
 fn export_tool(call: &ToolCall) -> ExportTool {
@@ -391,6 +446,9 @@ fn render_markdown_artifact(artifact: &Artifact) -> String {
     }
     if let Some(output_bytes) = artifact.output_bytes {
         rendered.push_str(&format!(" · {output_bytes} bytes"));
+    }
+    if let Some(status) = &artifact.status {
+        rendered.push_str(&format!(" · {}", single_line(status)));
     }
     if let (Some(message_ix), Some(part_ix)) = (artifact.message_ix, artifact.part_ix) {
         rendered.push_str(&format!(" · message {message_ix}, part {part_ix}"));
@@ -535,6 +593,9 @@ fn render_text_artifact(artifact: &Artifact) -> String {
     }
     if let Some(output_bytes) = artifact.output_bytes {
         rendered.push_str(&format!(" ({output_bytes} bytes)"));
+    }
+    if let Some(status) = &artifact.status {
+        rendered.push_str(&format!(" [{}]", single_line(status)));
     }
     if let (Some(message_ix), Some(part_ix)) = (artifact.message_ix, artifact.part_ix) {
         rendered.push_str(&format!(" @ message {message_ix}, part {part_ix}"));
@@ -1161,6 +1222,50 @@ Hello\n"
     }
 
     #[test]
+    fn worker_artifact_points_at_the_launch_call_that_named_its_session() {
+        let launch = |id: &str, output: &str| {
+            tool_part(
+                id,
+                ToolCall::Mcp {
+                    server: "comet-workers".into(),
+                    tool: "workers".into(),
+                    input: Some(serde_json::json!({ "action": "launch_worker" })),
+                },
+                Some(output),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let mut first = message("m0", MessageRole::User, "go");
+        first
+            .parts
+            .push(launch("t0", r#"{"sessionId":"worker-other"}"#));
+        let mut second = message("m1", MessageRole::Assistant, "launching");
+        second
+            .parts
+            .push(launch("t1", r#"{"sessionId":"worker-1"}"#));
+        let mut done = worker("worker-1", "Build", WorkerSemantic::Terminal);
+        done.activity = "done".into();
+
+        let doc = ExportDoc::from_transcript(
+            metadata("Launch"),
+            &[first, second],
+            &[
+                done,
+                worker("worker-unseen", "Lost", WorkerSemantic::Working),
+            ],
+        );
+        let markdown = render_markdown(&doc);
+
+        assert!(markdown.contains("- **Worker** `Build` `worker-1` · done · message 1, part 1\n"));
+        // No launch call names it: no invented position, status still shown.
+        assert!(markdown.contains("- **Worker** `Lost` `worker-unseen` · building\n"));
+    }
+
+    #[test]
     fn review_regression_worker_title_stays_within_artifact_line() {
         let title = "Build `x`\n## forged";
         let doc = ExportDoc::from_transcript(
@@ -1174,9 +1279,9 @@ Hello\n"
         let json = render_json(&doc).expect("serialize export");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse export");
 
-        assert!(markdown.contains("- **Worker** ``Build `x` ## forged`` `worker-1`\n"));
+        assert!(markdown.contains("- **Worker** ``Build `x` ## forged`` `worker-1` · building\n"));
         assert!(!markdown.contains("\n## forged"));
-        assert!(text.contains("- worker Build `x` ## forged worker-1\n"));
+        assert!(text.contains("- worker Build `x` ## forged worker-1 [building]\n"));
         assert!(!text.contains("\n## forged"));
         assert_eq!(parsed["artifactIndex"][0]["tool"], title);
     }
@@ -1247,13 +1352,13 @@ Hello\n"
 ## Artifacts\n\n\
 - **File write** `Write` `src/shared.rs` · message 0, part 1\n\
 - **Subagent** `Agent` `subagent-doc-shared` · message 1, part 1\n\
-- **Worker** `Build frontend` `worker-ses-shared`\n"
+- **Worker** `Build frontend` `worker-ses-shared` · building\n"
         ));
         assert!(text.contains(
             "ARTIFACTS:\n\
 - file-write Write src/shared.rs @ message 0, part 1\n\
 - subagent Agent subagent-doc-shared @ message 1, part 1\n\
-- worker Build frontend worker-ses-shared\n"
+- worker Build frontend worker-ses-shared [building]\n"
         ));
 
         for rendered in [&markdown, &text, &json] {
@@ -1283,6 +1388,7 @@ Hello\n"
         assert_eq!(parsed["artifactIndex"][2]["kind"], "worker");
         assert_eq!(parsed["artifactIndex"][2]["tool"], "Build frontend");
         assert_eq!(parsed["artifactIndex"][2]["sessionId"], "worker-ses-shared");
+        assert_eq!(parsed["artifactIndex"][2]["status"], "building");
         assert!(parsed["artifactIndex"][2].get("messageIx").is_none());
         assert!(parsed["artifactIndex"][2].get("partIx").is_none());
         assert_eq!(parsed["messages"][1]["parts"][1]["kind"], "tool");
