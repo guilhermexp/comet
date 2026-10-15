@@ -881,6 +881,8 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
+    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
+    pub update: Option<zeron_update::UpdateStatus>,
     /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
     /// standing stream may be backed by subprocess and network probes.
     pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
@@ -1001,6 +1003,7 @@ impl AppState {
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
+            update: None,
             harness_updates: Vec::new(),
             data_dir: None,
             clock: ClockTransitions::default(),
@@ -1566,6 +1569,14 @@ impl AppState {
             return false;
         }
         self.harness_updates = statuses;
+        true
+    }
+
+    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) -> bool {
+        if self.update.as_ref() == Some(&status) {
+            return false;
+        }
+        self.update = Some(status);
         true
     }
 
@@ -2530,6 +2541,7 @@ impl AppState {
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
+        self.update = None;
         self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
         cx.notify();
     }
@@ -2733,6 +2745,14 @@ impl AppState {
                 handle.clone(),
                 methods::AUTH_STATUS,
                 AppState::apply_auth_value,
+            ),
+            // App release checker (crates/update); absent when the engine
+            // spawned no checker — the stream then never yields a frame.
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::UPDATE_STATUS,
+                AppState::apply_update,
             ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);

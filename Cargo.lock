@@ -14005,6 +14005,7 @@ dependencies = [
  "zeron-rpc",
  "zeron-syntax",
  "zeron-theme",
+ "zeron-update",
  "zeron-veil",
  "zeron-voice",
  "zeron-voice-media",

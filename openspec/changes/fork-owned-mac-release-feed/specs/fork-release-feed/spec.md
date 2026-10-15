@@ -31,3 +31,12 @@ No scheduled job SHALL merge upstream code into the fork. The sync workflow SHAL
 - **Test:** manual
 - **WHEN** no one dispatches the sync workflow
 - **THEN** the fork's `main` receives no upstream commits
+
+### Requirement: The installed Mac app offers the update in the sidebar
+
+When the engine's `UpdateStatus` stream reports a newer release, the sidebar SHALL show an update strip above the user menu. On a macOS bundle install the app SHALL download and verify the release in the background without a click, then offer "Restart to update"; clicking it SHALL swap the bundle and relaunch. A failed download SHALL show the error and retry on click, never in a loop. On other installs the strip SHALL be advisory (`zeron update`) and dismissible per version.
+
+#### Scenario: Release seen by a bundle install
+- **Test:** manual
+- **WHEN** `/Applications/Zeron.app` 1.0.0 sees release 1.0.1 in the feed
+- **THEN** the strip shows "Downloading v1.0.1…", then "Restart to update to v1.0.1", and a click relaunches into 1.0.1

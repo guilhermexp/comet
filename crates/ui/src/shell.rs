@@ -79,6 +79,7 @@ use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
 use crate::workers::workspace::{WorkersContent, WorkersSidebar, WorkersSidebarEvent};
 
 mod actions_ui;
+mod app_update;
 mod chat_dropzone;
 #[cfg(test)]
 mod chat_dropzone_tests;
@@ -2751,6 +2752,8 @@ pub struct Shell {
     auth_task: Option<Task<()>>,
     runtime_change_task: Option<Task<()>>,
     runtime_change_error: Option<SharedString>,
+    /// In-app update lifecycle for this process (see `shell/app_update.rs`).
+    app_update: app_update::AppUpdate,
     /// The one-time local→synced import stream (switch wizard progress step).
     import_task: Option<Task<()>>,
     /// Title of the chat the import stream is copying right now.
@@ -3431,6 +3434,7 @@ impl Shell {
             auth_task: None,
             runtime_change_task: None,
             runtime_change_error: None,
+            app_update: app_update::AppUpdate::new(),
             import_task: None,
             import_current: None,
             toasts: Vec::new(),
@@ -11605,6 +11609,10 @@ impl Shell {
             // appearing IS the signal.
             .when_some(self.render_connection_pill(theme, cx), |el, pill| {
                 el.child(pill)
+            })
+            // App update strip (fork release feed): above the user menu.
+            .when_some(self.render_update_strip(theme, cx), |el, strip| {
+                el.child(strip)
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
