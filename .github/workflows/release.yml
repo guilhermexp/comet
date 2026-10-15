@@ -1,15 +1,18 @@
 name: release
 
-# Build release artifacts and publish them:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
-#   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-# then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at zeron.sh/releases/* for
-# `curl -fsSL https://zeron.sh/install.sh | sh`), bumping latest.txt.
+# Fork release (macOS only). The installed app's updater (crates/update) reads
+# https://github.com/guilhermexp/comet/releases/latest/download/manifest.json,
+# so every update the Mac receives comes from this fork. Upstream changes ship
+# only after the owner merges them into main by hand.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
-# workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
+# workflow_dispatch (builds + uploads workflow artifacts, no release).
+#
+# Publishes a GitHub Release with:
+#   zeron-<ver>-macos-arm64.dmg          (manual install)
+#   zeron-<ver>-macos-arm64-app.tar.gz   (auto-updater payload)
+#   manifest.json                        (version + sha256 per artifact)
 
 on:
   push:
@@ -20,41 +23,6 @@ permissions:
   contents: write
 
 jobs:
-  linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04 # x86_64
-          - runner: ubuntu-24.04-arm # aarch64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: gpui system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxcb1-dev libx11-xcb-dev \
-            libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake
-      - name: rust toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - name: package
-        run: scripts/package-linux.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-${{ runner.arch }}
-          path: target/package/*.tar.gz
-          if-no-files-found: error
-
-  # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
-  # been type-checked against the Apple SDK — this job may surface errors on
-  # its first runs. continue-on-error keeps the Linux release shippable.
-  #
   # Signing/notarization (both optional — absent secrets fall back to an
   # ad-hoc-signed build):
   #   MACOS_CERT_P12 / MACOS_CERT_PASSWORD — base64 "Developer ID Application"
@@ -64,7 +32,6 @@ jobs:
   #     script notarizes and staples the app + dmg (no Gatekeeper warning).
   macos:
     runs-on: macos-latest # Apple silicon
-    continue-on-error: true
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -119,13 +86,8 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
+    needs: [macos]
     runs-on: ubuntu-latest
-    env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: b57dde68ee5964dccc025437b5478a5b
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -138,29 +100,20 @@ jobs:
           ls dist/ | grep -q "zeron-$ver-" \
             || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
-      - name: upload to R2 (zeron.sh/releases/*)
-        if: env.CLOUDFLARE_API_TOKEN != ''
+      - name: manifest.json
         run: |
-          for f in dist/*; do
-            npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
-              --file "$f" --remote
-          done
-          # manifest.json: version + per-artifact sha256 — the auto-updater
-          # (crates/update) verifies downloads against it. Published before
-          # latest.txt so no client ever sees a version without its checksums.
+          # version + per-artifact sha256 — the auto-updater (crates/update)
+          # verifies downloads against it.
           manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
           for f in dist/*; do
             sha=$(sha256sum "$f" | cut -d' ' -f1)
             manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
           done
-          printf '%s' "$manifest" > manifest.json
-          npx wrangler@4 r2 object put comet-native-releases/manifest.json \
-            --file manifest.json --remote
-          printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put comet-native-releases/latest.txt \
-            --file latest.txt --remote
+          printf '%s' "$manifest" > dist/manifest.json
+          cat dist/manifest.json
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          make_latest: true

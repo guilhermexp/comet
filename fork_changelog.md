@@ -9,6 +9,13 @@ Tracks local/private fork changes against upstream.
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
 
+## 2026-10-15 — Feed de update próprio (Mac)
+
+- O app instalado se atualiza só das GitHub Releases do fork
+  (`COMET_RELEASES_URL`); `release.yml` virou só macOS (dmg, tarball do app,
+  `manifest.json`), sem Linux nem R2. `sync-fork.yml` perdeu o cron: upstream
+  entra só por merge manual. Versão própria a partir de `1.0.0`.
+
 ## 2026-10-14 — Base upstream v0.2.112 preparada
 
 - Scratch por Chat sem Project, home names-only, worktrees de Chat com destino

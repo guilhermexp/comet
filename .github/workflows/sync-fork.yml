@@ -20,9 +20,9 @@
 # SOFTWARE.
 name: Sync fork with upstream
 
+# Manual only: upstream code enters the fork when the owner dispatches this
+# (or merges by hand), never on a schedule.
 on:
-  schedule:
-    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 concurrency:

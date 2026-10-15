@@ -301,18 +301,21 @@ fn release_base(edge_url: &str) -> anyhow::Result<String> {
     edge_release_base(edge_url)
 }
 
+/// The fork's own feed: GitHub Releases of `guilhermexp/comet`, published by
+/// `.github/workflows/release.yml` (dmg, app tarball, `manifest.json`).
+const COMET_RELEASES_URL: &str = "https://github.com/guilhermexp/comet/releases/latest/download";
+
 /// `{edge}/releases`, except on the upstream Zeron edge: its feed publishes
-/// Zeron builds (a newer version line), so a Comet install would "update"
-/// into another product. Comet has no hosted feed; set `ZERON_RELEASES_URL`.
+/// Zeron builds, so a Comet install would "update" into another product.
+/// There the fork's GitHub Releases feed ([`COMET_RELEASES_URL`]) applies.
 fn edge_release_base(edge_url: &str) -> anyhow::Result<String> {
     let edge_url = edge_url.trim_end_matches('/');
     let host = reqwest::Url::parse(edge_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
-    anyhow::ensure!(
-        !host.is_some_and(|host| host == "zeron.sh" || host.ends_with(".zeron.sh")),
-        "no Comet release feed configured (set ZERON_RELEASES_URL)"
-    );
+    if host.is_some_and(|host| host == "zeron.sh" || host.ends_with(".zeron.sh")) {
+        return Ok(COMET_RELEASES_URL.to_owned());
+    }
     Ok(format!("{edge_url}/releases"))
 }
 
@@ -1384,13 +1387,17 @@ mod tests {
     }
 
     #[test]
-    fn upstream_zeron_edge_is_not_a_comet_release_feed() {
+    fn upstream_zeron_edge_uses_the_fork_release_feed() {
         for edge in [
             "https://edge.zeron.sh",
             "https://zeron.sh/",
             "https://EDGE.Zeron.sh",
         ] {
-            assert!(edge_release_base(edge).is_err(), "accepted {edge}");
+            assert_eq!(
+                edge_release_base(edge).unwrap(),
+                COMET_RELEASES_URL,
+                "{edge}"
+            );
         }
         assert_eq!(
             edge_release_base("https://edge.example.com/").unwrap(),

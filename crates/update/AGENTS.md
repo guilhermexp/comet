@@ -36,7 +36,7 @@ Single `lib.rs` covering:
 Owns: release discovery, download + sha256 verification, staging, install-kind
 detection, the apply/restart mechanics, check cadence. Does NOT own: the
 release pipeline itself (`.github/workflows/release.yml`,
-`edge/src/install.sh`, the `comet-native-releases` R2 bucket) or the UI
+`edge/src/install.sh`, the fork's GitHub Releases) or the UI
 presentation of `UpdateStatus`.
 
 ## Local Contracts
@@ -44,11 +44,13 @@ presentation of `UpdateStatus`.
 - Artifact names and the manifest schema are a contract with the release
   workflow and `edge/src/install.sh` — a mismatch silently breaks updates;
   `artifact_names_match_packaging` pins the current pairs.
-- **No feed on the upstream Zeron edge.** `{edge.zeron.sh}/releases` publishes
-  Zeron builds on another version line; treating it as ours would "update" a
-  Comet install into Zeron. `release_base` refuses `zeron.sh`/`*.zeron.sh`
-  unless `ZERON_RELEASES_URL` names a feed, and the engine only spawns the
-  checker when `has_release_feed` holds. Self-hosted edges keep `{edge}/releases`.
+- **The fork's feed replaces the upstream Zeron edge's.** `{edge.zeron.sh}/releases`
+  publishes Zeron builds; treating it as ours would "update" a Comet install
+  into Zeron. `edge_release_base` maps `zeron.sh`/`*.zeron.sh` to
+  `COMET_RELEASES_URL` (the fork's GitHub Releases, `latest/download`), which
+  `.github/workflows/release.yml` fills with the macOS dmg, app tarball and
+  `manifest.json`. `ZERON_RELEASES_URL` still overrides; self-hosted edges keep
+  `{edge}/releases`. The client follows GitHub's HTTPS redirects.
 - Downloaded bytes are verified against the manifest sha256 before staging;
   only pre-manifest `latest.txt` releases may skip verification (and must log).
 - `apply_headless` flips the `current` symlink atomically; never patch a

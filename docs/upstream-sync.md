@@ -23,7 +23,7 @@ Primeiro uso da skill: [2026-10-09, sem novidades](../.upstream-sync/history/202
 
 ## Automação recorrente
 
-O [workflow sync-fork](../.github/workflows/sync-fork.yml), instalado a partir de `sync-fork` 1.1.0 do harness, executa no GitHub Actions (`ubuntu-latest`), não na box. Origem: branch padrão de `zeronsh/zeron`; destino fixo: `guilhermexp/comet:main`. Cron `17 */6 * * *`: 00:17, 06:17, 12:17 e 18:17 UTC, sujeito à fila do GitHub. Há disparo manual em [Actions](https://github.com/guilhermexp/comet/actions/workflows/sync-fork.yml).
+O [workflow sync-fork](../.github/workflows/sync-fork.yml), instalado a partir de `sync-fork` 1.1.0 do harness, executa no GitHub Actions (`ubuntu-latest`), não na box. Origem: branch padrão de `zeronsh/zeron`; destino fixo: `guilhermexp/comet:main`. Sem agendamento desde 2026-10-15 (decisão do dono): o upstream só entra no fork por disparo manual em [Actions](https://github.com/guilhermexp/comet/actions/workflows/sync-fork.yml) ou merge à mão, e chega ao Mac instalado pela release do próprio fork (`fork-release-feed`).
 
 - **Sem conflito:** API `merge-upstream` atualiza diretamente o fork, conforme autorizado pelo dono. Merge textual limpo não comprova compatibilidade nem execução dos testes.
 - **Com conflito:** Git confirma os arquivos conflitantes; o workflow publica no fork uma branch no SHA upstream e abre PR draft com data, revisões, arquivos e link do run. O destino não é atualizado e o job termina com falha, pois a integração continua pendente.

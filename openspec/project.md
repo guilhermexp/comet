@@ -53,7 +53,7 @@ local OAuth credential through snapshots or sync.
 - Branch `main`; `origin` = fork `guilhermexp/comet`; `upstream` = `zeronsh/comet`.
 - **Nunca pushar pro upstream.** `gh` precisa de `-R guilhermexp/comet` (o default resolve pro upstream).
 - Mudanças pequenas/localizadas podem ir direto à `main`, conforme `CLAUDE.md`; `no-mistakes` fica para mudanças grandes ou pedido explícito. Status do gate é consultado no checkout principal.
-- Tag `v*` dispara release no R2; push na `main` tocando `edge/` dispara deploy do Worker. Ambos herdados do upstream — não disparar sem intenção.
+- Tag `v*` dispara a release macOS do fork (GitHub Release + `manifest.json`), de onde o app instalado se atualiza; push na `main` tocando `edge/` dispara deploy do Worker (herdado do upstream). Não disparar sem intenção.
 
 ## Domain Context
 
@@ -71,7 +71,8 @@ local OAuth credential through snapshots or sync.
 
 ## External Dependencies
 
-- **Cloudflare** — Workers, Durable Objects, R2 (releases em `comet.zeron.sh`).
+- **Cloudflare** — Workers, Durable Objects, R2.
+- **GitHub Releases** — feed de update do app Mac (`guilhermexp/comet/releases/latest/download`).
 - **WorkOS** — auth (JWKS, code exchange, refresh), via edge.
 - **zeronsh/zui** — extração do gpui pinada por rev; bumps preservam a regressão de pontuação/quebra de linha do fork.
 - **Claude Code / Codex** — CLIs externas dirigidas pelos harnesses; mudança de formato de saída delas quebra o parse.
