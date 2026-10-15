@@ -7,6 +7,8 @@ use zeron_proto::DevServer;
 /// Poll cadence: a listener scan is one `ps` + two `lsof` on the host.
 const DEV_SERVER_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 const DEV_SERVER_ROW_HEIGHT: f32 = 28.0;
+/// Rows shown before the list scrolls inside the card.
+const DEV_SERVER_VISIBLE_ROWS: f32 = 3.5;
 
 pub(super) type DevServerKey = (Option<String>, Vec<String>);
 
@@ -118,7 +120,18 @@ impl DetailsSidebar {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
-        if self.dev_servers.is_empty() && self.dev_server_error.is_none() {
+        // Only what this chat's agent started: a server whose port or dev
+        // command appears in one of the chat's own commands.
+        let visible: Vec<DevServer> = {
+            let transcript = &self.app_state.read(cx).transcript;
+            let commands = chat_commands(transcript);
+            self.dev_servers
+                .iter()
+                .filter(|server| started_by_chat(server, &commands))
+                .cloned()
+                .collect()
+        };
+        if visible.is_empty() && self.dev_server_error.is_none() {
             return None;
         }
         let header = div()
@@ -143,11 +156,9 @@ impl DetailsSidebar {
                 div()
                     .text_size(px(12.0))
                     .text_color(theme.text_muted)
-                    .child(self.dev_servers.len().to_string()),
+                    .child(visible.len().to_string()),
             );
-        let rows = self
-            .dev_servers
-            .clone()
+        let rows = visible
             .into_iter()
             .enumerate()
             .map(|(index, server)| {
@@ -159,7 +170,13 @@ impl DetailsSidebar {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let label = server_label(&server.command);
+                // The dev command reads better than the listener (`next dev`, not
+                // `next-server (v16.3.8)`).
+                let label = server
+                    .signatures
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| server_label(&server.command));
                 let stop = div()
                     .id(("dev-server-stop", index))
                     .debug_selector(move || format!("dev-server-stop-{index}"))
@@ -234,7 +251,13 @@ impl DetailsSidebar {
             .flex()
             .flex_col()
             .child(header)
-            .children(rows);
+            .child(
+                div()
+                    .id("dev-servers-body")
+                    .max_h(px(DEV_SERVER_ROW_HEIGHT * DEV_SERVER_VISIBLE_ROWS))
+                    .overflow_y_scroll()
+                    .children(rows),
+            );
         if let Some(error) = self.dev_server_error.clone() {
             section = section.child(
                 div()
@@ -247,6 +270,49 @@ impl DetailsSidebar {
         }
         Some(div().child(section))
     }
+}
+
+/// Every shell command this chat's agent ran.
+fn chat_commands(transcript: &[zeron_doc::SessionMessageEntry]) -> Vec<String> {
+    transcript
+        .iter()
+        .filter(|entry| entry.role == zeron_doc::MessageRole::Assistant)
+        .flat_map(|entry| entry.parts.iter())
+        .filter_map(|part| match part {
+            zeron_doc::MessagePart::Tool {
+                call: zeron_proto::ToolCall::Exec { command },
+                ..
+            } => Some(command.split_whitespace().collect::<Vec<_>>().join(" ")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The chat started `server` when one of its commands names the port
+/// (`--port 3210`, `localhost:3210`) or runs one of the server's dev
+/// commands (`npm run dev`, `next dev`) as whole words.
+pub(super) fn started_by_chat(server: &DevServer, commands: &[String]) -> bool {
+    let port = server.port.to_string();
+    commands.iter().any(|command| {
+        contains_word(command, &port, |c| c.is_ascii_digit())
+            || server.signatures.iter().any(|signature| {
+                contains_word(command, signature, |c| {
+                    c.is_alphanumeric() || c == '-' || c == '_'
+                })
+            })
+    })
+}
+
+/// `needle` occurs in `haystack` not glued to a `joins` character on either side.
+fn contains_word(haystack: &str, needle: &str, joins: impl Fn(char) -> bool) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(needle).any(|(at, _)| {
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + needle.len()..].chars().next();
+        !before.is_some_and(&joins) && !after.is_some_and(&joins)
+    })
 }
 
 /// The program a listener runs, without paths: `next-server (v16.3.8)`,
@@ -284,7 +350,37 @@ pub(super) fn server_label(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::server_label;
+    use super::{server_label, started_by_chat};
+    use zeron_proto::DevServer;
+
+    fn server(port: u16, signatures: &[&str]) -> DevServer {
+        DevServer {
+            pid: 1,
+            started_at: 1,
+            port,
+            cwd: "/p/bops".into(),
+            root: "/p/bops".into(),
+            command: "next-server".into(),
+            signatures: signatures.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn only_servers_named_by_the_chats_commands_count() {
+        let commands = vec![
+            "cd /p/bops && npx next dev --port 3210 -H 127.0.0.1".to_owned(),
+            "curl http://127.0.0.1:3210/api/tailnet".to_owned(),
+        ];
+        assert!(started_by_chat(&server(3210, &["next dev"]), &commands));
+        // Same dev command, other port: the chat ran `next dev`.
+        assert!(started_by_chat(&server(4000, &["next dev"]), &commands));
+        // Neither the port nor the command: started elsewhere.
+        assert!(!started_by_chat(&server(5173, &["vite"]), &commands));
+        // A port inside a longer number is not that port.
+        assert!(!started_by_chat(&server(321, &["vite"]), &commands));
+        let installs = vec!["npm i vite-plugin-x".to_owned()];
+        assert!(!started_by_chat(&server(5173, &["vite"]), &installs));
+    }
 
     #[test]
     fn labels_drop_paths_and_flags() {

@@ -6,7 +6,7 @@ When an agent starts a development server in the background (for example `next d
 
 ## What Changes
 
-- Details shows a **Servers** section inside the session card while any TCP listener runs inside the chat's folder or any Project worked. Each row shows the port, the program and the project; clicking opens `http://127.0.0.1:<port>`.
+- Details shows a **Servers** section inside the session card for development servers (`npm run dev`, `next dev`, `cargo run`, …) that this chat's agent started inside its folder or any Project worked. Each row shows the port, the dev command and the project; clicking opens `http://127.0.0.1:<port>`. The list scrolls after about three rows.
 - Hovering a row reveals **Stop**. The host re-validates pid, start time and project root, then sends SIGTERM to the listener and its launchers inside the same project (never past a shell, an agent or Zeron).
 - New forwardable RPCs `ListDevServers` and `StopDevServer`; the UI polls every 5 s only while Details shows the session card.
 

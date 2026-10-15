@@ -2,12 +2,17 @@
 
 ### Requirement: Details lists servers running in the chat's projects
 
-Details SHALL show a Servers section listing every TCP listener whose working directory is inside the chat's folder or a Project worked, on the chat's host device, one row per process and port. Zeron's own engine and authentication callbacks SHALL be excluded. The section SHALL be hidden when nothing listens.
+Details SHALL show a Servers section listing development servers whose working directory is inside the chat's folder or a Project worked, on the chat's host device, one row per process and port. A listener SHALL count as a development server only when it or a launcher above it (up to a shell or agent CLI) runs a dev command such as `npm run dev`, `next dev`, `vite`, `cargo run` or `mix phx.server`; databases, caches, agents and browsers SHALL NOT appear. Only servers the chat's agent started SHALL be shown: one of the chat's own shell commands names the server's port or runs one of its dev commands as whole words. The list SHALL show about three rows and scroll inside the card. The section SHALL be hidden when nothing qualifies.
 
 #### Scenario: Agent starts a dev server in a Project worked
 - **Test:** unit
 - **WHEN** a chat in `Orchestrator.v3` worked on `bops` and `next dev --port 3210` listens with cwd `bops`
-- **THEN** Servers shows `:3210 · next-server · bops`
+- **THEN** Servers shows `:3210 · next dev · bops`
+
+#### Scenario: Services the agent did not start
+- **Test:** unit
+- **WHEN** postgres, redis, minio and the agent's own ports listen inside a Project worked
+- **THEN** none of them appears in Servers
 
 ### Requirement: A listed server can be stopped from Details
 

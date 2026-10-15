@@ -75,6 +75,10 @@ pub struct DevServer {
     pub root: String,
     /// Command line, for the row's label.
     pub command: String,
+    /// Dev-server phrases from the launch chain (`npm run dev`, `next dev`),
+    /// matched against the chat's own commands to tell what its agent started.
+    #[serde(default)]
+    pub signatures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
