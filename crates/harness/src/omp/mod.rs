@@ -1,7 +1,7 @@
 //! Native Oh My Pi driver over `omp --mode rpc-ui`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,10 +71,10 @@ Rules:
 /// Appended only when this run will actually register the `workers` host tool.
 /// The mandate inside is unconditional because the block's presence *is* the
 /// condition: a session without the tool never reads a rule promising one, and
-/// a session with it never reads a hedge it has to interpret. Two independent
-/// gates decide the two halves (`is_orchestrator_workspace` for the prompt,
-/// `enable_workers_mcp` for the tool) — composing here is what keeps the text
-/// from describing a surface the session does not have.
+/// a session with it never reads a hedge it has to interpret. The base half
+/// rides every chat run in any workspace; `enable_workers_mcp` gates this half
+/// — composing here is what keeps the text from describing a surface the
+/// session does not have.
 const OMP_ORCHESTRATOR_DELEGATION_APPEND: &str = r#"
 
 Delegation — two substances, never interchangeable:
@@ -89,10 +89,10 @@ Workers do not inherit this conversation. Every briefing must be self-contained:
 const MAX_PENDING_INTERACTIVE_REQUESTS: usize = 32;
 const MAX_INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// The orchestrator system prompt for one run. The delegation half is appended
-/// only when the `workers` tool will actually be registered: two independent
-/// gates decide the two halves, and composing them here is what keeps the text
-/// from mandating a tool the session was never given.
+/// The orchestrator system prompt for one chat run, in any workspace. The
+/// delegation half is appended only when the `workers` tool will actually be
+/// registered: composing it here is what keeps the text from mandating a tool
+/// the session was never given.
 fn orchestrator_system_prompt(workers_expected: bool) -> String {
     let mut prompt = OMP_ORCHESTRATOR_SYSTEM_PROMPT.to_owned();
     if workers_expected {
@@ -120,7 +120,6 @@ enum InteractiveMethod {
 pub struct OmpHarness {
     executable: Option<PathBuf>,
     workers_mcp_executable: Option<PathBuf>,
-    orchestrator_workspace: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
     handshake_timeout: Duration,
     request_timeout: Duration,
@@ -165,9 +164,6 @@ impl Default for OmpHarness {
         Self {
             executable: None,
             workers_mcp_executable: None,
-            orchestrator_workspace: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".orchestrator")),
             env: None,
             handshake_timeout: handshake_timeout_from_env(),
             request_timeout: Duration::from_secs(10),
@@ -188,11 +184,6 @@ impl OmpHarness {
 
     pub fn with_workers_mcp_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.workers_mcp_executable = Some(executable.into());
-        self
-    }
-
-    pub fn with_orchestrator_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
-        self.orchestrator_workspace = Some(workspace.into());
         self
     }
 
@@ -228,15 +219,6 @@ impl OmpHarness {
                     .map(PathBuf::from)
             })
             .or_else(|| crate::find_on_paths("omp", Vec::new()))
-    }
-
-    fn is_orchestrator_workspace(&self, cwd: &Path) -> bool {
-        let Some(expected) = self.orchestrator_workspace.as_deref() else {
-            return false;
-        };
-        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let expected = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
-        cwd == expected
     }
 
     /// Whether this run will register the `workers` host tool. `WorkersBridge`
@@ -352,9 +334,7 @@ impl Harness for OmpHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let cwd = PathBuf::from(&request.cwd);
         let workers_expected = self.workers_tool_expected(&request);
-        let system_prompt_append = self
-            .is_orchestrator_workspace(&cwd)
-            .then(|| orchestrator_system_prompt(workers_expected));
+        let system_prompt_append = Some(orchestrator_system_prompt(workers_expected));
         // Attachments are filesystem work that gates nothing on the child:
         // resolve them BEFORE the spawn so no process sits idle through
         // multi-megabyte reads.

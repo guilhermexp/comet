@@ -20,6 +20,7 @@ internal host modes (`__session_host__` et al.).
 | `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine directly from `third_party/unpeel/crates/unpeel-tui/src/activity.rs` so Start/Stop/PermissionRequest, durable seeds, runtime generations and output fallbacks cannot drift from the pinned TUI frontend; persists provider Session metadata and refreshes provider telemetry fail-soft without replacing the URL Worker identity; rejects nested OMP provider hooks before queue, activity, binding or telemetry mutation, and serves a read-only `?validate=1` notifier preflight; persistence failure invalidates prior telemetry instead of refreshing stale identity; startup migrates the short-lived unbound telemetry marker in the background by recomputing current provider evidence |
 | `session_event_journal.rs` | Session output/event journaling; rejects nested OMP hooks before journal/task-episode mutation and serves the read-only `?validate=1` notifier preflight |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
+| `background_tasks.rs` | Background tasks (shells `run_in_background`, async agents) the Worker's current runtime launched and has not seen finish, read from the provider JSONL; withholds completion evidence |
 | `workspace_trust.rs` | Workspace trust decisions |
 | `project_identity.rs` | Durable repository/checkout identity, conservative Git discovery, stable macOS identity with legacy compatibility, read-only diagnosis and identity-only CAS recovery |
 | `project_ledger.rs` | Historical checkout metadata, grouping of checkout history under the registry's projects (`group_rows_by_project`) and persistent Forget suppression |
@@ -457,6 +458,29 @@ apps/zeron (host-mode dispatch at startup).
   só o diretório gerenciado da sessão (stem exato, sem walk global nem
   `starts_with` lexical); `read_transcript` do controller MCP passa a
   resolver manifesto `omp`.
+- **Fim de turno não é fim de tarefa, e Esc encerra o turno** (2026-10-14).
+  O Claude dispara `Stop` ao fechar um turno com shell/agente em background e
+  abre outro sozinho quando a task avisa. `background_tasks` lê o JSONL do
+  provider (launch = `toolUseResult.backgroundTaskId` ou `isAsync`+`agentId`;
+  fim = `<task-id>` no `<task-notification>`), só do runtime atual
+  (`runtime_launched_at`), e `WorkerCompletionEvidence.background_tasks_pending`
+  segura a conclusão — na notificação e no `wait_for_status`. Teto: 15 min de
+  output parado libera, senão um dev server em background prenderia a tarefa.
+  Interrupção: o Claude não dispara `Stop` no Esc e, se o prompt volta ao
+  composer, não pinta row de interrupção. O Host grava `interrupt-requested`
+  (ms) a cada Esc puro escrito no PTY; `turn_interrupted_in` vale enquanto esse
+  carimbo for mais novo que o seed `last-hook-event.json`, e alimenta o mesmo
+  overlay report-only `turn_settled_by_interrupt` (nunca confirma `Stop`).
+  `wait_for_status(completed)` devolve `interrupted: true` em vez de esperar o
+  timeout. Cancelar a espera do orquestrador não é interromper o Worker.
+- **`read_transcript` é o transcript nativo inteiro, paginado.** Sem `entries`
+  usa a faixa de Settings → Transcripts (Whole = 0); `0` explícito também é
+  tudo. A resposta é uma página de 96 KiB (`transcript_page`): sem `offset`, a
+  cauda; com `offset`, a partir dele, com `next_offset`/`previous_offset`/
+  `truncated`. Mensagens não são mais cortadas no leitor compartilhado
+  (vendor), e "Whole" lê até 64 MiB do JSONL com nota explícita além disso.
+  O prompt do controller proíbe pedir ao Worker para contornar falhas do
+  Comet (salvar arquivo, reenviar, mudar a espera).
 - **`\r` no output tail é retorno de carro, não "mais um controle".** Um TUI
   repinta a status line dezenas de vezes e o journal guarda cada repaint;
   `clean_output` tira o ANSI mas mantém o `\r`, então mapeá-lo para espaço junto
@@ -707,7 +731,8 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 | `tests/space_migration.rs` — migração única: principal não registrado, Space existente, segunda rodada no-op, registro sem evidência, sessões preservadas | integration | `cargo test -p zeron-workers-unpeel --test space_migration` |
 | `tests/worker_initial_briefing.rs` (13) — OMP/Claude/Pi/Codex native delivery, literal input, spawn and ACK failures, no replay, existing interactive guards, managed Codex wrapper privacy and upstream launcher composition | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
-| `tests/parent_notifications.rs` (37) | integration | `--test parent_notifications` |
+| `tests/parent_notifications.rs` (38) | integration | `--test parent_notifications` |
+| `src/background_tasks.rs`, `controller_mcp::transcript_page_tests`, `activity_bridge` Escape settle | unit | `cargo test -p zeron-workers-unpeel --lib -- background_tasks transcript_page escape_after` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (ownership, external/legacy checkouts, dirty removal and hook bypass), `tests/local_actions.rs`, `tests/session_actions.rs`, `tests/local_bootstrap.rs`, `tests/dev_demo_fixture.rs` — client actions over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |

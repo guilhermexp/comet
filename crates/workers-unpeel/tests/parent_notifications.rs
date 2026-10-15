@@ -243,6 +243,49 @@ fn a_new_controller_submission_creates_one_new_completable_episode() {
 }
 
 #[test]
+fn stop_with_background_tasks_pending_is_not_completion() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    let worker = session("worker-1", 7, "idle", "running");
+    let paused = WorkerCompletionEvidence {
+        output_quiescent: true,
+        background_tasks_pending: true,
+    };
+
+    let pending = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &[worker.clone()],
+        &sessions_root,
+        |_| paused,
+    )
+    .unwrap();
+    assert!(
+        pending.is_empty(),
+        "a Stop while background tasks run is a pause"
+    );
+    assert!(
+        !current_episode_completed_with_evidence_at(&path, &worker, &sessions_root, paused)
+            .unwrap()
+    );
+
+    let pending = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &[worker],
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the Stop after the tasks report back completes"
+    );
+}
+
+#[test]
 fn stop_waits_until_the_output_stops_growing() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
@@ -256,6 +299,7 @@ fn stop_waits_until_the_output_stops_growing() {
         &sessions_root,
         |_| WorkerCompletionEvidence {
             output_quiescent: false,
+            background_tasks_pending: false,
         },
     )
     .unwrap();
@@ -1147,6 +1191,7 @@ fn current_episode_completed_ack_does_not_satisfy_growing_output() {
             &sessions_root,
             WorkerCompletionEvidence {
                 output_quiescent: false,
+                background_tasks_pending: false,
             },
         )
         .unwrap(),

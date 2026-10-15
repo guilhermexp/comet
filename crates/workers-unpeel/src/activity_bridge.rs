@@ -128,7 +128,8 @@ impl ActivityBridge {
                     command: &manifest.session.command,
                     active_runtime_id: session.active_runtime_id.as_deref(),
                     menu_prompt_active: manifest.menu_prompt_active,
-                    turn_settled_by_interrupt: manifest.turn_settled_by_interrupt,
+                    turn_settled_by_interrupt: manifest.turn_settled_by_interrupt
+                        || turn_interrupted_in(&session_dir),
                     runtime_launch_generation: manifest.runtime_launch_generation,
                     runtime_launched_at: manifest.runtime_launched_at,
                     activity_signal: manifest.screen_changed_at.unwrap_or_else(|| {
@@ -179,6 +180,26 @@ fn migrate_legacy_telemetry_for_manifest(
     manifest: &unpeel_core::session_host::HostedSessionManifest,
 ) -> bool {
     unpeel_core::session_telemetry::refresh_legacy(manifest).unwrap_or(false)
+}
+
+/// An Escape written to the PTY after the latest lifecycle hook settled the
+/// running turn. Claude Code fires no `Stop` for a user interrupt, and its
+/// screen paints no interrupt row when the prompt is put back in the composer,
+/// so the Host's Escape stamp is the only evidence. The next hook (a new
+/// prompt's `UserPromptSubmit`, a `Stop`) rewrites the durable seed and makes
+/// the stamp stale again. Report-only, like the Codex screen detector: it
+/// never confirms a Stop or completes an episode.
+pub(crate) fn turn_interrupted_in(session_dir: &Path) -> bool {
+    let Some(interrupted_at) = unpeel_core::session_host::interrupt_requested_at(session_dir)
+    else {
+        return false;
+    };
+    file_modified_unix_ms(&session_dir.join("last-hook-event.json"))
+        .is_some_and(|last_hook_at| interrupted_at > last_hook_at)
+}
+
+pub(crate) fn turn_interrupted(session_id: &str) -> bool {
+    turn_interrupted_in(&unpeel_core::session_host::session_dir(session_id))
 }
 
 fn file_modified_unix_ms(path: &Path) -> Option<u64> {
@@ -714,6 +735,30 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn escape_after_the_last_hook_settles_the_turn_until_the_next_hook() {
+        let directory = tempfile::tempdir().unwrap();
+        let seed = directory.path().join("last-hook-event.json");
+        let stamp = directory
+            .path()
+            .join(unpeel_core::session_host::INTERRUPT_REQUEST_FILE);
+        std::fs::write(&seed, r#"{"hook_event_name":"UserPromptSubmit"}"#).unwrap();
+        assert!(
+            !super::turn_interrupted_in(directory.path()),
+            "no Escape yet"
+        );
+
+        let after_seed = super::file_modified_unix_ms(&seed).unwrap() + 1;
+        std::fs::write(&stamp, after_seed.to_string()).unwrap();
+        assert!(super::turn_interrupted_in(directory.path()));
+
+        std::fs::write(&stamp, (after_seed - 10_000).to_string()).unwrap();
+        assert!(
+            !super::turn_interrupted_in(directory.path()),
+            "a hook newer than the Escape rearms the turn"
+        );
+    }
+
     use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
 

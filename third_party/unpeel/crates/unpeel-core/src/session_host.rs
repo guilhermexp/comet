@@ -602,6 +602,40 @@ impl OutputRetentionState {
     }
 }
 
+/// Session-dir file holding the unix-ms time of the last bare Escape written
+/// to the PTY (terminal key or controller `send_keys escape`).
+///
+/// Escape interrupts the running turn in the agent CLIs, and Claude Code fires
+/// no `Stop` for a user interrupt, so without this the Session keeps reading
+/// as working until the next hook. Activity derivation compares it with the
+/// latest turn-start hook: an Escape after that start settles the turn.
+pub const INTERRUPT_REQUEST_FILE: &str = "interrupt-requested";
+
+/// The unix-ms time recorded in [`INTERRUPT_REQUEST_FILE`], if any.
+pub fn interrupt_requested_at(session_dir: &Path) -> Option<u64> {
+    fs::read_to_string(session_dir.join(INTERRUPT_REQUEST_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn is_bare_escape_key(data: &[u8]) -> bool {
+    // Legacy encoding, then the kitty keyboard protocol forms.
+    matches!(data, b"\x1b" | b"\x1b[27u" | b"\x1b[27;1u")
+}
+
+fn note_interrupt_key(session_id: &str, data: &[u8]) {
+    if !is_bare_escape_key(data) {
+        return;
+    }
+    let dir = session_dir(session_id);
+    let tmp = dir.join(format!("{INTERRUPT_REQUEST_FILE}.tmp"));
+    if fs::write(&tmp, current_timestamp_ms().to_string()).is_ok() {
+        let _ = fs::rename(&tmp, dir.join(INTERRUPT_REQUEST_FILE));
+    }
+}
+
 fn mark_input_written(session_id: &str, has_been_written_to: &Arc<AtomicBool>) {
     if !has_been_written_to.swap(true, Ordering::Relaxed) {
         let _ = update_manifest_session(session_id, |manifest| {
@@ -6484,6 +6518,21 @@ exit "${UNPEEL_FAKE_PROVIDER_STATUS:-0}"
     }
 
     #[test]
+    fn only_a_bare_escape_counts_as_an_interrupt_key() {
+        assert!(super::is_bare_escape_key(b"\x1b"));
+        assert!(super::is_bare_escape_key(b"\x1b[27u"));
+        assert!(
+            !super::is_bare_escape_key(b"\x1b[A"),
+            "arrow keys start with ESC"
+        );
+        assert!(
+            !super::is_bare_escape_key(b"\x1b\x1b"),
+            "double Escape is Claude's rewind"
+        );
+        assert!(!super::is_bare_escape_key(b"hello\r"));
+    }
+
+    #[test]
     fn apply_manifest_auto_title_titles_first_prompt_only() {
         let session_id = unique_session_id("auto-title");
         let manifest = manifest_for_auto_title(&session_id, "claude", "claude");
@@ -7482,6 +7531,7 @@ fn handle_client(
                     .map_err(|e| format!("Write error: {e}"))?;
             }
             mark_input_written(session_id, has_been_written_to);
+            note_interrupt_key(session_id, &data);
             maybe_auto_title_from_input(session_id, &data, title_buffer, title_done);
         }
         return Ok(());
@@ -7528,6 +7578,7 @@ fn handle_client(
                     };
                     if applied {
                         mark_input_written(session_id, has_been_written_to);
+                        note_interrupt_key(session_id, data.as_bytes());
                         // Auto-title from the first submitted prompt for
                         // clients that write straight to the control socket
                         // (native attach, MCP).

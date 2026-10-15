@@ -953,6 +953,19 @@ contracts above; it is not an upstream runtime API guarantee.
   use `--manifest-path third_party/unpeel/crates/Cargo.toml`, while downstream
   bridge tests use the root workspace.
 
+## Comet transcript and interrupt fidelity (local fork)
+
+- Message entries (`push_transcript_entry`) are never truncated: Copy
+  transcript, `read_transcript` and phone views get the whole message. Tool,
+  result and file previews keep their caps.
+- `read_transcript_markdown` with `max_entries == 0` reads up to 64 MiB of
+  provider JSONL (`TRANSCRIPT_MARKDOWN_WHOLE_BYTES`) instead of the 2 MiB
+  client cap, and says so in the Markdown when the file is larger. Client-sized
+  reads (`read_jsonl_lines_before`, snapshots) keep `MAX_STREAM_BYTES`.
+- The session Host writes `interrupt-requested` (unix ms) in the session dir on
+  every bare Escape written to the PTY (`is_bare_escape_key`); Comet reads it
+  through `interrupt_requested_at`. Claude Code fires no hook on interrupt.
+
 ## Comet worker output geometry
 
 The session Host initializes its PTY and `TerminalViewportState` from the same

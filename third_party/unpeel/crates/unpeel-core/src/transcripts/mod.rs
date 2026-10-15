@@ -342,6 +342,26 @@ pub fn read_transcript_snapshot(
     include_tools: bool,
     tail_bytes: Option<u64>,
 ) -> Result<TranscriptSnapshot, String> {
+    read_transcript_snapshot_within(
+        manifest,
+        max_entries,
+        include_tools,
+        tail_bytes,
+        MAX_STREAM_BYTES,
+    )
+}
+
+/// [`read_transcript_snapshot`] with an explicit ceiling on the JSONL window.
+/// Client-sized reads keep [`MAX_STREAM_BYTES`]; the Markdown export passes
+/// its own, larger ceiling so "Whole transcript" is not silently the last
+/// 2 MiB of the provider file.
+fn read_transcript_snapshot_within(
+    manifest: &HostedSessionManifest,
+    max_entries: usize,
+    include_tools: bool,
+    tail_bytes: Option<u64>,
+    window_cap: u64,
+) -> Result<TranscriptSnapshot, String> {
     let transcript = resolve_provider_transcript(manifest)?;
     let (entries, start_offset, next_offset, model) =
         match transcript.path.extension().and_then(|ext| ext.to_str()) {
@@ -362,10 +382,11 @@ pub fn read_transcript_snapshot(
                 (entries, 0, next_offset, model)
             }
             _ => {
-                let read = read_jsonl_lines_before(
+                let read = read_jsonl_window(
                     &transcript.path,
                     None,
                     tail_bytes.unwrap_or(DEFAULT_TRANSCRIPT_TAIL_BYTES),
+                    window_cap,
                 )?;
                 let (entries, start_offset) = collect_transcript_entries_from_window(
                     transcript.provider,
@@ -591,13 +612,22 @@ pub fn read_jsonl_lines_before(
     before_offset: Option<u64>,
     max_bytes: u64,
 ) -> Result<JsonlWindowRead, String> {
+    read_jsonl_window(path, before_offset, max_bytes, MAX_STREAM_BYTES)
+}
+
+fn read_jsonl_window(
+    path: &Path,
+    before_offset: Option<u64>,
+    max_bytes: u64,
+    window_cap: u64,
+) -> Result<JsonlWindowRead, String> {
     let mut file =
         fs::File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
     let len = file
         .metadata()
         .map_err(|e| format!("Failed to stat {}: {e}", path.display()))?
         .len();
-    let max_bytes = max_bytes.clamp(1, MAX_STREAM_BYTES);
+    let max_bytes = max_bytes.clamp(1, window_cap);
     let end = before_offset.unwrap_or(len).min(len);
     let start = end.saturating_sub(max_bytes);
 
@@ -723,9 +753,16 @@ fn collect_transcript_entries_from_window(
     }
 }
 
-/// Bytes of JSONL tail scanned when rendering a full Markdown transcript. Larger
-/// than the default snapshot tail so "whole conversation" captures more history.
+/// Bytes of JSONL tail scanned when rendering a bounded-range Markdown
+/// transcript. Larger than the default snapshot tail so a range of entries is
+/// not cut short by tool output between them.
 const TRANSCRIPT_MARKDOWN_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Bytes of JSONL scanned for "Whole transcript" (`max_entries == 0`). The
+/// provider file carries tool payloads, so this is far above the rendered
+/// size; a file beyond it renders with an explicit omission note instead of
+/// silently losing its beginning.
+const TRANSCRIPT_MARKDOWN_WHOLE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read the app-wide [`TranscriptSettings`](crate::state::TranscriptSettings)
 /// from `app-state.json`, falling back to the shipped defaults when the file is
@@ -835,18 +872,28 @@ pub fn read_transcript_markdown(
         || opts.include_reasoning
         || opts.include_file_changes
         || opts.include_plan_updates;
-    let max_entries = if opts.max_entries == 0 {
-        usize::MAX
+    let whole = opts.max_entries == 0;
+    let (max_entries, window) = if whole {
+        (usize::MAX, TRANSCRIPT_MARKDOWN_WHOLE_BYTES)
     } else {
-        opts.max_entries
+        (opts.max_entries, TRANSCRIPT_MARKDOWN_TAIL_BYTES)
     };
-    let snapshot = read_transcript_snapshot(
+    let snapshot = read_transcript_snapshot_within(
         manifest,
         max_entries,
         collect_tools,
-        Some(TRANSCRIPT_MARKDOWN_TAIL_BYTES),
+        Some(window),
+        window,
     )?;
-    let body = format_transcript_markdown(&snapshot, opts);
+    let mut body = format_transcript_markdown(&snapshot, opts);
+    let beyond_window = fs::metadata(&snapshot.path)
+        .is_ok_and(|metadata| metadata.len() > TRANSCRIPT_MARKDOWN_WHOLE_BYTES);
+    if whole && beyond_window {
+        body = format!(
+            "_Earlier history omitted: only the last {} MiB of the provider transcript were read._\n\n{body}",
+            TRANSCRIPT_MARKDOWN_WHOLE_BYTES / (1024 * 1024)
+        );
+    }
     if !opts.include_session_info {
         return Ok(body);
     }
@@ -1212,7 +1259,10 @@ fn push_transcript_entry(entries: &mut Vec<TranscriptEntry>, role: &'static str,
         None,
         None,
         None,
-        4_000,
+        // Message text is the conversation itself, not a preview: every
+        // reader (Copy transcript, read_transcript, phone views) must get it
+        // whole. Tool and file entries keep their preview caps below.
+        usize::MAX,
     );
 }
 

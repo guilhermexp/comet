@@ -198,6 +198,12 @@ for rollback. Idempotent: epoch check makes re-entry a no-op.
   chat2 manually. Expected count: single digits.
 - Mid-migration crash: seeding is (rebuild locally → POST checkpoint → flip registry).
   Each step idempotent; a crash before the flip leaves the chat on s2, retried next open.
+- Seed into a room whose floor already moved (`409 floor_regression` on the
+  `seqCovered=0` POST): some host already runs the chat on chat2, so the seed can
+  never land. The seeding device keeps its fat doc as `.pre-chat2`, flips the
+  registry to `roomGen: 2` and converges through the M3 discard-and-adopt open
+  (`DocHost::adopt_live_chat2_room`). Before 2026-10-14 the sweep retried that
+  refused seed every 10 minutes forever.
 
 **M6. Immediate relief (optional, pre-chat2).** For currently-wedged chats where the
 user can't wait a release cycle: `POST /reset-log` on the s2 room + host re-push works

@@ -9,6 +9,10 @@ use crate::session_event_journal::{SessionHookJournalEntry, read_entries};
 
 const BINDINGS_KEY: &str = "comet_worker_parent_notifications";
 const COMPLETION_OUTPUT_QUIESCENCE_MS: u64 = 2_000;
+/// A background task that never reports back (a dev server started with
+/// `run_in_background`) must not hold completion forever: after this much
+/// output silence the pending task stops withholding it.
+const BACKGROUND_TASK_GRACE_MS: u64 = 15 * 60 * 1_000;
 pub(crate) const TASK_EPISODE_FILE: &str = "comet-task-episode";
 const TASK_SUBMITTED_FILE: &str = "comet-task-submitted";
 
@@ -43,20 +47,26 @@ pub struct WorkerParentLink {
 /// session, so "no process outside a launch-time snapshot" was unsatisfiable
 /// for any runtime that boots one, and the snapshot itself raced the children.
 /// Judging what the worker actually delivered is the orchestrator's job.
+///
+/// A `Stop` while the runtime's own background tasks (shells, async agents)
+/// are still out is a pause: the runtime opens a new turn when they report
+/// back, so it withholds completion (see `background_tasks`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCompletionEvidence {
     pub output_quiescent: bool,
+    pub background_tasks_pending: bool,
 }
 
 impl WorkerCompletionEvidence {
     pub fn quiescent() -> Self {
         Self {
             output_quiescent: true,
+            background_tasks_pending: false,
         }
     }
 
     fn permits_completion(&self) -> bool {
-        self.output_quiescent
+        self.output_quiescent && !self.background_tasks_pending
     }
 }
 
@@ -714,12 +724,20 @@ pub fn pending_worker_parent_notifications(
 }
 
 fn live_completion_evidence(session: &WorkersSession) -> WorkerCompletionEvidence {
-    let output_quiescent = std::fs::metadata(unpeel_core::session_host::output_path(&session.id))
+    let quiet_ms = std::fs::metadata(unpeel_core::session_host::output_path(&session.id))
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|elapsed| elapsed.as_millis() as u64 >= COMPLETION_OUTPUT_QUIESCENCE_MS);
-    WorkerCompletionEvidence { output_quiescent }
+        .map(|elapsed| elapsed.as_millis() as u64);
+    let output_quiescent = quiet_ms.is_some_and(|quiet| quiet >= COMPLETION_OUTPUT_QUIESCENCE_MS);
+    // Only worth reading the transcript when nothing else withholds completion.
+    let background_tasks_pending = output_quiescent
+        && quiet_ms.is_some_and(|quiet| quiet < BACKGROUND_TASK_GRACE_MS)
+        && crate::background_tasks::pending_background_tasks(&session.id) > 0;
+    WorkerCompletionEvidence {
+        output_quiescent,
+        background_tasks_pending,
+    }
 }
 
 fn episode_completed_from_state(

@@ -212,6 +212,7 @@ pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
 /// receives `[worker-task-notification]` when the worker finishes. Short repeated
 /// waits are polling and burn a full model turn each.
 pub const WAIT_TIMED_OUT_NEXT: &str = "Worker still running. Either call wait_for_status again with a timeout_seconds sized to the remaining work (up to limits.wait_seconds), or end your turn: a [worker-task-notification] arrives in this chat when the worker finishes. Do not poll with short waits.";
+pub const WAIT_INTERRUPTED_NEXT: &str = "The worker's turn was interrupted (Escape) before it finished, so the task is not completed and no completion notification will come for it. Read its transcript to see where it stopped, then send_text to continue or redirect it.";
 pub const WAIT_BLOCKED_NEEDS_INPUT_NEXT: &str = "Worker is blocked waiting for input. Read the worker output and respond in that session. This is not completion, nothing was approved, and the episode is still open.";
 
 /// Closed set of status strings accepted by `wait_for_status`.
@@ -829,7 +830,13 @@ fn dispatch_action(
                 "existing_worktree": "Use worktree_path and worktree_branch together to target an existing checkout; this pair is exclusive with new_worktree."
             },
             "keys": ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "ctrl-c", "text:<literal>"],
-            "limits": { "wait_seconds": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
+            "read_transcript": {
+                "source": "The Worker's own provider transcript (the same reader as Copy transcript), not the terminal. Messages are returned whole.",
+                "range": "entries omitted uses the Settings → Transcripts range; 0 is the whole conversation; 1-500 overrides it.",
+                "paging": "Each call returns at most limits.transcript_bytes of Markdown. Without offset it is the most recent page. When truncated is true, call again with offset=next_offset (forward) or offset=previous_offset (back), or offset=0 for the beginning. Never ask the Worker to resend or save something already in its transcript."
+            },
+            "read_output": "The terminal screen tail. It shows redraws (a resize repaints earlier output) and is diagnostic only; it is not the source of a Worker's report.",
+            "limits": { "wait_seconds": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "keys": 64, "output_bytes": 65536, "transcript_bytes": TRANSCRIPT_PAGE_BYTES }
         })),
         "list_projects" => {
             let registry = controller_registry()?;
@@ -1039,19 +1046,20 @@ fn dispatch_action(
         }
         "read_transcript" => {
             let session = find_session(client, arguments)?;
+            // Omitted: the Settings → Transcripts range (Whole transcript is
+            // 0). An explicit value overrides it; 0 is the whole conversation.
             let entries = arguments
                 .get("entries")
                 .and_then(Value::as_u64)
-                .unwrap_or(50)
-                .clamp(1, 500) as usize;
+                .map(|entries| entries.min(500) as usize);
+            let offset = arguments.get("offset").and_then(Value::as_u64);
             let transcript = client
-                .transcript_markdown(&session.id, Some(entries))
+                .transcript_markdown(&session.id, entries)
                 .map_err(|error| error.to_string())?;
-            Ok(json!({
-                "session_id": session.id,
-                "entries": entries,
-                "markdown": truncate_tail(&transcript, 96 * 1024)
-            }))
+            let mut page = transcript_page(&transcript, offset, TRANSCRIPT_PAGE_BYTES);
+            page["session_id"] = json!(session.id);
+            page["entries"] = entries.map_or(json!("settings"), |entries| json!(entries));
+            Ok(page)
         }
         "send_text" => {
             let session = find_session(client, arguments)?;
@@ -1934,7 +1942,7 @@ fn wait_for_status(
     }
     let timeout =
         clamp_wait_for_status_timeout(arguments.get("timeout_seconds").and_then(Value::as_u64));
-    wait_until_matching(
+    wait_until_settled(
         timeout,
         &wanted,
         cancel,
@@ -1948,6 +1956,7 @@ fn wait_for_status(
                 .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))
         },
         |session| tracked && crate::current_episode_completed(session),
+        |session| crate::activity_bridge::turn_interrupted(&session.id),
     )
 }
 
@@ -1968,8 +1977,24 @@ pub fn wait_until_matching(
     timeout_seconds: u64,
     wanted: &str,
     cancel: &AtomicBool,
+    poll: impl FnMut() -> Result<WorkersSession, String>,
+    extra_match: impl FnMut(&WorkersSession) -> bool,
+) -> Result<Value, String> {
+    wait_until_settled(timeout_seconds, wanted, cancel, poll, extra_match, |_| {
+        false
+    })
+}
+
+/// [`wait_until_matching`] that also ends a `completed` wait when the current
+/// turn was interrupted: that episode will never complete, so waiting on it
+/// would only run out the timeout.
+fn wait_until_settled(
+    timeout_seconds: u64,
+    wanted: &str,
+    cancel: &AtomicBool,
     mut poll: impl FnMut() -> Result<WorkersSession, String>,
     mut extra_match: impl FnMut(&WorkersSession) -> bool,
+    mut interrupted: impl FnMut(&WorkersSession) -> bool,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let mut initial_completion: Option<bool> = None;
@@ -2003,6 +2028,14 @@ pub fn wait_until_matching(
             }
             if is_completed {
                 return Ok(json!({ "matched": true, "worker": session_json(&session) }));
+            }
+            if !session.activity.eq_ignore_ascii_case("working") && interrupted(&session) {
+                return Ok(json!({
+                    "matched": false,
+                    "interrupted": true,
+                    "worker": session_json(&session),
+                    "next": WAIT_INTERRUPTED_NEXT
+                }));
             }
         } else {
             let matched = session.activity.eq_ignore_ascii_case(wanted)
@@ -2086,6 +2119,46 @@ fn optional_string(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+const TRANSCRIPT_PAGE_BYTES: usize = 96 * 1024;
+
+/// One page of a rendered transcript. Without `offset` it is the tail, the
+/// most recent content; with it, the page starts at that byte. Byte offsets
+/// index the rendered Markdown, are snapped to char boundaries, and are what
+/// `next_offset`/`start_offset` hand back, so a caller walks the whole
+/// conversation — a long message included — without asking the Worker for it
+/// again.
+fn transcript_page(markdown: &str, offset: Option<u64>, page_bytes: usize) -> Value {
+    let total = markdown.len();
+    let boundary = |mut index: usize, forward: bool| {
+        index = index.min(total);
+        while !markdown.is_char_boundary(index) {
+            index = if forward { index + 1 } else { index - 1 };
+        }
+        index
+    };
+    let (start, end) = match offset {
+        Some(offset) => {
+            let start = boundary(usize::try_from(offset).unwrap_or(usize::MAX), false);
+            (start, boundary(start.saturating_add(page_bytes), false))
+        }
+        None => (boundary(total.saturating_sub(page_bytes), true), total),
+    };
+    let mut page = json!({
+        "markdown": &markdown[start..end],
+        "start_offset": start,
+        "end_offset": end,
+        "total_bytes": total,
+        "truncated": start > 0 || end < total,
+    });
+    if end < total {
+        page["next_offset"] = json!(end);
+    }
+    if start > 0 {
+        page["previous_offset"] = json!(start.saturating_sub(page_bytes));
+    }
+    page
+}
+
 fn truncate_tail(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
@@ -2129,8 +2202,13 @@ fn tool_definition() -> Value {
         finished task; `idle` matches any pause, including a worker waiting on its own \
         subagents, and `exited` matches only a dead process — neither idle nor exited means \
         the task finished) or end your turn — a `[worker-task-notification]` arrives in this \
-        chat when the worker finishes; never poll with short waits. `read_output` inspects \
-        evidence, then `stop_worker` or `archive_worker`. A worker that is not \
+        chat when the worker finishes; never poll with short waits. `read_transcript` returns \
+        the worker's own conversation with messages whole (page with `offset` when \
+        `truncated`); `read_output` is only the terminal screen. Then `stop_worker` or \
+        `archive_worker`. A failure of these tools (a cut read, an early notification, a \
+        wait that ends oddly) is Comet's to fix, not the worker's: never ask a worker to \
+        save its answer to a file, resend it, or change how it waits; messages to a worker \
+        carry only guidance about its task. A worker that is not \
         running — stopped, or hibernated by the idle policy — refuses input until \
         `restart_worker` brings it back with its conversation under a new \
         `session_id`. \
@@ -2155,7 +2233,8 @@ fn tool_definition() -> Value {
                 "submit": { "type": "boolean", "description": "send_text: submit the text with a carriage return. Defaults to true." },
                 "status": { "type": "string", "description": "wait_for_status: the status to block on. Use 'completed' when waiting for the worker to finish its task. 'idle' matches any pause (including a worker waiting on its own subagents) and 'exited' matches only a dead process, so neither idle nor exited means the task finished. Accepted values: completed, running, exited, starting, working, blocked, done, idle." },
                 "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: how long to block, chosen by you to fit the work (default 30, maximum 4h); expiration returns timed_out: true with a worker snapshot and a next hint as a normal read, not a failure. The wait is cancellable and does not block other actions." },
-                "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
+                "entries": { "type": "integer", "minimum": 0, "maximum": 500, "description": "read_transcript: how many transcript entries to render; 0 is the whole conversation. Omitted: the Settings → Transcripts range." },
+                "offset": { "type": "integer", "minimum": 0, "description": "read_transcript: byte offset into the rendered transcript to start this page at, from a previous next_offset/previous_offset (0 = beginning). Omitted: the most recent page." },
                 "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing delivered once at launch. OMP, Claude, Pi and Codex receive it through native startup. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
                 "title": { "type": "string", "description": "launch_worker: the worker's display name in the Workers list, final for the session and kept across restart — name the ticket or task (e.g. `WT-20260924-fix-parser`), at most 256 bytes. Omitted: the first line of `initial_text`." },
                 "worktree_path": { "type": "string", "description": "launch_worker: required together with worktree_branch to run in an existing git worktree instead of the project checkout. Mutually exclusive with new_worktree." },
@@ -2324,5 +2403,35 @@ mod project_activity_tests {
             &[],
         );
         assert!(other.get("error").is_none(), "{other}");
+    }
+}
+
+#[cfg(test)]
+mod transcript_page_tests {
+    use super::transcript_page;
+
+    #[test]
+    fn pages_walk_the_whole_transcript_without_losing_bytes() {
+        let markdown = "é".repeat(50) + &"a".repeat(25);
+        let tail = transcript_page(&markdown, None, 30);
+        assert_eq!(tail["truncated"], true);
+        assert_eq!(tail["end_offset"], markdown.len());
+        assert!(tail.get("next_offset").is_none());
+
+        let mut offset = Some(0);
+        let mut rebuilt = String::new();
+        while let Some(start) = offset {
+            let page = transcript_page(&markdown, Some(start), 31);
+            rebuilt.push_str(page["markdown"].as_str().unwrap());
+            offset = page["next_offset"].as_u64();
+        }
+        assert_eq!(
+            rebuilt, markdown,
+            "char boundaries never split or drop text"
+        );
+
+        let whole = transcript_page("short", None, 30);
+        assert_eq!(whole["truncated"], false);
+        assert_eq!(whole["markdown"], "short");
     }
 }

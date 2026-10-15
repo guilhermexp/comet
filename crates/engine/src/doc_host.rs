@@ -2797,6 +2797,14 @@ impl DocHost {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
             let body: String = body.chars().take(200).collect();
+            // `floor_regression` on a seqCovered=0 seed means the chat2 room
+            // already moved its floor: some host ran this chat on chat2 and
+            // checkpointed past 0. Seeding would replace that live lineage,
+            // and the edge refuses it forever, so the 10-minute sweep retried
+            // a dead seed indefinitely. Adopt the live room instead.
+            if status == reqwest::StatusCode::CONFLICT && body.contains("floor_regression") {
+                return self.adopt_live_chat2_room(chat_id);
+            }
             return Err(format!("seed checkpoint HTTP {status}: {body}"));
         }
         // PINNED RE-CHECK before anything irreversible (review B1): if a
@@ -2821,14 +2829,7 @@ impl DocHost {
                 }
             }
         }
-        // Rollback copy of the fat lineage BEFORE the thin one replaces it —
-        // never overwriting an existing copy (review B5).
-        let rollback_id = format!("{chat_id}.pre-chat2");
-        if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None))
-            && let Ok(Some(old)) = self.inner.store.load_snapshot(chat_id)
-        {
-            let _ = self.inner.store.save_snapshot(&rollback_id, &old);
-        }
+        self.save_pre_chat2_rollback(chat_id);
         self.inner
             .store
             .save_snapshot_with_cursor(chat_id, &snapshot, 0, crate::chat2_host::CHAT2_DOC_EPOCH)
@@ -2842,31 +2843,64 @@ impl DocHost {
         if !flipped {
             return Err("chat row vanished during seed".into());
         }
-        // The live handle still holds the FAT doc on the s2 room. Retire it:
-        // it must never persist again (it would clobber the thin lineage);
-        // drop it entirely when unpinned so the next open converges onto
-        // chat2. A pinned (watched/running) handle keeps working against s2
-        // until it closes — the flip is registry-side, readers already moved.
-        let dropped = {
-            let mut handles = lock(&self.inner.handles);
-            if let Some(handle) = handles.get(chat_id) {
-                handle.retired.store(true, Ordering::Relaxed);
-                // Drop unless a live WRITER holds the doc. Watchers do not
-                // keep the fat handle alive: their streams end with it and
-                // they resubscribe onto the chat2 adopt path (the same
-                // contract the cutover watcher enforces for remote flips).
-                if Arc::strong_count(&handle.doc) == 1 {
-                    handles.remove(chat_id);
-                    true
-                } else {
-                    false
-                }
+        let dropped = self.retire_flipped_handle(chat_id);
+        tracing::info!(chat = %chat_id, handle_dropped = dropped, "chat2 seed complete");
+        Ok(())
+    }
+
+    /// Rollback copy of the fat lineage before chat2 replaces it — never
+    /// overwriting an existing copy (review B5).
+    fn save_pre_chat2_rollback(&self, chat_id: &str) {
+        let rollback_id = format!("{chat_id}.pre-chat2");
+        if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None))
+            && let Ok(Some(old)) = self.inner.store.load_snapshot(chat_id)
+        {
+            let _ = self.inner.store.save_snapshot(&rollback_id, &old);
+        }
+    }
+
+    /// The seed found the chat2 room already live (floor past 0): flip the
+    /// registry so this device converges through the ordinary M3
+    /// discard-and-adopt open, exactly as when another device cut the chat
+    /// over. The local fat lineage is kept as the `.pre-chat2` rollback.
+    fn adopt_live_chat2_room(&self, chat_id: &str) -> Result<(), String> {
+        self.save_pre_chat2_rollback(chat_id);
+        let flipped = self
+            .workspace()
+            .ok_or("no workspace host")?
+            .set_chat_room_gen(chat_id, 2)
+            .map_err(|e| e.to_string())?;
+        if !flipped {
+            return Err("chat row vanished during seed".into());
+        }
+        let dropped = self.retire_flipped_handle(chat_id);
+        tracing::info!(chat = %chat_id, handle_dropped = dropped,
+            "chat2 room already live; adopted it instead of seeding");
+        Ok(())
+    }
+
+    /// The live handle still holds the FAT doc on the s2 room. Retire it:
+    /// it must never persist again (it would clobber the thin lineage);
+    /// drop it entirely when unpinned so the next open converges onto
+    /// chat2. A pinned (watched/running) handle keeps working against s2
+    /// until it closes — the flip is registry-side, readers already moved.
+    fn retire_flipped_handle(&self, chat_id: &str) -> bool {
+        let mut handles = lock(&self.inner.handles);
+        if let Some(handle) = handles.get(chat_id) {
+            handle.retired.store(true, Ordering::Relaxed);
+            // Drop unless a live WRITER holds the doc. Watchers do not
+            // keep the fat handle alive: their streams end with it and
+            // they resubscribe onto the chat2 adopt path (the same
+            // contract the cutover watcher enforces for remote flips).
+            if Arc::strong_count(&handle.doc) == 1 {
+                handles.remove(chat_id);
+                true
             } else {
                 false
             }
-        };
-        tracing::info!(chat = %chat_id, handle_dropped = dropped, "chat2 seed complete");
-        Ok(())
+        } else {
+            false
+        }
     }
 
     /// Boot-time transcript salvage (born-gen2 aftermath, 2026-08-11): a chat

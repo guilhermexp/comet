@@ -71,11 +71,6 @@ if [ "$scenario" = "require-system-prompt" ]; then
   has "$append" "Communication:" || exit 32
   has "$append" "Operational boundaries:" || exit 33
 fi
-if [ "$scenario" = "reject-system-prompt" ]; then
-  for arg in "$@"; do
-    [ "$arg" != "--append-system-prompt" ] || exit 34
-  done
-fi
 if [ "$scenario" = "require-skill-scope" ]; then
   overlay=
   while [ "$#" -gt 0 ]; do
@@ -337,8 +332,6 @@ while IFS= read -r line; do
         if has "$answer" '"confirmed"'; then fail_stage decline 29; fi
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "require-system-prompt" ]; then
-        emit '{"type":"agent_end","messages":[]}'
-      elif [ "$scenario" = "reject-system-prompt" ]; then
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "require-skill-scope" ]; then
         emit '{"type":"agent_end","messages":[]}'

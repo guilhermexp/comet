@@ -1,6 +1,7 @@
 //! Typed Comet adapter for the pinned Unpeel local worker runtime.
 
 mod activity_bridge;
+mod background_tasks;
 mod branch_cleanup;
 mod checkout_activity;
 mod checkout_lifecycle;

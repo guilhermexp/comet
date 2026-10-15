@@ -833,6 +833,33 @@ fn opencode_is_detected_but_not_file_backed_yet() {
     assert!(error.contains("outside JSONL"));
 }
 
+#[test]
+fn long_messages_are_kept_whole() {
+    // A Worker's final report (20 425 chars in the 2026-10-14 incident) was
+    // cut to ~4 000 for every reader of the shared transcript.
+    let report = "relatório ".repeat(2_500);
+    let mut entries: Vec<TranscriptEntry> = Vec::new();
+    push_transcript_entry(&mut entries, "Assistant", report.clone());
+    assert_eq!(entries[0].text, report.trim());
+}
+
+#[test]
+fn whole_markdown_window_reads_past_the_stream_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.jsonl");
+    let line = format!("{{\"pad\":\"{}\"}}\n", "x".repeat(1024));
+    let mut body = String::from("{\"first\":true}\n");
+    while body.len() < 3 * 1024 * 1024 {
+        body.push_str(&line);
+    }
+    std::fs::write(&path, &body).unwrap();
+    let capped = read_jsonl_lines_before(&path, None, u64::MAX).unwrap();
+    assert!(capped.offset > 0, "client reads keep the 2 MiB cap");
+    let whole = read_jsonl_window(&path, None, 64 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    assert_eq!(whole.offset, 0);
+    assert_eq!(whole.lines[0].1, "{\"first\":true}");
+}
+
 fn markdown_test_snapshot() -> TranscriptSnapshot {
     let mut entries: Vec<TranscriptEntry> = Vec::new();
     push_user_transcript_entry(&mut entries, "hello there");

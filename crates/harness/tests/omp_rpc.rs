@@ -802,15 +802,13 @@ async fn declining_a_question_reaches_omp_as_a_cancelled_response() {
 }
 
 #[tokio::test]
-async fn orchestrator_cwd_receives_the_omp_system_prompt() {
-    let root = tempfile::tempdir().unwrap();
-    let orchestrator = root.path().join(".orchestrator");
-    std::fs::create_dir(&orchestrator).unwrap();
-    let harness =
-        fake_harness("require-system-prompt").with_orchestrator_workspace(orchestrator.clone());
+async fn every_omp_chat_run_receives_the_omp_system_prompt() {
+    // Any project, not only `~/.orchestrator`: the append is the default.
+    let project = tempfile::tempdir().unwrap();
+    let harness = fake_harness("require-system-prompt");
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");
     let mut request = request("hello");
-    request.cwd = orchestrator.to_string_lossy().into_owned();
+    request.cwd = project.path().to_string_lossy().into_owned();
     assert!(!request.enable_workers_mcp);
 
     let events = harness
@@ -843,37 +841,6 @@ async fn every_omp_launch_scopes_skills_to_the_project() {
 
     let events = harness
         .run(request("hello"), controls)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-
-    assert!(events.iter().all(Result::is_ok));
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            Ok(AgentEvent::Done {
-                status: DoneStatus::Completed,
-                ..
-            })
-        )
-    }));
-}
-
-#[tokio::test]
-async fn non_orchestrator_cwd_does_not_receive_the_omp_system_prompt() {
-    let root = tempfile::tempdir().unwrap();
-    let orchestrator = root.path().join(".orchestrator");
-    let project = root.path().join("project");
-    std::fs::create_dir(&orchestrator).unwrap();
-    std::fs::create_dir(&project).unwrap();
-    let harness = fake_harness("reject-system-prompt").with_orchestrator_workspace(orchestrator);
-    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
-    let mut request = request("hello");
-    request.cwd = project.to_string_lossy().into_owned();
-
-    let events = harness
-        .run(request, controls)
         .await
         .unwrap()
         .collect::<Vec<_>>()

@@ -1196,3 +1196,104 @@ async fn cold_jobs_get_a_real_timed_turn_without_any_writer_ending() {
     assert_eq!(writers.len(), ACTIVE_SYNC_CAP);
     host.shutdown_workers().await;
 }
+
+/// Edge whose chat2 room already moved its floor: every seed checkpoint is
+/// refused with `409 floor_regression`, exactly as the real edge answers a
+/// seqCovered=0 POST into a live room.
+async fn live_room_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let posts = Arc::new(AtomicUsize::new(0));
+    let counted = posts.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let counted = counted.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0; 8192];
+                // Read headers plus the declared body before answering.
+                loop {
+                    let n = stream.read(&mut buffer).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                if String::from_utf8_lossy(&request).starts_with("POST") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = r#"{"error":"floor_regression"}"#;
+                let reply = format!(
+                    "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (url, posts, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seed_into_a_live_chat2_room_adopts_it_instead_of_retrying() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let (url, posts, task) = live_room_edge().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    legacy_chat(&workspace, "straggler", "host", Some(1));
+    let fat = SessionDoc::init("straggler").unwrap();
+    let fat_bytes = fat.export_snapshot().unwrap();
+    store.save_snapshot("straggler", &fat_bytes).unwrap();
+    let edge = EdgeConfig::with_static_token(&url, "test");
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig {
+            device_id: "host".into(),
+            default_harness: HarnessId::Mock,
+            edge: Some(edge.clone()),
+        },
+    );
+    host.set_workspace(workspace);
+
+    host.seed_chat2(&edge, "straggler", Arc::new(fat))
+        .await
+        .expect("a live chat2 room is adopted, not a seed failure");
+
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let row = host
+        .workspace()
+        .unwrap()
+        .chat("straggler")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.room_gen,
+        Some(2),
+        "registry flips so the next open adopts"
+    );
+    assert_eq!(
+        store
+            .load_snapshot("straggler.pre-chat2")
+            .unwrap()
+            .as_deref(),
+        Some(fat_bytes.as_slice()),
+        "the local fat lineage is kept for rollback"
+    );
+    host.shutdown_workers().await;
+    task.abort();
+}

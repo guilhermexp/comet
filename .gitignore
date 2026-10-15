@@ -23,3 +23,7 @@ progress.md
 # Orchestrator chat uploads written into the workspace at runtime
 .orchestrator/
 /scripts/**/__pycache__/
+
+# Local agent worktrees and graft config — never committed.
+/.claude/worktrees/
+/.graft/
