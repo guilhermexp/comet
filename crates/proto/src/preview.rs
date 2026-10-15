@@ -58,3 +58,42 @@ impl Default for PreviewSnapshot {
 pub struct WatchPreviewsParams {
     pub chat_id: String,
 }
+
+/// A TCP listener running inside one of the requested project roots on the
+/// host device — the Details "Servers" list. Unlike [`PreviewService`] this
+/// is not limited to HTTP or to the chat's own project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DevServer {
+    pub pid: u32,
+    /// Process creation time, milliseconds since the Unix epoch.
+    pub started_at: u64,
+    pub port: u16,
+    /// The listener process's working directory.
+    pub cwd: String,
+    /// The requested root that owns `cwd`.
+    pub root: String,
+    /// Command line, for the row's label.
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDevServersParams {
+    pub cwds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopDevServerParams {
+    pub pid: u32,
+    pub started_at: u64,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopDevServerReply {
+    /// Every process signalled: the listener plus its in-project launchers.
+    pub stopped: Vec<u32>,
+}

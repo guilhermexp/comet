@@ -166,7 +166,8 @@ fn worked_project_diff_updates_and_visibility_cancel_the_local_stream(
     while let Ok(request) = requests.try_recv() {
         let request: zeron_rpc::ClientFrame = serde_json::from_str(&request).unwrap();
         assert!(
-            request.params.get("cwds").is_none(),
+            request.method.as_deref() != Some(methods::WATCH_CHECKOUT_DIFFS)
+                || request.params.get("cwds").is_none(),
             "initially collapsed section opens no Worked Project stream"
         );
         if !request.cancel {
@@ -330,7 +331,8 @@ fn worked_project_diff_updates_and_visibility_cancel_the_local_stream(
             cancellations.push(request.id);
         } else {
             assert!(
-                request.params.get("cwds").is_none(),
+                request.method.as_deref() != Some(methods::WATCH_CHECKOUT_DIFFS)
+                    || request.params.get("cwds").is_none(),
                 "collapsed section must not subscribe"
             );
         }

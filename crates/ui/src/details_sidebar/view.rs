@@ -241,6 +241,8 @@ use zeron_rpc::methods;
 #[path = "session_card.rs"]
 mod session_card;
 
+#[path = "dev_servers.rs"]
+mod dev_servers;
 #[path = "worked_project_diffs.rs"]
 mod worked_project_diffs;
 
@@ -481,6 +483,12 @@ pub struct DetailsSidebar {
     worked_diff_key: Option<(Option<String>, Vec<String>)>,
     worked_diff_watch: Option<Task<()>>,
     worked_diffs: HashMap<String, session_card::SessionDiffTotals>,
+    /// Details → Servers poll (see `dev_servers.rs`).
+    dev_server_key: Option<dev_servers::DevServerKey>,
+    dev_server_watch: Option<Task<()>>,
+    dev_servers: Vec<zeron_proto::DevServer>,
+    dev_server_stopping: std::collections::HashSet<u32>,
+    dev_server_error: Option<SharedString>,
     context_sources: Option<session_card::ContextSources>,
     context_sources_task: Option<Task<()>>,
     context_sources_pending: Option<String>,
@@ -575,6 +583,11 @@ impl DetailsSidebar {
             worked_diff_key: None,
             worked_diff_watch: None,
             worked_diffs: HashMap::new(),
+            dev_server_key: None,
+            dev_server_watch: None,
+            dev_servers: Vec::new(),
+            dev_server_stopping: Default::default(),
+            dev_server_error: None,
             context_sources: None,
             context_sources_task: None,
             context_sources_pending: None,
@@ -3067,6 +3080,7 @@ impl DetailsSidebar {
     fn render_details(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let Some(context) = self.sidebar.context().cloned() else {
             self.ensure_worked_project_diff_watch(Vec::new(), cx);
+            self.ensure_dev_server_watch(None, Vec::new(), cx);
             return div()
                 .p(px(16.0))
                 .text_color(theme.text_muted)
@@ -3120,6 +3134,15 @@ impl DetailsSidebar {
             worked.iter().map(|project| project.path.clone()).collect()
         };
         self.ensure_worked_project_diff_watch(paths, cx);
+        // Servers: listeners in the chat's folder or any Project worked.
+        let server_roots = if hide_workspace {
+            Vec::new()
+        } else {
+            std::iter::once(context.cwd.to_string_lossy().into_owned())
+                .chain(worked.iter().map(|project| project.path.clone()))
+                .collect()
+        };
+        self.ensure_dev_server_watch(context.target_device_id.clone(), server_roots, cx);
         if context.mode == super::context::DetailsMode::Orchestrator {
             if !worked.is_empty() {
                 let collapsed = self.sidebar.projects_worked_collapsed();
@@ -3284,6 +3307,10 @@ impl DetailsSidebar {
                 workspace_body = workspace_body.child(recap_row);
                 workspace_extra = true;
             }
+        }
+        if !hide_workspace && let Some(servers) = self.render_dev_servers(theme, cx) {
+            workspace_body = workspace_body.child(servers);
+            workspace_extra = true;
         }
         let mut content = div().w_full().flex().flex_col().gap(px(10.0)).p(px(10.0));
         if !hide_workspace {

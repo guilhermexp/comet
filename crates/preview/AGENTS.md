@@ -19,6 +19,8 @@ Catálogo, descoberta de listeners/processos, proxy HTTP/WebSocket, multiplexaç
 - Descoberta roda fora da thread de UI; start é idempotente, stop cancela o serviço e shutdown aguarda tarefas. Novo runtime usa nova instância.
 - Descoberta mantém verdict de HTTP por `(pid, started_at, address)`: listeners confirmados não recebem novo probe a cada ciclo; listeners não-HTTP usam backoff e uma troca de processo/porta invalida o cache. O proxy valida somente o PID e o horário de início antes de conectar. Pairing é refeito a cada 10s enquanto aguarda e um `connect` com nova sessão substitui o peer zumbi. Listener cujo programa é `zeron` (outra instância do app/engine, ex. `cargo run` do checkout) não é candidato: a porta IPC dele só fala WebSocket, e o `HEAD /` gerava warning de handshake naquele processo a cada varredura.
 
+- `servers.rs` (Details → Servers) é separado do catálogo: lista **qualquer** listener TCP sob as raízes pedidas (pasta do chat + Projects worked), sem probe HTTP. `stop` revalida pid + start time + raiz no host e manda SIGTERM ao listener e aos launchers acima dele com cwd na mesma raiz, parando em shell, CLI de agente, Zeron ou após 3 níveis — nunca derruba o agente que lançou o servidor.
+
 ## Work Guidance
 
 Preservar limites de frames, backpressure e teardown de peers. Não colocar credenciais, caminhos ou parâmetros de processo extras no signaling.
@@ -30,6 +32,7 @@ Preservar limites de frames, backpressure e teardown de peers. Não colocar cred
 | `src/**` | unit | `cargo test -p zeron-preview --lib` |
 | `tests/**` | integration | `cargo test -p zeron-preview --tests` |
 | browser/pairing real | none — BCU e dois devices; fixtures locais não provam rede publicada | ver change OpenSpec |
+| `servers.rs` list/stop guards | unit | `cargo test -p zeron-preview --lib servers` |
 | discovery probe cache + same-process guard + peer re-pair | unit / integration | `cargo test -p zeron-preview --lib` · `cargo test -p zeron-preview --test discovery` |
 
 ## Child DOX Index

@@ -30,7 +30,7 @@ impl Listener {
     /// Infisical) abort the login on an unsolicited HEAD, so exclude explicit
     /// authentication commands before connecting at all. Match whole arguments,
     /// not paths, URLs or source strings that happen to mention authentication.
-    pub(crate) fn is_authentication_command(&self) -> bool {
+    pub fn is_authentication_command(&self) -> bool {
         self.args
             .iter()
             .skip(1)

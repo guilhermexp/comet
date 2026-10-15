@@ -2549,6 +2549,24 @@ impl RpcService for EngineRpc {
             methods::WATCH_TRANSFERS => Ok(RpcReply::Stream(watch_stream(
                 self.doc_host.watch_transfers(),
             ))),
+            methods::LIST_DEV_SERVERS => {
+                let p: zeron_proto::ListDevServersParams = parse_params(params)?;
+                let servers =
+                    tokio::task::spawn_blocking(move || zeron_preview::servers::list(&p.cwds))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&servers)
+            }
+            methods::STOP_DEV_SERVER => {
+                let p: zeron_proto::StopDevServerParams = parse_params(params)?;
+                let stopped = tokio::task::spawn_blocking(move || {
+                    zeron_preview::servers::stop(p.pid, p.started_at, &p.root)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&zeron_proto::StopDevServerReply { stopped })
+            }
             methods::WATCH_PREVIEWS => {
                 let p: zeron_proto::WatchPreviewsParams = parse_params(params)?;
                 if self

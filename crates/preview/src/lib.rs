@@ -7,6 +7,7 @@ pub mod login;
 pub mod mux;
 pub mod peer;
 pub mod proxy;
+pub mod servers;
 pub mod signaling;
 
 pub mod service;

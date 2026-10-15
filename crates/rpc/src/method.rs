@@ -131,6 +131,12 @@ macro_rules! rpc_methods {
 // and must fail fast on the default 30s.
 rpc_methods! {
     WATCH_PREVIEWS / WatchPreviews = "WatchPreviews" { params: zeron_proto::WatchPreviewsParams, reply: zeron_proto::PreviewSnapshot },
+    /// TCP listeners inside the given project roots on the target device
+    /// (Details → Servers). Relay-forwardable via `targetDeviceId`.
+    LIST_DEV_SERVERS / ListDevServers = "ListDevServers" { params: zeron_proto::ListDevServersParams, reply: Vec<zeron_proto::DevServer>, forwardable: true },
+    /// SIGTERM one listed dev server (and its in-project launchers) after
+    /// re-validating pid, start time and root on the host.
+    STOP_DEV_SERVER / StopDevServer = "StopDevServer" { params: zeron_proto::StopDevServerParams, reply: zeron_proto::StopDevServerReply, forwardable: true },
     GET_TITLE_SETTINGS / GetTitleSettings = "GetTitleSettings" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     SET_TITLE_SETTINGS / SetTitleSettings = "SetTitleSettings" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_HARNESSES / ListHarnesses = "ListHarnesses" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
