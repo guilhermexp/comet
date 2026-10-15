@@ -214,18 +214,25 @@ fn discover_at(harness: HarnessId, cwd: &Path, home: &Path) -> Result<Vec<Skill>
             break;
         }
     }
+    let mut project_roots = Vec::new();
     for dir in ancestors.into_iter().rev() {
         for suffix in project_dirs(harness) {
-            roots.push((dir.join(suffix), String::new()));
+            project_roots.push((dir.join(suffix), String::new()));
         }
     }
+    // Global and project scopes each get their own budget: a large personal
+    // catalog (thousands of entries under ~/.agents/skills) used to spend it
+    // all before the project roots were reached, hiding every project skill.
+    // Project roots still scan last, so they override globals by name.
     let mut found = BTreeMap::new();
-    let mut remaining = MAX_DISCOVERY_ENTRIES;
-    for (root, namespace) in roots {
-        if remaining == 0 {
-            break;
+    for scope in [roots, project_roots] {
+        let mut remaining = MAX_DISCOVERY_ENTRIES;
+        for (root, namespace) in scope {
+            if remaining == 0 {
+                break;
+            }
+            scan_root(&root, &namespace, harness, &mut found, &mut remaining)?;
         }
-        scan_root(&root, &namespace, harness, &mut found, &mut remaining)?;
     }
     Ok(found.into_values().collect())
 }
@@ -467,7 +474,9 @@ mod tests {
             write(&repo, &format!(".pi/skills/skill-{index}.md"), "Body");
         }
         let skills = discover_at(HarnessId::Pi, &repo, &home).unwrap();
-        assert_eq!(skills.len(), MAX_DISCOVERY_ENTRIES);
+        // The project scope is capped on its own; the global skill sits in
+        // the other budget.
+        assert_eq!(skills.len(), MAX_DISCOVERY_ENTRIES + 1);
         assert!(skills.iter().any(|skill| skill.name == "global"));
 
         // Directories count too; pending nested work cannot restart the budget.
@@ -525,6 +534,26 @@ mod tests {
             found.keys().map(String::as_str).collect::<Vec<_>>(),
             ["linked", "valid"]
         );
+    }
+
+    #[test]
+    fn a_large_global_catalog_does_not_hide_project_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for index in 0..MAX_DISCOVERY_ENTRIES + 100 {
+            write(
+                &home,
+                &format!(".agents/skills/global-{index}/SKILL.md"),
+                "Global",
+            );
+        }
+        write(&repo, ".agents/skills/project/SKILL.md", "Project");
+
+        let skills = discover_at(HarnessId::Omp, &repo, &home).unwrap();
+
+        assert!(skills.iter().any(|skill| skill.name == "project"));
     }
 
     #[test]
