@@ -371,6 +371,9 @@ fn semantic_tool_icon(name: &str, input: Option<&Value>) -> ToolIconDescriptor {
 pub(crate) fn tool_icon_descriptor(call: &ToolCall) -> ToolIconDescriptor {
     match call {
         ToolCall::Exec { command } => material(command_icon(command)),
+        ToolCall::ReadFile { path } if path.trim().to_ascii_lowercase().starts_with("skill://") => {
+            material("skill")
+        }
         ToolCall::ReadFile { path }
         | ToolCall::WriteFile { path, .. }
         | ToolCall::EditFile { path, .. } => file(path),

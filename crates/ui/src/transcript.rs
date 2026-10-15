@@ -3153,6 +3153,10 @@ fn workers_tool_chips(
 /// search-like tools take a colon so the query reads as "Searched: foo".
 fn stream_copy(call: &ToolCall, label: &str, detail: &str) -> (String, String) {
     match call {
+        ToolCall::ReadFile { path } if invoked_skill_name(path).is_some() => (
+            "Skill".into(),
+            invoked_skill_name(path).unwrap_or_default().to_owned(),
+        ),
         ToolCall::ReadFile { path }
         | ToolCall::WriteFile { path, .. }
         | ToolCall::EditFile { path, .. } => (label.to_owned(), stream_file_name(path).to_owned()),
@@ -9820,7 +9824,7 @@ impl Transcript {
             .selected_chat_row()
             .and_then(|chat| chat.cwd.clone());
         let expanded = crate::file_preview::model::expand_tilde(path);
-        let display_name = file_badge_name(path);
+        let display_name = skill_badge_name(path).unwrap_or_else(|| file_badge_name(path));
         let tooltip_path = match cwd {
             Some(cwd)
                 if !expanded.contains("://")
@@ -12539,6 +12543,32 @@ impl ToolFileOpener {
 }
 
 /// Basename shown in a tool's file badge; keep the original path for routing.
+/// The skill an OMP `skill://<name>` read invokes (the bare URI; a sub-file
+/// like `skill://name/references/x.md` is an ordinary read).
+fn invoked_skill_name(path: &str) -> Option<&str> {
+    let path = path.trim();
+    let scheme = path.get(..8)?;
+    if !scheme.eq_ignore_ascii_case("skill://") {
+        return None;
+    }
+    let name = path[8..].trim_matches('/');
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
+/// A read chip for a skill names the skill: `skill://grill` is `grill`, and
+/// `…/deploy-pipeline/SKILL.md` is `deploy-pipeline` — every skill file is
+/// called `SKILL.md`, so the basename alone never says which one it is.
+fn skill_badge_name(path: &str) -> Option<&str> {
+    if let Some(name) = invoked_skill_name(path) {
+        return Some(name);
+    }
+    let mut components = path.rsplit(['/', '\\']).filter(|c| !c.is_empty());
+    components
+        .next()
+        .filter(|file| file.eq_ignore_ascii_case("SKILL.md"))?;
+    components.next()
+}
+
 fn file_badge_name(path: &str) -> &str {
     path.rsplit(['/', '\\'])
         .find(|component| !component.is_empty())
@@ -18228,6 +18258,26 @@ mod tests {
         assert_eq!(file_badge_name("src/components/"), "components");
         assert_eq!(file_badge_name("main.rs"), "main.rs");
         assert_eq!(file_badge_name(""), "");
+    }
+
+    #[test]
+    fn skill_reads_name_the_skill() {
+        assert_eq!(skill_badge_name("skill://grill"), Some("grill"));
+        assert_eq!(skill_badge_name("SKILL://grill/"), Some("grill"));
+        assert_eq!(
+            skill_badge_name("/tmp/x/deployment-pipeline-design/SKILL.md"),
+            Some("deployment-pipeline-design")
+        );
+        assert_eq!(skill_badge_name("skill://grill/references/guide.md"), None);
+        assert_eq!(skill_badge_name("SKILL.md"), None);
+        assert_eq!(skill_badge_name("src/main.rs"), None);
+        let call = ToolCall::ReadFile {
+            path: "skill://grill".into(),
+        };
+        assert_eq!(
+            stream_copy(&call, "Read", "skill://grill"),
+            ("Skill".into(), "grill".into())
+        );
     }
 
     #[gpui::test]
