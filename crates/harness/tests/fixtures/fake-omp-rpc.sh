@@ -194,6 +194,7 @@ while IFS= read -r line; do
       respond "$line" '{"level":"events"}'
       ;;
     switch_session)
+      has "$line" '"provider":"openai-codex"' && has "$line" '"modelId":"gpt-5.6-sol"' || exit 24
       case "$line" in *'"sessionPath":"/tmp/omp-session.jsonl"'*) respond "$line" '{"cancelled":false}' ;; *) exit 22 ;; esac
       ;;
     set_host_tools)

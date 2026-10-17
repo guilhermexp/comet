@@ -361,9 +361,17 @@ impl Harness for OmpHarness {
             .request(json!({ "type": "set_ask_dialog", "enabled": true }))
             .await;
         if let Some(session_path) = request.resume.as_deref() {
-            let response = process
-                .request(json!({ "type": "switch_session", "sessionPath": session_path }))
-                .await?;
+            // Hand OMP the chat's model up front: since OMP 18.11 a headless
+            // switch_session throws "Could not restore model" when the
+            // session's saved model does not resolve at open time, instead of
+            // falling back. An explicit model skips that restore.
+            let mut switch = json!({ "type": "switch_session", "sessionPath": session_path });
+            if let Some(model) = request.model.as_deref() {
+                let (provider, model_id) = split_model_id(model)?;
+                switch["provider"] = json!(provider);
+                switch["modelId"] = json!(model_id);
+            }
+            let response = process.request(switch).await?;
             if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
                 return Err(HarnessError::Protocol(
                     "OMP session resume was cancelled".into(),
