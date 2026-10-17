@@ -199,8 +199,47 @@ impl DetailsSidebar {
                 .map(|f| format!("{:.1}%", f * 100.0))
                 .unwrap_or_else(|| "—".into())
                 .into();
+            let chat_button = |id: &'static str, glyph: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .size(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::ink(0.08)))
+                    .aria_label(label)
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| ActionTooltip {
+                            label: label.into(),
+                        })
+                        .into()
+                    })
+                    .child(
+                        icons::icon(glyph)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+            };
+            let chat_actions = div()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    chat_button("details-new-side-chat", icons::PLUS, "New side chat").on_click(
+                        cx.listener(|_, _, _, cx| cx.emit(DetailsSidebarEvent::NewSideChat)),
+                    ),
+                )
+                .child(
+                    chat_button("details-fork-chat", icons::FORK, "Fork chat").on_click(
+                        cx.listener(|_, _, _, cx| cx.emit(DetailsSidebarEvent::ForkChat)),
+                    ),
+                )
+                .into_any_element();
             card = card
-                .child(card_header("Session", None, theme))
+                .child(card_header("Session", Some(chat_actions), theme))
                 .child(
                     div()
                         .h(px(28.0))

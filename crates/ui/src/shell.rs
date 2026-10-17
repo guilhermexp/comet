@@ -3171,6 +3171,8 @@ impl Shell {
                 DetailsSidebarEvent::OpenWorkingTreeDiff { path } => {
                     this.focus_working_tree_diff(path.clone(), cx);
                 }
+                DetailsSidebarEvent::NewSideChat => this.create_child_chat(None, cx),
+                DetailsSidebarEvent::ForkChat => this.create_side_chat(cx),
                 DetailsSidebarEvent::OpenWorkerSession {
                     chat_id,
                     session_id,

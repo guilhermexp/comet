@@ -365,6 +365,9 @@ pub enum DetailsSidebarEvent {
     OpenWorkingTreeDiff {
         path: String,
     },
+    /// Session header buttons: the same verbs as the titlebar session card.
+    NewSideChat,
+    ForkChat,
 }
 
 #[derive(Clone, Copy)]
