@@ -13578,6 +13578,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+ "zeron-computer-use-mcp",
  "zeron-doc",
  "zeron-engine",
  "zeron-mcp",
@@ -13625,6 +13626,16 @@ dependencies = [
  "zeron-rpc",
  "zeron-sync",
  "zeron-voice-session",
+]
+
+[[package]]
+name = "zeron-computer-use-mcp"
+version = "1.0.5"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -165,6 +165,10 @@ fn main() -> anyhow::Result<()> {
         }
         return zeron_sessions_mcp::run_stdio().map_err(anyhow::Error::msg);
     }
+    if std::env::args().nth(1).as_deref() == Some(zeron_computer_use_mcp::COMPUTER_USE_MCP_ARG) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return zeron_computer_use_mcp::run_stdio(&args).map_err(anyhow::Error::msg);
+    }
     if zeron_workers_unpeel::run_session_host_mode_if_requested().map_err(anyhow::Error::msg)? {
         return Ok(());
     }
