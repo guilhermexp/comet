@@ -799,7 +799,12 @@ impl WorkersSettingsView {
         let presets = settings
             .as_ref()
             .map(|settings| settings.presets.clone())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            // A preset whose CLI is missing on this Mac lives only under Not
+            // installed; it comes back here once the CLI is found again.
+            .filter(|preset| preset.installed)
+            .collect::<Vec<_>>();
         let runtimes = settings
             .as_ref()
             .map(|settings| settings.runtimes.clone())
