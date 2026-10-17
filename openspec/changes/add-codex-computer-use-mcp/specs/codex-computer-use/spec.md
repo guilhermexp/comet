@@ -68,6 +68,28 @@ Settings → Agents SHALL show a "Computer Use" switch, on by default, saved per
 - **WHEN** the settings file exists but cannot be read or parsed
 - **THEN** the server SHALL treat Computer Use as off
 
+### Requirement: Scope selector chooses chats only or chats and Workers
+
+Next to the switch, Settings → Agents SHALL show a two-option selector: "Comet only" (agent chats) and "Comet + Workers" (agent chats and Worker sessions), saved per device and defaulting to "Comet + Workers". The selector SHALL be inactive while the switch is off. With "Comet only", new Worker sessions SHALL see no Computer Use tool and a Worker call SHALL be refused with a message naming the setting; chats SHALL be unaffected.
+
+#### Scenario: Default scope
+- **WHEN** the device has no saved scope
+- **THEN** the selector SHALL read "Comet + Workers" and new Worker sessions SHALL list the two tools
+
+#### Scenario: Comet only hides the tools from Workers
+- **WHEN** the scope is "Comet only" and a Worker starts
+- **THEN** the Worker's tool list SHALL contain neither `computer_use` nor `computer_use_reset`
+- **AND** a new chat SHALL still list both tools
+
+#### Scenario: Scope narrowed mid-session
+- **WHEN** the scope changes to "Comet only" while a Worker that already lists the tools is running, and that Worker calls `computer_use`
+- **THEN** the call SHALL return an error result saying Computer Use is limited to Comet chats in Settings
+- **AND** no code SHALL reach the runtime
+
+#### Scenario: Selector inactive when off
+- **WHEN** the switch is off
+- **THEN** the selector SHALL be shown inactive and neither chats nor Workers SHALL list the tools
+
 ### Requirement: Runtime resolution picks the newest installed plugin
 
 The server SHALL start the `cua_repl` command declared by the newest `unified-computer-use` plugin version installed by ChatGPT.app, comparing versions by their numeric parts. It SHALL limit the runtime to the native computer surface. With no usable plugin it SHALL list no tools.

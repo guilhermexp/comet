@@ -49,7 +49,8 @@ Motivação em `proposal.md`. Estado atual que molda o desenho:
 **Non-Goals:**
 - Reaproveitar ou ligar o domínio `computer` (cua-driver) do Unpeel. Fica
   como está, desligado.
-- Gate por chamada (Off/Ask/Allow). O pedido é liga/desliga.
+- Gate por chamada (Off/Ask/Allow). O pedido é liga/desliga mais o alcance
+  (só chats ou chats + Workers).
 - Desligar o Computer Use nativo do Codex.
 - Runtimes de Worker sem seam MCP.
 - Empacotar o runtime: sem ChatGPT.app não há Computer Use.
@@ -74,10 +75,16 @@ O servidor é montado sempre (exceto Codex e runs internos). Ele lê o setting:
 - em `tools/list`: desligado ou runtime ausente → lista vazia;
 - em cada `tools/call`: desligado → resultado de erro, sem tocar o runtime.
 
-Leitura: `{data_dir}/ui-settings.json`, só a chave `codexComputerUseEnabled`
-(struct mínimo com `Option<bool>`, sem depender do crate de UI). Ausente →
-ligado; `false` → desligado; arquivo existente mas ilegível/malformado →
-desligado. `data_dir` é resolvido pela mesma regra de `paths.rs`; quem monta
+Leitura: `{data_dir}/ui-settings.json`, só as chaves `codexComputerUseEnabled`
+e `codexComputerUseScope` (struct mínimo com `Option`s, sem depender do crate
+de UI). Ausente → ligado; `false` → desligado; arquivo existente mas
+ilegível/malformado → desligado. Escopo ausente ou valor desconhecido →
+`chatsAndWorkers`; `chats` → o servidor de um Worker age como desligado.
+
+Origem: a montagem diz ao servidor de onde ele é. Chats passam só
+`["__computer_use_mcp__"]`; Workers (adapters e ponte omp/pi) passam
+`["__computer_use_mcp__", "--worker"]`. Assim o mesmo gate cobre o seletor sem
+canal novo; o arg é estático e cabe nos configs fixos dos adapters. `data_dir` é resolvido pela mesma regra de `paths.rs`; quem monta
 passa `ZERON_DATA_DIR` explícito no env do servidor quando o conhece, para o
 filho não depender do env herdado.
 
@@ -145,6 +152,13 @@ Use" acima da lista de runtimes, no padrão do toggle de habilitar runtime
 permissão de Acessibilidade; não afeta o Codex; vale para sessões novas.
 Campo `codex_computer_use_enabled: bool` em `UiSettings`, serializado como
 `codexComputerUseEnabled`, `Default` = `true`.
+
+Seletor de alcance (decisão do dono, 2026-10-17) logo abaixo do switch, no
+padrão de segmented control já usado em Settings: "Só Comet" / "Comet +
+Workers". Campo `codex_computer_use_scope: ComputerUseScope` (`Chats` |
+`ChatsAndWorkers`, serde `chats` / `chatsAndWorkers`), serializado como
+`codexComputerUseScope`, `Default` = `ChatsAndWorkers`. Com o switch desligado
+o seletor fica esmaecido e não clicável; o valor salvo é mantido.
 
 Escopo por máquina (decisão do dono, 2026-10-17): o servidor lê o arquivo do
 host onde o agente roda, então o botão governa só as sessões daquele host; host

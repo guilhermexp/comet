@@ -37,6 +37,10 @@ caminho, ligado por padrão e com um botão em Settings para desligar.
   fica ligado). O botão só liga/desliga o servidor do Comet; o Computer Use
   nativo do Codex não muda, e o texto do botão diz isso. Desligado: sessão nova não vê a tool, e chamada
   de sessão já aberta é recusada com mensagem clara.
+- Junto do botão, um seletor de alcance com duas opções: "Só Comet" (só os
+  chats) e "Comet + Workers" (padrão). Em "Só Comet", Workers novos não veem a
+  tool e chamada de Worker já aberto é recusada. Com o botão desligado o
+  seletor fica inativo.
 - Sem ChatGPT.app (runtime ausente), o servidor não anuncia tool nenhuma.
 - Depois que a versão do Comet estiver provada em chat e Worker OMP, a extensão
   `omp-codex-computer-use` sai do omp desta máquina, para não haver tool
