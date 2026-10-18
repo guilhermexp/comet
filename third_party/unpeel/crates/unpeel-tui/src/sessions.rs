@@ -262,6 +262,7 @@ fn derive_status(
             anchor_start_event_to_output,
             manifest.runtime_launched_at,
             manifest.runtime_launch_generation,
+            |_| true,
         );
         // Hook-owned lifecycle. Seed the latch from disk if this TUI hasn't
         // seen a live event yet, then sweep timeouts against output growth.

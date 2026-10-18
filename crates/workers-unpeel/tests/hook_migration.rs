@@ -75,13 +75,20 @@ fn a_foreign_tool_hook_under_a_temp_root_does_not_look_like_our_stale_asset() {
 }
 
 #[test]
-fn legacy_hook_pruning_keeps_the_upstream_owned_lifecycle_extension() {
+fn legacy_hook_pruning_preserves_all_current_runtime_extensions() {
     let temp = TempDir::new().unwrap();
     let legacy = temp.path().join(".unpeel/hooks");
     std::fs::create_dir_all(&legacy).unwrap();
     std::fs::write(legacy.join("notify-hook.sh"), "#!/bin/sh\n").unwrap();
-    let extension = legacy.join("pi-family-lifecycle-extension.js");
-    std::fs::write(&extension, "// lifecycle\n").unwrap();
+    let extensions =
+        ["pi", "omp"].map(|runtime| legacy.join(format!("{runtime}-lifecycle-extension.js")));
+    for extension in &extensions {
+        std::fs::write(extension, "// lifecycle\n").unwrap();
+    }
+    let obsolete = legacy.join("pi-family-lifecycle-extension.js");
+    std::fs::write(&obsolete, "// old shared lifecycle\n").unwrap();
+    let obsolete_prime = legacy.join("prime-agent-lifecycle-extension.js");
+    std::fs::write(&obsolete_prime, "// obsolete TypeScript Prime lifecycle\n").unwrap();
     let config = temp.path().join("settings.json");
     std::fs::write(
         &config,
@@ -92,9 +99,20 @@ fn legacy_hook_pruning_keeps_the_upstream_owned_lifecycle_extension() {
     assert!(remove_legacy_hook_root_at(&legacy, &[config], false).unwrap());
     assert!(!legacy.join("notify-hook.sh").exists());
     assert!(
-        extension.exists(),
-        "pi-family launches with --extension pointing at this path"
+        !obsolete.exists(),
+        "the migrated shared asset is no longer needed"
     );
+    assert!(
+        !obsolete_prime.exists(),
+        "native Prime no longer loads JavaScript extensions"
+    );
+    for extension in extensions {
+        assert!(
+            extension.is_file(),
+            "runtime launch still needs --extension {}",
+            extension.display()
+        );
+    }
 }
 
 #[test]

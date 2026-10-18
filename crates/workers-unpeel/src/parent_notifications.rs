@@ -185,6 +185,8 @@ fn hook_events(
                 // PermissionRequest row, so a blocked stretch cannot mint one
                 // steer per journal line.
                 last_turn_sequence = entry.sequence;
+                actionable.clear();
+                retained_latch_event_id = None;
             }
             "PermissionRequest" => actionable.push((
                 WorkerParentNotificationKind::WaitingForInput,
@@ -197,6 +199,8 @@ fn hook_events(
                 entry.occurred_at_unix_ms,
             )),
             "Stop" | "StopFailure" => {
+                actionable
+                    .retain(|(kind, _, _)| *kind != WorkerParentNotificationKind::WaitingForInput);
                 const REARM_GRACE_MS: u64 = 5_000;
                 if distrust_stop
                     && (now_ms.saturating_sub(entry.occurred_at_unix_ms) < REARM_GRACE_MS
@@ -640,12 +644,11 @@ fn pending_from_state(
             }
         };
         let evidence = completion_evidence(session);
-        // A worker sitting on a permission prompt has a Stop in its journal and
-        // a quiescent output, so quiescence alone would announce it as done.
-        // Its own activity is the discriminator, and it costs no inspection.
+        // A blocked prompt or a resumed but quiet turn is not completed merely
+        // because an older Stop and quiescent output remain in the snapshot.
         let completion_permitted = binding.acknowledged_completed_episode
             != Some(binding.active_task_episode)
-            && session.activity != "blocked"
+            && !activity_blocks_completion(&session.activity)
             && evidence.permits_completion();
         let has_completed_event = events
             .iter()
@@ -923,15 +926,17 @@ pub fn ack_worker_parent_notification_at(
     })
 }
 
-/// Test shim for the PRODUCTION ack path: acknowledging always compacts the
-/// journal, which drops every previously acknowledged id (their sequence
-/// numbers no longer mean anything). Only ids that survive compaction —
-/// lifecycle ids, which carry no sequence — must keep the worker quiet.
+/// Exercise the production acknowledgement path against an isolated session root.
+/// Compaction must preserve the lifecycle identity used by subsequent polls.
 #[doc(hidden)]
 pub fn ack_worker_parent_notification_compacted_at(
     path: &Path,
     notification: &WorkerParentNotification,
+    sessions_root: &Path,
 ) -> Result<(), String> {
+    crate::session_event_journal::compact_to_latest(
+        &sessions_root.join(&notification.worker_session_id),
+    )?;
     unpeel_core::app_state::edit_at(path, |state| {
         acknowledge_in_state(state, notification, true)
     })

@@ -779,7 +779,9 @@ changing `browser_mcp.rs` or bumping the engine, run
 | Cline | `cline` | Native global hook files (`~/.cline/hooks`, `.bash` preferred) |
 | Amp | `amp` | Amp plugin + notify hook |
 | Gemini | `gemini --yolo` | Gemini settings hook script |
-| Pi | `pi` | None (output heuristics) |
+| Pi | `pi` | Runtime-specific lifecycle extension (`agent_settled` and blocking UI prompt callbacks) |
+| OMP | `omp` | Runtime-specific extension (`ask` tool call/result, approval events, terminal `agent_end`) |
+| Prime Agent | `prime-agent` | Rust 0.10 native daemon protocol 7, private Worker endpoint and root roster/event observation; no JS loader or reliable prompt hooks |
 | OpenCode | `opencode` | OpenCode plugin + notify hook |
 | Copilot | none built-in | Project hook file + hook script |
 | Cursor Agent | `cursor-agent` built-in, not quick-launchable | Cursor hook script |
@@ -787,6 +789,7 @@ changing `browser_mcp.rs` or bumping the engine, run
 | Kimi | `kimi --yolo` built-in, not quick-launchable | Current Kimi Code config hooks (`~/.kimi-code/config.toml`) + legacy hooks (`~/.kimi/config.toml`) |
 | Kiro | `kiro-cli --v3` built-in, not quick-launchable | Global v3 hook file (`~/.kiro/hooks/unpeel.json`) |
 | Muse Code | `muse --yolo` built-in, not quick-launchable | Unpeel native muse plugin (`muse plugins install/approve`, gated on `MUSE_EXPERIMENTAL_PLUGINS=1` at launch) |
+| Antigravity | `agy` | None (output-derived fallback, no synthetic lifecycle) |
 
 ## Provider Hook Details and Adding a Built-in Runtime
 
@@ -918,18 +921,49 @@ exist.
 
 `runtimes/setup_conformance_tests.rs` executes every owned shell hook with explicit proxy variables and empty proxy exclusions. CaptureServer verifies direct loopback delivery and the persisted `last-hook-event.json` event and generation.
 
+### Test Coverage Matrix
+
+| Layer / path | Tier | Verification |
+|---|---|---|
+| `runtimes/setup_conformance_tests.rs`: ten executable shell reporters and shared transport | integration | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib setup_conformance` |
+| OMP/Pi/Amp/OpenCode adapter and callback contracts; Prime native ownership, framing, cancellation and resume | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib` |
+| Prime native lifecycle through Comet Host/journal, same-PTY resume and private daemon teardown | integration | Manual official 0.10 CLI probe with private HOME/provider/XDG, hook root distinct from state, managed and external saved history, real Host input/resume/stop APIs and loopback model; record actual generations/provider UUID, never a hosted-model/production-profile substitute |
+| `crates/unpeel-tui/src/activity.rs`: accepted durable seeds and live-event precedence | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-tui --bin unpeel activity` |
+
 ## Comet downstream lifecycle isolation (local fork)
 
 This section records the Comet integration layered on the provider-neutral hook
 contracts above; it is not an upstream runtime API guarantee.
 
-- Pi and Prime retain `pi-family-lifecycle-extension.js`. OMP installs the
-  separate `omp-lifecycle-extension.js` from
-  `runtimes/_shared/pi-family/adapter/setup.rs`, so the OMP-only child-agent
-  classifier cannot suppress unrelated Pi-family events.
-- The extension includes `unpeel_agent_kind` from `ctx.agent.kind`: `sub`
-  events stop before posting, while `main` is authoritative and can rebind a
-  primary Worker even when its transcript path resembles a child artifact.
+- Pi and OMP install distinct runtime-stamped lifecycle assets from
+  `runtimes/_shared/pi-family/adapter/setup.rs`, migrating the old shared
+  extension argument without an alias. OMP uses actual `ask`/approval events
+  and continuation-aware end; Pi uses `agent_settled` and its UI callbacks.
+- Prime Rust 0.10 rejects JS extensions. Its adapter strips only our legacy
+  extension arguments, retains the existing `pi-sessions` history and uses
+  explicit ID/path resume instead of a generated global `--continue` picker.
+  A Worker-owned private protocol-7 daemon supplies root roster/session
+  events; saved rows, queued children and nested roots cannot claim ownership.
+  `agent_end` triggers a roster query, not immediate completion: only the
+  owned root's idle state completes a turn. Transport loss/inactive is not
+  completion, and the native API has no event replay. Generation-fenced Host
+  lifetime control cleans up only this daemon on scope end/teardown without
+  holding PTY state locks. External daemon overrides are refused. Prime does
+  not advertise full attention or inherit OMP transcript telemetry.
+- Native scope cleanup uses the accepted launch generation, not the unrelated
+  zero-based observer-reset counter. An explicit saved path survives UUID
+  capture only after its bounded session header matches that UUID. Native
+  publication uses `hook_assets::notify_hook_script_path()` and an absolute
+  Bash interpreter: the managed hook root can differ from `unpeel_home`, and
+  Comet deliberately removes legacy transport copies from `<home>/hooks`.
+  Scope/Host cleanup never emits synthetic `Stop`; an interrupted in-flight
+  runtime must not become successful completion merely because observation ended.
+- Prime may leave its socket inode after a successful native shutdown. Remove
+  that owned endpoint only after a kernel connection attempt confirms no
+  listener remains; a live or unverified endpoint is not safe to unlink.
+- The OMP extension includes `unpeel_agent_kind` from `ctx.agent.kind`: `sub`
+  events stop before posting, while validated `main` can rebind a primary
+  Worker even when its transcript path resembles a child artifact.
   Older extension payloads omit that field, so the OMP adapter uses the
   provider's canonical child-transcript layout beneath the trusted OMP session
   root (`runtimes/omp/adapter/telemetry.rs::is_nested_provider_transcript`).
@@ -937,21 +971,27 @@ contracts above; it is not an upstream runtime API guarantee.
   trusted transcript under that root, so a child whose JSONL is not flushed
   yet is still nested. It does not classify arbitrary nested JSONL paths or
   apply this fallback to Pi/Prime.
-- Comet's `crates/workers-unpeel` ingress repeats the classification before
-  queueing lifecycle events, changing activity, writing the session journal,
-  or persisting provider binding/telemetry. Its read-only
-  `POST /hook/<id>?validate=1` route supports old extensions and old listeners:
-  a current listener returns `202` with `ignored: true` for a child event,
-  while an older listener's `404` leaves primary delivery compatible. The
-  shared notifier preflights every known listener for synchronous Worker hooks
-  and suppresses all actual child POSTs and the durable marker if any listener
-  explicitly ignores the event. Async hooks keep marker-before-background-POST
-  ordering.
-- The focused Rust/Bun regressions live in the OMP extension/adapter and the
-  Comet `activity_bridge`/`session_event_journal` tests. From the Comet root,
-  run local Cargo batches through `scripts/cargo-verify.py`; vendor core tests
-  use `--manifest-path third_party/unpeel/crates/Cargo.toml`, while downstream
-  bridge tests use the root workspace.
+- Comet's shared `hook_admission` first compares the reporter's explicit
+  `unpeel_runtime_id` with the active/launch runtime. Even `main` cannot
+  authorize a different provider. It applies the same role/path/generation
+  admission before HTTP mutation and durable activity/journal recovery.
+  The read-only `POST /hook/<id>?validate=1` returns `202 ignored` for rejected
+  evidence; an old listener's `404` is not a rejection. Both synchronous and
+  asynchronous reporters preflight before any seed or delivery. A private
+  atomic seed retains lifecycle and identity, not raw prompts or tool inputs;
+  unreachable listeners still allow offline recovery.
+- Canonicalize provider/session and transcript field names accepted from SDKs
+  before the live/durable privacy projection. Fields such as `providerSessionId`,
+  `conversationId` and `providerTranscriptPath` must retain their admission and
+  recovery identity as `session_id`/`transcript_path`; raw prompt fields stay out.
+- Executable regressions cover all ten shell reporters (online/offline,
+  synchronous/asynchronous admission), OMP/Pi/Amp/OpenCode callback contracts,
+  native Prime ownership/resume/lifetime, Comet activity/journal admission and
+  compacted parent attention. Run local Cargo through `scripts/cargo-verify.py`;
+  vendor suites use `--manifest-path third_party/unpeel/crates/Cargo.toml`,
+  downstream bridge suites use the root workspace. Provider-native probes need
+  isolated HOME/provider/XDG directories and loopback models; never restart
+  production Workers or claim unexercised provider UI coverage.
 
 ## Comet transcript and interrupt fidelity (local fork)
 

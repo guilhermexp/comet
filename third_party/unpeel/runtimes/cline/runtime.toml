@@ -28,10 +28,10 @@ script_path_signatures = []
 
 [lifecycle]
 source = "hooks"
-authority = "partial"
+authority = "complete"
 fallback = "none"
 completion_reliable = true
-attention_reliable = false
+attention_reliable = true
 
 [[usage.stores]]
 root = ".cline/data/sessions"

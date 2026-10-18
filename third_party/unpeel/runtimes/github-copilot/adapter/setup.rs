@@ -22,8 +22,11 @@ pub fn prepare_copilot_project_hooks(cwd: &str) -> Result<(), String> {
         "hooks": {
             "sessionStart": [{ "type": "command", "bash": format!("{} sessionStart", hook_script_path.display()), "timeoutSec": 5 }],
             "sessionEnd": [{ "type": "command", "bash": format!("{} sessionEnd", hook_script_path.display()), "timeoutSec": 5 }],
+            "agentStop": [{ "type": "command", "bash": format!("{} agentStop", hook_script_path.display()), "timeoutSec": 5 }],
             "userPromptSubmitted": [{ "type": "command", "bash": format!("{} userPromptSubmitted", hook_script_path.display()), "timeoutSec": 5 }],
-            "postToolUse": [{ "type": "command", "bash": format!("{} postToolUse", hook_script_path.display()), "timeoutSec": 5 }]
+            "preToolUse": [{ "type": "command", "bash": format!("{} preToolUse", hook_script_path.display()), "timeoutSec": 5 }],
+            "postToolUse": [{ "type": "command", "bash": format!("{} postToolUse", hook_script_path.display()), "timeoutSec": 5 }],
+            "notification": [{ "type": "command", "bash": format!("{} notification", hook_script_path.display()), "timeoutSec": 5 }]
         }
     });
     let serialized = serde_json::to_string_pretty(&hook_json)

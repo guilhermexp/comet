@@ -11,9 +11,10 @@ claim or race the TUI's aggregate `custom:unpeel` authority. See
 
 Claude:
 
-- Installs hook config into Claude settings (`SessionStart`,
-  `UserPromptSubmit`, `Stop`, `StopFailure`, `PermissionRequest`)
-- Emits lifecycle and permission events through the Unpeel hook server
+- Installs lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `Stop`,
+  `StopFailure`, `PermissionRequest`) plus filtered `PreToolUse`/`PostToolUse`
+  for `AskUserQuestion`. A normal question cannot depend on an approval hook:
+  its pre-tool boundary requests attention and its result resumes working.
 - `SessionStart` is forwarded as `HookSeen` (metadata-only latch, like
   grok/kiro) — it fires at launch and on in-tool `/resume`, `/clear`,
   `/compact` with the new `session_id` + `transcript_path`, so a session
@@ -43,6 +44,9 @@ Codex:
 Amp:
 
 - Installs an Amp plugin that maps agent start/end to Start/Stop notify events
+- Tracks built-in `ask_user_choice` through its actual tool-call/result IDs
+  and thread ownership. This does not promise generic approval/custom-dialog
+  coverage.
 
 Gemini:
 
@@ -57,12 +61,17 @@ Gemini:
 OpenCode:
 
 - Installs a plugin under Unpeel-managed OpenCode config
-- Plugin tracks busy/idle/permission events and calls the notify hook
+- Tracks root busy/idle plus actual v1/v2 permission and question
+  asked/replied/rejected events. Pending interaction IDs prevent an unrelated
+  reply from clearing another question.
 
 Copilot:
 
 - Installs a hook script
 - Writes project-local hook config under `.github/hooks/unpeel-notify.json`
+- Uses actual `agentStop` for main-turn completion and filtered permission/
+  elicitation notifications for attention. Ordinary tool execution is working,
+  not blocked; child agent/parent IDs are rejected before publication.
 
 Cursor Agent:
 
@@ -76,8 +85,9 @@ Grok (xAI `grok` CLI):
 - Maps Grok lifecycle events onto Unpeel state: `SessionStart` → HookSeen
   (latch only — the CLI opened, not a turn), `UserPromptSubmit` → Start
   (busy), `Stop`/`StopFailure`/`SessionEnd` → Stop (idle),
-  `Notification` `approval_required` and `PreToolUse` `ask_user_question` →
-  PermissionRequest (attention)
+  `Notification` `approval_required`/`permission_prompt` and `PreToolUse`
+  `ask_user_question` → PermissionRequest (attention). The matching
+  PostToolUse/PostToolUseFailure returns to working, not completed.
 - `GROK_SESSION_ID` is available to every hook and Unpeel mints the id at
   launch (`grok --session-id <uuid>`), so restart is precise
   (`grok --resume <id>`) — see Resume on Restart
@@ -123,6 +133,9 @@ Cline (`cline` CLI):
 - Maps TaskStart/TaskResume, tool, completion, cancellation, shutdown, and
   error hooks to UserPromptSubmit/Start/Stop/StopFailure and forwards
   `sessionContext.rootSessionId`
+- Actual `ask_question` PreToolUse/PostToolUse boundaries provide question/
+  answered transitions; `TaskComplete` is terminal. A nonempty
+  `parent_agent_id` is excluded before any offline seed or delivery.
 - Resumes exactly with `cline --id <id>` once TaskStart reports the id; older
   sessions without one open `cline history` because Cline has no continue-last
   flag
@@ -144,10 +157,31 @@ Cline (`cline` CLI):
 
 Pi:
 
-- No hook-port integration today; Unpeel relies on output heuristics
-- Each pi session is pinned to its own storage dir at launch
-  (`--session-dir ~/.unpeel/pi-sessions/<session-id>`), which makes restart's
-  `--continue` exact — see Resume on Restart
+- Loads its own runtime-stamped lifecycle extension: `agent_settled` confirms
+  completion, while actual blocking UI prompt start/end callbacks report
+  attention/answer. It does not subscribe to OMP-only events.
+- Keeps provider storage pinned under `pi-sessions`; exact resume remains
+  provider-owned.
+
+OMP:
+
+- Loads a distinct runtime-stamped extension. Actual `ask` tool-call/result
+  and approval requested/resolved events drive waiting/working transitions.
+- `agent_end` with continuation/nonterminal evidence is not completion.
+  Canonical child-agent events are excluded before publication.
+
+Prime Agent (supported Rust 0.10 runtime):
+
+- Does not accept `--extension`; managed legacy JS arguments are removed.
+  A private protocol-7 daemon per Worker provides native root roster/session
+  events without a dummy observing agent or attaching to a global daemon.
+- `agent_end` requests a fresh roster; only owned root idle confirms Stop.
+  Inactive/transport loss is not completion, and the API has no event replay.
+- Host lifetime control fences generations and cleans up its own daemon on
+  runtime scope end/teardown. Explicit daemon overrides are rejected.
+- Resume selects the owned provider ID/path and retains `pi-sessions`;
+  unresolved `--continue` is rejected rather than silently opening a picker.
+  No full prompt-attention or OMP telemetry support is advertised.
 
 Muse Code (Meta `muse` CLI):
 

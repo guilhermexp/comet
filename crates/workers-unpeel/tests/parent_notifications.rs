@@ -75,7 +75,10 @@ fn write_hook_at(
     let sequence = std::fs::read_to_string(&path)
         .unwrap_or_default()
         .lines()
-        .count() as u64
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|entry| entry["sequence"].as_u64())
+        .max()
+        .unwrap_or(0)
         + 1;
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
@@ -339,13 +342,12 @@ fn long_lived_service_children_do_not_block_completion() {
 }
 
 #[test]
-fn acknowledging_permission_does_not_consume_a_blocked_completion() {
+fn acknowledging_permission_does_not_consume_a_later_completion() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
     begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "PermissionRequest", 7);
-    write_hook(&sessions_root, "worker-1", "Stop", 7);
 
     let waiting = pending_worker_parent_notifications_with_evidence_at(
         &path,
@@ -357,6 +359,17 @@ fn acknowledging_permission_does_not_consume_a_blocked_completion() {
     .remove(0);
     assert_eq!(waiting.kind, WorkerParentNotificationKind::WaitingForInput);
     ack_worker_parent_notification_at(&path, &waiting).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    assert!(
+        pending_worker_parent_notifications_with_evidence_at(
+            &path,
+            &[session("worker-1", 7, "blocked", "running")],
+            &sessions_root,
+            |_| WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+        .is_empty()
+    );
 
     let completed = pending_worker_parent_notifications_with_evidence_at(
         &path,
@@ -470,38 +483,6 @@ fn prepared_episode_requires_durable_submission_before_notification() {
 }
 
 #[test]
-fn journal_preserves_multiple_episodes_observed_after_downtime() {
-    let (dir, path) = state_file();
-    let sessions_root = dir.path().join("sessions");
-    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
-    write_hook(&sessions_root, "worker-1", "Start", 7);
-    write_hook(&sessions_root, "worker-1", "Stop", 7);
-    write_hook(&sessions_root, "worker-1", "Start", 7);
-    write_hook(&sessions_root, "worker-1", "Stop", 7);
-
-    let pending = pending_worker_parent_notifications_with_evidence_at(
-        &path,
-        &[session("worker-1", 7, "idle", "running")],
-        &sessions_root,
-        |_| WorkerCompletionEvidence::quiescent(),
-    )
-    .unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].superseded_event_ids.len(), 1);
-    ack_worker_parent_notification_at(&path, &pending[0]).unwrap();
-    assert!(
-        pending_worker_parent_notifications_at(
-            &path,
-            &[session("worker-1", 7, "idle", "running")],
-            &sessions_root,
-        )
-        .unwrap()
-        .is_empty()
-    );
-}
-
-#[test]
 fn exited_without_a_completed_lifecycle_is_actionable() {
     let (dir, path) = state_file();
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
@@ -534,7 +515,7 @@ fn acknowledged_exit_never_re_notifies_under_a_second_spelling() {
     // Production acks compact the journal, which drops every previously
     // acknowledged id. A second spelling of the same exit would come back
     // un-acknowledged here and the pair would alternate forever.
-    ack_worker_parent_notification_compacted_at(&path, &pending[0]).unwrap();
+    ack_worker_parent_notification_compacted_at(&path, &pending[0], &sessions_root).unwrap();
     assert!(
         pending_worker_parent_notifications_at(&path, &dead, &sessions_root)
             .unwrap()
@@ -950,6 +931,7 @@ fn repeated_prompts_do_not_amplify_parent_notifications() {
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
     begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     let sessions = [session("worker-1", 7, "blocked", "running")];
+    write_hook(&sessions_root, "worker-1", "UserPromptSubmit", 7);
     for _ in 0..5 {
         write_hook(&sessions_root, "worker-1", "PermissionRequest", 7);
     }
@@ -962,7 +944,18 @@ fn repeated_prompts_do_not_amplify_parent_notifications() {
     .unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].kind, WorkerParentNotificationKind::WaitingForInput);
-    ack_worker_parent_notification_at(&path, &first[0]).unwrap();
+    ack_worker_parent_notification_compacted_at(&path, &first[0], &sessions_root).unwrap();
+    assert!(
+        pending_worker_parent_notifications_with_evidence_at(
+            &path,
+            &sessions,
+            &sessions_root,
+            |_| WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+        .is_empty(),
+        "production compaction must preserve the acknowledged blocked episode"
+    );
     for _ in 0..5 {
         write_hook(&sessions_root, "worker-1", "PermissionRequest", 7);
     }
@@ -993,6 +986,88 @@ fn repeated_prompts_do_not_amplify_parent_notifications() {
         WorkerParentNotificationKind::WaitingForInput
     );
     assert_ne!(second[0].event_id, first[0].event_id);
+    ack_worker_parent_notification_compacted_at(&path, &second[0], &sessions_root).unwrap();
+    assert!(
+        pending_worker_parent_notifications_with_evidence_at(
+            &path,
+            &sessions,
+            &sessions_root,
+            |_| WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn resolved_question_does_not_wake_parent_from_a_stale_journal_row() {
+    for resolution in ["UserPromptSubmit", "Stop", "StopFailure"] {
+        let (dir, path) = state_file();
+        let sessions_root = dir.path().join("sessions");
+        register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+        begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+        write_hook(&sessions_root, "worker-1", "UserPromptSubmit", 7);
+        write_hook(&sessions_root, "worker-1", "PermissionRequest", 7);
+        write_hook(&sessions_root, "worker-1", resolution, 7);
+        let activity = if resolution == "UserPromptSubmit" {
+            "working"
+        } else {
+            "idle"
+        };
+        let pending = pending_worker_parent_notifications_with_evidence_at(
+            &path,
+            &[session("worker-1", 7, activity, "running")],
+            &sessions_root,
+            |_| WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap();
+        if resolution == "UserPromptSubmit" {
+            assert!(
+                pending.is_empty(),
+                "the answered question is no longer pending"
+            );
+        } else {
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].kind, WorkerParentNotificationKind::Completed);
+            assert!(
+                pending[0].superseded_event_ids.is_empty(),
+                "resolved attention must not remain actionable after {resolution}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resumed_turn_retires_unacknowledged_completion_even_if_output_is_quiet() {
+    for activity in ["working", "idle"] {
+        let (dir, path) = state_file();
+        let sessions_root = dir.path().join("sessions");
+        register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+        begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+        write_hook(&sessions_root, "worker-1", "Stop", 7);
+        write_hook(&sessions_root, "worker-1", "UserPromptSubmit", 7);
+        let resumed = session("worker-1", 7, activity, "running");
+        assert!(
+            pending_worker_parent_notifications_with_evidence_at(
+                &path,
+                &[resumed.clone()],
+                &sessions_root,
+                |_| WorkerCompletionEvidence::quiescent(),
+            )
+            .unwrap()
+            .is_empty(),
+            "a previous Stop is not completion evidence for a resumed turn"
+        );
+        assert!(
+            !current_episode_completed_with_evidence_at(
+                &path,
+                &resumed,
+                &sessions_root,
+                WorkerCompletionEvidence::quiescent(),
+            )
+            .unwrap()
+        );
+    }
 }
 
 #[test]

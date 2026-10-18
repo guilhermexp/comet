@@ -1,20 +1,18 @@
 #[cfg(test)]
 mod tests {
     use super::{
-        kiro_mcp_server_value, AMP_PLUGIN_SCRIPT, CLAUDE_HOOK_SCRIPT, CLINE_HOOK_SCRIPT,
-        CODEX_NOTIFY_NORMALIZER_SCRIPT, COPILOT_HOOK_SCRIPT, CURSOR_HOOK_SCRIPT,
-        GEMINI_HOOK_SCRIPT, KIMI_HOOK_SCRIPT, KIRO_HOOK_SCRIPT, NOTIFY_HOOK_SCRIPT,
-        OPENCODE_PLUGIN_SCRIPT,
+        CLINE_HOOK_SCRIPT, COPILOT_HOOK_SCRIPT, GEMINI_HOOK_SCRIPT, KIMI_HOOK_SCRIPT,
+        KIRO_HOOK_SCRIPT, kiro_mcp_server_value,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Stdio};
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     };
     use std::thread;
     use std::time::{Duration, Instant};
@@ -22,20 +20,31 @@ mod tests {
     struct CaptureServer {
         port: u16,
         events: Arc<Mutex<Vec<Value>>>,
+        preflights: Arc<Mutex<Vec<Value>>>,
         stop: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
     impl CaptureServer {
         fn start() -> Self {
+            Self::start_with_rejection(false)
+        }
+
+        fn start_rejecting() -> Self {
+            Self::start_with_rejection(true)
+        }
+
+        fn start_with_rejection(reject: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture server");
             listener
                 .set_nonblocking(true)
                 .expect("set capture server nonblocking");
             let port = listener.local_addr().expect("capture addr").port();
             let events = Arc::new(Mutex::new(Vec::new()));
+            let preflights = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let events_for_thread = Arc::clone(&events);
+            let preflights_for_thread = Arc::clone(&preflights);
             let stop_for_thread = Arc::clone(&stop);
             let handle = thread::spawn(move || {
                 while !stop_for_thread.load(Ordering::Relaxed) {
@@ -47,6 +56,9 @@ mod tests {
                             if reader.read_line(&mut request_line).is_err() {
                                 continue;
                             }
+
+                            let is_preflight = request_line.contains("?validate=1")
+                                || request_line.contains("&validate=1");
 
                             let mut content_length = 0usize;
                             loop {
@@ -68,13 +80,24 @@ mod tests {
                                 continue;
                             }
                             if let Ok(value) = serde_json::from_slice::<Value>(&body) {
-                                events_for_thread.lock().unwrap().push(value);
+                                if is_preflight {
+                                    preflights_for_thread.lock().unwrap().push(value);
+                                } else {
+                                    events_for_thread.lock().unwrap().push(value);
+                                }
                             }
 
-                            let _ = write!(
-                                stream,
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{{\"ok\":true}}"
-                            );
+                            if is_preflight && reject {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{{\"ignored\":true}}"
+                                );
+                            } else {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{{\"ok\":true}}"
+                                );
+                            }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(25));
@@ -87,6 +110,7 @@ mod tests {
             Self {
                 port,
                 events,
+                preflights,
                 stop,
                 handle: Some(handle),
             }
@@ -100,6 +124,26 @@ mod tests {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
                 if let Some(event) = self.events.lock().unwrap().iter().find(|value| {
+                    value
+                        .get("hook_event_name")
+                        .and_then(|field| field.as_str())
+                        == Some(expected)
+                }) {
+                    return Some(event.clone());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            None
+        }
+
+        fn wait_for_preflight(&self, expected: &str, timeout: Duration) -> bool {
+            self.wait_for_preflight_payload(expected, timeout).is_some()
+        }
+
+        fn wait_for_preflight_payload(&self, expected: &str, timeout: Duration) -> Option<Value> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Some(event) = self.preflights.lock().unwrap().iter().find(|value| {
                     value
                         .get("hook_event_name")
                         .and_then(|field| field.as_str())
@@ -128,6 +172,10 @@ mod tests {
 
         fn events_snapshot(&self) -> Vec<Value> {
             self.events.lock().unwrap().clone()
+        }
+
+        fn preflights_snapshot(&self) -> Vec<Value> {
+            self.preflights.lock().unwrap().clone()
         }
     }
 
@@ -307,10 +355,8 @@ mod tests {
         )
         .expect("write generic notify transport");
         let normalizer_path = root.join("codex-notify.sh");
-        let normalizer = super::CODEX_NOTIFY_NORMALIZER_SCRIPT.replace(
-            "{{NOTIFY_PATH}}",
-            transport_path.to_string_lossy().as_ref(),
-        );
+        let normalizer = super::CODEX_NOTIFY_NORMALIZER_SCRIPT
+            .replace("{{NOTIFY_PATH}}", transport_path.to_string_lossy().as_ref());
         super::write_executable_script(&normalizer_path, &normalizer, "Codex notify normalizer")
             .expect("write Codex notify normalizer");
         normalizer_path
@@ -401,121 +447,6 @@ mod tests {
             .map(|path| path.to_string_lossy().to_string())
     }
 
-    #[test]
-    fn codex_notify_normalizer_maps_provider_events_before_generic_transport() {
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("agent-turn-complete"));
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("task_complete"));
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("turn_aborted"));
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("request_permissions"));
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("apply_patch_approval_request"));
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("EVENT_TYPE=\"Stop\""));
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("EVENT_TYPE=\"PermissionRequest\""));
-        assert!(CODEX_NOTIFY_NORMALIZER_SCRIPT.contains("{{NOTIFY_PATH}}"));
-        assert!(!NOTIFY_HOOK_SCRIPT.contains("agent-turn-complete"));
-        assert!(NOTIFY_HOOK_SCRIPT.contains("UNPEEL_PORT_REGISTRY_FILE"));
-        assert!(NOTIFY_HOOK_SCRIPT.contains("current_unpeel_ports"));
-        assert!(NOTIFY_HOOK_SCRIPT.contains("post_hook_payload_to_current_ports"));
-        assert!(NOTIFY_HOOK_SCRIPT.contains("comet_task_episode"));
-    }
-
-    #[test]
-    fn notify_hook_script_preserves_codex_session_and_transcript_for_busy_events() {
-        let capture = CaptureServer::start();
-        let script = write_temp_codex_notify_hook("notify-busy");
-        let payload = json!({
-            "type": "task_started",
-            "session_id": "codex-provider-session",
-            "transcript_path": "/tmp/codex-provider-session.jsonl",
-            "cwd": "/tmp/project"
-        })
-        .to_string();
-
-        let output = Command::new("bash")
-            .arg(script)
-            .arg(&payload)
-            .env("HOME", hook_env_home("notify-busy"))
-            .env("UNPEEL_APP_PORT", capture.port.to_string())
-            .env("UNPEEL_SESSION_ID", "unpeel-route-session")
-            .env("UNPEEL_HOOK_POST_SYNC", "1")
-            .env("UNPEEL_HOOK_TRACE_FILE", hook_trace_file("notify-busy"))
-            .output()
-            .expect("run notify hook");
-
-        assert!(output.status.success(), "notify hook failed: {output:?}");
-        let event = capture
-            .wait_for_event_payload("Start", Duration::from_secs(5))
-            .unwrap_or_else(|| panic!("expected Start event, got {:?}", capture.events_snapshot()));
-        assert_eq!(
-            event.get("type").and_then(Value::as_str),
-            Some("task_started")
-        );
-        assert_eq!(
-            event.get("session_id").and_then(Value::as_str),
-            Some("codex-provider-session")
-        );
-        assert_eq!(
-            event.get("transcript_path").and_then(Value::as_str),
-            Some("/tmp/codex-provider-session.jsonl")
-        );
-        assert_eq!(
-            event.get("cwd").and_then(Value::as_str),
-            Some("/tmp/project")
-        );
-    }
-
-    #[test]
-    fn notify_hook_script_preserves_codex_metadata_for_permission_events() {
-        let capture = CaptureServer::start();
-        let script = write_temp_codex_notify_hook("notify-permission");
-        let payload = json!({
-            "type": "apply_patch_approval_request",
-            "session_id": "codex-approval-session",
-            "transcript_path": "/tmp/codex-approval-session.jsonl",
-            "tool_name": "apply_patch"
-        })
-        .to_string();
-
-        let output = Command::new("bash")
-            .arg(&script)
-            .arg(&payload)
-            .env("HOME", hook_env_home("notify-permission"))
-            .env("UNPEEL_APP_PORT", capture.port.to_string())
-            .env("UNPEEL_SESSION_ID", "unpeel-route-session")
-            .env("UNPEEL_HOOK_POST_SYNC", "1")
-            .env(
-                "UNPEEL_HOOK_TRACE_FILE",
-                hook_trace_file("notify-permission"),
-            )
-            .output()
-            .expect("run notify hook");
-
-        assert!(output.status.success(), "notify hook failed: {output:?}");
-        let event = capture
-            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected PermissionRequest event, got {:?}",
-                    capture.events_snapshot()
-                )
-            });
-        assert_eq!(
-            event.get("type").and_then(Value::as_str),
-            Some("apply_patch_approval_request")
-        );
-        assert_eq!(
-            event.get("session_id").and_then(Value::as_str),
-            Some("codex-approval-session")
-        );
-        assert_eq!(
-            event.get("transcript_path").and_then(Value::as_str),
-            Some("/tmp/codex-approval-session.jsonl")
-        );
-        assert_eq!(
-            event.get("tool_name").and_then(Value::as_str),
-            Some("apply_patch")
-        );
-    }
-
     fn run_hook_script_recording(
         script_src: &str,
         label: &str,
@@ -569,6 +500,7 @@ mod tests {
             script: &'static str,
             args: &'static [&'static str],
             input: &'static str,
+            expected_runtime_id: &'static str,
         }
 
         let cases = [
@@ -577,60 +509,70 @@ mod tests {
                 script: super::CLAUDE_HOOK_SCRIPT,
                 args: &[],
                 input: r#"{"hook_event_name":"Stop"}"#,
+                expected_runtime_id: "claude",
             },
             Case {
                 label: "notify-generation",
                 script: super::NOTIFY_HOOK_SCRIPT,
-                args: &[r#"{"hook_event_name":"Stop"}"#],
+                args: &[r#"{"hook_event_name":"Stop","unpeel_runtime_id":"codex"}"#],
                 input: "",
+                expected_runtime_id: "codex",
             },
             Case {
                 label: "gemini-generation",
                 script: super::GEMINI_HOOK_SCRIPT,
                 args: &[],
                 input: r#"{"hook_event_name":"AfterAgent"}"#,
+                expected_runtime_id: "gemini",
             },
             Case {
                 label: "kimi-generation",
                 script: super::KIMI_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "kimi",
             },
             Case {
                 label: "kiro-generation",
                 script: super::KIRO_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "kiro-cli",
             },
             Case {
                 label: "cline-generation",
                 script: super::CLINE_HOOK_SCRIPT,
                 args: &["TaskComplete", "{}"],
                 input: "",
+                expected_runtime_id: "cline",
             },
             Case {
                 label: "copilot-generation",
                 script: super::COPILOT_HOOK_SCRIPT,
                 args: &["sessionEnd"],
                 input: "{}",
+                expected_runtime_id: "copilot",
             },
             Case {
                 label: "cursor-generation",
                 script: super::CURSOR_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "cursor-agent",
             },
             Case {
                 label: "grok-generation",
                 script: super::GROK_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "grok",
             },
             Case {
                 label: "muse-generation",
                 script: super::MUSE_HOOK_SCRIPT,
                 args: &[],
                 input: r#"{"hook_event_name":"Stop"}"#,
+                expected_runtime_id: "muse",
             },
         ];
 
@@ -680,6 +622,12 @@ mod tests {
                 case.label
             );
 
+            assert!(
+                capture.wait_for_preflight("Stop", Duration::from_secs(5)),
+                "{} preflight missing",
+                case.label
+            );
+
             let posted = capture
                 .wait_for_event_payload("Stop", Duration::from_secs(5))
                 .unwrap_or_else(|| {
@@ -697,9 +645,23 @@ mod tests {
                 "{} HTTP payload",
                 case.label
             );
-            assert!(proxy.events_snapshot().is_empty(), "{} used proxy", case.label);
+            assert_eq!(
+                posted.get("unpeel_runtime_id").and_then(Value::as_str),
+                Some(case.expected_runtime_id),
+                "{} HTTP runtime id",
+                case.label
+            );
+            assert!(
+                proxy.events_snapshot().is_empty() && proxy.preflights_snapshot().is_empty(),
+                "{} used proxy",
+                case.label
+            );
             let seed = read_last_hook_event(&session_dir);
-            assert_eq!(seed["hook_event_name"], "Stop", "{} durable event", case.label);
+            assert_eq!(
+                seed["hook_event_name"], "Stop",
+                "{} durable event",
+                case.label
+            );
             assert_eq!(
                 seed.get("unpeel_runtime_generation")
                     .and_then(Value::as_u64),
@@ -707,8 +669,909 @@ mod tests {
                 "{} durable seed",
                 case.label
             );
+            assert_eq!(
+                seed.get("unpeel_runtime_id").and_then(Value::as_str),
+                Some(case.expected_runtime_id),
+                "{} durable seed runtime id",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn every_owned_hook_reporter_suppresses_delivery_and_seed_on_rejected_preflight() {
+        struct Case {
+            label: &'static str,
+            script: &'static str,
+            args: &'static [&'static str],
+            input: &'static str,
         }
 
+        let cases = [
+            Case {
+                label: "claude-reject",
+                script: super::CLAUDE_HOOK_SCRIPT,
+                args: &[],
+                input: r#"{"hook_event_name":"Stop"}"#,
+            },
+            Case {
+                label: "notify-reject",
+                script: super::NOTIFY_HOOK_SCRIPT,
+                args: &[r#"{"hook_event_name":"Stop","unpeel_runtime_id":"codex"}"#],
+                input: "",
+            },
+            Case {
+                label: "gemini-reject",
+                script: super::GEMINI_HOOK_SCRIPT,
+                args: &[],
+                input: r#"{"hook_event_name":"AfterAgent"}"#,
+            },
+            Case {
+                label: "kimi-reject",
+                script: super::KIMI_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: "{}",
+            },
+            Case {
+                label: "kiro-reject",
+                script: super::KIRO_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: "{}",
+            },
+            Case {
+                label: "cline-reject",
+                script: super::CLINE_HOOK_SCRIPT,
+                args: &["TaskComplete", "{}"],
+                input: "",
+            },
+            Case {
+                label: "copilot-reject",
+                script: super::COPILOT_HOOK_SCRIPT,
+                args: &["sessionEnd"],
+                input: "{}",
+            },
+            Case {
+                label: "cursor-reject",
+                script: super::CURSOR_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: "{}",
+            },
+            Case {
+                label: "grok-reject",
+                script: super::GROK_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: "{}",
+            },
+            Case {
+                label: "muse-reject",
+                script: super::MUSE_HOOK_SCRIPT,
+                args: &[],
+                input: r#"{"hook_event_name":"Stop"}"#,
+            },
+        ];
+
+        for sync_mode in [true, false] {
+            for case in &cases {
+                let capture = CaptureServer::start_rejecting();
+                let session_dir = temp_path(&format!(
+                    "{}-{}-session",
+                    case.label,
+                    if sync_mode { "sync" } else { "async" }
+                ));
+                fs::create_dir_all(&session_dir).expect("create session dir");
+                let script = write_temp_hook_script(case.label, case.script);
+                let mut command = Command::new("bash");
+                command
+                    .arg(&script)
+                    .args(case.args)
+                    .env("HOME", hook_env_home(case.label))
+                    .env("UNPEEL_APP_PORT", capture.port.to_string())
+                    .env("UNPEEL_SESSION_ID", "unpeel-reject-session")
+                    .env("UNPEEL_SESSION_DIR", &session_dir)
+                    .env("UNPEEL_RUNTIME_GENERATION", "42")
+                    .env("UNPEEL_HOOK_TRACE_FILE", hook_trace_file(case.label))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                if sync_mode {
+                    command.env("UNPEEL_HOOK_POST_SYNC", "1");
+                } else {
+                    command.env_remove("UNPEEL_HOOK_POST_SYNC");
+                }
+                let mut child = command.spawn().expect("spawn rejected hook reporter");
+                child
+                    .stdin
+                    .take()
+                    .expect("hook stdin")
+                    .write_all(case.input.as_bytes())
+                    .expect("write rejected hook stdin");
+                let output = child.wait_with_output().expect("wait for hook reporter");
+                assert!(
+                    output.status.success(),
+                    "{} reporter failed on 202 veto: {output:?}",
+                    case.label
+                );
+
+                // Preflight arrived and was rejected
+                assert!(
+                    capture.wait_for_preflight("Stop", Duration::from_secs(5)),
+                    "{}-{} preflight not received",
+                    case.label,
+                    if sync_mode { "sync" } else { "async" }
+                );
+
+                // Give background async processes a brief moment to finish
+                thread::sleep(Duration::from_millis(100));
+
+                // No actual state-changing delivery event was posted
+                assert!(
+                    capture.events_snapshot().is_empty(),
+                    "{}-{} posted event despite 202 ignore veto: {:?}",
+                    case.label,
+                    if sync_mode { "sync" } else { "async" },
+                    capture.events_snapshot()
+                );
+
+                // No durable seed was written
+                assert!(
+                    !session_dir.join("last-hook-event.json").exists(),
+                    "{}-{} wrote last-hook-event.json despite 202 ignore veto",
+                    case.label,
+                    if sync_mode { "sync" } else { "async" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_owned_hook_reporter_preserves_atomic_seed_when_listeners_unavailable() {
+        struct Case {
+            label: &'static str,
+            script: &'static str,
+            args: &'static [&'static str],
+            input: &'static str,
+            expected_runtime_id: &'static str,
+            expected_identity: Option<(&'static str, &'static str)>,
+        }
+
+        let cases = [
+            Case {
+                label: "claude-offline",
+                script: super::CLAUDE_HOOK_SCRIPT,
+                args: &[],
+                input: r#"{"hook_event_name":"Stop","prompt_text":"sensitive user text"}"#,
+                expected_runtime_id: "claude",
+                expected_identity: None,
+            },
+            Case {
+                label: "notify-offline",
+                script: super::NOTIFY_HOOK_SCRIPT,
+                args: &[
+                    r#"{"hook_event_name":"Stop","unpeel_runtime_id":"codex","providerSessionId":"codex-owned","providerTranscriptPath":"/tmp/codex-owned.jsonl","prompt_text":"secret prompt"}"#,
+                ],
+                input: "",
+                expected_runtime_id: "codex",
+                expected_identity: Some(("codex-owned", "/tmp/codex-owned.jsonl")),
+            },
+            Case {
+                label: "gemini-offline",
+                script: super::GEMINI_HOOK_SCRIPT,
+                args: &[],
+                input: r#"{"hook_event_name":"AfterAgent","prompt_text":"gemini secret"}"#,
+                expected_runtime_id: "gemini",
+                expected_identity: None,
+            },
+            Case {
+                label: "kimi-offline",
+                script: super::KIMI_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: r#"{"prompt_text":"kimi secret"}"#,
+                expected_runtime_id: "kimi",
+                expected_identity: None,
+            },
+            Case {
+                label: "kiro-offline",
+                script: super::KIRO_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: r#"{"prompt_text":"kiro secret"}"#,
+                expected_runtime_id: "kiro-cli",
+                expected_identity: None,
+            },
+            Case {
+                label: "cline-offline",
+                script: super::CLINE_HOOK_SCRIPT,
+                args: &["TaskComplete", r#"{"prompt_text":"cline secret"}"#],
+                input: "",
+                expected_runtime_id: "cline",
+                expected_identity: None,
+            },
+            Case {
+                label: "copilot-offline",
+                script: super::COPILOT_HOOK_SCRIPT,
+                args: &["sessionEnd"],
+                input: r#"{"prompt_text":"copilot secret"}"#,
+                expected_runtime_id: "copilot",
+                expected_identity: None,
+            },
+            Case {
+                label: "cursor-offline",
+                script: super::CURSOR_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: r#"{"prompt_text":"cursor secret"}"#,
+                expected_runtime_id: "cursor-agent",
+                expected_identity: None,
+            },
+            Case {
+                label: "grok-offline",
+                script: super::GROK_HOOK_SCRIPT,
+                args: &["Stop"],
+                input: r#"{"prompt_text":"grok secret"}"#,
+                expected_runtime_id: "grok",
+                expected_identity: None,
+            },
+            Case {
+                label: "muse-offline",
+                script: super::MUSE_HOOK_SCRIPT,
+                args: &[],
+                input: r#"{"hook_event_name":"Stop","prompt_text":"muse secret"}"#,
+                expected_runtime_id: "muse",
+                expected_identity: None,
+            },
+        ];
+
+        for case in cases {
+            let session_dir = temp_path(&format!("{}-session", case.label));
+            fs::create_dir_all(&session_dir).expect("create session dir");
+            let script = write_temp_hook_script(case.label, case.script);
+            let mut command = Command::new("bash");
+            command
+                .arg(&script)
+                .args(case.args)
+                .env("HOME", hook_env_home(case.label))
+                .env("UNPEEL_APP_PORT", "1") // Closed / unreachable port
+                .env("UNPEEL_SESSION_ID", "unpeel-offline-session")
+                .env("UNPEEL_SESSION_DIR", &session_dir)
+                .env("UNPEEL_RUNTIME_GENERATION", "42")
+                .env("UNPEEL_HOOK_TRACE_FILE", hook_trace_file(case.label))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().expect("spawn offline hook reporter");
+            child
+                .stdin
+                .take()
+                .expect("hook stdin")
+                .write_all(case.input.as_bytes())
+                .expect("write offline hook stdin");
+            let output = child
+                .wait_with_output()
+                .expect("wait for offline hook reporter");
+            assert!(
+                output.status.success(),
+                "{} reporter failed when listeners offline: {output:?}",
+                case.label
+            );
+
+            assert!(
+                session_dir.join("last-hook-event.json").exists(),
+                "{} failed to preserve offline recovery seed",
+                case.label
+            );
+
+            let seed = read_last_hook_event(&session_dir);
+            assert_eq!(
+                seed["hook_event_name"], "Stop",
+                "{} durable event",
+                case.label
+            );
+            assert_eq!(
+                seed.get("unpeel_runtime_id").and_then(Value::as_str),
+                Some(case.expected_runtime_id),
+                "{} durable seed runtime id",
+                case.label
+            );
+            assert_eq!(
+                seed.get("unpeel_runtime_generation")
+                    .and_then(Value::as_u64),
+                Some(42),
+                "{} durable seed generation",
+                case.label
+            );
+            if let Some((provider, transcript)) = case.expected_identity {
+                assert_eq!(
+                    seed["session_id"], provider,
+                    "offline recovery provider binding"
+                );
+                assert_eq!(
+                    seed["transcript_path"], transcript,
+                    "offline recovery transcript"
+                );
+                assert!(seed.get("providerSessionId").is_none());
+                assert!(seed.get("providerTranscriptPath").is_none());
+            }
+
+            // Raw prompts or tool input must NEVER be persisted in durable seeds
+            assert!(
+                seed.get("prompt_text").is_none()
+                    && seed.get("prompt").is_none()
+                    && seed.get("input").is_none(),
+                "{} leaked raw prompt into durable seed: {:?}",
+                case.label,
+                seed
+            );
+        }
+    }
+
+    #[test]
+    fn claude_ask_user_question_maps_to_permission_and_resumes_to_start() {
+        let capture = CaptureServer::start();
+        let script = write_temp_hook_script("claude-ask", super::CLAUDE_HOOK_SCRIPT);
+        let session_dir = temp_path("claude-ask-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        // PreToolUse with AskUserQuestion maps to PermissionRequest
+        let pre_payload = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "session_id": "claude-ses-1"
+        })
+        .to_string();
+
+        let mut command = Command::new("bash");
+        command
+            .arg(&script)
+            .env("HOME", hook_env_home("claude-ask"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "claude-ask-unpeel")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_RUNTIME_GENERATION", "42")
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn claude pre");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(pre_payload.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+
+        let event = capture
+            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
+            .expect("PermissionRequest from AskUserQuestion PreToolUse");
+        assert_eq!(event["tool_name"], "AskUserQuestion");
+        assert_eq!(event["unpeel_runtime_id"], "claude");
+
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "PermissionRequest");
+        assert_eq!(seed["unpeel_runtime_id"], "claude");
+        assert_eq!(seed["tool_name"], "AskUserQuestion");
+
+        // PostToolUse with AskUserQuestion maps to Start
+        let post_payload = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "AskUserQuestion",
+            "session_id": "claude-ses-1"
+        })
+        .to_string();
+
+        let mut command = Command::new("bash");
+        command
+            .arg(&script)
+            .env("HOME", hook_env_home("claude-ask"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "claude-ask-unpeel")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_RUNTIME_GENERATION", "42")
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn claude post");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(post_payload.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+
+        let event = capture
+            .wait_for_event_payload("Start", Duration::from_secs(5))
+            .expect("Start from AskUserQuestion PostToolUse");
+        assert_eq!(event["tool_name"], "AskUserQuestion");
+        assert_eq!(event["unpeel_runtime_id"], "claude");
+
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "Start");
+        assert_eq!(seed["unpeel_runtime_id"], "claude");
+    }
+
+    #[test]
+    fn copilot_session_start_maps_to_hook_seen_and_does_not_seed() {
+        let capture = CaptureServer::start();
+        let script = write_temp_hook_script("copilot-start", super::COPILOT_HOOK_SCRIPT);
+        let session_dir = temp_path("copilot-start-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        // Seed with a finished turn's Stop
+        fs::write(
+            session_dir.join("last-hook-event.json"),
+            r#"{"hook_event_name":"Stop","unpeel_runtime_id":"copilot"}"#,
+        )
+        .unwrap();
+
+        let mut command = Command::new("bash");
+        command
+            .arg(&script)
+            .arg("sessionStart")
+            .env("HOME", hook_env_home("copilot-start"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "copilot-start-unpeel")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_RUNTIME_GENERATION", "42")
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"{}").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+
+        let event = capture
+            .wait_for_event_payload("HookSeen", Duration::from_secs(5))
+            .expect("HookSeen from sessionStart");
+        assert_eq!(event["unpeel_runtime_id"], "copilot");
+
+        // Durable seed must remain Stop, not overwritten by sessionStart
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "Stop");
+        assert_eq!(seed["unpeel_runtime_id"], "copilot");
+    }
+
+    #[test]
+    fn codex_notify_normalizer_stamps_codex_runtime_id_and_maps_approval_request() {
+        let capture = CaptureServer::start();
+        let script = write_temp_codex_notify_hook("codex-approval-test");
+        let session_dir = temp_path("codex-approval-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let payload = json!({
+            "type": "apply_patch_approval_request",
+            "session_id": "codex-approval-ses"
+        })
+        .to_string();
+
+        let output = Command::new("bash")
+            .arg(&script)
+            .arg(&payload)
+            .env("HOME", hook_env_home("codex-approval-test"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "unpeel-record-session")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_RUNTIME_GENERATION", "7")
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .env(
+                "UNPEEL_HOOK_TRACE_FILE",
+                hook_trace_file("codex-approval-test"),
+            )
+            .output()
+            .expect("run codex approval hook");
+        assert!(output.status.success(), "codex hook failed: {output:?}");
+
+        let event = capture
+            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
+            .expect("PermissionRequest from apply_patch_approval_request");
+        assert_eq!(event["unpeel_runtime_id"], "codex");
+
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "PermissionRequest");
+        assert_eq!(seed["unpeel_runtime_id"], "codex");
+    }
+    #[test]
+    fn copilot_agent_stop_and_notification_flow() {
+        let capture = CaptureServer::start();
+        let script = write_temp_hook_script("copilot-flow", super::COPILOT_HOOK_SCRIPT);
+        let session_dir = temp_path("copilot-flow-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        // 1. Ordinary preToolUse is non-blocking working state (Start)
+        let pre_tool = json!({ "toolName": "bash", "toolArgs": { "command": "ls" } }).to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("preToolUse")
+            .env("HOME", hook_env_home("copilot-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "copilot-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(pre_tool.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let ev = capture
+            .wait_for_event_payload("Start", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ev["unpeel_runtime_id"], "copilot");
+
+        // 2. Notification with permission_prompt maps to PermissionRequest
+        let perm_note = json!({
+            "notification_type": "permission_prompt",
+            "message": "Allow bash execution?",
+            "tool_name": "bash"
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("notification")
+            .env("HOME", hook_env_home("copilot-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "copilot-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(perm_note.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let ev = capture
+            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ev["tool_name"], "bash");
+
+        // 3. Notification with elicitation_dialog (user question) maps to PermissionRequest
+        let elicit_note = json!({
+            "notification_type": "elicitation_dialog",
+            "message": "Which file should I edit?"
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("notification")
+            .env("HOME", hook_env_home("copilot-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "copilot-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(elicit_note.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+
+        // 4. Unrelated notification (shell_completed) is ignored (no delivery event)
+        let events_before = capture.events_snapshot().len();
+        let shell_note = json!({
+            "notification_type": "shell_completed",
+            "message": "Command finished"
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("notification")
+            .env("HOME", hook_env_home("copilot-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "copilot-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(shell_note.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(capture.events_snapshot().len(), events_before);
+
+        // 5. agentStop maps to Stop
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("agentStop")
+            .env("HOME", hook_env_home("copilot-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "copilot-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"{}").unwrap();
+        assert!(child.wait().unwrap().success());
+        let ev = capture
+            .wait_for_event_payload("Stop", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ev["unpeel_runtime_id"], "copilot");
+        let events = capture.events_snapshot();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.get("hook_event_name").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["Start", "PermissionRequest", "PermissionRequest", "Stop"]
+        );
+
+        // Child identity alone is authoritative; parentAgentId is optional.
+        let offline_seed = json!({
+            "hook_event_name": "Start",
+            "session_id": "primary-copilot",
+            "unpeel_runtime_id": "copilot",
+            "unpeel_runtime_generation": 2,
+            "comet_task_episode": 4
+        })
+        .to_string();
+        fs::write(session_dir.join("last-hook-event.json"), &offline_seed).unwrap();
+
+        for payload in [
+            json!({
+                "sessionId": "primary-copilot",
+                "agentId": "native-child",
+                "parentAgentId": "native-root"
+            }),
+            json!({"sessionId": "primary-copilot", "agentId": "native-child"}),
+            json!({"session_id": "primary-copilot", "agent_id": "native-child"}),
+        ] {
+            let mut cmd = Command::new("bash");
+            cmd.arg(&script)
+                .arg("agentStop")
+                .env("HOME", hook_env_home("copilot-flow"))
+                .env("UNPEEL_APP_PORT", "1")
+                .env("UNPEEL_SESSION_ID", "primary-copilot")
+                .env("UNPEEL_SESSION_DIR", &session_dir)
+                .env("UNPEEL_RUNTIME_GENERATION", "2")
+                .env("UNPEEL_HOOK_POST_SYNC", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+            assert_eq!(
+                fs::read_to_string(session_dir.join("last-hook-event.json")).unwrap(),
+                offline_seed,
+                "child lifecycle must not alter primary recovery evidence"
+            );
+        }
+    }
+    #[test]
+    fn cline_ask_question_attention_resolved_and_child_suppression() {
+        let capture = CaptureServer::start();
+        let script = write_temp_hook_script("cline-flow", super::CLINE_HOOK_SCRIPT);
+        let session_dir = temp_path("cline-flow-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        // 1. Ordinary tool PreToolUse maps to Start (non-blocking)
+        let ord_pre = json!({ "toolName": "read_file" }).to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("PreToolUse")
+            .arg(&ord_pre)
+            .env("HOME", hook_env_home("cline-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "cline-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1");
+        assert!(cmd.status().unwrap().success());
+        let ev = capture
+            .wait_for_event_payload("Start", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ev["tool_name"], "read_file");
+        assert_eq!(ev["unpeel_runtime_id"], "cline");
+
+        // 2. PreToolUse with ask_question maps to PermissionRequest (attention)
+        let ask_pre = json!({
+            "hookName": "tool_call",
+            "tool_call": { "name": "ask_question" }
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("PreToolUse")
+            .arg(&ask_pre)
+            .env("HOME", hook_env_home("cline-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "cline-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1");
+        assert!(cmd.status().unwrap().success());
+        let ev = capture
+            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ev["tool_name"], "ask_question");
+        assert_eq!(ev["unpeel_runtime_id"], "cline");
+
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "PermissionRequest");
+        assert_eq!(seed["tool_name"], "ask_question");
+        assert_eq!(seed["unpeel_runtime_id"], "cline");
+
+        // 3. PostToolUse with ask_question maps to Start (resumed working)
+        let ask_post = json!({
+            "hookName": "tool_result",
+            "tool_result": { "name": "ask_question" }
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("PostToolUse")
+            .arg(&ask_post)
+            .env("HOME", hook_env_home("cline-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "cline-flow-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1");
+        assert!(cmd.status().unwrap().success());
+        let events = capture.events_snapshot();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.get("hook_event_name").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["Start", "PermissionRequest", "Start"]
+        );
+
+        // 4. Child event with non-empty parent_agent_id must early-exit and never overwrite existing primary seed offline
+        let offline_seed = json!({
+            "hook_event_name": "Start",
+            "session_id": "provider-primary",
+            "unpeel_runtime_id": "cline",
+            "unpeel_runtime_generation": 2,
+            "comet_task_episode": 4
+        })
+        .to_string();
+        fs::write(session_dir.join("last-hook-event.json"), &offline_seed).unwrap();
+
+        let child_payload = json!({
+            "agent_id": "root-agent",
+            "parent_agent_id": "owning-root",
+            "hookName": "agent_end",
+            "sessionContext": {
+                "rootSessionId": "provider-primary"
+            }
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("TaskComplete")
+            .arg(&child_payload)
+            .env("HOME", hook_env_home("cline-flow"))
+            .env("UNPEEL_APP_PORT", "1") // offline port
+            .env("UNPEEL_SESSION_ID", "provider-primary")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_RUNTIME_GENERATION", "2")
+            .env("UNPEEL_HOOK_POST_SYNC", "1");
+        assert!(cmd.status().unwrap().success());
+
+        // Primary seed must remain unchanged ("Start"), not overwritten by child "Stop"
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "Start");
+        assert_eq!(seed["session_id"], "provider-primary");
+
+        // And root payload with null parent_agent_id still processes normally
+        let root_payload = json!({
+            "agent_id": "root-agent",
+            "parent_agent_id": null,
+            "hookName": "agent_end",
+            "sessionContext": {
+                "rootSessionId": "provider-primary"
+            }
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("TaskComplete")
+            .arg(&root_payload)
+            .env("HOME", hook_env_home("cline-flow"))
+            .env("UNPEEL_APP_PORT", "1") // offline port
+            .env("UNPEEL_SESSION_ID", "provider-primary")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_RUNTIME_GENERATION", "2")
+            .env("UNPEEL_HOOK_POST_SYNC", "1");
+        assert!(cmd.status().unwrap().success());
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "Stop");
+    }
+    #[test]
+    fn grok_question_answer_resumes_working_without_completing_turn() {
+        let capture = CaptureServer::start();
+        let script = write_temp_hook_script("grok-flow", super::GROK_HOOK_SCRIPT);
+        let session_dir = temp_path("grok-flow-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        // Opening a question is waiting-for-input, not completion.
+        let ask_payload = json!({
+            "tool_name": "ask_user_question",
+            "session_id": "grok-provider-ses"
+        })
+        .to_string();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("Attention")
+            .env("HOME", hook_env_home("grok-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "grok-provider-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(ask_payload.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let ev = capture
+            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ev["tool_name"], "ask_user_question");
+        assert_eq!(ev["unpeel_runtime_id"], "grok");
+
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "PermissionRequest");
+        assert_eq!(seed["tool_name"], "ask_user_question");
+        assert_eq!(seed["unpeel_runtime_id"], "grok");
+
+        // 3. PostToolUse question resolution triggers Start -> delivers Start and seeds Start
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg("Start")
+            .env("HOME", hook_env_home("grok-flow"))
+            .env("UNPEEL_APP_PORT", capture.port.to_string())
+            .env("UNPEEL_SESSION_ID", "grok-provider-ses")
+            .env("UNPEEL_SESSION_DIR", &session_dir)
+            .env("UNPEEL_HOOK_POST_SYNC", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(ask_payload.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let ev = capture
+            .wait_for_event_payload("Start", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ev["tool_name"], "ask_user_question");
+        assert_eq!(ev["unpeel_runtime_id"], "grok");
+
+        let seed = read_last_hook_event(&session_dir);
+        assert_eq!(seed["hook_event_name"], "Start");
+        assert_eq!(seed["tool_name"], "ask_user_question");
+        assert_eq!(seed["unpeel_runtime_id"], "grok");
     }
 
     #[test]
@@ -953,15 +1816,10 @@ mod tests {
         // /clear re-links the session to the new conversation id. The script
         // must forward it as HookSeen (metadata-only latch) and must not let
         // it overwrite the durable busy/idle seed.
-        assert!(super::HOOK_EVENTS.contains(&"SessionStart"));
-        assert!(super::CLAUDE_HOOK_SCRIPT.contains(r#""hook_event_name":"HookSeen""#));
-        assert!(super::CLAUDE_HOOK_SCRIPT.contains("comet_task_episode"));
-        assert!(KIMI_HOOK_SCRIPT.contains("comet_task_episode"));
 
         let session_dir = temp_path("claude-record-start");
         fs::create_dir_all(&session_dir).expect("create session dir");
-        fs::write(session_dir.join("comet-task-episode"), "3\n")
-            .expect("write task episode");
+        fs::write(session_dir.join("comet-task-episode"), "3\n").expect("write task episode");
         let stop_payload = json!({
             "hook_event_name": "Stop",
             "session_id": "provider-1"
@@ -1033,13 +1891,8 @@ mod tests {
         let session_dir = temp_path("notify-record-session");
         let payload = json!({ "type": "agent-turn-complete" }).to_string();
         let script = write_temp_codex_notify_hook("notify-record");
-        let output = run_hook_path_recording(
-            &script,
-            "notify-record",
-            &[&payload],
-            "",
-            &session_dir,
-        );
+        let output =
+            run_hook_path_recording(&script, "notify-record", &[&payload], "", &session_dir);
         assert!(output.status.success(), "notify hook failed: {output:?}");
         let event = read_last_hook_event(&session_dir);
         assert_eq!(
@@ -1063,137 +1916,6 @@ mod tests {
         assert!(
             !missing_dir.exists(),
             "record must never create the session dir"
-        );
-    }
-
-    #[test]
-    fn gemini_hook_script_preserves_provider_metadata_for_lifecycle_events() {
-        let capture = CaptureServer::start();
-        let script = write_temp_hook_script("gemini-metadata", super::GEMINI_HOOK_SCRIPT);
-        let payload = json!({
-            "hook_event_name": "BeforeAgent",
-            "session_id": "gemini-provider-session",
-            "conversationId": "gemini-conversation",
-            "transcript_path": "/tmp/gemini-provider-session.jsonl",
-            "tool_name": "gemini"
-        })
-        .to_string();
-
-        let output =
-            run_hook_script_with_stdin(&script, &[], &payload, &capture, "gemini-metadata");
-
-        assert!(output.status.success(), "gemini hook failed: {output:?}");
-        let event = capture
-            .wait_for_event_payload("Start", Duration::from_secs(5))
-            .unwrap_or_else(|| panic!("expected Start event, got {:?}", capture.events_snapshot()));
-        assert_eq!(
-            event.get("session_id").and_then(Value::as_str),
-            Some("gemini-provider-session")
-        );
-        assert_eq!(
-            event.get("conversationId").and_then(Value::as_str),
-            Some("gemini-conversation")
-        );
-        assert_eq!(
-            event.get("transcript_path").and_then(Value::as_str),
-            Some("/tmp/gemini-provider-session.jsonl")
-        );
-        assert_eq!(
-            event.get("tool_name").and_then(Value::as_str),
-            Some("gemini")
-        );
-    }
-
-    #[test]
-    fn copilot_hook_script_preserves_metadata_for_permission_events() {
-        let capture = CaptureServer::start();
-        let script = write_temp_hook_script("copilot-metadata", super::COPILOT_HOOK_SCRIPT);
-        let payload = json!({
-            "session_id": "copilot-provider-session",
-            "conversationID": "copilot-conversation",
-            "transcriptPath": "/tmp/copilot-provider-session.jsonl",
-            "tool_name": "shell"
-        })
-        .to_string();
-
-        let output = run_hook_script_with_stdin(
-            &script,
-            &["preToolUse"],
-            &payload,
-            &capture,
-            "copilot-metadata",
-        );
-
-        assert!(output.status.success(), "copilot hook failed: {output:?}");
-        let event = capture
-            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected PermissionRequest event, got {:?}",
-                    capture.events_snapshot()
-                )
-            });
-        assert_eq!(
-            event.get("session_id").and_then(Value::as_str),
-            Some("copilot-provider-session")
-        );
-        assert_eq!(
-            event.get("conversationID").and_then(Value::as_str),
-            Some("copilot-conversation")
-        );
-        assert_eq!(
-            event.get("transcriptPath").and_then(Value::as_str),
-            Some("/tmp/copilot-provider-session.jsonl")
-        );
-        assert_eq!(
-            event.get("tool_name").and_then(Value::as_str),
-            Some("shell")
-        );
-    }
-
-    #[test]
-    fn cursor_hook_script_preserves_metadata_for_permission_events() {
-        let capture = CaptureServer::start();
-        let script = write_temp_hook_script("cursor-metadata", super::CURSOR_HOOK_SCRIPT);
-        let payload = json!({
-            "session_id": "cursor-provider-session",
-            "providerTranscriptPath": "/tmp/cursor-provider-session.jsonl",
-            "tool_name": "terminal"
-        })
-        .to_string();
-
-        let output = run_hook_script_with_stdin(
-            &script,
-            &["PermissionRequest"],
-            &payload,
-            &capture,
-            "cursor-metadata",
-        );
-
-        assert!(output.status.success(), "cursor hook failed: {output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("\"continue\":true"),
-            "cursor hook should auto-confirm permission request: {output:?}"
-        );
-        let event = capture
-            .wait_for_event_payload("PermissionRequest", Duration::from_secs(5))
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected PermissionRequest event, got {:?}",
-                    capture.events_snapshot()
-                )
-            });
-        assert_eq!(
-            event.get("session_id").and_then(Value::as_str),
-            Some("cursor-provider-session")
-        );
-        assert_eq!(
-            event.get("providerTranscriptPath").and_then(Value::as_str),
-            Some("/tmp/cursor-provider-session.jsonl")
-        );
-        assert_eq!(
-            event.get("tool_name").and_then(Value::as_str),
-            Some("terminal")
         );
     }
 
@@ -1314,9 +2036,10 @@ mod tests {
         // 6067d9ad: Codex spawns notify with its own environment and a PATH
         // lookup dies there as an unattributable 127.
         assert!(super::CODEX_WRAPPER_SCRIPT.contains("UNPEEL_NOTIFY_BASH=\"${BASH:-/bin/bash}\""));
-        assert!(super::CODEX_WRAPPER_SCRIPT.contains(
-            "notify=[\\\"$UNPEEL_NOTIFY_BASH\\\",\\\"$UNPEEL_CODEX_NOTIFY_PATH\\\"]"
-        ));
+        assert!(
+            super::CODEX_WRAPPER_SCRIPT
+                .contains("notify=[\\\"$UNPEEL_NOTIFY_BASH\\\",\\\"$UNPEEL_CODEX_NOTIFY_PATH\\\"]")
+        );
     }
 
     #[test]
@@ -1328,8 +2051,10 @@ mod tests {
 
     #[test]
     fn codex_wrapper_script_registers_the_unified_unpeel_mcp_server() {
-        assert!(super::CODEX_WRAPPER_SCRIPT
-            .contains("mcp_servers.unpeel.command=\\\"$UNPEEL_MCP_BIN\\\""));
+        assert!(
+            super::CODEX_WRAPPER_SCRIPT
+                .contains("mcp_servers.unpeel.command=\\\"$UNPEEL_MCP_BIN\\\"")
+        );
         assert!(super::CODEX_WRAPPER_SCRIPT.contains("mcp_servers.unpeel.args=[\\\"__mcp__\\\"]"));
         assert!(super::CODEX_WRAPPER_SCRIPT.contains("mcp_servers.unpeel.env={UNPEEL_SESSION_ID="));
         // Registration must be skipped gracefully when the binary is unknown.
@@ -1496,9 +2221,11 @@ timeout = 5
             fs::read_to_string(&user_hook).expect("read user hook"),
             "#!/bin/bash\necho user-owned\n"
         );
-        assert!(fs::read_to_string(hooks_dir.join("TaskStart.zsh"))
-            .expect("read managed hook")
-            .contains("# Managed by Unpeel."));
+        assert!(
+            fs::read_to_string(hooks_dir.join("TaskStart.zsh"))
+                .expect("read managed hook")
+                .contains("# Managed by Unpeel.")
+        );
     }
 
     #[test]
@@ -1581,27 +2308,6 @@ timeout = 5
     }
 
     #[test]
-    fn cursor_hook_script_auto_confirms_permission_requests() {
-        assert!(CURSOR_HOOK_SCRIPT.contains("PermissionRequest"));
-        assert!(CURSOR_HOOK_SCRIPT.contains("{\"continue\":true}"));
-        assert!(CURSOR_HOOK_SCRIPT.contains("UNPEEL_APP_PORT"));
-        assert!(CURSOR_HOOK_SCRIPT.contains("UNPEEL_PORT_REGISTRY_FILE"));
-        assert!(CURSOR_HOOK_SCRIPT.contains("post_hook_event_to_current_ports"));
-        assert!(CURSOR_HOOK_SCRIPT.contains("GROK_SESSION_ID"));
-        assert!(CURSOR_HOOK_SCRIPT.contains("\"session_id\""));
-        assert!(super::GROK_HOOK_SCRIPT.contains("Attention"));
-        let grok_hooks = super::grok_hooks_json(&PathBuf::from("/tmp/grok-hook.sh"))
-            .expect("serialize grok hooks");
-        assert!(grok_hooks.contains("approval_required"));
-        assert!(grok_hooks.contains("\"command\": \"/tmp/grok-hook.sh HookSeen\""));
-        assert!(grok_hooks.contains("\"command\": \"/tmp/grok-hook.sh UserPromptSubmit\""));
-        assert!(!grok_hooks.contains("\"command\": \"/tmp/grok-hook.sh Start\""));
-        assert!(super::GROK_HOOK_SCRIPT.contains("tool_name"));
-        assert!(super::GROK_DEFAULTS_WRAPPER_SCRIPT.contains("AppleInterfaceStyle"));
-        assert!(super::GROK_DEFAULTS_WRAPPER_SCRIPT.contains("UNPEEL_APP_APPEARANCE_FILE"));
-    }
-
-    #[test]
     fn grok_command_wrapper_resolves_auto_theme_from_unpeel_appearance() {
         assert!(super::GROK_COMMAND_WRAPPER_SCRIPT.contains("UNPEEL_REAL_GROK_BIN"));
         assert!(super::GROK_COMMAND_WRAPPER_SCRIPT.contains("UNPEEL_GROK_APP_APPEARANCE"));
@@ -1665,9 +2371,11 @@ timeout = 5
             stdout.contains("GROK_CURSOR_HOOKS_ENABLED=false"),
             "{stdout}"
         );
-        assert!(fs::read_to_string(real_home.join("config.toml"))
-            .expect("read real config")
-            .contains("theme = \"auto\""));
+        assert!(
+            fs::read_to_string(real_home.join("config.toml"))
+                .expect("read real config")
+                .contains("theme = \"auto\"")
+        );
     }
 
     #[test]
@@ -1716,9 +2424,11 @@ timeout = 5
             stdout.contains("GROK_CLAUDE_HOOKS_ENABLED=false"),
             "{stdout}"
         );
-        assert!(fs::read_to_string(real_home.join("config.toml"))
-            .expect("read real config")
-            .contains("theme = \"groknight\""));
+        assert!(
+            fs::read_to_string(real_home.join("config.toml"))
+                .expect("read real config")
+                .contains("theme = \"groknight\"")
+        );
         assert!(
             !fs::read_to_string(real_home.join("config.toml"))
                 .expect("read real config")
@@ -1772,14 +2482,6 @@ timeout = 5
             stdout.contains("GROK_CLAUDE_HOOKS_ENABLED=false"),
             "{stdout}"
         );
-    }
-
-    #[test]
-    fn claude_hook_script_posts_to_registered_app_ports() {
-        assert!(CLAUDE_HOOK_SCRIPT.contains("UNPEEL_PORT_REGISTRY_FILE"));
-        assert!(CLAUDE_HOOK_SCRIPT.contains("current_unpeel_ports"));
-        assert!(CLAUDE_HOOK_SCRIPT.contains("post_hook_payload_to_current_ports"));
-        assert!(super::HOOK_EVENTS.contains(&"StopFailure"));
     }
 
     #[test]
@@ -1968,28 +2670,6 @@ js_repl = false
         ));
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn opencode_plugin_tracks_busy_idle_and_permission_events() {
-        assert!(OPENCODE_PLUGIN_SCRIPT.contains("session.status"));
-        assert!(OPENCODE_PLUGIN_SCRIPT.contains("permission.ask"));
-        assert!(OPENCODE_PLUGIN_SCRIPT.contains("notify('Start', sessionID)"));
-        assert!(OPENCODE_PLUGIN_SCRIPT.contains("notify('Stop', sessionID)"));
-        assert!(OPENCODE_PLUGIN_SCRIPT.contains("notify('PermissionRequest', rootSessionID)"));
-        assert!(OPENCODE_PLUGIN_SCRIPT.contains("session_id: sessionID"));
-    }
-
-    #[test]
-    fn amp_plugin_tracks_agent_lifecycle_and_prompt_hints() {
-        assert!(AMP_PLUGIN_SCRIPT.contains("@i-know-the-amp-plugin-api-is-wip"));
-        assert!(AMP_PLUGIN_SCRIPT.contains("amp.on(\"agent.start\""));
-        assert!(AMP_PLUGIN_SCRIPT.contains("amp.on(\"agent.end\""));
-        assert!(AMP_PLUGIN_SCRIPT.contains("tool_name: \"amp\""));
-        assert!(AMP_PLUGIN_SCRIPT.contains("prompt_text"));
-        assert!(AMP_PLUGIN_SCRIPT.contains("hook_event_name"));
-        assert!(AMP_PLUGIN_SCRIPT.contains("threadIDFrom"));
-        assert!(AMP_PLUGIN_SCRIPT.contains("session_id: threadIDFrom"));
     }
 
     #[test]

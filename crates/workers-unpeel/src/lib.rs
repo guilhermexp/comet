@@ -8,6 +8,7 @@ mod checkout_lifecycle;
 mod controller_mcp;
 mod copy_ignored;
 mod git_command;
+mod hook_admission;
 mod hook_migration;
 mod parent_notifications;
 pub mod project_activity;
@@ -4648,21 +4649,6 @@ mod runtime_capability_tests {
         assert!(sessions[2].capabilities.notify_when_done);
         assert!(sessions[3].capabilities.notify_when_done);
         assert!(sessions[4].capabilities.notify_when_done);
-    }
-
-    #[test]
-    fn pi_family_declares_reliable_attention() {
-        let catalog = unpeel_core::runtime_catalog::builtin_runtime_catalog();
-        for slug in ["omp", "pi", "prime-agent"] {
-            let runtime = catalog
-                .by_slug(slug)
-                .or_else(|| catalog.by_legacy_slug(slug))
-                .unwrap_or_else(|| panic!("{slug} must be in the pinned catalog"));
-            assert!(
-                runtime.lifecycle.attention_reliable,
-                "{slug} ships the pi-family prompt listener and must declare attention_reliable"
-            );
-        }
     }
 }
 

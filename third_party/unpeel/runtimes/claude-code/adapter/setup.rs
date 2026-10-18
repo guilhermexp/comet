@@ -19,6 +19,8 @@ pub(crate) const HOOK_EVENTS: &[&str] = &[
     "Stop",
     "StopFailure",
     "PermissionRequest",
+    "PreToolUse",
+    "PostToolUse",
 ];
 pub fn install_claude_hooks() -> Result<(), String> {
     let script_path = claude_hook_script_path();
@@ -122,6 +124,8 @@ pub(crate) fn build_hook_entry(event: &str, command: &str) -> Value {
     });
     if event == "PermissionRequest" {
         entry["matcher"] = Value::String("*".into());
+    } else if event == "PreToolUse" || event == "PostToolUse" {
+        entry["matcher"] = Value::String("AskUserQuestion|ask_user_question".into());
     }
     entry
 }

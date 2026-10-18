@@ -1,9 +1,17 @@
-const FILTER_NESTED_OMP_SUBAGENTS: bool = false;
-const SESSION_TELEMETRY_READER: Option<crate::session_telemetry::ReadSessionTelemetry> = None;
+use super::{Integration, RuntimeLaunchOptions};
 
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../runtimes/_shared/pi-family/adapter/mod.rs"
-));
+pub(crate) mod observer;
+pub(crate) mod resume;
+pub(crate) mod setup;
 
-pub(crate) const INTEGRATION: Integration = family_integration();
+fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> String {
+    setup::startup_command(command)
+}
+
+pub(crate) const INTEGRATION: Integration = Integration::new(
+    Some(setup::install_prime_support),
+    Some(setup::configure_host_command),
+)
+.with_host_runtime(setup::start_host_runtime)
+.with_startup_command(prepare_startup_command)
+.with_resume_adapter(resume::ADAPTER);

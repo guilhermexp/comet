@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -454,27 +455,33 @@ impl ActivityEngine {
         anchor_start_to_output: bool,
         not_before_unix_ms: Option<u64>,
         current_generation: u64,
+        admit: impl FnOnce(&serde_json::Value) -> bool,
     ) {
         let seed_path = session_dir.join("last-hook-event.json");
-        let Ok(meta) = fs::metadata(&seed_path) else {
+        let Ok(mut file) = fs::File::open(&seed_path) else {
+            return;
+        };
+        let Ok(meta) = file.metadata() else {
             return;
         };
         let Ok(modified_at) = meta.modified() else {
             return;
         };
-        let entry = self.entries.entry(session_id.to_string()).or_default();
-        if entry
-            .last_seed_modified_at
-            .is_some_and(|seen| modified_at <= seen)
-        {
-            return;
-        }
-        // Preserve HTTP fallback if a new live event failed to persist: an
-        // older disk snapshot must not roll it back. Legacy hook payloads
-        // have no source sequence, so ambiguous delayed HTTP stays live-owned.
-        if entry.last_hook_at.is_some_and(|seen| modified_at <= seen) {
-            entry.last_seed_modified_at = Some(modified_at);
-            return;
+        if let Some(entry) = self.entries.get(session_id) {
+            if entry
+                .last_seed_modified_at
+                .is_some_and(|seen| modified_at <= seen)
+            {
+                return;
+            }
+            // Preserve HTTP fallback if a new live event failed to persist: an
+            // older disk snapshot must not roll it back. Legacy hook payloads
+            // have no source sequence, so ambiguous delayed HTTP stays live-owned.
+            if entry.last_hook_at.is_some_and(|seen| modified_at <= seen) {
+                let entry = self.entries.get_mut(session_id).unwrap();
+                entry.last_seed_modified_at = Some(modified_at);
+                return;
+            }
         }
         if let Some(not_before) = not_before_unix_ms {
             let seed_millis = meta
@@ -487,12 +494,16 @@ impl ActivityEngine {
                 return;
             }
         }
-        let Ok(raw) = fs::read_to_string(&seed_path) else {
+        let mut raw = Vec::new();
+        if file.read_to_end(&mut raw).is_err() {
+            return;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
             return;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        if !admit(&value) {
             return;
-        };
+        }
         let Some(name) = value.get("hook_event_name").and_then(|v| v.as_str()) else {
             return;
         };
@@ -528,7 +539,7 @@ impl ActivityEngine {
             current_generation,
             not_before_unix_ms,
         );
-        let entry = self.entries.get_mut(session_id).unwrap();
+        let entry = self.entries.entry(session_id.to_string()).or_default();
         entry.last_seed_modified_at = Some(modified_at);
         if applied {
             // Output anchoring controls the timeout, not event ordering. A
@@ -716,7 +727,7 @@ mod tests {
         )
         .unwrap();
         let mut engine = ActivityEngine::default();
-        engine.seed_from_disk("s", &dir, true, None, 0);
+        engine.seed_from_disk("s", &dir, true, None, 0, |_| true);
         assert!(engine.is_latched("s"));
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
         let _ = std::fs::remove_dir_all(&dir);
@@ -745,7 +756,7 @@ mod tests {
         let mut engine = ActivityEngine::default();
         engine.apply_hook_event_for_runtime("s", "Start", None, t0, Some(1), 1, None);
         write_seed_at(&dir, "Stop", t0 + Duration::from_secs(1), 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
         assert!(engine.hook_confirmed_idle("s"));
         fs::remove_dir_all(dir).unwrap();
@@ -757,9 +768,9 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let mut engine = ActivityEngine::default();
         write_seed_at(&dir, "Stop", t0, 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         write_seed_at(&dir, "Start", t0 + Duration::from_secs(1), 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
         assert!(!engine.hook_confirmed_idle("s"));
         fs::remove_dir_all(dir).unwrap();
@@ -772,11 +783,11 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let mut engine = ActivityEngine::default();
         write_seed_at(&dir, "Stop", t0, 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         engine.note_output_and_sweep("s", 1, true, true, t0);
         engine.note_output_and_sweep("s", 2, true, true, t0 + STOP_REARM_GRACE);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
         assert!(!engine.hook_confirmed_idle("s"));
         engine.apply_hook_event_for_runtime(
@@ -789,7 +800,7 @@ mod tests {
             None,
         );
         write_seed_at(&dir, "Stop", t0 - Duration::from_secs(1), 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -801,10 +812,10 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let mut engine = ActivityEngine::default();
         write_seed_at(&dir, "Start", t0, 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         engine.note_output_and_sweep("s", 1, true, false, t0 + HOOK_IDLE_TIMEOUT);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
         assert!(!engine.hook_confirmed_idle("s"));
         fs::remove_dir_all(dir).unwrap();
@@ -827,7 +838,7 @@ mod tests {
             None,
         );
         write_seed_at(&dir, "Stop", t0 + Duration::from_secs(2), 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Busy));
         assert!(!engine.hook_confirmed_idle("s"));
         fs::remove_dir_all(dir).unwrap();
@@ -848,9 +859,9 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(t0 + Duration::from_secs(3)))
             .unwrap();
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         write_seed_at(&dir, "Stop", t0 + Duration::from_secs(2), 1);
-        engine.seed_from_disk("s", &dir, true, None, 1);
+        engine.seed_from_disk("s", &dir, true, None, 1, |_| true);
         assert_eq!(engine.hook_owned_state("s"), Some(HookState::Idle));
         assert!(engine.hook_confirmed_idle("s"));
         fs::remove_dir_all(dir).unwrap();
@@ -877,10 +888,68 @@ mod tests {
         // generation-one seed cannot latch generation two.
         engine.observe_runtime_launch("s", 2, None);
         assert!(!engine.is_latched("s"));
-        engine.seed_from_disk("s", &dir, true, None, 2);
+        engine.seed_from_disk("s", &dir, true, None, 2, |_| true);
         assert!(!engine.is_latched("s"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_from_disk_holds_open_handle_preventing_toctou_replacement() {
+        let dir = std::env::temp_dir().join(format!("unpeel-toctou-seed-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last-hook-event.json");
+        fs::write(
+            &path,
+            r#"{"hook_event_name":"Start","unpeel_runtime_id":"omp","unpeel_runtime_generation":1}"#,
+        )
+        .unwrap();
+
+        let mut engine = ActivityEngine::default();
+        let session_id = "toctou-session";
+        let target_path = path.clone();
+
+        // The predicate is called with the parsed value from the opened handle.
+        // It deterministically replaces the file on disk with a Stop event from a foreign runtime.
+        engine.seed_from_disk(
+            session_id,
+            &dir,
+            false,
+            None,
+            1,
+            move |value| {
+                assert_eq!(
+                    value.get("hook_event_name").and_then(|v| v.as_str()),
+                    Some("Start"),
+                    "validator must see the original record parsed from the open handle"
+                );
+                // Deterministic TOCTOU attack: replace the file on disk while validation is running
+                fs::write(
+                    &target_path,
+                    r#"{"hook_event_name":"Stop","unpeel_runtime_id":"claude","unpeel_runtime_generation":1}"#,
+                )
+                .unwrap();
+                // Accept the original record
+                true
+            },
+        );
+
+        // State must reflect the ORIGINAL validated record ("Start" -> Busy), NOT the replacement ("Stop" -> Idle).
+        assert_eq!(engine.hook_owned_state(session_id), Some(HookState::Busy));
+        assert!(!engine.hook_confirmed_idle(session_id));
+
+        // Now test that if the validator rejects an invalid record, it cannot apply
+        let mut engine_reject = ActivityEngine::default();
+        engine_reject.observe_runtime_launch("reject-session", 1, None);
+        engine_reject.seed_from_disk("reject-session", &dir, false, None, 1, |value| {
+            // Reject invalid runtime
+            value.get("unpeel_runtime_id").and_then(|v| v.as_str()) != Some("claude")
+        });
+        // Because "claude" is rejected by the predicate, state is not latched or changed
+        assert_eq!(engine_reject.hook_owned_state("reject-session"), None);
+        assert!(!engine_reject.is_latched("reject-session"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

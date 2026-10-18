@@ -487,10 +487,9 @@ pub use crate::integrations::{
 
 #[cfg(test)]
 pub(crate) use crate::integrations::{
-    amp::setup::AMP_PLUGIN_SCRIPT,
     claude::setup::{
         build_hook_entry, claude_hook_script_path, is_stale_unpeel_claude_hook,
-        prune_stale_unpeel_claude_hooks, CLAUDE_HOOK_SCRIPT, HOOK_EVENTS,
+        prune_stale_unpeel_claude_hooks, CLAUDE_HOOK_SCRIPT,
     },
     cline::setup::{write_cline_event_hook, CLINE_HOOK_SCRIPT},
     codex::setup::{
@@ -502,14 +501,10 @@ pub(crate) use crate::integrations::{
     copilot::setup::COPILOT_HOOK_SCRIPT,
     cursor_agent::setup::{merge_cursor_mcp_servers_at, CURSOR_HOOK_SCRIPT},
     gemini::setup::GEMINI_HOOK_SCRIPT,
-    grok::setup::{
-        grok_hooks_json, GROK_COMMAND_WRAPPER_SCRIPT, GROK_DEFAULTS_WRAPPER_SCRIPT,
-        GROK_HOOK_SCRIPT,
-    },
+    grok::setup::{GROK_COMMAND_WRAPPER_SCRIPT, GROK_HOOK_SCRIPT},
     kimi::setup::{reconcile_kimi_config, upsert_kimi_code_managed_mcp, KIMI_HOOK_SCRIPT},
     kiro_cli::setup::{kiro_mcp_server_value, KIRO_HOOK_SCRIPT},
     muse::setup::{muse_plugin_manifest_json, MUSE_HOOK_SCRIPT},
-    opencode::setup::OPENCODE_PLUGIN_SCRIPT,
 };
 
 #[cfg(test)]

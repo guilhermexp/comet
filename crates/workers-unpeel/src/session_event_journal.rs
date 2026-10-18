@@ -146,6 +146,7 @@ fn start(session_id: &str, session_dir: &Path) -> Result<SessionHookJournalIngre
                 &mut sequence,
                 &mut last_entry,
                 &mut reconciled_snapshot_identity,
+                Some(&expected_session_id),
             )
             .is_ok()
             {
@@ -179,6 +180,7 @@ fn start(session_id: &str, session_dir: &Path) -> Result<SessionHookJournalIngre
             &mut sequence,
             &mut last_entry,
             &mut reconciled_snapshot_identity,
+            Some(&expected_session_id),
         );
     });
     Ok(SessionHookJournalIngress {
@@ -254,10 +256,8 @@ fn handle_connection(
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "Hook journal payload is missing hook_event_name".to_string())?;
     let manifest = unpeel_core::session_host::load_manifest(expected_session_id);
-    if manifest
-        .as_ref()
-        .is_some_and(|manifest| crate::activity_bridge::is_nested_provider_hook(manifest, &value))
-    {
+    let admission = crate::hook_admission::check_hook_admission(manifest.as_ref(), &value);
+    if admission.is_ignored() {
         respond(&mut stream, "202 Accepted", r#"{"ok":true,"ignored":true}"#);
         return Ok(None);
     }
@@ -281,9 +281,12 @@ fn handle_connection(
         .get("comet_task_episode")
         .or_else(|| value.get("cometTaskEpisode"))
         .and_then(serde_json::Value::as_u64);
-    let current_snapshot = last_hook_snapshot(journal_path.parent().unwrap_or(Path::new(".")))
-        .ok()
-        .flatten();
+    let current_snapshot = last_hook_snapshot(
+        journal_path.parent().unwrap_or(Path::new(".")),
+        Some(expected_session_id),
+    )
+    .ok()
+    .flatten();
     if let (Some(last), Some(snapshot)) = (last_entry, current_snapshot.as_ref())
         && last.source_modified_unix_ns.is_some()
         && last.source_modified_unix_ns == snapshot.source_modified_unix_ns
@@ -322,9 +325,10 @@ fn reconcile_last_hook_snapshot(
     sequence: &mut u64,
     last_entry: &mut Option<SessionHookJournalEntry>,
     reconciled_snapshot_identity: &mut Option<u128>,
+    session_id: Option<&str>,
 ) -> Result<(), String> {
-    let Some(mut snapshot) = last_hook_snapshot(journal_path.parent().unwrap_or(Path::new(".")))?
-    else {
+    let session_dir = journal_path.parent().unwrap_or(Path::new("."));
+    let Some(mut snapshot) = last_hook_snapshot(session_dir, session_id)? else {
         return Ok(());
     };
     let identity = snapshot.source_modified_unix_ns;
@@ -357,7 +361,10 @@ fn reconcile_last_hook_snapshot(
     Ok(())
 }
 
-fn last_hook_snapshot(session_dir: &Path) -> Result<Option<SessionHookJournalEntry>, String> {
+fn last_hook_snapshot(
+    session_dir: &Path,
+    session_id: Option<&str>,
+) -> Result<Option<SessionHookJournalEntry>, String> {
     let path = session_dir.join("last-hook-event.json");
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
@@ -378,15 +385,33 @@ fn last_hook_snapshot(session_dir: &Path) -> Result<Option<SessionHookJournalEnt
         serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
     let Some(hook_event_name) = value
         .get("hook_event_name")
+        .or_else(|| value.get("hookEventName"))
         .and_then(serde_json::Value::as_str)
     else {
         return Ok(None);
     };
+    let manifest = std::fs::read(session_dir.join("manifest.json"))
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_slice::<unpeel_core::session_host::HostedSessionManifest>(&raw).ok()
+        })
+        .or_else(|| session_id.and_then(unpeel_core::session_host::load_manifest))
+        .or_else(|| {
+            session_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(unpeel_core::session_host::load_manifest)
+        });
+    let admission = crate::hook_admission::check_hook_admission(manifest.as_ref(), &value);
+    if admission.is_ignored() {
+        return Ok(None);
+    }
     Ok(Some(SessionHookJournalEntry {
         sequence: 0,
         hook_event_name: hook_event_name.to_owned(),
         tool_name: value
             .get("tool_name")
+            .or_else(|| value.get("toolName"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
         runtime_generation: value
@@ -402,17 +427,64 @@ fn last_hook_snapshot(session_dir: &Path) -> Result<Option<SessionHookJournalEnt
     }))
 }
 
+fn is_turn_start(raw: &str) -> bool {
+    let key = raw
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | ' '))
+        .collect::<String>();
+    matches!(
+        key.as_str(),
+        "start" | "userpromptsubmit" | "userpromptsubmitted" | "beforesubmitprompt"
+    )
+}
+
+fn is_permission_request(raw: &str) -> bool {
+    let key = raw
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | ' '))
+        .collect::<String>();
+    key == "permissionrequest"
+}
+
 pub(crate) fn compact_to_latest(session_dir: &Path) -> Result<(), String> {
+    // An exited Worker can retain parent-delivery state after its session
+    // directory is gone; there is no journal to compact in that case.
+    if !session_dir
+        .try_exists()
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
     with_journal_lock(session_dir, || {
         let Some(entries) = read_entries(session_dir)? else {
             return Ok(());
         };
-        let Some(latest) = entries.last() else {
+        let Some(latest) = entries.last().cloned() else {
             return Ok(());
         };
         let path = session_dir.join(JOURNAL_FILE);
-        let mut encoded = serde_json::to_vec(latest).map_err(|error| error.to_string())?;
-        encoded.push(b'\n');
+        let mut retained = Vec::with_capacity(2);
+        if is_permission_request(&latest.hook_event_name) && entries.len() > 1 {
+            if let Some(start_entry) = entries[..entries.len() - 1].iter().rev().find(|entry| {
+                is_turn_start(&entry.hook_event_name)
+                    && entry.runtime_generation == latest.runtime_generation
+                    && entry.task_episode == latest.task_episode
+            }) {
+                retained.push(start_entry.clone());
+            }
+        }
+        retained.push(latest);
+
+        let mut encoded = Vec::new();
+        for entry in &retained {
+            let mut line = serde_json::to_vec(entry).map_err(|error| error.to_string())?;
+            line.push(b'\n');
+            encoded.extend_from_slice(&line);
+        }
         let temporary = session_dir.join(format!(".{JOURNAL_FILE}.{}.tmp", std::process::id()));
         std::fs::write(&temporary, encoded).map_err(|error| error.to_string())?;
         std::fs::rename(&temporary, path).map_err(|error| error.to_string())
@@ -936,5 +1008,325 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, 3);
         assert_eq!(entries[0].hook_event_name, "Stop");
+    }
+
+    #[test]
+    fn foreign_claude_hooks_rejected_by_journal_ingress_and_replay() {
+        let unpeel_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _homes = TestHomes::set(unpeel_home.path(), home.path());
+
+        let session_id = "worker-foreign-journal";
+        let session_dir = unpeel_home.path().join("app-sessions").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let manifest = test_manifest(
+            session_id,
+            "omp --session-dir /tmp/sessions".into(),
+            home.path(),
+        );
+        unpeel_core::session_host::save_manifest(&manifest).unwrap();
+
+        let ingress = start(session_id, &session_dir).unwrap();
+
+        // 1. Foreign Claude HTTP delivery is rejected with 202
+        let foreign_claude_payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "unpeel_runtime_id": "claude",
+            "unpeel_agent_kind": "main",
+            "unpeel_runtime_generation": 1,
+            "comet_task_episode": 1
+        });
+        let preflight = post_validation(ingress.port, session_id, &foreign_claude_payload);
+        assert!(preflight.contains("202 Accepted"), "{preflight}");
+        let post_result = post(ingress.port, session_id, &foreign_claude_payload);
+        assert!(post_result.contains("202 Accepted"), "{post_result}");
+        drop(ingress);
+
+        assert_eq!(read_entries(&session_dir).unwrap(), None);
+
+        // 2. Foreign Claude snapshot is rejected in replay
+        let journal_path = session_dir.join(JOURNAL_FILE);
+        let seed_path = session_dir.join("last-hook-event.json");
+        std::fs::write(&seed_path, foreign_claude_payload.to_string()).unwrap();
+        std::thread::sleep(SNAPSHOT_RECONCILE_GRACE + Duration::from_millis(50));
+
+        let mut sequence = 1;
+        let mut last_entry = None;
+        let mut reconciled_snapshot_identity = None;
+        reconcile_last_hook_snapshot(
+            &journal_path,
+            &mut sequence,
+            &mut last_entry,
+            &mut reconciled_snapshot_identity,
+            Some(session_id),
+        )
+        .unwrap();
+        assert_eq!(read_entries(&session_dir).unwrap(), None);
+
+        // 3. Nested OMP subagent snapshot is rejected in replay
+        let nested_payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "unpeel_runtime_id": "omp",
+            "unpeel_agent_kind": "sub",
+            "unpeel_runtime_generation": 1,
+            "comet_task_episode": 1
+        });
+        std::fs::write(&seed_path, nested_payload.to_string()).unwrap();
+        std::thread::sleep(SNAPSHOT_RECONCILE_GRACE + Duration::from_millis(50));
+        reconcile_last_hook_snapshot(
+            &journal_path,
+            &mut sequence,
+            &mut last_entry,
+            &mut reconciled_snapshot_identity,
+            Some(session_id),
+        )
+        .unwrap();
+        assert_eq!(read_entries(&session_dir).unwrap(), None);
+
+        // 4. Valid primary OMP snapshot is accepted in replay
+        let primary_payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "unpeel_runtime_id": "omp",
+            "unpeel_agent_kind": "main",
+            "unpeel_runtime_generation": 1,
+            "comet_task_episode": 1
+        });
+        std::fs::write(&seed_path, primary_payload.to_string()).unwrap();
+        // Artificial delay past reconcile grace for testing
+        std::thread::sleep(SNAPSHOT_RECONCILE_GRACE + Duration::from_millis(50));
+        reconcile_last_hook_snapshot(
+            &journal_path,
+            &mut sequence,
+            &mut last_entry,
+            &mut reconciled_snapshot_identity,
+            Some(session_id),
+        )
+        .unwrap();
+        let entries = read_entries(&session_dir).unwrap().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hook_event_name, "PermissionRequest");
+    }
+
+    #[test]
+    fn compact_to_latest_retains_start_before_permission_request_preserving_episodes() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join(JOURNAL_FILE);
+
+        // Case A: Start + PermissionRequest -> retains both
+        append_entry(
+            &journal_path,
+            &SessionHookJournalEntry {
+                sequence: 1,
+                hook_event_name: "Start".into(),
+                tool_name: None,
+                runtime_generation: Some(1),
+                task_episode: Some(1),
+                occurred_at_unix_ms: 10,
+                source_modified_unix_ns: None,
+            },
+        )
+        .unwrap();
+        append_entry(
+            &journal_path,
+            &SessionHookJournalEntry {
+                sequence: 2,
+                hook_event_name: "PermissionRequest".into(),
+                tool_name: Some("AskUserQuestion".into()),
+                runtime_generation: Some(1),
+                task_episode: Some(1),
+                occurred_at_unix_ms: 20,
+                source_modified_unix_ns: None,
+            },
+        )
+        .unwrap();
+        compact_to_latest(directory.path()).unwrap();
+        let entries = read_entries(directory.path()).unwrap().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].hook_event_name, "Start");
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[1].hook_event_name, "PermissionRequest");
+
+        // Case B: UserPromptSubmit + PermissionRequest -> retains both
+        std::fs::remove_file(&journal_path).unwrap();
+        append_entry(
+            &journal_path,
+            &SessionHookJournalEntry {
+                sequence: 10,
+                hook_event_name: "UserPromptSubmit".into(),
+                tool_name: None,
+                runtime_generation: Some(2),
+                task_episode: Some(5),
+                occurred_at_unix_ms: 100,
+                source_modified_unix_ns: None,
+            },
+        )
+        .unwrap();
+        append_entry(
+            &journal_path,
+            &SessionHookJournalEntry {
+                sequence: 11,
+                hook_event_name: "PermissionRequest".into(),
+                tool_name: Some("AskUserQuestion".into()),
+                runtime_generation: Some(2),
+                task_episode: Some(5),
+                occurred_at_unix_ms: 200,
+                source_modified_unix_ns: None,
+            },
+        )
+        .unwrap();
+        compact_to_latest(directory.path()).unwrap();
+        let entries = read_entries(directory.path()).unwrap().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 10);
+        assert_eq!(entries[0].hook_event_name, "UserPromptSubmit");
+        assert_eq!(entries[1].sequence, 11);
+        assert_eq!(entries[1].hook_event_name, "PermissionRequest");
+
+        // Case C: Cross-generation boundary -> only latest PermissionRequest retained
+        std::fs::remove_file(&journal_path).unwrap();
+        append_entry(
+            &journal_path,
+            &SessionHookJournalEntry {
+                sequence: 20,
+                hook_event_name: "Start".into(),
+                tool_name: None,
+                runtime_generation: Some(1),
+                task_episode: Some(1),
+                occurred_at_unix_ms: 100,
+                source_modified_unix_ns: None,
+            },
+        )
+        .unwrap();
+        append_entry(
+            &journal_path,
+            &SessionHookJournalEntry {
+                sequence: 21,
+                hook_event_name: "PermissionRequest".into(),
+                tool_name: Some("AskUserQuestion".into()),
+                runtime_generation: Some(2), // New generation!
+                task_episode: Some(1),
+                occurred_at_unix_ms: 200,
+                source_modified_unix_ns: None,
+            },
+        )
+        .unwrap();
+        compact_to_latest(directory.path()).unwrap();
+        let entries = read_entries(directory.path()).unwrap().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 21);
+        assert_eq!(entries[0].hook_event_name, "PermissionRequest");
+    }
+
+    #[test]
+    fn missing_or_corrupt_manifest_rejects_stamped_seeds_in_journal_replay_while_legitimate_recovers()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join(JOURNAL_FILE);
+        let seed_path = directory.path().join("last-hook-event.json");
+
+        // 1. Missing manifest: stamped foreign seed rejected
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "unpeel_runtime_id": "claude",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::thread::sleep(SNAPSHOT_RECONCILE_GRACE + Duration::from_millis(50));
+        let mut sequence = 1;
+        let mut last_entry = None;
+        let mut reconciled_snapshot_identity = None;
+        reconcile_last_hook_snapshot(
+            &journal_path,
+            &mut sequence,
+            &mut last_entry,
+            &mut reconciled_snapshot_identity,
+            Some("worker-missing-manifest"),
+        )
+        .unwrap();
+        assert_eq!(read_entries(directory.path()).unwrap(), None);
+
+        // 2. Missing manifest: stamped primary seed rejected without verifiable manifest
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "unpeel_runtime_id": "omp",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::thread::sleep(SNAPSHOT_RECONCILE_GRACE + Duration::from_millis(50));
+        reconcile_last_hook_snapshot(
+            &journal_path,
+            &mut sequence,
+            &mut last_entry,
+            &mut reconciled_snapshot_identity,
+            Some("worker-missing-manifest"),
+        )
+        .unwrap();
+        assert_eq!(read_entries(directory.path()).unwrap(), None);
+
+        // 3. Legitimate manifest added: stamped primary seed recovers
+        let manifest = test_manifest(
+            "worker-missing-manifest",
+            "omp --session-dir /tmp/sessions".into(),
+            directory.path(),
+        );
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::thread::sleep(SNAPSHOT_RECONCILE_GRACE + Duration::from_millis(50));
+        reconcile_last_hook_snapshot(
+            &journal_path,
+            &mut sequence,
+            &mut last_entry,
+            &mut reconciled_snapshot_identity,
+            Some("worker-missing-manifest"),
+        )
+        .unwrap();
+        let entries = read_entries(directory.path()).unwrap().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hook_event_name, "PermissionRequest");
+
+        // 4. Missing manifest: legacy unmarked primary seed recovers per contract
+        let dir_legacy = tempfile::tempdir().unwrap();
+        let journal_legacy = dir_legacy.path().join(JOURNAL_FILE);
+        let seed_legacy = dir_legacy.path().join("last-hook-event.json");
+        std::fs::write(
+            &seed_legacy,
+            serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::thread::sleep(SNAPSHOT_RECONCILE_GRACE + Duration::from_millis(50));
+        let mut seq_legacy = 1;
+        let mut last_legacy = None;
+        let mut rec_legacy = None;
+        reconcile_last_hook_snapshot(
+            &journal_legacy,
+            &mut seq_legacy,
+            &mut last_legacy,
+            &mut rec_legacy,
+            Some("worker-legacy"),
+        )
+        .unwrap();
+        let legacy_entries = read_entries(dir_legacy.path()).unwrap().unwrap();
+        assert_eq!(legacy_entries.len(), 1);
+        assert_eq!(legacy_entries[0].hook_event_name, "PermissionRequest");
     }
 }

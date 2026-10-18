@@ -28,6 +28,9 @@ fi
 if ! printf '%s' "$INPUT" | grep -q '"hook_event_name"[[:space:]]*:'; then
   INPUT=$(printf '%s' "$INPUT" | sed "1s/^[[:space:]]*{/&\"hook_event_name\":\"$EVENT_TYPE\",/")
 fi
+if ! printf '%s' "$INPUT" | grep -q '"unpeel_runtime_id"[[:space:]]*:'; then
+  INPUT=$(printf '%s' "$INPUT" | sed '1s/^[[:space:]]*{/&"unpeel_runtime_id":"codex",/')
+fi
 # Codex spawns hooks with an environment of its own choosing, and a PATH lookup
 # for the interpreter here surfaces as a bare `hook exited with code 127` with
 # nothing in the trace to name the hook that died. `$BASH` is this script's own

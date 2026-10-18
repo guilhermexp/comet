@@ -80,53 +80,48 @@ Test: integration — verificação do root de hooks legado (`hook_migration`).
 
 ### Requirement: Worker da família pi reporta atenção quando pede input
 
-O sistema SHALL emitir um evento de lifecycle de atenção quando o agente de um
-Worker da família pi abre um prompt interativo que bloqueia o turno esperando
-resposta, e SHALL refletir esse estado como Worker bloqueado para o painel e
-para o Orquestrador. Prompt de pergunta ao usuário MUST produzir a transição de
-atenção: o motor de estado hoje a descarta, sob a premissa de que a pergunta já
-aparece no terminal — premissa que vale para um humano olhando o pane e não
-para um Orquestrador que só enxerga o estado reportado.
+O sistema SHALL usar sinais suportados pelo runtime para reportar atenção quando um prompt interativo primário bloqueia o Worker esperando resposta. OMP, Pi e Prime MUST ter suas APIs verificadas separadamente; um callback inexistente não constitui integração. Uma pergunta reconhecida MUST bloquear a atividade e sua resposta MUST retomar o trabalho sem emitir conclusão. A ausência de suporte comprovado MUST ser representada honestamente nas capabilities em vez de anunciar atenção confiável.
 
 #### Scenario: Prompt interativo emite evento de atenção
-- Test: unit — extensão de lifecycle da família pi sob o host de extensão real.
+Test: unit — extensão executável e transições de atividade.
 
-- **WHEN** o agente de um Worker da família pi abre um prompt interativo que
-  bloqueia o turno
-- **THEN** o transporte de notificação recebe um evento de atenção
-- **AND** o evento nomeia a ferramenta que abriu o prompt
-- **AND** nenhum evento de fim de turno é emitido, porque o turno não terminou
+- **WHEN** a ferramenta de pergunta primária do OMP espera resposta sem solicitar aprovação de ferramenta
+- **THEN** o Worker reporta atenção e a notificação fica disponível ao Chat pai
+- **AND** o callback de aprovação não é necessário para detectar essa pergunta
 
 #### Scenario: Motor de estado aceita atenção de prompt de pergunta
-- Test: unit — `ActivityEngine` recebendo o evento de permissão com o nome da
-ferramenta de pergunta ao usuário.
+Test: unit — motor de atividade com atenção nomeando a ferramenta de pergunta.
 
-- **WHEN** o motor recebe um evento de atenção cuja ferramenta é um prompt de
-  pergunta ao usuário
-- **THEN** o estado do Worker passa a atenção
-- **AND** o evento deixa de ser tratado como apenas ancoragem de posse de hook
+- **WHEN** um runtime com suporte verificado reporta atenção de uma pergunta primária
+- **THEN** o Worker fica bloqueado e o evento não é descartado como mera posse de hook
 
 #### Scenario: Worker bloqueado é distinguível de Worker trabalhando
-- Test: unit — `derive_activity` para a família pi.
+Test: unit — derivação da atividade do Worker.
 
-- **WHEN** um Worker da família pi está parado num prompt interativo
-- **THEN** a atividade reportada é bloqueado, não trabalhando
-- **AND** um Worker no meio de um turno continua reportando trabalhando
+- **WHEN** o Worker está num prompt primário suportado que espera resposta
+- **THEN** sua atividade é bloqueado
+- **AND** um Worker executando um turno sem interação pendente permanece trabalhando
 
 #### Scenario: Resposta ao prompt retoma o turno
-- Test: unit — `ActivityEngine` com atividade de tela após o evento de atenção.
+Test: unit — extensão executável e motor de atividade.
 
-- **WHEN** o prompt é respondido e o agente volta a produzir
-- **THEN** a atividade reportada volta a trabalhando
-- **AND** o fim do turno continua chegando como evento de conclusão
+- **WHEN** uma interação bloqueante termina por resposta ou cancelamento
+- **THEN** o Worker deixa atenção e retoma a atividade apropriada
+- **AND** o fim da interação não é publicado como fim de turno
 
 #### Scenario: Runtime da família pi declara atenção confiável
-- Test: unit — capabilities por sessão a partir do catálogo pinado.
+Test: unit — reporters executáveis e catálogo por runtime.
 
-- **WHEN** o painel Workers carrega uma sessão de runtime da família pi
-- **THEN** o runtime declara que reporta atenção por evento
-- **AND** a derivação de atenção não depende de reconhecer o desenho do prompt
-  no viewport
+- **WHEN** um runtime da família pi não possui um sinal de prompt suportado e verificado
+- **THEN** a integração não declara atenção confiável para esse runtime
+- **AND** a conclusão por evento suportado continua funcionando
+
+#### Scenario: Continuação automática do agente
+Test: unit — extensão executável.
+
+- **WHEN** o runtime termina um segmento e informa que continuará o turno
+- **THEN** nenhum evento de conclusão primária é publicado
+- **AND** uma conclusão efetiva posterior permanece notificável
 
 ### Requirement: Primary Worker lifecycle excludes nested OMP subagents
 

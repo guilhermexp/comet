@@ -29,7 +29,7 @@ Every agent chat run (root, child or side chat) on the Claude, Pi, ACP and OMP r
 
 ### Requirement: Workers receive the Computer Use server
 
-Worker sessions launched from claude, cursor-agent, cline, kimi, omp and pi presets SHALL get the Computer Use server. A preset whose command already carries its own MCP config flag SHALL launch as the user wrote it, as the existing unified Unpeel server does. Codex Workers SHALL NOT get it.
+Worker sessions launched from claude, cursor-agent, cline, kimi, omp and pi presets SHALL get the Computer Use server. A preset whose command already carries its own MCP config flag SHALL launch as the user wrote it, as the existing unified Unpeel server does. Codex and Prime Agent Workers SHALL NOT get it.
 
 #### Scenario: Claude Worker
 - **WHEN** a Worker starts from the `claude` preset

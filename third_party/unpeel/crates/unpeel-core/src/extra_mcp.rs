@@ -3,9 +3,9 @@
 //! Unpeel registers none, so a standalone build launches exactly as before.
 //! Comet registers its servers (`comet-computer-use`) at process start, before
 //! the session host runs. Adapters with an MCP config seam (claude-code,
-//! cursor-agent, cline, kimi) write each server next to `unpeel`; the pi
-//! family has no MCP client and loads one generated bridge extension per
-//! server instead. Every server runs the current executable with its args.
+//! cursor-agent, cline, kimi) write each server next to `unpeel`; OMP and Pi
+//! have no MCP client and load one generated bridge extension per server
+//! instead. Native Prime Agent has no extension loader and gets none. Every server runs the current executable with its args.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

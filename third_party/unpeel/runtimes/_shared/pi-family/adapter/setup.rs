@@ -1,6 +1,6 @@
 use crate::app_paths::unpeel_home;
 use crate::hook_assets::{
-    NOTIFY_HOOK_SCRIPT, notify_hook_script_path, write_executable_script, write_file_atomic,
+    notify_hook_script_path, write_executable_script, write_file_atomic, NOTIFY_HOOK_SCRIPT,
 };
 use std::ops::Range;
 use std::path::PathBuf;
@@ -11,21 +11,14 @@ const LIFECYCLE_EXTENSION: &str = include_str!(concat!(
 ));
 
 pub(crate) fn lifecycle_extension_path() -> PathBuf {
-    unpeel_home()
-        .join("hooks")
-        .join(if super::FILTER_NESTED_OMP_SUBAGENTS {
-            "omp-lifecycle-extension.js"
-        } else {
-            "pi-family-lifecycle-extension.js"
-        })
+    unpeel_home().join("hooks").join(super::EXTENSION_FILE_NAME)
 }
 
 /// Append `--extension <lifecycle extension>` exactly once.
 ///
-/// Every pi-family CLI (`pi`, `omp`, `prime-agent`) takes `-e/--extension` and
-/// runs the same extension API (`agent_start`/`agent_end`/`ui_prompt_*`), so
-/// the Start/Stop/Attention transport is identical for all three; only the
-/// alias gate differs, and that stays with each runtime's own adapter.
+/// OMP and Pi use distinct rendered callback sets and share only installation
+/// and transport. Their lifecycle APIs are not interchangeable. Native Prime
+/// Rust does not use this extension loader.
 pub(crate) fn with_lifecycle_extension(command: &str) -> String {
     let trimmed = command.trim();
     let path = lifecycle_extension_path();
@@ -37,14 +30,13 @@ pub(crate) fn with_lifecycle_extension(command: &str) -> String {
     // Older Worker sessions already have the shared path persisted in their
     // command. Replace it for OMP so future launches get the OMP-only path
     // classifier while remaining idempotent for Pi and Prime.
-    if super::FILTER_NESTED_OMP_SUBAGENTS {
-        let legacy_path = unpeel_home()
-            .join("hooks")
-            .join("pi-family-lifecycle-extension.js");
-        let legacy_raw = legacy_path.to_string_lossy();
-        if let Some(updated) = replace_extension_argument(
-            trimmed,
-            legacy_raw.as_ref(), &quoted_path)
+    let legacy_path = unpeel_home()
+        .join("hooks")
+        .join("pi-family-lifecycle-extension.js");
+    let legacy_raw = legacy_path.to_string_lossy();
+    if path != legacy_path {
+        if let Some(updated) =
+            replace_extension_argument(trimmed, legacy_raw.as_ref(), &quoted_path)
         {
             return updated;
         }
@@ -221,12 +213,16 @@ fn replace_extension_argument(
 
 fn render_lifecycle_extension(
     notify_path: &std::path::Path,
+    runtime_slug: &str,
     filter_nested_omp_subagents: bool,
 ) -> Result<String, String> {
     let notify_path_json = serde_json::to_string(&notify_path.to_string_lossy())
         .map_err(|error| format!("Failed to encode lifecycle hook path: {error}"))?;
+    let runtime_id_json = serde_json::to_string(runtime_slug)
+        .map_err(|error| format!("Failed to encode runtime ID: {error}"))?;
     Ok(LIFECYCLE_EXTENSION
         .replace("{{NOTIFY_PATH_JSON}}", &notify_path_json)
+        .replace("{{RUNTIME_ID_JSON}}", &runtime_id_json)
         .replace(
             "{{FILTER_NESTED_OMP_SUBAGENTS_JSON}}",
             if filter_nested_omp_subagents {
@@ -240,7 +236,11 @@ fn render_lifecycle_extension(
 pub(crate) fn install_lifecycle_extension() -> Result<(), String> {
     let notify_path = notify_hook_script_path();
     write_executable_script(&notify_path, NOTIFY_HOOK_SCRIPT, "shared notify transport")?;
-    let extension = render_lifecycle_extension(&notify_path, super::FILTER_NESTED_OMP_SUBAGENTS)?;
+    let extension = render_lifecycle_extension(
+        &notify_path,
+        super::RUNTIME_SLUG,
+        super::FILTER_NESTED_OMP_SUBAGENTS,
+    )?;
     write_file_atomic(
         &lifecycle_extension_path(),
         &extension,
@@ -280,7 +280,8 @@ mod tests {
         let extension_path = directory.path().join("lifecycle-extension.mjs");
         std::fs::write(
             &extension_path,
-            render_lifecycle_extension(&notify_path, false).expect("render lifecycle extension"),
+            render_lifecycle_extension(&notify_path, "omp", false)
+                .expect("render lifecycle extension"),
         )
         .expect("write lifecycle extension");
         let harness_path = directory.path().join("harness.mjs");
@@ -318,6 +319,7 @@ await handlers.get("agent_end")({{}}, context);
         assert_eq!(
             payload,
             serde_json::json!({
+                "unpeel_runtime_id": "omp",
                 "hook_event_name": "Stop",
                 "session_id": "omp-provider-1",
                 "provider_transcript_path": "/trusted/omp-provider-1.jsonl"
@@ -427,7 +429,8 @@ await handlers.get("agent_end")({{}}, context);
         let extension_path = directory.path().join("lifecycle-extension.mjs");
         std::fs::write(
             &extension_path,
-            render_lifecycle_extension(&notify_path, true).expect("render lifecycle extension"),
+            render_lifecycle_extension(&notify_path, "omp", true)
+                .expect("render lifecycle extension"),
         )
         .expect("write lifecycle extension");
         let harness_path = directory.path().join("harness.mjs");
@@ -487,14 +490,17 @@ const explicitMain = {{
 await handlers.get("agent_start")({{}}, nested);
 await handlers.get("agent_end")({{}}, nestedAlias);
 await handlers.get("agent_start")({{}}, unflushedNested);
-await handlers.get("ui_prompt_start")({{ kind: "custom", reason: "ui_prompt" }}, nested);
-await handlers.get("ui_prompt_end")({{}}, nested);
+await handlers.get("tool_approval_requested")({{ toolName: "bash" }}, nested);
+await handlers.get("tool_approval_resolved")({{}}, nested);
+await handlers.get("tool_call")({{ toolName: "ask" }}, nested);
+await handlers.get("tool_result")({{ toolName: "ask" }}, nested);
 await handlers.get("agent_start")({{}}, inMemorySubagent);
 await handlers.get("agent_start")({{}}, explicitMain);
 await handlers.get("agent_start")({{}}, primary);
-await handlers.get("ui_prompt_start")({{ kind: "custom", reason: "ui_prompt" }}, explicitPrimary);
-await handlers.get("ui_prompt_end")({{}}, explicitPrimary);
-await handlers.get("agent_end")({{}}, primary);
+await handlers.get("tool_call")({{ toolName: "ask" }}, explicitPrimary);
+await handlers.get("tool_result")({{ toolName: "ask" }}, explicitPrimary);
+await handlers.get("agent_end")({{ willContinue: true }}, primary);
+await handlers.get("agent_end")({{ willContinue: false }}, primary);
 await handlers.get("agent_start")({{}}, reboundPrimary);
 await handlers.get("agent_end")({{}}, reboundPrimary);
 "#,
@@ -560,6 +566,10 @@ await handlers.get("agent_end")({{}}, reboundPrimary);
                 "opus-resumed"
             ]
         );
+        for payload in &payloads {
+            assert_eq!(payload["unpeel_runtime_id"], "omp");
+        }
+        assert_eq!(payloads[2]["tool_name"], "ask");
     }
 
     #[test]
@@ -582,7 +592,7 @@ await handlers.get("agent_end")({{}}, reboundPrimary);
         let extension_path = directory.path().join("pi-lifecycle-extension.mjs");
         std::fs::write(
             &extension_path,
-            render_lifecycle_extension(&notify_path, false).expect("render Pi extension"),
+            render_lifecycle_extension(&notify_path, "pi", false).expect("render Pi extension"),
         )
         .expect("write Pi extension");
         let harness_path = directory.path().join("harness.mjs");
@@ -596,7 +606,7 @@ const context = {{ sessionManager: {{
   getSessionId() {{ return "pi-primary"; }},
   getSessionFile() {{ return {}; }},
 }} }};
-await handlers.get("agent_end")({{}}, context);
+await handlers.get("agent_settled")({{}}, context);
 "#,
                 serde_json::to_string(&extension_path.to_string_lossy()).unwrap(),
                 serde_json::to_string(&child_path.to_string_lossy()).unwrap(),
@@ -621,26 +631,27 @@ await handlers.get("agent_end")({{}}, context);
             .map(|line| serde_json::from_str(line).expect("valid captured hook JSON"))
             .collect();
         assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["unpeel_runtime_id"], "pi");
         assert_eq!(payloads[0]["hook_event_name"], "Stop");
         assert_eq!(payloads[0]["session_id"], "pi-primary");
     }
 
     #[test]
-    fn ui_prompt_start_posts_permission_request_without_stop() {
+    fn pi_lifecycle_extension_maps_ui_prompt_dialogs() {
         let directory = tempfile::tempdir().expect("temporary extension harness");
-        let capture_path = directory.path().join("payload.json");
+        let capture_path = directory.path().join("payloads.jsonl");
         let notify_path = directory.path().join("notify.sh");
         std::fs::write(
             &notify_path,
-            "#!/bin/bash\nprintf '%s' \"$1\" > \"$CAPTURE_PATH\"\n",
+            "#!/bin/bash\nprintf '%s\\n' \"$1\" >> \"$CAPTURE_PATH\"\n",
         )
         .expect("write capture notifier");
-        let extension_path = directory.path().join("lifecycle-extension.mjs");
+        let extension_path = directory.path().join("pi-lifecycle-extension.mjs");
         std::fs::write(
             &extension_path,
-            render_lifecycle_extension(&notify_path, false).expect("render lifecycle extension"),
+            render_lifecycle_extension(&notify_path, "pi", false).expect("render Pi extension"),
         )
-        .expect("write lifecycle extension");
+        .expect("write Pi extension");
         let harness_path = directory.path().join("harness.mjs");
         std::fs::write(
             &harness_path,
@@ -649,10 +660,11 @@ await handlers.get("agent_end")({{}}, context);
 const handlers = new Map();
 register({{ on(name, handler) {{ handlers.set(name, handler); }} }});
 const context = {{ sessionManager: {{
-  getSessionId() {{ return "omp-provider-1"; }},
-  getSessionFile() {{ return "/trusted/omp-provider-1.jsonl"; }},
+  getSessionId() {{ return "pi-primary"; }},
+  getSessionFile() {{ return "/trusted/pi-primary.jsonl"; }},
 }} }};
-await handlers.get("ui_prompt_start")({{ kind: "custom", reason: "ui_prompt" }}, context);
+await handlers.get("ui_prompt_start")({{ kind: "select" }}, context);
+await handlers.get("ui_prompt_end")({{}}, context);
 "#,
                 serde_json::to_string(&extension_path.to_string_lossy()).unwrap()
             ),
@@ -670,12 +682,206 @@ await handlers.get("ui_prompt_start")({{ kind: "custom", reason: "ui_prompt" }},
             "bun failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let payload: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(capture_path).expect("captured hook payload"))
-                .expect("valid captured hook JSON");
-        assert_eq!(payload["hook_event_name"], "PermissionRequest");
-        assert_eq!(payload["tool_name"], "AskUserQuestion");
-        assert_ne!(payload["hook_event_name"], "Stop");
-        assert_eq!(payload["session_id"], "omp-provider-1");
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(capture_path)
+            .expect("captured hook payloads")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid captured hook JSON"))
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["hook_event_name"], "PermissionRequest");
+        assert_eq!(payloads[0]["tool_name"], "select");
+        assert_eq!(payloads[0]["unpeel_runtime_id"], "pi");
+        assert_eq!(payloads[1]["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(payloads[1]["unpeel_runtime_id"], "pi");
+    }
+
+    #[test]
+    fn omp_ordinary_ask_tool_call_and_result_posts_permission_request_and_resume() {
+        let directory = tempfile::tempdir().expect("temporary extension harness");
+        let capture_path = directory.path().join("payloads.jsonl");
+        let notify_path = directory.path().join("notify.sh");
+        std::fs::write(
+            &notify_path,
+            "#!/bin/bash\nprintf '%s\\n' \"$1\" >> \"$CAPTURE_PATH\"\n",
+        )
+        .expect("write capture notifier");
+        let extension_path = directory.path().join("lifecycle-extension.mjs");
+        std::fs::write(
+            &extension_path,
+            render_lifecycle_extension(&notify_path, "omp", false)
+                .expect("render lifecycle extension"),
+        )
+        .expect("write lifecycle extension");
+        let harness_path = directory.path().join("harness.mjs");
+        std::fs::write(
+            &harness_path,
+            format!(
+                r#"import register from {};
+const handlers = new Map();
+register({{ on(name, handler) {{ handlers.set(name, handler); }} }});
+const context = {{ sessionManager: {{
+  getSessionId() {{ return "omp-provider-1"; }},
+  getSessionFile() {{ return "/trusted/omp-provider-1.jsonl"; }},
+}} }};
+await handlers.get("tool_call")({{ toolName: "ask" }}, context);
+await handlers.get("tool_result")({{ toolName: "ask" }}, context);
+"#,
+                serde_json::to_string(&extension_path.to_string_lossy()).unwrap()
+            ),
+        )
+        .expect("write extension harness");
+
+        let output = Command::new("bun")
+            .arg("run")
+            .arg(&harness_path)
+            .env("CAPTURE_PATH", &capture_path)
+            .output()
+            .expect("run lifecycle extension with bun");
+        assert!(
+            output.status.success(),
+            "bun failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(capture_path)
+            .expect("captured hook payloads")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid captured hook JSON"))
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["hook_event_name"], "PermissionRequest");
+        assert_eq!(payloads[0]["tool_name"], "ask");
+        assert_eq!(payloads[0]["unpeel_runtime_id"], "omp");
+        assert_eq!(payloads[0]["session_id"], "omp-provider-1");
+        assert_eq!(payloads[1]["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(payloads[1]["unpeel_runtime_id"], "omp");
+    }
+
+    #[test]
+    fn omp_agent_end_with_will_continue_does_not_post_stop() {
+        let directory = tempfile::tempdir().expect("temporary extension harness");
+        let capture_path = directory.path().join("payloads.jsonl");
+        let notify_path = directory.path().join("notify.sh");
+        std::fs::write(
+            &notify_path,
+            "#!/bin/bash\nprintf '%s\\n' \"$1\" >> \"$CAPTURE_PATH\"\n",
+        )
+        .expect("write capture notifier");
+        let extension_path = directory.path().join("lifecycle-extension.mjs");
+        std::fs::write(
+            &extension_path,
+            render_lifecycle_extension(&notify_path, "omp", false)
+                .expect("render lifecycle extension"),
+        )
+        .expect("write lifecycle extension");
+        let harness_path = directory.path().join("harness.mjs");
+        std::fs::write(
+            &harness_path,
+            format!(
+                r#"import register from {};
+const handlers = new Map();
+register({{ on(name, handler) {{ handlers.set(name, handler); }} }});
+const context = {{ sessionManager: {{
+  getSessionId() {{ return "omp-provider-1"; }},
+  getSessionFile() {{ return "/trusted/omp-provider-1.jsonl"; }},
+}} }};
+await handlers.get("agent_end")({{ willContinue: true }}, context);
+await handlers.get("agent_end")({{ isTerminal: false }}, context);
+await handlers.get("agent_end")({{ willContinue: false, isTerminal: true }}, context);
+"#,
+                serde_json::to_string(&extension_path.to_string_lossy()).unwrap()
+            ),
+        )
+        .expect("write extension harness");
+
+        let output = Command::new("bun")
+            .arg("run")
+            .arg(&harness_path)
+            .env("CAPTURE_PATH", &capture_path)
+            .output()
+            .expect("run lifecycle extension with bun");
+        assert!(
+            output.status.success(),
+            "bun failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(capture_path)
+            .expect("captured hook payloads")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid captured hook JSON"))
+            .collect();
+        assert_eq!(payloads.len(), 1, "only willContinue:false emits Stop");
+        assert_eq!(payloads[0]["hook_event_name"], "Stop");
+        assert_eq!(payloads[0]["unpeel_runtime_id"], "omp");
+    }
+
+    #[test]
+    fn omp_tool_approval_requested_and_resolved() {
+        let directory = tempfile::tempdir().expect("temporary extension harness");
+        let capture_path = directory.path().join("payloads.jsonl");
+        let notify_path = directory.path().join("notify.sh");
+        std::fs::write(
+            &notify_path,
+            "#!/bin/bash\nprintf '%s\\n' \"$1\" >> \"$CAPTURE_PATH\"\n",
+        )
+        .expect("write capture notifier");
+        let extension_path = directory.path().join("lifecycle-extension.mjs");
+        std::fs::write(
+            &extension_path,
+            render_lifecycle_extension(&notify_path, "omp", false)
+                .expect("render lifecycle extension"),
+        )
+        .expect("write lifecycle extension");
+        let harness_path = directory.path().join("harness.mjs");
+        std::fs::write(
+            &harness_path,
+            format!(
+                r#"import register from {};
+const handlers = new Map();
+register({{ on(name, handler) {{ handlers.set(name, handler); }} }});
+const context = {{ sessionManager: {{
+  getSessionId() {{ return "omp-provider-1"; }},
+  getSessionFile() {{ return "/trusted/omp-provider-1.jsonl"; }},
+}} }};
+await handlers.get("tool_approval_requested")({{ toolName: "write_file" }}, context);
+await handlers.get("tool_approval_resolved")({{}}, context);
+"#,
+                serde_json::to_string(&extension_path.to_string_lossy()).unwrap()
+            ),
+        )
+        .expect("write extension harness");
+
+        let output = Command::new("bun")
+            .arg("run")
+            .arg(&harness_path)
+            .env("CAPTURE_PATH", &capture_path)
+            .output()
+            .expect("run lifecycle extension with bun");
+        assert!(
+            output.status.success(),
+            "bun failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(capture_path)
+            .expect("captured hook payloads")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid captured hook JSON"))
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["hook_event_name"], "PermissionRequest");
+        assert_eq!(payloads[0]["tool_name"], "write_file");
+        assert_eq!(payloads[0]["unpeel_runtime_id"], "omp");
+        assert_eq!(payloads[1]["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(payloads[1]["unpeel_runtime_id"], "omp");
+    }
+
+    #[test]
+    fn pi_and_omp_render_distinct_runtime_identities() {
+        let directory = tempfile::tempdir().expect("temporary extension harness");
+        let notify_path = directory.path().join("notify.sh");
+        let pi_ext = render_lifecycle_extension(&notify_path, "pi", false).unwrap();
+        let omp_ext = render_lifecycle_extension(&notify_path, "omp", true).unwrap();
+
+        assert!(pi_ext.contains(r#""pi""#));
+        assert!(omp_ext.contains(r#""omp""#));
     }
 }

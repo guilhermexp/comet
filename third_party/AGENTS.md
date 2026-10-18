@@ -156,25 +156,25 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   The Codex command wrapper must not log argv. Before exec it removes PATH
   entries resolving to itself by file identity, so upstream launchers cannot
   recurse through the managed wrapper. Prime-agent keeps interactive delivery.
-- **Lifecycle da família pi e isolamento de subagentes OMP.** `pi`, `omp` e
-  `prime-agent` emitem `Start`/`Stop` em `agent_start`/`agent_end` e
-  `PermissionRequest`/`UserPromptSubmit` em `ui_prompt_start`/`ui_prompt_end`
-  (prompt bloqueante, com `tool_name`), com id de conversa e transcript do
-  provider. `attention_reliable = true` no `runtime.toml` dos três descreve
-  esse transporte. Pi e Prime compartilham
-  `pi-family-lifecycle-extension.js`; OMP usa `omp-lifecycle-extension.js` para
-  descartar eventos `ctx.agent.kind === "sub"` e, para extensões antigas sem
-  esse campo, reconhecer somente o layout canônico de artefato filho OMP.
-  `kind === "main"` prevalece sobre o fallback de caminho, permitindo que o
-  Worker primário retome um transcript após troca/reabertura. O append e a
-  migração idempotentes moram em
-  `_shared/pi-family/adapter/setup.rs::with_lifecycle_extension`; o gate de
-  alias fica no adapter de cada runtime, porque `pi` tem resume/context próprios
-  e não inclui o `mod.rs` compartilhado. `runtime.toml` com `source = "hooks"`
-  exige a capability `lifecycle_hooks` (e `completion_reliable` exige
-  `notify_when_done`) — o catálogo valida os dois pares. `omp` também declara
-  `transcript`; o adaptador lê JSONL só no diretório gerenciado da sessão
-  sob `<unpeel_home>/pi-sessions` (stem exato, sem walk global).
+- **Lifecycle é provider-owned; transporte e admissão são compartilhados.**
+  Cada reporter carimba o próprio `unpeel_runtime_id`, não o runtime herdado do
+  Worker. O Comet rejeita origem diferente, geração stale e subagente
+  identificável antes de atividade, binding, telemetria ou journal, tanto por
+  HTTP quanto em recovery. Seed conserva só lifecycle e identidade necessários,
+  nunca prompts/argumentos. Preflight síncrono e assíncrono respeitam
+  `202 ignored` antes de publicar seed ou POST; ausência de listener conserva
+  recovery offline. `main` não pode autorizar hook de outro runtime.
+  OMP e Pi recebem extensões distintas e migram o flag legado sem alias:
+  OMP usa `ask`/aprovação e fim sem continuação; Pi usa seus callbacks UI e
+  `agent_settled`. O append idempotente fica no setup compartilhado.
+  Prime Rust 0.10 usa protocolo nativo 7, não `--extension`: daemon privado
+  por Worker, root sem hierarquia de filho, snapshot idle para confirmar fim
+  e cleanup vinculado ao scope/geração do Host. Desconexão não é conclusão;
+  não há replay de eventos nem atenção completa. ID/path explícito substitui
+  o picker `--continue`; o histórico continua em `pi-sessions`.
+  O catálogo exige `lifecycle_hooks` para `source = hooks` e `notify_when_done`
+  para conclusão confiável; AGY permanece hookless. A telemetria OMP continua
+  restrita ao transcript gerenciado (stem exato, sem walk global).
 - **Asset gerenciado cria o diretório dele.** `hook_assets::write_file_atomic`
   faz `create_dir_all` do pai: um root apagado (reinstalação limpa de CLI,
   poda do root legado) fazia a instalação inteira morrer com `No such file or

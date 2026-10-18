@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "903ee42e98607a17c632938bdcadfef9793e8fc2"
+vendored_tree = "a59bca0a6931665574af47e635d5af09a7a47630"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -148,3 +148,19 @@ base_revision_resolves_upstream = false
 # cline/adapter/mod.rs, kimi/adapter/setup.rs, _shared/pi-family/adapter/
 # {mod.rs,setup.rs}, pi/adapter/mod.rs} e em runtimes/setup_conformance_tests.rs
 # (assinatura de merge_cursor_mcp_servers_at passou a Vec). Sem patch upstream.
+
+# 2026-10-17 — Worker lifecycle authority across all runtime reporters:
+# each reporter stamps its actual source runtime; synchronous/asynchronous
+# preflight rejection precedes both delivery and private identity-preserving
+# seeds. Comet applies the same runtime/role/generation admission at ingress
+# and recovery. OMP/Pi/Amp/OpenCode and shell question hooks follow actual
+# provider callbacks; reliability metadata does not promise unsupported input.
+# Prime Agent targets native Rust 0.10 protocol 7 instead of a JS loader:
+# private per-Worker daemon, root-only observation, explicit owned resume with
+# existing pi-sessions storage, and generation-fenced Host scope/teardown
+# cleanup. A native end queries roster idle; transport loss is not completion,
+# and the native API has no event replay. Generated client metadata and owner
+# contracts are reconciled. Prime gets no Computer Use bridge (owner
+# decision); its normalizer also drops a persisted managed
+# hooks/mcp-bridge-comet-computer-use.js argument. Local patch only, not an upstream update;
+# local_modifications_count remains the unrecomputed historical value above.

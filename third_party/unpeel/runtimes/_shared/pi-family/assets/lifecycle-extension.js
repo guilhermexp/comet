@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 
 const notifyPath = {{NOTIFY_PATH_JSON}};
+const runtimeId = {{RUNTIME_ID_JSON}};
 const filterNestedOmpSubagents = {{FILTER_NESTED_OMP_SUBAGENTS_JSON}};
 
 function providerSessionMetadata(ctx) {
@@ -50,7 +51,6 @@ function isNestedOmpAgent(ctx) {
     return false;
   }
 }
-
 function promptToolName(event) {
   const kind = typeof event?.kind === "string" ? event.kind.trim() : "";
   if (!kind || kind === "custom") {
@@ -58,7 +58,6 @@ function promptToolName(event) {
   }
   return kind;
 }
-
 function notify(hookEventName, ctx, toolName) {
   if (isNestedOmpAgent(ctx)) {
     return Promise.resolve();
@@ -66,6 +65,7 @@ function notify(hookEventName, ctx, toolName) {
 
   return new Promise((resolve) => {
     const payload = {
+      unpeel_runtime_id: runtimeId,
       hook_event_name: hookEventName,
       ...providerSessionMetadata(ctx),
       ...(typeof toolName === "string" && toolName
@@ -83,16 +83,53 @@ function notify(hookEventName, ctx, toolName) {
 }
 
 export default function registerUnpeelLifecycle(extension) {
-  extension.on("agent_start", async (_event, ctx) => {
-    await notify("Start", ctx);
-  });
-  extension.on("agent_end", async (_event, ctx) => {
-    await notify("Stop", ctx);
-  });
-  extension.on("ui_prompt_start", async (event, ctx) => {
-    await notify("PermissionRequest", ctx, promptToolName(event));
-  });
-  extension.on("ui_prompt_end", async (_event, ctx) => {
-    await notify("UserPromptSubmit", ctx);
-  });
+  if (runtimeId === "omp") {
+    extension.on("agent_start", async (_event, ctx) => {
+      await notify("Start", ctx);
+    });
+    extension.on("agent_end", async (event, ctx) => {
+      if (event?.willContinue || event?.isTerminal === false) {
+        return;
+      }
+      await notify("Stop", ctx);
+    });
+    extension.on("tool_call", async (event, ctx) => {
+      if (event?.toolName === "ask") {
+        await notify("PermissionRequest", ctx, "ask");
+      }
+    });
+    extension.on("tool_result", async (event, ctx) => {
+      if (event?.toolName === "ask") {
+        await notify("UserPromptSubmit", ctx);
+      }
+    });
+    extension.on("tool_approval_requested", async (event, ctx) => {
+      const toolName =
+        typeof event?.toolName === "string" && event.toolName
+          ? event.toolName
+          : "tool_approval";
+      await notify("PermissionRequest", ctx, toolName);
+    });
+    extension.on("tool_approval_resolved", async (_event, ctx) => {
+      await notify("UserPromptSubmit", ctx);
+    });
+  } else if (runtimeId === "pi") {
+    extension.on("agent_start", async (_event, ctx) => {
+      await notify("Start", ctx);
+    });
+    extension.on("agent_settled", async (_event, ctx) => {
+      await notify("Stop", ctx);
+    });
+    extension.on("session_shutdown", async (event, ctx) => {
+      if (event?.reason === "quit") {
+        await notify("Stop", ctx);
+      }
+    });
+    extension.on("ui_prompt_start", async (event, ctx) => {
+      await notify("PermissionRequest", ctx, promptToolName(event));
+    });
+    extension.on("ui_prompt_end", async (_event, ctx) => {
+      await notify("UserPromptSubmit", ctx);
+    });
+  }
 }

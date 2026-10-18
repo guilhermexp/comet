@@ -687,6 +687,24 @@ fn read_input_stream_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, S
     Ok(Some(data))
 }
 
+type HostRuntimeControlSlot = Arc<Mutex<Option<Box<dyn crate::integrations::HostRuntimeControl>>>>;
+
+/// Shared IPC/runtime threads may outlive this stack frame. Taking the resource
+/// out of the shared slot ensures they cannot postpone its actual cleanup.
+struct HostRuntimeControlOwner(Option<HostRuntimeControlSlot>);
+
+impl Drop for HostRuntimeControlOwner {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0.as_ref() {
+            let control = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            drop(control);
+        }
+    }
+}
+
 struct HostRuntime {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -700,7 +718,10 @@ struct HostRuntime {
     /// then execing or renaming itself. Resume Agent uses its PID/start/PGID
     /// until a complete session scan proves the old job is gone.
     last_runtime_observation: Option<ActiveRuntimeObservation>,
+    /// Identity of the accepted managed launch, distinct from reader resets.
+    runtime_launch_generation: u64,
     recent_write_ids: RecentWriteIds,
+    host_runtime_control: Option<HostRuntimeControlSlot>,
 }
 
 #[cfg(unix)]
@@ -1393,13 +1414,32 @@ fn resume_agent_in_place(
         return Err("An agent resume launch is pending".into());
     }
 
+    // Runtime cleanup may perform IPC whose receiver needs PTY state. Keep the
+    // restart serializer, but never hold the runtime mutex across that work.
+    let control_error = if let Some(slot) = guard.host_runtime_control.clone() {
+        drop(guard);
+        let prepared = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+            .ok_or_else(|| "Host runtime control has closed".to_owned())
+            .and_then(|control| control.prepare_launch(next_generation));
+        guard = runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prepared.err()
+    } else {
+        None
+    };
     // The manifest publication above can touch disk. Re-prove every process
     // invariant immediately before submitting Ctrl-U + command as one write.
-    let ownership_error = match owned_shell_is_foreground(&guard, &manifest, expected_runtime_id) {
-        Ok(true) => None,
-        Ok(false) => Some("Owned shell lost the terminal before agent relaunch".to_string()),
-        Err(error) => Some(error),
-    };
+    let ownership_error = control_error.or_else(|| {
+        match owned_shell_is_foreground(&guard, &manifest, expected_runtime_id) {
+            Ok(true) => None,
+            Ok(false) => Some("Owned shell lost the terminal before agent relaunch".to_string()),
+            Err(error) => Some(error),
+        }
+    });
     if let Some(error) = ownership_error {
         clear_runtime_launch_pending(
             session_id,
@@ -1437,6 +1477,7 @@ fn resume_agent_in_place(
         }
         return Err(error);
     }
+    guard.runtime_launch_generation = next_generation;
     drop(guard);
 
     let manifest_update = update_manifest_session(session_id, |manifest| {
@@ -4849,6 +4890,9 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             Some(false) => cmd.env("COLORFGBG", "0;15"),
         };
         integrations::configure_host_command(runtime_id, &launch, &mut cmd, &mut shell_prelude)?;
+        let host_runtime_control = integrations::start_host_runtime(runtime_id, &launch, &cmd)?
+            .map(|control| Arc::new(Mutex::new(Some(control))));
+        let host_runtime_control_owner = HostRuntimeControlOwner(host_runtime_control.clone());
         let mut automatic_mcp_registration = integrations::automatic_mcp_registration(
             runtime_id,
             trimmed_command,
@@ -4963,7 +5007,9 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             child,
             shell_executable: PathBuf::from(&shell),
             last_runtime_observation: None,
+            runtime_launch_generation: u64::from(launches_stable_runtime),
             recent_write_ids: RecentWriteIds::default(),
+            host_runtime_control,
         }));
         // Raw local socket clients can bypass the lifecycle-file lock used by
         // `session_ops`; serialize in-place relaunches here as the final
@@ -5045,6 +5091,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         let runtime_for_observer = Arc::clone(&runtime);
         let generation_for_runtime_observer = Arc::clone(&runtime_generation);
         let pending_generation_for_runtime_observer = Arc::clone(&pending_runtime_generation);
+        let host_runtime_control_for_observer = host_runtime_control_owner.0.clone();
         let runtime_observer_thread = thread::spawn(move || {
             let (Some(session_leader_pid), Some(session_leader_started_at_ms)) =
                 (pid, pid_started_at)
@@ -5055,20 +5102,20 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             let mut observed_generation = generation_for_runtime_observer.load(Ordering::Acquire);
             let mut previous_foreground_was_shell = false;
             while running_for_runtime_observer.load(Ordering::Relaxed) {
-                let generation = generation_for_runtime_observer.load(Ordering::Acquire);
-                if generation != observed_generation {
-                    observed_generation = generation;
-                    tracker = RuntimeObservationTracker::default();
-                    runtime_for_observer
+                let (launch_generation, current_child_pid, foreground_process_group_id) = {
+                    let mut state = runtime_for_observer
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .last_runtime_observation = None;
-                }
-                let (current_child_pid, foreground_process_group_id) = {
-                    let runtime = runtime_for_observer.lock().unwrap();
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let generation = generation_for_runtime_observer.load(Ordering::Acquire);
+                    if generation != observed_generation {
+                        observed_generation = generation;
+                        tracker = RuntimeObservationTracker::default();
+                        state.last_runtime_observation = None;
+                    }
                     (
-                        runtime.child.process_id(),
-                        runtime.master.process_group_leader(),
+                        state.runtime_launch_generation,
+                        state.child.process_id(),
+                        state.master.process_group_leader(),
                     )
                 };
                 // The Child is retained until shutdown, but still fail closed
@@ -5198,16 +5245,31 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                                 && !manifest.runtime_launch_pending
                         })
                     {
-                        let _ = pending_generation_for_runtime_observer.compare_exchange(
-                            pending_generation,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                        if completion_observed {
+                        let cleared = pending_generation_for_runtime_observer
+                            .compare_exchange(
+                                pending_generation,
+                                0,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok();
+                        if completion_observed && cleared {
                             remove_runtime_launch_completion_marker(
                                 &runtime_observer_completion_path,
                             );
+                        }
+                    }
+                }
+                // Completion remains meaningful after the launch-pending latch
+                // cleared. Fence a delayed old observation with its generation.
+                if completion_observed {
+                    if let Some(slot) = host_runtime_control_for_observer.as_ref() {
+                        if let Some(control) = slot
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .as_mut()
+                        {
+                            control.on_scope_end(launch_generation);
                         }
                     }
                 }

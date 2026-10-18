@@ -31,7 +31,7 @@ source = "hooks"
 authority = "complete"
 fallback = "none"
 completion_reliable = true
-attention_reliable = true
+attention_reliable = false
 
 [[usage.stores]]
 root = ".gemini/tmp"

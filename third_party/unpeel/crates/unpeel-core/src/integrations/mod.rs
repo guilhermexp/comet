@@ -1,5 +1,12 @@
 pub mod shared;
 
+pub(crate) mod pi_family_resume {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../runtimes/_shared/pi-family/adapter/resume.rs"
+    ));
+}
+
 use crate::session_host::SessionHostLaunch;
 use portable_pty::CommandBuilder;
 use std::path::Path;
@@ -26,6 +33,16 @@ impl RuntimeLaunchOptions {
         self.sessions_mcp || self.browser_mcp || self.computer_mcp
     }
 }
+
+/// Host-owned runtime resources. Callers serialize these operations separately
+/// from PTY state locks; implementations may join threads or perform IPC.
+pub trait HostRuntimeControl: Send {
+    fn prepare_launch(&mut self, next_generation: u64) -> Result<(), String>;
+    fn on_scope_end(&mut self, generation: u64);
+}
+
+pub type StartHostRuntime =
+    fn(&SessionHostLaunch, &CommandBuilder) -> Result<Box<dyn HostRuntimeControl>, String>;
 
 #[derive(Clone, Copy)]
 pub struct BuiltinPresetDefinition {
@@ -55,6 +72,7 @@ pub struct Integration {
     pub read_session_telemetry: Option<crate::session_telemetry::ReadSessionTelemetry>,
     pub is_nested_provider_transcript: Option<IsNestedProviderTranscript>,
     pub native_initial_input: Option<NativeInitialInput>,
+    pub start_host_runtime: Option<StartHostRuntime>,
 }
 
 impl Integration {
@@ -75,6 +93,7 @@ impl Integration {
             read_session_telemetry: None,
             is_nested_provider_transcript: None,
             native_initial_input: None,
+            start_host_runtime: None,
         }
     }
 
@@ -152,6 +171,11 @@ impl Integration {
 
     pub const fn with_native_initial_input(mut self, input: NativeInitialInput) -> Self {
         self.native_initial_input = Some(input);
+        self
+    }
+
+    pub const fn with_host_runtime(mut self, start_host_runtime: StartHostRuntime) -> Self {
+        self.start_host_runtime = Some(start_host_runtime);
         self
     }
 }
@@ -341,6 +365,20 @@ pub fn configure_host_command(
     }
 
     Ok(())
+}
+
+pub fn start_host_runtime(
+    tool: &str,
+    launch: &SessionHostLaunch,
+    cmd: &CommandBuilder,
+) -> Result<Option<Box<dyn HostRuntimeControl>>, String> {
+    if let Some(start) =
+        integration_for_dispatch(tool).and_then(|integration| integration.start_host_runtime)
+    {
+        Ok(Some(start(launch, cmd)?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn startup_command(

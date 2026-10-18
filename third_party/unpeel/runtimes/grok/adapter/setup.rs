@@ -90,16 +90,16 @@ pub(crate) fn ensure_grok_hooks(script_path: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn grok_hooks_json(script_path: &Path) -> Result<String, String> {
-    let command = script_path.to_string_lossy();
-    // Grok-native event names (10-hooks.md): SessionStart means the interactive
+    let command = crate::integrations::shared::shell_quote(&script_path.to_string_lossy());
+    // Grok-native event names: SessionStart means the interactive
     // CLI opened, not that the agent is working, so it only latches provider
     // metadata. UserPromptSubmit drives busy; turn/session end events drive
-    // idle. Attention is wired from
-    // approval_required notifications and ask_user_question PreToolUse only —
-    // not generic Notification/Stop pairs (those stuck sessions yellow) and
-    // not Cursor-compat beforeShellExecution PermissionRequest (auto-approved
-    // noise under --always-approve).
+    // idle. Attention is wired from approval_required / permission_prompt
+    // notifications and ask_user_question PreToolUse. Resolution is wired
+    // from matching PostToolUse/PostToolUseFailure so an answered question resumes
+    // working without staying in attention until turn completion.
     let attention_command = format!("{command} Attention");
+    let resume_command = format!("{command} Start");
     let hooks_json = json!({
         "hooks": {
             "SessionStart": [
@@ -119,7 +119,7 @@ pub(crate) fn grok_hooks_json(script_path: &Path) -> Result<String, String> {
             ],
             "Notification": [
                 {
-                    "matcher": "approval_required",
+                    "matcher": "approval_required|permission_prompt",
                     "hooks": [
                         { "type": "command", "command": attention_command.clone() }
                     ]
@@ -130,6 +130,22 @@ pub(crate) fn grok_hooks_json(script_path: &Path) -> Result<String, String> {
                     "matcher": "ask_user_question|AskUserQuestion",
                     "hooks": [
                         { "type": "command", "command": attention_command }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "ask_user_question|AskUserQuestion",
+                    "hooks": [
+                        { "type": "command", "command": resume_command.clone() }
+                    ]
+                }
+            ],
+            "PostToolUseFailure": [
+                {
+                    "matcher": "ask_user_question|AskUserQuestion",
+                    "hooks": [
+                        { "type": "command", "command": resume_command }
                     ]
                 }
             ]

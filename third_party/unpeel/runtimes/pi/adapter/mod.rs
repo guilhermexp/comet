@@ -1,5 +1,7 @@
-use super::{Integration, RuntimeLaunchOptions, shared};
+use super::{shared, Integration, RuntimeLaunchOptions};
 
+const RUNTIME_SLUG: &str = "pi";
+const EXTENSION_FILE_NAME: &str = "pi-lifecycle-extension.js";
 const FILTER_NESTED_OMP_SUBAGENTS: bool = false;
 
 mod context {
@@ -53,8 +55,16 @@ mod tests {
         for command in ["pi", "pi --model x"] {
             let prepared = startup_command(command);
             assert_eq!(prepared.matches("--extension").count(), 1, "{prepared}");
-            assert!(prepared.contains("pi-family-lifecycle-extension.js"));
+            assert!(prepared.contains("pi-lifecycle-extension.js"));
             assert_eq!(startup_command(&prepared), prepared);
         }
+        let legacy = format!(
+            "pi --extension {}",
+            crate::app_paths::unpeel_home()
+                .join("hooks/pi-family-lifecycle-extension.js")
+                .display()
+        );
+        let updated = startup_command(&legacy);
+        assert!(updated.contains("pi-lifecycle-extension.js"), "{updated}");
     }
 }

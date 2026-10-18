@@ -17,8 +17,9 @@ internal host modes (`__session_host__` et al.).
 |---|---|
 | `lib.rs` | All typed `Workers*` models, including optional device-local model/token telemetry on `WorkersSession`, `LocalWorkersClient`, `WorkersRuntime`, `runtime_catalog_snapshot` (o catálogo pinado, público para a UI provar seus espelhos de ícone/tint contra a fonte em vez de copiá-la à mão), session-host mode detection/dispatch (`is_session_host_mode`, `session_host_launch_args`, `session_host_launcher_path`, `run_session_host_mode_if_requested`) |
 | `controller_mcp.rs` | Comet-owned MCP surface for the primary Orchestrator (`CONTROLLER_MCP_ARG`) — intentionally separate from Unpeel's worker-to-worker MCP host |
-| `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine directly from `third_party/unpeel/crates/unpeel-tui/src/activity.rs` so Start/Stop/PermissionRequest, durable seeds, runtime generations and output fallbacks cannot drift from the pinned TUI frontend; persists provider Session metadata and refreshes provider telemetry fail-soft without replacing the URL Worker identity; rejects nested OMP provider hooks before queue, activity, binding or telemetry mutation, and serves a read-only `?validate=1` notifier preflight; persistence failure invalidates prior telemetry instead of refreshing stale identity; startup migrates the short-lived unbound telemetry marker in the background by recomputing current provider evidence |
-| `session_event_journal.rs` | Session output/event journaling; rejects nested OMP hooks before journal/task-episode mutation and serves the read-only `?validate=1` notifier preflight |
+| `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine from `third_party/unpeel/crates/unpeel-tui/src/activity.rs`; applies shared hook admission before live activity/binding/telemetry mutation or durable recovery; serves read-only `?validate=1`; persistence failure invalidates stale telemetry, and startup recomputes legacy unbound telemetry from current provider evidence |
+| `hook_admission.rs` | Shared source-runtime, nested-conversation and generation admission for live hooks, preflight and durable recovery; explicit cross-runtime identity cannot be overridden by `agent_kind: main`; unidentified legacy primary hooks retain their existing contract |
+| `session_event_journal.rs` | Session output/event journaling with shared admission before HTTP or snapshot recovery; acknowledgement preserves a blocked interaction's matching turn start so its notification identity survives compaction |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `background_tasks.rs` | Background tasks (shells `run_in_background`, async agents) the Worker's current runtime launched and has not seen finish, read from the provider JSONL; withholds completion evidence |
 | `workspace_trust.rs` | Workspace trust decisions |
@@ -53,7 +54,7 @@ apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
 
-- **Servidores MCP extras dos Workers** (`register_worker_mcp_servers`, chamado no `main` antes de qualquer host mode): registra `comet-computer-use` (`zeron __computer_use_mcp__ --worker`) em `unpeel_core::extra_mcp`. Os adapters com seam MCP escrevem o servidor ao lado de `unpeel` — claude-code (`claude-unpeel-mcp.json`), cursor-agent (`~/.cursor/mcp.json`), cline (settings por sessão), kimi (`kimi-unpeel-mcp.json` e, no Kimi Code, entrada persistente em `~/.kimi-code/mcp.json` que não sobrescreve entrada do usuário com o mesmo nome) — e o pi family (omp, pi, prime-agent) carrega uma extensão-ponte gerada por servidor (`<unpeel_home>/hooks/mcp-bridge-<nome>.js`, fonte `zeron_harness::pi::MCP_BRIDGE_SOURCE`). Codex não recebe: segue o Computer Use nativo. O `--worker` faz o escopo "Comet only" de Settings recusar Workers.
+- **Servidores MCP extras dos Workers** (`register_worker_mcp_servers`, chamado no `main` antes de qualquer host mode): registra `comet-computer-use` (`zeron __computer_use_mcp__ --worker`) em `unpeel_core::extra_mcp`. Os adapters com seam MCP escrevem o servidor ao lado de `unpeel` — claude-code (`claude-unpeel-mcp.json`), cursor-agent (`~/.cursor/mcp.json`), cline (settings por sessão), kimi (`kimi-unpeel-mcp.json` e, no Kimi Code, entrada persistente em `~/.kimi-code/mcp.json` que não sobrescreve entrada do usuário com o mesmo nome) — e omp e pi carregam uma extensão-ponte gerada por servidor (`<unpeel_home>/hooks/mcp-bridge-<nome>.js`, fonte `zeron_harness::pi::MCP_BRIDGE_SOURCE`). Codex não recebe: segue o Computer Use nativo. Prime Agent também não (decisão do dono, 2026-10-18): o binário Rust 0.10 rejeita `--extension`, e o launcher remove a ponte gerenciada `…/hooks/mcp-bridge-comet-computer-use.js` de comandos Prime persistidos. O `--worker` faz o escopo "Comet only" de Settings recusar Workers.
 
 - **Um projeto é um Space; Workers só guardam checkouts.** O registro único é
   o de Spaces da engine (o mesmo que o chat MCP `list_projects` devolve).
@@ -428,9 +429,10 @@ apps/zeron (host-mode dispatch at startup).
   crescimento de sinal (cursor/spinner/repaint) e termina em início de
   turno, marker `controller-input-activity.json`, fim de turno, ou o teto
   `HOOK_IDLE_TIMEOUT` — crescimento de tela não rearma esse prazo. Evento
-  latch-only não carimba `last_hook_at`. A extensão da família pi emite
-  `PermissionRequest` em `ui_prompt_start` e `UserPromptSubmit` em
-  `ui_prompt_end` (nunca `Stop` no fim do prompt).
+  latch-only não carimba `last_hook_at`. No OMP, `tool_call` de `ask` emite
+  `PermissionRequest`, e `tool_result` retoma com `UserPromptSubmit`; aprovação
+  usa `tool_approval_requested`/`tool_approval_resolved`. Não presumir esses
+  eventos nem `ui_prompt_*` em outros CLIs da família.
   `derive_activity` projeta isso como `blocked` sem `menu_prompt_active`.
   O footer de revisão de hooks do Codex (`enter review`/`trust all` com
   `esc close`, e a linha inteira `t trust · esc back` no detalhe) é menu em
@@ -449,10 +451,13 @@ apps/zeron (host-mode dispatch at startup).
   trabalho rearma. `wait_for_status` de `completed`/`exited`
   solta no mesmo tick com `needs_input` quando a atividade é `blocked`.
   `parent_notifications` emite `WaitingForInput` uma vez por episódio de
-  bloqueio, chaveado pela sequência do último `Start`/`UserPromptSubmit`,
-  não por cada `PermissionRequest`; `unread` no snapshot é overlay das
-  notificações pendentes, **substitui** o arquivo nativo `activity-state.json`
-  que o Comet nunca escreve. A montagem do prompt usa `worker_output_text` (item acima);
+  bloqueio, chaveado pela sequência do último `Start`/`UserPromptSubmit`.
+  ACK preserva esse início e o último pedido no journal; descartar o início
+  mudava a identidade e notificava de novo. Resposta/início ou fim de turno
+  retiram atenção antiga; início também invalida conclusão de um `Stop`
+  anterior, mesmo com saída silenciosa. `unread` é overlay das notificações
+  pendentes, substituindo o `activity-state.json` nativo que o Comet não escreve.
+  A montagem do prompt usa `worker_output_text` (item acima);
   `safe_output_block`
   descarta o `\r` final antes de escolher o segmento, senão uma linha
   terminada em retorno de carro virava `none`. `omp` declara a capability
@@ -578,24 +583,28 @@ apps/zeron (host-mode dispatch at startup).
   a trace breadcrumb instead of failing the turn when no interpreter exists.
   Codex hooks deliver their payload on **stdin** (`argc=0`, measured), so any
   new hook asset that reads `$1` must keep the `cat` fallback.
-- **Os três CLIs da família pi são hook-owned, `pi` inclusive.** `pi`, `omp` e
-  `prime-agent` aceitam `-e/--extension` e rodam a mesma API de extensão
-  (`agent_start`/`agent_end`), mas OMP usa asset próprio para isolar seus
-  subagentes. A extensão OMP inclui `unpeel_agent_kind`: `sub` é descartado,
-  `main` é evidência autoritativa e payloads de extensões antigas usam apenas a
-  relação canônica entre transcript filho e artefato primário OMP.
-  `activity_bridge` e `session_event_journal` aplicam a mesma defesa antes de
-  qualquer mutação. `POST /hook/<id>?validate=1` verifica aceitação sem gravar
-  journal, avançar atividade ou persistir binding. Notificadores síncronos
-  consultam todos os listeners conhecidos antes de postar; somente uma resposta
-  `202` com `ignored: true` veta entrega e marker. Hosts antigos que devolvem
-  `404` para validação continuam elegíveis para eventos primários. O caminho
-  assíncrono mantém o marker antes do POST em background. Pi e Prime mantêm o
-  asset compartilhado. Os três declaram `lifecycle_hooks` + `notify_when_done`;
-  o append idempotente do flag mora em `setup::with_lifecycle_extension`, e o
-  gate de alias fica no adapter de cada runtime. Runtime sem hooks no catálogo
-  hoje é o `agy` — é ele que os testes usam para exercitar o ramo hookless de
-  `derive_activity`.
+- **Lifecycle é provider-owned; transporte e admissão são compartilhados.**
+  OMP e Pi recebem `omp-lifecycle-extension.js` e `pi-lifecycle-extension.js`,
+  cada qual com `unpeel_runtime_id` próprio; o argumento compartilhado antigo
+  é migrado sem alias. OMP observa `ask`, aprovação e `agent_end` sem continuação;
+  Pi observa seus diálogos UI e `agent_settled`. `sub` OMP não publica; `main`
+  só prevalece sobre o fallback de transcript depois de validar a origem.
+  A mesma admissão controla HTTP, preflight e os bytes consumidos no replay.
+  `POST /hook/<id>?validate=1` não altera estado; `202 ignored` veta POST e seed
+  nos dois modos de transporte. Listener ausente permite seed privado/atômico
+  com identidade, geração e episódio, sem prompt/argumentos. Metadata-only
+  `HookSeen` não sobrescreve evidência de lifecycle. `agy` continua hookless.
+- **Prime Agent Rust 0.10 não carrega extensões JS.** O adapter remove apenas
+  argumentos dos nossos assets legados e acompanha o protocolo nativo 7 num
+  daemon privado por Worker. Só o root residente, sem hierarquia de filho,
+  pode vincular o UUID real do provider. Busy/start abre atividade; `agent_end`
+  pede roster atualizado e só idle do root confirma conclusão. EOF, inactive
+  e lacuna de transporte não são `Stop`; a API não oferece replay de eventos.
+  O Host encerra somente esse daemon ao sair o scope ou no teardown, fora do
+  mutex do PTY; geração antiga não pode encerrar a retomada. `--daemon-socket`
+  externo é recusado. Retomada usa ID/path explícito e mantém `pi-sessions`;
+  `--continue` não resolvido é erro, nunca um picker global silencioso.
+  Prime não anuncia atenção completa nem reutiliza a telemetria OMP.
 - **Reinstalação limpa de CLI é o caso normal, não a exceção.** Apagar
   `~/.unpeel` (ou a poda do root legado) some com o diretório onde a extensão
   de lifecycle é escrita, e `write_file_atomic` falhava com `No such file or
@@ -726,19 +735,20 @@ state. Do not calculate fingerprints from outside the diagnostic response.
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/lib.rs` (criação/preparo Chat e Workers), `src/checkout_lifecycle.rs`, `src/checkout_activity.rs`, `src/worktree_ownership.rs`, `src/copy_ignored.rs`, `src/branch_cleanup.rs`, `src/worktrunk_{hooks,lifecycle,approvals}.rs`, `src/worktree_config.rs` (setup e retries) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `src/hook_migration.rs`, `src/activity_bridge.rs`, `src/resources.rs`, `src/session_event_journal.rs`, `src/project_ledger.rs`, `src/project_git.rs` | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/hook_migration.rs`, `src/hook_admission.rs`, `src/activity_bridge.rs`, `src/resources.rs`, `src/session_event_journal.rs`, `src/project_ledger.rs`, `src/project_git.rs` | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `src/project_identity.rs` (link `space_id`, herança por repositório, round-trip com chaves desconhecidas) | unit | `cargo test -p zeron-workers-unpeel --lib project_identity` |
 | `tests/controller_mcp.rs` — Comet-owned MCP surface, including `launch_worker.new_worktree` validation, recoverable launch failures, the project registry (add/list/launch through a fake engine over WebSocket with `WatchChats`, `tests/support`) and each project's activity in `list_projects` (tickets, Worker sessions, chats, unreadable workspace, remote project, ids equal to the Settings readers) | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `src/project_tickets.rs` (frontmatter, carga por pasta, erro de workspace ilegível, links OpenSpec, casamento por checkout e por nome) | unit | `cargo test -p zeron-workers-unpeel --lib project_tickets` |
 | `tests/space_migration.rs` — migração única: principal não registrado, Space existente, segunda rodada no-op, registro sem evidência, sessões preservadas | integration | `cargo test -p zeron-workers-unpeel --test space_migration` |
 | `tests/worker_initial_briefing.rs` (13) — OMP/Claude/Pi/Codex native delivery, literal input, spawn and ACK failures, no replay, existing interactive guards, managed Codex wrapper privacy and upstream launcher composition | integration | `cargo test -p zeron-workers-unpeel --test worker_initial_briefing` |
 | `tests/checkout_identity_recovery.rs` — stable identity, explicit recovery, stale CAS, blocker classification, and isolated controller behavior | integration | `cargo test -p zeron-workers-unpeel --test checkout_identity_recovery` |
-| `tests/parent_notifications.rs` (38) | integration | `--test parent_notifications` |
+| `tests/parent_notifications.rs` — atenção repetida, resposta, ACK com compactação real e idempotência; engine entrega ao pai sem turno ativo | integration | `--test parent_notifications`; `cargo test -p zeron-engine --test message_queue worker_notice_without_live_mailbox_starts_a_durable_turn` |
 | `src/background_tasks.rs`, `controller_mcp::transcript_page_tests`, `activity_bridge` Escape settle | unit | `cargo test -p zeron-workers-unpeel --lib -- background_tasks transcript_page escape_after` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (12) — settings snapshot/persistence, inicialização de presets no primeiro uso, preservação de exclusões/dados inválidos e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (ownership, external/legacy checkouts, dirty removal and hook bypass), `tests/local_actions.rs`, `tests/session_actions.rs`, `tests/local_bootstrap.rs`, `tests/dev_demo_fixture.rs` — client actions over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
+| Ingress/polling do app e Host/journal reais com Prime Rust 0.10: binding do UUID, dois scopes no mesmo PTY, retomada exata e cleanup do daemon privado | integration | Smoke manual isolado com `LocalWorkersClient::bootstrap()` ativo e `zeron __session_host__ <launch.json>`; primeiro exercitar input real no Host (PTY intocado reinicia fresh), depois input pela API nativa de protocolo 7 e resume/stop pelas APIs reais do Host. Conferir o binding em `provider-session.json`, não apenas no manifest de lançamento. Usar HOME/provider/XDG privados, hook root distinto do estado, histórico gerenciado e externo e modelo só em loopback; registrar eventos por geração, sem reiniciar o app/Workers de produção. Isso não substitui teste de teclado/render da TUI nativa |
 
 ### Native initial briefing scenarios
 

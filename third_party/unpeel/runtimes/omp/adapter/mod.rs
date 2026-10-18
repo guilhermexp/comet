@@ -1,4 +1,6 @@
 pub(crate) mod telemetry;
+const RUNTIME_SLUG: &str = "omp";
+const EXTENSION_FILE_NAME: &str = "omp-lifecycle-extension.js";
 const FILTER_NESTED_OMP_SUBAGENTS: bool = true;
 const SESSION_TELEMETRY_READER: Option<crate::session_telemetry::ReadSessionTelemetry> =
     Some(telemetry::read);

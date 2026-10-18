@@ -2,25 +2,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Assets the pinned upstream still resolves under the legacy hook root.
+/// Launch extensions still resolved under `<unpeel_home>/hooks`.
 ///
-/// `third_party/unpeel/runtimes/_shared/pi-family/adapter/setup.rs` both writes
-/// and reads the pi-family lifecycle extension at `<unpeel_home>/hooks`. OMP
-/// has a separate extension asset so its child-artifact guard cannot change
-/// Pi or Prime behavior through a shared-file overwrite. These assets coexist
-/// with the Comet-managed hook scripts under `app_hooks_root()`, while
-/// every Comet-managed hook script lives under `app_hooks_root()`. Deleting the
-/// legacy root wholesale therefore strips a live launch dependency: pi-family
-/// runtimes (`pi`, `omp`, `prime-agent`) are started with `--extension <that
-/// path>`, and a missing
-/// file makes the runtime load no extension at all, so the session never emits
-/// Start/Stop/PermissionRequest and its activity stays pinned at `idle` while
-/// the PTY streams. Vendored code is read-only here, so the migration keeps
-/// what upstream still owns instead of patching the path.
-const UPSTREAM_OWNED_LEGACY_ASSETS: &[&str] = &[
-    "pi-family-lifecycle-extension.js",
-    "omp-lifecycle-extension.js",
-];
+/// Provider shell transports live under `app_hooks_root()`, but each pi-family
+/// adapter prepares `--extension` with its own file under this root. Pruning one
+/// of these assets silently disables lifecycle on the next launch. Retain only
+/// current launch dependencies; persisted shared-extension arguments migrate to
+/// the runtime-specific path before launch.
+const UPSTREAM_OWNED_LEGACY_ASSETS: &[&str] =
+    &["pi-lifecycle-extension.js", "omp-lifecycle-extension.js"];
 
 pub(crate) fn ensure_managed_hook_migration() -> Result<(), String> {
     static INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -111,8 +101,8 @@ fn install_runtime_hooks_with(
 /// The pinned upstream resolves the pi-family lifecycle extension under the
 /// legacy hook root at spawn time (`--extension <unpeel_home>/hooks/...`): a
 /// missing file launches the runtime with no extension at all, so the session
-/// never emits Start/Stop and stays visually idle. OMP and Pi/Prime use
-/// separate assets to keep the OMP child-session guard runtime-specific.
+/// never emits Start/Stop and stays visually idle. Each runtime has its own
+/// asset so one provider's API and identity cannot overwrite another's.
 /// Installation is otherwise lazy and per-process, which lets the first launch
 /// of a fresh process race the install. Cheap when healthy: one metadata probe
 /// per asset.

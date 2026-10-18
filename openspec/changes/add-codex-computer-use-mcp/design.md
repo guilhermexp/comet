@@ -123,7 +123,8 @@ nesse mesmo processo.
   regras atuais de "comando do usuário com config MCP próprio lança intocado"
   valem igual; o kimi não sobrescreve entrada do usuário com outro comando.
 - codex: nada.
-- omp, pi e prime-agent (pi-family): sem cliente MCP. O setup gera
+- omp e pi (pi-family): sem cliente MCP. Prime Agent fica de fora (ver
+  proposal); o Rust 0.10 nem aceita `--extension`. O setup gera
   `<unpeel_home>/hooks/mcp-bridge-<nome>.js` a partir de
   `crates/harness/src/pi/mcp.mjs` com a config embutida como literal, e o
   comando de startup ganha `--extension <arquivo>` por servidor. Se a API do

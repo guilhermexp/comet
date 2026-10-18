@@ -4,9 +4,9 @@ use crate::resume::{
 };
 use std::path::{Component, Path};
 
-// The pi family CLIs (`omp`, `prime-agent`) accept `-c/--continue`,
-// `-r/--resume <id|path>`, `--session-dir` and `--no-session`. Unlike `pi`
-// they have no `--session` and no `--fork`.
+// OMP accepts `-c/--continue`, `-r/--resume <id|path>`, `--session-dir` and
+// `--no-session`, but no `--session` or `--fork`. Native Prime reuses the
+// storage/preparation callbacks and supplies its own explicit-resume policy.
 const RESUME_FLAGS: &[(&str, bool)] = &[
     ("-c", false),
     ("--continue", false),
@@ -107,7 +107,7 @@ fn embedded_conversation_id(command: &str) -> Option<String> {
     id_in_command(&tokenize(command), ID_FLAGS)
 }
 
-pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh)
+pub(crate) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh)
     .with_new_launch_preparation(prepare_new_launch)
     .with_managed_session_dir(managed_session_dir)
     .with_embedded_conversation_id(embedded_conversation_id);
@@ -150,10 +150,6 @@ mod tests {
         assert_eq!(
             resumed("omp -r old -c --model x", Some("new")),
             "omp --model x --resume 'new'"
-        );
-        assert_eq!(
-            resumed("prime-agent --extension /tmp/e.js", Some("new")),
-            "prime-agent --extension /tmp/e.js --resume 'new'"
         );
     }
 

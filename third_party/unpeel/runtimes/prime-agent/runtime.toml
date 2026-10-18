@@ -26,7 +26,7 @@ source = "hooks"
 authority = "partial"
 fallback = "none"
 completion_reliable = true
-attention_reliable = true
+attention_reliable = false
 
 [[suggested_presets]]
 id = "prime-agent"

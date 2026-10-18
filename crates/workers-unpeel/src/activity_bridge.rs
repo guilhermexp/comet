@@ -138,6 +138,7 @@ impl ActivityBridge {
                             .unwrap_or(0)
                     }),
                     session_dir: &session_dir,
+                    manifest: Some(&manifest),
                 },
                 now,
             );
@@ -310,6 +311,7 @@ struct ActivityInput<'a> {
     runtime_launched_at: Option<u64>,
     activity_signal: u64,
     session_dir: &'a Path,
+    manifest: Option<&'a unpeel_core::session_host::HostedSessionManifest>,
 }
 
 fn derive_activity(
@@ -348,12 +350,21 @@ fn derive_activity(
         input.runtime_launch_generation,
         input.runtime_launched_at,
     );
+    let loaded_manifest;
+    let manifest = match input.manifest {
+        Some(manifest) => Some(manifest),
+        None => {
+            loaded_manifest = unpeel_core::session_host::load_manifest(input.session_id);
+            loaded_manifest.as_ref()
+        }
+    };
     engine.seed_from_disk(
         input.session_id,
         input.session_dir,
         anchor_start_to_output,
         input.runtime_launched_at,
         input.runtime_launch_generation,
+        |value| crate::hook_admission::check_hook_admission(manifest, value).is_accepted(),
     );
     if let Some(at) = read_controller_input_at(input.session_dir) {
         engine.note_controller_input(input.session_id, at);
@@ -547,30 +558,6 @@ fn hook_event_from_json(
     }
 }
 
-pub(crate) fn is_nested_provider_hook(
-    manifest: &unpeel_core::session_host::HostedSessionManifest,
-    payload: &serde_json::Value,
-) -> bool {
-    match first_json_string(payload, &["unpeel_agent_kind", "agent_kind", "agentKind"]).as_deref() {
-        Some("main") => return false,
-        Some("sub") => return true,
-        _ => {}
-    }
-    first_json_string(
-        payload,
-        &[
-            "transcript_path",
-            "transcriptPath",
-            "provider_transcript_path",
-            "providerTranscriptPath",
-        ],
-    )
-    .as_deref()
-    .is_some_and(|path| {
-        unpeel_core::integrations::is_nested_provider_transcript(manifest, Path::new(path))
-    })
-}
-
 fn persist_provider_binding(event: &HookEvent) -> Result<bool, String> {
     unpeel_core::session_ops::set_provider_session(
         &event.session_id,
@@ -690,21 +677,18 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
         );
         return;
     };
-    let Some(manifest) = unpeel_core::session_host::load_manifest(session_id) else {
+    let manifest = unpeel_core::session_host::load_manifest(session_id);
+    let admission = crate::hook_admission::check_hook_admission(manifest.as_ref(), &json);
+    if admission.is_ignored() {
+        respond(&mut stream, "202 Accepted", r#"{"ok":true,"ignored":true}"#);
+        return;
+    }
+    if manifest.is_none() {
         respond(
             &mut stream,
             "404 Not Found",
             r#"{"error":"unknown session"}"#,
         );
-        return;
-    };
-    if is_nested_provider_hook(&manifest, &json) {
-        // Old pi-family extensions have no agent-kind marker. Recognize their
-        // persisted OMP child transcript from the adapter's trusted artifacts
-        // layout before queuing anything that can reach activity/binding stores.
-        // The same decision is available on the preflight route, which does
-        // not mutate the Worker before all registered listeners are checked.
-        respond(&mut stream, "202 Accepted", r#"{"ok":true,"ignored":true}"#);
         return;
     }
     if validate_only {
@@ -715,11 +699,6 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_e
         .get("unpeel_runtime_generation")
         .or_else(|| json.get("unpeelRuntimeGeneration"))
         .and_then(serde_json::Value::as_u64);
-    if runtime_generation.is_some_and(|generation| generation < manifest.runtime_launch_generation)
-    {
-        respond(&mut stream, "200 OK", r#"{"ok":true}"#);
-        return;
-    }
     let event = hook_event_from_json(
         session_id,
         event_name,
@@ -876,6 +855,7 @@ mod tests {
             runtime_launched_at: None,
             activity_signal: signal,
             session_dir: dir,
+            manifest: None,
         }
     }
 
@@ -1264,6 +1244,13 @@ mod tests {
                     let _ = write!(
                         stream,
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
+                if path.contains("validate=1") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{{\"ok\":true,\"validated\":true}}"
                     );
                     continue;
                 }
@@ -2399,5 +2386,399 @@ mod tests {
     fn activity_timestamp_tracks_output_and_hook_progress() {
         assert_eq!(latest_activity_timestamp(100, Some(300), Some(200)), 300);
         assert_eq!(latest_activity_timestamp(400, Some(300), Some(200)), 400);
+    }
+
+    #[test]
+    fn foreign_claude_permission_and_stop_carrying_omp_worker_env_rejected_and_state_unchanged() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let state_home = tempfile::tempdir().expect("temporary Unpeel home");
+        let user_home = tempfile::tempdir().expect("temporary user home");
+        let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
+        let session_dir = state_home.path().join("app-sessions/worker-omp-env");
+        std::fs::create_dir_all(&session_dir).expect("Worker session directory");
+
+        let omp_root = user_home.path().join("explicit-omp-sessions");
+        let primary = omp_root.join("primary.jsonl");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        std::fs::write(
+            &primary,
+            "{\"type\":\"session\",\"id\":\"omp-primary\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"provider\":\"provider\",\"model\":\"opus\",\"usage\":{\"totalTokens\":50000000}}}\n",
+        )
+        .unwrap();
+
+        let mut manifest = omp_manifest("worker-omp-env");
+        manifest.session.command = format!("omp --session-dir '{}'", omp_root.display());
+        manifest.cwd = user_home.path().to_string_lossy().into_owned();
+        unpeel_core::session_host::save_manifest(&manifest).expect("save Worker manifest");
+
+        unpeel_core::session_ops::set_provider_session(
+            "worker-omp-env",
+            Some("omp-primary"),
+            Some(&primary.to_string_lossy()),
+        )
+        .expect("seed primary provider binding");
+        unpeel_core::session_telemetry::refresh(&manifest)
+            .expect("seed primary provider telemetry");
+        assert_eq!(
+            unpeel_core::session_telemetry::load("worker-omp-env")
+                .expect("primary telemetry")
+                .total_tokens,
+            50_000_000
+        );
+
+        let change_epoch = Arc::new(AtomicU64::new(0));
+        let ingress = start_hook_ingress(Arc::clone(&change_epoch)).expect("start ingress");
+
+        let foreign_claude_permission = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "AskUserQuestion",
+            "unpeel_runtime_id": "claude",
+            "unpeel_agent_kind": "main",
+            "unpeel_runtime_generation": 1,
+            "session_id": "claude-inherited-session",
+            "provider_transcript_path": "/tmp/claude-transcript.jsonl"
+        });
+
+        let preflight =
+            post_hook_validation(ingress.port, "worker-omp-env", &foreign_claude_permission);
+        assert!(preflight.contains("202 Accepted"), "{preflight}");
+        assert_eq!(change_epoch.load(Ordering::Acquire), 0);
+        assert!(ingress.events.lock().unwrap().try_recv().is_err());
+
+        let post_response =
+            post_hook_payload(ingress.port, "worker-omp-env", &foreign_claude_permission);
+        assert!(post_response.contains("202 Accepted"), "{post_response}");
+        assert_eq!(change_epoch.load(Ordering::Acquire), 0);
+        assert!(ingress.events.lock().unwrap().try_recv().is_err());
+
+        // Binding and telemetry remain unchanged
+        assert_eq!(
+            unpeel_core::session_ops::provider_session_marker("worker-omp-env"),
+            (
+                Some("omp-primary".into()),
+                Some(primary.to_string_lossy().into_owned())
+            )
+        );
+        assert_eq!(
+            unpeel_core::session_telemetry::load("worker-omp-env")
+                .expect("telemetry")
+                .total_tokens,
+            50_000_000
+        );
+
+        let foreign_claude_stop = serde_json::json!({
+            "hook_event_name": "Stop",
+            "unpeel_runtime_id": "claude",
+            "unpeel_agent_kind": "main",
+            "unpeel_runtime_generation": 1,
+            "session_id": "claude-inherited-session",
+        });
+        let stop_preflight =
+            post_hook_validation(ingress.port, "worker-omp-env", &foreign_claude_stop);
+        assert!(stop_preflight.contains("202 Accepted"), "{stop_preflight}");
+        let stop_response = post_hook_payload(ingress.port, "worker-omp-env", &foreign_claude_stop);
+        assert!(stop_response.contains("202 Accepted"), "{stop_response}");
+        assert_eq!(change_epoch.load(Ordering::Acquire), 0);
+
+        // State check: activity engine remains in working/busy state if active
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("worker-omp-env", "Start", None, t0);
+        assert_eq!(
+            engine.hook_owned_state("worker-omp-env"),
+            Some(HookState::Busy)
+        );
+        assert!(!engine.hook_confirmed_idle("worker-omp-env"));
+    }
+
+    #[test]
+    fn durable_seed_replay_rejects_foreign_runtime_and_nested_subagent_retaining_valid_primary_recovery()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().to_path_buf();
+        let seed_path = session_dir.join("last-hook-event.json");
+        let mut manifest = omp_manifest("worker-replay-test");
+        manifest.session.command = "omp --session-dir /tmp/sessions".into();
+
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.observe_runtime_launch("worker-replay-test", 1, Some(1000));
+        engine.apply_hook_event("worker-replay-test", "Start", None, t0);
+        assert_eq!(
+            engine.hook_owned_state("worker-replay-test"),
+            Some(HookState::Busy)
+        );
+
+        // 1. Foreign Claude Stop carrying OMP worker env + main + gen 1 is rejected in replay
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "unpeel_runtime_id": "claude",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let input_activity = ActivityInput {
+            session_id: "worker-replay-test",
+            command: "omp --session-dir /tmp/sessions",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: &session_dir,
+            manifest: Some(&manifest),
+        };
+        let derived = derive_activity(&mut engine, input_activity, t0 + Duration::from_secs(2));
+        assert_eq!(
+            derived,
+            Some("working"),
+            "foreign Claude Stop must not change Worker to idle"
+        );
+        assert!(!engine.hook_confirmed_idle("worker-replay-test"));
+
+        // 2. Nested OMP subagent Stop is rejected in replay
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "unpeel_runtime_id": "omp",
+                "unpeel_agent_kind": "sub",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let input_activity = ActivityInput {
+            session_id: "worker-replay-test",
+            command: "omp --session-dir /tmp/sessions",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: &session_dir,
+            manifest: Some(&manifest),
+        };
+        let derived = derive_activity(&mut engine, input_activity, t0 + Duration::from_secs(3));
+        assert_eq!(
+            derived,
+            Some("working"),
+            "nested OMP subagent Stop must not change Worker to idle"
+        );
+
+        // 3. Valid primary OMP Stop is accepted and recovers
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "unpeel_runtime_id": "omp",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let input_activity = ActivityInput {
+            session_id: "worker-replay-test",
+            command: "omp --session-dir /tmp/sessions",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: &session_dir,
+            manifest: Some(&manifest),
+        };
+        let derived = derive_activity(&mut engine, input_activity, t0 + Duration::from_secs(4));
+        assert_eq!(
+            derived,
+            Some("idle"),
+            "valid primary OMP Stop must recover to idle"
+        );
+        assert!(engine.hook_confirmed_idle("worker-replay-test"));
+
+        // 4. Legacy primary without runtime_id recovers as intended
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let input_activity = ActivityInput {
+            session_id: "worker-replay-test",
+            command: "omp --session-dir /tmp/sessions",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: &session_dir,
+            manifest: Some(&manifest),
+        };
+        let derived = derive_activity(&mut engine, input_activity, t0 + Duration::from_secs(5));
+        assert_eq!(
+            derived,
+            Some("blocked"),
+            "legacy primary PermissionRequest must recover to blocked"
+        );
+    }
+
+    #[test]
+    fn missing_or_corrupt_manifest_rejects_stamped_seeds_while_legitimate_recovers_and_legacy_retains_contract()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().to_path_buf();
+        let seed_path = session_dir.join("last-hook-event.json");
+
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.observe_runtime_launch("worker-no-manifest", 1, Some(1000));
+        engine.apply_hook_event("worker-no-manifest", "Start", None, t0);
+        assert_eq!(
+            engine.hook_owned_state("worker-no-manifest"),
+            Some(HookState::Busy)
+        );
+
+        // 1. Missing manifest: stamped foreign runtime seed cannot apply
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "unpeel_runtime_id": "claude",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let input_activity = ActivityInput {
+            session_id: "worker-no-manifest",
+            command: "omp",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: &session_dir,
+            manifest: None,
+        };
+        let derived = derive_activity(&mut engine, input_activity, t0 + Duration::from_secs(2));
+        assert_eq!(
+            derived,
+            Some("working"),
+            "stamped foreign seed without manifest must not apply"
+        );
+        assert!(!engine.hook_confirmed_idle("worker-no-manifest"));
+
+        // 2. Missing manifest: stamped primary runtime seed cannot apply without verifiable manifest
+        std::fs::write(
+            &seed_path,
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "unpeel_runtime_id": "omp",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let input_activity = ActivityInput {
+            session_id: "worker-no-manifest",
+            command: "omp",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: &session_dir,
+            manifest: None,
+        };
+        let derived = derive_activity(&mut engine, input_activity, t0 + Duration::from_secs(3));
+        assert_eq!(
+            derived,
+            Some("working"),
+            "stamped primary seed without manifest must not apply"
+        );
+        assert!(!engine.hook_confirmed_idle("worker-no-manifest"));
+
+        // 3. Legitimate manifest present: stamped primary seed recovers
+        let mut manifest = omp_manifest("worker-no-manifest");
+        manifest.session.command = "omp --session-dir /tmp/sessions".into();
+        let input_activity_with_manifest = ActivityInput {
+            session_id: "worker-no-manifest",
+            command: "omp --session-dir /tmp/sessions",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: &session_dir,
+            manifest: Some(&manifest),
+        };
+        let derived = derive_activity(
+            &mut engine,
+            input_activity_with_manifest,
+            t0 + Duration::from_secs(4),
+        );
+        assert_eq!(
+            derived,
+            Some("idle"),
+            "stamped primary seed with manifest must recover"
+        );
+        assert!(engine.hook_confirmed_idle("worker-no-manifest"));
+
+        // 4. Missing manifest: legacy unmarked primary seed retains intentional compatibility
+        let dir_legacy = tempfile::tempdir().unwrap();
+        let legacy_seed_path = dir_legacy.path().join("last-hook-event.json");
+        std::fs::write(
+            &legacy_seed_path,
+            serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "unpeel_agent_kind": "main",
+                "unpeel_runtime_generation": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut engine_legacy = ActivityEngine::default();
+        engine_legacy.observe_runtime_launch("worker-legacy", 1, Some(1000));
+        let input_legacy = ActivityInput {
+            session_id: "worker-legacy",
+            command: "omp",
+            active_runtime_id: None,
+            menu_prompt_active: false,
+            turn_settled_by_interrupt: false,
+            runtime_launch_generation: 1,
+            runtime_launched_at: Some(1000),
+            activity_signal: 10,
+            session_dir: dir_legacy.path(),
+            manifest: None,
+        };
+        let derived = derive_activity(
+            &mut engine_legacy,
+            input_legacy,
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(
+            derived,
+            Some("blocked"),
+            "unmarked legacy seed without manifest recovers per spec"
+        );
     }
 }

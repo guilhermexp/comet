@@ -34,7 +34,7 @@ source = "hooks"
 authority = "complete"
 fallback = "none"
 completion_reliable = true
-attention_reliable = true
+attention_reliable = false
 distrust_stops_while_output_grows = true
 
 [[usage.stores]]
