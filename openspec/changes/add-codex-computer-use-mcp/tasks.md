@@ -30,8 +30,8 @@ testes de uma rodada numa invocação.
 
 ## 5. Workers
 
-- [ ] 5.1 Provar a ponte MCP de `crates/harness/src/pi/mcp.mjs` dentro do `omp` e do `pi` atuais (registro de tool e resultado com imagem) apontando para `zeron __computer_use_mcp__`; se o omp divergir, criar a variante do asset; verificar com `omp -p` e `pi -p` chamando `computer_use` com `cua.getState()` e mostrando a saída.
-- [ ] 5.2 Registro `unpeel_core::extra_mcp` (D4); adapters pi-family e `pi` carregam a ponte gerada por `--extension` (instalada junto da extensão de lifecycle), apontando para `zeron __computer_use_mcp__ --worker`; verificar com teste de `startup_command` e com `setup_conformance_tests.rs`.
+- [x] 5.1 Provar a ponte MCP de `crates/harness/src/pi/mcp.mjs` dentro do `omp` e do `pi` atuais (registro de tool e resultado com imagem) apontando para `zeron __computer_use_mcp__`; se o omp divergir, criar a variante do asset; verificar com `omp -p` e `pi -p` chamando `computer_use` com `cua.getState()` e mostrando a saída.
+- [x] 5.2 Registro `unpeel_core::extra_mcp` (D4); adapters pi-family e `pi` carregam a ponte gerada por `--extension` (instalada junto da extensão de lifecycle), apontando para `zeron __computer_use_mcp__ --worker`; verificar com teste de `startup_command` e com `setup_conformance_tests.rs`.
 - [x] 5.3 Adapters claude-code, cursor-agent, cline e kimi escrevem `comet-computer-use` (args `["__computer_use_mcp__", "--worker"]`) ao lado de `unpeel`, mantendo "config do usuário lança intocado"; codex sem mudança; verificar com os testes de cada adapter e `setup_conformance_tests.rs`.
 - [x] 5.4 Atualizar `third_party/unpeel-upstream.toml` e `crates/workers-unpeel/AGENTS.md` (seam de MCP por adapter e o segundo servidor); verificar lendo os dois arquivos no mesmo commit das mudanças vendorizadas.
 
