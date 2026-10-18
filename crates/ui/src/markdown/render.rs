@@ -3343,6 +3343,25 @@ mod tests {
         })
     }
 
+    // The fork's inline chips register fragments in one source-selection group.
+    fn registered_group_text(member: &str) -> String {
+        REGISTRY.with(|registry| {
+            let entries = registry.borrow();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.text.as_ref() == member)
+                .unwrap();
+            match &entry.group {
+                Some(group) => entries
+                    .iter()
+                    .filter(|entry| entry.group.as_ref() == Some(group))
+                    .map(|entry| entry.text.as_ref())
+                    .collect(),
+                None => entry.text.to_string(),
+            }
+        })
+    }
+
     fn selection_position(key: &str, ix: usize) -> gpui::Point<gpui::Pixels> {
         let (_, layout, _) = selection_test_snapshot(key);
         layout.position_for_index(ix).expect("text position")
@@ -3438,13 +3457,14 @@ mod tests {
         // the unrenderable one as the inline code it shows.
         let before = selection_key_for_text(r"Before $x = \frac{a}{b}$ after.");
         let display = selection_key_for_text(r"$$\int_0^1 x^2\,dx = \frac{1}{3}$$");
-        selection_key_for_text(r"Tail $\nope$ text.");
+        selection_key_for_text(r"$\nope$");
+        assert_eq!(registered_group_text(r"$\nope$"), r"Tail $\nope$ text.");
         // The fraction opens the paragraph's line; the display formula gets
         // a line box of its own height.
         assert!(selection_test_bounds(&before).size.height > px(MD_LINE_HEIGHT));
         assert!(selection_test_bounds(&display).size.height > px(MD_LINE_HEIGHT));
 
-        let tail = selection_key_for_text(r"Tail $\nope$ text.");
+        let tail = selection_key_for_text("Tail ");
         cx.simulate_event(gpui::MouseDownEvent {
             button: gpui::MouseButton::Left,
             position: selection_position(&before, 0),
@@ -3509,7 +3529,11 @@ mod tests {
         });
         // Inline math is inline code on an ordinary line; display math is
         // the `math` code block, which reads back as its bare source.
-        let before = selection_key_for_text(r"Before $x = \frac{a}{b}$ after.");
+        let before = selection_key_for_text("Before ");
+        assert_eq!(
+            registered_group_text(r"$x = \frac{a}{b}$"),
+            r"Before $x = \frac{a}{b}$ after."
+        );
         assert_eq!(
             selection_test_bounds(&before).size.height,
             px(MD_LINE_HEIGHT)
@@ -5218,7 +5242,9 @@ mod tests {
         assert_eq!(flat.text.as_ref(), r"see $\nope{x}$");
         assert!(flat.math.is_empty());
         assert_eq!(flat.chips, vec![4..flat.text.len()]);
-        assert_eq!(flat.runs[1].color, inline_code_text(&Theme::dark()));
+        // Inline chips keep the fork's normal text color and rounded wash.
+        assert_eq!(flat.runs[1].color, Theme::dark().text);
+        assert!(flat.runs[1].background_color.is_some());
         // Shown text is the source already; nothing to map.
         assert!(flat.original.is_none());
     }
@@ -5342,66 +5368,68 @@ mod tests {
 
     #[test]
     fn math_in_a_link_label_is_never_underlined_or_cut() {
-        let url = "https://example.com/step";
-        let linked = |text: &str, math: bool| InlineRun {
-            text: text.into(),
-            style: InlineStyle {
-                link: Some(url.into()),
-                math,
-                ..Default::default()
-            },
-        };
-        let flat = flatten_runs(
-            &[
-                linked("the ", false),
-                linked("O(n^2)", true),
-                linked(" step", false),
-            ],
-            &Theme::dark(),
-            false,
-        );
-        let [slot] = flat.math.as_slice() else {
-            panic!("one formula slot");
-        };
-        assert_eq!(flat.links, vec![(0..flat.text.len(), url.to_string())]);
-        let underlined = |runs: &[TextRun], range: Range<usize>| {
-            super::super::link_presentation::slice_runs(runs, range)
-                .iter()
-                .all(|run| run.underline.is_some())
-        };
-        assert!(underlined(&flat.runs, 0..slot.range.start));
-        assert!(underlined(&flat.runs, slot.range.end..flat.text.len()));
-        assert!(
-            super::super::link_presentation::slice_runs(&flat.runs, slot.range.clone())
-                .iter()
-                .all(|run| run.underline.is_none()),
-            "the formula paints over its slot without a line through it"
-        );
-
-        // Every width that truncates the label cuts before the slot or after
-        // it, never inside; a formula cut away leaves nothing to paint.
-        for width in 1..flat.text.chars().count() {
-            let shown =
-                super::super::link_presentation::truncate(&flat, width as f32, |text, _| {
-                    text.chars().count() as f32
-                });
-            let Some(ellipsis) = shown.text.find('…') else {
-                // Too short a cut to be worth an ellipsis.
-                assert_eq!(shown.math.len(), 1);
-                continue;
+        for url in ["https://example.com/step", "/tmp/step.md"] {
+            let link_underlined = !is_web_link(url);
+            let linked = |text: &str, math: bool| InlineRun {
+                text: text.into(),
+                style: InlineStyle {
+                    link: Some(url.into()),
+                    math,
+                    ..Default::default()
+                },
             };
-            match shown.math.as_slice() {
-                [] => assert!(ellipsis <= slot.range.start, "{:?}", shown.text),
-                [kept] => {
-                    assert_eq!(kept.range, slot.range);
-                    assert!(ellipsis >= slot.range.end, "{:?}", shown.text);
+            let flat = flatten_runs(
+                &[
+                    linked("the ", false),
+                    linked("O(n^2)", true),
+                    linked(" step", false),
+                ],
+                &Theme::dark(),
+                false,
+            );
+            let [slot] = flat.math.as_slice() else {
+                panic!("one formula slot");
+            };
+            assert_eq!(flat.links, vec![(0..flat.text.len(), url.to_string())]);
+            let underlined = |runs: &[TextRun], range: Range<usize>| {
+                super::super::link_presentation::slice_runs(runs, range)
+                    .iter()
+                    .all(|run| run.underline.is_some() == link_underlined)
+            };
+            assert!(underlined(&flat.runs, 0..slot.range.start));
+            assert!(underlined(&flat.runs, slot.range.end..flat.text.len()));
+            assert!(
+                super::super::link_presentation::slice_runs(&flat.runs, slot.range.clone())
+                    .iter()
+                    .all(|run| run.underline.is_none()),
+                "the formula paints over its slot without a line through it"
+            );
+
+            // Every width that truncates the label cuts before the slot or after
+            // it, never inside; a formula cut away leaves nothing to paint.
+            for width in 1..flat.text.chars().count() {
+                let shown =
+                    super::super::link_presentation::truncate(&flat, width as f32, |text, _| {
+                        text.chars().count() as f32
+                    });
+                let Some(ellipsis) = shown.text.find('…') else {
+                    // Too short a cut to be worth an ellipsis.
+                    assert_eq!(shown.math.len(), 1);
+                    continue;
+                };
+                match shown.math.as_slice() {
+                    [] => assert!(ellipsis <= slot.range.start, "{:?}", shown.text),
+                    [kept] => {
+                        assert_eq!(kept.range, slot.range);
+                        assert!(ellipsis >= slot.range.end, "{:?}", shown.text);
+                    }
+                    _ => panic!("one slot at most"),
                 }
-                _ => panic!("one slot at most"),
+                // The ellipsis keeps the fork's destination-specific link style,
+                // including when it stands for a formula.
+                let at = ellipsis..ellipsis + '…'.len_utf8();
+                assert!(underlined(&shown.runs, at), "{:?}", shown.text);
             }
-            // The ellipsis keeps the link's underline even when it stands
-            // for the formula.
-            let at = ellipsis..ellipsis + '…'.len_utf8();
-            assert!(underlined(&shown.runs, at), "{:?}", shown.text);
         }
     }
 

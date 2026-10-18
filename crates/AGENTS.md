@@ -25,6 +25,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
   interactive delivery. Regression seam:
   `cargo test -p zeron-workers-unpeel --test worker_initial_briefing`.
 
+- Markdown autolinking counts parentheses/brackets once per token and updates counts while trimming, including the fork file-path path. Hostile URL/file punctuation tails must remain linear without dropping file links.
+
 - `visual` owns sandboxed Luau/native element trees and CPU raster/scene validation; `visual-gpu` owns bounded offscreen GPU state shared by desktop/mobile. `zatex` owns pure TeX layout and bundled math font provenance. None depends on UI or engine.
 
 ## Work Guidance

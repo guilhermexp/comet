@@ -626,10 +626,13 @@ fn side_chat_rename_leaves_takeover_to_show_its_editor(cx: &mut TestAppContext) 
             );
             cx.notify();
         });
-        shell.toggle_right_pane(window, cx);
+        // Takeover needs a live mounted surface under the fork's pane contract.
+        shell.add_browser_surface(None, window, cx);
     });
     settled(&shell, cx);
+    assert!(shell.read_with(cx, |shell, cx| shell.right_pane_shown(cx)));
     change(&shell, cx, |s, _, cx| s.toggle_right_pane_expand(cx));
+    assert!(shell.read_with(cx, |shell, _| shell.right_pane_expanded));
     near(settled(&shell, cx).widths[3], 0.0);
 
     change(&shell, cx, |s, _, cx| s.open_rename_chat("side".into(), cx));
@@ -801,7 +804,11 @@ fn worked_project_diff_watch_tracks_effective_details_visibility(cx: &mut TestAp
         cancellations: &mut Vec<u64>,
     ) {
         for _ in 0..20 {
-            shell.update(cx, |_, cx| cx.notify());
+            shell.update(cx, |shell, cx| {
+                *shell.test_time.as_mut().unwrap() +=
+                    Duration::from_millis(100).mul_f32(motion::speed_scale());
+                cx.notify();
+            });
             cx.update(|window, cx| window.draw(cx).clear());
             cx.run_until_parked();
             runtime.block_on(tokio::task::yield_now());

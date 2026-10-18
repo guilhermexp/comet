@@ -1762,21 +1762,9 @@ impl Repos {
     /// worktrees, and still exists. Filesystem resolution happens on a
     /// disposable thread because user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
-        let paths = self.worktree_paths(repo_path).await.ok()?;
-        let candidate = candidate.to_owned();
-        let worker = disposable_worker("checkout-auth", move || {
-            let candidate = std::fs::canonicalize(candidate).ok()?;
-            paths
-                .into_iter()
-                .filter_map(|path| std::fs::canonicalize(path).ok())
-                .any(|path| path == candidate)
-                .then_some(candidate)
-        });
-        tokio::time::timeout(PATH_EXISTS_TIMEOUT, worker)
+        self.resolve_checkout(repo_path, candidate, CheckoutQuery::Workspace)
             .await
-            .ok()
-            .flatten()
-            .flatten()
+            .map(|(path, _)| path)
     }
 
     /// The linked worktrees of `repo_path` as git itself registers them — the
@@ -1810,7 +1798,21 @@ impl Repos {
         candidate: &Path,
         query: CheckoutQuery,
     ) -> Option<(PathBuf, Option<String>)> {
-        let worktrees = self.linked_worktrees(repo_path).await;
+        let worktrees = match query {
+            // Main folders remain authorized even without Git; the worker below
+            // checks their canonical identity. Only extra checkouts need this list.
+            CheckoutQuery::Workspace => self
+                .worktree_paths(repo_path)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| WorktreeEntry {
+                    path: path.to_string_lossy().into_owned(),
+                    branch: None,
+                })
+                .collect(),
+            CheckoutQuery::Registration => self.linked_worktrees(repo_path).await,
+        };
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
         let worker = disposable_worker("checkout-auth", move || {

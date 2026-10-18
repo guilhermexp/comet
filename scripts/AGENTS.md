@@ -67,3 +67,5 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 ## Child DOX Index
 
 Sem filhos.
+
+`ci/test-core.sh` includes `zeron-visual`, `zeron-visual-gpu` and `zatex` unit targets alongside the existing core packages. The UI workflow path selectors include these new shared dependencies for core/native/iOS; a green recipe is not proof until the exact revision runs.

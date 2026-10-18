@@ -7724,10 +7724,11 @@ impl Shell {
         let Some(rename) = self.chat_rename.as_mut() else {
             return;
         };
-        if !std::mem::take(&mut rename.focus_pending) {
+        let focus = rename.input.focus_handle(cx);
+        if !rename.focus_pending || !self.shortcut_focus.contains(&focus, window) {
             return;
         }
-        let focus = rename.input.focus_handle(cx);
+        rename.focus_pending = false;
         window.focus(&focus, cx);
         rename._blur = Some(cx.on_blur(&focus, window, |this, _, cx| {
             this.finish_rename_chat(true, cx);
@@ -15337,7 +15338,6 @@ impl Render for Shell {
                 _ => {}
             }
         }
-        self.focus_rename_chat(window, cx);
 
         self.render_time = Some(self.motion_time());
         if self.all_file_edits_flushed(cx)
@@ -15506,7 +15506,11 @@ impl Render for Shell {
         }
         let shortcut_focus = self.shortcut_focus.clone();
         let (preferred_focus, unfocused) = self.navigation_focus_fallback(cx);
+        let shell = cx.weak_entity();
         window.defer(cx, move |window, cx| {
+            shell
+                .update(cx, |shell, cx| shell.focus_rename_chat(window, cx))
+                .ok();
             restore_mounted_focus(&shortcut_focus, &preferred_focus, &unfocused, window, cx);
         });
 

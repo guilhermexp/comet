@@ -1949,11 +1949,21 @@ fn find_file_path(text: &str) -> Option<(usize, usize)> {
             .map_or(token_slice.len(), |(i, _)| i);
         let mut raw_token = &token_slice[..token_end];
 
+        // Keep counts current, like bare_url_len: hostile punctuation tails
+        // must not rescan the entire path on every trimmed character.
+        let (open_parens, mut close_parens) = (
+            raw_token.matches('(').count(),
+            raw_token.matches(')').count(),
+        );
+        let (open_brackets, mut close_brackets) = (
+            raw_token.matches('[').count(),
+            raw_token.matches(']').count(),
+        );
         while let Some(last) = raw_token.chars().next_back() {
             let trim = match last {
                 '.' | ',' | ';' | '!' | '?' | '*' | '_' | '~' => true,
-                ')' => raw_token.matches('(').count() < raw_token.matches(')').count(),
-                ']' => raw_token.matches('[').count() < raw_token.matches(']').count(),
+                ')' => open_parens < close_parens,
+                ']' => open_brackets < close_brackets,
                 ':' => !raw_token.rsplit_once(':').map_or(false, |(_, s)| {
                     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
                 }),
@@ -1961,6 +1971,11 @@ fn find_file_path(text: &str) -> Option<(usize, usize)> {
             };
             if !trim {
                 break;
+            }
+            match last {
+                ')' => close_parens -= 1,
+                ']' => close_brackets -= 1,
+                _ => {}
             }
             raw_token = &raw_token[..raw_token.len() - last.len_utf8()];
         }
@@ -3810,6 +3825,8 @@ mod math_tests {
             format!("{}$ \\)", "\\( ".repeat(85_000)),
             format!("{}$ \\]", "\\[ ".repeat(85_000)),
             format!("see http://a{}", ")".repeat(64 << 10)),
+            format!("see /tmp/report.txt{}", ")".repeat(64 << 10)),
+            format!("see /tmp/report.txt{}", "]".repeat(64 << 10)),
             "_a ".repeat(40_000) + &"a* ".repeat(40_000),
         ] {
             let started = std::time::Instant::now();

@@ -322,7 +322,9 @@ impl Shell {
             None => info_row(&theme, row_glyph(icons::HOME, &theme), "No project".into())
                 .into_any_element(),
         };
-        if show_context_metadata {
+        // The outgoing card may still paint during its fade. Its hidden
+        // target must not recreate the subscription the shell just dropped.
+        if show_context_metadata && self.session_info_visible(cx) {
             self.ensure_session_diffs(cx);
         } else {
             self.session_diffs = SessionDiffs::default();
