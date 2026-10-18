@@ -1,0 +1,18 @@
+- [x] Verify clean branch, pins, merge base, incoming 13 commits and PR #24; read contracts and adjustments.
+- [x] Format baseline before merge (no delta).
+- [ ] U1 Integrate and prove: Native sandboxed Luau visuals, controls/charts/tables, 2D/3D/shaders/assets with bounded validation, off-main GPU, reuse and teardown; root-only MCP grants. Re-read adjustments before this task.
+- [ ] U2 Integrate and prove: zatex inline/display math, six fonts and persisted settings, bounded parser/layout and streaming fallback; retain file links/Mermaid/selection. Re-read adjustments before this task.
+- [ ] U3 Integrate and prove: Side-chat/subagent lanes, folded finished rows, bounded scroll/counts/rename/harness marks and checkout totals; reconcile Details Workers ownership and existing new/fork buttons without duplicate activity. Re-read adjustments before this task.
+- [ ] U4 Integrate and prove: Convergent section header drag order, iOS cross-section/pin drag, neighbor anchors and advertised capability. Re-read adjustments before this task.
+- [ ] U5 Integrate and prove: Dwell/warm hover card, dismiss on scroll/drag/menu, once-per-frame lifecycle and metadata; retain mentions and fork rows. Re-read adjustments before this task.
+- [ ] U6 Integrate and prove: OpenCode v2 forms normalize to field-keyed input panels and form route; v1 works and engine owns lifecycle. Re-read adjustments before this task.
+- [ ] U7 Integrate and prove: Cursor Plus catalog/defaults on fresh and switched runs, warm catalog; protect dev bundles with fork updater/feed. Re-read adjustments before this task.
+- [ ] U8 Integrate and prove: Recent Files flicker fix with unified search/index ownership. Re-read adjustments before this task.
+- [ ] U9 Integrate and prove: Persist sidebar Archived visibility setting. Re-read adjustments before this task.
+- [ ] U10 Integrate and prove: Bulk archived Chat deletion with explicit confirmation and device/sync routing. Re-read adjustments before this task.
+- [ ] U11 Integrate and prove: Adaptive iOS split/tab shell, fold state, uneven safe areas, transcript/composer alignment; native acceptance pending. Re-read adjustments before this task.
+- [ ] Reconcile all-target APIs/lockfile and run focused plus workspace regressions with revision/exit logs.
+- [ ] Inspect final-upstream incoming additions for omissions; record every conflict decision.
+- [ ] Run isolated actual Linux app smoke/screenshots and lifecycle/selection/bounds assertions.
+- [ ] Update DOX and sync YAML; deliver reviewable commits/evidence/native limits, no publish.
+- [ ] Complete native macOS/iOS acceptance and archive (handoff; unavailable on Linux).
