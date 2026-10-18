@@ -169,6 +169,7 @@ fn main() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         return zeron_computer_use_mcp::run_stdio(&args).map_err(anyhow::Error::msg);
     }
+    zeron_workers_unpeel::register_worker_mcp_servers(zeron_harness::pi::MCP_BRIDGE_SOURCE);
     if zeron_workers_unpeel::run_session_host_mode_if_requested().map_err(anyhow::Error::msg)? {
         return Ok(());
     }

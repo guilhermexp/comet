@@ -121,6 +121,19 @@ fn write_session_mcp_config(launch: &SessionHostLaunch) -> Result<PathBuf, Strin
             "unpeel".to_string(),
             stdio_server(&executable, crate::mcp_host::MCP_HOST_ARG),
         );
+        // Servers the embedding app registered ride the same settings file.
+        for server in crate::extra_mcp::servers() {
+            servers.insert(
+                server.name.to_string(),
+                json!({
+                    "transport": {
+                        "type": "stdio",
+                        "command": executable,
+                        "args": server.args,
+                    }
+                }),
+            );
+        }
     }
 
     let serialized = serde_json::to_string_pretty(&config)

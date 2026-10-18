@@ -41,7 +41,7 @@ Hooks de remoção leem o `.config/wt.toml` do checkout removido; hooks de cria�
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
 | `tests/` | Integration tests per surface |
 
-Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`), plus
+Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`), `zeron-computer-use-mcp` (só as constantes do servidor registrado), plus
 `zeron-proto`/`zeron-rpc` only for the project registry transport (neither
 depends on this crate: no cycle, checked with `cargo tree -i`) and `chrono`
 for ticket times. Nunca depende de gpui nem de `zeron-ui`: os leitores de
@@ -52,6 +52,8 @@ Settings, incluindo os leitores `project_activity`/`project_tickets`),
 apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
+
+- **Servidores MCP extras dos Workers** (`register_worker_mcp_servers`, chamado no `main` antes de qualquer host mode): registra `comet-computer-use` (`zeron __computer_use_mcp__ --worker`) em `unpeel_core::extra_mcp`. Os adapters com seam MCP escrevem o servidor ao lado de `unpeel` — claude-code (`claude-unpeel-mcp.json`), cursor-agent (`~/.cursor/mcp.json`), cline (settings por sessão), kimi (`kimi-unpeel-mcp.json` e, no Kimi Code, entrada persistente em `~/.kimi-code/mcp.json` que não sobrescreve entrada do usuário com o mesmo nome) — e o pi family (omp, pi, prime-agent) carrega uma extensão-ponte gerada por servidor (`<unpeel_home>/hooks/mcp-bridge-<nome>.js`, fonte `zeron_harness::pi::MCP_BRIDGE_SOURCE`). Codex não recebe: segue o Computer Use nativo. O `--worker` faz o escopo "Comet only" de Settings recusar Workers.
 
 - **Um projeto é um Space; Workers só guardam checkouts.** O registro único é
   o de Spaces da engine (o mesmo que o chat MCP `list_projects` devolve).

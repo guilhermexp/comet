@@ -52,6 +52,26 @@ pub(crate) fn with_lifecycle_extension(command: &str) -> String {
     append_extension_argument(trimmed, &quoted_path)
 }
 
+/// Append `--extension <bridge>` once per MCP server the embedding app
+/// registered (see `crate::extra_mcp`). Pi-family CLIs have no MCP client;
+/// the bridge extension spawns the server and registers its tools.
+pub(crate) fn with_extra_mcp_bridges(command: &str) -> String {
+    with_extension_paths(command, &crate::extra_mcp::pi_bridge_paths())
+}
+
+fn with_extension_paths(command: &str, paths: &[PathBuf]) -> String {
+    let mut command = command.trim().to_string();
+    for path in paths {
+        let raw_path = path.to_string_lossy();
+        if has_extension_argument(&command, raw_path.as_ref()) {
+            continue;
+        }
+        let quoted_path = crate::integrations::shared::shell_quote(&raw_path);
+        command = append_extension_argument(&command, &quoted_path);
+    }
+    command
+}
+
 fn append_extension_argument(command: &str, quoted_path: &str) -> String {
     if let Some(delimiter) = shell_tokens(command)
         .into_iter()
@@ -225,13 +245,27 @@ pub(crate) fn install_lifecycle_extension() -> Result<(), String> {
         &lifecycle_extension_path(),
         &extension,
         "Pi-family lifecycle extension",
-    )
+    )?;
+    crate::extra_mcp::install_pi_bridges().map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn mcp_bridges_are_appended_once_before_the_argument_delimiter() {
+        let bridge = PathBuf::from("/home/u/.unpeel/hooks/mcp-bridge-comet-computer-use.js");
+        let paths = [bridge.clone()];
+        let command = with_extension_paths("omp --model x -- task", &paths);
+        assert_eq!(
+            command,
+            format!("omp --model x --extension '{}' -- task", bridge.display())
+        );
+        assert_eq!(with_extension_paths(&command, &paths), command);
+        assert_eq!(with_extension_paths(" pi ", &[]), "pi");
+    }
 
     #[test]
     fn lifecycle_extension_reports_provider_session_identity() {

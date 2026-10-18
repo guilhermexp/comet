@@ -92,22 +92,40 @@ impl WorkersBridge {
         let Some(server) = workers_mcp::resolve_zeron_for(executable, grant) else {
             return Ok(None);
         };
-        Self::launch_with(server, None).await.map(Some)
+        Self::launch_with(server, None).await
+    }
+
+    /// `comet-computer-use`: its tools become OMP host tools. `None` when the
+    /// server lists no tool (Settings switch off, scope excludes this
+    /// session, or no ChatGPT.app runtime on this host).
+    pub async fn start_computer_use(
+        executable: &std::path::Path,
+        chat_id: Option<&str>,
+        data_dir: Option<&str>,
+    ) -> Result<Option<Self>, HarnessError> {
+        let Some(server) = workers_mcp::resolve_computer_use_for(executable, chat_id, data_dir)
+        else {
+            return Ok(None);
+        };
+        Self::launch_with(server, None).await
     }
 
     async fn launch(
         server: workers_mcp::WorkersMcpServer,
         expected_tool: &str,
     ) -> Result<Self, HarnessError> {
-        Self::launch_with(server, Some(expected_tool)).await
+        Self::launch_with(server, Some(expected_tool))
+            .await?
+            .ok_or_else(|| HarnessError::Protocol("Workers controller advertised no tool".into()))
     }
 
     /// `Some(tool)`: a single-tool controller that must advertise exactly that
-    /// tool first. `None`: serve every advertised tool.
+    /// tool first. `None`: serve every advertised tool, or return `None` (and
+    /// stop the sidecar) when it advertises none.
     async fn launch_with(
         server: workers_mcp::WorkersMcpServer,
         expected_tool: Option<&str>,
-    ) -> Result<Self, HarnessError> {
+    ) -> Result<Option<Self>, HarnessError> {
         let request_timeout = if expected_tool.is_some() {
             TOOL_CALL_TIMEOUT
         } else {
@@ -228,22 +246,21 @@ impl WorkersBridge {
                 .collect(),
         };
         if definitions.is_empty() {
-            return Err(HarnessError::Protocol(
-                "MCP sidecar advertised no tool".into(),
-            ));
+            let _ = child.kill().await;
+            return Ok(None);
         }
         let tool_names = definitions
             .iter()
             .filter_map(|definition| definition["name"].as_str().map(str::to_owned))
             .collect();
-        Ok(Self {
+        Ok(Some(Self {
             client,
             child: tokio::sync::Mutex::new(child),
             definitions,
             tool_names,
             pending: Arc::new(Mutex::new(HashMap::new())),
             request_timeout,
-        })
+        }))
     }
 
     /// The first (for single-tool controllers, the only) definition.

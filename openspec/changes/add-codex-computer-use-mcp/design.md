@@ -96,30 +96,39 @@ virarem por sessão. Dois canais para um booleano. O custo do gate no servidor
 
 ### D3. Quem é "run de agente" nos chats
 
-Campo novo `RunRequest.enable_computer_use_mcp` (`#[serde(default)]`, falso no
-fio), posto `true` onde hoje o engine/composer põe `enable_workers_mcp: true`
-para chat de agente (composer, `SpawnChat`/side chat, `doc_host`). Títulos,
-recap, commit message e voz continuam falsos. `servers_for` acrescenta o
-servidor quando o campo é verdadeiro; `codex/mod.rs` filtra
-`comet-computer-use` do que monta. OMP ganha `WorkersBridge::start_computer_use`
-e um ramo próprio no roteamento por nome de tool e no cancel.
+Reaproveita `RunRequest.enable_workers_mcp` como sinal de "chat de agente":
+ele já é `true` exatamente no composer, `SpawnChat`/side chat e `doc_host`, e
+`false` em títulos, recap, commit message e voz. `servers_for` acrescenta
+`comet-computer-use` quando ele é verdadeiro, **sem** passar pelo
+`ZERON_DISABLE_WORKERS_MCP` (esse kill switch continua desligando só os três
+servidores de Workers). `codex/mod.rs` filtra `comet-computer-use` do que
+monta. OMP ganha `WorkersBridge::start_computer_use` e um ramo próprio no
+roteamento por nome de tool e no cancel.
 
-Alternativa: reaproveitar `enable_workers_mcp`. Acoplaria ao
-`ZERON_DISABLE_WORKERS_MCP` e ao significado "pode controlar Workers".
+Alternativa descartada na implementação: campo novo
+`RunRequest.enable_computer_use_mcp`. Tocaria ~80 literais de `RunRequest`
+para marcar o mesmo conjunto de runs; o acoplamento ao kill switch, motivo
+original do campo novo, foi resolvido dentro de `servers_for`.
 
-### D4. Workers: segundo servidor nos adapters existentes + ponte omp/pi
+### D4. Workers: registro de servidores extras no Unpeel vendorizado
+
+O Unpeel vendorizado ganha `unpeel_core::extra_mcp`: um registro por processo,
+vazio por padrão (Unpeel standalone lança igual a antes). O Comet registra
+`comet-computer-use` (args `["__computer_use_mcp__", "--worker"]`) e o fonte da
+ponte Pi em `main()`, antes do session host rodar; o setup dos adapters roda
+nesse mesmo processo.
 
 - claude-code, cursor-agent, cline, kimi: onde o adapter escreve a entrada
-  `unpeel`, escreve também `comet-computer-use` (mesmo executável, args
-  `["__computer_use_mcp__"]`). As regras atuais de "comando do usuário com
-  config MCP próprio lança intocado" valem igual.
+  `unpeel`, escreve também cada servidor registrado (mesmo executável). As
+  regras atuais de "comando do usuário com config MCP próprio lança intocado"
+  valem igual; o kimi não sobrescreve entrada do usuário com outro comando.
 - codex: nada.
-- omp e pi: o adapter pi-family (e o de `pi`) acrescenta `--extension` com a
-  ponte MCP. A ponte de chat Pi (`crates/harness/src/pi/mcp.mjs`) é a base;
-  ela usa a API de extensão do Pi. Se a API do omp divergir no que a ponte usa
-  (registro de tool, resultado com imagem), o asset ganha uma variante omp —
-  a tarefa 5.1 decide pelo teste, não por suposição. O asset é instalado pelo
-  `install_runtime_support` do adapter, ao lado da extensão de lifecycle.
+- omp, pi e prime-agent (pi-family): sem cliente MCP. O setup gera
+  `<unpeel_home>/hooks/mcp-bridge-<nome>.js` a partir de
+  `crates/harness/src/pi/mcp.mjs` com a config embutida como literal, e o
+  comando de startup ganha `--extension <arquivo>` por servidor. Se a API do
+  omp divergir no que a ponte usa (registro de tool, resultado com imagem), o
+  asset ganha uma variante omp — a tarefa 5.1 decide pelo teste.
 
 ### D5. Comportamento do proxy (porte da extensão do omp)
 
@@ -147,15 +156,15 @@ Alternativa: reaproveitar `enable_workers_mcp`. Acoplaria ao
 ### D6. Settings
 
 Toggle em Settings → Agents (`settings/harnesses.rs`), card próprio "Computer
-Use" acima da lista de runtimes, no padrão do toggle de habilitar runtime
+Use" abaixo da lista de runtimes, só quando o alvo é esta máquina, no padrão do toggle de habilitar runtime
 (`Role::Switch`, `aria_label`, Enter/Space). Descrição: requer ChatGPT.app e
 permissão de Acessibilidade; não afeta o Codex; vale para sessões novas.
 Campo `codex_computer_use_enabled: bool` em `UiSettings`, serializado como
 `codexComputerUseEnabled`, `Default` = `true`.
 
-Seletor de alcance (decisão do dono, 2026-10-17) logo abaixo do switch, no
-padrão de segmented control já usado em Settings: "Só Comet" / "Comet +
-Workers". Campo `codex_computer_use_scope: ComputerUseScope` (`Chats` |
+Seletor de alcance (decisão do dono, 2026-10-17) logo abaixo do switch: Settings
+não tinha segmented control, então o card ganha um par de pílulas
+`Role::RadioButton` ("Comet only" / "Comet + Workers"). Campo `codex_computer_use_scope: ComputerUseScope` (`Chats` |
 `ChatsAndWorkers`, serde `chats` / `chatsAndWorkers`), serializado como
 `codexComputerUseScope`, `Default` = `ChatsAndWorkers`. Com o switch desligado
 o seletor fica esmaecido e não clicável; o valor salvo é mantido.

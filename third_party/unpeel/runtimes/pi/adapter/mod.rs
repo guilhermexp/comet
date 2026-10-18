@@ -30,7 +30,7 @@ pub(crate) fn startup_command(command: &str) -> String {
     if !shared::command_head(trimmed).eq_ignore_ascii_case("pi") {
         return trimmed.to_string();
     }
-    setup::with_lifecycle_extension(trimmed)
+    setup::with_extra_mcp_bridges(&setup::with_lifecycle_extension(trimmed))
 }
 
 fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> String {

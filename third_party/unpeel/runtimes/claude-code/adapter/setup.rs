@@ -45,7 +45,7 @@ pub(crate) fn write_claude_unpeel_mcp_config() -> Result<(), String> {
     // The file name keeps the pre-rename `unpeel-mcp` spelling: launch
     // commands recorded by existing sessions reference this exact path, so
     // only the server key inside changes to `unpeel`.
-    let config = json!({
+    let mut config = json!({
         "mcpServers": {
             "unpeel": {
                 "type": "stdio",
@@ -54,6 +54,12 @@ pub(crate) fn write_claude_unpeel_mcp_config() -> Result<(), String> {
             }
         }
     });
+    // Servers the embedding app registered ride the same `--mcp-config`.
+    for (name, entry) in
+        crate::extra_mcp::config_entries(crate::extra_mcp::servers(), &exe, true)
+    {
+        config["mcpServers"][name] = entry;
+    }
     let path = claude_unpeel_mcp_config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

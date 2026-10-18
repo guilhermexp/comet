@@ -19,6 +19,7 @@ pub mod controller_api;
 pub mod controller_host;
 pub mod controller_protocol;
 pub mod direct_connection;
+pub mod extra_mcp;
 pub mod first_run;
 mod ghostty_vt;
 pub mod hook_assets;

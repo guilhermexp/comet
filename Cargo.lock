@@ -13581,6 +13581,7 @@ dependencies = [
  "zeron-computer-use-mcp",
  "zeron-doc",
  "zeron-engine",
+ "zeron-harness",
  "zeron-mcp",
  "zeron-proto",
  "zeron-rpc",
@@ -14115,6 +14116,7 @@ dependencies = [
  "unicode-width",
  "unpeel-core",
  "uuid",
+ "zeron-computer-use-mcp",
  "zeron-proto",
  "zeron-rpc",
 ]

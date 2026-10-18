@@ -752,6 +752,95 @@ async fn root_grant_serves_every_zeron_chat_tool_as_a_host_tool() {
 }
 
 #[tokio::test]
+async fn computer_use_bridge_serves_its_tools_or_none_when_switched_off() {
+    let bridge =
+        WorkersBridge::start_computer_use(&fake_workers_controller_path(), Some("chat-1"), None)
+            .await
+            .unwrap()
+            .unwrap();
+    let names: Vec<_> = bridge
+        .definitions()
+        .iter()
+        .map(|definition| definition["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["computer_use", "computer_use_reset"]);
+    assert!(bridge.serves("computer_use") && !bridge.serves("workers"));
+    let result = bridge
+        .handle_call("omp-call-cu", "computer_use", json!({ "code": "1" }))
+        .await;
+    assert_eq!(result["result"]["content"][0]["text"], "computer use");
+    bridge.shutdown().await.unwrap();
+
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("ui-settings.json"),
+        r#"{"codexComputerUseEnabled":false}"#,
+    )
+    .unwrap();
+    let off = WorkersBridge::start_computer_use(
+        &fake_workers_controller_path(),
+        Some("chat-1"),
+        data.path().to_str(),
+    )
+    .await
+    .unwrap();
+    assert!(off.is_none());
+}
+
+fn computer_use_texts(events: &[AgentEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn computer_use_host_calls_reach_the_computer_use_server() {
+    let harness = fake_harness("computer-use-host-tools");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("computer use");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+    assert_eq!(
+        computer_use_texts(&events),
+        ["after computer use"],
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn computer_use_switched_off_registers_no_host_tool() {
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("ui-settings.json"),
+        r#"{"codexComputerUseEnabled":false}"#,
+    )
+    .unwrap();
+    let mut env = fake_env("computer-use-off");
+    env.insert(
+        "ZERON_DATA_DIR".into(),
+        data.path().to_string_lossy().into_owned(),
+    );
+    let harness = fake_harness("computer-use-off").with_env(env);
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("computer use off");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+    assert_eq!(
+        computer_use_texts(&events),
+        ["no computer use"],
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn sessions_and_workers_host_calls_are_answered_once_by_their_own_server() {
     let harness = fake_harness("mixed-host-tools")
         .with_workers_mcp_executable(fake_workers_controller_path());

@@ -143,6 +143,8 @@ pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessErr
 fn codex_workers_mcp_overrides(request: &RunRequest) -> Vec<String> {
     crate::workers_mcp::servers_for_request(request)
         .iter()
+        // Codex keeps its native Computer Use from `~/.codex/config.toml`.
+        .filter(|server| server.name != crate::workers_mcp::COMPUTER_USE_NAME)
         .flat_map(|server| server.codex_overrides())
         .collect()
 }
@@ -2369,6 +2371,17 @@ mod tests {
                 None,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn codex_overrides_never_mount_computer_use() {
+        let overrides = codex_workers_mcp_overrides(&workers_request(true));
+        assert!(
+            !overrides
+                .iter()
+                .any(|value| value.contains("comet-computer-use")),
+            "{overrides:?}"
         );
     }
 

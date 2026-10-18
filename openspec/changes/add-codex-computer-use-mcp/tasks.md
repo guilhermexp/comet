@@ -14,26 +14,26 @@ testes de uma rodada numa invocação.
 
 ## 2. Botão em Settings
 
-- [ ] 2.1 Campos `codex_computer_use_enabled` (default `true`, `codexComputerUseEnabled`) e `codex_computer_use_scope` (default `ChatsAndWorkers`, `codexComputerUseScope`) em `UiSettings` e setters no `SettingsStore`; verificar com teste de round-trip: arquivo sem as chaves carrega `true`/`ChatsAndWorkers`, valores salvos voltam iguais, escopo desconhecido cai no default.
+- [x] 2.1 Campos `codex_computer_use_enabled` (default `true`, `codexComputerUseEnabled`) e `codex_computer_use_scope` (default `ChatsAndWorkers`, `codexComputerUseScope`) em `UiSettings` e setters no `SettingsStore`; verificar com teste de round-trip: arquivo sem as chaves carrega `true`/`ChatsAndWorkers`, valores salvos voltam iguais, escopo desconhecido cai no default.
 - [ ] 2.2 Card "Computer Use" em Settings → Agents com switch acessível e seletor "Só Comet" / "Comet + Workers" inativo com o switch desligado (D6); verificar no app rodando: alternar os dois, reabrir o app e ver o estado persistido em `~/.zeron/ui-settings.json`.
 
 ## 3. Chats (Claude, Pi, ACP)
 
-- [ ] 3.1 `RunRequest.enable_computer_use_mcp` (`#[serde(default)]`) e carimbo `true` nos mesmos pontos de chat de agente que hoje põem `enable_workers_mcp: true` (composer, spawn de chat filho/side, `doc_host`); títulos, recap, commit message e voz ficam `false`; verificar com os testes existentes de `titles.rs`, `recap.rs`, `commit_message.rs` e `voice_chat.rs` afirmando `false`.
-- [ ] 3.2 `servers_for` acrescenta `comet-computer-use` (com `ZERON_DATA_DIR` e `COMET_COMPUTER_USE_SESSION` no env) quando o campo é verdadeiro, e `codex/mod.rs` filtra esse servidor; verificar com testes em `workers_mcp.rs` (Claude/ACP/Pi contêm, request interno não contém) e em `codex/mod.rs` (overrides sem `mcp_servers.comet-computer-use`).
-- [ ] 3.3 Atualizar `crates/harness/AGENTS.md` (lista de servidores e exceção do Codex); verificar lendo a seção de `workers_mcp.rs` revisada.
+- [x] 3.1 Montar o servidor pelo sinal `RunRequest.enable_workers_mcp` (D3: já `true` só em chat de agente, `false` em títulos, recap, commit message e voz), sem passar pelo `ZERON_DISABLE_WORKERS_MCP`; verificar com teste em `workers_mcp.rs` (request interno não monta; kill switch dos Workers ligado ainda monta).
+- [x] 3.2 `servers_for` acrescenta `comet-computer-use` (com `ZERON_DATA_DIR` e `COMET_COMPUTER_USE_SESSION` no env) quando o campo é verdadeiro, e `codex/mod.rs` filtra esse servidor; verificar com testes em `workers_mcp.rs` (Claude/ACP/Pi contêm, request interno não contém) e em `codex/mod.rs` (overrides sem `mcp_servers.comet-computer-use`).
+- [x] 3.3 Atualizar `crates/harness/AGENTS.md` (lista de servidores e exceção do Codex); verificar lendo a seção de `workers_mcp.rs` revisada.
 
 ## 4. Chat OMP
 
-- [ ] 4.1 `WorkersBridge::start_computer_use` (deadline 330 s), registro das tools como host tools e ramo próprio no roteamento por nome e no cancel em `omp/mod.rs`; verificar com teste em `tests/omp_rpc.rs` com servidor falso: `computer_use` chega ao servidor certo e não ao `zeron`/workers.
-- [ ] 4.2 Com botão desligado, OMP não registra as tools; verificar no mesmo teste com o gate desligado (lista vazia → nenhum host tool novo).
+- [x] 4.1 `WorkersBridge::start_computer_use` (deadline 330 s), registro das tools como host tools e ramo próprio no roteamento por nome e no cancel em `omp/mod.rs`; verificar com teste em `tests/omp_rpc.rs` com servidor falso: `computer_use` chega ao servidor certo e não ao `zeron`/workers.
+- [x] 4.2 Com botão desligado, OMP não registra as tools; verificar no mesmo teste com o gate desligado (lista vazia → nenhum host tool novo).
 
 ## 5. Workers
 
 - [ ] 5.1 Provar a ponte MCP de `crates/harness/src/pi/mcp.mjs` dentro do `omp` e do `pi` atuais (registro de tool e resultado com imagem) apontando para `zeron __computer_use_mcp__`; se o omp divergir, criar a variante do asset; verificar com `omp -p` e `pi -p` chamando `computer_use` com `cua.getState()` e mostrando a saída.
-- [ ] 5.2 Adapters pi-family e `pi` carregam a ponte por `--extension` (asset instalado pelo `install_runtime_support`), apontando para `zeron __computer_use_mcp__ --worker`; verificar com teste de `startup_command` e com `setup_conformance_tests.rs`.
-- [ ] 5.3 Adapters claude-code, cursor-agent, cline e kimi escrevem `comet-computer-use` (args `["__computer_use_mcp__", "--worker"]`) ao lado de `unpeel`, mantendo "config do usuário lança intocado"; codex sem mudança; verificar com os testes de cada adapter e `setup_conformance_tests.rs`.
-- [ ] 5.4 Atualizar `third_party/unpeel-upstream.toml` e `crates/workers-unpeel/AGENTS.md` (seam de MCP por adapter e o segundo servidor); verificar lendo os dois arquivos no mesmo commit das mudanças vendorizadas.
+- [ ] 5.2 Registro `unpeel_core::extra_mcp` (D4); adapters pi-family e `pi` carregam a ponte gerada por `--extension` (instalada junto da extensão de lifecycle), apontando para `zeron __computer_use_mcp__ --worker`; verificar com teste de `startup_command` e com `setup_conformance_tests.rs`.
+- [x] 5.3 Adapters claude-code, cursor-agent, cline e kimi escrevem `comet-computer-use` (args `["__computer_use_mcp__", "--worker"]`) ao lado de `unpeel`, mantendo "config do usuário lança intocado"; codex sem mudança; verificar com os testes de cada adapter e `setup_conformance_tests.rs`.
+- [x] 5.4 Atualizar `third_party/unpeel-upstream.toml` e `crates/workers-unpeel/AGENTS.md` (seam de MCP por adapter e o segundo servidor); verificar lendo os dois arquivos no mesmo commit das mudanças vendorizadas.
 
 ## 6. Prova ponta a ponta
 

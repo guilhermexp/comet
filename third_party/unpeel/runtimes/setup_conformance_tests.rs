@@ -2120,7 +2120,7 @@ js_repl = false
 
         super::merge_cursor_mcp_servers_at(
             Some(&mcp_path),
-            [
+            vec![
                 (
                     "unpeel",
                     Some(json!({

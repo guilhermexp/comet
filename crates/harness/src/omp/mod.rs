@@ -274,6 +274,17 @@ impl OmpHarness {
             .or_else(|| std::env::current_exe().ok())
     }
 
+    /// `ZERON_DATA_DIR` this run's sidecars should read, when one is set.
+    fn data_dir(&self) -> Option<String> {
+        self.env
+            .as_ref()
+            .and_then(|env| env.get("ZERON_DATA_DIR"))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .or_else(|| std::env::var("ZERON_DATA_DIR").ok())
+            .filter(|value| !value.is_empty())
+    }
+
     fn workers_disabled(&self) -> bool {
         self.env
             .as_ref()
@@ -420,10 +431,29 @@ impl Harness for OmpHarness {
         } else {
             None
         };
+        // Optional like `zeron`: a run without Computer Use beats a run that
+        // fails to start. The server itself enforces the Settings switch.
+        let computer_use = match (request.enable_workers_mcp, self.workers_executable()) {
+            (true, Some(executable)) => match WorkersBridge::start_computer_use(
+                &executable,
+                request.workers_parent_chat_id.as_deref(),
+                self.data_dir().as_deref(),
+            )
+            .await
+            {
+                Ok(bridge) => bridge.map(Arc::new),
+                Err(error) => {
+                    tracing::warn!(target: "zeron_harness::omp", %error, "Computer Use MCP unavailable");
+                    None
+                }
+            },
+            _ => None,
+        };
         let host_tools: Vec<_> = workers
             .iter()
             .chain(sessions.iter())
             .chain(zeron.iter())
+            .chain(computer_use.iter())
             .flat_map(|bridge| bridge.definitions().iter().cloned())
             .collect();
         if !host_tools.is_empty() {
@@ -499,6 +529,7 @@ impl Harness for OmpHarness {
             workers,
             sessions,
             zeron,
+            computer_use,
             request.cwd,
             model,
             session_id,
@@ -763,6 +794,7 @@ async fn run_session(
     workers: Option<Arc<WorkersBridge>>,
     sessions: Option<Arc<WorkersBridge>>,
     zeron: Option<Arc<WorkersBridge>>,
+    computer_use: Option<Arc<WorkersBridge>>,
     cwd: String,
     model: String,
     mut session_id: String,
@@ -1069,6 +1101,12 @@ async fn run_session(
                             || tool == "wait_for_status";
                         let bridge = match tool {
                             "sessions" => sessions.as_ref(),
+                            _ if computer_use
+                                .as_ref()
+                                .is_some_and(|bridge| bridge.serves(tool)) =>
+                            {
+                                computer_use.as_ref()
+                            }
                             _ if zeron.as_ref().is_some_and(|bridge| bridge.serves(tool)) => {
                                 zeron.as_ref()
                             }
@@ -1126,6 +1164,9 @@ async fn run_session(
                             }
                             if let Some(zeron) = &zeron {
                                 zeron.cancel_call(target_id);
+                            }
+                            if let Some(computer_use) = &computer_use {
+                                computer_use.cancel_call(target_id);
                             }
                         }
                     }
@@ -1237,6 +1278,9 @@ async fn run_session(
     }
     if let Some(zeron) = zeron {
         let _ = zeron.shutdown().await;
+    }
+    if let Some(computer_use) = computer_use {
+        let _ = computer_use.shutdown().await;
     }
     let _ = process.shutdown().await;
 }

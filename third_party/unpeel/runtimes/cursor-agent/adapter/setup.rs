@@ -42,20 +42,24 @@ pub fn write_cursor_mcp_config(unified_mcp_enabled: bool) -> Result<(), String> 
     // One unified entry per launch; the legacy names (`unpeel-mcp` before the
     // 2026-07-25 rename, the per-domain pair before unification) are pruned
     // so Cursor sessions don't see the same domains twice.
-    merge_cursor_mcp_servers_at(
-        cursor_mcp_path().as_deref(),
-        [
-            ("unpeel", unified_mcp_enabled.then_some(unified)),
-            ("unpeel-mcp", None),
-            ("unpeel-sessions", None),
-            ("unpeel-browser", None),
-        ],
-    )
+    let mut servers = vec![
+        ("unpeel", unified_mcp_enabled.then_some(unified)),
+        ("unpeel-mcp", None),
+        ("unpeel-sessions", None),
+        ("unpeel-browser", None),
+    ];
+    // Servers the embedding app registered follow the unified entry.
+    servers.extend(
+        crate::extra_mcp::config_entries(crate::extra_mcp::servers(), &exe, true)
+            .into_iter()
+            .map(|(name, entry)| (name, unified_mcp_enabled.then_some(entry))),
+    );
+    merge_cursor_mcp_servers_at(cursor_mcp_path().as_deref(), servers)
 }
 
 pub(crate) fn merge_cursor_mcp_servers_at(
     mcp_path: Option<&std::path::Path>,
-    servers: [(&str, Option<Value>); 4],
+    servers: Vec<(&str, Option<Value>)>,
 ) -> Result<(), String> {
     let Some(mcp_path) = mcp_path else {
         return Ok(());

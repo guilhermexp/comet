@@ -308,6 +308,38 @@ pub enum PullRequestDestination {
     External,
 }
 
+/// Which sessions on this device see the Comet Computer Use tools when the
+/// switch is on. The `comet-computer-use` server reads it as
+/// `codexComputerUseScope`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ComputerUseScope {
+    /// Comet agent chats only; Workers do not get the tools.
+    Chats,
+    #[default]
+    ChatsAndWorkers,
+}
+
+impl ComputerUseScope {
+    pub const ALL: [Self; 2] = [Self::Chats, Self::ChatsAndWorkers];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chats => "Comet only",
+            Self::ChatsAndWorkers => "Comet + Workers",
+        }
+    }
+}
+
+/// An unknown scope (a newer build's value) reads as the default instead of
+/// failing the whole settings file.
+fn computer_use_scope_or_default<'de, D>(deserializer: D) -> Result<ComputerUseScope, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 impl PullRequestDestination {
     pub const ALL: [Self; 2] = [Self::Native, Self::External];
     pub fn label(self) -> &'static str {
@@ -603,6 +635,34 @@ pub fn transcript_compact_mode(cx: &App) -> bool {
 pub fn set_transcript_compact_mode(enabled: bool, cx: &mut App) {
     if update(SavePolicy::Immediate, cx, |settings| {
         settings.transcript_compact_mode = enabled;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+/// The Computer Use switch and scope (see `UiSettings::codex_computer_use_enabled`).
+pub fn codex_computer_use(cx: &App) -> (bool, ComputerUseScope) {
+    cx.try_global::<SettingsStore>()
+        .map(|store| {
+            (
+                store.current.codex_computer_use_enabled,
+                store.current.codex_computer_use_scope,
+            )
+        })
+        .unwrap_or((true, ComputerUseScope::default()))
+}
+
+pub fn set_codex_computer_use_enabled(enabled: bool, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.codex_computer_use_enabled = enabled;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_codex_computer_use_scope(scope: ComputerUseScope, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.codex_computer_use_scope = scope;
     }) {
         cx.refresh_windows();
     }
@@ -1103,6 +1163,11 @@ pub struct UiSettings {
     /// Local preference: never transfers an active call or credentials.
     #[serde(default)]
     pub codex_voice_device: Option<String>,
+    /// Comet's Computer Use server (`comet-computer-use`) for sessions whose
+    /// agent runs on this device. Codex's native Computer Use ignores it.
+    pub codex_computer_use_enabled: bool,
+    #[serde(deserialize_with = "computer_use_scope_or_default")]
+    pub codex_computer_use_scope: ComputerUseScope,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -1206,6 +1271,8 @@ impl Default for UiSettings {
             pause_animations_in_background: false,
             codex_voice: None,
             codex_voice_device: None,
+            codex_computer_use_enabled: true,
+            codex_computer_use_scope: ComputerUseScope::ChatsAndWorkers,
             legacy_accent_color: None,
         }
     }
@@ -1850,6 +1917,8 @@ impl UiSettings {
             pause_animations_in_background,
             codex_voice,
             codex_voice_device,
+            codex_computer_use_enabled,
+            codex_computer_use_scope,
             legacy_accent_color,
             // Fork-owned fields.
             details_sidebar_width,
@@ -2859,6 +2928,8 @@ mod tests {
             window_geometry: None,
             codex_voice: Some("ember".into()),
             codex_voice_device: Some("fedora".into()),
+            codex_computer_use_enabled: false,
+            codex_computer_use_scope: ComputerUseScope::Chats,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,
@@ -3624,6 +3695,48 @@ mod tests {
         }
         .clamped();
         assert_eq!(healed.sidebar_width, SIDEBAR_DEFAULT);
+    }
+
+    #[test]
+    fn computer_use_settings_round_trip_and_default_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(UiSettings::path(dir.path()), r#"{"theme":"dark"}"#).unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(loaded.codex_computer_use_enabled);
+        assert_eq!(
+            loaded.codex_computer_use_scope,
+            ComputerUseScope::ChatsAndWorkers
+        );
+
+        let saved = UiSettings {
+            codex_computer_use_enabled: false,
+            codex_computer_use_scope: ComputerUseScope::Chats,
+            ..UiSettings::default()
+        };
+        saved.save(dir.path()).unwrap();
+        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(
+            json.contains(r#""codexComputerUseEnabled": false"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""codexComputerUseScope": "chats""#),
+            "{json}"
+        );
+        assert_eq!(UiSettings::load(dir.path()), saved);
+
+        // A scope this build does not know keeps the rest of the file.
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"codexComputerUseEnabled":false,"codexComputerUseScope":"everything"}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.codex_computer_use_enabled);
+        assert_eq!(
+            loaded.codex_computer_use_scope,
+            ComputerUseScope::ChatsAndWorkers
+        );
     }
 
     #[test]

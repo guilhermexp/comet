@@ -238,6 +238,11 @@ pub(crate) fn write_kimi_mcp_file(path: &Path, server_name: &str, arg: &str) -> 
             "args": [arg],
         }),
     );
+    // Servers the embedding app registered ride the same config file.
+    for (name, entry) in crate::extra_mcp::config_entries(crate::extra_mcp::servers(), &exe, false)
+    {
+        servers.insert(name.to_string(), entry);
+    }
     let config = json!({
         "mcpServers": Value::Object(servers)
     });
@@ -343,6 +348,20 @@ pub(crate) fn write_kimi_code_mcp_config() -> Result<(), String> {
     };
 
     let executable = crate::session_host::resolve_current_executable()?;
+    // Servers the embedding app registered are persistent entries too; one
+    // the user authored under the same name stays.
+    for (name, entry) in
+        crate::extra_mcp::config_entries(crate::extra_mcp::servers(), &executable, false)
+    {
+        let ours = servers.get(name).is_none_or(|existing| {
+            existing.get("command").and_then(Value::as_str)
+                == entry.get("command").and_then(Value::as_str)
+                || existing.pointer("/args/0") == entry.pointer("/args/0")
+        });
+        if ours {
+            servers.insert(name.to_string(), entry);
+        }
+    }
     upsert_kimi_code_managed_mcp(
         servers,
         "unpeel",

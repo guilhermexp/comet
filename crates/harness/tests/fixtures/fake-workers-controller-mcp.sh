@@ -8,6 +8,15 @@ if [ "${1:-}" = "mcp" ]; then
   tool=zeron
   label="zeron $ZERON_CHAT_ID"
   tools="[{\"name\":\"list_chats\",\"description\":\"List chats\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"create_chat\",\"description\":\"Create a chat\",\"inputSchema\":{\"type\":\"object\"}}]"
+elif [ "${1:-}" = "__computer_use_mcp__" ]; then
+  # `comet-computer-use`: two tools, or none when Settings turned it off.
+  [ "${COMET_COMPUTER_USE_SESSION:-}" = "chat-1" ] || exit 12
+  label="computer use"
+  if grep -q '"codexComputerUseEnabled":false' "${ZERON_DATA_DIR:-/nonexistent}/ui-settings.json" 2>/dev/null; then
+    tools="[]"
+  else
+    tools="[{\"name\":\"computer_use\",\"description\":\"Drive apps\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"computer_use_reset\",\"description\":\"Reset\",\"inputSchema\":{\"type\":\"object\"}}]"
+  fi
 elif [ "${1:-}" = "__sessions_mcp__" ]; then
   [ "${COMET_SESSIONS_CONTROLLER:-}" = "1" ] || exit 12
   tool=sessions

@@ -1,5 +1,6 @@
-//! Comet MCP servers (`comet-workers`, `comet-sessions`), resolved together
-//! and rendered in each runtime's own config dialect.
+//! Comet MCP servers (`comet-workers`, `comet-sessions`, `zeron`,
+//! `comet-computer-use`), resolved together and rendered in each runtime's
+//! own config dialect.
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -144,6 +145,40 @@ pub(crate) fn resolve_zeron_for(
     })
 }
 
+pub(crate) const COMPUTER_USE_MCP_ARG: &str = "__computer_use_mcp__";
+pub(crate) const COMPUTER_USE_NAME: &str = "comet-computer-use";
+/// Above the tool's 300 s `timeout_ms` ceiling plus the server's margin.
+pub(crate) const COMPUTER_USE_TIMEOUT_SECS: u64 = 330;
+
+/// Comet's Computer Use proxy for an agent chat. Mounted whenever the run is
+/// an agent chat (`enable_workers_mcp`), independent of the Workers kill
+/// switch: the Settings switch is enforced inside the server, which reads
+/// this host's `ui-settings.json`. Codex never mounts it (native Computer
+/// Use); see `codex_workers_mcp_overrides`.
+pub(crate) fn resolve_computer_use_for(
+    executable: &Path,
+    chat_id: Option<&str>,
+    data_dir: Option<&str>,
+) -> Option<WorkersMcpServer> {
+    if !executable.is_absolute() {
+        return None;
+    }
+    let mut env = Vec::new();
+    if let Some(dir) = data_dir.filter(|value| !value.trim().is_empty()) {
+        env.push(("ZERON_DATA_DIR".to_owned(), dir.to_owned()));
+    }
+    if let Some(id) = chat_id.filter(|value| !value.trim().is_empty()) {
+        env.push(("COMET_COMPUTER_USE_SESSION".to_owned(), id.to_owned()));
+    }
+    Some(WorkersMcpServer {
+        name: COMPUTER_USE_NAME,
+        command: executable.to_path_buf(),
+        args: vec![COMPUTER_USE_MCP_ARG.to_owned()],
+        env,
+        timeout_secs: COMPUTER_USE_TIMEOUT_SECS,
+    })
+}
+
 pub(crate) fn servers_for_request(request: &zeron_proto::RunRequest) -> Vec<WorkersMcpServer> {
     let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
         .ok()
@@ -175,6 +210,13 @@ pub(crate) fn servers_for(
     if let Some(grant) = &request.sessions {
         servers.extend(resolve_sessions_for(executable, grant));
         servers.extend(resolve_zeron_for(executable, grant));
+    }
+    if request.enable_workers_mcp {
+        servers.extend(resolve_computer_use_for(
+            executable,
+            request.workers_parent_chat_id.as_deref(),
+            std::env::var("ZERON_DATA_DIR").ok().as_deref(),
+        ));
     }
     servers
 }
@@ -385,7 +427,7 @@ mod tests {
     #[test]
     fn both_grants_render_workers_and_sessions() {
         let servers = servers_for(Path::new("/opt/zeron"), &request(true, true), false);
-        assert_eq!(servers.len(), 3);
+        assert_eq!(servers.len(), 4);
         let claude: serde_json::Value =
             serde_json::from_str(&claude_config_json(&servers).unwrap()).unwrap();
         assert!(claude["mcpServers"].get("comet-workers").is_some());
@@ -408,7 +450,7 @@ mod tests {
                 .any(|line| line.contains("mcp_servers.comet-workers.tool_timeout_sec="))
         );
         let acp: Vec<_> = servers.iter().map(|server| server.acp_value()).collect();
-        assert_eq!(acp.len(), 3);
+        assert_eq!(acp.len(), 4);
     }
 
     #[test]
@@ -451,14 +493,46 @@ mod tests {
     #[test]
     fn workers_only_omits_sessions() {
         let servers = servers_for(Path::new("/opt/zeron"), &request(true, false), false);
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "comet-workers");
+        let names: Vec<_> = servers.iter().map(|server| server.name).collect();
+        assert_eq!(names, ["comet-workers", "comet-computer-use"]);
         let config = claude_config_json(&servers).unwrap();
         assert!(!config.contains("comet-sessions"));
         assert!(
             !config.contains("\"zeron\""),
             "no chat MCP without the root grant"
         );
+    }
+
+    #[test]
+    fn agent_chat_mounts_computer_use_even_with_workers_disabled() {
+        let servers = servers_for(Path::new("/opt/zeron"), &request(true, false), true);
+        let names: Vec<_> = servers.iter().map(|server| server.name).collect();
+        assert_eq!(names, ["comet-computer-use"]);
+        let claude: serde_json::Value =
+            serde_json::from_str(&claude_config_json(&servers).unwrap()).unwrap();
+        let server = &claude["mcpServers"]["comet-computer-use"];
+        assert_eq!(server["args"], serde_json::json!([COMPUTER_USE_MCP_ARG]));
+        assert_eq!(server["env"]["COMET_COMPUTER_USE_SESSION"], "parent");
+        let acp = servers[0].acp_value();
+        assert_eq!(acp["name"], "comet-computer-use");
+    }
+
+    #[test]
+    fn computer_use_env_carries_data_dir_and_chat() {
+        let server =
+            resolve_computer_use_for(Path::new("/opt/zeron"), Some("chat-9"), Some("/data/zeron"))
+                .unwrap();
+        assert!(
+            server
+                .env
+                .contains(&("ZERON_DATA_DIR".into(), "/data/zeron".into()))
+        );
+        assert!(
+            server
+                .env
+                .contains(&("COMET_COMPUTER_USE_SESSION".into(), "chat-9".into()))
+        );
+        assert!(resolve_computer_use_for(Path::new("zeron"), None, None).is_none());
     }
 
     #[test]

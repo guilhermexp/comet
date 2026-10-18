@@ -815,6 +815,110 @@ impl HarnessesPage {
         .into_any_element()
     }
 
+    /// Comet's Computer Use switch and scope. Device-local
+    /// (`ui-settings.json` of the machine the agent runs on), so it shows only
+    /// while the page targets this device.
+    fn render_computer_use(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (enabled, scope) = crate::settings::codex_computer_use(cx);
+        let switch = widgets::toggle_switch(theme, enabled, "computer-use")
+            .id("computer-use-toggle")
+            .cursor_pointer()
+            .tab_index(0)
+            .role(gpui::Role::Switch)
+            .aria_label("Computer Use")
+            .aria_toggled(if enabled {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+            .on_click(move |_, _, cx| crate::settings::set_codex_computer_use_enabled(!enabled, cx))
+            .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
+                if !event.is_held && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    crate::settings::set_codex_computer_use_enabled(!enabled, cx);
+                    cx.stop_propagation();
+                }
+            });
+        let segments = crate::settings::ComputerUseScope::ALL.map(|option| {
+            let selected = option == scope;
+            div()
+                .id(SharedString::from(format!("computer-use-scope-{option:?}")))
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(6.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .when(selected, |el| {
+                    el.bg(theme.surface)
+                        .text_color(theme.text)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                })
+                .when(!selected, |el| el.text_color(theme.text_muted))
+                .when(enabled, |el| {
+                    el.cursor_pointer()
+                        .tab_index(0)
+                        .role(gpui::Role::RadioButton)
+                        .aria_label(option.label())
+                        .aria_toggled(if selected {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
+                        .focus_visible(|s| s.border_1().border_color(theme.accent))
+                        .when(!selected, |el| el.hover(|s| s.text_color(theme.text)))
+                        .on_click(move |_, _, cx| {
+                            crate::settings::set_codex_computer_use_scope(option, cx)
+                        })
+                        .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
+                            if !event.is_held
+                                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                crate::settings::set_codex_computer_use_scope(option, cx);
+                                cx.stop_propagation();
+                            }
+                        })
+                })
+                .child(option.label())
+        });
+        let selector = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .gap(px(2.0))
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(theme.ink(0.06))
+            .when(!enabled, |el| el.opacity(0.45))
+            .children(segments);
+        let text = |title: &'static str, description: &'static str| {
+            div()
+                .flex_1()
+                .min_w(px(220.0))
+                .child(widgets::row_title(theme, title))
+                .child(widgets::meta_line(
+                    theme,
+                    vec![SharedString::from(description).into_any_element()],
+                ))
+        };
+        widgets::section_card(theme)
+            .child(
+                widgets::card_row(theme, true)
+                    .child(text(
+                        "Computer Use",
+                        "Lets agents drive Mac apps through ChatGPT.app's Computer Use (needs ChatGPT.app and Accessibility permission). Applies to new sessions on this Mac. Codex's native Computer Use is not affected.",
+                    ))
+                    .child(switch),
+            )
+            .child(
+                widgets::card_row(theme, false)
+                    .child(text(
+                        "Available to",
+                        "Comet chats only, or Workers too.",
+                    ))
+                    .child(selector),
+            )
+            .into_any_element()
+    }
+
     fn rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = Theme::of(cx).for_settings_surface();
         let Loadable::Ready(list) = &self.harnesses else {
@@ -1232,6 +1336,10 @@ impl Render for HarnessesPage {
             _ => None,
         };
         let switcher = self.render_device_switcher(&theme, cx);
+        let computer_use = self
+            .target_device
+            .is_none()
+            .then(|| self.render_computer_use(&theme, cx));
 
         let can_control = self.can_control_updates(cx);
         let check = div()
@@ -1290,7 +1398,8 @@ impl Render for HarnessesPage {
                                         ),
                                 )
                                 .children(update_error)
-                                .child(body),
+                                .child(body)
+                                .children(computer_use),
                         ),
                 )
                 .fade_overflow_y(&self.scroll.scroll),

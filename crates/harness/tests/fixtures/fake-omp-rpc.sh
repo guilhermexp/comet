@@ -202,6 +202,13 @@ while IFS= read -r line; do
         has "$line" '"name":"workers"' || exit 60
         has "$line" '"name":"sessions"' || exit 61
         respond "$line" '{"toolNames":["workers","sessions"]}'
+      elif [ "$scenario" = "computer-use-host-tools" ]; then
+        has "$line" '"name":"computer_use"' || exit 62
+        has "$line" '"name":"computer_use_reset"' || exit 62
+        respond "$line" '{"toolNames":["workers","computer_use","computer_use_reset"]}'
+      elif [ "$scenario" = "computer-use-off" ]; then
+        has "$line" '"name":"computer_use"' && exit 63
+        respond "$line" '{"toolNames":["workers"]}'
       else
         respond "$line" '{"toolNames":["workers"]}'
       fi
@@ -352,6 +359,22 @@ while IFS= read -r line; do
         else
           fail_stage timeout 28
         fi
+      elif [ "$scenario" = "computer-use-host-tools" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"host_tool_call","id":"host-cu","toolCallId":"cu-1","toolName":"computer_use","arguments":{"code":"cua.getState()"}}'
+        read -r host_result
+        has "$host_result" '"id":"host-cu"' || fail_stage computer-use 74
+        has "$host_result" '"isError":false' || fail_stage computer-use 74
+        has "$host_result" 'computer use' || fail_stage computer-use 75
+        emit '{"type":"host_tool_call","id":"host-workers","toolCallId":"workers-1","toolName":"workers","arguments":{"action":"help"}}'
+        read -r host_result
+        has "$host_result" 'worker help' || fail_stage computer-use 76
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after computer use"}}'
+        emit '{"type":"agent_end","messages":[]}'
+      elif [ "$scenario" = "computer-use-off" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"no computer use"}}'
+        emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "mixed-host-tools" ]; then
         emit '{"type":"agent_start"}'
         emit '{"type":"host_tool_call","id":"host-sessions","toolCallId":"sessions-1","toolName":"sessions","arguments":{"action":"help"}}'

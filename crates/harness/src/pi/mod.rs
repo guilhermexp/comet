@@ -1,6 +1,11 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
 mod catalog;
 mod mcp;
+
+/// Pi extension that bridges one stdio MCP server; it reads the server from
+/// `process.env.ZERON_PI_MCP`. Workers load generated copies through
+/// `unpeel_core::extra_mcp`.
+pub const MCP_BRIDGE_SOURCE: &str = include_str!("mcp.mjs");
 mod normalize;
 mod rpc;
 mod sessions;

@@ -468,6 +468,21 @@ pub fn session_host_launcher_path(args: &[String]) -> Option<&Path> {
     (path.file_name().and_then(|name| name.to_str()) == Some("launch.json")).then_some(path)
 }
 
+/// MCP servers every Worker launch gets beside `unpeel`: written into the
+/// adapters' MCP configs, or loaded through `pi_bridge` by the pi family
+/// (see `unpeel_core::extra_mcp`). Call before the session host runs.
+pub fn register_worker_mcp_servers(pi_bridge: &'static str) {
+    static SERVERS: &[unpeel_core::extra_mcp::ExtraMcpServer] =
+        &[unpeel_core::extra_mcp::ExtraMcpServer {
+            name: zeron_computer_use_mcp::SERVER_NAME,
+            args: &[
+                zeron_computer_use_mcp::COMPUTER_USE_MCP_ARG,
+                zeron_computer_use_mcp::WORKER_FLAG,
+            ],
+        }];
+    unpeel_core::extra_mcp::register(SERVERS, Some(pi_bridge));
+}
+
 /// Let the Comet executable serve as Unpeel's detached local PTY host.
 /// Returns `true` after a host invocation has run, `false` for normal Comet CLI/UI arguments.
 pub fn run_session_host_mode_if_requested() -> Result<bool, String> {

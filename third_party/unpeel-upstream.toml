@@ -140,3 +140,11 @@ base_revision_resolves_upstream = false
 # whose JSONL is not yet flushed is therefore still nested. Applied together in
 # the OMP lifecycle extension and runtimes/omp/adapter/telemetry.rs. Local patch
 # only; local_modifications_count remains unrecomputed.
+
+# 2026-10-17 — add-codex-computer-use-mcp: novo módulo
+# crates/unpeel-core/src/extra_mcp.rs (registro de servidores MCP extras do
+# app embutidor; vazio no Unpeel standalone) e uso dele nos adapters
+# runtimes/{claude-code/adapter/setup.rs, cursor-agent/adapter/setup.rs,
+# cline/adapter/mod.rs, kimi/adapter/setup.rs, _shared/pi-family/adapter/
+# {mod.rs,setup.rs}, pi/adapter/mod.rs} e em runtimes/setup_conformance_tests.rs
+# (assinatura de merge_cursor_mcp_servers_at passou a Vec). Sem patch upstream.
