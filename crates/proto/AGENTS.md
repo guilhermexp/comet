@@ -47,6 +47,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
   device-local, com defaults em `WorktreeSettings`, não entidades CRDT; o cwd scratch
   portátil é resolvido somente pelo host proprietário.
 
+- `AgentEvent::Visual` carries only id/path/title; the script and named assets remain host uploads, never inline CRDT bytes. Sidebar section order remains an additive neighbor-anchored capability with convergent registry positions.
+
 ## Work Guidance
 
 - Lógica de apresentação que a UI e a engine derivam do mesmo estado pertence a `view`, não a `zeron-ui` — duplicar ali é como o comportamento diverge entre headed e headless.

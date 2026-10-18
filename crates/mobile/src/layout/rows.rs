@@ -32,6 +32,7 @@ pub enum RowKind {
     Chip,
     Image,
     Working,
+    Visual,
 }
 
 /// A user message awaiting its host echo (client-minted id = the echo's id).
@@ -97,6 +98,8 @@ pub(crate) enum Content {
         since_ms: Option<i64>,
         streaming: bool,
     },
+    /// An agent visual: its height comes from its worker.
+    Visual(Arc<crate::visual::VisualSlot>),
 }
 
 /// A width-independent row: identity, top gap class and prepared content.
@@ -146,6 +149,7 @@ pub(crate) mod geom {
     pub const CHIP_LINE: f32 = 32.0;
     pub const IMAGE: f32 = 260.0;
     pub const WORKING: f32 = 36.0;
+    pub const VISUAL_LOADING: f32 = 18.0;
 }
 
 impl Gap {
@@ -189,6 +193,9 @@ pub(crate) struct RowBuilder {
     pub collapsed: HashSet<u64>,
     /// Per-tool inline detail overrides (row detail key → open).
     pub detail_open: HashMap<u64, bool>,
+    /// Visual rows' links to their workers, by visual id (kept across
+    /// rebuilds: the worker holds the same slot).
+    pub visual_slots: HashMap<String, Arc<crate::visual::VisualSlot>>,
 }
 
 pub(crate) fn quick_hash(s: &str) -> u64 {
@@ -448,6 +455,23 @@ impl RowBuilder {
                             });
                             rows.push(Placed { core, gap });
                         }
+                        MessagePart::Visual { id, path, title } => {
+                            let gap = gap_for(&rows, false);
+                            let slot = self
+                                .visual_slots
+                                .entry(id.clone())
+                                .or_insert_with(|| crate::visual::VisualSlot::new(id, path, title))
+                                .clone();
+                            let core = Arc::new(RowCore {
+                                key: row_key(&format!("{}#{}", entry.id, id)),
+                                version: next_version(),
+                                kind: RowKind::Visual,
+                                entry_id: Arc::from(entry.id.as_str()),
+                                content: Content::Visual(slot),
+                                copy_text: title.clone(),
+                            });
+                            rows.push(Placed { core, gap });
+                        }
                         MessagePart::Input {
                             id,
                             questions,
@@ -563,6 +587,8 @@ impl RowBuilder {
                 .map(|(_, core)| core.clone());
             let core = reuse.unwrap_or_else(|| {
                 let id = format!("{pkey}.{bi}");
+                // Each block is its own row: its formulas share one budget.
+                ctx.math_area = 0.0;
                 let content = prepare_block(ctx, &block.block, 0, false);
                 Arc::new(RowCore {
                     key: row_key(&id),
@@ -804,6 +830,7 @@ fn prepare_user_text(
             pad_start: pad.0,
             pad_end: pad.1,
             atomic,
+            inline_box: None,
         });
         paints.push(super::markdown::SpanPaint {
             color,
@@ -869,6 +896,7 @@ fn prepare_user_text(
         links,
         chip: ((lh - chip_h) / 2.0, chip_h),
         badges,
+        math: Vec::new(),
     }
 }
 
@@ -908,18 +936,27 @@ fn chip_row(
     }
 }
 
+/// The message column's width in a viewport `width` wide.
+pub(crate) fn column_width(px: Px, width: f32) -> f32 {
+    use geom::*;
+    // Comfortable measure on iPad/landscape: cap the column, center it.
+    (width - px.v(MARGIN_X) * 2.0).clamp(40.0, px.v(READING_WIDTH))
+}
+
 /// Lays out (and optionally paints) one row at `width` (full viewport width).
+/// `visual` is a visual row's measured height (its slot's, read with the
+/// frame's version).
 pub(crate) fn place_row(
     core: &RowCore,
     gap: Gap,
     px: Px,
     width: f32,
+    visual: Option<f32>,
     mut out: Option<&mut DisplayBuilder>,
 ) -> f32 {
     use geom::*;
     let margin = px.v(MARGIN_X);
-    // Comfortable measure on iPad/landscape: cap the column, center it.
-    let cw = (width - margin * 2.0).clamp(40.0, px.v(READING_WIDTH));
+    let cw = column_width(px, width);
     let x = ((width - cw) / 2.0).max(margin).floor();
     let top = gap.px(px);
     let body = match &core.content {
@@ -961,6 +998,20 @@ pub(crate) fn place_row(
                 );
             }
             side
+        }
+        Content::Visual(slot) => {
+            // Until its worker has measured it: the loading line.
+            let h = visual.unwrap_or(px.v(VISUAL_LOADING));
+            if let Some(out) = out {
+                out.widget(
+                    WidgetKind::Visual {
+                        id: slot.id.clone(),
+                    },
+                    (x, top, cw, h),
+                    None,
+                );
+            }
+            h
         }
         Content::Working {
             since_ms,
@@ -1157,14 +1208,23 @@ fn place_user(
 
 /// Heap held by a row's prepared text (diagnostics; blocks recurse).
 pub(crate) fn content_heap_bytes(content: &Content) -> usize {
+    fn formula_bytes(f: &zatex::Formula) -> usize {
+        f.items.capacity() * std::mem::size_of::<zatex::Item>()
+    }
+    // The side table itself, then each formula's items.
+    fn math_bytes(t: &PText) -> usize {
+        t.math.capacity() * std::mem::size_of::<(usize, zatex::Formula)>()
+            + t.math.iter().map(|(_, f)| formula_bytes(f)).sum::<usize>()
+    }
     fn block(b: &PBlock) -> usize {
         match b {
-            PBlock::Text(t) | PBlock::Heading(t) => t.p.heap_bytes(),
+            PBlock::Text(t) | PBlock::Heading(t) => t.p.heap_bytes() + math_bytes(t),
             PBlock::Code(c) => {
                 c.body.p.heap_bytes()
                     + c.source.len()
                     + c.label.as_ref().map_or(0, |l| l.p.heap_bytes())
             }
+            PBlock::Math(m) => formula_bytes(&m.formula),
             PBlock::Quote(children) => children.iter().map(block).sum(),
             PBlock::List { items, .. } => items
                 .iter()
@@ -1173,7 +1233,12 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
                         + i.marker.as_ref().map_or(0, |m| m.p.heap_bytes())
                 })
                 .sum(),
-            PBlock::Table(t) => t.cells.iter().flatten().map(|c| c.p.heap_bytes()).sum(),
+            PBlock::Table(t) => t
+                .cells
+                .iter()
+                .flatten()
+                .map(|c| c.p.heap_bytes() + math_bytes(c))
+                .sum(),
             PBlock::Rule => 0,
         }
     }
@@ -1187,6 +1252,6 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
         Content::Tools(t) => super::tools::heap_bytes(t),
         Content::Chip(c) => c.text.p.heap_bytes(),
         Content::Image { reference } => reference.len(),
-        Content::Working { .. } => 0,
+        Content::Working { .. } | Content::Visual(_) => 0,
     }
 }

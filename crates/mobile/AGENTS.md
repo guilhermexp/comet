@@ -16,6 +16,8 @@ This crate owns `Cargo.toml` and `src/`. The Swift app and generated binding lif
 - Canonical attachment links are parsed and paired through `zeron-proto`. Use `pair_attachment_mentions` so each attachment path is consumed at most once; image chips retain their full upload path for preview activation, and unmatched uploads remain in the image or file strip.
 - Copy text uses the canonical attachment prompt projection, while display text may replace the links with chips.
 
+- `visual/` projects sandboxed Luau trees, assets, charts and GPU scenes/shaders into platform-neutral display lists with bounded input/layout/resource use. Transcript rows retain visual slot versions/heights; teardown belongs to the owning view. Math emits glyph primitives using six bundled faces, bounded source/layout/table area and cache budgets, retaining source copy text. UniFFI changes require regeneration and native iOS linking/testing; Linux tests do not certify UIKit.
+
 ## Work Guidance
 
 - Keep attachment matching in `zeron-proto`; do not duplicate filename sanitization or infer upload identity from display labels in this crate.
@@ -30,6 +32,12 @@ Run focused Rust checks through the repository Cargo wrapper on macOS/Linux, for
 |---|---|---|
 | `src/layout/**` | unit | `scripts/cargo-verify.py -- cargo test -p zeron-mobile layout::tests` |
 | `src/client_ffi/voice.rs` | unit | `scripts/cargo-verify.py -- cargo test -p zeron-mobile client_ffi::voice` |
+
+Additional integration coverage:
+
+| Layer / path | Tier | Command |
+| --- | --- | --- |
+| `src/visual/**` + math layout | unit; UIKit/GPU host integration is e2e native | `cargo test -p zeron-mobile` |
 
 ## Child DOX Index
 

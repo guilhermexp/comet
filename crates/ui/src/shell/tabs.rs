@@ -360,6 +360,23 @@ impl Shell {
         // across the chat column - the capture button landed on top of the
         // conversation title. A content-sized cluster needs no geometry: the
         // row's own right padding already ends at the chat column's edge.
+        let running_lanes = {
+            let state = self.state.read(cx);
+            let now = Utc::now();
+            state.selected_chat.as_deref().map_or(0, |chat| {
+                let side_chats = state
+                    .chats
+                    .iter()
+                    .filter(|side| {
+                        !side.archived
+                            && side.parent_chat_id.as_deref() == Some(chat)
+                            && state.display_status_for(side, now)
+                                == zeron_proto::ChatIndicator::Working
+                    })
+                    .count() as u32;
+                state.running_subagents_for(chat, now) + side_chats
+            })
+        };
         let row_gap = 8.0;
         let files_open = self.files_panel_open(cx);
         let files_now = self.files_visible_width(cx);
@@ -499,6 +516,11 @@ impl Shell {
                 cx.listener(|this, _, _, _| this.note_session_info_press()),
             )
             .when(open, |button| button.bg(crate::theme::wash(0.09)))
+            // Running subagents and side chats ride the card's lanes: the
+            // button counts them, open or closed, for as long as they run.
+            .when(running_lanes > 0, |button| {
+                crate::running_pill::mark_titlebar_button(button, running_lanes, &theme)
+            })
         });
         let inner = div()
             .size_full()
@@ -610,13 +632,6 @@ impl Shell {
     /// the explorer slot over its column while open.
     fn render_files_panel_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.files_panel_open(cx);
-        let running_subagents = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat
-                .as_deref()
-                .map_or(0, |chat| state.running_subagents_for(chat, Utc::now()))
-        };
         header_icon_button(
             "toggle-files-panel",
             icons::FILE_TREE,
@@ -634,9 +649,6 @@ impl Shell {
             "Hide files panel"
         } else {
             "Show files panel"
-        })
-        .when(running_subagents > 0, |button| {
-            crate::running_pill::mark_files_button(button, running_subagents, theme)
         })
         .into_any_element()
     }

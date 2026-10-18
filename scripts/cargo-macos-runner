@@ -20,6 +20,7 @@ def main():
     if binary.name != "zeron" or not headed:
         os.execv(str(binary), [str(binary), *arguments])
 
+    os.environ["ZERON_AUTO_UPDATE"] = "0"
     binary = binary.resolve()
     root = Path(__file__).resolve().parent.parent
     contents = binary.parent / "Zeron.app" / "Contents"

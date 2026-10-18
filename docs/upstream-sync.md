@@ -106,8 +106,8 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 - **Visual:** Settings no layout do upstream #449, mas com as seções Projects e Accounts do fork; Changes dentro do Files, transcript compacto, sem anel de contexto e sem terminal de rodapé.
 - **Painel direito:** só conta como aberto se tiver aba viva.
 - **Publicação e update:**
-  - versão 0.2.18, `release.yml` do fork, zui vendorizado em `third_party/zui`; deltas de API do pin upstream são aplicados numa fonte separada e copiados com proveniência, sem trocar para git dependency;
-  - o updater não usa o feed `zeron.sh`: vale o `has_release_feed`, e um feed próprio exige `ZERON_RELEASES_URL`.
+  - versão 1.0.7 nesta integração, `release.yml` do fork, zui vendorizado em `third_party/zui`; deltas de API do pin upstream são aplicados numa fonte separada e copiados com proveniência, sem trocar para git dependency;
+  - o updater mapeia `zeron.sh`/`*.zeron.sh` para `COMET_RELEASES_URL` (GitHub Releases do fork); `ZERON_RELEASES_URL` continua override explícito e edges self-hosted mantêm seu próprio feed.
 
 ## Recusado: continua a versão do fork
 
@@ -185,6 +185,24 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Localização customizada de worktree por device | #530 | v0.2.112 | Preferência da engine entra no lifecycle comum de Chat/Workers; criação usa hash de repo e journal já existente, não outro manager. Destinos de Workers standalone não mudam. Retry consulta posse independente da preferência atual |
 | PRs em panes/abas e Session information responsiva | #866/#867 | v0.2.112 | Registros novos de abas preservam URL + device/cache de credencial. Fit usa gutters de 16px e largura efetiva de Details; utility tabs conservam 118px, avatar de subagente e terminal à direita |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
+
+## Integração local de 18/10/2026 (em revisão)
+
+A integração `sync/upstream-20261018` usa o alvo fixo `c526d6f7` (13 commits),
+por merge real; preserva a versão 1.0.7 e o feed do fork. A PR #24 continua
+como diagnóstico draft antigo, sem mutação. Planejamento, contratos e tarefas
+pendentes: [`sync-upstream-20261018`](../openspec/changes/sync-upstream-20261018/).
+Não houve push, dispatch de CI, publicação nem acesso ao Mac nesta execução.
+
+Armadilhas adicionais: `PublishVisual` entra na tabela única `rpc::method`,
+sempre local-only, e o grant raiz continua em `workers_mcp`; não restaurar a
+injeção global por `RunRequest.mcp`. Lanes usam o lifecycle Cancelled do fork e
+cedem subagentes ao widget Workers visível de Details. O writer central de
+Settings precisa copiar `sidebar_show_archived`. O renderer de matemática deve
+preservar chips/links, IDs compostos e invalidação por prefixo. Bindings Swift
+precisam ser regeneradas do core integrado, nunca resolvidas só por texto.
+`ZERON_AUTO_UPDATE=0` protege bundles dev inclusive no launcher Cargo por exec
+direto; não desativa o lifecycle de instalações managed headless.
 
 ## Armadilhas conhecidas
 

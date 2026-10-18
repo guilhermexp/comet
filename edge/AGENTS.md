@@ -29,6 +29,8 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 - Quota de push do ChatRoom (`admitQuota`) conta só pushes **admitidos** — rejeição não estende a janela — e é dimensionada para o flush de reconexão de um Chat em streaming (1.200 pushes / 48 MiB por minuto, por device e room). Existe para conter loop descontrolado, não para medir tráfego honesto.
 - `chatRoute` deriva o Chat ID da rota autenticada e sobrescreve qualquer query enviada pelo cliente. Em pushes com `hostDevice` válido, ChatRoom grava row, recibo versionado de wake e próximo alarme na mesma transação SQLite antes do ACK; encaminha a wake para DeviceRoom e conserva tentativas falhas no alarme durável, separado do prazo de backup. O hint só roteia: identidade e posse continuam validadas pelos rooms. Hint inválido não recusa a row. Retries do recibo de servidor terminam em rejeição permanente (400/403) ou 1.440 tentativas; após exaustão a recuperação depende do sync do host ou do cliente, sem apagar os bytes do comando.
 
+- Native `visual` parts preserve id/path/name in doc form and id/path/title in app form. Invalid paths degrade to `Visual unavailable` without rendering a stray text/source field. Visual references stay atomic through split/join; scripts/assets remain host uploads. Regression: `src/session-doc/visuals.test.ts`.
+
 ## Work Guidance
 
 - Convergência com o cliente Rust se prova em `crates/sync/tests/registry_edge.rs`, não por inspeção.
@@ -46,6 +48,12 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 | `src/{auth,auth-routes,workos}.ts` | integration | `npm -C edge run test` + `npm -C edge run smoke` |
 | `src/preview-room.ts` | integration — auth, isolamento e protocolo DO | `npm -C edge run test:workerd` |
 | Tipos (todo o `src/**`) | typecheck obrigatório | `npm -C edge run typecheck` |
+
+Additional integration coverage:
+
+| Layer / path | Tier | Command |
+| --- | --- | --- |
+| `src/session-doc/visuals.test.ts` | unit — render/doc conversion, split/join and malformed fallback | `npm -C edge run test:unit -- src/session-doc/visuals.test.ts` |
 
 ## Child DOX Index
 

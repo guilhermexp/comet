@@ -570,6 +570,133 @@ fn session_info_reserves_the_rendered_transcript_column(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn side_chat_menu_rename_keeps_the_editor_visible_without_opening_files(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side", "title": "Side chat", "parentChatId": "a",
+                    "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap(),
+            );
+            cx.notify();
+        });
+        shell.chat_menu.open(ChatMenuState {
+            chat_id: "side".into(),
+            tab: None,
+            position: gpui::point(px(800.0), px(200.0)),
+            page: ChatMenuPage::Root,
+        });
+    });
+    settled(&shell, cx);
+    assert!(shell.read_with(cx, |shell, cx| !shell.files_panel_open(cx)));
+
+    let rename = cx.debug_bounds("chat-menu-rename").unwrap();
+    cx.simulate_click(rename.center(), Default::default());
+    settled(&shell, cx);
+
+    shell.read_with(cx, |shell, cx| {
+        assert!(
+            !shell.files_panel_open(cx),
+            "Rename must not open the explorer"
+        );
+        assert!(shell.session_info_visible(cx));
+        assert_eq!(shell.chat_rename.as_ref().unwrap().chat_id, "side");
+    });
+    let field = cx
+        .debug_bounds("session-lanes-chat-side-title-editor")
+        .unwrap();
+    let card = cx.debug_bounds("session-lanes").unwrap();
+    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+}
+
+#[gpui::test]
+fn side_chat_rename_leaves_takeover_to_show_its_editor(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |shell, window, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side", "title": "Side chat", "parentChatId": "a",
+                    "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap(),
+            );
+            cx.notify();
+        });
+        shell.toggle_right_pane(window, cx);
+    });
+    settled(&shell, cx);
+    change(&shell, cx, |s, _, cx| s.toggle_right_pane_expand(cx));
+    near(settled(&shell, cx).widths[3], 0.0);
+
+    change(&shell, cx, |s, _, cx| s.open_rename_chat("side".into(), cx));
+    let frame = settled(&shell, cx);
+    assert!(!shell.read_with(cx, |s, _| s.right_pane_expanded));
+    assert!(frame.widths[3] > 0.0, "the transcript column must return");
+    let field = cx
+        .debug_bounds("session-lanes-chat-side-title-editor")
+        .unwrap();
+    let card = cx.debug_bounds("session-lanes").unwrap();
+    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+}
+
+fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_motion: bool) {
+    let (_dir, shell, cx) = setup(cx);
+    cx.simulate_resize(gpui::size(px(width), px(900.0)));
+    cx.update(|_, cx| motion::set_reduced_motion(cx, reduced_motion));
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            let now = Utc::now();
+            for index in 0..40 {
+                state.chats.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("side-{index}"), "title": format!("Side {index}"),
+                        "parentChatId": "a", "deviceId": "local", "archived": false,
+                        "createdAt": now - chrono::Duration::minutes(index),
+                    }))
+                    .unwrap(),
+                );
+            }
+            cx.notify();
+        });
+    });
+    settled(&shell, cx);
+    assert!(cx.debug_bounds("session-lanes").is_none());
+
+    // Reveal a paged-out row from a hidden card, then a row above the new
+    // scroll position. Both directions must leave the whole editor visible.
+    for (chat, selector) in [
+        ("side-39", "session-lanes-chat-side-39-title-editor"),
+        ("side-0", "session-lanes-chat-side-0-title-editor"),
+    ] {
+        change(&shell, cx, |shell, _, cx| {
+            shell.open_rename_chat(chat.into(), cx);
+        });
+        settled(&shell, cx);
+        for _ in 0..4 {
+            cx.run_until_parked();
+            draw(&shell, cx, 100);
+        }
+        let field = cx.debug_bounds(selector).unwrap();
+        let card = cx.debug_bounds("session-lanes").unwrap();
+        assert!(
+            field.top() >= card.top() && field.bottom() <= card.bottom(),
+            "{chat}'s editor {field:?} is outside the card {card:?}"
+        );
+        cx.update(|window, cx| {
+            shell.read_with(cx, |shell, cx| {
+                let rename = shell.chat_rename.as_ref().unwrap();
+                assert_eq!(rename.chat_id, chat);
+                assert!(rename.input.focus_handle(cx).is_focused(window));
+            });
+        });
+    }
+}
+
+#[gpui::test]
 fn worked_project_diff_watch_tracks_effective_details_visibility(cx: &mut TestAppContext) {
     fn project(id: &str, path: &str) -> WorkersProject {
         WorkersProject {
@@ -642,13 +769,13 @@ fn worked_project_diff_watch_tracks_effective_details_visibility(cx: &mut TestAp
                 cancellations.push(request.id);
                 continue;
             }
-            if request.method.as_deref() == Some(methods::WATCH_CHECKOUT_DIFFS)
-                && request.params.get("cwds").is_some()
-            {
-                assert_eq!(
-                    request.params["cwds"],
-                    serde_json::json!(["/tmp/worked-first", "/tmp/worked-second"])
-                );
+            if request.method.as_deref() == Some(methods::WATCH_CHECKOUT_DIFFS) {
+                if request.params.get("cwds").is_some() {
+                    assert_eq!(
+                        request.params["cwds"],
+                        serde_json::json!(["/tmp/worked-first", "/tmp/worked-second"])
+                    );
+                }
                 watches.push(request.id);
             }
             replies
@@ -793,4 +920,97 @@ fn worked_project_diff_watch_tracks_effective_details_visibility(cx: &mut TestAp
     );
     assert_eq!(watches.len(), 2, "visible Details starts a fresh watch");
     assert_ne!(watches[0], watches[1]);
+
+    // Session information has its own host-wide subscription, without `cwds`.
+    // Its lifetime must end at hidden routes/cards, independently of Details.
+    change(&shell, cx, |shell, _, cx| {
+        shell.settings.details_sidebar_open = false;
+        shell.settings.session_info_hidden = false;
+        settings::update(settings::SavePolicy::Immediate, cx, |settings| {
+            settings.details_sidebar_open = false;
+            settings.session_info_hidden = false;
+        });
+    });
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert!(
+        cancellations.contains(&watches[1]),
+        "Details releases its watch"
+    );
+    assert_eq!(
+        watches.len(),
+        3,
+        "Session information starts one host watch"
+    );
+    let session_watch = watches[2];
+    change(&shell, cx, |shell, _, _| {
+        shell.route = Route::Settings(SettingsSection::General)
+    });
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert!(
+        cancellations.contains(&session_watch),
+        "Settings cancels the hidden card's scoped watch"
+    );
+    assert_eq!(watches.len(), 3, "Settings cannot restart a hidden watch");
+    change(&shell, cx, |shell, _, _| shell.route = Route::Chat);
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert_eq!(
+        watches.len(),
+        4,
+        "Returning to the card starts a fresh watch"
+    );
+    let session_watch = watches[3];
+    change(&shell, cx, |shell, _, cx| {
+        shell.settings.session_info_hidden = true;
+        settings::update(settings::SavePolicy::Immediate, cx, |settings| {
+            settings.session_info_hidden = true
+        });
+    });
+    settle_watch(
+        &shell,
+        cx,
+        &runtime,
+        &mut requests,
+        &replies,
+        &mut watches,
+        &mut cancellations,
+    );
+    assert!(
+        cancellations.contains(&session_watch),
+        "Hiding the card cancels its scoped watch"
+    );
+    assert_eq!(watches.len(), 4, "The hidden card stays unsubscribed");
+}
+
+#[gpui::test]
+fn side_chat_rename_scrolls_to_its_row_in_a_docked_card(cx: &mut TestAppContext) {
+    check_side_chat_rename_scroll(cx, 1600.0, false);
+}
+
+#[gpui::test]
+fn side_chat_rename_scrolls_to_its_row_in_a_floating_card_without_motion(cx: &mut TestAppContext) {
+    check_side_chat_rename_scroll(cx, 1000.0, true);
 }

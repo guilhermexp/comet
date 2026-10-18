@@ -44,6 +44,8 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 - Both RegistryDoc and WorkspaceDoc preserve optional `lastCompletedTurn` in Session rows; absent legacy fields decode as None. Context usage and error metadata retain their existing contracts.
 
+- Native `visual` parts are atomic id/path/name references (`name` projects to title), not text. Missing/empty path degrades to `Visual unavailable`. The Edge materializer preserves the same shape; Luau source/assets never enter the document. Sidebar sections use convergent neighbor anchors and preserve old-reader compatibility.
+
 ## Work Guidance
 
 - Bug de "a UI não atualizou" quase sempre é diff não aplicado no mirror, não render — comece por aqui antes de `zeron-ui`.

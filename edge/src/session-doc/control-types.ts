@@ -66,6 +66,7 @@ export interface UserInputAnswer {
 
 /** Message parts — the structured view of an assistant turn (parts.ts). */
 export type MessagePart =
+  | { readonly kind: "visual"; readonly id: string; readonly path: string; readonly title: string }
   | { readonly kind: "image"; readonly id: string; readonly path: string; readonly name: string; readonly mimeType: string }
   | {
       readonly kind: "text";

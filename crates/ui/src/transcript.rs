@@ -837,6 +837,12 @@ pub enum RowKind {
         name: String,
         mime_type: String,
     },
+    /// An agent's `show_visual` script, rendered inline by [`crate::visuals`].
+    Visual {
+        owner: String,
+        path: String,
+        title: String,
+    },
     User {
         /// Visible prompt (attachment-ref trailer already stripped). When the
         /// prompt carries file mentions this is the *projected* display text —
@@ -2381,6 +2387,31 @@ fn rows_for_entry_with_todo_history(
                                     path: path.clone(),
                                     name: name.clone(),
                                     mime_type: mime_type.clone(),
+                                },
+                            },
+                        });
+                    }
+                    MessagePart::Visual {
+                        id: part_id,
+                        path,
+                        title,
+                    } => {
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: fnv1a(
+                                    format!("{}\0{path}\0{title}", entry.device_id).as_bytes(),
+                                ),
+                                turn_start: false,
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                                kind: RowKind::Visual {
+                                    owner: entry.device_id.clone(),
+                                    path: path.clone(),
+                                    title: title.clone(),
                                 },
                             },
                         });
@@ -4639,6 +4670,13 @@ pub struct Transcript {
     /// Width held free at the column's right for a docked side card; the
     /// reading column centers in what remains.
     right_reserve: f32,
+    /// Last global code-fence layout generation applied to this transcript.
+    /// Each instance owns separate scroll handles and list measurements, so
+    /// every one must reset itself after a global Fit-mode transition.
+    /// Last math-style generation applied (see
+    /// [`crate::settings::math_generation`]); like the code-fence one, each
+    /// instance remeasures its own rows.
+    math_generation: u64,
     /// Compact mode as last applied to this instance's row split. Render
     /// polls the setting each frame; a flip rebuilds every row.
     compact_mode: bool,
@@ -4738,6 +4776,8 @@ pub struct Transcript {
     /// In-flight ReadAttachmentChunk loads, keyed by device, path, and (for a
     /// generated image) its declared raster MIME — one per source.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
+    /// Inline `show_visual` visuals, keyed by row id.
+    visuals: HashMap<SharedString, Entity<crate::visuals::VisualFrame>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
@@ -5122,6 +5162,7 @@ impl Transcript {
             inline_code_links: Default::default(),
             content_width: crate::settings::transcript_width(cx),
             right_reserve: 0.0,
+            math_generation: crate::settings::math_generation(cx),
             compact_mode: crate::settings::transcript_compact_mode(cx),
             highlights: HighlightStore::default(),
             show_jump_button: false,
@@ -5168,6 +5209,7 @@ impl Transcript {
             mermaid_copied_svg: None,
             mermaid_copied_code: None,
             attachment_loads: HashMap::new(),
+            visuals: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
@@ -6212,6 +6254,7 @@ impl Transcript {
                 self.own_turn_kick = false;
                 self.own_turn_last_tick = None;
             }
+            self.visuals.clear();
             self.chat_id = selected;
             self.tool_images.clear(cx);
             self.image_copy = None;
@@ -8621,6 +8664,7 @@ impl Transcript {
                         link,
                         workspace_root: self.workspace_root(cx),
                         code: None,
+                        math: crate::settings::math_style(cx),
                     };
                     let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                     render::render_block(
@@ -8692,6 +8736,7 @@ impl Transcript {
                     link,
                     workspace_root: self.workspace_root(cx),
                     code: None,
+                    math: crate::settings::math_style(cx),
                 };
                 if seed_history && let Some(veil) = &veil {
                     let historical = &self.historical_markdown[&row.id];
@@ -8810,6 +8855,9 @@ impl Transcript {
             }
             RowKind::Question { history } => {
                 crate::questions::render(history, &theme, cx.entity_id(), cx)
+            }
+            RowKind::Visual { owner, path, title } => {
+                self.render_visual(&row.id, owner, path, title, cx)
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::Notice { text } => notice_divider(text.clone(), &theme),
@@ -10139,6 +10187,11 @@ impl Transcript {
     /// Rows left the transcript (compact fold settled, history rebuilt):
     /// their chips' previews start the release grace.
     fn release_departed_tool_images(&mut self, cx: &mut Context<Self>) {
+        let live_visuals: HashSet<_> = flat_rows(&self.rows)
+            .filter(|row| matches!(row.kind, RowKind::Visual { .. }))
+            .map(|row| row.id.clone())
+            .collect();
+        self.visuals.retain(|key, _| live_visuals.contains(key));
         if self.tool_images.is_idle() {
             return;
         }
@@ -10399,6 +10452,52 @@ impl Transcript {
         ))
     }
 
+    fn render_visual(
+        &mut self,
+        row_id: &SharedString,
+        owner: &str,
+        path: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let link_ui = self.link_ui(cx);
+        let frame = match self.visuals.get(row_id) {
+            Some(frame) => frame.clone(),
+            None => {
+                let state = self.state.read(cx);
+                let engine = state.engine().cloned();
+                // Relay-forward only for a genuinely remote owner.
+                let target =
+                    (state.local_device_id.as_deref() != Some(owner)).then(|| owner.to_owned());
+                let frame = cx.new(|cx| {
+                    crate::visuals::VisualFrame::new(
+                        row_id.clone(),
+                        title.to_owned(),
+                        path.to_owned(),
+                        engine,
+                        target,
+                        cx,
+                    )
+                });
+                // A visual whose tree changes shape (a tab switch, a load)
+                // resizes its row, like a diagram finishing.
+                let id = row_id.clone();
+                cx.subscribe(
+                    &frame,
+                    move |this, _, _: &crate::visuals::VisualLayoutChanged, cx| {
+                        this.remeasure_row_containing(&id);
+                        cx.notify();
+                    },
+                )
+                .detach();
+                self.visuals.insert(row_id.clone(), frame.clone());
+                frame
+            }
+        };
+        frame.update(cx, |frame, _| frame.set_link_ui(link_ui));
+        div().w_full().child(frame).into_any_element()
+    }
+
     fn render_reasoning(
         &mut self,
         row_id: &SharedString,
@@ -10506,6 +10605,7 @@ impl Transcript {
                 link: self.link_ui(cx),
                 workspace_root: self.workspace_root(cx),
                 code: None,
+                math: crate::settings::math_style(cx),
             };
             let highlights = self.code_highlight_for(row_id, tree, None, cx);
             let mut trace_theme = theme.clone();
@@ -10714,6 +10814,7 @@ impl Transcript {
                 link: None,
                 workspace_root: None,
                 code: None,
+                math: crate::settings::math_style(cx),
             };
             let highlight = self.code_highlight_for(row_id, tree, Some(block_ix), cx);
             return render::render_block(
@@ -13375,6 +13476,12 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 acc.push(0);
             }
         }
+        if let MessagePart::Visual { path, title, .. } = part {
+            for field in [path, title] {
+                acc.extend_from_slice(field.as_bytes());
+                acc.push(0);
+            }
+        }
         if let MessagePart::Input {
             questions,
             answers,
@@ -13419,6 +13526,20 @@ impl Render for Transcript {
             // Cached tool rows baked the old default; re-render and re-measure.
             self.render_cache.borrow_mut().clear();
             self.list.remeasure();
+        }
+        let math_generation = crate::settings::math_generation(cx);
+        if self.math_generation != math_generation {
+            self.math_generation = math_generation;
+            // Formulas change size with their face, and display math becomes
+            // a code block (or back), so every row with math changes height.
+            // The render cache drops its laid-out text on its own.
+            self.list.remeasure();
+            if self.pinned {
+                self.wake_spring();
+            }
+            if self.own_turn.is_some() {
+                self.own_turn_kick = true;
+            }
         }
         let content_width = crate::settings::transcript_width(cx);
         if self.content_width != content_width {

@@ -130,6 +130,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - Completion markers publish atomically with status/error and survive hydration. Pending accepted steers suppress internal-handoff completion; mailbox acceptance and ledger insertion are serialized. Quiescence publishes completion only for nonempty output without pending steers.
 - Model discovery com catálogo em disco espera a lista viva só 100ms e serve o disco; esse caso é `debug` ("Model discovery deferred"), não falha — o refresh continua e loga "Model discovery failed" se de fato falhar. O warning restante carrega `reason` legível, nunca `Option` em debug.
 
+- `PublishVisual` is local-only and accepts only a live turn. Validate title/script bytes and named assets, run bounded Luau/control validation in `spawn_blocking`, store assets before the script, then inject an atomic Visual event. Failure/ended turn removes its stored files. This does not change root MCP grants or enable per-run MCP injection. `workspace_checkout` includes the registered main and detached worktrees with NUL-safe paths and a bounded filesystem worker; deletion keeps its distinct ownership/branch query.
+
 ## Work Guidance
 
 - O watchdog de quietude respeita `authoritative_prompt_end` em turnos com prompt: ACP permanece `Working` até o sinal autoritativo e aceita o próximo steer. Atividade autônoma mantém o fallback, coberto por `tests/acp_lifecycle.rs`.
@@ -182,6 +184,12 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/{doc_host,sessions}.rs` + `tests/runtime_survival.rs` (ordem Send/Stop, cancelamento antes de reutilizar runtime e redelivery de mailbox na troca de runtime) | integration — harness controlado | `cargo test -p zeron-engine --test runtime_survival stop_cancels_sends_held_for_the_stopped_turn` · `cargo test -p zeron-engine --test runtime_survival a_steer_sent_before_stop_is_cancelled_with_it` · `cargo test -p zeron-engine --test runtime_survival a_send_accepted_by_a_stopping_runtime_is_redispatched` |
 | `tests/queued_attachments.rs` | integration — bytes específicos de cada fixture + path local no prompt do run e readback opaco | `cargo test -p zeron-engine --test queued_attachments` |
 | Superfície multi-device real | e2e manual | `scripts/e2e-smoke.sh` |
+
+Additional integration coverage:
+
+| Layer / path | Tier | Command |
+| --- | --- | --- |
+| `tests/e2e.rs::publish_visual_lands_in_the_live_turn` + visual uploads | integration — actual RPC/Loro/host upload paths | `cargo test -p zeron-engine --test e2e publish_visual_lands_in_the_live_turn` |
 
 ## Child DOX Index
 

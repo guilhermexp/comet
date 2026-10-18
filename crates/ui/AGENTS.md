@@ -388,6 +388,11 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - **Projeto vazio não é seleção automática de Workers**: `apply_snapshot` nunca escolhe o primeiro registro como fallback. Ao desaparecer a última sessão do projeto selecionado, a seleção implícita é limpa (inclui archive/remove local e refresh de alteração externa). Projeto vazio selecionado explicitamente ou com launch pendente continua acessível; o ledger e os arquivos não são removidos.
 - **Quit drena a engine in-process antes do `cx.quit()`.** O GPUI dá 200ms (`SHUTDOWN_TIMEOUT`, zui vendorizado) aos handlers de `on_app_quit`; o shutdown da engine leva segundos e os flushes do fim (snapshots) nunca rodavam (`timed out waiting on app_will_quit`). `app_menus::quit_after_save` chama `drain_engine_then_quit` (`lib.rs`): esconde o app, roda `EngineHandle::shutdown` no Tokio com teto de 8s e só então `finish_quit`. Segundo ⌘Q durante a drenagem é absorvido; o `on_app_quit` vira no-op depois dela e segue como fallback de caminhos que não passam pelo gate. Engine remota sai na hora.
 
+- Native visuals (`visuals.rs`) render sandboxed Luau trees from a host-owned `visual` part. GPU scenes/shaders render off the UI thread with reusable targets; dropping a departed Chat/row releases frames and sprite images. Math (`markdown/math.rs`, zatex) preserves source offsets for selection/copy, bounds layout/cache/fallback work, and reads all six fonts plus size/render preferences from the central SettingsStore.
+- The session lanes below Session information list side Chats with bounded scrolling, Finished folding and rename reveal. When the rendered Details Workers widget owns subagents, lanes omit their duplicate presentation; hiding that widget or Details restores the lane. Cancellation follows the existing `chat_workers::activity_tasks_from_entries` projection. CLI Workers retain their own lifecycle, telemetry and counts. New side chat/Fork chat stay in the Details header and lane controls. A tab/menu rename reveals the parent lane; the old tab title editor is retired.
+- Session information checkout totals use a scoped subscription only while their location metadata is visible. Settings/non-ready/Workers routes and hidden cards release it before early exits. This is independent of Worked Projects' existing local subscriptions.
+- Session hover cards reconcile once per sidebar render, honor dwell/warm timing and dismiss on scroll/drag/menu. Titles use the fork mention projection; confirmed PR badges retain device scope. Archived visibility is persisted by `apply_shell_settings`; Delete all snapshots only confirmed archived IDs and rechecks each before deletion.
+
 ## Work Guidance
 
 - **Workers / Projects:** ambas as telas agrupam checkouts pelo projeto
@@ -436,7 +441,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/terminal/view.rs` (reverse video com terminal translúcido) | unit | `cargo test -p zeron-ui --lib monocode_wash_terminal_inverse_stays_legible` |
 | `src/pickers.rs` (bloqueio de troca de Ref por `Working` e badge de Retarget) | unit — predicados puros; trigger/popover são visuais (`scripts/dev-demo.sh`) | `cargo test -p zeron-ui --lib live_ref_switch_is_blocked_only_while_working` · `cargo test -p zeron-ui --lib worktree_row_declares_the_retarget_cost` |
 | `src/pickers.rs` (último modelo escolhido, navegação e persistência) | unit — GPUI TestAppContext sem render nem engine, com armazenamento temporário | `cargo test -p zeron-ui existing_chat_model_pick_is_remembered_for_new_chats --lib` |
-| `src/{chat_export,image_media}.rs` (ExportDoc, generated-image metadata/escaping, bounded raster decode and animated GIF first-frame normalization) | unit | `cargo test -p zeron-ui --lib chat_export` · `cargo test -p zeron-ui --lib image_media` |
+| `src/{chat_export,image_media}.rs` (ExportDoc, generated-image and Visual reference metadata/escaping, bounded raster decode and animated GIF first-frame normalization) | unit | `cargo test -p zeron-ui --lib chat_export` · `cargo test -p zeron-ui --lib image_media` |
 | `src/shell.rs` (menu EXPORT, resolução do transcript, notice) | unit — decisões puras; render gpui é visual | `cargo test -p zeron-ui --lib export` |
 | `src/url_chips.rs` + projeção da row de usuário | unit | `cargo test -p zeron-ui url_chips` · `cargo test -p zeron-ui transcript` |
 | `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p zeron-ui` |
@@ -488,7 +493,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/details_sidebar/view.rs` (ticker de usage e idade de launch, retenção de snapshot, render gpui; reducers puros de `DetailsSidebarPreferences` — marcadores de colapso per-context (só chaves `:`; caminhos de arquivo de builds antigos são descartados na carga), visibilidade de widgets) | unit nos reducers de preferência; ciclo de vida de `Task`/render gpui é visual | `cargo test -p zeron-ui --lib details_sidebar::view` · `scripts/dev-demo.sh` |
 | `src/terminal/emulator.rs` (ANSI, seleção e retenção opt-in da tela alternativa) | unit — controle dividido entre chunks, tela principal e tela viva preservadas | `cargo test -p zeron-ui --lib terminal::emulator` |
 | `src/shell.rs` (divisores, orçamento responsivo e preservação da coluna vizinha) | unit — geometria pura; arraste nativo é visual | `cargo test -p zeron-ui --lib shell::tests` |
-| `src/shell/{panel_layout,session_info,panel_interaction_tests}.rs` (reset isolado de Details, metadata responsiva e composer acompanhando a geometria renderizada) | unit — GPUI TestAppContext com layout e resize reais | `cargo test -p zeron-ui resetting_details_width_restores_default_and_preserves_right_preference` · `cargo test -p zeron-ui details_owns_session_location_metadata_while_session_actions_remain` · `cargo test -p zeron-ui panels_share_space_and_keep_rendered_geometry_through_their_lifecycle` |
+| `src/shell/{panel_layout,session_info,panel_interaction_tests}.rs` (reset isolado de Details, metadata responsiva, cancelamento RPC dos watches de Details/Session information ao ocultar ou mudar de rota e composer acompanhando a geometria renderizada) | unit — GPUI TestAppContext com layout e resize reais | `cargo test -p zeron-ui resetting_details_width_restores_default_and_preserves_right_preference` · `cargo test -p zeron-ui details_owns_session_location_metadata_while_session_actions_remain` · `cargo test -p zeron-ui panels_share_space_and_keep_rendered_geometry_through_their_lifecycle` |
 | `src/{shell,settings,terminal}/**` (render gpui) | unit nos fixtures existentes; caminhos sem fixture e aparência final exigem QA nativo | testes focados da surface · `scripts/dev-demo.sh` |
 | `src/workers/workspace.rs` (ordem por atividade da sidebar, subtree de projeto, cap de rows com a selecionada garantida, ramo de `session_sort`, confirmação de remoção sem hooks e faixa advisory) | unit (projeções puras); render gpui é visual | `cargo test -p zeron-ui workers::workspace` |
 | `src/workers/project_menu.rs` (elegibilidade de remoção comum e override sem hooks por posse/availability) | unit | `cargo test -p zeron-ui workers::project_menu` |
@@ -504,6 +509,13 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/file_preview/view.rs` (Markdown visível, cache e viewport) + `examples/preview_probe.rs` | none — probe nativo de frame e QA visual; limite de tempo depende da máquina | `cargo run -p zeron-ui --example preview_probe -- /absolute/report.md` · procedimento em `docs/report-preview-performance-2026-09-09.md` |
 | `src/file_preview/native_document.rs` (detach e first responder AppKit) + `tests/native_preview_focus.rs` | integration — janela GPUI/WebKit reais na main thread, opt-in macOS; não prova envio no Chat | `ZERON_NATIVE_PREVIEW_FOCUS_TEST=1 cargo test -p zeron-ui --test native_preview_focus` |
 
+Additional integration coverage:
+
+| Layer / path | Tier | Command |
+| --- | --- | --- |
+| `src/{visuals,markdown/math}.rs` + `shell/{session_lanes,session_hover_card,sidebar_sections,session_info}.rs` | unit / GPUI; appearance and GPU interaction need isolated native smoke | `cargo test -p zeron-ui --lib` |
+| `src/settings.rs` + `settings/archived.rs` | unit / GPUI — central persistence, captured confirmation set and partial failures | `cargo test -p zeron-ui --lib settings` |
+
 ## Child DOX Index
 
 `tests/native_preview_focus.rs` é um runner de integração macOS com `harness = false` para executar AppKit na main thread. Inclui o módulo de produção sem expor API de teste; só cria uma janela isolada quando `ZERON_NATIVE_PREVIEW_FOCUS_TEST=1`. O restante da suite imprime `SKIPPED` para esse runner.
@@ -511,3 +523,5 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 Subárvores com doc próprio: [`src/appshots/AGENTS.md`](src/appshots/AGENTS.md) (captura nativa de janela, consentimento, destino imutável e transporte de Appshots).
 
 Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs, voice stage), `terminal/` (emulator, panel, view), `settings/`, `markdown/`, `workers/` (model, client compartilhado, terminal de polling/journal, menus de sessão/projeto/workspace, menu bar status item e monitor de recursos — interface com `crates/workers-unpeel`), `composer/` (chip e testes), `orb/` (primitivas de orb), `voice/` (permissões e transporte remoto da UI). Os módulos-raiz `chat_export.rs`, `composer.rs`, `voice.rs`, `markdown_decor.rs` e `inspector.rs` (dev-only) também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.
+
+Visuals remain visible outside settled tool-activity folds, like generated images. Chat export records their title/path in Markdown, text and JSON without loading scripts or assets.

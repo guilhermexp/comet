@@ -25,6 +25,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
   interactive delivery. Regression seam:
   `cargo test -p zeron-workers-unpeel --test worker_initial_briefing`.
 
+- `visual` owns sandboxed Luau/native element trees and CPU raster/scene validation; `visual-gpu` owns bounded offscreen GPU state shared by desktop/mobile. `zatex` owns pure TeX layout and bundled math font provenance. None depends on UI or engine.
+
 ## Work Guidance
 
 - Mudança que atravessa duas crates quase sempre indica que o tipo está na camada errada: tipo de fio vai pra `proto`, forma de documento vai pra `doc`.
@@ -70,3 +72,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-voice-session` | [`voice-session/AGENTS.md`](voice-session/AGENTS.md) | Lifecycle e transporte de cliente de voz local/remoto |
 | `zeron-orb` | [`orb/AGENTS.md`](orb/AGENTS.md) | Geometria e animação de orb compartilhadas, sem renderer |
 | `zeron-veil` | [`veil/AGENTS.md`](veil/AGENTS.md) | Fade e revelação de texto compartilhados, sem renderer |
+
+| `zeron-visual` | [`visual/AGENTS.md`](visual/AGENTS.md) | Sandboxed Luau and native visual model |
+| `zeron-visual-gpu` | [`visual-gpu/AGENTS.md`](visual-gpu/AGENTS.md) | Offscreen GPU shader/scene rendering |
+| `zatex` | [`zatex/AGENTS.md`](zatex/AGENTS.md) | Bounded TeX layout and six math fonts |

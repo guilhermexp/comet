@@ -27,6 +27,9 @@ members = [
     "crates/client",
     "crates/mcp",
     "crates/text",
+    "crates/visual",
+    "crates/visual-gpu",
+    "crates/zatex",
     "apps/zeron",
 ]
 exclude = [
@@ -69,6 +72,9 @@ zeron-client = { path = "crates/client" }
 zeron-theme = { path = "crates/theme" }
 zeron-mcp = { path = "crates/mcp" }
 zeron-text = { path = "crates/text" }
+zatex = { path = "crates/zatex" }
+zeron-visual = { path = "crates/visual" }
+zeron-visual-gpu = { path = "crates/visual-gpu" }
 
 # CRDT
 loro = "1.13"
@@ -118,6 +124,12 @@ gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "701ca97a
 
 # Native voice support. Optional activation is declared by the consuming crate.
 base64 = "0.22"
+mlua = { version = "0.12", features = ["luau"] }
+naga = { version = "29", features = ["glsl-in"] }
+gltf = { version = "1", default-features = false, features = ["import", "utils", "names", "KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_emissive_strength"] }
+wgpu = { version = "29", features = ["glsl"] }
+pollster = "0.4"
+tiny-skia = "0.11"
 crossbeam-queue = "0.3"
 cpal = "=0.18.2"
 webrtc-audio-processing = { version = "~2.1.0", features = ["bundled"] }
@@ -248,6 +260,12 @@ gpui = { path = "third_party/zui/crates/gpui" }
 gpui_macros = { path = "third_party/zui/crates/gpui_macros" }
 gpui_platform = { path = "third_party/zui/crates/gpui_platform" }
 gpui_tokio = { path = "third_party/zui/crates/gpui_tokio" }
+# Scenes rasterize in software every frame the camera moves.
+[profile.dev.package.zeron-visual]
+opt-level = 3
+
+[profile.dev.package.zeron-visual-gpu]
+opt-level = 3
 
 # Mobile core (scripts/ios/build-core.sh). Always optimized — layout and sync
 # run on the phone's hot paths, so even Debug app builds link an -O core.

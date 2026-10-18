@@ -319,6 +319,7 @@ rpc_methods! {
     UPLOAD_CHUNK / UploadChunk = "UploadChunk" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     UPLOAD_COMMIT / UploadCommit = "UploadCommit" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     READ_ATTACHMENT_CHUNK / ReadAttachmentChunk = "ReadAttachmentChunk" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    PUBLISH_VISUAL / PublishVisual = "PublishVisual" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     FETCH_TOOL_BLOB / FetchToolBlob = "FetchToolBlob" { params: serde_json::Value, reply: serde_json::Value },

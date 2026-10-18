@@ -22,7 +22,7 @@ Convergent section header drag order, iOS cross-section/pin drag, neighbor ancho
 
 Dwell/warm hover card, dismiss on scroll/drag/menu, once-per-frame lifecycle and metadata; retain mentions and fork rows. Source 840fda74; exact incoming files are recorded by git diff and per-commit manifests in evidence.
 
-### U6: TAKE
+### U6: ADAPT
 
 OpenCode v2 forms normalize to field-keyed input panels and form route; v1 works and engine owns lifecycle. Source 9609f994; exact incoming files are recorded by git diff and per-commit manifests in evidence.
 
@@ -32,9 +32,9 @@ Cursor Plus catalog/defaults on fresh and switched runs, warm catalog; protect d
 
 ### U8: ADAPT
 
-Recent Files flicker fix with unified search/index ownership. Source 2a209cc6; exact incoming files are recorded by git diff and per-commit manifests in evidence.
+Recent Files reduces authorization Git round trips with concurrent checkout/identity lookup and NUL-safe worktree parsing; fork unified search/index ownership remains. Source 2a209cc6; exact incoming files are recorded by git diff and per-commit manifests in evidence.
 
-### U9: TAKE
+### U9: ADAPT
 
 Persist sidebar Archived visibility setting. Source 81e04e1c; exact incoming files are recorded by git diff and per-commit manifests in evidence.
 

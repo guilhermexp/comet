@@ -142,6 +142,7 @@ pub(super) fn fragment(flat: &FlatText, range: Range<usize>) -> FlatText {
         chips: Vec::new(),
         hovered_chip: flat.hovered_chip.clone(),
         file_glyphs: Vec::new(),
+        math: Vec::new(),
     }
 }
 

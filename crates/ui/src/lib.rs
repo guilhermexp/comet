@@ -91,6 +91,7 @@ pub mod transcript;
 mod turn_steps;
 pub mod typography;
 mod url_chips;
+pub mod visuals;
 pub mod voice;
 pub mod workers;
 mod workspace_links;

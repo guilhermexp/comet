@@ -80,3 +80,41 @@ Test: unit
 
 Test: e2e
 
+#### Scenario: Visual publication keeps root grants and bounded validation
+- **WHEN** a root Chat receives its authorized tools and publishes a visual during a live turn
+- **THEN** the engine SHALL validate bounded script/assets before storing and publishing atomic references
+- **AND** child Chats, subagents, Workers and internal title/recap runs SHALL not gain the root tool grant
+- **AND** invalid scripts or absent live turns SHALL fail explicitly without a persisted visual
+
+Test: integration
+
+#### Scenario: Math retains source and rendering budgets
+- **WHEN** formulas stream, fail to parse, exceed layout budgets or switch among the six fonts
+- **THEN** desktop/mobile SHALL preserve readable source fallback and source text for copy/selection
+- **AND** settings changes SHALL invalidate each surface's measured formula rows without replacing file links or Mermaid
+
+Test: unit
+
+#### Scenario: OpenCode question forms keep engine input ownership
+- **WHEN** v2 emits a question form with keyed single and multiple selection fields
+- **THEN** the real adapter SHALL submit the field-keyed answer body to the form route
+- **AND** the adapter SHALL emit no duplicate input lifecycle events
+- **AND** v1 question request/reply paths SHALL continue to work
+
+Test: integration
+
+#### Scenario: Cursor defaults follow the current model
+- **WHEN** a run starts or changes model with implicit model parameters
+- **THEN** the real adapter SHALL fill options from the credential-scoped warm catalog without waiting for an unnecessary refresh
+- **AND** explicit options SHALL win and rejected Max Mode defaults SHALL be excluded
+
+Test: integration
+
+#### Scenario: Fork UI state remains authoritative
+- **WHEN** Details hides or yields its subagent presentation, a section moves, or Archived visibility changes
+- **THEN** lanes SHALL retain bounded side-chat/subagent navigation and cancellation state without duplicate activity
+- **AND** hidden metadata SHALL release scoped diff watches before route/gate early exits
+- **AND** the central settings writer SHALL persist Archived visibility without clobbering settings owned elsewhere
+
+Test: unit
+

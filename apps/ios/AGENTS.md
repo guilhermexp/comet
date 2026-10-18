@@ -41,6 +41,8 @@ WebRTC e o lifecycle remoto ficam em `Zeron/Voice/`.
   clones/checkouts do mesmo repositório usam a identidade de projeto e a ordem
   recente permanece. Chats sem Project formam um grupo por device.
 
+- SplitRoot adapts between compact tabs and regular split presentation while retaining navigation/fold state. Transcript/composer geometry uses the actual uneven safe areas and readable width. Section drag moves Chats across sections/pins with neighbor anchors. Native `VisualView` consumes Rust-owned visual display lists; math faces resolve from the shared bundled table. These paths require Simulator/device interaction tests, including fold/unfold with keyboard and selection.
+
 ## Work Guidance
 
 Mudança de API UniFFI exige regenerar as bindings pelo fluxo de

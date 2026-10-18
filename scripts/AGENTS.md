@@ -38,6 +38,8 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 - **`omp-dev` é opt-in.** `cargo run` usa o OMP instalado, resolvido pelo harness; `.cargo/config.toml` não impõe um checkout de OMP. Para desenvolver capabilities locais, usar explicitamente `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run`. O wrapper entrega `../oh-my-pi` (ou `ZERON_OMP_SOURCE_DIR`) somente com CLI executável e `node_modules/@oh-my-pi/pi-natives`; caso contrário usa o `omp` instalado. O catálogo de modelos e as capabilities são os do runtime escolhido: o checkout local pode ter Live Voice e ainda assim estar atrasado nos modelos. Não reintroduzir override implícito, nem interpretar o binário novo do Comet como atualização do OMP.
 - O workflow `release.yml` (tag `v*`) espera artefato nomeado `zeron-<versão>-*` dentro de `dist/`. Renomear artefato quebra o gate de nome no CI.
 
+- The native Cargo runner disables app replacement with `ZERON_AUTO_UPDATE=0`, including direct exec; `run-macos-dev.sh` and Info-dev.plist carry the same policy. Demo fanout seeds coexist with the fork Worker fixture, isolated profile/port overrides and Bash 3.2-compatible scalar project IDs. Demo folders default to temporary paths, never real project folders.
+
 ## Work Guidance
 
 - Comando novo de dev vira script aqui e entra na tabela de comandos do `../AGENTS.md`.
