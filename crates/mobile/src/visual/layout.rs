@@ -92,6 +92,13 @@ struct LaidMark {
 }
 
 impl Laid {
+    /// Whether two surfaces share an id: the host keys frames and touches
+    /// by it, so such a layout must never be displayed.
+    pub(crate) fn has_duplicate_surface(&self) -> bool {
+        let mut ids = std::collections::HashSet::with_capacity(self.surfaces.len());
+        !self.surfaces.iter().all(|s| ids.insert(s.id))
+    }
+
     fn mark(&self) -> LaidMark {
         LaidMark {
             paint: self.paint.mark(),

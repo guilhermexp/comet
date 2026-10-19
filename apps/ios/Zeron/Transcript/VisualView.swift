@@ -15,6 +15,12 @@ final class VisualView: UIView {
     private var surfaces: [UInt64: VisualSurfaceView] = [:]
     private var controls: [UInt64: VisualControlView] = [:]
     private(set) var display: VisualDisplay?
+    /// Why the visual can't be drawn, shown in its place.
+    private(set) var failure: VisualRasterError?
+    private var failureLabel: UILabel?
+    var surfaceCount: Int { surfaces.count }
+    var controlCount: Int { controls.count }
+    var hasStaticImage: Bool { base.contents != nil }
     private var attached = false
     private var foreground = UIApplication.shared.applicationState != .background
     private var observers: [NSObjectProtocol] = []
@@ -82,11 +88,21 @@ final class VisualView: UIView {
     }
 
     /// A new layout: the static paint, surface frames and touch targets.
-    fileprivate func apply(_ d: VisualDisplay, image: CGImage?) {
+    fileprivate func apply(_ d: VisualDisplay, raster: Result<CGImage?, VisualRasterError>) {
+        display = d
+        let image: CGImage?
+        switch raster {
+        case let .success(drawn): image = drawn
+        case let .failure(error): return fail(error)
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
-        display = d
+        if failure != nil {
+            failure = nil
+            failureLabel?.removeFromSuperview()
+            failureLabel = nil
+        }
         base.frame = CGRect(x: 0, y: 0, width: CGFloat(d.width), height: CGFloat(d.height))
         base.contents = image
 
@@ -130,6 +146,40 @@ final class VisualView: UIView {
         }
     }
 
+    /// Nothing of a visual that can't be drawn stays live: no stale paint,
+    /// surface frames or touch targets, only the error.
+    fileprivate func fail(_ error: VisualRasterError) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        failure = error
+        base.contents = nil
+        for view in surfaces.values { view.removeFromSuperview() }
+        surfaces = [:]
+        for view in controls.values { view.removeFromSuperview() }
+        controls = [:]
+        let label = failureLabel ?? {
+            let label = UILabel()
+            label.numberOfLines = 0
+            label.font = .preferredFont(forTextStyle: .footnote)
+            label.adjustsFontForContentSizeCategory = true
+            label.textColor = Palette.danger
+            addSubview(label)
+            failureLabel = label
+            return label
+        }()
+        label.text = error.message
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if let label = failureLabel {
+            let size = label.sizeThatFits(CGSize(width: bounds.width, height: .greatestFiniteMagnitude))
+            label.frame = CGRect(x: 0, y: 0, width: bounds.width, height: ceil(size.height))
+        }
+    }
+
     fileprivate func apply(frame id: UInt64, image: CGImage?, paint: CGImage?) {
         guard let view = surfaces[id] else { return }
         CATransaction.begin()
@@ -139,7 +189,10 @@ final class VisualView: UIView {
     }
 
     override var accessibilityElements: [Any]? {
-        get { controls.values.sorted { ($0.frame.minY, $0.frame.minX) < ($1.frame.minY, $1.frame.minX) } }
+        get {
+            if let failureLabel { return [failureLabel] }
+            return controls.values.sorted { ($0.frame.minY, $0.frame.minX) < ($1.frame.minY, $1.frame.minX) }
+        }
         set {}
     }
 }
@@ -152,8 +205,9 @@ private final class VisualSink: VisualListener, @unchecked Sendable {
     private let fonts = StyleFonts()
     private let lock = NSLock()
     private var sizes: [UInt64: CGSize] = [:]
-    private var pendingDisplay: (VisualDisplay, CGImage?)?
+    private var pendingDisplay: (VisualDisplay, Result<CGImage?, VisualRasterError>)?
     private var pendingFrames: [UInt64: (CGImage?, CGImage?)] = [:]
+    private var pendingFailure: VisualRasterError?
     private var scheduled = false
 
     init(scale: CGFloat) {
@@ -163,10 +217,23 @@ private final class VisualSink: VisualListener, @unchecked Sendable {
     func display(display: VisualDisplay) {
         fonts.update(display.styles)
         let size = CGSize(width: CGFloat(display.width), height: CGFloat(display.height))
-        let image = VisualPainter.render(display.paint, size: size, scale: scale, fonts: fonts)
+        let raster = VisualPainter.render(display.paint, size: size, scale: scale, fonts: fonts)
         lock.lock()
-        sizes = Dictionary(uniqueKeysWithValues: display.surfaces.map { ($0.id, CGSize(width: CGFloat($0.w), height: CGFloat($0.h))) })
-        pendingDisplay = (display, image)
+        switch raster {
+        case .success:
+            // Rust refuses duplicate surface ids; never trap on one here.
+            sizes = Dictionary(
+                display.surfaces.map { ($0.id, CGSize(width: CGFloat($0.w), height: CGFloat($0.h))) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            pendingFailure = nil
+        case .failure:
+            // Frames already queued, or still coming, are for surfaces that
+            // will not be shown.
+            sizes = [:]
+            pendingFrames = [:]
+        }
+        pendingDisplay = (display, raster)
         schedule()
         lock.unlock()
     }
@@ -178,12 +245,28 @@ private final class VisualSink: VisualListener, @unchecked Sendable {
         lock.unlock()
         guard let size else { return }
         let image = frame.image.flatMap(VisualPainter.image)
-        let paint = frame.paint.shapes.isEmpty && frame.paint.runs.isEmpty
-            ? nil
-            : VisualPainter.render(frame.paint, size: size, scale: scale, fonts: fonts)
+        let paint: CGImage?
+        if frame.paint.shapes.isEmpty && frame.paint.runs.isEmpty {
+            paint = nil
+        } else {
+            switch VisualPainter.render(frame.paint, size: size, scale: scale, fonts: fonts) {
+            case let .success(drawn): paint = drawn
+            case let .failure(error):
+                lock.lock()
+                sizes = [:]
+                pendingFrames = [:]
+                pendingFailure = error
+                schedule()
+                lock.unlock()
+                return
+            }
+        }
         lock.lock()
-        pendingFrames[frame.surface] = (image, paint)
-        schedule()
+        // A surface dropped by a failure meanwhile takes no more frames.
+        if sizes[frame.surface] != nil {
+            pendingFrames[frame.surface] = (image, paint)
+            schedule()
+        }
         lock.unlock()
     }
 
@@ -195,13 +278,34 @@ private final class VisualSink: VisualListener, @unchecked Sendable {
             lock.lock()
             let display = pendingDisplay
             let frames = pendingFrames
+            let failure = pendingFailure
             pendingDisplay = nil
             pendingFrames = [:]
+            pendingFailure = nil
             scheduled = false
             lock.unlock()
             guard let view else { return }
-            if let (d, image) = display { view.apply(d, image: image) }
+            if let (d, raster) = display { view.apply(d, raster: raster) }
+            if let failure { return view.fail(failure) }
             for (id, (image, paint)) in frames { view.apply(frame: id, image: image, paint: paint) }
+        }
+    }
+}
+
+/// Why a paint can't be rasterized; shown in place of the visual.
+enum VisualRasterError: Error, Equatable {
+    /// A non-finite or negative size, or a scale that isn't positive.
+    case invalidSize
+    /// More pixels than one bitmap may hold.
+    case tooLarge
+    /// CoreGraphics couldn't make the bitmap (memory pressure).
+    case unavailable
+
+    var message: String {
+        switch self {
+        case .invalidSize: "Visual error: this visual has an invalid size and can't be shown."
+        case .tooLarge: "Visual error: this visual is too large to show; ask for a shorter view or split it into pages."
+        case .unavailable: "Visual error: there wasn't enough memory to draw this visual. Scroll away and back to try again."
         }
     }
 }
@@ -209,6 +313,29 @@ private final class VisualSink: VisualListener, @unchecked Sendable {
 /// Draws Rust-placed shapes and runs. Pure CoreGraphics: safe off the main
 /// thread.
 enum VisualPainter {
+    /// One bitmap's limits: the common GPU texture side, and 64 MiB of BGRA
+    /// in all. Matches `MAX_STATIC_SIDE_PX`/`MAX_STATIC_PIXELS` in
+    /// `crates/mobile/src/visual`, which lays out a short error instead.
+    static let maxSide = 16_384
+    static let maxPixels = 16_777_216
+
+    /// The bitmap for `size` points at `scale`, checked before anything is
+    /// converted to `Int` or allocated; `nil` when there's nothing to draw.
+    static func pixelSize(_ size: CGSize, scale: CGFloat) -> Result<(width: Int, height: Int)?, VisualRasterError> {
+        guard size.width.isFinite, size.height.isFinite, size.width >= 0, size.height >= 0,
+              scale.isFinite, scale > 0
+        else { return .failure(.invalidSize) }
+        let w = (size.width * scale).rounded(.up)
+        let h = (size.height * scale).rounded(.up)
+        guard w.isFinite, h.isFinite else { return .failure(.tooLarge) }
+        guard w > 0, h > 0 else { return .success(nil) }
+        guard w <= CGFloat(maxSide), h <= CGFloat(maxSide) else { return .failure(.tooLarge) }
+        let (width, height) = (Int(w), Int(h))
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        guard !overflow, pixels <= maxPixels else { return .failure(.tooLarge) }
+        return .success((width, height))
+    }
+
     static func color(_ c: Rgba) -> CGColor {
         CGColor(srgbRed: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: CGFloat(c.a))
     }
@@ -228,17 +355,23 @@ enum VisualPainter {
         )
     }
 
-    static func render(_ paint: VisualPaint, size: CGSize, scale: CGFloat, fonts: StyleFonts) -> CGImage? {
-        let width = Int((size.width * scale).rounded(.up))
-        let height = Int((size.height * scale).rounded(.up))
-        guard width > 0, height > 0,
-              let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: bitmap)
-        else { return nil }
+    /// `nil` for an empty size; an error, never a silent blank, when the
+    /// paint can't be drawn.
+    static func render(_ paint: VisualPaint, size: CGSize, scale: CGFloat, fonts: StyleFonts) -> Result<CGImage?, VisualRasterError> {
+        let pixels: (width: Int, height: Int)?
+        switch pixelSize(size, scale: scale) {
+        case let .success(checked): pixels = checked
+        case let .failure(error): return .failure(error)
+        }
+        guard let (width, height) = pixels else { return .success(nil) }
+        guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: bitmap)
+        else { return .failure(.unavailable) }
         // Top-left origin in points, like the display list.
         ctx.translateBy(x: 0, y: CGFloat(height))
         ctx.scaleBy(x: scale, y: -scale)
         draw(paint, in: ctx, fonts: fonts)
-        return ctx.makeImage()
+        guard let image = ctx.makeImage() else { return .failure(.unavailable) }
+        return .success(image)
     }
 
     static func draw(_ paint: VisualPaint, in ctx: CGContext, fonts: StyleFonts) {

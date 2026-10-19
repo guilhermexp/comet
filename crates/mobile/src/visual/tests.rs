@@ -505,3 +505,137 @@ fn frames_are_premultiplied_for_core_graphics() {
     let image = image_of(2, 1, vec![200, 100, 50, 128, 10, 20, 30, 255]);
     assert_eq!(image.bgra, vec![100, 50, 25, 128, 10, 20, 30, 255]);
 }
+
+#[test]
+fn duplicate_surface_keys_never_reach_the_display() {
+    let dup = open(
+        r#"
+        return ui.column {
+          ui.canvas { key = "same", height = 60, draw = function() end },
+          ui.canvas { key = "same", height = 60, draw = function() end },
+        }
+        "#,
+        300.0,
+    );
+    let (display, _) = dup
+        .display_where(|d| !d.surfaces.is_empty() || text_of(d).contains("duplicate surface key"));
+    let ids: Vec<u64> = display.surfaces.iter().map(|s| s.id).collect();
+    assert!(
+        ids.is_empty() && text_of(&display).contains("duplicate surface key"),
+        "{ids:?}: {}",
+        text_of(&display)
+    );
+
+    // A control that makes two keys equal keeps the last valid layout.
+    let ctl = open(
+        r#"
+        local s = ui.state { dup = false }
+        return function()
+          return ui.column {
+            ui.button { label = "Dup", on_click = function() s.dup = true end },
+            ui.canvas { key = "a", height = 60, draw = function() end },
+            ui.canvas { key = s.dup and "a" or "b", height = 60, draw = function() end },
+          }
+        end
+        "#,
+        300.0,
+    );
+    let (display, _) = ctl.ready();
+    let before: Vec<u64> = display.surfaces.iter().map(|s| s.id).collect();
+    assert_eq!(before.len(), 2);
+    assert_ne!(before[0], before[1]);
+    ctl.session.activate(display.controls[0].id);
+    let (display, _) = ctl.display_where(|d| text_of(d).contains("duplicate surface key"));
+    assert_eq!(
+        display.surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+        before
+    );
+}
+
+#[test]
+fn colliding_surface_ids_are_detected_after_layout() {
+    let mut visual = Visual::load(
+        "return ui.column { ui.canvas { key = 'a', height = 60, draw = function() end },
+           ui.scene { key = 'b', height = 60, draw = function() end } }",
+        1,
+    )
+    .unwrap();
+    let mut tree = visual.render().unwrap();
+    let text = crate::layout::tests::text_system();
+    let mut typo = crate::layout::typography(&text);
+    let mut cache = WidthCache::new();
+    let mut lay = |tree: &zeron_visual::Node| {
+        let mut ctx = TextCtx {
+            typo: &mut typo,
+            cache: &mut cache,
+        };
+        layout::lay_out(&mut ctx, &Palette::new(true), tree, 300.0)
+    };
+    assert!(!lay(&tree).has_duplicate_surface());
+    // A tree the parser didn't build (or a hash collision) can still pair ids.
+    let zeron_visual::NodeKind::Stack(stack) = &mut tree.kind else {
+        panic!("column")
+    };
+    stack.children[1].key = Some("a".into());
+    assert!(lay(&tree).has_duplicate_surface());
+}
+
+#[test]
+fn static_paint_budget_checks_points_at_pixel_scale() {
+    // 390 points at 3x: 1170 px wide; 16 Mi px allow ~14,339 px tall.
+    assert!(static_paint_fits(390.0, 4_779.0, 3.0));
+    assert!(!static_paint_fits(390.0, 4_781.0, 3.0));
+    // The per-side texture limit binds first on narrow, tall paint.
+    assert!(!static_paint_fits(100.0, 8_200.0, 2.0));
+    assert!(static_paint_fits(0.0, 0.0, 3.0));
+    for (w, h, s) in [
+        (f32::NAN, 10.0, 2.0),
+        (10.0, f32::INFINITY, 2.0),
+        (-1.0, 10.0, 2.0),
+        (10.0, 10.0, 0.0),
+    ] {
+        assert!(!static_paint_fits(w, h, s), "{w}x{h}@{s}");
+    }
+}
+
+#[test]
+fn a_visual_too_tall_to_rasterize_shows_a_short_error_instead() {
+    // Within node and text limits, ~238,000 points tall: 780 x 476,000 px at
+    // the test's 2x (~1.5 GB of bitmap), never laid out for the platform.
+    let tall = open(
+        r#"
+        local rows = {}
+        for i = 1, 1000 do
+          rows[#rows + 1] = ui.text { "row " .. i }
+          rows[#rows + 1] = ui.space { size = 200 }
+        end
+        return ui.column(rows)
+        "#,
+        390.0,
+    );
+    let (display, _) = tall.ready();
+    let text = text_of(&display);
+    assert!(
+        text.contains("too large to show") && display.height < 200.0,
+        "{} points: {}",
+        display.height,
+        &text[..text.len().min(120)]
+    );
+    assert!(display.surfaces.is_empty() && display.controls.is_empty());
+    assert_eq!(tall.slot.height(), Some(display.height));
+
+    // A long but bitmap-sized visual still lays out in full.
+    let long = open(
+        r#"
+        local rows = {}
+        for i = 1, 100 do rows[#rows + 1] = ui.text { "row " .. i } end
+        rows[#rows + 1] = ui.button { label = "More", on_click = function() end }
+        return ui.column(rows)
+        "#,
+        390.0,
+    );
+    let (display, _) = long.ready();
+    assert!(text_of(&display).contains("row 100"));
+    assert!(display.height > 1_000.0, "{}", display.height);
+    assert_eq!(display.controls.len(), 1);
+}

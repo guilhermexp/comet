@@ -462,6 +462,22 @@ const FRAME: Duration = Duration::from_micros(16_667);
 /// GPU surfaces render at most this dense (3× phones would quadruple the
 /// pixels for little visible gain, and every frame crosses to the platform).
 const MAX_GPU_SCALE: f32 = 2.0;
+/// The platform rasterizes the static paint into one bitmap at the device's
+/// pixel scale: at most this many pixels per side (the common GPU texture
+/// limit) and in all (64 MiB of BGRA). Matched by `VisualPainter` on iOS.
+pub(crate) const MAX_STATIC_SIDE_PX: f64 = 16_384.0;
+pub(crate) const MAX_STATIC_PIXELS: f64 = 16_777_216.0;
+
+/// Whether a `width` × `height` point display fits the static bitmap budget
+/// at `scale` (finite, non-negative sizes only).
+pub(crate) fn static_paint_fits(width: f32, height: f32, scale: f32) -> bool {
+    let [w, h, s] = [width, height, scale].map(f64::from);
+    if !(w.is_finite() && h.is_finite() && s.is_finite()) || w < 0.0 || h < 0.0 || s <= 0.0 {
+        return false;
+    }
+    let (w, h) = ((w * s).ceil(), (h * s).ceil());
+    w <= MAX_STATIC_SIDE_PX && h <= MAX_STATIC_SIDE_PX && w * h <= MAX_STATIC_PIXELS
+}
 
 enum Load {
     Loading,
@@ -826,7 +842,22 @@ impl Worker {
                     typo: &mut self.typo,
                     cache: &mut self.cache,
                 };
-                layout::lay_out(&mut ctx, &self.palette, tree, self.width)
+                let laid = layout::lay_out(&mut ctx, &self.palette, tree, self.width);
+                if laid.has_duplicate_surface() {
+                    // The parser rejects duplicate surface keys; this also
+                    // covers distinct keys whose ids collide.
+                    let color = self.palette.danger;
+                    let mut failed = Laid::default();
+                    failed.height = self.status(
+                        "Visual error: two surfaces share an id; give them distinct keys",
+                        color,
+                        &mut failed,
+                        0.0,
+                    );
+                    failed
+                } else {
+                    laid
+                }
             }
             (Load::Failed(message), _) => {
                 let (message, color) = (message.clone(), self.palette.muted);
@@ -850,6 +881,18 @@ impl Worker {
             let color = self.palette.danger;
             laid.height =
                 top + self.status(&format!("Visual error: {error}"), color, &mut laid, top);
+        }
+        // Too big to rasterize, the error line included: a short error
+        // instead of a row (and a bitmap) the platform can't hold.
+        let tall = laid.height.ceil();
+        if !static_paint_fits(self.width, tall, self.source.pixel_scale.max(1.0)) {
+            let color = self.palette.danger;
+            laid = Laid::default();
+            let message = format!(
+                "Visual error: at {tall:.0} points tall this visual is too large to show; \
+                 ask for a shorter view or split it into pages"
+            );
+            laid.height = self.status(&message, color, &mut laid, 0.0);
         }
         // Keep each surface's state (camera, buffers, touch) across renders.
         let mut surfaces = HashMap::with_capacity(laid.surfaces.len());
