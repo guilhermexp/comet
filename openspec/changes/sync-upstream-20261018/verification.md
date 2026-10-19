@@ -101,3 +101,40 @@ Final host UniFFI regeneration matches committed Swift after trailing-blank and
 terminal-LF normalization. Two literal drift checks failed only on missing final
 LF in Linux output; all API content matched. Headers/modulemap match the first
 regeneration. Provenance and both failed comparisons remain in the report.
+
+
+## Review continuation R1–R5 (2026-10-19)
+
+Delivered baseline `f3457141` was independently reviewed. R1–R3 reproduced with
+scaled inputs only, under subprocess AS1GiB/CPU15s/wall25s limits: depth16 false
+DAG accepted, repeated 32KiB span allocated 34,382,733 native bytes, unbounded
+logs/text collections, repeated model views and aggregate/count budgets missing.
+R5 reproduced Max Mode defaults after an empty catalog rejection. Before logs
+are preserved separately from repairs, including all failed development checks.
+
+Repairs `20b49e44`, `e40e727a`, `c698d6c3` bound native visits/deadlines,
+pre-copy text/log bytes, pre-import model materialization and share image views;
+separate grouped iOS Chat sources from destinations; accept Cursor metadata and
+models atomically under the credential-scoped cache lock. The focused gate
+passed 411 harness +19 Cursor +41 Visual +5 native allocation tests. Safe bounded
+reproductions passed after the repair. One fresh read-only candidate review
+found no concrete surviving bypass/regression. iOS behavioral tests are added,
+not executed here: UIKit/Swift/Xcode are unavailable.
+
+The previous complete run's ETXTBSY failure remains historical evidence; no
+Codex fixture/adapter/test source was changed. New complete workspace and actual
+isolated app results, exact logs, retained failures, resource limits, commits and
+native gaps are recorded in `.tmp/reports/review-20261019.md`. Do not infer native
+acceptance or archive from these Linux checks. Original U1–U11 evidence above is
+preserved and unchanged.
+
+Review source `c698d6c3`: the single final complete workspace run passed exit0,
+5,847 outer-target passes plus two child re-executions, 52 inherited ignores.
+The prior ETXTBSY test passes in this run; its earlier failed run remains true.
+
+Production app build and private Xvfb/software-Vulkan smoke passed exit0. Four
+scaled invalid publications returned the expected budgets; EngineReady remained
+responsive. Valid dashboard checked six interactions; actual UI selected30d,
+updated the chart and displayed Mon210/104 after enabling the table. New
+screenshots, binary hash and exact latencies are in the review report. Format
+check and strict OpenSpec validation passed. Graft refresh remains unavailable127.

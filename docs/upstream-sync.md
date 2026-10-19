@@ -214,6 +214,15 @@ precisam ser regeneradas do core integrado, nunca resolvidas só por texto.
 `ZERON_AUTO_UPDATE=0` protege bundles dev inclusive no launcher Cargo por exec
 direto; não desativa o lifecycle de instalações managed headless.
 
+A revisão R1–R5 desta mesma integração tem evidência adicional em
+`.tmp/reports/review-20261019.md` e registro próprio no histórico. Contratos
+adicionais a preservar: parsing nativo de Visual conta visitas/deadline além de
+nodes; texto/logs e import de glTF verificam bytes antes de copiar/decodificar;
+views de imagem idênticas compartilham backing. Modelos Cursor e exclusões de
+Max Mode formam um único snapshot aceito por credencial; discovery rejeitada
+não publica metadados. No iOS, a seção de origem de drag não precisa ser um
+destino: project groups permitem arrastar Chats, mas seguem proibidos para drop.
+
 ## Armadilhas conhecidas
 
 - **Campos a mais no proto do fork quebram literais do upstream:**

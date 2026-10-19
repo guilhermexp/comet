@@ -43,6 +43,8 @@ WebRTC e o lifecycle remoto ficam em `Zeron/Voice/`.
 
 - SplitRoot adapts between compact tabs and regular split presentation while retaining navigation/fold state. Transcript/composer geometry uses the actual uneven safe areas and readable width. Section drag moves Chats across sections/pins with neighbor anchors. Native `VisualView` consumes Rust-owned visual display lists; math faces resolve from the shared bundled table. These paths require Simulator/device interaction tests, including fold/unfold with keyboard and selection.
 
+Chat drag sources use row identity plus movable/archive/search policy, independently of destination policy. Project groups remain disallowed destinations but their Chat rows can be dragged to Pinned/custom sections/Recent. `ZeronTests/SessionDragTests.swift` is a UIKit unit regression for the policy used by the actual drag delegate; execute it on an iOS Simulator, never infer native acceptance from Linux source review.
+
 ## Work Guidance
 
 Mudança de API UniFFI exige regenerar as bindings pelo fluxo de
@@ -62,5 +64,3 @@ testes offline de voz.
 ## Child DOX Index
 
 Sem filhos.
-
-Chat drag sources use row identity plus movable/archive/search policy, independently of destination policy. Project groups remain disallowed destinations but their Chat rows can be dragged to Pinned/custom sections/Recent. `ZeronTests/SessionDragTests.swift` is a UIKit unit regression for the policy used by the actual drag delegate; execute it on an iOS Simulator, never infer native acceptance from Linux source review.

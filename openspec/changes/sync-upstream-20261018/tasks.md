@@ -17,5 +17,15 @@
 - [x] Update DOX and sync YAML; deliver reviewable commits/evidence/native limits, no publish.
 - [ ] Complete native macOS/iOS acceptance and archive (handoff; unavailable on Linux).
 
-- [ ] Obtain a fully green workspace run if required for the integration gate; current complete run retains one unchanged Codex fixture ETXTBSY failure despite 23 passing repetitions.
+- [x] Obtain a fully green workspace run: review source `c698d6c3` passed exit0 on 2026-10-19 (5,847 outer passes +2 child executions, 52 ignores). The earlier complete run remains failed with unchanged Codex fixture ETXTBSY despite its 23 subsequent passing repetitions.
 - [ ] Review all six math faces, GPU assets and native interaction on macOS/iOS; Linux manual glyph review used Fira/STIX, unit corpus exercised every bundled face.
+
+## Review continuation R1–R5 (2026-10-19)
+
+- [x] R1 Bound every native visual traversal visit and parser deadline; safe scaled DAG and legitimate list regressions.
+- [x] R2 Enforce text/log byte and element budgets before native conversion/copy, including sibling collections and invalid UTF-8; preserve normal formatting.
+- [x] R3 Preflight model input/buffer/image counts and aggregate decoded/encoded materialization before allocation; share repeated image views.
+- [x] R4 Separate iOS grouped-list drag sources from drop destinations; behavioral Swift regression; native run pending if unavailable.
+- [x] R5 Commit Cursor model/default-exclusion snapshots atomically, preserving rejected refreshes, credentials and concurrency; run/switch regressions.
+- [x] Run one coherent focused gate, isolated publication/dashboard smoke, independent candidate review and one final full workspace run; preserve all outcomes.
+- [x] Update DOX, verification, history and new review report; local commits only, no archive/publication.

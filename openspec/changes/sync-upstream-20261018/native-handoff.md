@@ -60,3 +60,12 @@ Bounded source, VM memory/time, decoded assets, tree/geometry and target reuse
 have separate evidence. Those checks do not establish a wall-clock bound for
 arbitrary hostile GLSL on a GPU. No intentionally nonterminating shader was run
 on the shared host; acceptance must not claim that stronger property.
+
+## Review continuation R4
+
+On the delivered revision, run `ZeronTests/SessionDragTests.swift` in the iOS
+Simulator. In Group by Project, drag an actual Chat from a project group to
+Pinned and a custom section; with project grouping disabled also exercise
+Recent. Ensure project groups remain rejected destinations and search/Archived/header drags remain blocked. The UIKit policy
+has behavioral unit coverage added, but no Swift compiler/Simulator is available
+on agents-us. Linux source review does not close this acceptance item.

@@ -1,0 +1,128 @@
+schema_version: 1
+id: 20261019T012951Z-c526d6f7-review
+skill_version: null
+started_at: '2026-10-19T01:29:51Z'
+finished_at: '2026-10-19T02:01:57.142975+00:00'
+request: Continue same pinned integration; validate and repair R1-R5 with bounded reproductions, strict
+  limits and evidence. No worker push; orchestrator publishes after review.
+workflow_source: .tmp/briefs/review-20261019.md; .tmp/briefs/upstream-20261018.md; openspec-apply-change
+  and codex-security:fix-finding. Not a new fetch/merge or claimed upstream-sync skill execution.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  previous_integrated_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_label: 'after 0.2.114, through #942'
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: sync/upstream-20261018
+  target_branch: sync/upstream-20261018
+  initial_sha: f3457141b5d136d8550a76769bb5363efe9efccd
+  observed_target_sha: f3457141b5d136d8550a76769bb5363efe9efccd
+  result_sha: c698d6c3f3fbeeb568a17f99d1c19787112b8532
+  result_sha_note: Validated repair source; final documentary HEAD in .tmp/reports/review-20261019.md.
+    Git result excludes subsequent docs-only closeout.
+  initial_worktree: clean
+strategy:
+  operation: review_corrections
+  reason: Same integration, no new upstream commits. Repair confirmed R1-R5 while preserving original
+    real merge and fork contracts.
+  merge_sha: 348f8b01d58e1f5b524ca75b8df5a4eed758b03e
+  merge_parents:
+  - d7df75f87864fb7fa1e13d1d4ec4b44f253573c0
+  - c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  repair_commits:
+  - 20b49e443edbd7e5d2397a193206ed8dca87079c
+  - e40e727acf38004009c48b62a44324a329b0550b
+  - c698d6c3f3fbeeb568a17f99d1c19787112b8532
+changes:
+  incoming_range: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f..c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  incoming_count: 0
+  summary: Bound native parsing/text/log/model materialization; decouple iOS grouped Chat drag source;
+    atomically accept Cursor models and default-exclusion metadata.
+  imported: []
+customizations:
+- Original U1-U11 integration and decisions retained; see prior history record.
+- Version1.0.7, fork feed, vendors, root grants, OMP/Kimi/steer, UI/Edge/core remain unchanged from delivered
+  baseline.
+conflicts: []
+verification:
+- command: Scaled native/model/Cursor before and after via limited.py + private sandbox
+  revision_before: f3457141
+  revision_after: c698d6c3f3fbeeb568a17f99d1c19787112b8532
+  result: confirmed_and_repaired
+  exit_before: 1
+  exit_after: 0
+  logs:
+  - baseline-behavior.log
+  - bounded-final.log
+  observed: Each original group failed exit101 before; all pass after. AS1GiB CPU15s wall25s core0. No
+    full OOM/exponential payload.
+- command: cargo test -p zeron-visual -p zeron-harness --lib --test native_limits --test cursor -- --test-threads=4
+  revision: c698d6c3f3fbeeb568a17f99d1c19787112b8532
+  result: passed
+  exit: 0
+  log: focused-ready.log
+  observed: 411 harness,19 Cursor,41 Visual,5 native_limits; child environment regression also passes.
+    Failed development attempts retained.
+- command: Independent read-only candidate review
+  revision: c698d6c3f3fbeeb568a17f99d1c19787112b8532
+  result: no_concrete_bypass_or_regression
+  observed: One fresh reviewer, finding/policy/diff only. No tests or edits. Native UIKit/macOS/iOS remain
+    unavailable.
+- command: cargo test --workspace --no-fail-fast -- --test-threads=4
+  revision: c698d6c3f3fbeeb568a17f99d1c19787112b8532
+  result: passed
+  log: workspace-final.log
+  exit: 0
+  observed: 5847 outer Cargo-target passes,0 failed,52 ignored;2 nested child passes (5849 emitted-summary
+    total). Prior ETXTBSY test passes this revision; earlier failure record preserved, no retry/suppression.
+- command: Actual production app private Local profile Xvfb/software Vulkan
+  revision: c698d6c3f3fbeeb568a17f99d1c19787112b8532
+  result: passed_linux_scope
+  exit: 0
+  log: app-smoke.log
+  observed: Actual production build0; expected R1/R2/R3 publication budget errors, EngineReady responsive,
+    valid dashboard6 interactions and actual30d/table UI. Private daemon AS2GiB CPU90s; RPC12s; outer180s;
+    owned teardown. Binary SHA256 5cd009f0faa06fd8c8de88b486078930ee3ba79dcbc85d6600a2c12687cfbd5f
+- command: graft build
+  result: unavailable
+  exit: 127
+  log: graft-refresh.log
+  observed: Executable absent; Git/source/DOX fallback retained.
+- command: cargo fmt --all -- --check
+  exit: 0
+  result: passed
+  log: format-final.log
+- command: openspec validate sync-upstream-20261018 --strict
+  exit: 0
+  result: passed
+  log: openspec-final.log
+limits:
+- No Swift/Xcode/UIKit/AppKit/Metal/device execution on agents-us; iOS drag behavioral regression added
+  but native execution pending.
+- Prior complete run remains exit101:5836pass/1ETXTBSY/52ignored, despite unchanged-source repetitions.
+  No Codex fixture/adapter/test source modified.
+- No arbitrary hostile GPU shader wall-clock guarantee; no deliberately nonterminating shader run.
+- No live authenticated provider/quota validation; original native acceptance remains open.
+references:
+- .upstream-sync/history/20261018T222447Z-c526d6f7.yaml
+- docs/upstream-sync.md
+- openspec/changes/sync-upstream-20261018/verification.md
+- openspec/changes/sync-upstream-20261018/native-handoff.md
+- .tmp/reports/review-20261019.md
+- .tmp/reports/review-20261019/
+outcome: integrated
+pending:
+- Native acceptance and OpenSpec archive remain open.
+delivery:
+  integration: local_review
+  target_branch: sync/upstream-20261018
+  commit: c698d6c3f3fbeeb568a17f99d1c19787112b8532
+  pr: https://github.com/guilhermexp/comet/pull/24 (unchanged read-only diagnostic)
+  publication: worker_forbidden_orchestrator_after_review
+  record_pushed: false
+  deploy: not_authorized
+started_at_note: Timestamp of first retained bounded behavioral reproduction; earlier setup/compile is
+  retained without an initial UTC header.

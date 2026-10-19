@@ -118,14 +118,13 @@ Test: integration
 
 Test: unit
 
-
 #### Scenario: Native visual traversal and materialization are bounded
 - **WHEN** scripts reuse empty/false lists or strings, or models repeat image/buffer references
 - **THEN** native traversal SHALL consume bounded work and enforce its deadline independently from Lua interrupts
 - **AND** text/log/model aggregate byte and entry budgets SHALL be checked before copying or decoding
 - **AND** legitimate nested lists, numeric text, logs and repeated image views SHALL remain usable
 
-Test: unit
+Test: integration
 
 #### Scenario: Grouped iOS Chats remain draggable
 - **WHEN** the front page groups unassigned Chats by Project
