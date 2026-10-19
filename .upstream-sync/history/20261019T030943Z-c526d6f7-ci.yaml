@@ -1,0 +1,102 @@
+schema_version: 1
+id: 20261019T030943Z-c526d6f7-ci
+skill_version: null
+started_at: '2026-10-19T03:09:43.381049+00:00'
+finished_at: '2026-10-19T03:14:56.208823+00:00'
+request: C1 canonical Swift EOF correction; C2 document preexisting Windows unpeel-core errors. No workflow
+  changes, ports, full builds, reruns or publication.
+workflow_source: User CI PR25 follow-up; original pinned integration authority preserved.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  previous_integrated_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_label: 'after 0.2.114, through #942'
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: sync/upstream-20261018
+  target_branch: sync/upstream-20261018
+  initial_sha: 9e1a6b74438df1f18243930ccf029957e0661535
+  observed_target_sha: 9e1a6b74438df1f18243930ccf029957e0661535
+  result_sha: ac20de2698fdc730037983c0b5063a426b83ddfe
+  result_sha_note: Correction commit/final HEAD in .tmp/reports/ci-20261019.md.
+  initial_worktree: clean
+strategy:
+  operation: ci_closeout
+  reason: One-byte canonical generated-file correction; documentation of CI boundaries, no new merge.
+  merge_sha: 348f8b01d58e1f5b524ca75b8df5a4eed758b03e
+  merge_parents:
+  - d7df75f87864fb7fa1e13d1d4ec4b44f253573c0
+  - c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  repair_commits:
+  - ac20de2698fdc730037983c0b5063a426b83ddfe
+changes:
+  incoming_count: 0
+  summary: Swift binding exact generator output, sole terminal LF removal; DOX/ledger correct prior noncanonical
+    normalization claim. Windows failure classified/preexisting, no source port.
+  imported: []
+  incoming_range: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f..c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+customizations:
+- Original U1-U11 integration and decisions retained; see prior history record.
+- Version1.0.7, fork feed, vendors, root grants, OMP/Kimi/steer, UI/Edge/core remain unchanged from delivered
+  baseline.
+conflicts: []
+verification:
+- command: Existing host UniFFI library generate + exact build-core.sh sed/cmp/copy stage
+  revision: 9e1a6b74438df1f18243930ccf029957e0661535
+  exit: 0
+  result: passed_host_scope
+  log: bindgen.log
+  observed: old530851 == canonical530850 + LF; new SHA25625527528774ab68929a026a86e52467893061a742bbb4aef06d4613474e5a86f;
+    header/modulemap identical. No iOS target build/link.
+- command: gh run view39189505714 -R guilhermexp/comet --log/metadata
+  revision: 9e1a6b74438df1f18243930ccf029957e0661535
+  exit: 0
+  result: remote_failure_verified
+  observed: ios-tests only failed step Generated Swift bindings are current; Rust mobile core tests success;
+    iOS unit tests skipped. Other UI/Linux/browser/frame recovery jobs success.
+- command: gh run view39189505816 -R guilhermexp/comet --log/metadata + Git baseline tree comparison
+  revision: 9e1a6b74438df1f18243930ccf029957e0661535
+  exit: 0
+  result: preexisting_failure_documented
+  observed: Windows unpeel-core51 Unix API errors; treea59bca0a6931665574af47e635d5af09a7a47630 identical
+    e750..HEAD; no independent Windows baseline rerun.
+- command: Workspace/Linux/macOS/iOS CI reruns
+  result: not_run_by_worker
+  observed: 'Explicit user scope: orchestrator publishes and follows iOS rerun.'
+- command: Canonical cmp + git diff --exit-code -- apps/ios/Zeron/Core/Generated
+  revision: ac20de2698fdc730037983c0b5063a426b83ddfe
+  exit: 0
+  result: passed_host_scope
+  log: canonical-drift-check.log
+  observed: Correction committed exactly as generated. Script/workflows/vendor unchanged.
+- command: openspec validate sync-upstream-20261018 --strict
+  exit: 0
+  result: passed
+  log: openspec.log
+limits:
+- 'Original host bindgen-final proof added terminal LF outside build-core.sh: API equality only, insufficient
+  for canonical drift; old evidence preserved.'
+- Native iOS unit tests skipped at drift gate, not a pass. Corrected iOS rerun pending orchestrator.
+- Windows failure preexisting per orchestrator baseline proof corroborated by identical vendor tree; no
+  Windows port or check disabled.
+- Other native/manual acceptance remains open.
+references:
+- .upstream-sync/history/20261019T021050Z-c526d6f7-r2.yaml
+- .tmp/reports/ci-20261019.md
+- .tmp/reports/ci-20261019/
+- openspec/changes/sync-upstream-20261018/verification.md
+outcome: integrated
+pending:
+- Orchestrator publication and iOS drift/XCTest rerun.
+- Native/manual acceptance and OpenSpec archive remain open.
+delivery:
+  integration: local_review
+  target_branch: sync/upstream-20261018
+  commit: ac20de2698fdc730037983c0b5063a426b83ddfe
+  pr: https://github.com/guilhermexp/comet/pull/24 (unchanged read-only diagnostic)
+  publication: worker_forbidden_orchestrator_after_review
+  record_pushed: false
+  deploy: not_authorized
+started_at_note: First retained generation timestamp; initial read-only investigation preceded it.

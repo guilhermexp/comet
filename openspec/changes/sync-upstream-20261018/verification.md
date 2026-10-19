@@ -36,8 +36,10 @@ handoff, not publication authorization or native acceptance.
   Actual-application evidence is recorded separately in the review report.
 
 All-target executable compilation passed again on e6a7ef19 after three retained
-failed integration attempts. `all-targets-source-final.log`, exit 0. Host mobile/UniFFI generation passed, including normalized equality
-against the reconciled Swift binding. No iOS linking or Swift execution implied.
+failed integration attempts. `all-targets-source-final.log`, exit 0. Host mobile/UniFFI generation ran successfully; API equality was observed only
+after an additional terminal LF outside the canonical script. That comparison
+did not pass the literal generated-file drift gate (corrected in C1 below).
+No iOS linking or Swift execution was implied.
 Six incoming math fonts are byte-identical to the pinned upstream assets.
 
 ## Incoming-line reconciliation
@@ -97,10 +99,12 @@ Arbitrary hostile GLSL time bounds were not tested. Other four math faces and
 asset lifecycle have executed unit/integration evidence, not manual native
 pixel review. Screenshot sampling does not establish a 5–8 ms palette benchmark.
 
-Final host UniFFI regeneration matches committed Swift after trailing-blank and
-terminal-LF normalization. Two literal drift checks failed only on missing final
-LF in Linux output; all API content matched. Headers/modulemap match the first
-regeneration. Provenance and both failed comparisons remain in the report.
+Historical host UniFFI regeneration matched API content after trailing-blank
+normalization plus an extra terminal LF. That LF addition was not in
+`build-core.sh`; the comparison was insufficient for its exact drift gate. Two
+literal comparisons failed on the final LF and must remain failures. Headers
+and modulemap matched. Original provenance/logs are preserved; C1 below fixes
+the generated artifact without changing API or gate.
 
 
 ## Review continuation R1–R5 (2026-10-19)
@@ -167,3 +171,27 @@ No full workspace rerun: explicitly forbidden by the owner for this closure;
 CI follows acceptance via the orchestrator. Previous complete-run results stay
 historical evidence, not validation of current source. No push/release/CI dispatch
 or archival. Native macOS/iOS acceptance remains open.
+
+
+## CI closeout C1/C2 — PR25 / 2026-10-19
+
+Observed runs39189505714 and39189505816 both evaluate HEAD9e1a6b74. C1:
+`ios-tests` failed only in “Generated Swift bindings are current”; Rust mobile
+core tests passed, and “Run iOS unit tests” was skipped, not a native pass.
+The complete log ends with a sole terminal-LF diff on `// swiftlint:enable all`.
+Existing host library SHA256ba81e0e4… was reused to regenerate UniFFI and apply
+exactly the script sed/cmp/copy stage. Canonical530850 bytes match the old530851
+bytes minus one terminal LF; no other byte/API changes, headers/modulemap equal.
+Prior bindgen-final/provenance.json explicitly added an extra LF, proving API
+content only, not the canonical gate. Its evidence remains unchanged.
+
+C2: Windows native-platform-check run39189505816 reports51 unpeel-core Unix API
+errors. Baselinee750f810 and HEAD9e1a6b74 share Unpeel tree
+a59bca0a6931665574af47e635d5af09a7a47630 with empty diff. This corroborates the
+orchestrator baseline proof: preexisting incompatibility, outside integration
+scope. No vendor port, workflow/gate change or Windows rerun performed.
+
+Full downloaded logs, job metadata, SHA256 manifest, canonical output/provenance
+and exact byte assertion: `.tmp/reports/ci-20261019.md`. No expensive local Linux
+or workspace reruns, no new iOS pass claimed. Orchestrator publishes this local
+correction and follows the iOS rerun; native/manual acceptance stays open.

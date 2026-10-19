@@ -36,3 +36,11 @@
 - [x] Charge all confirmed paths through existing boundaries; preserve valid axes/default/explicit controls, numeric and canvas semantics.
 - [x] Focused visual gate, bounded subprocess before/after, one independent candidate review and limited actual publication/dashboard smoke; no workspace rerun.
 - [x] Record DOX, OpenSpec, sync history, commits and new report; no archive or publication.
+
+
+## CI C1/C2 closeout
+
+- [x] C1 Regenerate from the available host library with only the canonical script postprocess; commit exact output and prove sole terminal LF difference, unchanged Swift API/header/modulemap.
+- [x] Correct original terminal-LF proof limitation in ledger/DOX without rewriting retained evidence or weakening the drift gate.
+- [x] C2 Preserve remote failure logs/hash and baseline/current identical Unpeel tree; classify Windows incompatibility as preexisting/out of scope, no port or disabled check.
+- [ ] Orchestrator publishes correction and observes iOS drift/XCTest rerun; worker performs no push or CI dispatch.

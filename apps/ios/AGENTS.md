@@ -35,7 +35,10 @@ WebRTC e o lifecycle remoto ficam em `Zeron/Voice/`.
   quit ou perda de rede antes do Edge aceitar os bytes ainda exige reabrir o
   app para transmitir.
 - `Core/Generated/zeron_core.swift` é gerado a partir do core Rust. Não editar à
-  mão; preserve os avisos de licença de WebRTC e Thinking Orbs.
+  mão; preserve os avisos de licença de WebRTC e Thinking Orbs. O fluxo canônico
+  remove somente blanks de fim de linha pelo sed de `build-core.sh`; não
+  acrescentar LF terminal para comparar/versionar. Output do gerador/script é
+  autoritativo byte a byte, inclusive EOF sem LF.
 - Sessions oferece `Group by Project`, preferência local do telefone compartilhada
   pelo menu da lista e Settings. Somente Chats fora das seções são agrupados;
   clones/checkouts do mesmo repositório usam a identidade de projeto e a ordem

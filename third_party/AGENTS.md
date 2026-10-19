@@ -211,6 +211,15 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 | `third_party/zui/crates/gpui_macos/tests/window_glass_backing.rs` | integration — setters reais, configuração/ordem nativa, reutilização, resize e limpeza; main thread AppKit | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --test window_glass_backing` (macOS com sessão gráfica; no CI `ui-tests.yml`, build `--no-run` e execução em bundle isolado com timeout, exit zero e marcador PASS obrigatório) |
 | Estabilidade óptica do vidro durante repaint | none — asserções AppKit não comprovam desaparecimento das ondas; comparação headed no mesmo desktop é evidência separada | Captura/comparação do vidro real sem trocar wallpaper ou preferências do usuário |
 
+### Limitação de plataforma observada (CI 2026-10-19)
+
+`native-platform-check (windows-latest)` no run39189505816/HEAD9e1a6b74 falhou
+em `unpeel-core` com51 diagnósticos de APIs Unix (fd/flock/mode/attach_ready_path
+entre outros). `third_party/unpeel` tem a mesma árvore Git `a59bca0a6931665574af47e635d5af09a7a47630`
+na baseline e750f810 e nesse HEAD; a incompatibilidade é preexistente e está fora
+do escopo da integração. Não desabilitar o check nem portar o vendor como parte
+desse closeout. Log/hash e limites de comprovação: `.tmp/reports/ci-20261019.md`.
+
 ## Child DOX Index
 
 | Domínio | Doc | Papel |
