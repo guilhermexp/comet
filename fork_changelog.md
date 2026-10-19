@@ -9,6 +9,14 @@ Tracks local/private fork changes against upstream.
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
 
+## 2026-10-19: v1.0.8
+
+- Integra o upstream até `c526d6f7` pela [PR #25](https://github.com/guilhermexp/comet/pull/25): visuais Luau, matemática LaTeX, lanes de conversas, reordenação da sidebar, hover cards, formulários OpenCode v2, catálogo Cursor e melhorias de arquivos, arquivados e layout iOS.
+- Preserva os contratos de Workers, OMP/Kimi, MCP, steering, Details/Usage e o feed de atualização do fork.
+- Corrige limites de expansão glTF, IDs duplicados de superfícies, orçamento de bitmap iOS e confirmação da publicação pelo turno ativo, incluindo o prazo do watchdog.
+- A revisão `eac908b5` passou nos checks Rust, Linux, macOS e iOS, com 18 testes Swift sem falhas. A incompatibilidade Windows/Unpeel permanece registrada; o aceite manual nativo mais amplo continua pendente na change.
+- Publicação pelo fluxo existente do fork, somente macOS: DMG, tarball do app e `manifest.json`.
+
 ## 2026-10-15 — Feed de update próprio (Mac)
 
 - O app instalado se atualiza só das GitHub Releases do fork
