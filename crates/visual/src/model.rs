@@ -50,6 +50,7 @@ const MAX_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
 /// its accessors): bounds the total decoding work while primitives that share
 /// one large vertex accessor stay usable.
 const MAX_EXPANDED_WORK: usize = 256 * 1024 * 1024;
+const UNREADABLE_INDICES: &str = "the model has an index accessor its buffer view can't hold";
 
 fn charge(total: &mut usize, bytes: usize, kind: &str) -> Result<(), String> {
     *total = total
@@ -392,6 +393,18 @@ impl Model {
         // without a base view expands a tiny file to `count` elements.
         let mut expanded = 0;
         walk(&scene, identity, |primitive, _, shape| {
+            // Only a primitive WITHOUT an index accessor draws implicit
+            // indices: one whose accessor can't be read (a view too short
+            // for its count) would otherwise collect `positions` of them,
+            // which the charge below never counted.
+            if primitive.indices().is_some()
+                && primitive
+                    .reader(|b| buffers.get(b.index()).map(|d| &d.0[..]))
+                    .read_indices()
+                    .is_none()
+            {
+                return Err(UNREADABLE_INDICES.into());
+            }
             charge_expanded(&mut expanded, primitive, shape)
         })?;
         walk(
@@ -414,9 +427,10 @@ impl Model {
                     .flatten()
                     .map(|t| t.into_f32().collect::<Vec<_>>())
                     .filter(|t| t.len() >= positions.len());
-                let indices: Vec<usize> = match reader.read_indices() {
-                    Some(indices) => indices.into_u32().map(|i| i as usize).collect(),
-                    None => (0..positions.len()).collect(),
+                let indices: Vec<usize> = match (primitive.indices(), reader.read_indices()) {
+                    (_, Some(indices)) => indices.into_u32().map(|i| i as usize).collect(),
+                    (None, None) => (0..positions.len()).collect(),
+                    (Some(_), None) => return Err(UNREADABLE_INDICES.into()),
                 };
                 let material = primitive.material().index().unwrap_or(default_material);
                 for tri in indices.chunks_exact(3) {

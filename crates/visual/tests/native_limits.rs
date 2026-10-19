@@ -443,3 +443,78 @@ fn sparse_model_expansion_is_admitted_before_native_collection() {
     assert!(unbounded.is_empty(), "{}", unbounded.join("\n"));
     publish(3, 8).0.unwrap();
 }
+
+/// A GLB whose POSITION is a base-less sparse accessor of `positions`
+/// entries, with `indices` naming bufferView 0 (4 bytes), bufferView 1
+/// (12 bytes) or nothing, over a 16-byte binary chunk.
+fn indexed_sparse_glb(positions: usize, indices: Option<usize>) -> Vec<u8> {
+    let (primitive_indices, index_accessor) = match indices {
+        Some(view) => (
+            r#","indices":1"#.to_owned(),
+            format!(r#",{{"bufferView":{view},"componentType":5125,"count":3,"type":"SCALAR"}}"#),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let mut json = format!(
+        r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}}{primitive_indices}}}]}}],"buffers":[{{"byteLength":16}}],"bufferViews":[{{"buffer":0,"byteLength":4}},{{"buffer":0,"byteOffset":4,"byteLength":12}}],"accessors":[{{"componentType":5126,"count":{positions},"type":"VEC3","min":[0,0,0],"max":[1,1,1],"sparse":{{"count":1,"indices":{{"bufferView":0,"componentType":5125}},"values":{{"bufferView":1}}}}}}{index_accessor}]}}"#
+    )
+    .into_bytes();
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    let total = 12 + 8 + json.len() + 8 + 16;
+    let mut glb = b"glTF".to_vec();
+    for n in [2, total, json.len()] {
+        glb.extend_from_slice(&(n as u32).to_le_bytes());
+    }
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(&16u32.to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&[0; 16]);
+    glb
+}
+
+#[test]
+fn an_unreadable_index_accessor_is_refused_not_made_implicit() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let script = "return ui.scene {height=200, draw=function(s) s:model {asset='m.glb'} end}";
+    let publish = |positions: usize, indices: Option<usize>| {
+        let assets = zeron_visual::Assets::new(
+            [(
+                "m.glb".to_owned(),
+                indexed_sparse_glb(positions, indices).into(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::Relaxed);
+        let result = zeron_visual::check_with_assets(script, 1, assets);
+        TRACK.store(false, Ordering::Relaxed);
+        (result, ALLOCATED.load(Ordering::Relaxed))
+    };
+    // Three explicit u32 indices need 12 bytes; bufferView 0 holds 4, so the
+    // reader yields nothing. Admitted as 48 MB of positions plus 3 indices,
+    // that used to fall back to 4M implicit indices: 48 + 32 MB collected.
+    let (result, allocated) = publish(4_000_000, Some(0));
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.message.contains("index accessor"))
+            && allocated < 8 * 1024 * 1024,
+        "{result:?}; native allocated {allocated} bytes"
+    );
+    // Controls: readable explicit indices and absent ones (implicit, still
+    // charged: 4M positions + 4M implicit indices are refused up front).
+    publish(3, Some(1)).0.unwrap();
+    publish(3, None).0.unwrap();
+    let (result, allocated) = publish(4_000_000, None);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.message.contains("expanded accessor byte budget"))
+            && allocated < 8 * 1024 * 1024,
+        "{result:?}; native allocated {allocated} bytes"
+    );
+}
