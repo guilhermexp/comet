@@ -95,3 +95,5 @@ Para regressão focada do transporte OMP, use `process_correlates_out_of_order_r
 ## Child DOX Index
 
 Sem filhos.
+
+Cursor catalog models and Max Mode default exclusions are one credential-scoped accepted snapshot under the catalog lock. Rejected/empty refreshes and cancelled discovery cannot publish companion metadata; credential changes invalidate both. `catalog::tests::snapshot_metadata_is_atomic_across_rejection_concurrency_and_credentials` (unit) and `tests/cursor.rs::rejected_catalog_refresh_keeps_max_mode_exclusions_for_start_and_switch` (integration) cover rejection/start/switch; explicit options remain authoritative.

@@ -94,12 +94,7 @@ pub struct CursorHarness {
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Credential-scoped successful catalog, with bounded refresh and backoff.
-    pub(crate) models_cache: catalog::Catalog,
-    /// Models whose catalog default is a Max Mode variant, from the latest
-    /// discovery. Their defaults are never sent: the backend can reject the
-    /// very variant the catalog marks default (verified live: Grok 4.7's
-    /// 500k default fails "Invalid parameters" while the bare id runs).
-    max_mode_defaults: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub(crate) models_cache: catalog::Catalog<std::collections::HashSet<String>>,
 }
 
 impl Default for CursorHarness {
@@ -109,7 +104,6 @@ impl Default for CursorHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             models_cache: catalog::Catalog::default(),
-            max_mode_defaults: Default::default(),
         }
     }
 }
@@ -140,7 +134,9 @@ impl CursorHarness {
     }
 
     /// Spawn the shim in models mode and map its one catalog frame.
-    async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
+    async fn discover_models(
+        &self,
+    ) -> Result<(Vec<Model>, std::collections::HashSet<String>), HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
         let mut cmd = Command::new(&exe);
         cmd.args(&args);
@@ -183,11 +179,7 @@ impl CursorHarness {
                 .ok_or_else(|| {
                     HarnessError::Protocol("cursor models probe returned no catalog".into())
                 })?;
-            *self
-                .max_mode_defaults
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = max_mode_default_ids(&items);
-            Ok::<_, HarnessError>(map_model_items(&items))
+            Ok::<_, HarnessError>((map_model_items(&items), max_mode_default_ids(&items)))
         };
         tokio::time::timeout(Duration::from_secs(15), run)
             .await
@@ -199,21 +191,36 @@ impl CursorHarness {
     /// cold catalog is fetched. A failed fetch yields none (bare SDK ids), and
     /// Max Mode defaults are left out (bare ids, as before).
     async fn catalog_for_defaults(&self) -> Vec<Model> {
-        let mut models = match self
+        let (mut models, exclusions) = match self
             .model_context()
             .ok()
             .flatten()
-            .and_then(|context| self.models_cache.cached_for(context.key()))
+            .and_then(|context| self.models_cache.cached_snapshot_for(context.key()))
         {
-            Some(models) => models,
-            None => self.models().await.unwrap_or_default(),
+            Some(snapshot) => snapshot,
+            None => self
+                .model_snapshot(false)
+                .await
+                .map(|(catalog, exclusions)| (catalog.models, exclusions))
+                .unwrap_or_default(),
         };
-        let max_mode = self
-            .max_mode_defaults
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        models.retain(|model| !max_mode.contains(&model.id));
+        models.retain(|model| !exclusions.contains(&model.id));
         models
+    }
+
+    async fn model_snapshot(
+        &self,
+        force: bool,
+    ) -> Result<(crate::ModelCatalog, std::collections::HashSet<String>), HarnessError> {
+        self.model_context()?.unwrap().log();
+        self.models_cache
+            .get_with_metadata(
+                force,
+                Duration::from_secs(20),
+                || self.model_context().map(|c| c.unwrap().key()),
+                || self.discover_models(),
+            )
+            .await
     }
 
     /// (program, args) for the shim process: the test override, or node
@@ -319,14 +326,7 @@ impl Harness for CursorHarness {
         }))
     }
     async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
-        self.model_context()?.unwrap().log();
-        self.models_cache
-            .get_with(
-                force,
-                || self.model_context().map(|c| c.unwrap().key()),
-                || self.discover_models(),
-            )
-            .await
+        self.model_snapshot(force).await.map(|(catalog, _)| catalog)
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.model_catalog(false).await.map(|c| c.models)

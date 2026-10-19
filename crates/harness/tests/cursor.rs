@@ -713,3 +713,68 @@ async fn mcp_injection_reaches_shim_on_new_and_resumed_runs() {
         }));
     }
 }
+
+#[tokio::test]
+async fn rejected_catalog_refresh_keeps_max_mode_exclusions_for_start_and_switch() {
+    use std::os::unix::fs::PermissionsExt;
+    for rejected in [
+        r#"{"ev":"models","items":[]}"#,
+        r#"{"ev":"models","items":[{"id":"default","aliases":["auto"]}]}"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("rejected.json");
+        let shim = dir.path().join("shim.sh");
+        let source=include_str!("fixtures/fake-cursor-shim.sh")
+            .replacen("if [ \"$1\" = \"models\" ]; then", &format!("if [ \"$1\" = \"models\" ]; then\n if [ -f '{}' ]; then cat '{}'; exit 0; fi",marker.display(),marker.display()),1)
+            .replacen("*scenario:model-switch*)", "*scenario:rejected-switch*)\n  emit '{\"ev\":\"ready\",\"agentId\":\"switch\"}'\n  emit '{\"ev\":\"turn\",\"status\":\"finished\"}'\n  read -r next || exit 1\n  case \"$next\" in *'\"modelOptions\":{}'*) ;; *) emit '{\"ev\":\"fatal\",\"message\":\"rejected max mode switch default\"}'; exit 1;; esac\n  emit '{\"ev\":\"turn\",\"status\":\"finished\"}'\n  read -r next || exit 0\n  ;;\n*scenario:model-switch*)",1);
+        std::fs::write(&shim, source).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let h = CursorHarness::new().with_executable(shim);
+        h.models().await.unwrap();
+        std::fs::write(&marker, rejected).unwrap();
+        let refreshed = h.model_catalog(true).await.unwrap();
+        assert_eq!(refreshed.source, "cache");
+        let (c, _steer, _token) = controls();
+        let mut req = request("scenario:model-maxmode");
+        req.model = Some("grok-4.7".into());
+        let events = run_to_first_done(&h, req, c).await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        let (c, steer, _token) = controls();
+        let mut stream = h.run(request("scenario:rejected-switch"), c).await.unwrap();
+        let mut done = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                if let AgentEvent::Done { status, error, .. } = event.unwrap() {
+                    assert_eq!(status, DoneStatus::Completed, "{error:?}");
+                    done += 1;
+                    if done == 2 {
+                        break;
+                    }
+                    let mut next = request("switch");
+                    next.model = Some("grok-4.7".into());
+                    steer
+                        .send(SteerMessage {
+                            prompt: "switch".into(),
+                            message_id: None,
+                            attachments: vec![],
+                            config: Some(Box::new(next)),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(done, 2);
+    }
+}
