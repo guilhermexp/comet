@@ -1,18 +1,21 @@
 - [x] Verify clean branch, pins, merge base, incoming 13 commits and PR #24; read contracts and adjustments.
 - [x] Format baseline before merge (no delta).
-- [ ] U1 Integrate and prove: Native sandboxed Luau visuals, controls/charts/tables, 2D/3D/shaders/assets with bounded validation, off-main GPU, reuse and teardown; root-only MCP grants. Re-read adjustments before this task.
-- [ ] U2 Integrate and prove: zatex inline/display math, six fonts and persisted settings, bounded parser/layout and streaming fallback; retain file links/Mermaid/selection. Re-read adjustments before this task.
-- [ ] U3 Integrate and prove: Side-chat/subagent lanes, folded finished rows, bounded scroll/counts/rename/harness marks and checkout totals; reconcile Details Workers ownership and existing new/fork buttons without duplicate activity. Re-read adjustments before this task.
-- [ ] U4 Integrate and prove: Convergent section header drag order, iOS cross-section/pin drag, neighbor anchors and advertised capability. Re-read adjustments before this task.
-- [ ] U5 Integrate and prove: Dwell/warm hover card, dismiss on scroll/drag/menu, once-per-frame lifecycle and metadata; retain mentions and fork rows. Re-read adjustments before this task.
-- [ ] U6 Integrate and prove: OpenCode v2 forms normalize to field-keyed input panels and form route; v1 works and engine owns lifecycle. Re-read adjustments before this task.
-- [ ] U7 Integrate and prove: Cursor Plus catalog/defaults on fresh and switched runs, warm catalog; protect dev bundles with fork updater/feed. Re-read adjustments before this task.
-- [ ] U8 Integrate and prove: Recent Files flicker fix with unified search/index ownership. Re-read adjustments before this task.
-- [ ] U9 Integrate and prove: Persist sidebar Archived visibility setting. Re-read adjustments before this task.
-- [ ] U10 Integrate and prove: Bulk archived Chat deletion with explicit confirmation and device/sync routing. Re-read adjustments before this task.
-- [ ] U11 Integrate and prove: Adaptive iOS split/tab shell, fold state, uneven safe areas, transcript/composer alignment; native acceptance pending. Re-read adjustments before this task.
-- [ ] Reconcile all-target APIs/lockfile and run focused plus workspace regressions with revision/exit logs.
-- [ ] Inspect final-upstream incoming additions for omissions; record every conflict decision.
-- [ ] Run isolated actual Linux app smoke/screenshots and lifecycle/selection/bounds assertions.
-- [ ] Update DOX and sync YAML; deliver reviewable commits/evidence/native limits, no publish.
+- [x] U1 Integrate and prove on Linux (native acceptance separately pending): Native sandboxed Luau visuals, controls/charts/tables, 2D/3D/shaders/assets with bounded validation, off-main GPU, reuse and teardown; root-only MCP grants. Re-read adjustments before this task.
+- [x] U2 Integrate and prove on Linux (native acceptance separately pending): zatex inline/display math, six fonts and persisted settings, bounded parser/layout and streaming fallback; retain file links/Mermaid/selection. Re-read adjustments before this task.
+- [x] U3 Integrate and prove on Linux (native acceptance separately pending): Side-chat/subagent lanes, folded finished rows, bounded scroll/counts/rename/harness marks and checkout totals; reconcile Details Workers ownership and existing new/fork buttons without duplicate activity. Re-read adjustments before this task.
+- [x] U4 Integrate and prove on Linux (native acceptance separately pending): Convergent section header drag order, iOS cross-section/pin drag, neighbor anchors and advertised capability. Re-read adjustments before this task.
+- [x] U5 Integrate and prove on Linux (native acceptance separately pending): Dwell/warm hover card, dismiss on scroll/drag/menu, once-per-frame lifecycle and metadata; retain mentions and fork rows. Re-read adjustments before this task.
+- [x] U6 Integrate and prove on Linux (native acceptance separately pending): OpenCode v2 forms normalize to field-keyed input panels and form route; v1 works and engine owns lifecycle. Re-read adjustments before this task.
+- [x] U7 Integrate and prove on Linux (native acceptance separately pending): Cursor Plus catalog/defaults on fresh and switched runs, warm catalog; protect dev bundles with fork updater/feed. Re-read adjustments before this task.
+- [x] U8 Integrate and prove on Linux (native acceptance separately pending): Recent Files flicker fix with unified search/index ownership. Re-read adjustments before this task.
+- [x] U9 Integrate and prove on Linux (native acceptance separately pending): Persist sidebar Archived visibility setting. Re-read adjustments before this task.
+- [x] U10 Integrate and prove on Linux (native acceptance separately pending): Bulk archived Chat deletion with explicit confirmation and device/sync routing. Re-read adjustments before this task.
+- [ ] U11 Native acceptance pending; source integrated: Adaptive iOS split/tab shell, fold state, uneven safe areas, transcript/composer alignment; native acceptance pending. Re-read adjustments before this task.
+- [x] Reconcile all-target APIs/lockfile and execute focused/workspace regressions with revision/exit logs. Workspace run has one ETXTBSY failure; see verification ledger, not a green-workspace claim.
+- [x] Inspect final-upstream incoming additions for omissions; record every conflict decision.
+- [x] Run isolated actual Linux app smoke/screenshots and lifecycle/selection/bounds assertions.
+- [x] Update DOX and sync YAML; deliver reviewable commits/evidence/native limits, no publish.
 - [ ] Complete native macOS/iOS acceptance and archive (handoff; unavailable on Linux).
+
+- [ ] Obtain a fully green workspace run if required for the integration gate; current complete run retains one unchanged Codex fixture ETXTBSY failure despite 23 passing repetitions.
+- [ ] Review all six math faces, GPU assets and native interaction on macOS/iOS; Linux manual glyph review used Fira/STIX, unit corpus exercised every bundled face.

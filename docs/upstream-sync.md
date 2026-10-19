@@ -194,6 +194,16 @@ como diagnóstico draft antigo, sem mutação. Planejamento, contratos e tarefas
 pendentes: [`sync-upstream-20261018`](../openspec/changes/sync-upstream-20261018/).
 Não houve push, dispatch de CI, publicação nem acesso ao Mac nesta execução.
 
+Merge local `348f8b01` (pais `d7df75f8` + `c526d6f7`); código avaliado em
+`e6a7ef19`. All-targets e smoke e2e com duas engines passaram. A regressão
+completa registrou 5.836 passes, uma falha transitória `ETXTBSY` na fixture
+Codex e 52 ignores; a suíte Codex passou em três repetições e o caso em mais
+20, sem alteração de fontes. Não chamar o run completo de verde. UI real
+exercitada em perfil Local sintético/Xvfb/Vulkan por software, com captura e
+asserções de persistência/cópia/exclusão. Evidência e limites:
+[`verification.md`](../openspec/changes/sync-upstream-20261018/verification.md).
+A aceitação macOS/iOS segue pendente; não arquivar o OpenSpec por esses passes.
+
 Armadilhas adicionais: `PublishVisual` entra na tabela única `rpc::method`,
 sempre local-only, e o grant raiz continua em `workers_mcp`; não restaurar a
 injeção global por `RunRequest.mcp`. Lanes usam o lifecycle Cancelled do fork e
