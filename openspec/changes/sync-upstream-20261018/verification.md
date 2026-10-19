@@ -195,3 +195,35 @@ Full downloaded logs, job metadata, SHA256 manifest, canonical output/provenance
 and exact byte assertion: `.tmp/reports/ci-20261019.md`. No expensive local Linux
 or workspace reruns, no new iOS pass claimed. Orchestrator publishes this local
 correction and follows the iOS rerun; native/manual acceptance stays open.
+
+
+## Review F1–F4 — 2026-10-19 (Claude Code handoff)
+
+Codex worker interrupted before delivering fixes; its partial tests were kept and
+revised (F1 sizes rescaled to the chosen budgets, F2 fixture lacked canvas
+height/button labels and the shared-allocator lock). Its `red-f2.log` was not a
+reproduction and is not used as one. Commits `a29021fc` (F1), `e1d015f6` (F2
+parser), `474a6473` (F2/F3 mobile + iOS), `3e72f696` (F4).
+
+RED on unfixed product code, AS1GiB/CPU15s/wall25s: F1 a ~700-byte asset
+allocated 72,780,792 / 288,785,100 native bytes and was accepted (six unit
+cases reached collection); F2 all 16 duplicate surface pairs and the
+control-driven rerender were accepted, and mobile emitted a display with ids
+`[18101011682566982396, 18101011682566982396]`; F3 mobile emitted a
+237,992-point display (RED variant disables only the new cap); F4 a parked
+runtime accepted a visual and success preceded persistence. GREEN: all refused
+with < 8 MiB native allocation, short visible errors, persisted-on-ack.
+
+Focused gate: `cargo test -p zeron-visual -p zeron-mobile -p zeron-doc` exit0
+(49+12 visual, 80 mobile, 191+1 doc) and `cargo test -p zeron-engine -p zeron-mcp`
+exit0 (659 engine unit and all integration targets incl. e2e). Production
+`cargo build -p zeron` exit0; private headless engine smoke (bwrap, no network,
+daemon AS2GiB) exit0: two F1 and two F2 invalid publications refused, two valid
+publications stored, F4 after stop/parked refused with uploads unchanged.
+Independent read-only review found no verified defect; two concerns were fixed
+(per-visit vs summed model budget; size cap after the error line).
+
+Not run: Swift/XCTest (no toolchain on Linux; `VisualRasterTests` targets the
+existing `ios-tests` lane), full workspace, CI. Native macOS/iOS acceptance and
+archive remain open. Evidence: `.tmp/reports/review-f1-f4-claude-20261019.md`.
+

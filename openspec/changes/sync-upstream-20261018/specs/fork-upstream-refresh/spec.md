@@ -124,6 +124,22 @@ Test: unit
 - **AND** text/log/model aggregate byte and entry budgets SHALL be checked before copying or decoding
 - **AND** independent retained default copies, numeric children, canvas text and scene axes/default labels SHALL consume the same pre-copy byte budgets
 - **AND** legitimate nested lists, numeric text, logs and repeated image views SHALL remain usable
+- **AND** sparse or repeated model primitives SHALL be charged for their expanded attribute and index vectors before any is collected
+
+Test: integration
+
+#### Scenario: Visual surfaces stay unambiguous and drawable
+- **WHEN** a view repeats a chart, canvas, scene or shader key, or lays out past the platform bitmap budget
+- **THEN** publication and rerenders SHALL fail with a visual error before a display with duplicate surface ids is emitted
+- **AND** the mobile display and iOS raster SHALL show a short visible error instead of allocating the bitmap, keeping no stale surfaces or controls
+- **AND** unrelated keys and drawable visuals SHALL remain usable
+
+Test: integration
+
+#### Scenario: Visual publication is bound to its turn
+- **WHEN** `show_visual` is called and the turn parks, is steered, stops or ends before the visual is folded
+- **THEN** the publication SHALL fail and remove its stored script and assets, never landing in another turn
+- **AND** success SHALL be reported only after the live turn persisted the visual part
 
 Test: integration
 

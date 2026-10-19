@@ -66,3 +66,15 @@ exponential DAG/OOM payload or infinite GPU shader. Native acceptance stays open
 R2 closure: retained text admission includes axes labels/defaults, implicit
 tabs/link copies, numeric root children and canvas text. Reuse existing
 pre-copy byte charging; projection copies derive from already admitted data.
+
+Review F1–F4: glTF primitives are admitted by a cumulative pre-pass over every
+usable primitive visit (expanded positions, readable normals/UVs, explicit or
+implicit indices; checked, 64 MiB per visit and 256 MiB summed) before any
+vector is collected.
+Surface keys share one host id domain, so a repeated chart/canvas/scene/shader
+key is a script error at publication and on rerender; mobile layout also refuses
+colliding ids and static paint beyond the platform bitmap budget, which iOS
+re-checks before CoreGraphics with a visible error and no stale surfaces.
+`PublishVisual` binds to a turn identity before decoding and succeeds only on a
+run-loop acknowledgement that the same live turn persisted the part; otherwise
+its files are removed.

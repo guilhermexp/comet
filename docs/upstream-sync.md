@@ -228,6 +228,15 @@ Fechamento adicional de R2: contabilizar também as cópias implícitas retidas
 canvas. O limite por cena/canvas reinicia por draw, com cobrança antes da cópia.
 Prova antes/depois e escopo auditado: `.tmp/reports/review-r2-closure.md`.
 
+Revisão F1–F4 (2026-10-19): accessors glTF expandidos (sparse sem base) são
+cobrados antes de qualquer collect, 64 MiB por visita e 256 MiB somados entre
+primitives/instâncias; chaves repetidas de chart/canvas/scene/shader são erro
+de visual (o host usa a chave como id de superfície); `crates/mobile` e
+`VisualPainter` recusam display com ids colididos ou bitmap estático acima de
+16.384 px por lado/16 Mi px, mostrando erro visível; `PublishVisual` se vincula
+ao turno vivo e só responde sucesso após o loop persistir a parte, removendo os
+arquivos em qualquer recusa. Prova: `.tmp/reports/review-f1-f4-claude-20261019.md`.
+
 ## Armadilhas conhecidas
 
 - **Campos a mais no proto do fork quebram literais do upstream:**

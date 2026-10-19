@@ -130,7 +130,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - Completion markers publish atomically with status/error and survive hydration. Pending accepted steers suppress internal-handoff completion; mailbox acceptance and ledger insertion are serialized. Quiescence publishes completion only for nonempty output without pending steers.
 - Model discovery com catálogo em disco espera a lista viva só 100ms e serve o disco; esse caso é `debug` ("Model discovery deferred"), não falha — o refresh continua e loga "Model discovery failed" se de fato falhar. O warning restante carrega `reason` legível, nunca `Option` em debug.
 
-- `PublishVisual` is local-only and accepts only a live turn. Validate title/script bytes and named assets, run bounded Luau/control validation in `spawn_blocking`, store assets before the script, then inject an atomic Visual event. Failure/ended turn removes its stored files. This does not change root MCP grants or enable per-run MCP injection. `workspace_checkout` reuses the common bounded resolver: the canonical registered main folder is authorized even without Git, and additional checkouts come from NUL-safe Git enumeration. Deletion retains its separate Registration query and never treats that main-folder allowance as permission to delete it.
+- `PublishVisual` is local-only and accepts only a live turn: it binds to `SessionsEngine::visual_turn` (run id + turn number, `None` while parked between turns) before decoding anything. Validate title/script bytes and named assets, run bounded Luau/control validation in `spawn_blocking`, store assets before the script, then `publish_visual` hands the event to the run loop, which acknowledges only when that same turn is still live (not parked, steered past, stopped or ended) and the part is written into the turn's entry. Success means persisted; any refusal or a dropped run removes the stored files. The work runs in a detached task so a caller that goes away cannot strand files. This does not change root MCP grants or enable per-run MCP injection. `workspace_checkout` reuses the common bounded resolver: the canonical registered main folder is authorized even without Git, and additional checkouts come from NUL-safe Git enumeration. Deletion retains its separate Registration query and never treats that main-folder allowance as permission to delete it.
 
 ## Work Guidance
 
@@ -189,7 +189,7 @@ Additional integration coverage:
 
 | Layer / path | Tier | Command |
 | --- | --- | --- |
-| `tests/e2e.rs::publish_visual_lands_in_the_live_turn` + visual uploads | integration — actual RPC/Loro/host upload paths | `cargo test -p zeron-engine --test e2e publish_visual_lands_in_the_live_turn` |
+| `tests/e2e.rs::publish_visual_*` + `visual_publication_is_bound_to_the_turn_it_was_checked_in` + visual uploads | integration — actual RPC/Loro/host upload paths, parked runtime, turn binding/ack | `cargo test -p zeron-engine --test e2e visual` |
 
 ## Child DOX Index
 

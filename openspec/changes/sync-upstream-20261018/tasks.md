@@ -43,4 +43,13 @@
 - [x] C1 Regenerate from the available host library with only the canonical script postprocess; commit exact output and prove sole terminal LF difference, unchanged Swift API/header/modulemap.
 - [x] Correct original terminal-LF proof limitation in ledger/DOX without rewriting retained evidence or weakening the drift gate.
 - [x] C2 Preserve remote failure logs/hash and baseline/current identical Unpeel tree; classify Windows incompatibility as preexisting/out of scope, no port or disabled check.
-- [ ] Orchestrator publishes correction and observes iOS drift/XCTest rerun; worker performs no push or CI dispatch.
+- [x] Orchestrator published C1: UI run39193873821 on 9a7225b4 passed canonical Swift drift and 14 XCTest/0 failures (orchestrator evidence, not local execution).
+
+## Authorized review F1–F4 (2026-10-19)
+
+- [x] F1 Reproduce sparse accessor expansion safely; pre-admit checked cumulative expanded attribute/index work across primitives and instances.
+- [x] F2 Reject duplicate surface keys/IDs before publication/display, including control-driven rerenders; preserve unrelated keys.
+- [x] F3 Bound iOS physical raster allocation before conversion/CGContext, propagate bounded visible error, clear stale interaction state; add real XCTest (native execution pending).
+- [x] F4 Bind publication to an active turn identity and consumer persistence acknowledgement; deterministic lifecycle/race/cleanup regressions.
+- [x] Focused gate, limited isolated real publication smoke, independent candidate review and local commits/report; no archive or publication.
+- [ ] Orchestrator publishes F1–F4 and observes CI, including the first native run of `ZeronTests/VisualRasterTests`.

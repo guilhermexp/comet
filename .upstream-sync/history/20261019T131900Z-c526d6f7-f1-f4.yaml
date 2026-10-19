@@ -1,0 +1,94 @@
+schema_version: 1
+id: 20261019T131900Z-c526d6f7-f1-f4
+skill_version: null
+started_at: '2026-10-19T13:19:00Z'
+finished_at: '2026-10-19T14:45:00Z'
+request: Correct review findings F1-F4 (sparse glTF expansion, duplicate surface ids, iOS raster budget,
+  show_visual turn binding/ack) with bounded proofs, preserving and revising the interrupted partial work.
+  No push/merge/release/archive.
+workflow_source: .tmp/briefs/review-f1-f4-20261019.md via .tmp/briefs/review-f1-f4-claude-handoff.md (executor
+  Claude Code; scope unchanged). Adjustments file had no additional guidance.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  previous_integrated_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_label: 'after 0.2.114, through #942'
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: sync/upstream-20261018
+  target_branch: sync/upstream-20261018
+  initial_sha: 9a7225b4596c966a865b4e4b26730c4bb12330ff
+  observed_target_sha: 9a7225b4596c966a865b4e4b26730c4bb12330ff
+  result_sha: 3e72f696
+  result_sha_note: Last product commit; the documentation commit follows (see report).
+  initial_worktree: interrupted Codex partial edits (4 files), preserved and revised
+strategy:
+  operation: review_corrections
+  reason: Authorized review findings F1-F4 on the fork's own visual pipeline.
+  repair_commits:
+  - a29021fc fix(visual) F1
+  - e1d015f6 fix(visual) F2 parser
+  - 474a6473 fix(mobile,ios) F2/F3
+  - 3e72f696 fix(engine) F4
+changes:
+  incoming_count: 0
+  summary: Expanded glTF accessor admission (64 MiB/visit, 256 MiB summed); duplicate surface keys refused;
+    mobile/iOS bitmap budget with visible error and no stale surfaces; PublishVisual turn binding with
+    persisted acknowledgement and cleanup.
+  imported: []
+customizations:
+- Version 1.0.7, fork contracts, R1-R5/R2 closure and C1/C2 outcomes unchanged.
+conflicts: []
+verification:
+- command: Bounded RED on unfixed product code (AS1GiB CPU15s wall25s)
+  exit: 101
+  result: confirmed
+  log: red-f1-unit.log red-f1-path.log red-f2-visual.log red-f2-visual-rerender.log red-f2-mobile.log red-f3-mobile.log red-f4-e2e.log
+- command: Bounded GREEN same tests
+  exit: 0
+  result: passed
+  log: green-f1-unit.log green-f1-path.log green-f2-f3-mobile-bounded.log green-f4-e2e-attempt1.log
+- command: cargo test -p zeron-visual -p zeron-mobile -p zeron-doc
+  exit: 0
+  result: passed
+  log: gate-visual-mobile-doc.log
+- command: cargo test -p zeron-engine -p zeron-mcp
+  exit: 0
+  result: passed
+  log: gate-engine-mcp.log
+- command: cargo build -p zeron
+  exit: 0
+  result: passed
+  log: production-app-build.log
+- command: Private headless engine smoke (bwrap, no network, daemon AS2GiB CPU90s)
+  exit: 0
+  result: passed_linux_scope
+  log: app-smoke.log
+  observed: SHA256 5d842f237b017aa2bf17bd92e5891811bfbed921eeb0497a1f96337a841f7ae9
+- command: Independent read-only candidate review
+  result: no_verified_defect; two concerns fixed before commit
+- command: openspec validate sync-upstream-20261018 --strict
+  exit: 0
+  result: passed
+  log: openspec-final.log
+- command: Swift/XCTest VisualRasterTests
+  result: not_run_no_toolchain_on_linux
+limits:
+- No Swift/UIKit/Simulator execution; iOS tests await the existing ios-tests lane.
+- No full workspace run and no CI dispatch; orchestrator publishes.
+references:
+- .tmp/reports/review-f1-f4-claude-20261019.md
+- .tmp/reports/review-f1-f4-claude-20261019/
+- openspec/changes/sync-upstream-20261018/verification.md
+outcome: integrated
+pending:
+- Native acceptance, CI observation and OpenSpec archive remain open.
+delivery:
+  integration: local_review
+  target_branch: sync/upstream-20261018
+  pr: https://github.com/guilhermexp/comet/pull/25
+  publication: worker_forbidden_orchestrator_after_review
+  record_pushed: false
+  deploy: not_authorized
