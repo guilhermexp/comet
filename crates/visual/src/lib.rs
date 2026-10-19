@@ -132,6 +132,8 @@ pub struct Visual {
 }
 
 const MAX_LOG_LINES: usize = 200;
+const MAX_LOG_BYTES: usize = 64 * 1024;
+const MAX_LOG_LINE_BYTES: usize = 8000;
 
 impl Visual {
     /// Compile and run a script's setup. `seed` keeps its random numbers
@@ -173,13 +175,33 @@ impl Visual {
         let globals = lua.globals();
         let logs: Rc<RefCell<Vec<String>>> = Rc::default();
         let sink = logs.clone();
+        let log_bytes = Cell::new(0usize);
         globals.set(
             "print",
             lua.create_function(move |_, args: mlua::Variadic<Value>| {
                 let mut logs = sink.borrow_mut();
                 if logs.len() < MAX_LOG_LINES {
-                    let line: Vec<String> = args.iter().map(node::value_text).collect();
-                    logs.push(line.join("\t"));
+                    let mut line = String::new();
+                    let available = MAX_LOG_LINE_BYTES.min(MAX_LOG_BYTES - log_bytes.get());
+                    for (i, value) in args.iter().enumerate() {
+                        if i >= 4000 {
+                            return Err(mlua::Error::external(VisualError::script(
+                                "log argument budget exceeded",
+                            )));
+                        }
+                        if i > 0 {
+                            if line.len() >= available {
+                                return Err(mlua::Error::external(VisualError::script(
+                                    "log byte budget exceeded",
+                                )));
+                            }
+                            line.push('\t');
+                        }
+                        node::append_log_text(&mut line, value, available)
+                            .map_err(mlua::Error::external)?;
+                    }
+                    log_bytes.set(log_bytes.get() + line.len());
+                    logs.push(line);
                 }
                 Ok(())
             })?,
@@ -277,8 +299,8 @@ impl Visual {
     /// until the next render.
     pub fn render(&mut self) -> Result<Node, VisualError> {
         let value = self.budgeted(CALL_BUDGET, || self.view.call::<Value>(()))?;
-        let mut parser = node::Parser::new();
         let deadline = Instant::now() + CALL_BUDGET;
+        let mut parser = node::Parser::new(deadline);
         self.deadline.set(Some(deadline));
         let tree = parser.root(value);
         self.deadline.set(None);

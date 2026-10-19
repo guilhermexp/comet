@@ -118,3 +118,25 @@ Test: integration
 
 Test: unit
 
+
+#### Scenario: Native visual traversal and materialization are bounded
+- **WHEN** scripts reuse empty/false lists or strings, or models repeat image/buffer references
+- **THEN** native traversal SHALL consume bounded work and enforce its deadline independently from Lua interrupts
+- **AND** text/log/model aggregate byte and entry budgets SHALL be checked before copying or decoding
+- **AND** legitimate nested lists, numeric text, logs and repeated image views SHALL remain usable
+
+Test: unit
+
+#### Scenario: Grouped iOS Chats remain draggable
+- **WHEN** the front page groups unassigned Chats by Project
+- **THEN** those rows SHALL remain drag sources for pins and custom sections
+- **AND** project groups SHALL remain disallowed destinations and archive/search restrictions SHALL remain
+
+Test: unit
+
+#### Scenario: Cursor rejected discovery preserves coherent defaults
+- **WHEN** discovery refresh is empty, invalid, concurrent or changes credentials
+- **THEN** models and Max Mode exclusions SHALL come from the same accepted snapshot
+- **AND** start and switch SHALL omit incompatible implicit defaults while explicit overrides remain intact
+
+Test: integration

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use mlua::{Function, Table, UserData, UserDataMethods, Value};
 
 use crate::draw::lua_error;
-use crate::node::{parse_color, value_text};
+use crate::node::{parse_color, retained_text};
 use crate::style::{Color, TextSize, Token};
 
 /// Faces a scene may draw (glTF models bring many).
@@ -190,6 +190,7 @@ pub(crate) struct Label3 {
 /// The geometry one draw call produced.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Scene {
+    text_bytes: usize,
     pub(crate) faces: Vec<Face>,
     pub(crate) lines: Vec<Line3>,
     pub(crate) points: Vec<Point3>,
@@ -1157,8 +1158,13 @@ impl UserData for Scene {
                     o.raw_get::<Option<f32>>("radius")?
                         .unwrap_or(3.0)
                         .clamp(0.5, 24.0),
-                    o.raw_get::<Value>("hint")
-                        .map(|v| (!v.is_nil()).then(|| value_text(&v)))?,
+                    match o.raw_get::<Value>("hint")? {
+                        Value::Nil => None,
+                        value => Some(
+                            retained_text(&value, &mut s.text_bytes)
+                                .map_err(|e| lua_error(e.to_string()))?,
+                        ),
+                    },
                 ),
                 None => (Color::token(Token::Accent), 3.0, None),
             };
@@ -1196,7 +1202,8 @@ impl UserData for Scene {
                 };
                 s.labels.push(Label3 {
                     at: v3(at, "label")?,
-                    text: value_text(&text),
+                    text: retained_text(&text, &mut s.text_bytes)
+                        .map_err(|e| lua_error(e.to_string()))?,
                     color,
                     size,
                 });

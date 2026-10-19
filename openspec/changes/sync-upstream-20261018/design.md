@@ -49,3 +49,16 @@ Adaptive iOS split/tab shell, fold state, uneven safe areas, transcript/composer
 ## Verification plan
 
 Use direct Cargo with one shared task target and limited jobs as explicitly required on agents-us. Retain baseline failures and exact revision/exit logs. Run upstream regressions plus fork grants/Workers/steer/search/markdown regressions, workspace/all-target integration, actual isolated app under Xvfb/software Vulkan, synthetic bulk deletion, selection/copy and hostile math/visual budgets. Read actual CI definitions but do not dispatch. Linux cannot certify AppKit/UIKit; record precise handoff and keep acceptance tasks open. No archival before native criteria are verified.
+
+## Review correction boundaries R1–R5
+
+Native Luau-to-Rust parsing must bound visits independently from constructed
+nodes and check a native deadline. Text and captured logs reserve cumulative
+bytes before copying; collection entries (including empty values) consume work.
+Model import preflights input, buffer/image counts and aggregate decoded/encoded
+bytes before import/copy/decode; identical image views share existing Arc backing.
+Cursor cache metadata must be committed with its accepted credential-scoped model
+snapshot, not mutated by speculative discovery. iOS drag source eligibility is
+independent from destination eligibility, retaining search/archive restrictions.
+Reproductions use scaled inputs under CPU/address-space/time limits; no full
+exponential DAG/OOM payload or infinite GPU shader. Native acceptance stays open.

@@ -4,6 +4,7 @@
 //! render's handler list.
 
 use mlua::{Function, Table, Value};
+use std::{cell::Cell, rc::Rc, time::Instant};
 
 use crate::VisualError;
 use crate::style::{Align, Color, Justify, TextSize, Token, Weight};
@@ -271,12 +272,89 @@ pub const MAX_HEIGHT: f32 = 720.0;
 const MAX_NODES: usize = 4000;
 const MAX_DEPTH: usize = 48;
 const MAX_TEXT: usize = 8000;
+const MAX_PARSE_STEPS: usize = 100_000;
+const MAX_VIEW_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Native traversal is not interrupted by Luau's safepoints. Count work,
+/// including omitted/empty values, independently from constructed nodes.
+struct ParseBudget {
+    steps: Cell<usize>,
+    text_bytes: Cell<usize>,
+    deadline: Instant,
+}
+
+impl ParseBudget {
+    fn step(&self) -> Result<(), VisualError> {
+        let steps = self.steps.get() + 1;
+        self.steps.set(steps);
+        if steps > MAX_PARSE_STEPS {
+            return Err(VisualError::script(
+                "the view exceeds its native work budget",
+            ));
+        }
+        if (steps == 1 || steps.is_multiple_of(256)) && Instant::now() >= self.deadline {
+            return Err(VisualError::script(
+                "the view ran past its native time budget",
+            ));
+        }
+        Ok(())
+    }
+
+    fn append(
+        &self,
+        out: &mut String,
+        value: &Value,
+        limit: usize,
+        clipped: bool,
+    ) -> Result<(), VisualError> {
+        self.step()?;
+        let numeric;
+        let bytes = match value {
+            Value::String(s) => s.as_bytes(),
+            _ => {
+                numeric = value_text(value);
+                return self.append_bytes(out, numeric.as_bytes(), limit, clipped);
+            }
+        };
+        self.append_bytes(out, &bytes, limit, clipped)
+    }
+
+    fn append_bytes(
+        &self,
+        out: &mut String,
+        bytes: &[u8],
+        limit: usize,
+        clipped: bool,
+    ) -> Result<(), VisualError> {
+        let len = lossy_prefix_len(bytes, limit.saturating_sub(out.len()), clipped)?;
+        let total = self
+            .text_bytes
+            .get()
+            .checked_add(len)
+            .ok_or_else(|| VisualError::script("view text byte budget exceeded"))?;
+        if total > MAX_VIEW_TEXT_BYTES {
+            return Err(VisualError::script("view text byte budget exceeded"));
+        }
+        self.text_bytes.set(total);
+        // Reserve only after all local/aggregate checks, then copy directly.
+        out.reserve(len);
+        append_lossy_prefix(out, bytes, len);
+        Ok(())
+    }
+
+    fn text(&self, value: &Value, limit: usize, clipped: bool) -> Result<String, VisualError> {
+        let mut text = String::new();
+        self.append(&mut text, value, limit, clipped)?;
+        Ok(text)
+    }
+}
 
 /// Builds a [`Node`] tree from a view's return value, collecting the
 /// functions it references.
 pub(crate) struct Parser {
     pub handlers: Vec<Function>,
     nodes: usize,
+    budget: Rc<ParseBudget>,
 }
 
 /// Field names every node accepts.
@@ -300,10 +378,15 @@ fn forbidden(prop: &str) -> Option<&'static str> {
 }
 
 impl Parser {
-    pub fn new() -> Self {
+    pub fn new(deadline: Instant) -> Self {
         Self {
             handlers: Vec::new(),
             nodes: 0,
+            budget: Rc::new(ParseBudget {
+                steps: Cell::new(0),
+                text_bytes: Cell::new(0),
+                deadline,
+            }),
         }
     }
 
@@ -338,15 +421,18 @@ impl Parser {
         out: &mut Vec<Node>,
         depth: usize,
     ) -> Result<(), VisualError> {
+        self.budget.step()?;
         if depth > MAX_DEPTH {
             return Err(VisualError::script("the view nests too deeply"));
         }
         match value {
             Value::Nil | Value::Boolean(false) => {}
-            Value::String(s) => out.push(self.plain_text(s.to_string_lossy())?),
+            Value::String(s) => {
+                out.push(self.plain_text(self.budget.text(&Value::String(s), MAX_TEXT, true)?)?)
+            }
             Value::Integer(_) | Value::Number(_) => out.push(self.plain_text(number_text(&value))?),
             Value::Table(table) => {
-                if table.raw_get::<Option<String>>("__kind")?.is_some() {
+                if !matches!(table.raw_get::<Value>("__kind")?, Value::Nil) {
                     out.push(self.node(&table, depth)?);
                 } else {
                     for child in table.sequence_values::<Value>() {
@@ -392,8 +478,13 @@ impl Parser {
 
     fn node(&mut self, table: &Table, depth: usize) -> Result<Node, VisualError> {
         self.count()?;
-        let kind: String = table.raw_get("__kind")?;
-        let props = Props { table, kind: &kind };
+        let budget = self.budget.clone();
+        let kind = budget.text(&table.raw_get::<Value>("__kind")?, 64, false)?;
+        let props = Props {
+            table,
+            kind: &kind,
+            budget: &budget,
+        };
         let node_kind = match kind.as_str() {
             "column" | "row" => {
                 props.allow(&["gap", "align", "justify", "wrap", "hover", "on_click"])?;
@@ -497,7 +588,11 @@ impl Parser {
                     "transparent",
                 ])?;
                 let code = match props.table.raw_get::<Value>("code")? {
-                    Value::String(code) => code.to_string_lossy(),
+                    Value::String(code) => props.budget.text(
+                        &Value::String(code),
+                        crate::shader::MAX_SHADER_BYTES,
+                        false,
+                    )?,
                     Value::Nil => {
                         return Err(props.error(
                             "needs code: GLSL defining void mainImage(out vec4 fragColor, in \
@@ -510,7 +605,16 @@ impl Parser {
                 if let Some(table) = props.get::<Option<Table>>("buffers")? {
                     for value in table.sequence_values::<Value>() {
                         match value? {
-                            Value::String(code) => buffers.push(code.to_string_lossy()),
+                            Value::String(code) => {
+                                if buffers.len() >= crate::shader::MAX_BUFFERS {
+                                    return Err(props.error("too many shader buffers"));
+                                }
+                                buffers.push(props.budget.text(
+                                    &Value::String(code),
+                                    crate::shader::MAX_SHADER_BYTES,
+                                    false,
+                                )?);
+                            }
                             _ => return Err(props.error("'buffers' is a list of GLSL strings")),
                         }
                     }
@@ -525,7 +629,16 @@ impl Parser {
                 if let Some(table) = props.get::<Option<Table>>("textures")? {
                     for value in table.sequence_values::<Value>() {
                         match value? {
-                            Value::String(name) => textures.push(name.to_string_lossy()),
+                            Value::String(name) => {
+                                if textures.len() >= crate::shader::MAX_TEXTURES {
+                                    return Err(props.error("too many shader textures"));
+                                }
+                                textures.push(props.budget.text(
+                                    &Value::String(name),
+                                    MAX_TEXT,
+                                    false,
+                                )?);
+                            }
                             _ => return Err(props.error("'textures' is a list of asset names")),
                         }
                     }
@@ -546,9 +659,13 @@ impl Parser {
                 };
                 let mut inputs = Vec::new();
                 if let Some(table) = props.get::<Option<Table>>("inputs")? {
-                    for pair in table.pairs::<String, f64>() {
+                    for pair in table.pairs::<Value, f64>() {
+                        if inputs.len() >= crate::shader::MAX_INPUTS {
+                            return Err(props.error("too many shader inputs"));
+                        }
                         let (name, value) =
                             pair.map_err(|_| props.error("'inputs' maps names to numbers"))?;
+                        let name = props.budget.text(&name, MAX_TEXT, false)?;
                         if !crate::shader::valid_input_name(&name) {
                             return Err(
                                 props.error(&format!("input '{name}' is not a usable GLSL name"))
@@ -600,11 +717,10 @@ impl Parser {
             "tabs" => {
                 props.allow(&["options", "value", "on_change"])?;
                 let options: Vec<String> = props
-                    .get::<Option<Vec<Value>>>("options")?
-                    .unwrap_or_default()
+                    .list::<Value>("options")?
                     .iter()
-                    .map(value_text)
-                    .collect();
+                    .map(|v| props.budget.text(v, MAX_TEXT, false))
+                    .collect::<Result<_, _>>()?;
                 if options.is_empty() {
                     return Err(props.error("needs options = { ... }"));
                 }
@@ -689,20 +805,22 @@ impl Parser {
         let mut spans = Vec::new();
         let mut len = 0usize;
         for child in props.table.sequence_values::<Value>() {
+            props.budget.step()?;
             let span = match child? {
-                Value::Table(table)
-                    if table.raw_get::<Option<String>>("__kind")?.as_deref() == Some("span") =>
+                Value::Table(table) if matches!(table.raw_get::<Value>("__kind")?, Value::String(s) if s.as_bytes().as_ref() == b"span") =>
                 {
                     let span_props = Props {
                         table: &table,
                         kind: "span",
+                        budget: props.budget,
                     };
                     span_props.allow(&["weight", "color", "mono", "italic"])?;
-                    let text: String = table
-                        .sequence_values::<Value>()
-                        .map(|v| v.map(|v| value_text(&v)))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .concat();
+                    let mut text = String::new();
+                    for value in table.sequence_values::<Value>() {
+                        props
+                            .budget
+                            .append(&mut text, &value?, MAX_TEXT - len, false)?;
+                    }
                     Span {
                         text,
                         weight: span_props.weight()?,
@@ -716,7 +834,7 @@ impl Parser {
                 }
                 Value::Nil | Value::Boolean(false) => continue,
                 value => Span {
-                    text: value_text(&value),
+                    text: props.budget.text(&value, MAX_TEXT - len, false)?,
                     ..Default::default()
                 },
             };
@@ -741,13 +859,16 @@ impl Parser {
     fn table(&mut self, props: &Props, depth: usize) -> Result<Table_, VisualError> {
         props.allow(&["columns", "rows", "hover"])?;
         let mut columns = Vec::new();
-        for column in props
-            .get::<Option<Vec<Value>>>("columns")?
-            .unwrap_or_default()
-        {
+        for column in props.list::<Value>("columns")? {
             columns.push(match column {
                 Value::Table(t) => Column {
-                    label: t.get::<Option<String>>("label")?.unwrap_or_default(),
+                    label: Props {
+                        table: &t,
+                        kind: "column",
+                        budget: props.budget,
+                    }
+                    .string("label")?
+                    .unwrap_or_default(),
                     align: match t.get::<Option<String>>("align")? {
                         Some(a) => Align::parse(&a)?,
                         None => Align::Start,
@@ -755,13 +876,13 @@ impl Parser {
                     width: t.get::<Option<f64>>("width")?.map(|w| w as f32),
                 },
                 other => Column {
-                    label: value_text(&other),
+                    label: props.budget.text(&other, MAX_TEXT, false)?,
                     ..Default::default()
                 },
             });
         }
         let mut rows = Vec::new();
-        for row in props.get::<Option<Vec<Table>>>("rows")?.unwrap_or_default() {
+        for row in props.list::<Table>("rows")? {
             let mut cells = Vec::new();
             for cell in row.sequence_values::<Value>() {
                 let cell = cell?;
@@ -835,34 +956,35 @@ fn chart(props: &Props) -> Result<Chart, VisualError> {
         }
     };
     let x: Vec<String> = props
-        .get::<Option<Vec<Value>>>("x")?
-        .unwrap_or_default()
+        .list::<Value>("x")?
         .iter()
-        .map(value_text)
-        .collect();
+        .map(|v| props.budget.text(v, MAX_TEXT, false))
+        .collect::<Result<_, _>>()?;
     let mut series = Vec::new();
-    for (ix, s) in props
-        .get::<Option<Vec<Table>>>("series")?
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-    {
+    for (ix, s) in props.list::<Table>("series")?.into_iter().enumerate() {
         let s_props = Props {
             table: &s,
             kind: "chart series",
+            budget: props.budget,
         };
         s_props.allow(&["name", "values", "points", "color"])?;
         let values = match s.get::<Option<Table>>("values")? {
             Some(values) => {
                 let len = values.raw_len();
+                if len > 20_000 {
+                    return Err(props.error("has more than 20,000 values in a series"));
+                }
                 (1..=len)
-                    .map(|i| values.raw_get::<Option<f64>>(i))
+                    .map(|i| {
+                        props.budget.step().map_err(mlua::Error::external)?;
+                        values.raw_get::<Option<f64>>(i)
+                    })
                     .collect::<Result<Vec<_>, _>>()?
             }
             None => Vec::new(),
         };
         let mut points = Vec::new();
-        for point in s.get::<Option<Vec<Table>>>("points")?.unwrap_or_default() {
+        for point in s_props.list::<Table>("points")? {
             let px: f64 = point.raw_get(1).or_else(|_| point.get("x"))?;
             let py: f64 = point.raw_get(2).or_else(|_| point.get("y"))?;
             points.push((px, py));
@@ -917,6 +1039,7 @@ fn chart(props: &Props) -> Result<Chart, VisualError> {
 struct Props<'a> {
     table: &'a Table,
     kind: &'a str,
+    budget: &'a ParseBudget,
 }
 
 impl Props<'_> {
@@ -928,9 +1051,10 @@ impl Props<'_> {
     /// fails at `show_visual` time instead of being silently ignored.
     fn allow(&self, known: &[&str]) -> Result<(), VisualError> {
         for pair in self.table.pairs::<Value, Value>() {
+            self.budget.step()?;
             let (key, _) = pair?;
             let Value::String(key) = key else { continue };
-            let key = key.to_string_lossy();
+            let key = self.budget.text(&Value::String(key), MAX_TEXT, true)?;
             if COMMON.contains(&key.as_str()) || known.contains(&key.as_str()) {
                 continue;
             }
@@ -954,6 +1078,17 @@ impl Props<'_> {
             .map_err(|e| self.error(&format!("'{name}': {}", short_error(&e))))
     }
 
+    fn list<T: mlua::FromLua>(&self, name: &str) -> Result<Vec<T>, VisualError> {
+        let mut items = Vec::new();
+        if let Some(table) = self.get::<Option<Table>>(name)? {
+            for value in table.sequence_values::<T>() {
+                self.budget.step()?;
+                items.push(value?);
+            }
+        }
+        Ok(items)
+    }
+
     fn number(&self, name: &str) -> Result<Option<f64>, VisualError> {
         self.get(name)
     }
@@ -970,7 +1105,7 @@ impl Props<'_> {
         Ok(match self.table.raw_get::<Value>(name)? {
             Value::Nil => None,
             value @ (Value::String(_) | Value::Integer(_) | Value::Number(_)) => {
-                Some(clip(value_text(&value)))
+                Some(self.budget.text(&value, MAX_TEXT, true)?)
             }
             _ => return Err(self.error(&format!("'{name}' must be a string"))),
         })
@@ -1007,7 +1142,7 @@ impl Props<'_> {
             Value::Nil => None,
             Value::Integer(n) => Some(Weight::from_number(n as f64)),
             Value::Number(n) => Some(Weight::from_number(n)),
-            Value::String(s) => Some(Weight::parse(&s.to_string_lossy())?),
+            Value::String(s) => Some(Weight::parse(&token_text(Value::String(s))?)?),
             _ => return Err(self.error("'weight' must be a number or a name")),
         })
     }
@@ -1039,12 +1174,12 @@ impl Props<'_> {
 pub(crate) fn parse_color(value: Value) -> Result<Option<Color>, VisualError> {
     Ok(match value {
         Value::Nil => None,
-        Value::String(s) => Some(Color::token(Token::parse(&s.to_string_lossy())?)),
+        Value::String(s) => Some(Color::token(Token::parse(&token_text(Value::String(s))?)?)),
         Value::Table(t) if t.raw_get::<Option<bool>>("__color")?.unwrap_or(false) => {
-            let token = Token::parse(&t.raw_get::<String>("token")?)?;
-            let mix = match t.raw_get::<Option<String>>("mix")? {
+            let token = Token::parse(&token_text(t.raw_get("token")?)?)?;
+            let mix = match t.raw_get::<Option<Value>>("mix")? {
                 Some(other) => Some((
-                    Token::parse(&other)?,
+                    Token::parse(&token_text(other)?)?,
                     t.raw_get::<Option<f64>>("t")?
                         .unwrap_or(0.5)
                         .clamp(0.0, 1.0) as f32,
@@ -1069,9 +1204,108 @@ pub(crate) fn parse_color(value: Value) -> Result<Option<Color>, VisualError> {
     })
 }
 
+fn token_text(value: Value) -> Result<String, VisualError> {
+    let mut text = String::new();
+    append_log_text(&mut text, &value, 64)?;
+    Ok(text)
+}
+
+/// Shared with scene labels/hints; charge the exact lossy UTF-8 bytes before copying.
+pub(crate) fn retained_text(value: &Value, total: &mut usize) -> Result<String, VisualError> {
+    let budget = ParseBudget {
+        steps: Cell::new(0),
+        text_bytes: Cell::new(*total),
+        deadline: Instant::now() + std::time::Duration::from_secs(1),
+    };
+    let text = budget.text(value, MAX_TEXT, true)?;
+    *total = budget.text_bytes.get();
+    Ok(text)
+}
+
+fn lossy_prefix_len(bytes: &[u8], limit: usize, clipped: bool) -> Result<usize, VisualError> {
+    let mut len = 0;
+    if !clipped && bytes.len() > limit {
+        return Err(VisualError::script("text byte budget exceeded"));
+    }
+    for chunk in bytes.utf8_chunks() {
+        for part in [
+            chunk.valid(),
+            if chunk.invalid().is_empty() {
+                ""
+            } else {
+                "\u{fffd}"
+            },
+        ] {
+            let mut take = part.len().min(limit - len);
+            while !part.is_char_boundary(take) {
+                take -= 1;
+            }
+            len += take;
+            if take < part.len() {
+                return if clipped {
+                    Ok(len)
+                } else {
+                    Err(VisualError::script("text byte budget exceeded"))
+                };
+            }
+        }
+    }
+    Ok(len)
+}
+
+fn append_lossy_prefix(out: &mut String, bytes: &[u8], mut len: usize) {
+    for chunk in bytes.utf8_chunks() {
+        for part in [
+            chunk.valid(),
+            if chunk.invalid().is_empty() {
+                ""
+            } else {
+                "\u{fffd}"
+            },
+        ] {
+            let take = part.len().min(len);
+            out.push_str(&part[..take]);
+            len -= take;
+            if len == 0 {
+                return;
+            }
+        }
+    }
+}
+
+/// Append one print argument without an unchecked conversion or join.
+pub(crate) fn append_log_text(
+    out: &mut String,
+    value: &Value,
+    limit: usize,
+) -> Result<(), VisualError> {
+    match value {
+        Value::String(s) => {
+            let bytes = s.as_bytes();
+            let len = lossy_prefix_len(&bytes, limit.saturating_sub(out.len()), false)?;
+            out.reserve(len);
+            append_lossy_prefix(out, &bytes, len);
+        }
+        _ => {
+            let text = value_text(value);
+            if text.len() > limit.saturating_sub(out.len()) {
+                return Err(VisualError::script("log byte budget exceeded"));
+            }
+            out.push_str(&text);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn value_text(value: &Value) -> String {
     match value {
-        Value::String(s) => s.to_string_lossy(),
+        Value::String(s) => {
+            let bytes = s.as_bytes();
+            let len = lossy_prefix_len(&bytes, MAX_TEXT, true).expect("clipping cannot fail");
+            let mut text = String::with_capacity(len);
+            append_lossy_prefix(&mut text, &bytes, len);
+            text
+        }
         Value::Integer(_) | Value::Number(_) => number_text(value),
         Value::Boolean(b) => b.to_string(),
         Value::Nil => String::new(),
@@ -1114,6 +1348,18 @@ pub(crate) fn short_error(error: &mlua::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_native_deadline_rejects_even_empty_children() {
+        let mut parser = Parser::new(Instant::now() - std::time::Duration::from_millis(1));
+        assert!(
+            parser
+                .root(Value::Boolean(false))
+                .unwrap_err()
+                .message
+                .contains("time budget")
+        );
+    }
 
     #[test]
     fn numbers_format_with_grouping_and_units() {

@@ -2,7 +2,7 @@
 //! world-space triangles with their normals, texture coordinates, and PBR
 //! materials, plus the images those materials use.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::scene::{Material, TextureData, V3};
 
@@ -40,6 +40,64 @@ const MAX_TRIANGLES: usize = 400_000;
 /// Most node visits while walking the scene (instancing can repeat nodes;
 /// a malformed file can loop).
 const MAX_NODE_VISITS: usize = 100_000;
+const MAX_MODEL_ENTRIES: usize = 128;
+const MAX_IMPORTED_BYTES: usize = 16 * 1024 * 1024;
+
+fn charge(total: &mut usize, bytes: usize, kind: &str) -> Result<(), String> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| format!("model {kind} byte budget exceeded"))?;
+    if *total > MAX_IMPORTED_BYTES {
+        return Err(format!("model {kind} byte budget exceeded"));
+    }
+    Ok(())
+}
+
+/// An upper bound before base64 decoding, including malformed input. Never
+/// trust a buffer's declared length instead of its actual encoded payload.
+fn data_uri_bytes(uri: &str) -> Result<usize, String> {
+    let data = uri
+        .strip_prefix("data:")
+        .and_then(|s| s.split_once(";base64,"))
+        .map(|(_, data)| data)
+        .ok_or("models require self-contained base64 data URIs")?;
+    data.len()
+        .checked_add(3)
+        .and_then(|n| (n / 4).checked_mul(3))
+        .ok_or_else(|| "model data URI byte budget exceeded".into())
+}
+
+fn preflight(document: &gltf::Document, blob: Option<&[u8]>) -> Result<(), String> {
+    if document.buffers().len() > MAX_MODEL_ENTRIES {
+        return Err("model buffer count exceeds 128".into());
+    }
+    if document.images().len() > MAX_MODEL_ENTRIES {
+        return Err("model image count exceeds 128".into());
+    }
+    let mut buffers = 0;
+    for buffer in document.buffers() {
+        let actual = match buffer.source() {
+            gltf::buffer::Source::Bin => blob.map_or(0, <[u8]>::len),
+            gltf::buffer::Source::Uri(uri) => data_uri_bytes(uri)?,
+        };
+        let padded = actual
+            .max(buffer.length())
+            .checked_add(3)
+            .map(|n| n & !3)
+            .ok_or("model buffer byte budget exceeded")?;
+        charge(&mut buffers, padded, "buffer")?;
+    }
+    let mut images = 0;
+    for image in document.images() {
+        let length = match image.source() {
+            gltf::image::Source::View { view, .. } => view.length(),
+            gltf::image::Source::Uri { uri, .. } => data_uri_bytes(uri)?,
+        };
+        // Charge logical references even when identical view bytes are shared.
+        charge(&mut images, length, "image")?;
+    }
+    Ok(())
+}
 
 fn to_srgb(c: f32) -> f32 {
     let c = c.clamp(0.0, 1.0);
@@ -101,37 +159,55 @@ impl Model {
     }
 
     fn parse_unguarded(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > crate::assets::MAX_ASSET_BYTES {
+            return Err("model input byte budget exceeded".into());
+        }
         let unusable = |e: gltf::Error| format!("not a usable glTF model: {e}");
         let gltf = gltf::Gltf::from_slice(bytes).map_err(unusable)?;
         let document = gltf.document;
+        preflight(&document, gltf.blob.as_deref())?;
         // No base path: external files are refused, only embedded data loads.
         let buffers = gltf::import_buffers(&document, None, gltf.blob).map_err(unusable)?;
         // Images stay encoded: the renderer decodes them with the same size
         // limits as image assets (a small file can declare a huge image).
+        let mut views: HashMap<(usize, usize, usize), Arc<[u8]>> = HashMap::new();
         let images = document
             .images()
-            .map(|image| {
-                let bytes: Vec<u8> = match image.source() {
-                    gltf::image::Source::View { view, .. } => buffers
-                        .get(view.buffer().index())
-                        .and_then(|data| {
-                            data.0
-                                .get(view.offset()..view.offset().checked_add(view.length())?)
-                        })
-                        .map(<[u8]>::to_vec)
-                        .unwrap_or_default(),
-                    gltf::image::Source::Uri { uri, .. } => uri
-                        .strip_prefix("data:")
-                        .and_then(|rest| rest.split_once(";base64,"))
-                        .and_then(|(_, data)| {
-                            use base64::Engine as _;
-                            base64::engine::general_purpose::STANDARD.decode(data).ok()
-                        })
-                        .unwrap_or_default(),
+            .map(|image| -> Result<TextureData, String> {
+                let bytes: Arc<[u8]> = match image.source() {
+                    gltf::image::Source::View { view, .. } => {
+                        let key = (view.buffer().index(), view.offset(), view.length());
+                        if let Some(bytes) = views.get(&key) {
+                            bytes.clone()
+                        } else {
+                            let end = view
+                                .offset()
+                                .checked_add(view.length())
+                                .ok_or("invalid image buffer view")?;
+                            let data = buffers
+                                .get(view.buffer().index())
+                                .and_then(|data| data.0.get(view.offset()..end))
+                                .ok_or("invalid image buffer view")?;
+                            let bytes: Arc<[u8]> = data.into();
+                            views.insert(key, bytes.clone());
+                            bytes
+                        }
+                    }
+                    gltf::image::Source::Uri { uri, .. } => {
+                        use base64::Engine as _;
+                        let (_, data) = uri
+                            .strip_prefix("data:")
+                            .and_then(|s| s.split_once(";base64,"))
+                            .ok_or("models require self-contained base64 data URIs")?;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|_| "invalid model image data URI")?
+                            .into()
+                    }
                 };
-                TextureData::Encoded(bytes.into())
+                Ok(TextureData::Encoded(bytes))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         let materials: Vec<ModelMaterial> = document
             .materials()
             .map(|m| {
@@ -305,6 +381,7 @@ pub(crate) fn parse_shared(bytes: &[u8]) -> Result<Arc<Model>, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use base64::Engine as _;
 
     /// A binary glTF of one red, double-sided triangle under a node that
     /// moves it up by 2 and doubles it.
@@ -358,6 +435,88 @@ pub(crate) mod tests {
             len = bin.len()
         );
         glb(&json, &bin)
+    }
+
+    fn repeated_images(count: usize, size: usize) -> Vec<u8> {
+        let images = std::iter::repeat_n(r#"{"bufferView":1,"mimeType":"image/png"}"#, count)
+            .collect::<Vec<_>>()
+            .join(",");
+        triangle_with(
+            &vec![0; size],
+            &format!(
+                r#""nodes":[{{"mesh":0}}],
+            "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}}}}]}}],
+            "accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}}],
+            "bufferViews":[{{"buffer":0,"byteLength":36}},{{"buffer":0,"byteOffset":36,"byteLength":{size}}}],
+            "images":[{images}]"#
+            ),
+        )
+    }
+
+    #[test]
+    fn repeated_image_views_share_backing_and_aggregate_images_are_bounded() {
+        let model = Model::parse(&repeated_images(4, 1024)).unwrap();
+        let (TextureData::Encoded(a), TextureData::Encoded(b)) =
+            (&model.images[0], &model.images[1])
+        else {
+            panic!("encoded images")
+        };
+        assert!(Arc::ptr_eq(a, b), "repeated image view was copied");
+    }
+
+    #[test]
+    fn aggregate_image_materialization_is_bounded_before_copy() {
+        // Only 512 KiB on input; old implementation copies 32 MiB, not GB.
+        let result = Model::parse(&repeated_images(64, 512 * 1024));
+        assert!(
+            result.is_err(),
+            "oversized aggregate image materialization was accepted"
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("image byte budget"), "{error}");
+    }
+
+    #[test]
+    fn model_image_and_buffer_counts_are_checked_before_import() {
+        let error = Model::parse(&repeated_images(129, 4)).unwrap_err();
+        assert!(error.contains("image count"), "{error}");
+        let buffers = std::iter::repeat_n(
+            r#"{"byteLength":4,"uri":"data:application/octet-stream;base64,AAAAAA=="}"#,
+            129,
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+        let json = format!(
+            r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[]}}],"buffers":[{buffers}]}}"#
+        );
+        let error = Model::parse(json.as_bytes()).unwrap_err();
+        assert!(error.contains("buffer count"), "{error}");
+    }
+
+    #[test]
+    fn embedded_uri_imports_are_bounded_before_decode_and_preserve_images() {
+        let binary = repeated_images(1, 4);
+        let json_len = u32::from_le_bytes(binary[12..16].try_into().unwrap()) as usize;
+        let json = std::str::from_utf8(&binary[20..20 + json_len]).unwrap();
+        let model_bytes = &binary[28 + json_len..];
+        let uri = base64::engine::general_purpose::STANDARD.encode(model_bytes);
+        let json = json.replace(r#""buffers":[{"byteLength":40}]"#, &format!(r#""buffers":[{{"byteLength":40,"uri":"data:application/octet-stream;base64,{uri}"}}]"#))
+            .replace(r#"{"bufferView":1,"mimeType":"image/png"}"#, r#"{"uri":"data:image/png;base64,AQIDBA=="}"#);
+        let model = Model::parse(json.as_bytes()).unwrap();
+        let TextureData::Encoded(bytes) = &model.images[0] else {
+            panic!("encoded")
+        };
+        assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+        let error = Model::parse(br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":16777217,"uri":"data:application/octet-stream;base64,AAAAAA=="}]}"#).unwrap_err();
+        assert!(error.contains("buffer byte budget"), "{error}");
+        for uri in ["outside.bin", "data:image/png;utf8,abcd"] {
+            let json = format!(r#"{{"asset":{{"version":"2.0"}},"images":[{{"uri":"{uri}"}}]}}"#);
+            assert!(
+                Model::parse(json.as_bytes())
+                    .unwrap_err()
+                    .contains("self-contained base64")
+            );
+        }
     }
 
     #[test]
