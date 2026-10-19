@@ -3528,6 +3528,9 @@ async fn drive_run(
                             || writer.as_ref().is_some_and(|w| w.written().len() > at);
                         if accepted {
                             dirty = false;
+                            // Turn output like any streamed event: the quiesce
+                            // window restarts from it (a refusal is not activity).
+                            last_stream_activity = tokio::time::Instant::now();
                             inner.publish(&chat_id, &publish.event);
                         } else {
                             folded.truncate(at);
