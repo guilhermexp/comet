@@ -52,4 +52,6 @@
 - [x] F3 Bound iOS physical raster allocation before conversion/CGContext, propagate bounded visible error, clear stale interaction state; add real XCTest (native execution pending).
 - [x] F4 Bind publication to an active turn identity and consumer persistence acknowledgement; deterministic lifecycle/race/cleanup regressions.
 - [x] Focused gate, limited isolated real publication smoke, independent candidate review and local commits/report; no archive or publication.
+- [x] F1 closure: refuse an explicit index accessor the reader can't open before collection; only absence is implicit (truncated-input RED measured on the real path).
+- [x] F4 closure: an accepted visual restarts the quiesce window before its ack; refusals don't (paused-time RED/GREEN).
 - [ ] Orchestrator publishes F1–F4 and observes CI, including the first native run of `ZeronTests/VisualRasterTests`.

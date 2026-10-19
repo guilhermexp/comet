@@ -236,6 +236,9 @@ de visual (o host usa a chave como id de superfície); `crates/mobile` e
 16.384 px por lado/16 Mi px, mostrando erro visível; `PublishVisual` se vincula
 ao turno vivo e só responde sucesso após o loop persistir a parte, removendo os
 arquivos em qualquer recusa. Prova: `.tmp/reports/review-f1-f4-claude-20261019.md`.
+Fechamento: accessor de índice explícito ilegível é recusado (só ausência gera
+índices implícitos) e visual aceito reinicia a janela de quiesce; prova em
+`.tmp/reports/review-f1-f4-closure-20261019.md`.
 
 ## Armadilhas conhecidas
 

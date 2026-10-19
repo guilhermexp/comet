@@ -227,3 +227,30 @@ Not run: Swift/XCTest (no toolchain on Linux; `VisualRasterTests` targets the
 existing `ios-tests` lane), full workspace, CI. Native macOS/iOS acceptance and
 archive remain open. Evidence: `.tmp/reports/review-f1-f4-claude-20261019.md`.
 
+
+## Review F1/F4 closure — 2026-10-19
+
+Independent rereview of `d4afa44a` accepted F2/F3 and found two P2 gaps,
+both reproduced here before the repair (AS1GiB/CPU15s/wall25s).
+
+F1: gltf 1.4.1 `read_indices()` is `None` both for an absent accessor and for
+an explicit one whose view is too short (`accessor::Iter::new` fails its slice).
+A 4M-entry sparse POSITION plus 3 u32 indices on a 4-byte view was admitted at
+48 MB and fell back to implicit indices: 198,219,964 native bytes before the
+triangle limit. Commit `0a06faf3` refuses such an accessor in the pre-pass;
+GREEN < 8 MiB, readable/absent controls and the 20-primitive shared-accessor
+control still accepted.
+
+F4: the dedicated visual arm skipped `last_stream_activity`. Paused-time
+regression `tests/visual_quiesce.rs`: on `d4afa44a` the turn parked on the old
+deadline after an accepted visual (Idle at t+W+60s); commit `9877fde1`
+keeps it Working there, parks at the renewed deadline, and a refused (stale
+ticket) publication does not prolong the next turn. GREEN 5/5 runs.
+
+Gate `cargo test -p zeron-visual -p zeron-engine` exit0; `cargo build -p zeron`
+exit0; private headless smoke exit0 (binary SHA256 dfcf37006c99f31bd45d9af498b910f58089f56bd994e8696ee0f35287fb6705): F1 three invalid
+models (incl. truncated indices) and F2 two duplicates refused, three valid
+publications stored, F4 stop/parked refused, uploads unchanged, daemon alive.
+No workspace run, Swift, bindings or CI. Evidence:
+`.tmp/reports/review-f1-f4-closure-20261019.md`.
+
