@@ -139,3 +139,153 @@ fn scene_retained_text_is_bounded_and_log_budget_survives_render() {
     )
     .unwrap();
 }
+
+fn scene_from(script: &str) -> Result<zeron_visual::Scene, zeron_visual::VisualError> {
+    let mut v = Visual::load(script, 1)?;
+    let node = v.render()?;
+    let zeron_visual::NodeKind::Scene(scene) = node.kind else {
+        panic!("scene")
+    };
+    v.draw_scene(scene.draw, 0.0)
+}
+
+#[test]
+fn axes_individual_copy_is_clipped_before_allocation() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Prepare the shared Lua string before metering native draw copies.
+    let mut v = Visual::load("local t=string.rep('x',524288); return ui.scene {height=200,draw=function(s) s:axes {labels={t,t,t}} end}",1).unwrap();
+    let zeron_visual::NodeKind::Scene(node) = v.render().unwrap().kind else {
+        panic!("scene")
+    };
+    ALLOCATED.store(0, Ordering::Relaxed);
+    TRACK.store(true, Ordering::Relaxed);
+    let scene = v.draw_scene(node.draw, 0.0);
+    TRACK.store(false, Ordering::Relaxed);
+    let allocated = ALLOCATED.load(Ordering::Relaxed);
+    let scene = scene.unwrap();
+    let labels: Vec<_> = scene
+        .project(
+            zeron_visual::Camera {
+                yaw: 0.5,
+                pitch: 0.3,
+                zoom: 1.0,
+            },
+            400.,
+            400.,
+        )
+        .prims
+        .into_iter()
+        .filter_map(|p| match p {
+            zeron_visual::Prim::Label { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    eprintln!(
+        "AXES_NATIVE_ALLOCATED={allocated} LABEL_BYTES={:?}",
+        labels.iter().map(String::len).collect::<Vec<_>>()
+    );
+    assert_eq!(labels.len(), 3);
+    assert!(labels.iter().all(|s| s.len() == 8000));
+    assert!(allocated < 256 * 1024, "native allocations {allocated}");
+}
+
+#[test]
+fn axes_aggregate_includes_default_xyz_and_preserves_missing_labels() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let aggregate_rejected = check("return ui.scene {height=200,draw=function(s) local t=string.rep('x',8000); for i=1,44 do s:axes {labels={t,t,t}} end end}",1).is_err();
+    let prefix = "return ui.scene {height=200,draw=function(s) local t=string.rep('x',8000); for i=1,131 do s:label({0,0,0},t) end; ";
+    let defaults_rejected = check(
+        &format!("{prefix}s:label({{0,0,0}},string.rep('x',574)); s:axes() end}}"),
+        1,
+    )
+    .is_err();
+    eprintln!(
+        "AXES_AGGREGATE_REJECTED={aggregate_rejected} DEFAULT_XYZ_REJECTED={defaults_rejected}"
+    );
+    check(
+        &format!("{prefix}s:label({{0,0,0}},string.rep('x',573)); s:axes() end}}"),
+        1,
+    )
+    .unwrap();
+    for (options, expected) in [
+        ("", vec!["x", "y", "z"]),
+        ("{labels=nil}", vec!["x", "y", "z"]),
+        ("{labels={'east',nil,'up'}}", vec!["east", "up"]),
+        ("{labels={}}", vec![]),
+    ] {
+        let scene = scene_from(&format!(
+            "return ui.scene {{height=200,draw=function(s) s:axes({options}) end}}"
+        ))
+        .unwrap();
+        let actual: Vec<_> = scene
+            .project(
+                zeron_visual::Camera {
+                    yaw: 0.5,
+                    pitch: 0.3,
+                    zoom: 1.0,
+                },
+                400.,
+                400.,
+            )
+            .prims
+            .into_iter()
+            .filter_map(|p| match p {
+                zeron_visual::Prim::Label { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+    assert!(aggregate_rejected && defaults_rejected);
+}
+
+#[test]
+fn tabs_and_link_default_copies_consume_the_view_budget() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rejected = Vec::new();
+    for (make, explicit) in [
+        (
+            "ui.tabs {options={s},on_change=function()end}",
+            "ui.tabs {options={s},value='',on_change=function()end}",
+        ),
+        ("ui.link {url=s}", "ui.link {url=s,label=''}"),
+    ] {
+        let prefix = "local s='https://'..string.rep('x',7992); local nodes={}; ";
+        let script = format!("{prefix}for i=1,80 do nodes[i]={make} end; return nodes");
+        let result = check(&script, 1);
+        eprintln!("DEFAULT_ROUTE={make} REJECTED={}", result.is_err());
+        if let Err(error) = &result {
+            assert!(error.message.contains("text byte budget"), "{error:?}");
+        }
+        rejected.push(result.is_err());
+        check(
+            &format!("{prefix}for i=1,80 do nodes[i]={explicit} end; return nodes"),
+            1,
+        )
+        .unwrap();
+    }
+    let mut v=Visual::load("return {ui.tabs {options={'a','b'},on_change=function()end},ui.link {url='https://example.invalid'}}",1).unwrap();
+    let zeron_visual::NodeKind::Stack(stack) = v.render().unwrap().kind else {
+        panic!("stack")
+    };
+    let zeron_visual::NodeKind::Tabs { options, value, .. } = &stack.children[0].kind else {
+        panic!("tabs")
+    };
+    assert_eq!(*value, options[0]);
+    let zeron_visual::NodeKind::Link { label, url } = &stack.children[1].kind else {
+        panic!("link")
+    };
+    assert_eq!(label, url);
+    assert_eq!(rejected, [true, true]);
+}
+
+#[test]
+fn numeric_children_and_canvas_text_share_retained_byte_limits() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let numeric = check("return table.create(3500,1e308)", 1).is_err();
+    check("return {42,12.5,1e308}", 1).unwrap();
+    let canvas=check("return ui.canvas {height=200,draw=function(g) local t=string.rep('x',8000); for i=1,132 do g:text(0,0,t) end end}",1).is_err();
+    eprintln!("NUMERIC_REJECTED={numeric} CANVAS_REJECTED={canvas}");
+    check("return ui.canvas {height=200,draw=function(g) g:text(0,0,'ok\\nline'); g:text(0,10,42); g:text(0,20,true); g:text(0,30,nil) end}",1).unwrap();
+    assert!(numeric && canvas);
+}

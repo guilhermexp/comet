@@ -29,3 +29,10 @@
 - [x] R5 Commit Cursor model/default-exclusion snapshots atomically, preserving rejected refreshes, credentials and concurrency; run/switch regressions.
 - [x] Run one coherent focused gate, isolated publication/dashboard smoke, independent candidate review and one final full workspace run; preserve all outcomes.
 - [x] Update DOX, verification, history and new review report; local commits only, no archive/publication.
+
+## R2 closure — retained display text
+
+- [ ] Reproduce axes individual/aggregate/default accounting and implicit tabs/link copies on the delivered source; audit equivalent retained input paths.
+- [ ] Charge all confirmed paths through existing boundaries; preserve valid axes/default/explicit controls, numeric and canvas semantics.
+- [ ] Focused visual gate, bounded subprocess before/after, one independent candidate review and limited actual publication/dashboard smoke; no workspace rerun.
+- [ ] Record DOX, OpenSpec, sync history, commits and new report; no archive or publication.

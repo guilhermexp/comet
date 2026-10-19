@@ -62,3 +62,7 @@ snapshot, not mutated by speculative discovery. iOS drag source eligibility is
 independent from destination eligibility, retaining search/archive restrictions.
 Reproductions use scaled inputs under CPU/address-space/time limits; no full
 exponential DAG/OOM payload or infinite GPU shader. Native acceptance stays open.
+
+R2 closure: retained text admission includes axes labels/defaults, implicit
+tabs/link copies, numeric root children and canvas text. Reuse existing
+pre-copy byte charging; projection copies derive from already admitted data.
