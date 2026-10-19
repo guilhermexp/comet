@@ -290,6 +290,91 @@ fn numeric_children_and_canvas_text_share_retained_byte_limits() {
     assert!(numeric && canvas);
 }
 
+#[test]
+fn duplicate_surface_keys_fail_publication() {
+    // Shares the metered allocator with the measured tests.
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let surface = |key: &str| {
+        [
+            format!("ui.canvas {{key='{key}', height=60, draw=function() end}}"),
+            format!(
+                "ui.scene {{key='{key}', height=60, draw=function(s) s:box {{at={{0,0,0}}}} end}}"
+            ),
+            format!(
+                "ui.chart {{key='{key}', type='bar', height=120, series={{{{values={{1,2,3}}}}}}}}"
+            ),
+            format!(
+                "ui.shader {{key='{key}', height=60, code=[[void mainImage(out vec4 c, in vec2 p) {{ c = vec4(1.0); }}]]}}"
+            ),
+        ]
+    };
+    // Every pairing is valid with distinct keys, so a failure below is the
+    // shared key alone: all variants share one id domain.
+    let pairs: Vec<(String, String, String)> = surface("same")
+        .into_iter()
+        .flat_map(|first| {
+            surface("same")
+                .into_iter()
+                .zip(surface("other"))
+                .map(move |(other, distinct)| (first.clone(), other, distinct))
+        })
+        .collect();
+    for (first, _, distinct) in &pairs {
+        check(&format!("return ui.column {{{first}, {distinct}}}"), 1)
+            .unwrap_or_else(|e| panic!("{first} + {distinct}: {e}"));
+    }
+    let accepted: Vec<String> = pairs
+        .iter()
+        .filter_map(|(first, other, _)| {
+            match check(&format!("return ui.column {{{first}, {other}}}"), 1) {
+                Err(error) if error.message.contains("duplicate surface key 'same'") => None,
+                result => Some(format!("{first} + {other}: {result:?}")),
+            }
+        })
+        .collect();
+    assert!(
+        accepted.is_empty(),
+        "{} duplicate pairs not refused:\n{}",
+        accepted.len(),
+        accepted.join("\n")
+    );
+}
+
+#[test]
+fn duplicate_surface_key_from_a_control_fails_the_rerender() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v = Visual::load(
+        "local dup=false
+         return function() return ui.column {
+           ui.button {label='change', on_click=function() dup=true end},
+           ui.canvas {key='a', height=60, draw=function() end},
+           ui.canvas {key=dup and 'a' or 'b', height=60, draw=function() end}} end",
+        1,
+    )
+    .unwrap();
+    let tree = v.render().unwrap();
+    let button = zeron_visual::children(&tree).next().unwrap();
+    let zeron_visual::NodeKind::Button { on_click, .. } = button.kind else {
+        panic!("button")
+    };
+    v.call(on_click, zeron_visual::HandlerArg::None).unwrap();
+    let error = v.render().unwrap_err();
+    assert!(
+        error.message.contains("duplicate surface key 'a'"),
+        "{error}"
+    );
+    // Non-surface keys, unkeyed surfaces and a surface sharing a non-surface
+    // node's key are unrelated to surface ids and stay accepted.
+    check(
+        "return ui.column {ui.text {'one', key='same'}, ui.text {'two', key='same'},
+           ui.canvas {height=60, draw=function() end}, ui.canvas {height=60, draw=function() end},
+           ui.button {label='ok', key='same', on_click=function() end},
+           ui.column {key='same', ui.canvas {key='inner', height=60, draw=function() end}}}",
+        1,
+    )
+    .unwrap();
+}
+
 /// A GLB placing one mesh `instances` times whose sparse accessors have no
 /// base view: `normals` logical NORMAL entries from a 16-byte binary chunk.
 fn sparse_normals_glb(normals: usize, instances: usize) -> Vec<u8> {

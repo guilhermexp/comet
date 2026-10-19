@@ -4,7 +4,7 @@
 //! render's handler list.
 
 use mlua::{Function, Table, Value};
-use std::{cell::Cell, rc::Rc, time::Instant};
+use std::{cell::Cell, collections::HashSet, rc::Rc, time::Instant};
 
 use crate::VisualError;
 use crate::style::{Align, Color, Justify, TextSize, Token, Weight};
@@ -355,6 +355,9 @@ pub(crate) struct Parser {
     pub handlers: Vec<Function>,
     nodes: usize,
     budget: Rc<ParseBudget>,
+    /// Keys of the charts, canvases, scenes and shaders so far: hosts id a
+    /// surface by its key, so two with one key would share frames/touches.
+    surface_keys: HashSet<String>,
 }
 
 /// Field names every node accepts.
@@ -382,6 +385,7 @@ impl Parser {
         Self {
             handlers: Vec::new(),
             nodes: 0,
+            surface_keys: HashSet::new(),
             budget: Rc::new(ParseBudget {
                 steps: Cell::new(0),
                 text_bytes: Cell::new(0),
@@ -802,11 +806,25 @@ impl Parser {
             }
             other => return Err(VisualError::script(format!("unknown node '{other}'"))),
         };
+        let key = props.string("key")?;
+        if let Some(key) = &key
+            && matches!(
+                node_kind,
+                NodeKind::Chart(_) | NodeKind::Canvas(_) | NodeKind::Scene(_) | NodeKind::Shader(_)
+            )
+            && !self.surface_keys.insert(key.clone())
+        {
+            return Err(props.error(&format!(
+                "has a duplicate surface key '{}': charts, canvases, scenes and shaders \
+                 need distinct keys",
+                clip_display(key)
+            )));
+        }
         Ok(Node {
             kind: node_kind,
             width: props.number("width")?.map(|w| w.clamp(0.0, 2000.0) as f32),
             grow: props.bool("grow")?.unwrap_or(false),
-            key: props.string("key")?,
+            key,
         })
     }
 
@@ -1342,6 +1360,16 @@ fn number_text(value: &Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// A short prefix of a script-supplied value for an error message.
+fn clip_display(text: &str) -> String {
+    let mut end = text.len().min(64);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let ellipsis = if end < text.len() { "…" } else { "" };
+    format!("{}{ellipsis}", &text[..end])
 }
 
 fn clip(mut text: String) -> String {

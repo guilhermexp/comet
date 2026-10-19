@@ -284,8 +284,8 @@ are skipped, and lists of nodes flatten (so ui.map results can be children). Unk
 \"start|center|end|between\", wrap = true, ... }, ui.grid { columns = 3, gap = 16, ... }. Any node \
 takes width = px or grow = true inside a row (sliders, charts, tables, canvases, and scenes fill a \
 row's spare width by default), and key = \"name\" to keep its hover or camera when the tree changes \
-shape. A row or column with on_click = function() end is clickable; hover = true gives \
-it the hover wash.\n\
+shape (charts, canvases, scenes, and shaders in one view need distinct keys). A row or column \
+with on_click = function() end is clickable; hover = true gives it the hover wash.\n\
 - ui.text { \"plain \", ui.span { \"bold\", weight = 600, color = \"accent\", mono = true }, size = \
 \"xs|sm|body|lg|xl|2xl\", weight = 400-700, color, mono, italic, align, truncate }, or ui.text \"string\".\n\
 - ui.stat { value = \"182 ms\", label = \"p95 latency\", delta = \"-12%\", tone = \"success\" }: a headline \
