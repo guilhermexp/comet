@@ -223,6 +223,11 @@ Max Mode formam um único snapshot aceito por credencial; discovery rejeitada
 não publica metadados. No iOS, a seção de origem de drag não precisa ser um
 destino: project groups permitem arrastar Chats, mas seguem proibidos para drop.
 
+Fechamento adicional de R2: contabilizar também as cópias implícitas retidas
+(tab value/link label), labels/defaults de axes, filhos numéricos e texto de
+canvas. O limite por cena/canvas reinicia por draw, com cobrança antes da cópia.
+Prova antes/depois e escopo auditado: `.tmp/reports/review-r2-closure.md`.
+
 ## Armadilhas conhecidas
 
 - **Campos a mais no proto do fork quebram literais do upstream:**

@@ -122,6 +122,7 @@ Test: unit
 - **WHEN** scripts reuse empty/false lists or strings, or models repeat image/buffer references
 - **THEN** native traversal SHALL consume bounded work and enforce its deadline independently from Lua interrupts
 - **AND** text/log/model aggregate byte and entry budgets SHALL be checked before copying or decoding
+- **AND** independent retained default copies, numeric children, canvas text and scene axes/default labels SHALL consume the same pre-copy byte budgets
 - **AND** legitimate nested lists, numeric text, logs and repeated image views SHALL remain usable
 
 Test: integration

@@ -138,3 +138,32 @@ responsive. Valid dashboard checked six interactions; actual UI selected30d,
 updated the chart and displayed Mon210/104 after enabling the table. New
 screenshots, binary hash and exact latencies are in the review report. Format
 check and strict OpenSpec validation passed. Graft refresh remains unavailable127.
+
+
+## R2 retained text closure after independent review
+
+The previous review did not completely close R2: axes labels/defaults and
+implicit tab/link copies bypassed byte accounting. The follow-up also found
+numeric root children and canvas text as equivalent input routes. Earlier
+reports/logs are preserved, not promoted into proof for this repair.
+
+Regression commit `21ecf740` fails four grouped behavioral tests on the delivered
+implementation: axes individual/aggregate/default labels, tabs+links, and numeric
+children+canvas. Hard-limited before/after runs (AS1GiB/CPU15s/wall25s) prove
+all seven cases; native draw allocation for axes drops from1,592,885 to44,069
+cumulative Rust bytes, with each retained label clipped to8,000. Near-limit
+x/y/z defaults are charged and explicit missing/empty values retain semantics.
+
+Repair `d87d5736` reuses append_bytes/retained_text, including a per-canvas draw
+counter. Focused Visual gate passed41 unit +9 integration tests; production app
+build and actual private Xvfb/software-Vulkan smoke passed0. Six invalid
+publications return the expected text budget errors with EngineReady responsive;
+valid axes/canvas/dashboard pass, including six checked dashboard interactions
+and actual30d/table UI. One fresh read-only candidate review found no concrete
+surviving bypass/regression. Audit, logs, limits, hashes and screenshots live in
+`.tmp/reports/review-r2-closure.md` and its sibling evidence directory.
+
+No full workspace rerun: explicitly forbidden by the owner for this closure;
+CI follows acceptance via the orchestrator. Previous complete-run results stay
+historical evidence, not validation of current source. No push/release/CI dispatch
+or archival. Native macOS/iOS acceptance remains open.

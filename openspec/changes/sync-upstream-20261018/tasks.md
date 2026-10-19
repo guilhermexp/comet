@@ -32,7 +32,7 @@
 
 ## R2 closure — retained display text
 
-- [ ] Reproduce axes individual/aggregate/default accounting and implicit tabs/link copies on the delivered source; audit equivalent retained input paths.
-- [ ] Charge all confirmed paths through existing boundaries; preserve valid axes/default/explicit controls, numeric and canvas semantics.
-- [ ] Focused visual gate, bounded subprocess before/after, one independent candidate review and limited actual publication/dashboard smoke; no workspace rerun.
-- [ ] Record DOX, OpenSpec, sync history, commits and new report; no archive or publication.
+- [x] Reproduce axes individual/aggregate/default accounting and implicit tabs/link copies on the delivered source; audit equivalent retained input paths.
+- [x] Charge all confirmed paths through existing boundaries; preserve valid axes/default/explicit controls, numeric and canvas semantics.
+- [x] Focused visual gate, bounded subprocess before/after, one independent candidate review and limited actual publication/dashboard smoke; no workspace rerun.
+- [x] Record DOX, OpenSpec, sync history, commits and new report; no archive or publication.
