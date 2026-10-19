@@ -1,0 +1,58 @@
+schema_version: 1
+id: 20261019T150500Z-c526d6f7-f1-f4-closure
+skill_version: null
+started_at: '2026-10-19T14:50:00Z'
+finished_at: '2026-10-19T15:10:00Z'
+request: Close independent rereview P2s on d4afa44a - F1 unreadable explicit index accessor falling back to implicit
+  indices; F4 accepted visual not renewing the quiesce window. No push/merge/release/archive.
+workflow_source: .tmp/briefs/review-f1-f4-closure-20261019.md (F2/F3 accepted; not refactored).
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  previous_integrated_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: sync/upstream-20261018
+  initial_sha: d4afa44ad1ae0038b0e9e439beaa1b1ee3749901
+  result_sha: 9877fde1
+  result_sha_note: Last product commit; documentation commit follows (see report).
+strategy:
+  operation: review_corrections
+  repair_commits:
+  - 0a06faf3 fix(visual) F1 closure
+  - 9877fde1 fix(engine) F4 closure
+verification:
+- command: Bounded RED on d4afa44a product code (AS1GiB CPU15s wall25s)
+  exit: 101
+  result: confirmed
+  log: red-f1-path.log red-f4-quiesce.log
+- command: Bounded GREEN same tests (F4 x5)
+  exit: 0
+  result: passed
+  log: green-f1-path.log green-f1-unit.log green-f4-quiesce-run1..5.log
+- command: cargo test -p zeron-visual -p zeron-engine
+  exit: 0
+  result: passed
+  log: gate-visual-engine.log
+- command: cargo build -p zeron
+  exit: 0
+  log: production-app-build.log
+- command: Private headless engine smoke (bwrap, no network, daemon AS2GiB)
+  exit: 0
+  result: passed_linux_scope
+  log: app-smoke.log
+  observed: SHA256 dfcf37006c99f31bd45d9af498b910f58089f56bd994e8696ee0f35287fb6705
+limits:
+- No Swift/Simulator, bindings, workspace or CI run; no internal review per brief.
+references:
+- .tmp/reports/review-f1-f4-closure-20261019.md
+outcome: integrated
+pending:
+- Orchestrator rereview, publication/CI, native acceptance and archive.
+delivery:
+  integration: local_review
+  pr: https://github.com/guilhermexp/comet/pull/25
+  publication: worker_forbidden_orchestrator_after_review
+  record_pushed: false

@@ -46,6 +46,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - `LinkCache` trata `host_offline` do relay como evidência, não blip: a sequência que termina nele estaciona dials daquele device por `offline_cooldown` (5 min). Esse cooldown sobrevive ao broadcast "online" (que todo handshake emite — inclusive o dial rejeitado — e zerava o próprio backoff, gerando o loop 1.5s/3s/6s) e ao refresh de token; só `reset_cooldown` (presença fresca) ou sign-out o limpam. Falhas comuns seguem a curva 5s→60s. O motivo do link-down pode chegar logo depois da falha do probe; o dial espera até 250ms por ele.
 - Um sinal de retomada do sistema invalida o socket ativo do `HostRelay`, inclusive durante o dial, e inicia outro sem esperar o lease. `LinkCache` fecha links de peers e remove backoffs comuns nesse sinal, mas conserva cooldowns `host_offline` até presença remota fresca (ou sign-out); o sinal `online` continua separado.
 
+- `PublishVisual` is registered only in `rpc_methods!`, local-only and unary. The engine validates a live turn, bounded Luau and assets before storage/publication. New tools remain behind the existing root Chat MCP grant; no per-run MCP injection is restored.
+
 ## Work Guidance
 
 - RPC novo = tipo em `zeron-proto` + linha no `rpc_methods!` de `method.rs` + handler na engine. Os três no mesmo commit, senão a UI compila contra um contrato que não existe.

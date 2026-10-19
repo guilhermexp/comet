@@ -21,7 +21,7 @@ export type SessionMessageRole = "user" | "assistant" | "system";
  */
 export interface DocMessagePart {
   readonly id: string;
-  readonly kind: "text" | "reasoning" | "tool" | "input" | "error" | "image";
+  readonly kind: "text" | "reasoning" | "tool" | "input" | "error" | "image" | "visual";
   /** kind === "text" — LoroText in the doc, string in mirror state. */
   readonly text?: string;
   readonly path?: string;
@@ -49,6 +49,8 @@ export const toDocParts = (
 ): ReadonlyArray<DocMessagePart> =>
   parts.map((p): DocMessagePart => {
     switch (p.kind) {
+      case "visual":
+        return { id: p.id, kind: "visual", path: p.path, name: p.title };
       case "image":
         return {
           id: p.id,
@@ -88,6 +90,10 @@ export const fromDocParts = (
 ): ReadonlyArray<SessionMessagePart> =>
   parts.map((p): SessionMessagePart => {
     switch (p.kind) {
+      case "visual":
+        return typeof p.path === "string" && p.path.length > 0
+          ? { kind: "visual", id: p.id, path: p.path, title: p.name ?? "" }
+          : { kind: "error", id: p.id, message: "Visual unavailable" };
       case "image":
         return typeof p.path === "string" && p.path.length > 0 &&
           typeof p.name === "string" && p.name.length > 0 &&

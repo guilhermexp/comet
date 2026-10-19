@@ -63,6 +63,8 @@ presentation of `UpdateStatus`.
 - `Updater::shutdown` is persistent and idempotent, terminating the check loop
   within timeout even in `current_thread` runtimes immediately after spawn.
 
+- Development launchers explicitly set `ZERON_AUTO_UPDATE=0`. macOS bundle detection treats `0|false|no` as Unmanaged, so the fork's UI strip remains advisory and cannot stage/swap a dev bundle. Absence retains installed-app auto-download behavior and the fork release feed. The Cargo native runner execs directly and must set the environment itself; LaunchServices plist variables alone are insufficient.
+
 ## Work Guidance
 
 - Keep everything async-tokio, filesystem effects behind the small
@@ -72,7 +74,7 @@ presentation of `UpdateStatus`.
 
 ## Verification
 
-`cargo test -p zeron-update` — 11 unit tests, all in `lib.rs`, covering version
+`cargo test -p zeron-update` — unit tests in `lib.rs`, covering version
 compare, install-kind detection, artifact naming, manifest parsing, headless
 symlink swap against tempdirs, persistent shutdown in current_thread runtimes,
 and atomic restart gating with single ownership, in-flight admission tracking,
@@ -89,6 +91,12 @@ Download verification and the macOS bundle swap have no automated coverage — v
 | Atomic restart gating (`RestartGate`) | unit | `cargo test -p zeron-update` |
 | Download + sha256 verify + stage | none — needs the releases bucket; manual validation | — |
 | macOS bundle swap + relaunch | none — needs a real .app install; manual validation | — |
+
+Additional integration coverage:
+
+| Layer / path | Tier | Command |
+| --- | --- | --- |
+| Explicit dev update opt-out | unit — subprocess env, real install-kind detection | `cargo test -p zeron-update development_opt_out_protects_bundle_updates` |
 
 ## Child DOX Index
 

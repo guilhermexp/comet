@@ -10,7 +10,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 ## Stack
 
-- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,sessions-mcp,computer-use-mcp,preview,voice,audio,voice-media,voice-session,orb,veil}` + `apps/zeron` (membro padrão do workspace).
+- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,visual,visual-gpu,zatex,update,workers-unpeel,sessions-mcp,computer-use-mcp,preview,voice,audio,voice-media,voice-session,orb,veil}` + `apps/zeron` (membro padrão do workspace).
 - **UI = gpui**, snapshot vendorizado de `zeronsh/zui` em `third_party/zui` (Apache-2.0; proveniência em `third_party/zui-upstream.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
 - **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres nem Hono server. Sync não usa WebRTC; previews de servidores usam RTC autenticado por PreviewRoom.
@@ -37,7 +37,7 @@ O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes execut�
 
 Para baterias pesadas, prefira o CI existente e confira revisão, plataforma, jobs e etapas realmente executados conforme a skill `implement` do harness. Considere também a compilação: mesmo um filtro de `cargo test -p zeron-ui` pode criar gigabytes de dependências. Checks locais baratos e validação nativa específica continuam úteis; quando Cargo local for necessário, use a proteção abaixo. No `no-mistakes`, `test` é validação focada da mudança/uso real; a regressão ampla fica no CI. Não repetir a bateria local apenas para espelhar CI nem dispensar etapas genericamente.
 
-Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml` contém jobs Linux, macOS e iOS; `preview-tests.yml` testa networking em Linux/macOS e coordinator em Linux. Isso descreve a receita, não garante sucesso: confira os logs da revisão avaliada. O job nativo macOS tem orçamento de 90 minutos para compilações release frias e fixtures; os limites curtos de execução das regressões continuam separados. Linux não cobre o teste AppKit `native_preview_focus`, que requer sessão gráfica macOS, nem substitui outros caminhos macOS/iOS exigidos pela entrega.
+Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml` contém jobs Linux, macOS e iOS; `preview-tests.yml` testa networking em Linux/macOS e coordinator em Linux. Os filtros de UI/native/iOS incluem `visual`, `visual-gpu` e `zatex`; o core nextest inclui suas suites unitárias. Isso descreve a receita, não garante sucesso: confira os logs da revisão avaliada. O job nativo macOS tem orçamento de 90 minutos para compilações release frias e fixtures; os limites curtos de execução das regressões continuam separados. Linux não cobre o teste AppKit `native_preview_focus`, que requer sessão gráfica macOS, nem substitui outros caminhos macOS/iOS exigidos pela entrega.
 
 ## Remotes e publicação
 

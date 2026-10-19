@@ -217,6 +217,10 @@ struct RunHandle {
     /// ignores its token can never strand the run.
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
+    /// Checked `show_visual` publications for the run loop to fold.
+    visual_tx: mpsc::UnboundedSender<VisualPublish>,
+    /// The run's live turn (see [`VisualTurn`]); `None` while parked.
+    live_turn: Arc<Mutex<Option<u64>>>,
     pending_inputs: PendingInputs,
     /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
     /// event — the at-least-once ledger. A run can die with accepted steers
@@ -233,6 +237,41 @@ struct RunHandle {
     /// is unambiguously before the stop (cancelled with it) or after it
     /// (re-dispatched to a fresh runtime — never lost).
     retiring: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The turn a `show_visual` call belongs to: its run and that run's turn
+/// number, which advances at every park, resume and steer boundary. A visual
+/// checked across one of those is refused instead of landing in another turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualTurn {
+    run_id: String,
+    turn: u64,
+}
+
+/// A checked visual for the run loop; `ack` answers whether it is now in
+/// the turn's transcript (dropped unanswered when the run is gone).
+struct VisualPublish {
+    turn: u64,
+    event: AgentEvent,
+    ack: oneshot::Sender<bool>,
+}
+
+/// The loop's side of [`VisualTurn`].
+struct VisualInbox {
+    rx: mpsc::UnboundedReceiver<VisualPublish>,
+    live: Arc<Mutex<Option<u64>>>,
+    turn: u64,
+}
+
+impl VisualInbox {
+    fn open(&mut self) {
+        self.turn += 1;
+        *lock(&self.live) = Some(self.turn);
+    }
+
+    fn close(&self) {
+        *lock(&self.live) = None;
+    }
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -1028,6 +1067,13 @@ impl SessionsEngine {
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (visual_tx, visual_rx) = mpsc::unbounded_channel::<VisualPublish>();
+        let live_turn = Arc::new(Mutex::new((!idle).then_some(1)));
+        let visuals = VisualInbox {
+            rx: visual_rx,
+            live: live_turn.clone(),
+            turn: 1,
+        };
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
 
         // Input bridge: the harness asks questions; we mint the request id, park the
@@ -1100,6 +1146,8 @@ impl SessionsEngine {
                 started: started.clone(),
                 cancel: cancel_tx,
                 engine_tx,
+                visual_tx,
+                live_turn,
                 pending_inputs,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fork_history_sent: fork_history_sent.clone(),
@@ -1136,6 +1184,7 @@ impl SessionsEngine {
             handle.writer(),
             controls,
             engine_rx,
+            visuals,
             cancel_rx,
             RunResumeState {
                 idle,
@@ -1413,6 +1462,48 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
+    }
+
+    /// Fold an engine-made event (a `show_visual` page) into the chat's live
+    /// run, after whatever the harness streamed so far. Returns `false` when
+    /// the chat has no run on this device.
+    /// The chat's turn in flight on this device, for a `show_visual` call
+    /// made from inside it. `None` without a run or while it is parked
+    /// between turns (nothing would fold the visual).
+    pub fn visual_turn(&self, chat_id: &str) -> Option<VisualTurn> {
+        let runs = lock(&self.inner.runs);
+        let handle = runs.get(chat_id)?;
+        let turn = (*lock(&handle.live_turn))?;
+        Some(VisualTurn {
+            run_id: handle.run_id.clone(),
+            turn,
+        })
+    }
+
+    /// Fold a checked visual into the turn it was published from. `true`
+    /// only once the run loop has written it into that turn's transcript
+    /// entry; `false` when the turn ended, parked, was steered or stopped
+    /// meanwhile, or the run is gone (the caller then removes its files).
+    pub async fn publish_visual(
+        &self,
+        chat_id: &str,
+        turn: &VisualTurn,
+        event: AgentEvent,
+    ) -> bool {
+        let (ack, accepted) = oneshot::channel();
+        let sent = lock(&self.inner.runs)
+            .get(chat_id)
+            .filter(|h| h.run_id == turn.run_id)
+            .is_some_and(|h| {
+                h.visual_tx
+                    .send(VisualPublish {
+                        turn: turn.turn,
+                        event,
+                        ack,
+                    })
+                    .is_ok()
+            });
+        sent && accepted.await.unwrap_or(false)
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such
@@ -3008,6 +3099,7 @@ async fn drive_run(
     doc: crate::doc_host::DocWriter,
     mut controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    mut visuals: VisualInbox,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
     checkout_activity: Option<zeron_workers_unpeel::CheckoutActivityReservation>,
@@ -3418,6 +3510,35 @@ async fn drive_run(
                     break (SessionStatus::Idle, None);
                 }
                 Some(event) = engine_rx.recv() => event,
+                // Only the turn the visual was checked in may take it, and it
+                // is acknowledged only once written into that turn's entry.
+                Some(publish) = visuals.rx.recv() => {
+                    let mut accepted = false;
+                    if idle_since.is_none() && !interrupted && publish.turn == visuals.turn {
+                        let at = folded.len();
+                        fold_event_into_parts(&mut folded, &publish.event);
+                        let synced = sync_segment(
+                            doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                        );
+                        if let Err(err) = &synced {
+                            tracing::warn!(chat = %chat_id, error = %err, "visual segment sync failed");
+                        }
+                        // A failed sync that still wrote the part keeps it.
+                        accepted = synced.is_ok()
+                            || writer.as_ref().is_some_and(|w| w.written().len() > at);
+                        if accepted {
+                            dirty = false;
+                            // Turn output like any streamed event: the quiesce
+                            // window restarts from it (a refusal is not activity).
+                            last_stream_activity = tokio::time::Instant::now();
+                            inner.publish(&chat_id, &publish.event);
+                        } else {
+                            folded.truncate(at);
+                        }
+                    }
+                    let _ = publish.ack.send(accepted);
+                    continue;
+                }
                 next = stream.next() => match next {
                     Some(Ok(event)) => event,
                     // A stream error while PARKED is a post-turn child death —
@@ -3530,6 +3651,7 @@ async fn drive_run(
                     entry_id = new_id();
                     segment_started = now_ms();
                     idle_since = Some(tokio::time::Instant::now());
+                    visuals.close();
                     reap_deferred_until = None;
                     self_continued_turn = false;
                     inner.set_status_with_completion(
@@ -3837,6 +3959,7 @@ async fn drive_run(
                     "parked session resumed by self-continued agent output"
                 );
                 idle_since = None;
+                visuals.open();
                 self_continued_turn = true;
                 // The park cleared the fold; rotate to a fresh entry and
                 // fall through — this event is the new segment's first part.
@@ -3977,6 +4100,8 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            // A visual checked before the boundary belongs to the turn it ends.
+            visuals.open();
             // A steer starts the next user turn: close the stats of this one.
             inner.set_turn_stats(&chat_id, turn.finish(now_ms()));
             turn = TurnAccumulator::default();
@@ -4176,6 +4301,7 @@ async fn drive_run(
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
+                visuals.close();
                 reap_deferred_until = None;
                 self_continued_turn = false;
                 // Accepted steers still own this runtime. Publishing Idle
@@ -4205,6 +4331,13 @@ async fn drive_run(
                 tokio::time::Instant::now() + std::time::Duration::from_millis(STREAM_COMMIT_MS);
         }
     };
+
+    // No turn takes visuals any more; queued ones are refused as the inbox drops.
+    visuals.close();
+    visuals.rx.close();
+    while let Ok(publish) = visuals.rx.try_recv() {
+        let _ = publish.ack.send(false);
+    }
 
     // Any subagent still streaming when the run ends freezes as-is: the
     // parent process is gone, so nothing more can arrive on this stream.

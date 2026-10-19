@@ -384,6 +384,16 @@ impl InstallKind {
     }
 }
 
+/// Explicit opt-out used by development launchers; absence retains installed-app behavior.
+fn desktop_updates_disabled() -> bool {
+    std::env::var("ZERON_AUTO_UPDATE").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no"
+        )
+    })
+}
+
 pub fn detect_install() -> InstallKind {
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
@@ -419,6 +429,9 @@ fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> Inst
         if ancestor.extension().is_some_and(|ext| ext == "app")
             && exe.starts_with(ancestor.join("Contents").join("MacOS"))
         {
+            if desktop_updates_disabled() {
+                return InstallKind::Unmanaged;
+            }
             return InstallKind::MacApp {
                 bundle: ancestor.to_path_buf(),
             };
@@ -1435,6 +1448,45 @@ mod tests {
         // Garbage never counts as newer.
         assert!(!version_newer("", "0.1.0"));
         assert!(!version_newer("nightly", "0.1.0"));
+    }
+
+    #[test]
+    fn development_opt_out_protects_bundle_updates() {
+        // Use subprocess env, never mutate process-wide environment alongside tests.
+        if let Ok(expected) = std::env::var("COMET_TEST_UPDATE_POLICY_CHILD") {
+            let install = detect_install_from_for_os(
+                Path::new("/tmp/Zeron.app/Contents/MacOS/zeron"),
+                None,
+                "macos",
+            );
+            assert_eq!(
+                matches!(install, InstallKind::Unmanaged),
+                expected == "disabled"
+            );
+            return;
+        }
+        for (policy, expected) in [
+            ("0", "disabled"),
+            ("false", "disabled"),
+            ("no", "disabled"),
+            ("1", "enabled"),
+        ] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::development_opt_out_protects_bundle_updates",
+                    "--nocapture",
+                ])
+                .env("ZERON_AUTO_UPDATE", policy)
+                .env("COMET_TEST_UPDATE_POLICY_CHILD", expected)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "policy {policy}: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+        }
     }
 
     #[test]

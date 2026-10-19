@@ -35,11 +35,18 @@ WebRTC e o lifecycle remoto ficam em `Zeron/Voice/`.
   quit ou perda de rede antes do Edge aceitar os bytes ainda exige reabrir o
   app para transmitir.
 - `Core/Generated/zeron_core.swift` é gerado a partir do core Rust. Não editar à
-  mão; preserve os avisos de licença de WebRTC e Thinking Orbs.
+  mão; preserve os avisos de licença de WebRTC e Thinking Orbs. O fluxo canônico
+  remove somente blanks de fim de linha pelo sed de `build-core.sh`; não
+  acrescentar LF terminal para comparar/versionar. Output do gerador/script é
+  autoritativo byte a byte, inclusive EOF sem LF.
 - Sessions oferece `Group by Project`, preferência local do telefone compartilhada
   pelo menu da lista e Settings. Somente Chats fora das seções são agrupados;
   clones/checkouts do mesmo repositório usam a identidade de projeto e a ordem
   recente permanece. Chats sem Project formam um grupo por device.
+
+- SplitRoot adapts between compact tabs and regular split presentation while retaining navigation/fold state. Transcript/composer geometry uses the actual uneven safe areas and readable width. Section drag moves Chats across sections/pins with neighbor anchors. Native `VisualView` consumes Rust-owned visual display lists; math faces resolve from the shared bundled table. `VisualPainter` checks finite/non-negative sizes and the bitmap budget (16,384 px per side, 16 Mi px, mirroring `crates/mobile`) before any `Int` conversion or `CGContext`; a refused or failed raster shows a visible danger-colored error and drops surfaces/controls (no stale frames or touches) until a drawable display arrives. Surface ids never trap, even if duplicated. `ZeronTests/VisualRasterTests.swift` covers limits and propagation through the real sink with a fake session; it must run on the Simulator lane. These paths require Simulator/device interaction tests, including fold/unfold with keyboard and selection.
+
+Chat drag sources use row identity plus movable/archive/search policy, independently of destination policy. Project groups remain disallowed destinations but their Chat rows can be dragged to Pinned/custom sections/Recent. `ZeronTests/SessionDragTests.swift` is a UIKit unit regression for the policy used by the actual drag delegate; execute it on an iOS Simulator, never infer native acceptance from Linux source review.
 
 ## Work Guidance
 

@@ -298,6 +298,14 @@ pub enum MessagePart {
         id: String,
         text: String,
     },
+    /// An agent-authored visual (`show_visual`): a Luau script stored on the
+    /// host at `path`, rendered natively. Old desktop builds' unknown-kind
+    /// fallback yields an empty text part (invisible); iOS drops unknown kinds.
+    Visual {
+        id: String,
+        path: String,
+        title: String,
+    },
     /// Model thinking. Streams through the doc `text` LoroText; parts written
     /// by upstream builds in the dedicated `reasoning` field are read too.
     Reasoning {
@@ -408,6 +416,7 @@ impl MessagePart {
         match self {
             MessagePart::Text { id, .. }
             | MessagePart::Image { id, .. }
+            | MessagePart::Visual { id, .. }
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
@@ -454,6 +463,7 @@ impl MessagePart {
                 name,
                 mime_type,
             } => id.len() + path.len() + name.len() + mime_type.len(),
+            MessagePart::Visual { id, path, title } => id.len() + path.len() + title.len(),
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::WorkflowTask { task, .. } => {
                 serde_json::to_vec(task).map_or(0, |value| value.len())
@@ -673,6 +683,18 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 *existing = image;
             } else {
                 out.push(image);
+            }
+        }
+        AgentEvent::Visual { id, path, title } => {
+            let visual = MessagePart::Visual {
+                id: id.clone(),
+                path: path.clone(),
+                title: title.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == id) {
+                *existing = visual;
+            } else {
+                out.push(visual);
             }
         }
         AgentEvent::ReasoningDelta { text } => {

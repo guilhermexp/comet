@@ -1,0 +1,119 @@
+schema_version: 1
+id: 20261019T021050Z-c526d6f7-r2
+skill_version: null
+started_at: '2026-10-19T02:10:50Z'
+finished_at: '2026-10-19T02:17:31.055301+00:00'
+request: Close R2 axes individual/aggregate/defaults and tabs/link implicit copies; audit equivalent retained
+  inputs, focused Visual and bounded actual app smoke only. No full workspace rerun, push/release.
+workflow_source: User R2 closure follow-up; original pinned brief/adjustments remain binding. Same OpenSpec
+  and fix-finding workflow; no new merge/fetch.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  previous_integrated_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_label: 'after 0.2.114, through #942'
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: sync/upstream-20261018
+  target_branch: sync/upstream-20261018
+  initial_sha: 85e765f3ec8b94654ea8db745bbef64a5ff61147
+  observed_target_sha: 85e765f3ec8b94654ea8db745bbef64a5ff61147
+  result_sha: d87d5736ec3ad8519d9f41cc932b8788248226d5
+  result_sha_note: Validated repair source. Subsequent documentation-only HEAD in .tmp/reports/review-r2-closure.md.
+  initial_worktree: clean
+strategy:
+  operation: review_corrections
+  reason: Independent review found incomplete R2; close only equivalent retained display-text routes.
+  merge_sha: 348f8b01d58e1f5b524ca75b8df5a4eed758b03e
+  merge_parents:
+  - d7df75f87864fb7fa1e13d1d4ec4b44f253573c0
+  - c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  repair_commits:
+  - 21ecf7405c7ee9626892c43bbd60a20453ce4d89
+  - d87d5736ec3ad8519d9f41cc932b8788248226d5
+changes:
+  incoming_count: 0
+  incoming_range: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f..c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  summary: Axes explicit/default labels, tabs/link independent default copies, numeric children and canvas
+    display text reuse existing pre-copy budgets.
+  imported: []
+customizations:
+- Original U1-U11 integration and decisions retained; see prior history record.
+- Version1.0.7, fork feed, vendors, root grants, OMP/Kimi/steer, UI/Edge/core remain unchanged from delivered
+  baseline.
+conflicts: []
+verification:
+- command: Baseline behavioral regressions under limited.py/sandbox
+  revision: 85e765f3 + tests21ecf740
+  exit: 101
+  result: confirmed
+  log: baseline-isolated-meter.log
+  observed: 5 pass4 fail;7 routes accepted without accounting; axes Rust draw allocations1,592,885 with3x524288-byte
+    labels.
+- command: cargo test -p zeron-visual -- --test-threads=4 --nocapture
+  revision: d87d5736 product code
+  exit: 0
+  result: passed
+  log: focused-visual.log
+  observed: 41 unit9 integration; no workspace repeat.
+- command: Same native regressions AS1GiB CPU15s wall25s
+  revision: d87d5736 product code
+  exit: 0
+  result: passed
+  log: bounded-after.log
+  observed: 9 pass; all7 routes bounded; axes allocations44,069, label lengths8000x3.
+- command: Independent fresh read-only candidate review
+  revision: d87d5736
+  result: no_concrete_bypass_or_regression
+  log: candidate-review.md
+- command: cargo build -p zeron
+  revision: d87d5736
+  exit: 0
+  result: passed
+  log: production-app-build.log
+- command: Private actual production app smoke Xvfb/software Vulkan
+  revision: d87d5736
+  exit: 0
+  result: passed_linux_scope
+  log: app-smoke.log
+  observed: 6 invalid publications rejected,3 valid accepted, EngineReady responsive; dashboard6 checked
+    controls and actual30d/table interaction. Daemon AS2GiB CPU90s RPC12s outer180s. SHA256 b1007df4135acf4ee7871a329474d3e97ac0acc0222d2a381f63c34039108a04
+- command: cargo fmt --all -- --check
+  exit: 0
+  result: passed
+  log: format-check.log
+- command: graft context
+  exit: 127
+  result: unavailable
+  log: graft-context.log
+- command: Full workspace local
+  result: not_run_by_explicit_user_instruction
+  observed: CI after acceptance via orchestrator; previous runs preserved and not claimed for this source.
+- command: openspec validate sync-upstream-20261018 --strict
+  exit: 0
+  result: passed
+  log: openspec-final.log
+limits:
+- Native macOS/iOS acceptance remains open; no Swift/UIKit/AppKit/Metal/device execution.
+- No full workspace rerun or CI dispatch in this closure; CI follows acceptance.
+- Hard limits cover scaled CPU/memory reproductions and private engine; no global GPU wall-clock guarantee.
+- Earlier review acceptance of R2 was incomplete; earlier evidence is preserved.
+references:
+- .upstream-sync/history/20261019T012951Z-c526d6f7-review.yaml
+- openspec/changes/sync-upstream-20261018/verification.md
+- .tmp/reports/review-r2-closure.md
+- .tmp/reports/review-r2-closure/
+outcome: integrated
+pending:
+- Native acceptance and OpenSpec archive remain open.
+delivery:
+  integration: local_review
+  target_branch: sync/upstream-20261018
+  commit: d87d5736ec3ad8519d9f41cc932b8788248226d5
+  pr: https://github.com/guilhermexp/comet/pull/24 (unchanged read-only diagnostic)
+  publication: worker_forbidden_orchestrator_after_review
+  record_pushed: false
+  deploy: not_authorized
+started_at_note: First retained behavioral reproduction timestamp; earlier test setup/compile logs preserved.

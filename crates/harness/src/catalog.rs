@@ -8,20 +8,21 @@ use std::{
 use zeron_proto::Model;
 
 #[derive(Default)]
-pub(crate) struct Catalog {
-    pub(crate) state: tokio::sync::Mutex<State>,
+pub(crate) struct Catalog<T = ()> {
+    pub(crate) state: tokio::sync::Mutex<State<T>>,
 }
 
 #[derive(Default)]
-pub(crate) struct State {
+pub(crate) struct State<T = ()> {
     context: Option<[u8; 32]>,
     models: Option<Vec<Model>>,
+    metadata: T,
     pub(crate) retry_at: Option<Instant>,
     error: Option<CatalogFailure>,
     completed_at: Option<Instant>,
 }
 
-impl Catalog {
+impl Catalog<()> {
     #[cfg(test)]
     pub(crate) async fn get<F, Fut, K>(
         &self,
@@ -65,6 +66,38 @@ impl Catalog {
         Fut: Future<Output = Result<Vec<Model>, HarnessError>>,
         K: Fn() -> Result<[u8; 32], HarnessError>,
     {
+        self.get_with_metadata(force, timeout, context, || {
+            let future = discover();
+            async move { future.await.map(|models| (models, ())) }
+        })
+        .await
+        .map(|(catalog, ())| catalog)
+    }
+}
+
+// Metadata belongs to the accepted credential-scoped snapshot. Speculative,
+// rejected or cancelled discovery must never mutate a companion cache.
+impl<T: Clone + Default> Catalog<T> {
+    pub(crate) fn cached_snapshot_for(&self, key: [u8; 32]) -> Option<(Vec<Model>, T)> {
+        let state = self.state.try_lock().ok()?;
+        if state.context != Some(key) {
+            return None;
+        }
+        Some((state.models.clone()?, state.metadata.clone()))
+    }
+
+    pub(crate) async fn get_with_metadata<F, Fut, K>(
+        &self,
+        force: bool,
+        timeout: Duration,
+        context: K,
+        mut discover: F,
+    ) -> Result<(ModelCatalog, T), HarnessError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(Vec<Model>, T), HarnessError>>,
+        K: Fn() -> Result<[u8; 32], HarnessError>,
+    {
         let requested_at = Instant::now();
         let mut state = self.state.lock().await;
         let key = context()?;
@@ -77,9 +110,14 @@ impl Catalog {
         if state.completed_at.is_some_and(|at| at >= requested_at)
             || (!force && state.retry_at.is_some_and(|at| Instant::now() < at))
         {
-            return cached(&state).map(|models| ModelCatalog {
-                models,
-                source: "cache",
+            return cached(&state).map(|models| {
+                (
+                    ModelCatalog {
+                        models,
+                        source: "cache",
+                    },
+                    state.metadata.clone(),
+                )
             });
         }
         let refresh = async {
@@ -92,7 +130,7 @@ impl Catalog {
                     tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
                 }
                 match discover().await {
-                    Ok(models) if !models.is_empty() => return Ok(models),
+                    Ok((models, metadata)) if !models.is_empty() => return Ok((models, metadata)),
                     Ok(_) => {
                         error = CatalogFailure {
                             code: CatalogFailureCode::Failed,
@@ -127,8 +165,9 @@ impl Catalog {
         let source = if result.is_ok() { "live" } else { "cache" };
         state.completed_at = Some(Instant::now());
         match result {
-            Ok(models) => {
+            Ok((models, metadata)) => {
                 state.models = Some(models);
+                state.metadata = metadata;
                 state.error = None;
                 state.retry_at = Some(Instant::now() + Duration::from_secs(60));
             }
@@ -146,7 +185,7 @@ impl Catalog {
                 state.retry_at = Some(Instant::now() + Duration::from_secs(cooldown));
             }
         }
-        cached(&state).map(|models| ModelCatalog { models, source })
+        cached(&state).map(|models| (ModelCatalog { models, source }, state.metadata.clone()))
     }
 }
 
@@ -168,7 +207,7 @@ fn needs_cooldown(error: &str) -> bool {
     .any(|pattern| lower.contains(pattern))
 }
 
-fn cached(state: &State) -> Result<Vec<Model>, HarnessError> {
+fn cached<T>(state: &State<T>) -> Result<Vec<Model>, HarnessError> {
     state.models.clone().ok_or_else(|| {
         state
             .error
@@ -197,8 +236,72 @@ mod tests {
             options: vec![],
         }]
     }
-    async fn expire(catalog: &Catalog) {
+    async fn expire<T>(catalog: &Catalog<T>) {
         catalog.state.lock().await.retry_at = None;
+    }
+
+    #[tokio::test]
+    async fn snapshot_metadata_is_atomic_across_rejection_concurrency_and_credentials() {
+        let cache = Arc::new(Catalog::<String>::default());
+        let key = Arc::new(AtomicUsize::new(1));
+        let context = || Ok([key.load(Ordering::SeqCst) as u8; 32]);
+        let timeout = Duration::from_secs(2);
+        cache
+            .get_with_metadata(true, timeout, context, || async {
+                Ok((models("good"), "accepted".into()))
+            })
+            .await
+            .unwrap();
+        let rejected = cache
+            .get_with_metadata(true, timeout, context, || async {
+                Ok((vec![], "rejected".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(rejected.0.models, models("good"));
+        assert_eq!(rejected.1, "accepted");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (worker_cache, worker_key) = (cache.clone(), key.clone());
+        let worker = tokio::spawn(async move {
+            let mut started = Some(started_tx);
+            let mut release = Some(release_rx);
+            worker_cache
+                .get_with_metadata(
+                    true,
+                    timeout,
+                    || Ok([worker_key.load(Ordering::SeqCst) as u8; 32]),
+                    || {
+                        let tx = started.take().unwrap();
+                        let rx = release.take().unwrap();
+                        async move {
+                            tx.send(()).unwrap();
+                            rx.await.unwrap();
+                            Ok((models("new"), "new-meta".into()))
+                        }
+                    },
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        // No half-snapshot is visible while discovery owns the lock.
+        assert!(cache.cached_snapshot_for([1; 32]).is_none());
+        key.store(2, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert!(worker.await.unwrap().is_err());
+        assert!(cache.cached_snapshot_for([1; 32]).is_none());
+        assert!(cache.cached_snapshot_for([2; 32]).is_none());
+        let new = cache
+            .get_with_metadata(true, timeout, context, || async {
+                Ok((models("login2"), "login2-meta".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(new.1, "login2-meta");
+        assert_eq!(
+            cache.cached_snapshot_for([2; 32]),
+            Some((models("login2"), "login2-meta".into()))
+        );
     }
 
     #[tokio::test]

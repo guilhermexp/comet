@@ -182,6 +182,14 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             mime_type: Some(mime_type.clone()),
             ..Default::default()
         },
+        // The script path and title ride `path` and `name`.
+        MessagePart::Visual { id, path, title } => DocPartJson {
+            id: id.clone(),
+            kind: "visual".into(),
+            path: Some(path.clone()),
+            name: Some(title.clone()),
+            ..Default::default()
+        },
         MessagePart::Text { id, text } => DocPartJson {
             id: id.clone(),
             kind: "text".into(),
@@ -301,6 +309,17 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             text: p.text.or(p.reasoning).unwrap_or_default(),
             completed: p.completed.unwrap_or(false),
             duration_ms: p.duration_ms,
+        },
+        "visual" => match p.path.filter(|path| !path.is_empty()) {
+            Some(path) => MessagePart::Visual {
+                id: p.id,
+                path,
+                title: p.name.unwrap_or_default(),
+            },
+            None => MessagePart::Error {
+                id: p.id,
+                message: "Visual unavailable".into(),
+            },
         },
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
             Some(call) => MessagePart::Tool {
@@ -1619,6 +1638,11 @@ impl<'a> SegmentWriter<'a> {
         }
     }
 
+    /// The parts written into the entry so far, in order.
+    pub fn written(&self) -> &[MessagePart] {
+        &self.written
+    }
+
     /// The state a later [`Self::resume`] needs.
     pub fn into_state(self) -> (usize, Vec<MessagePart>) {
         (self.entry_index, self.written)
@@ -2007,6 +2031,40 @@ mod tests {
             doc.export_snapshot().unwrap(),
             "preview never mutates storage"
         );
+    }
+
+    #[test]
+    fn visual_round_trips_and_degrades_without_a_path() {
+        let doc = SessionDoc::init("visuals").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Visual {
+                id: "v:1".into(),
+                path: "/uploads/v-1-visual.luau".into(),
+                title: "Latency by region".into(),
+            },
+        );
+        writer.sync(&parts).unwrap();
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        let loaded = SessionDoc::from_doc(imported);
+        assert_eq!(loaded.read_entries().unwrap()[0].parts, parts);
+        assert!(matches!(
+            from_doc_part(
+                serde_json::from_value(serde_json::json!({"kind":"visual", "id":"v", "name":"t"}))
+                    .unwrap()
+            ),
+            MessagePart::Error { .. }
+        ));
+        assert!(matches!(
+            from_doc_part(
+                serde_json::from_value(serde_json::json!({"kind":"visual", "id":"v", "path":"/p"}))
+                    .unwrap()
+            ),
+            MessagePart::Visual { .. }
+        ));
     }
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {

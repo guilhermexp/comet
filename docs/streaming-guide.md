@@ -1,8 +1,26 @@
 # Guia do streaming do Chat
 
-Mapa do código observado em **09/09/2026**, no checkout `main`, HEAD `bd5ebf07eb029479a1f32696b5a54f80b7a7e8d9`, **incluindo alterações locais ainda não commitadas**. Este documento descreve o estado atual e os pontos de correção; não autoriza nem implementa uma refatoração.
+Mapa do código observado em **09/09/2026**, no checkout `main`, HEAD `bd5ebf07eb029479a1f32696b5a54f80b7a7e8d9`, **incluindo alterações locais ainda não commitadas**. Esta fotografia descreve o estado daquela revisão e os pontos de correção; não autoriza nem implementa uma refatoração.
 
 O streaming não tem um renderer único. Há **17 tipos de evento**, **6 tipos de part persistida**, **12 famílias de tool**, **12 tipos de row**, **3 formatos de detalhe de tool** e **7 tipos de bloco Markdown**. As listas abaixo cobrem essas variantes do código. Nomes de MCP e tools `Unknown` são abertos: uma extensão pode trazer novos nomes sem criar um novo tipo de saída. A evidência e os hashes dos arquivos estão em [streaming-audit-2026-09-09.json](streaming-audit-2026-09-09.json).
+
+## Delta da integração de 18/10/2026
+
+O merge fixado em `c526d6f7` acrescenta `AgentEvent::Visual` → `MessagePart::Visual`
+→ `RowKind::Visual`, com script Luau e assets no device dono. `PublishVisual` valida
+antes de persistir e exige turno vivo; o MCP continua sob o grant raiz do fork.
+O renderer desktop retém `VisualFrame` por identidade da row e libera frames ao
+sair do Chat ou remover a row. Mudança de altura remede a row composta dona.
+Visuais, como imagens geradas, ficam fora do fold de atividade assentada; export
+conserva título/path, sem executar nem incorporar o script.
+
+`Block::Math` e runs inline com `style.math` passam pelo parser compartilhado e
+zatex; desktop/mobile mantêm fonte original para cópia e fallback. O Markdown
+do pensamento continua sendo o renderer completo do fork. Alterar fonte/tamanho
+matemático invalida medidas/cache. O adapter OpenCode não emite `InputResolved`
+extra: a engine continua dona do lifecycle. As contagens e linhas da fotografia
+abaixo não incluem estas variantes. Evidência e limites ficam em
+[`sync-upstream-20261018`](../openspec/changes/sync-upstream-20261018/).
 
 ## Como usar este guia
 

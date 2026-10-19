@@ -113,6 +113,10 @@ enum ExportPart {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
+    Visual {
+        title: String,
+        path: String,
+    },
     Tool {
         tool: ExportTool,
     },
@@ -164,6 +168,12 @@ impl ExportDoc {
                             name: name.clone(),
                             path: path.clone(),
                             mime_type: mime_type.clone(),
+                        });
+                    }
+                    MessagePart::Visual { title, path, .. } => {
+                        parts.push(ExportPart::Visual {
+                            title: title.clone(),
+                            path: path.clone(),
                         });
                     }
                     MessagePart::Tool {
@@ -419,6 +429,13 @@ pub(crate) fn render_markdown(doc: &ExportDoc) -> String {
                         markdown_inline_code(mime_type),
                     ));
                 }
+                ExportPart::Visual { title, path } => {
+                    rendered.push_str(&format!(
+                        "[{}](<{}>) · interactive visual\n",
+                        markdown_link_label(title),
+                        markdown_link_destination(path),
+                    ));
+                }
                 ExportPart::Tool { tool } => {
                     rendered.push_str(&render_markdown_tool(tool));
                 }
@@ -564,6 +581,13 @@ pub(crate) fn render_text(doc: &ExportDoc) -> String {
                         single_line(name),
                         single_line(path),
                         single_line(mime_type),
+                    ));
+                }
+                ExportPart::Visual { title, path } => {
+                    rendered.push_str(&format!(
+                        "[interactive visual: {}] {}\n",
+                        single_line(title),
+                        single_line(path)
                     ));
                 }
                 ExportPart::Tool { tool } => {
@@ -812,6 +836,28 @@ mod tests {
         let json = render_json(&doc).expect("serialize image metadata");
         assert!(json.contains("\"kind\": \"image\""));
         assert!(json.contains("\"mimeType\": \"image/png\""));
+    }
+
+    #[test]
+    fn visual_export_keeps_reference_and_escapes_without_loading_script() {
+        let mut entry = message("m-assistant", MessageRole::Assistant, "");
+        entry.parts = vec![MessagePart::Visual {
+            id: "visual-1".to_owned(),
+            path: "/nonexistent/<chart>.luau".to_owned(),
+            title: "Chart [1]".to_owned(),
+        }];
+        let doc = ExportDoc::from_transcript(metadata("Visuals"), &[entry], &[]);
+        assert!(
+            render_markdown(&doc)
+                .contains(r"[Chart \[1\]](</nonexistent/\<chart\>.luau>) · interactive visual")
+        );
+        assert!(
+            render_text(&doc).contains("[interactive visual: Chart [1]] /nonexistent/<chart>.luau")
+        );
+        let json = render_json(&doc).unwrap();
+        assert!(json.contains("\"kind\": \"visual\""));
+        assert!(json.contains("/nonexistent/<chart>.luau"));
+        assert!(doc.artifacts.is_empty());
     }
 
     #[test]

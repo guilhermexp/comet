@@ -1,0 +1,361 @@
+---
+schema_version: 1
+id: 20261018T222447Z-c526d6f7
+skill_version: null
+started_at: '2026-10-18T22:24:47Z'
+finished_at: '2026-10-19T00:46:21.084374+00:00'
+request: Execute pinned brief U1-U11 on agents-us; preserve fork, real merge, Linux evidence and local
+  review commits only. No publication.
+workflow_source: .tmp/briefs/upstream-20261018.md; upstream-sync/implement harness skill unavailable;
+  brief execution, not a claimed skill run.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  target_sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  previous_integrated_sha: 75b72602a0348f5697c7affc9f84afe367b763fb
+  target_label: 'after 0.2.114, through #942'
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: main
+  target_branch: sync/upstream-20261018
+  initial_sha: e750f810b2d5d083eb741c57c18ec2043b0d3b93
+  observed_target_sha: e750f810b2d5d083eb741c57c18ec2043b0d3b93
+  result_sha: e6a7ef1964762249fee84e105dd28625898c644a
+  result_sha_note: Validated source revision. Subsequent documentary commit/final HEAD recorded in local
+    report to avoid self-reference.
+  initial_worktree: clean
+strategy:
+  operation: merge
+  reason: Pinned real three-way merge, per-file decisions; preserve fork instead of global ours/theirs.
+  planning_sha: d7df75f87864fb7fa1e13d1d4ec4b44f253573c0
+  merge_sha: 348f8b01d58e1f5b524ca75b8df5a4eed758b03e
+  merge_parents:
+  - d7df75f87864fb7fa1e13d1d4ec4b44f253573c0
+  - c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  repair_commits:
+  - b1ceaa10607a4da2e6ce98d610cff9f526a90715
+  - e6a7ef1964762249fee84e105dd28625898c644a
+changes:
+  incoming_range: 75b72602a0348f5697c7affc9f84afe367b763fb..c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+  incoming_count: 13
+  summary: Native visuals, math, lanes, section order, hover, OpenCode forms, Cursor/dev updater, Recent
+    Files, Archived and adaptive iOS shell.
+  imported:
+  - sha: 81e04e1c5cf6c4f3b89d96bcced61e076025e069
+    subject: Add sidebar toggle for Archived section (#901)
+    scope: U9
+    decision: ADAPT
+    reason: Archived visibility also copied by fork central settings writer.
+  - sha: 2a209cc6cd479ca847184287557cffda1a0c1baf
+    subject: 'Cmd+K: fix Recent Files flicker (#890)'
+    scope: U8
+    decision: ADAPT
+    reason: Recent Files parallel/NUL-safe lookup through existing unified index and common authority
+      resolver.
+  - sha: 4141c761932aab133fc1ab5703c095e7ae37b137
+    subject: 'Settings: delete every archived session at once (#861)'
+    scope: U10
+    decision: ADAPT
+    reason: Confirmed captured archived IDs, revalidation and existing device/sync registry ownership.
+  - sha: 8a0fded8914de3861a4cf51c1d8c0007c07893dd
+    subject: 'Native visuals: agents show interactive Luau visuals rendered by GPUI (#900)'
+    scope: U1
+    decision: ADAPT
+    reason: Native Luau/GPU/assets with fork tool registry, root grants, projection/export and edge references.
+  - sha: 6ac8859998909bc5afd55838afb0635c281f31c3
+    subject: Bump version to v0.2.113
+    decision: ADAPT
+    reason: Include ancestry only; reject upstream version numbering, retain fork 1.0.7.
+  - sha: 9609f994a563f12f8a4ffbf7b5792760cd266f9e
+    subject: 'OpenCode v2: answer the question tool''s session forms (#833)'
+    scope: U6
+    decision: ADAPT
+    reason: v2 field-keyed forms and v1 compatibility; engine alone resolves input lifecycle.
+  - sha: 3b2f78027a2c31622c39c35716da4d6e1af8de15
+    subject: 'fix: send cursor model defaults for plus subscriptions (#920)'
+    scope: U7
+    decision: ADAPT
+    reason: Cursor warm catalog/defaults; explicit dev updater opt-out with own feed unchanged.
+  - sha: 26c8e8404d85a6e4a4973e802f26589ac1d91a2f
+    subject: Reorder sidebar sections by dragging their header (#909)
+    scope: U4
+    decision: TAKE
+    reason: Convergent section ordering, anchors/capability and iOS cross-section/pin drag.
+  - sha: 840fda748d6ee00667adc62d3b0cb5cb2bf107fa
+    subject: 'Sidebar: show a session hover card beside each chat row (#903)'
+    scope: U5
+    decision: ADAPT
+    reason: Hover lifecycle and per-frame reconciliation retain fork rows, mentions and scoped PR metadata.
+  - sha: 59182488115a5c53a9cfb24e2445b54dc22d2e39
+    subject: 'Session card: side chats and subagents  (#895)'
+    scope: U3
+    decision: ADAPT
+    reason: Lanes yield subagents to visible Details Workers; preserve lifecycle, counters, rename and
+      scoped watches.
+  - sha: c02739da309118c2174f427511110046f0bfba16
+    subject: Render LaTeX math in messages with zatex (#912)
+    scope: U2
+    decision: ADAPT
+    reason: zatex/fonts/bounds plus fork Markdown, links, Mermaid, source selection and linear path scanning.
+  - sha: 2e8f02ec2dfc521a20a5c43fcdbf4fae2381853a
+    subject: Bump version to v0.2.114
+    decision: ADAPT
+    reason: Include ancestry only; reject upstream version numbering, retain fork 1.0.7.
+  - sha: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f
+    subject: 'iOS: adapt to iPhone Duo (fold/unfold, uneven safe areas) (#942)'
+    scope: U11
+    decision: TAKE
+    reason: Adaptive UIKit shell retained; native acceptance pending.
+  fork_prs:
+  - number: 24
+    head_sha_observed_prefix: 6ac88599
+    status_observed: OPEN/DRAFT, stale diagnostic, read only
+customizations:
+  preserved:
+  - Version 1.0.7, own release feed/workflow, vendored zui/punctuation provenance and licenses.
+  - Workers lifecycle/restart IDs, notifications, parent mailbox, OMP/Kimi and computer-use MCP.
+  - Root-only MCP grants, multi-question wizard, titles, prescan/discovery budgets and Enter/Steer.
+  - Details Workers/Usage, session/device presence and dev-server ownership.
+  - Legacy OMP voice, context ring/footer terminal and Trajectory remain removed.
+  adapted:
+  - Native Luau/GPU/assets with fork tool registry, root grants, projection/export and edge references.
+  - zatex/fonts/bounds plus fork Markdown, links, Mermaid, source selection and linear path scanning.
+  - Lanes yield subagents to visible Details Workers; preserve lifecycle, counters, rename and scoped
+    watches.
+  - Convergent section ordering, anchors/capability and iOS cross-section/pin drag.
+  - Hover lifecycle and per-frame reconciliation retain fork rows, mentions and scoped PR metadata.
+  - v2 field-keyed forms and v1 compatibility; engine alone resolves input lifecycle.
+  - Cursor warm catalog/defaults; explicit dev updater opt-out with own feed unchanged.
+  - Recent Files parallel/NUL-safe lookup through existing unified index and common authority resolver.
+  - Archived visibility also copied by fork central settings writer.
+  - Confirmed captured archived IDs, revalidation and existing device/sync registry ownership.
+  - Adaptive UIKit shell retained; native acceptance pending.
+  removed:
+  - Duplicate adapter InputResolved emission; engine remains sole lifecycle owner.
+  - Incoming obsolete parallel presenters that would replace fork tool tree/Details surfaces.
+conflicts:
+- files:
+  - Cargo.toml
+  decision: 1.0.7, vendored gpui patches and fork profiles retained; add visual/GPU/zatex and optimized
+    visual profiles; dependency versions centralized.
+- files:
+  - Cargo.lock
+  decision: Regenerate from fork lock against merged manifests, preserving existing locked packages; no
+    upstream version replacement.
+- files:
+  - THIRD_PARTY_NOTICES.md
+  decision: Union Blobatar attribution and all six math font notices/licenses.
+- files:
+  - apps/ios/Zeron/Core/Generated/zeron_core.swift
+  decision: Regenerated with UniFFI from the built merged Linux core; normalized using the iOS script
+    rule. The hand candidate had identical nonblank content; no hand-generated file is treated as native
+    proof. iOS target regeneration/link remains pending.
+- files:
+  - crates/doc/src/parts.rs
+  decision: Add Visual beside Text; keep fork reasoning fields, completion/duration, file preview and
+    subagent lifecycle.
+- files:
+  - crates/doc/src/schema.rs
+  decision: Visual mapping plus fork reasoning/answers semantics; retain both opening-tail and new visual
+    round-trip tests.
+- files:
+  - crates/engine/src/repos.rs
+  decision: NUL-safe enumeration is routed through the fork common bounded resolver; registered primary
+    folders remain authorized without Git, while deletion retains its Registration/branch semantics.
+- files:
+  - crates/harness/src/opencode/mod.rs
+  decision: Remove adapter InputResolved emission; engine remains sole lifecycle owner. Retain v2 form
+    routes and all v1 handling.
+- files:
+  - crates/markdown/src/mend.rs
+  decision: New indexed delimiter matcher plus fork maximum-open-delimiter bound and nested-fence preservation.
+- files:
+  - crates/markdown/src/parser.rs
+  decision: Math blocks/budgets/streaming, plus fork file paths and recursive fence protection; retain
+    both helpers.
+- files:
+  - crates/mobile/src/layout/markdown.rs
+  decision: Final upstream formula/table-area/source fallback and baseline adjustments; preserve fork
+    attachment handling.
+- files:
+  - crates/mobile/src/layout/mod.rs
+  decision: Shared static font faces, math inputs/generation and visual slot/version measurements.
+- files:
+  - crates/mobile/src/layout/rows.rs
+  decision: Visual rows and formula-aware heap accounting, preserve fork input fields.
+- files:
+  - crates/mobile/src/layout/tests.rs
+  decision: Keep new visual Worker constructor and all existing/new tests.
+- files:
+  - crates/mobile/src/layout/tools.rs
+  decision: Math source in thought/code detail path.
+- files:
+  - crates/rpc/src/lib.rs
+  decision: Reject duplicate upstream method table; PublishVisual registered in method.rs only, local-only.
+- files:
+  - crates/ui/Cargo.toml
+  decision: zatex bundled alongside root-owned html5ever dependency.
+- files:
+  - crates/ui/src/change_requests.rs
+  decision: Keep SidebarIcon plus SessionRow surface; suppress duplicate tooltip on session rows, preserve
+    fork device routing.
+- files:
+  - crates/ui/src/changes.rs
+  decision: Retain process-wide native text backend. New math test helper uses that same backend.
+- files:
+  - crates/ui/src/files/mod.rs
+  decision: Retain fork Changes/Create/search state; upstream removal applies only to obsolete explorer
+    lanes, already absent here.
+- files:
+  - crates/ui/src/lib.rs
+  decision: Keep url_chips and add visuals module.
+- files:
+  - crates/ui/src/markdown/render.rs
+  decision: Formula slots/offsets/bounds/glyph overlay and source copy combined with fork prefix invalidation,
+    nested IDs, file links, rounded code backgrounds, hard breaks, table geometry/type and source preview.
+    No old fixed-width thought presenter restored.
+- files:
+  - crates/ui/src/pull_request_detail.rs
+  decision: Add math style to fork settled options builder; retain media/copy.
+- files:
+  - crates/ui/src/pull_request_media.rs
+  decision: Keep settled-options test setup with default math.
+- files:
+  - crates/ui/src/settings.rs
+  decision: Union computer-use/scope and collapse settings with math settings; preserve central writer
+    and add Archived ownership.
+- files:
+  - crates/ui/src/shell.rs
+  decision: Union search warming/hover/section drag state; side-chat rename reveals lanes, removing obsolete
+    tab editor; fork menu/actions/panels retained.
+- files:
+  - crates/ui/src/shell/panel_interaction_tests.rs
+  decision: Union all fork geometry/watch lifecycle tests and upstream lane rename/scroll tests.
+- files:
+  - crates/ui/src/shell/session_info.rs
+  decision: Fork 16px gutters and Details metadata ownership; add lanes and scoped totals watch, release
+    while hidden. Starter actions live in lanes and existing Details header.
+- files:
+  - crates/ui/src/shell/spaces.rs
+  decision: Add selectors/new controls while retaining fork row projection, mentions, pin transfer and
+    grouping.
+- files:
+  - crates/ui/src/shell/tabs.rs
+  decision: Keep fork titlebar geometry/content-sized controls; adapt new running side-chat + subagent
+    count without introducing a second panel host.
+- files:
+  - crates/ui/src/transcript.rs
+  decision: Add Visual rows/renderer and math style invalidation to fork renderer. Reject resurrected
+    upstream compact/thought/user rendering that replaced fork behavior. Retain fork tool tree, wizard,
+    lifecycle lines, mentions, file cards and native selection. Release departed visual frames.
+- files:
+  - scripts/dev-demo.sh
+  decision: Fanout fixture + fork Worker fixture, scalar Bash 3.2 variables, both port/profile override
+    conventions, temporary demo project folders.
+verification:
+- command: cargo fmt --all before merge
+  revision: e750f810b2d5d083eb741c57c18ec2043b0d3b93
+  result: passed
+  exit: 0
+  observed: No formatting delta.
+- command: cargo test --workspace --all-targets --no-run
+  revision: e6a7ef1964762249fee84e105dd28625898c644a
+  result: passed_after_repair
+  exit: 0
+  log: all-targets-source-final.log
+  observed: Initial compile failures retained; final all-target executables compile.
+- command: cargo test --workspace --no-fail-fast -- --test-threads=4
+  revision: e6a7ef1964762249fee84e105dd28625898c644a
+  result: failed
+  exit: 101
+  log: workspace-runtime-3.log
+  observed: '5836 passed, 1 failed, 52 ignored. Codex external_voice_keeps_canonical_events_without_any_local_helper:
+    ETXTBSY spawning copied fixture; adapter/test/fixture identical to baseline. Not a green workspace
+    run.'
+- command: 'Unchanged Codex executable: 3 full suites + 20 exact repetitions'
+  revision: e6a7ef1964762249fee84e105dd28625898c644a
+  result: passed
+  exit: 0
+  log: codex-etxtbsy-characterization.log
+  observed: 23/23 runs pass, no product/test edits; each full suite 39 passed, 4 ignored.
+- command: Complete focused UI and Workers libraries; replay fixture 20 repetitions
+  result: passed
+  exit: 0
+  log: sidebar-seed-focused.log
+  observed: UI 2554 passed/1 inherited ignore; Workers 324 passed; replay 20/20. Prior 13/20 flaky failures
+    and mtime probe retained.
+- command: npm -C edge test and typecheck
+  revision: 348f8b01d58e1f5b524ca75b8df5a4eed758b03e
+  result: passed
+  exit: 0
+  observed: 64 unit +34 workerd; Edge tree identical at final source. New regressions initially 2 failed/1
+    passed.
+- command: Baseline updater regression and Archived-writer omission proof
+  result: failed_before_repair_passed_after
+  observed: Both failures preserved; no ignored/deleted regressions.
+- command: Host mobile build + UniFFI Swift regeneration
+  revision: e6a7ef1964762249fee84e105dd28625898c644a
+  result: passed_with_normalization_limit
+  exit: 0
+  observed: API content, headers/modulemap match. Two raw drift checks differ only in terminal LF; normalized
+    Swift equals committed. No Swift/iOS link proof.
+- command: scripts/e2e-smoke.sh in private HOME/network/PID sandbox
+  revision: e6a7ef1964762249fee84e105dd28625898c644a
+  result: passed
+  exit: 0
+  log: e2e-source-final.log
+  observed: Real Worker +two engines; queued Run, transcript and status sync both directions; production
+    binary built.
+- command: Actual production app under Xvfb/software Vulkan, private Local profile
+  revision: e6a7ef1964762249fee84e105dd28625898c644a
+  result: passed_linux_scope
+  exit: 0
+  log: native-linux-attempt-2.log
+  observed: UI/RPC actions and screenshots; visual controls/2D/3D/shader, TeX copy, lanes, reorder, hover,
+    Files authority, Archived persistence/delete. First setup attempt retained.
+- command: Incoming addition/binary audit
+  revision: e6a7ef1964762249fee84e105dd28625898c644a
+  result: reviewed
+  observed: 40308 incoming added lines;172 classified candidates;0 unclassified;6 font assets identical.
+    Not semantic-equivalence proof.
+- command: CI filter JavaScript executed locally
+  result: passed
+  exit: 0
+  observed: visual/visual-gpu/zatex each select iOS/native/session-sync lanes. No CI dispatch.
+- command: openspec validate sync-upstream-20261018 --strict
+  result: passed
+  exit: 0
+  observed: Change stays open for native acceptance.
+- command: graft map/build
+  result: unavailable
+  exit: 127
+  observed: No executable/index. Exact Git/source spans substituted.
+limits:
+- No macOS/AppKit/Metal or iOS/UIKit execution, packaging, native focus/safe-area/fold acceptance.
+- Complete workspace retains one observed ETXTBSY failure despite passing unchanged-source repetitions.
+- No authenticated live-provider/account/quota or private incident-snapshot proof; inherited ignores retained.
+- Manual math glyph review Fira/STIX only; all six exercised by unit layout corpus. GPU texture/assets
+  native pixel paths still require native review.
+- No arbitrary hostile GLSL wall-clock bound proven; no nonterminating GPU shader executed.
+- Linux UniFFI normalization includes terminal LF; target-native regeneration/link/drift remains required.
+- Screenshot sampling is not a 5–8ms Recent Files performance benchmark.
+references:
+- docs/upstream-sync.md
+- openspec/changes/sync-upstream-20261018/verification.md
+- openspec/changes/sync-upstream-20261018/integration-decisions.md
+- openspec/changes/sync-upstream-20261018/native-handoff.md
+- .tmp/reports/upstream-20261018.md
+- .tmp/reports/upstream-20261018/
+outcome: integrated
+pending:
+- Native acceptance and OpenSpec archive remain open.
+- Review complete-run ETXTBSY failure; obtain fully green workspace run if gate requires it.
+delivery:
+  integration: local_review
+  target_branch: sync/upstream-20261018
+  commit: e6a7ef1964762249fee84e105dd28625898c644a
+  pr: https://github.com/guilhermexp/comet/pull/24 (read-only stale diagnostic)
+  publication: not_authorized
+  record_pushed: false
+  deploy: not_authorized

@@ -46,12 +46,11 @@ pub fn plan_turn_steps(
     if last_text <= last_tool {
         return None;
     }
-    // Generated images are transcript output, not tool activity. Keep an
-    // image outside the folded prefix even when a text part follows it; a
-    // final image must remain visible as the run's output.
+    // Images and interactive visuals are transcript output. Keep them
+    // outside the activity fold even when later text follows them.
     let split_before_part = parts
         .iter()
-        .position(|part| matches!(part, MessagePart::Image { .. }))
+        .position(|part| matches!(part, MessagePart::Image { .. } | MessagePart::Visual { .. }))
         .filter(|image| *image < last_text)
         .unwrap_or(last_text);
     // A fold with no children would hide the boundary without summarizing
@@ -88,7 +87,10 @@ fn is_visible_part(part: &MessagePart) -> bool {
         MessagePart::Text { text, .. }
         | MessagePart::Reasoning { text, .. }
         | MessagePart::Error { message: text, .. } => !text.trim().is_empty(),
-        MessagePart::Image { .. } | MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
+        MessagePart::Image { .. }
+        | MessagePart::Visual { .. }
+        | MessagePart::Tool { .. }
+        | MessagePart::Input { .. } => true,
         MessagePart::WorkflowTask { .. } | MessagePart::Fork { .. } => false,
     }
 }
@@ -108,6 +110,7 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
         | MessagePart::Text { .. }
         | MessagePart::Error { .. }
         | MessagePart::Image { .. }
+        | MessagePart::Visual { .. }
         | MessagePart::WorkflowTask { .. }
         | MessagePart::Fork { .. } => false,
     }
@@ -490,6 +493,34 @@ mod tests {
         let plan = plan_turn_steps(&parts, Some(MessageStatus::Complete)).unwrap();
         assert_eq!(plan.split_before_part, 1);
         assert_eq!(plan.summary, "1 read");
+    }
+
+    #[test]
+    fn interactive_visual_stays_visible_after_activity_is_folded() {
+        let visual = MessagePart::Visual {
+            id: "visual".into(),
+            path: "/tmp/chart.luau".into(),
+            title: "Chart".into(),
+        };
+        let parts = vec![
+            tool("read", read("src/lib.rs"), true),
+            visual.clone(),
+            tool("exec", exec("cargo test"), true),
+            text("answer", "Done"),
+        ];
+        assert_eq!(
+            plan_turn_steps(&parts, Some(MessageStatus::Complete))
+                .unwrap()
+                .split_before_part,
+            1
+        );
+        assert_eq!(
+            plan_turn_steps(
+                &[visual, text("answer", "Done")],
+                Some(MessageStatus::Complete)
+            ),
+            None
+        );
     }
 
     #[test]

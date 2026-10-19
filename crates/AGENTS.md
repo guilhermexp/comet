@@ -25,6 +25,10 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
   interactive delivery. Regression seam:
   `cargo test -p zeron-workers-unpeel --test worker_initial_briefing`.
 
+- Markdown autolinking counts parentheses/brackets once per token and updates counts while trimming, including the fork file-path path. Hostile URL/file punctuation tails must remain linear without dropping file links.
+
+- `visual` owns sandboxed Luau/native element trees and CPU raster/scene validation; `visual-gpu` owns bounded offscreen GPU state shared by desktop/mobile. `zatex` owns pure TeX layout and bundled math font provenance. None depends on UI or engine.
+
 ## Work Guidance
 
 - Mudança que atravessa duas crates quase sempre indica que o tipo está na camada errada: tipo de fio vai pra `proto`, forma de documento vai pra `doc`.
@@ -37,7 +41,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `crates/*/src/**` (lógica pura) | unit (`mod tests` co-located) | `cargo test -p <crate>` |
-| `crates/{engine,harness,rpc,workers-unpeel,doc,sync}/tests/**` | integration | `cargo test -p <crate>` |
+| `crates/{engine,harness,rpc,workers-unpeel,doc,sync,visual}/tests/**` | integration | `cargo test -p <crate>` |
 | `crates/ui/src/**` (estado, derivações) | unit | `cargo test -p zeron-ui` |
 | `crates/ui` (render gpui) | unit — fixtures `gpui::TestAppContext` de layout/render; QA visual nativo continua separado | `cargo test -p zeron-ui` · `scripts/dev-demo.sh` |
 | `crates/update` | unit (versão/manifest, swap symlink, shutdown, restart gate) | `cargo test -p zeron-update` |
@@ -70,3 +74,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-voice-session` | [`voice-session/AGENTS.md`](voice-session/AGENTS.md) | Lifecycle e transporte de cliente de voz local/remoto |
 | `zeron-orb` | [`orb/AGENTS.md`](orb/AGENTS.md) | Geometria e animação de orb compartilhadas, sem renderer |
 | `zeron-veil` | [`veil/AGENTS.md`](veil/AGENTS.md) | Fade e revelação de texto compartilhados, sem renderer |
+
+| `zeron-visual` | [`visual/AGENTS.md`](visual/AGENTS.md) | Sandboxed Luau and native visual model |
+| `zeron-visual-gpu` | [`visual-gpu/AGENTS.md`](visual-gpu/AGENTS.md) | Offscreen GPU shader/scene rendering |
+| `zatex` | [`zatex/AGENTS.md`](zatex/AGENTS.md) | Bounded TeX layout and six math fonts |

@@ -65,6 +65,11 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 - `run_isolated` is opt-in and never falls back to a coding run. `run_title` delegates with title instructions; recaps supply summary instructions while sharing the same restrictions. Claude disables tools/MCP/settings and denies permission requests; Codex uses read-only ephemeral threads, replacement instructions and explicit MCP/feature disablement. Workers MCP is disabled on this path.
 
+- OpenCode v2 question forms normalize `form.created` question fields into field-keyed input panels and reply via the form route, including single/multiselect values. V1 question endpoints remain supported. Only the engine emits/persists the input lifecycle; the adapter never emits a duplicate InputResolved.
+- Cursor fresh runs and in-place model switches fill implicit options from the credential-scoped warm catalog. Explicit/legacy choices win; catalog defaults marked Max Mode are excluded. `ZERON_MOCK_MATH=1` adds a synthetic desktop math/table/fallback/selection fixture; it executes no provider or command.
+
+Cursor catalog models and Max Mode default exclusions are one credential-scoped accepted snapshot under the catalog lock. Rejected/empty refreshes and cancelled discovery cannot publish companion metadata; credential changes invalidate both. `catalog::tests::snapshot_metadata_is_atomic_across_rejection_concurrency_and_credentials` (unit) and `tests/cursor.rs::rejected_catalog_refresh_keeps_max_mode_exclusions_for_start_and_switch` (integration) cover rejection/start/switch; explicit options remain authoritative.
+
 ## Work Guidance
 
 - Comandos OMP locais bem-sucedidos publicam `contextUsage` via `get_state` antes de `Done`. **`/compact` roda em background no OMP: `agentInvoked:false` é só ACK, nunca conclusão.** O adapter espera `command_output` terminal (`Compaction complete.` / falha), ignora `agent_end` intermediário, mantém cancelamento e o deadline de prompt após o ACK, e só então lê usage. Sucesso suprime a prosa CLI duplicada; erro de argumento/provider termina com falha. Estado ausente não inventa contagem. `tests/omp_rpc.rs` cobre ACK antecipado com estado stale, aumento de tokens, resultado antes do ACK, falha, timeout e cancelamento.

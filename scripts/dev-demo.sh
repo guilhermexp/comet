@@ -6,16 +6,20 @@
 #   scripts/dev-demo.sh --slow     # pace mock streams (~10s) to watch streaming
 #
 # Everything lives under /tmp/zeron-demo-*; re-runs reuse it. Ctrl-C cleans up.
+# A second demo beside a running one (another worktree's) picks its own
+# state and port: ZERON_DEMO_DIR=/tmp/zeron-demo-b ZERON_DEMO_PORT=27931.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Sessões concorrentes no mesmo checkout precisam de porta e dirs próprios,
 # senão o daemon novo perde o bind e o seed vai parar no daemon alheio.
 TAG=${ZERON_DEMO_TAG:-}
-DAEMON_DIR=/tmp/zeron-demo-daemon$TAG
-UI_DIR=/tmp/zeron-demo-ui$TAG
-WORKERS_DIR=/tmp/zeron-demo-workers$TAG
-IPC=${ZERON_DEMO_IPC:-27921}
+DEMO_DIR="${ZERON_DEMO_DIR:-/tmp/zeron-demo}"
+DAEMON_DIR="$DEMO_DIR-daemon$TAG"
+UI_DIR="$DEMO_DIR-ui$TAG"
+WORKERS_DIR="$DEMO_DIR-workers$TAG"
+IPC="${ZERON_DEMO_PORT:-${ZERON_DEMO_IPC:-27921}}"
+PROJECTS_DIR="${ZERON_DEMO_PROJECTS_DIR:-$DEMO_DIR-projects$TAG}"
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
 
@@ -53,7 +57,8 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   SPACE_aether=""
   for project in zeron soccertcg aether; do
     sid=$(uuidgen | tr 'A-Z' 'a-z')
-    probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
+    mkdir -p "$PROJECTS_DIR/$project"
+    probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$PROJECTS_DIR/$project\"}" >/dev/null
     case "$project" in
       zeron) SPACE_zeron="$sid" ;;
       soccertcg) SPACE_soccertcg="$sid" ;;
@@ -85,6 +90,27 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   touch "$DAEMON_DIR/.demo-seeded"
 fi
 
+# A session fanning out 40 subagents with side chats under it, for the
+# session card's lanes. Each launch fans out again; settled ones fold away.
+FANOUT_ID_FILE="$DAEMON_DIR/.fanout-chat"
+if [[ ! -f "$FANOUT_ID_FILE" ]]; then
+  echo "▸ seeding the fan-out session"
+  DEV=$(probe LocalDevice '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["deviceId"])')
+  sid=$(uuidgen | tr 'A-Z' 'a-z')
+  mkdir -p "$PROJECTS_DIR/scouts"
+  probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$PROJECTS_DIR/scouts\"}" >/dev/null
+  fanout=$(uuidgen | tr 'A-Z' 'a-z')
+  probe Mutate "{\"op\":\"createChat\",\"chatId\":\"$fanout\",\"spaceId\":\"$sid\",\"config\":{\"harness\":\"mock\",\"model\":\"fable-5\",\"reasoning\":null,\"sandbox\":\"workspace-write\"}}" >/dev/null
+  probe Mutate "{\"op\":\"renameChat\",\"chatId\":\"$fanout\",\"title\":\"Fan Out Forty Scouts\"}" >/dev/null
+  for title in "Investigate the cadence regression" "Draft the migration notes" "Review the relay retry budget"; do
+    side=$(uuidgen | tr 'A-Z' 'a-z')
+    probe Mutate "{\"op\":\"createChat\",\"chatId\":\"$side\",\"spaceId\":\"$sid\",\"parentChatId\":\"$fanout\",\"config\":{\"harness\":\"mock\",\"model\":\"fable-5\",\"reasoning\":null,\"sandbox\":\"workspace-write\"}}" >/dev/null
+    probe Mutate "{\"op\":\"renameChat\",\"chatId\":\"$side\",\"title\":\"$title\"}" >/dev/null
+  done
+  echo "$fanout" > "$FANOUT_ID_FILE"
+fi
+probe QueueCommand "{\"chatId\":\"$(cat "$FANOUT_ID_FILE")\",\"command\":{\"kind\":\"run\",\"messageId\":\"$(uuidgen)\",\"request\":{\"prompt\":\"/fanout 40\",\"model\":null,\"reasoning\":null,\"modelOptions\":{},\"cwd\":\"/tmp\",\"sandbox\":\"workspace-write\",\"autoApprove\":true,\"resume\":null}}}" >/dev/null
+
 DEMO_PARENT_CHAT_ID=$(probe WatchChats '{}' --stream 1 | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(next(row["id"] for row in rows if row.get("title") == "Native Zeron Rust Rewrite"))')
 python3 scripts/seed-demo-workers.py \
   --home "$WORKERS_DIR" \
@@ -92,5 +118,6 @@ python3 scripts/seed-demo-workers.py \
   --parent-chat-id "$DEMO_PARENT_CHAT_ID"
 
 echo "▸ opening zeron (composer is live — type into it; --slow shows streaming)"
+echo "  Fan Out Forty Scouts settles every 2.5s; send /fanout 40 to replay"
 UNPEEL_HOME="$WORKERS_DIR" COMET_WORKERS_HOOKS_DIR="$WORKERS_DIR/hooks" \
   ZERON_DATA_DIR="$UI_DIR" ZERON_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/zeron

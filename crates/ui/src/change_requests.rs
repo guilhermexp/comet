@@ -70,6 +70,7 @@ impl Render for ChangeRequestTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let card = div()
+            .debug_selector(|| "change-request-tooltip".into())
             .max_w(px(320.0))
             .px(px(9.0))
             .py(px(7.0))
@@ -108,6 +109,8 @@ impl Render for ChangeRequestTooltip {
 pub(crate) enum ChangeRequestBadgeSurface {
     Sidebar,
     SidebarIcon,
+    /// A sidebar session row supplies the PR details in its hover card.
+    SessionRow,
     Composer,
 }
 
@@ -200,6 +203,10 @@ fn render_badge_model(
     let accessible_label = format!("Open pull request {}: {}", model.number, model.title);
 
     div()
+        .debug_selector({
+            let id = id.clone();
+            move || format!("pull-request-badge-{id}")
+        })
         .id(id)
         .h(px(if composer { 20.0 } else { 16.0 }))
         .flex_none()
@@ -224,22 +231,31 @@ fn render_badge_model(
                     cx.stop_propagation();
                     crate::pull_request_detail::open_on_device(&url, device.clone(), window, cx);
                 })
-                .tooltip(move |_, cx| {
+        })
+        // Sidebar rows spell the pull request out in their hover card.
+        .when(
+            interactive && surface != ChangeRequestBadgeSurface::SessionRow,
+            |el| {
+                el.tooltip(move |_, cx| {
                     cx.new(|_| ChangeRequestTooltip {
                         model: tooltip_model.clone(),
                     })
                     .into()
                 })
                 .tooltip_show_delay(std::time::Duration::from_millis(350))
-        })
-        .when(composer || icon_only, |element| {
-            element.child(
-                crate::icons::icon(crate::icons::PULL_REQUEST)
-                    .size(px(11.0))
-                    .flex_none()
-                    .text_color(color.opacity(0.85)),
-            )
-        })
+            },
+        )
+        .when(
+            composer || icon_only || surface == ChangeRequestBadgeSurface::SessionRow,
+            |element| {
+                element.child(
+                    crate::icons::icon(crate::icons::PULL_REQUEST)
+                        .size(px(11.0))
+                        .flex_none()
+                        .text_color(color.opacity(0.85)),
+                )
+            },
+        )
         // Monospace digits give the badge a stable tabular width as PR numbers change.
         .when(!icon_only, |element| {
             element.child(

@@ -106,8 +106,8 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 - **Visual:** Settings no layout do upstream #449, mas com as seções Projects e Accounts do fork; Changes dentro do Files, transcript compacto, sem anel de contexto e sem terminal de rodapé.
 - **Painel direito:** só conta como aberto se tiver aba viva.
 - **Publicação e update:**
-  - versão 0.2.18, `release.yml` do fork, zui vendorizado em `third_party/zui`; deltas de API do pin upstream são aplicados numa fonte separada e copiados com proveniência, sem trocar para git dependency;
-  - o updater não usa o feed `zeron.sh`: vale o `has_release_feed`, e um feed próprio exige `ZERON_RELEASES_URL`.
+  - versão 1.0.7 nesta integração, `release.yml` do fork, zui vendorizado em `third_party/zui`; deltas de API do pin upstream são aplicados numa fonte separada e copiados com proveniência, sem trocar para git dependency;
+  - o updater mapeia `zeron.sh`/`*.zeron.sh` para `COMET_RELEASES_URL` (GitHub Releases do fork); `ZERON_RELEASES_URL` continua override explícito e edges self-hosted mantêm seu próprio feed.
 
 ## Recusado: continua a versão do fork
 
@@ -185,6 +185,60 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Localização customizada de worktree por device | #530 | v0.2.112 | Preferência da engine entra no lifecycle comum de Chat/Workers; criação usa hash de repo e journal já existente, não outro manager. Destinos de Workers standalone não mudam. Retry consulta posse independente da preferência atual |
 | PRs em panes/abas e Session information responsiva | #866/#867 | v0.2.112 | Registros novos de abas preservam URL + device/cache de credencial. Fit usa gutters de 16px e largura efetiva de Details; utility tabs conservam 118px, avatar de subagente e terminal à direita |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
+
+## Integração local de 18/10/2026 (em revisão)
+
+A integração `sync/upstream-20261018` usa o alvo fixo `c526d6f7` (13 commits),
+por merge real; preserva a versão 1.0.7 e o feed do fork. A PR #24 continua
+como diagnóstico draft antigo, sem mutação. Planejamento, contratos e tarefas
+pendentes: [`sync-upstream-20261018`](../openspec/changes/sync-upstream-20261018/).
+Não houve push, dispatch de CI, publicação nem acesso ao Mac nesta execução.
+
+Merge local `348f8b01` (pais `d7df75f8` + `c526d6f7`); código avaliado em
+`e6a7ef19`. All-targets e smoke e2e com duas engines passaram. A regressão
+completa registrou 5.836 passes, uma falha transitória `ETXTBSY` na fixture
+Codex e 52 ignores; a suíte Codex passou em três repetições e o caso em mais
+20, sem alteração de fontes. Não chamar o run completo de verde. UI real
+exercitada em perfil Local sintético/Xvfb/Vulkan por software, com captura e
+asserções de persistência/cópia/exclusão. Evidência e limites:
+[`verification.md`](../openspec/changes/sync-upstream-20261018/verification.md).
+A aceitação macOS/iOS segue pendente; não arquivar o OpenSpec por esses passes.
+
+Armadilhas adicionais: `PublishVisual` entra na tabela única `rpc::method`,
+sempre local-only, e o grant raiz continua em `workers_mcp`; não restaurar a
+injeção global por `RunRequest.mcp`. Lanes usam o lifecycle Cancelled do fork e
+cedem subagentes ao widget Workers visível de Details. O writer central de
+Settings precisa copiar `sidebar_show_archived`. O renderer de matemática deve
+preservar chips/links, IDs compostos e invalidação por prefixo. Bindings Swift
+precisam ser regeneradas do core integrado, nunca resolvidas só por texto.
+`ZERON_AUTO_UPDATE=0` protege bundles dev inclusive no launcher Cargo por exec
+direto; não desativa o lifecycle de instalações managed headless.
+
+A revisão R1–R5 desta mesma integração tem evidência adicional em
+`.tmp/reports/review-20261019.md` e registro próprio no histórico. Contratos
+adicionais a preservar: parsing nativo de Visual conta visitas/deadline além de
+nodes; texto/logs e import de glTF verificam bytes antes de copiar/decodificar;
+views de imagem idênticas compartilham backing. Modelos Cursor e exclusões de
+Max Mode formam um único snapshot aceito por credencial; discovery rejeitada
+não publica metadados. No iOS, a seção de origem de drag não precisa ser um
+destino: project groups permitem arrastar Chats, mas seguem proibidos para drop.
+
+Fechamento adicional de R2: contabilizar também as cópias implícitas retidas
+(tab value/link label), labels/defaults de axes, filhos numéricos e texto de
+canvas. O limite por cena/canvas reinicia por draw, com cobrança antes da cópia.
+Prova antes/depois e escopo auditado: `.tmp/reports/review-r2-closure.md`.
+
+Revisão F1–F4 (2026-10-19): accessors glTF expandidos (sparse sem base) são
+cobrados antes de qualquer collect, 64 MiB por visita e 256 MiB somados entre
+primitives/instâncias; chaves repetidas de chart/canvas/scene/shader são erro
+de visual (o host usa a chave como id de superfície); `crates/mobile` e
+`VisualPainter` recusam display com ids colididos ou bitmap estático acima de
+16.384 px por lado/16 Mi px, mostrando erro visível; `PublishVisual` se vincula
+ao turno vivo e só responde sucesso após o loop persistir a parte, removendo os
+arquivos em qualquer recusa. Prova: `.tmp/reports/review-f1-f4-claude-20261019.md`.
+Fechamento: accessor de índice explícito ilegível é recusado (só ausência gera
+índices implícitos) e visual aceito reinicia a janela de quiesce; prova em
+`.tmp/reports/review-f1-f4-closure-20261019.md`.
 
 ## Armadilhas conhecidas
 

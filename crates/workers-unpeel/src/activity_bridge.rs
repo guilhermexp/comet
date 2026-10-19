@@ -2502,6 +2502,17 @@ mod tests {
 
         let mut engine = ActivityEngine::default();
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        // Each write represents a distinct durable event. Wall-clock writes
+        // can share a filesystem mtime, which the replay version correctly dedups.
+        let write_seed = |event: serde_json::Value, at: SystemTime| {
+            std::fs::write(&seed_path, event.to_string()).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&seed_path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(at))
+                .unwrap();
+        };
         engine.observe_runtime_launch("worker-replay-test", 1, Some(1000));
         engine.apply_hook_event("worker-replay-test", "Start", None, t0);
         assert_eq!(
@@ -2510,17 +2521,15 @@ mod tests {
         );
 
         // 1. Foreign Claude Stop carrying OMP worker env + main + gen 1 is rejected in replay
-        std::fs::write(
-            &seed_path,
+        write_seed(
             serde_json::json!({
                 "hook_event_name": "Stop",
                 "unpeel_runtime_id": "claude",
                 "unpeel_agent_kind": "main",
                 "unpeel_runtime_generation": 1
-            })
-            .to_string(),
-        )
-        .unwrap();
+            }),
+            t0 + Duration::from_secs(2),
+        );
 
         let input_activity = ActivityInput {
             session_id: "worker-replay-test",
@@ -2543,17 +2552,15 @@ mod tests {
         assert!(!engine.hook_confirmed_idle("worker-replay-test"));
 
         // 2. Nested OMP subagent Stop is rejected in replay
-        std::fs::write(
-            &seed_path,
+        write_seed(
             serde_json::json!({
                 "hook_event_name": "Stop",
                 "unpeel_runtime_id": "omp",
                 "unpeel_agent_kind": "sub",
                 "unpeel_runtime_generation": 1
-            })
-            .to_string(),
-        )
-        .unwrap();
+            }),
+            t0 + Duration::from_secs(3),
+        );
         let input_activity = ActivityInput {
             session_id: "worker-replay-test",
             command: "omp --session-dir /tmp/sessions",
@@ -2574,17 +2581,15 @@ mod tests {
         );
 
         // 3. Valid primary OMP Stop is accepted and recovers
-        std::fs::write(
-            &seed_path,
+        write_seed(
             serde_json::json!({
                 "hook_event_name": "Stop",
                 "unpeel_runtime_id": "omp",
                 "unpeel_agent_kind": "main",
                 "unpeel_runtime_generation": 1
-            })
-            .to_string(),
-        )
-        .unwrap();
+            }),
+            t0 + Duration::from_secs(4),
+        );
         let input_activity = ActivityInput {
             session_id: "worker-replay-test",
             command: "omp --session-dir /tmp/sessions",
@@ -2606,16 +2611,14 @@ mod tests {
         assert!(engine.hook_confirmed_idle("worker-replay-test"));
 
         // 4. Legacy primary without runtime_id recovers as intended
-        std::fs::write(
-            &seed_path,
+        write_seed(
             serde_json::json!({
                 "hook_event_name": "PermissionRequest",
                 "unpeel_agent_kind": "main",
                 "unpeel_runtime_generation": 1
-            })
-            .to_string(),
-        )
-        .unwrap();
+            }),
+            t0 + Duration::from_secs(5),
+        );
         let input_activity = ActivityInput {
             session_id: "worker-replay-test",
             command: "omp --session-dir /tmp/sessions",

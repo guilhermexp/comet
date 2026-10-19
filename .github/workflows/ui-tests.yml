@@ -77,10 +77,12 @@ jobs:
             const mobileCore = ['apps/ios/', 'crates/mobile/', 'crates/client/', 'crates/text/',
               'crates/markdown/', 'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/',
               'crates/syntax/', 'crates/voice-session/', 'crates/voice-media/',
-              'crates/audio/', 'crates/orb/', 'crates/veil/', 'scripts/ios/'];
+              'crates/audio/', 'crates/orb/', 'crates/veil/', 'crates/visual/',
+              'crates/visual-gpu/', 'crates/zatex/', 'scripts/ios/'];
             // Native macOS/Linux fixtures: browser, preview, notifications,
             // diff font geometry and the vendored GPUI frame source.
-            const nativeSurfaces = ['crates/ui/src/browser/', 'crates/ui/src/file_preview/',
+            const nativeSurfaces = ['crates/visual/', 'crates/visual-gpu/', 'crates/zatex/',
+              'crates/ui/src/visuals.rs', 'crates/ui/src/markdown/math.rs', 'crates/ui/src/browser/', 'crates/ui/src/file_preview/',
               'crates/ui/src/notify.rs', 'crates/ui/src/changes.rs', 'crates/ui/src/attachments.rs',
               'crates/ui/src/composer.rs', 'crates/ui/src/queue.rs', 'crates/ui/src/transcript.rs',
               'crates/ui/src/shell/', 'crates/ui/src/voice.rs', 'crates/ui/src/orb/', 'crates/ui/examples/',
@@ -90,6 +92,7 @@ jobs:
             // core-tests: every non-UI Linux suite (scripts/ci/test-core.sh).
             const sessionSync = ['crates/harness/', 'crates/sync/', 'crates/update/',
               'crates/engine/', 'crates/doc/', 'crates/proto/', 'crates/rpc/', 'crates/preview/',
+              'crates/visual/', 'crates/visual-gpu/', 'crates/zatex/',
               'scripts/ci/', '.github/actions/linux-ci/'];
             const touches = prefixes => files.some(file =>
               [file.filename, file.previous_filename].some(path =>

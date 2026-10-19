@@ -1228,10 +1228,12 @@ fn rich_text(
     key: String,
     url: &str,
     theme: &Theme,
+    math: crate::markdown::math::MathStyle,
     window: &mut Window,
     owner: gpui::WeakEntity<PullRequestDetailPage>,
 ) -> AnyElement {
     let mut options = crate::markdown::render::RenderOptions::settled(key.into());
+    options.math = math;
     options.media = Some(super::pull_request_media::media(
         url,
         Rc::new(move |source, window, cx| {
@@ -1951,6 +1953,7 @@ impl Render for PullRequestDetailPage {
                                         format!("{}description", self.selection_prefix),
                                         &self.url,
                                         &theme,
+                                        crate::settings::math_style(cx),
                                         window,
                                         cx.weak_entity(),
                                     ))
@@ -2221,6 +2224,7 @@ impl Render for PullRequestDetailPage {
                                                         ),
                                                         &self.url,
                                                         &theme,
+                                                        crate::settings::math_style(cx),
                                                         window,
                                                         cx.weak_entity(),
                                                     ))

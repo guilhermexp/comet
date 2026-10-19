@@ -12,6 +12,7 @@ pub mod caption;
 mod client_ffi;
 pub mod layout;
 pub mod orb;
+pub mod visual;
 pub mod wallpaper;
 
 /// Version handshake: the Swift/Kotlin bindings must match the linked library.

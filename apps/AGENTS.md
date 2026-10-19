@@ -32,6 +32,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 - Appshots no iOS preservam o screenshot como anexo e projetam no transcript apenas origem/título; o texto AX observado fica oculto. O parser escolhe o último trailer de anexos válido e ignora marcadores que apareçam dentro do XML observado.
 - Voz Codex no iOS usa o estado compartilhado de `crates/voice-session` e media nativa via WebRTC/CoreAudio, com Live Activities/Dynamic Island; permanece cliente da engine host do Chat. Falha ao abrir Chat real retorna à navegação real com erro, nunca a fixture/demo. O Live OMP mantém seu contrato independente na engine.
 - `apps/zeron/build.rs` inclui a declaração de microfone de `Info-unbundled.plist` no Mach-O para launches sem bundle; o runner de dev continua usando identidade própria de Zeron Dev.
+- O shell iOS alterna tab/split com retenção de navegação e usa safe areas reais para transcript/composer; visuals nativos e math são projetados pelo core Rust. Linux não comprova UIKit.
 - `apps/ios` não entra no `cargo build`; build e teste são pelo Xcode.
 
 ## Work Guidance
