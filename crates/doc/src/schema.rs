@@ -1638,6 +1638,11 @@ impl<'a> SegmentWriter<'a> {
         }
     }
 
+    /// The parts written into the entry so far, in order.
+    pub fn written(&self) -> &[MessagePart] {
+        &self.written
+    }
+
     /// The state a later [`Self::resume`] needs.
     pub fn into_state(self) -> (usize, Vec<MessagePart>) {
         (self.entry_index, self.written)

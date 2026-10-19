@@ -4088,52 +4088,73 @@ impl RpcService for EngineRpc {
                         zeron_proto::VISUAL_MAX_BYTES
                     )));
                 }
-                // Before decoding and storing anything (checked again below).
-                if !self.sessions.has_run(&p.chat_id) {
+                // Bound to the turn in flight now, before decoding and
+                // storing anything: a turn that ends, parks or is steered
+                // while the script is checked refuses it below.
+                let Some(turn) = self.sessions.visual_turn(&p.chat_id) else {
                     return Err(no_turn_for_visual());
-                }
+                };
                 let id = format!("v:{}", crate::new_id());
                 let assets = decode_visual_assets(&p.assets)?;
                 // Run the script the way the desktop will (setup, render,
                 // every draw, every control) before anyone sees it, so the
                 // agent gets its errors with line numbers and can fix them.
-                let uploads = self.uploads.clone();
-                let (stored_id, script) = (id.clone(), p.script);
-                let (path, report) = tokio::task::spawn_blocking(move || {
-                    let files = zeron_visual::Assets::new(
-                        assets
-                            .iter()
-                            .map(|(name, bytes)| (name.clone(), bytes.as_slice().into()))
-                            .collect(),
-                    );
-                    let checked = zeron_visual::check_with_assets(
-                        &script,
-                        zeron_visual::seed_for(&stored_id),
-                        files,
-                    );
-                    let report = checked
-                        .map_err(|e| RpcError::BadParams(format!("visual script failed: {e}")))?;
-                    // Assets first: a script is only ever found with its files.
-                    uploads
-                        .store_visual_assets(&stored_id, &assets)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
-                    let path = uploads.store_visual(&stored_id, &script).map_err(|e| {
+                // Detached from this request: once files are stored, they
+                // are either acknowledged into the transcript or removed,
+                // even if the caller goes away meanwhile.
+                let (uploads, sessions) = (self.uploads.clone(), self.sessions.clone());
+                let (stored_id, chat_id, script) = (id.clone(), p.chat_id, p.script);
+                let event_title = title.clone();
+                let report = tokio::spawn(async move {
+                    let blocking_uploads = uploads.clone();
+                    let checked_id = stored_id.clone();
+                    let (path, report) = tokio::task::spawn_blocking(move || {
+                        let files = zeron_visual::Assets::new(
+                            assets
+                                .iter()
+                                .map(|(name, bytes)| (name.clone(), bytes.as_slice().into()))
+                                .collect(),
+                        );
+                        let checked = zeron_visual::check_with_assets(
+                            &script,
+                            zeron_visual::seed_for(&checked_id),
+                            files,
+                        );
+                        let report = checked.map_err(|e| {
+                            RpcError::BadParams(format!("visual script failed: {e}"))
+                        })?;
+                        // Assets first: a script is only ever found with its files.
+                        blocking_uploads
+                            .store_visual_assets(&checked_id, &assets)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        let path = blocking_uploads
+                            .store_visual(&checked_id, &script)
+                            .map_err(|e| {
+                                blocking_uploads.remove_visual(&checked_id);
+                                RpcError::Failed(e.to_string())
+                            })?;
+                        Ok::<_, RpcError>((path, report))
+                    })
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))??;
+                    let event = AgentEvent::Visual {
+                        id: stored_id.clone(),
+                        path,
+                        title: event_title,
+                    };
+                    if !sessions.publish_visual(&chat_id, &turn, event).await {
                         uploads.remove_visual(&stored_id);
-                        RpcError::Failed(e.to_string())
-                    })?;
-                    Ok::<_, RpcError>((path, report))
+                        return Err(RpcError::Failed(
+                            "The turn this visual was published from ended (or was stopped or \
+                             steered) before it could be shown; nothing was kept. Call \
+                             show_visual again from the current turn."
+                                .into(),
+                        ));
+                    }
+                    Ok(report)
                 })
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))??;
-                let event = AgentEvent::Visual {
-                    id: id.clone(),
-                    path: path.clone(),
-                    title: title.clone(),
-                };
-                if !self.sessions.inject_event(&p.chat_id, event) {
-                    self.uploads.remove_visual(&id);
-                    return Err(no_turn_for_visual());
-                }
                 RpcReply::value(&serde_json::json!({
                     "id": id,
                     "title": title,
