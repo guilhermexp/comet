@@ -1376,24 +1376,32 @@ impl UserData for Scene {
             Ok(())
         });
         // x/y/z axes from the origin, with optional names.
-        methods.add_method_mut("axes", |_, s, o: Option<Table>| {
+        methods.add_method_mut("axes", |lua, s, o: Option<Table>| {
             let size = match &o {
                 Some(o) => o.raw_get::<Option<f32>>("size")?.unwrap_or(1.0),
                 None => 1.0,
             };
-            let names: [String; 3] = match &o {
-                Some(o) => match o.raw_get::<Option<Table>>("labels")? {
-                    Some(t) => [
-                        t.raw_get::<Option<String>>(1)?.unwrap_or_default(),
-                        t.raw_get::<Option<String>>(2)?.unwrap_or_default(),
-                        t.raw_get::<Option<String>>(3)?.unwrap_or_default(),
-                    ],
-                    None => ["x".into(), "y".into(), "z".into()],
-                },
-                None => ["x".into(), "y".into(), "z".into()],
+            let labels = match &o {
+                Some(o) => o.raw_get::<Option<Table>>("labels")?,
+                None => None,
             };
-            for (axis, name) in names.into_iter().enumerate() {
+            for (axis, default) in ["x", "y", "z"].into_iter().enumerate() {
                 s.check_items()?;
+                let value = match &labels {
+                    Some(labels) => labels.raw_get::<Value>(axis + 1)?,
+                    None => Value::String(lua.create_string(default)?),
+                };
+                // Keep String's Lua number coercion, without first allocating
+                // an owned Rust String. Missing entries stay empty.
+                let value = match value {
+                    Value::Nil => Value::Nil,
+                    value => Value::String(
+                        lua.coerce_string(value)?
+                            .ok_or_else(|| lua_error("axes labels must be strings"))?,
+                    ),
+                };
+                let name = retained_text(&value, &mut s.text_bytes)
+                    .map_err(|e| lua_error(e.to_string()))?;
                 let mut end = [0.0; 3];
                 end[axis] = size;
                 s.lines.push(Line3 {

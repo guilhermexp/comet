@@ -6,7 +6,7 @@
 use mlua::{Table, UserData, UserDataFields, UserDataMethods, Value};
 
 use crate::VisualError;
-use crate::node::{parse_color, value_text};
+use crate::node::{parse_color, retained_text};
 use crate::style::{Align, Color, TextSize, Token, Weight};
 
 pub const MAX_COMMANDS: usize = 40_000;
@@ -61,6 +61,7 @@ pub struct Graphics {
     /// canvas take drags instead of scrolling past it.
     pub read_pointer: std::cell::Cell<bool>,
     points: usize,
+    text_bytes: usize,
 }
 
 impl Graphics {
@@ -73,6 +74,7 @@ impl Graphics {
             commands: Vec::new(),
             read_pointer: std::cell::Cell::new(false),
             points: 0,
+            text_bytes: 0,
         }
     }
 
@@ -364,7 +366,8 @@ impl UserData for Graphics {
                 let mut draw = DrawText {
                     x,
                     y,
-                    text: value_text(&text),
+                    text: retained_text(&text, &mut g.text_bytes)
+                        .map_err(|e| lua_error(e.to_string()))?,
                     size: TextSize::Sm,
                     weight: Weight::Regular,
                     color: Color::token(Token::Text),

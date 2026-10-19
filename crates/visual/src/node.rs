@@ -430,7 +430,9 @@ impl Parser {
             Value::String(s) => {
                 out.push(self.plain_text(self.budget.text(&Value::String(s), MAX_TEXT, true)?)?)
             }
-            Value::Integer(_) | Value::Number(_) => out.push(self.plain_text(number_text(&value))?),
+            Value::Integer(_) | Value::Number(_) => {
+                out.push(self.plain_text(self.budget.text(&value, MAX_TEXT, true)?)?)
+            }
             Value::Table(table) => {
                 if !matches!(table.raw_get::<Value>("__kind")?, Value::Nil) {
                     out.push(self.node(&table, depth)?);
@@ -724,9 +726,19 @@ impl Parser {
                 if options.is_empty() {
                     return Err(props.error("needs options = { ... }"));
                 }
-                let value = props
-                    .text_value("value")?
-                    .unwrap_or_else(|| options[0].clone());
+                let value = match props.text_value("value")? {
+                    Some(value) => value,
+                    None => {
+                        let mut value = String::new();
+                        props.budget.append_bytes(
+                            &mut value,
+                            options[0].as_bytes(),
+                            MAX_TEXT,
+                            false,
+                        )?;
+                        value
+                    }
+                };
                 NodeKind::Tabs {
                     options,
                     value,
@@ -771,10 +783,17 @@ impl Parser {
                 if !(url.starts_with("https://") || url.starts_with("http://")) {
                     return Err(props.error("url must be http(s)"));
                 }
-                NodeKind::Link {
-                    label: props.string("label")?.unwrap_or_else(|| url.clone()),
-                    url,
-                }
+                let label = match props.string("label")? {
+                    Some(label) => label,
+                    None => {
+                        let mut label = String::new();
+                        props
+                            .budget
+                            .append_bytes(&mut label, url.as_bytes(), MAX_TEXT, false)?;
+                        label
+                    }
+                };
+                NodeKind::Link { label, url }
             }
             "span" => {
                 return Err(VisualError::script(
