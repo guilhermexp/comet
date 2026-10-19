@@ -526,4 +526,4 @@ Subárvores sem doc próprio (ainda não têm regra local além da desta pasta):
 
 Visuals remain visible outside settled tool-activity folds, like generated images. Chat export records their title/path in Markdown, text and JSON without loading scripts or assets.
 
-Inline rename focus is armed only after its editor mounts, in the same deferred phase as shortcut focus recovery. Math regressions respect the fork's un-underlined web links and neutral inline-code chips, and copy assertions cover the shared selection group across chip fragments.
+Lane rename focus is armed after its editor mounts, in the deferred phase of shortcut focus recovery; sidebar rename retains its existing immediate-focus path. Math regressions respect the fork's un-underlined web links and neutral inline-code chips, and copy assertions cover the shared selection group across chip fragments.

@@ -74,3 +74,16 @@ Focused repair rounds retain exact commands/diff digests in
 `logs/focused-repairs-{1,2}.log`; the linearity set completed in 2.51 s in the
 passing focused run. Full final-revision runtime and native acceptance remain
 separate evidence gates.
+
+The second complete workspace run on `b1ceaa10` exposed three sidebar rename
+focus regressions and one intermittent Workers fixture. Keep immediate focus for
+an already mounted sidebar title; defer only Session-card lane editors until
+mount. The complete UI library then passes 2,554 tests (one inherited ignore).
+The unchanged Workers replay fixture failed 13/20 repetitions: 562/1,000 pairs
+of real filesystem writes shared the same full mtime in a separate probe. Replay
+correctly deduplicates that version. Give its four distinct synthetic writes
+explicit increasing mtimes, retaining every payload and assertion. The runtime
+prefix before `#[cfg(test)]` remains identical to baseline; 20/20 repetitions
+then pass. This is fixture determinism, not a production replay-policy change.
+See `logs/sidebar-seed-focused.log`, `worker-seed-baseline.log` and
+`worker-seed-mtime.log` for exact executable revisions and results.

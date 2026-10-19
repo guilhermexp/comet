@@ -7725,7 +7725,10 @@ impl Shell {
             return;
         };
         let focus = rename.input.focus_handle(cx);
-        if !rename.focus_pending || !self.shortcut_focus.contains(&focus, window) {
+        if !rename.focus_pending
+            || (rename.surface == ChatRenameSurface::SessionCard
+                && !self.shortcut_focus.contains(&focus, window))
+        {
             return;
         }
         rename.focus_pending = false;
@@ -15337,6 +15340,16 @@ impl Render for Shell {
                 }
                 _ => {}
             }
+        }
+
+        // Sidebar rows preserve their immediate in-place editor focus. The
+        // animated session lanes wait for mounting in the deferred phase.
+        if self
+            .chat_rename
+            .as_ref()
+            .is_some_and(|rename| rename.surface == ChatRenameSurface::Sidebar)
+        {
+            self.focus_rename_chat(window, cx);
         }
 
         self.render_time = Some(self.motion_time());
