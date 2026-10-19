@@ -289,3 +289,72 @@ fn numeric_children_and_canvas_text_share_retained_byte_limits() {
     check("return ui.canvas {height=200,draw=function(g) g:text(0,0,'ok\\nline'); g:text(0,10,42); g:text(0,20,true); g:text(0,30,nil) end}",1).unwrap();
     assert!(numeric && canvas);
 }
+
+/// A GLB placing one mesh `instances` times whose sparse accessors have no
+/// base view: `normals` logical NORMAL entries from a 16-byte binary chunk.
+fn sparse_normals_glb(normals: usize, instances: usize) -> Vec<u8> {
+    let sparse = |count: usize, shape: &str, bounds: &str| {
+        format!(
+            r#"{{"componentType":5126,"count":{count},"type":"{shape}"{bounds},"sparse":{{"count":1,"indices":{{"bufferView":0,"componentType":5125}},"values":{{"bufferView":1}}}}}}"#
+        )
+    };
+    let mut json = format!(
+        r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[{nodes}]}}],"nodes":[{{"mesh":0}}],"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"NORMAL":1}}}}]}}],"buffers":[{{"byteLength":16}}],"bufferViews":[{{"buffer":0,"byteLength":4}},{{"buffer":0,"byteOffset":4,"byteLength":12}}],"accessors":[{},{}]}}"#,
+        sparse(3, "VEC3", r#","min":[0,0,0],"max":[1,1,1]"#),
+        sparse(normals, "VEC3", ""),
+        nodes = vec!["0"; instances].join(",")
+    )
+    .into_bytes();
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    let total = 12 + 8 + json.len() + 8 + 16;
+    let mut glb = b"glTF".to_vec();
+    for n in [2, total, json.len()] {
+        glb.extend_from_slice(&(n as u32).to_le_bytes());
+    }
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(&16u32.to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&[0; 16]);
+    glb
+}
+
+#[test]
+fn sparse_model_expansion_is_admitted_before_native_collection() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let script = "return ui.scene {height=200, draw=function(s) s:model {asset='m.glb'} end}";
+    let publish = |normals: usize, instances: usize| {
+        let assets = zeron_visual::Assets::new(
+            [(
+                "m.glb".to_owned(),
+                sparse_normals_glb(normals, instances).into(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::Relaxed);
+        let result = zeron_visual::check_with_assets(script, 1, assets);
+        TRACK.store(false, Ordering::Relaxed);
+        (result, ALLOCATED.load(Ordering::Relaxed))
+    };
+    // A ~700-byte asset: 6M normals are 72 MB in one visit (> 64 MiB); 3M
+    // normals over 8 instances are 8 x 36 MB of decoding (> 256 MiB). Both
+    // were collected natively and accepted before.
+    let unbounded: Vec<String> = [(6_000_000, 1), (3_000_000, 8)]
+        .into_iter()
+        .filter_map(|(normals, instances)| {
+            let (result, allocated) = publish(normals, instances);
+            let refused = result
+                .as_ref()
+                .is_err_and(|e| e.message.contains("expanded accessor byte budget"));
+            (!refused || allocated >= 8 * 1024 * 1024).then(|| {
+                format!("{normals}x{instances}: {result:?}; native allocated {allocated} bytes")
+            })
+        })
+        .collect();
+    assert!(unbounded.is_empty(), "{}", unbounded.join("\n"));
+    publish(3, 8).0.unwrap();
+}

@@ -42,6 +42,14 @@ const MAX_TRIANGLES: usize = 400_000;
 const MAX_NODE_VISITS: usize = 100_000;
 const MAX_MODEL_ENTRIES: usize = 128;
 const MAX_IMPORTED_BYTES: usize = 16 * 1024 * 1024;
+/// Decoded attribute/index vectors one primitive visit holds at once: a
+/// model at the triangle limit with normals and UVs, without index sharing,
+/// needs about 48 MB.
+const MAX_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
+/// The same, summed over every primitive and instance visit (each re-reads
+/// its accessors): bounds the total decoding work while primitives that share
+/// one large vertex accessor stay usable.
+const MAX_EXPANDED_WORK: usize = 256 * 1024 * 1024;
 
 fn charge(total: &mut usize, bytes: usize, kind: &str) -> Result<(), String> {
     *total = total
@@ -144,6 +152,110 @@ fn transform_normal(m: &Mat4, n: [f32; 3]) -> V3 {
     ];
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-9);
     [v[0] / len, v[1] / len, v[2] / len]
+}
+
+/// Visit the scene's usable triangle primitives with their world matrix and
+/// whether their normals/texture coordinates have a readable shape.
+fn walk(
+    scene: &gltf::Scene,
+    identity: Mat4,
+    mut visit: impl FnMut(&gltf::mesh::Primitive, &Mat4, (bool, bool)) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut stack: Vec<(gltf::Node, Mat4)> = scene.nodes().map(|node| (node, identity)).collect();
+    let mut visits = 0;
+    while let Some((node, parent)) = stack.pop() {
+        visits += 1;
+        if visits > MAX_NODE_VISITS {
+            return Err("the model's node tree is too large (or loops)".into());
+        }
+        let world = multiply(&parent, &node.transform().matrix());
+        if let Some(mesh) = node.mesh() {
+            for primitive in mesh.primitives() {
+                if primitive.mode() != gltf::mesh::Mode::Triangles {
+                    continue;
+                }
+                // Only read attributes of the shape their meaning needs.
+                use gltf::accessor::{DataType, Dimensions};
+                use gltf::mesh::Semantic;
+                let shaped = |semantic: Semantic, dimensions: Dimensions, types: &[DataType]| {
+                    primitive.get(&semantic).is_some_and(|a| {
+                        a.dimensions() == dimensions && types.contains(&a.data_type())
+                    })
+                };
+                if !shaped(Semantic::Positions, Dimensions::Vec3, &[DataType::F32])
+                    || primitive.indices().is_some_and(|a| {
+                        a.dimensions() != Dimensions::Scalar
+                            || ![DataType::U8, DataType::U16, DataType::U32]
+                                .contains(&a.data_type())
+                    })
+                {
+                    continue;
+                }
+                let normals_ok = shaped(Semantic::Normals, Dimensions::Vec3, &[DataType::F32]);
+                let uvs_ok = shaped(
+                    Semantic::TexCoords(0),
+                    Dimensions::Vec2,
+                    &[DataType::F32, DataType::U8, DataType::U16],
+                );
+                visit(&primitive, &world, (normals_ok, uvs_ok))?;
+            }
+        }
+        for child in node.children() {
+            if stack.len() >= MAX_NODE_VISITS {
+                return Err("the model's node tree is too large (or loops)".into());
+            }
+            stack.push((child, world));
+        }
+    }
+    Ok(())
+}
+
+/// Charge the vectors `parse` collects for one primitive: positions, the
+/// readable normals/texture coordinates, and explicit or implicit indices.
+fn charge_expanded(
+    total: &mut usize,
+    primitive: &gltf::mesh::Primitive,
+    (normals_ok, uvs_ok): (bool, bool),
+) -> Result<(), String> {
+    use gltf::mesh::Semantic;
+    let exceeded = || "model expanded accessor byte budget exceeded".to_string();
+    let count = |semantic: Semantic| primitive.get(&semantic).map_or(0, |a| a.count());
+    let positions = count(Semantic::Positions);
+    let indices = primitive.indices().map_or(positions, |a| a.count());
+    let mut bytes = [
+        (positions, size_of::<V3>()),
+        (
+            if normals_ok {
+                count(Semantic::Normals)
+            } else {
+                0
+            },
+            size_of::<V3>(),
+        ),
+        (
+            if uvs_ok {
+                count(Semantic::TexCoords(0))
+            } else {
+                0
+            },
+            size_of::<[f32; 2]>(),
+        ),
+        (indices, size_of::<usize>()),
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, (n, size)| {
+        n.checked_mul(size).and_then(|b| sum.checked_add(b))
+    })
+    .ok_or_else(exceeded)?;
+    if bytes > MAX_EXPANDED_BYTES {
+        return Err(exceeded());
+    }
+    bytes = total.checked_add(bytes).ok_or_else(exceeded)?;
+    if bytes > MAX_EXPANDED_WORK {
+        return Err(exceeded());
+    }
+    *total = bytes;
+    Ok(())
 }
 
 impl Model {
@@ -275,97 +387,63 @@ impl Model {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        let mut stack: Vec<(gltf::Node, Mat4)> =
-            scene.nodes().map(|node| (node, identity)).collect();
-        let mut visits = 0;
-        while let Some((node, parent)) = stack.pop() {
-            visits += 1;
-            if visits > MAX_NODE_VISITS {
-                return Err("the model's node tree is too large (or loops)".into());
-            }
-            let world = multiply(&parent, &node.transform().matrix());
-            if let Some(mesh) = node.mesh() {
-                for primitive in mesh.primitives() {
-                    if primitive.mode() != gltf::mesh::Mode::Triangles {
+        // Admit every collected attribute/index vector, cumulatively over all
+        // primitives and instances, before reading any: a sparse accessor
+        // without a base view expands a tiny file to `count` elements.
+        let mut expanded = 0;
+        walk(&scene, identity, |primitive, _, shape| {
+            charge_expanded(&mut expanded, primitive, shape)
+        })?;
+        walk(
+            &scene,
+            identity,
+            |primitive, world, (normals_ok, uvs_ok)| {
+                let reader = primitive.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+                let Some(positions) = reader.read_positions() else {
+                    return Ok(());
+                };
+                let positions: Vec<V3> = positions.map(|p| transform_point(world, p)).collect();
+                // Attributes must cover every vertex; a short one is dropped.
+                let normals: Option<Vec<V3>> = normals_ok
+                    .then(|| reader.read_normals())
+                    .flatten()
+                    .map(|n| n.map(|n| transform_normal(world, n)).collect::<Vec<_>>())
+                    .filter(|n| n.len() >= positions.len());
+                let uvs: Option<Vec<[f32; 2]>> = uvs_ok
+                    .then(|| reader.read_tex_coords(0))
+                    .flatten()
+                    .map(|t| t.into_f32().collect::<Vec<_>>())
+                    .filter(|t| t.len() >= positions.len());
+                let indices: Vec<usize> = match reader.read_indices() {
+                    Some(indices) => indices.into_u32().map(|i| i as usize).collect(),
+                    None => (0..positions.len()).collect(),
+                };
+                let material = primitive.material().index().unwrap_or(default_material);
+                for tri in indices.chunks_exact(3) {
+                    if tri.iter().any(|&i| i >= positions.len()) {
                         continue;
                     }
-                    // Only read attributes of the shape their meaning needs.
-                    use gltf::accessor::{DataType, Dimensions};
-                    use gltf::mesh::Semantic;
-                    let shaped =
-                        |semantic: Semantic, dimensions: Dimensions, types: &[DataType]| {
-                            primitive.get(&semantic).is_some_and(|a| {
-                                a.dimensions() == dimensions && types.contains(&a.data_type())
-                            })
-                        };
-                    if !shaped(Semantic::Positions, Dimensions::Vec3, &[DataType::F32])
-                        || primitive.indices().is_some_and(|a| {
-                            a.dimensions() != Dimensions::Scalar
-                                || ![DataType::U8, DataType::U16, DataType::U32]
-                                    .contains(&a.data_type())
-                        })
-                    {
-                        continue;
+                    if model.triangles.len() >= MAX_TRIANGLES {
+                        return Err(format!("the model has over {MAX_TRIANGLES} triangles"));
                     }
-                    let normals_ok = shaped(Semantic::Normals, Dimensions::Vec3, &[DataType::F32]);
-                    let uvs_ok = shaped(
-                        Semantic::TexCoords(0),
-                        Dimensions::Vec2,
-                        &[DataType::F32, DataType::U8, DataType::U16],
-                    );
-                    let reader = primitive.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
-                    let Some(positions) = reader.read_positions() else {
-                        continue;
-                    };
-                    let positions: Vec<V3> =
-                        positions.map(|p| transform_point(&world, p)).collect();
-                    // Attributes must cover every vertex; a short one is dropped.
-                    let normals: Option<Vec<V3>> = normals_ok
-                        .then(|| reader.read_normals())
-                        .flatten()
-                        .map(|n| n.map(|n| transform_normal(&world, n)).collect::<Vec<_>>())
-                        .filter(|n| n.len() >= positions.len());
-                    let uvs: Option<Vec<[f32; 2]>> = uvs_ok
-                        .then(|| reader.read_tex_coords(0))
-                        .flatten()
-                        .map(|t| t.into_f32().collect::<Vec<_>>())
-                        .filter(|t| t.len() >= positions.len());
-                    let indices: Vec<usize> = match reader.read_indices() {
-                        Some(indices) => indices.into_u32().map(|i| i as usize).collect(),
-                        None => (0..positions.len()).collect(),
-                    };
-                    let material = primitive.material().index().unwrap_or(default_material);
-                    for tri in indices.chunks_exact(3) {
-                        if tri.iter().any(|&i| i >= positions.len()) {
-                            continue;
+                    let pick = |list: &[V3]| [list[tri[0]], list[tri[1]], list[tri[2]]];
+                    let p = pick(&positions);
+                    for v in &p {
+                        for (axis, value) in v.iter().enumerate() {
+                            model.bounds.0[axis] = model.bounds.0[axis].min(*value);
+                            model.bounds.1[axis] = model.bounds.1[axis].max(*value);
                         }
-                        if model.triangles.len() >= MAX_TRIANGLES {
-                            return Err(format!("the model has over {MAX_TRIANGLES} triangles"));
-                        }
-                        let pick = |list: &[V3]| [list[tri[0]], list[tri[1]], list[tri[2]]];
-                        let p = pick(&positions);
-                        for v in &p {
-                            for (axis, value) in v.iter().enumerate() {
-                                model.bounds.0[axis] = model.bounds.0[axis].min(*value);
-                                model.bounds.1[axis] = model.bounds.1[axis].max(*value);
-                            }
-                        }
-                        model.triangles.push(Triangle {
-                            positions: p,
-                            normals: normals.as_deref().map(pick),
-                            uvs: uvs.as_ref().map(|uv| [uv[tri[0]], uv[tri[1]], uv[tri[2]]]),
-                            material,
-                        });
                     }
+                    model.triangles.push(Triangle {
+                        positions: p,
+                        normals: normals.as_deref().map(pick),
+                        uvs: uvs.as_ref().map(|uv| [uv[tri[0]], uv[tri[1]], uv[tri[2]]]),
+                        material,
+                    });
                 }
-            }
-            for child in node.children() {
-                if stack.len() >= MAX_NODE_VISITS {
-                    return Err("the model's node tree is too large (or loops)".into());
-                }
-                stack.push((child, world));
-            }
-        }
+                Ok(())
+            },
+        )?;
         if model.triangles.is_empty() {
             return Err("the model has no triangle meshes".into());
         }
@@ -451,6 +529,106 @@ pub(crate) mod tests {
             "images":[{images}]"#
             ),
         )
+    }
+
+    // Tiny sparse GLB: no base bufferViews, one sparse item, large logical counts.
+    // Each rejected case expands to 72 MB in one visit (> 64 MiB) or 280 MB
+    // over seven 40 MB visits (> 256 MiB); the unfixed path stops at the
+    // triangle limit after the first. Run under the bounded subprocess limits.
+    fn sparse_work(
+        positions: usize,
+        extra: Option<(&str, usize)>,
+        primitives: usize,
+        instances: usize,
+    ) -> Vec<u8> {
+        let sparse = |count, shape: &str, component| {
+            format!(
+                r#"{{"componentType":{component},"count":{count},"type":"{shape}","min":[0,0,0],"max":[1,1,1],"sparse":{{"count":1,"indices":{{"bufferView":0,"componentType":5125}},"values":{{"bufferView":1}}}}}}"#
+            )
+        };
+        let mut accessors = vec![sparse(positions, "VEC3", 5126)];
+        let mut attrs = r#""POSITION":0"#.to_string();
+        let mut indices = String::new();
+        if let Some((kind, count)) = extra {
+            let shape = match kind {
+                "NORMAL" => "VEC3",
+                "TEXCOORD_0" => "VEC2",
+                _ => "SCALAR",
+            };
+            // min/max apply only to positions (shape-appropriate validation).
+            accessors.push(
+                sparse(count, shape, if kind == "indices" { 5125 } else { 5126 })
+                    .replace(r#","min":[0,0,0],"max":[1,1,1]"#, ""),
+            );
+            if kind == "indices" {
+                indices = r#","indices":1"#.into();
+            } else {
+                attrs += &format!(r#","{kind}":1"#);
+            }
+        }
+        let primitive = format!(r#"{{"attributes":{{{attrs}}}{indices}}}"#);
+        let json = format!(
+            r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[{nodes}]}}],"nodes":[{{"mesh":0}}],"meshes":[{{"primitives":[{prims}]}}],"buffers":[{{"byteLength":16}}],"bufferViews":[{{"buffer":0,"byteLength":4}},{{"buffer":0,"byteOffset":4,"byteLength":12}}],"accessors":[{accessors}]}}"#,
+            nodes = vec!["0"; instances].join(","),
+            prims = vec![primitive; primitives].join(","),
+            accessors = accessors.join(",")
+        );
+        glb(&json, &[0; 16])
+    }
+
+    fn expanded_rejected(
+        positions: usize,
+        extra: Option<(&str, usize)>,
+        primitives: usize,
+        instances: usize,
+    ) {
+        let error =
+            Model::parse(&sparse_work(positions, extra, primitives, instances)).unwrap_err();
+        assert!(
+            error.contains("expanded accessor byte budget"),
+            "{positions} {extra:?} {primitives}/{instances}: {error}"
+        );
+    }
+    #[test]
+    fn sparse_expanded_positions_and_implicit_indices() {
+        expanded_rejected(4_000_000, None, 1, 1);
+    }
+    #[test]
+    fn sparse_expanded_normals() {
+        expanded_rejected(3, Some(("NORMAL", 6_000_000)), 1, 1);
+    }
+    #[test]
+    fn sparse_expanded_uvs() {
+        expanded_rejected(3, Some(("TEXCOORD_0", 9_000_000)), 1, 1);
+    }
+    #[test]
+    fn sparse_expanded_indices() {
+        expanded_rejected(3, Some(("indices", 9_000_000)), 1, 1);
+    }
+    // 2M positions + implicit indices are 40 MB, admitted alone; seven
+    // repeats over primitives or instances cross the 256 MiB work budget.
+    #[test]
+    fn sparse_expanded_primitives() {
+        expanded_rejected(2_000_000, None, 7, 1);
+    }
+    #[test]
+    fn sparse_expanded_instances() {
+        expanded_rejected(2_000_000, None, 1, 7);
+    }
+
+    #[test]
+    fn primitives_sharing_a_large_vertex_accessor_stay_usable() {
+        // 20 primitives x 3.6 MB of shared positions: past the per-visit
+        // budget in sum only, well within the work budget.
+        let model = Model::parse(&sparse_work(300_000, Some(("indices", 3)), 20, 1)).unwrap();
+        assert_eq!(model.triangles.len(), 20);
+    }
+
+    #[test]
+    fn sparse_normal_models_remain_usable() {
+        let model = Model::parse(&sparse_work(3, Some(("NORMAL", 3)), 2, 2)).unwrap();
+        assert_eq!(model.triangles.len(), 4);
+        assert!(model.triangles.iter().all(|t| t.normals.is_some()));
     }
 
     #[test]
