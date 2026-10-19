@@ -828,7 +828,7 @@ async fn run_session(
     let mut in_flight_steers: Vec<(String, Option<String>)> = Vec::new();
     let mut delivering: HashSet<String> = HashSet::new();
     let mut pending_wait_for_status: HashSet<String> = HashSet::new();
-    let mut interrupted_by_worker_notification: HashSet<String> = HashSet::new();
+    let mut interrupted_waits: HashMap<String, bool> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
     let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
     let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
@@ -949,14 +949,15 @@ async fn run_session(
                                 steer_failed_tx.clone(),
                             );
                         } else {
-                            if prompt.starts_with("[worker-task-notification]")
-                                && !pending_wait_for_status.is_empty()
-                            {
-                                for tool_id in &pending_wait_for_status {
-                                    interrupted_by_worker_notification.insert(tool_id.clone());
-                                    if let Some(workers) = workers.as_ref() {
-                                        workers.cancel_call(tool_id);
-                                    }
+                            let is_worker_notice = prompt.starts_with("[worker-task-notification]");
+                            for tool_id in &pending_wait_for_status {
+                                if let Some(notice) = interrupted_waits.get_mut(tool_id) {
+                                    *notice |= is_worker_notice;
+                                } else {
+                                    interrupted_waits.insert(tool_id.clone(), is_worker_notice);
+                                }
+                                if let Some(workers) = workers.as_ref() {
+                                    workers.cancel_call(tool_id);
                                 }
                             }
                             queued_steers.push_back(steer);
@@ -975,8 +976,7 @@ async fn run_session(
             }
             Some((tool_id, outcome)) = tool_rx.recv() => {
                 pending_wait_for_status.remove(&tool_id);
-                let was_interrupted_by_notice =
-                    interrupted_by_worker_notification.remove(&tool_id);
+                let interrupted_wait = interrupted_waits.remove(&tool_id);
                 if answered.contains(&tool_id) {
                     delivering.remove(&tool_id);
                     if delivering.is_empty() {
@@ -1003,16 +1003,21 @@ async fn run_session(
                 answered.insert(tool_id.clone());
                 let result = match outcome {
                     Some(real_result) => real_result,
-                    None if was_interrupted_by_notice => json!({
+                    None if interrupted_wait.is_some() => json!({
                         "type": "host_tool_result",
                         "id": tool_id,
                         "result": {
                             "content": [{
                                 "type": "text",
-                                "text": "wait_for_status was interrupted by a worker notification"
+                                "text": if interrupted_wait == Some(true) {
+                                    "wait_for_status was interrupted by a worker notification"
+                                } else {
+                                    "wait_for_status was interrupted by an incoming message; the Worker was not stopped"
+                                }
                             }],
                             "interrupted": true,
-                            "interrupted_by_notification": true
+                            "interrupted_by_message": true,
+                            "interrupted_by_notification": interrupted_wait == Some(true)
                         },
                         "isError": false
                     }),

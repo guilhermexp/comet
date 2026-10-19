@@ -35,9 +35,11 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes executáveis da extensão lifecycle pi-family do Unpeel vendorizado.
 
-Para baterias pesadas, prefira o CI existente e confira revisão, plataforma, jobs e etapas realmente executados conforme a skill `implement` do harness. Considere também a compilação: mesmo um filtro de `cargo test -p zeron-ui` pode criar gigabytes de dependências. Checks locais baratos e validação nativa específica continuam úteis; quando Cargo local for necessário, use a proteção abaixo. No `no-mistakes`, `test` é validação focada da mudança/uso real; a regressão ampla fica no CI. Não repetir a bateria local apenas para espelhar CI nem dispensar etapas genericamente.
+Para baterias pesadas, prefira o CI existente e confira revisão, plataforma, jobs e etapas realmente executados conforme a skill `implement` do harness. Considere também a compilação: mesmo um filtro de `cargo test -p zeron-ui` pode criar gigabytes de dependências. Checks locais baratos e validação nativa específica continuam úteis; quando Cargo local for necessário, use a proteção abaixo. Reaproveite provas válidas da revisão avaliada e não repita a bateria local apenas para espelhar CI. `no-mistakes` não é etapa automática de desenvolvimento ou publicação neste projeto; só executar por pedido explícito do usuário.
 
-Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml` contém jobs Linux, macOS e iOS; `preview-tests.yml` testa networking em Linux/macOS e coordinator em Linux. Os filtros de UI/native/iOS incluem `visual`, `visual-gpu` e `zatex`; o core nextest inclui suas suites unitárias. Isso descreve a receita, não garante sucesso: confira os logs da revisão avaliada. O job nativo macOS tem orçamento de 90 minutos para compilações release frias e fixtures; os limites curtos de execução das regressões continuam separados. Linux não cobre o teste AppKit `native_preview_focus`, que requer sessão gráfica macOS, nem substitui outros caminhos macOS/iOS exigidos pela entrega.
+Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux quando mudam inputs Rust, incluindo `edge/src/install.sh`, consumido pelos testes do binário (não por alterações isoladas em `apps/ios/`, `scripts/ios/` ou outros arquivos de `edge/`); `ui-tests.yml` seleciona jobs Linux, macOS e iOS por arquivos e dependências Cargo transitivas em PRs e pushes na `main`. O networking Linux de preview está no `core-tests` de UI; `preview-tests.yml` cobre networking macOS e coordinator Linux. Os filtros de UI/native/iOS incluem `visual`, `visual-gpu` e `zatex`; o core nextest inclui suas suites unitárias. Isso descreve a receita, não garante sucesso: confira os jobs e etapas realmente executados na revisão avaliada. O job nativo macOS mantém orçamento de 90 minutos, mas seleciona separadamente app check, geometria, notificações, anexos, browser, preview e GPUI. Código compartilhado preserva cobertura nativa completa. Linux não cobre `native_preview_focus` (AppKit com sessão gráfica macOS).
+
+CI de testes cancela PRs e pushes ultrapassados na mesma ref. Para não perder alterações de runs cancelados, UI compara pushes com um ancestral aprovado pelo próprio workflow; sem base confiável, roda tudo. `release-profile-tests.yml` mantém consulta diária, mas só reaproveita o mesmo SHA quando os dois grupos realmente passaram há menos de sete dias; falha, cancelamento, mudança de SHA, prazo semanal ou disparo manual executam a suíte. Detalhes e testes baratos dos seletores: [`scripts/AGENTS.md`](scripts/AGENTS.md). Publicação por tag (`release.yml`) e deploy do Worker (`deploy.yml`) são independentes desses filtros.
 
 ## Remotes e publicação
 
@@ -45,7 +47,7 @@ Cobertura remota: `rust.yml` executa workspace + Unpeel no Linux; `ui-tests.yml`
 - **Nunca pushar para o upstream.** Qualquer push vai pro fork.
 - `gh` resolve pro upstream por default: **sempre passar `-R guilhermexp/comet`** em `gh run list`, `gh release view`, etc.
 - `.github/workflows/deploy.yml` é herdado do upstream: publica o Worker Cloudflare em push na `main` que toque `edge/`. `release.yml` é do fork e só Mac: tag `v<versão do Cargo.toml>` publica dmg + tarball do app + `manifest.json` numa GitHub Release, e o app instalado se atualiza dela (`crates/update`, `COMET_RELEASES_URL`). Versão própria a partir de `1.0.0`; em merge do upstream, manter a nossa.
-- Publicação local segue a decisão de 2026-10-02 em `CLAUDE.md`: mudança pequena/localizada pode ir direto para `main` por `git push origin HEAD:main`; `no-mistakes` fica para mudanças grandes ou pedido explícito. Status do gate sempre no checkout principal, nunca em worktree.
+- **Publicação direta e validação proporcional** (decisão do dono, 2026-10-19): após os checks focados necessários, commit e `git push origin HEAD:main`. **Não iniciar `no-mistakes` automaticamente**, mesmo em mudanças grandes, de wire ou múltiplos subsistemas. Só executar quando o usuário pedir explicitamente esse gate. Não acrescentar rodadas de revisão ou repetir provas já válidas apenas como ritual de publicação.
 - **Sync do upstream:** [sync-fork.yml](.github/workflows/sync-fork.yml) roda só por disparo manual (sem cron desde 2026-10-15). Política autorizada: sync direto se limpo; PR draft de diagnóstico se conflitar; PR aberta pausa novos syncs. Resolução por agente na `agents-us` é sob demanda, nunca automática. Credencial, limites, prova remota e procedimento da box ficam em [`docs/upstream-sync.md`](docs/upstream-sync.md#automação-recorrente).
 
 ## Gotchas duráveis
@@ -129,44 +131,44 @@ Suítes canônicas por superfície (detalhe e matriz `Test:` ficam no `AGENTS.md
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |
 | Código externo | [`third_party/AGENTS.md`](third_party/AGENTS.md) | Unpeel e zui vendorizados, patches Rust licenciados, proveniência e referências locais |
 
-<!-- graft:start -->
-## Graft — repo context graph
+<!-- trail:start -->
+## Trail — repo context graph
 
-This repo is indexed in `graft/`: small linked markdown nodes that explain each
+This repo is indexed in `.trail/cache/`: small linked markdown nodes that explain each
 system and carry exact file:line spans, kept in sync with the code through git.
 
 For ANY task here — understanding how something works, finding where code lives,
 or scoping a change — get context from the graph before grepping or opening
 source files. Re-ask freely (it's cheap) and reuse literal identifiers you
 already have (symbol, error string, file name) as the query. New to this repo?
-Run `graft map` first — a token-budgeted orientation (dir clusters, hubs,
+Run `trail map` first — a token-budgeted orientation (dir clusters, hubs,
 hotspots), no LLM, no key.
 
-- Run `graft ask "<your question>" --source` → ranked nodes with the relevant
+- Run `trail ask "<your question>" --source` → ranked nodes with the relevant
   code spans inlined (each hit's ≤8-line crux by default; `--full` for whole
   definitions when the crux isn't enough). Match the tool to the task shape:
   for understanding or editing, the top node IS the answer — cite its
   `covers:` file:line spans and edit straight from `--source`. For
   exhaustive tasks ("every occurrence / every caller of this pattern"), ranked
-  results are top-N, not complete — run `graft grep "<literal>"` instead
+  results are top-N, not complete — run `trail grep "<literal>"` instead
   (exhaustive over indexed files, grouped by enclosing symbol), falling back
   to raw `grep -rn` only for unindexed files.
-- `graft skeleton <file>` → every definition's signature + span, ~10× cheaper
+- `trail skeleton <file>` → every definition's signature + span, ~10× cheaper
   than reading the file; use it to skim an API surface.
-- `graft callers <symbol>` gives precomputed, exact edges — who calls this.
+- `trail callers <symbol>` gives precomputed, exact edges — who calls this.
   Add `--direction out` for what it calls, or `--depth N` to walk
   transitively for the full blast radius. For structural questions, skip
   ranking and use this directly.
-- Or browse: `graft/INDEX.md` lists every node; follow the links.
+- Or browse: `.trail/cache/INDEX.md` lists every node; follow the links.
 - Monorepos and folders of multiple repos rank fairly across sub-projects —
   hits carry `[scope/]` labels naming which one they're from. Narrow with
-  `graft ask "<task>" --in <scope>/` once you know where you're working.
+  `trail ask "<task>" --in <scope>/` once you know where you're working.
 
 If a returned span is truncated ("+N more lines"), open the file at that exact
 range before finalizing. Only open source files when a node genuinely lacks a
 needed detail, and then at the exact file:line the node points to — never
 re-read whole files.
 
-After big code changes, refresh the graph with `graft build` (deterministic,
+After big code changes, refresh the graph with `trail build` (deterministic,
 no API key, $0).
-<!-- graft:end -->
+<!-- trail:end -->

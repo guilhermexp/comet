@@ -175,6 +175,34 @@ impl GenerateChatRecapReply {
     }
 }
 
+/// Request parameters for `WorkerWaitState`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerWaitStateParams {
+    pub chat_id: String,
+}
+
+impl WorkerWaitStateParams {
+    pub fn new(chat_id: impl Into<String>) -> Self {
+        Self {
+            chat_id: chat_id.into(),
+        }
+    }
+}
+
+/// Reply for `WorkerWaitState`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerWaitStateReply {
+    pub pending_message: bool,
+}
+
+impl WorkerWaitStateReply {
+    pub fn new(pending_message: bool) -> Self {
+        Self { pending_message }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +531,6 @@ mod tests {
         assert!(methods::is_local_only(methods::STOP_ENGINE));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));
         assert!(!methods::is_local_only(methods::FETCH_TOOL_INPUT));
+        assert!(methods::is_local_only(methods::WORKER_WAIT_STATE));
     }
 }

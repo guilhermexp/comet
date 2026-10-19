@@ -410,7 +410,7 @@ while IFS= read -r line; do
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"wait-pending"}}'
         read -r host_result
         if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-wait"'; then
-          if has "$host_result" 'interrupted by a worker notification'; then
+          if has "$host_result" '"interrupted":true' && has "$host_result" '"isError":false'; then
             emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"wait-interrupted-delivered"}}'
           else
             fail_stage wait_not_interrupted 40
@@ -419,9 +419,15 @@ while IFS= read -r line; do
           fail_stage host_wait 31
         fi
         read -r steer
-        if has "$steer" '"type":"steer"' && has "$steer" '[worker-task-notification]'; then
+        if has "$steer" '"type":"steer"'; then
           emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"notice-steer-received"}}'
-          emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"[worker-task-notification] Worker \"worker-1\" -> completed."}]}}'
+          if has "$steer" '[worker-task-notification]'; then
+            emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"[worker-task-notification] Worker \"worker-1\" -> completed."}]}}'
+          elif has "$steer" 'Please check the CRM column background too.'; then
+            emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"Please check the CRM column background too."}]}}'
+          else
+            fail_stage unknown_steer 33
+          fi
           respond "$steer" '{}'
           emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after notice steer"}}'
           emit '{"type":"agent_end","messages":[]}'

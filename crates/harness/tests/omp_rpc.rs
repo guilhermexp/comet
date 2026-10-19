@@ -1870,6 +1870,18 @@ async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
 
 #[tokio::test]
 async fn worker_notification_during_pending_wait_for_status_is_delivered_promptly() {
+    assert_message_interrupts_pending_wait(
+        "[worker-task-notification] Worker \"worker-1\" -> completed.",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn user_message_during_pending_wait_for_status_is_delivered_promptly() {
+    assert_message_interrupts_pending_wait("Please check the CRM column background too.").await;
+}
+
+async fn assert_message_interrupts_pending_wait(prompt: &str) {
     let env = fake_env("workers-notification-interrupts-wait");
 
     let harness = OmpHarness::new()
@@ -1898,7 +1910,7 @@ async fn worker_notification_during_pending_wait_for_status_is_delivered_promptl
         if pending {
             steer
                 .send(SteerMessage {
-                    prompt: "[worker-task-notification] Worker \"worker-1\" -> completed.".into(),
+                    prompt: prompt.into(),
                     message_id: Some("m-notice".into()),
                     attachments: Vec::new(),
                     config: None,
@@ -1912,11 +1924,11 @@ async fn worker_notification_during_pending_wait_for_status_is_delivered_promptl
     events.extend(
         tokio::time::timeout(Duration::from_secs(5), collect_until_done(&mut stream))
             .await
-            .expect("pending wait should be interrupted and notice delivered promptly"),
+            .expect("pending wait should release and the message should be consumed promptly"),
     );
     assert!(
         started.elapsed() < Duration::from_secs(4),
-        "worker notification must end the wait promptly, took {:?}",
+        "an incoming message must end the wait promptly, took {:?}",
         started.elapsed()
     );
 

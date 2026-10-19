@@ -9,7 +9,7 @@ permissions:
   contents: read
 concurrency:
   group: preview-tests-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 jobs:
   # The Linux leg runs in the `core-tests` job of ui-tests.yml (same tests, one
   # shared build with the rest of the Rust tests).

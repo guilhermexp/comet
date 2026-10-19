@@ -633,6 +633,14 @@ impl SessionsEngine {
             .is_some_and(|h| h.turn.background_live())
     }
 
+    /// Whether the chat has accepted, unconsumed steers in its live run ledger.
+    pub fn has_pending_steers(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .filter(|h| !h.retiring.load(std::sync::atomic::Ordering::Acquire))
+            .is_some_and(|h| !lock(&h.routed_steers).is_empty())
+    }
+
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {

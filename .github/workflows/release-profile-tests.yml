@@ -1,9 +1,10 @@
 name: Release-profile tests
 
-# Pull-request and main CI test the dev profile (fast rebuilds). This runs the
-# same Linux suites once a day against the optimized release profile that
-# ships, so optimization-only failures still surface. It does not save a Rust
-# cache, so it cannot evict the main-seeded caches pull requests depend on.
+# Pull-request and main CI test the dev profile (fast rebuilds). This workflow
+# checks once a day against the optimized release profile that ships, skipping
+# execution when the exact commit passed within the last 7 days, and always
+# running weekly, on code changes, after failures/cancellations, or on manual dispatch.
+# It does not save a Rust cache, so it cannot evict main-seeded caches.
 
 on:
   schedule:
@@ -12,13 +13,38 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: release-profile-tests
+  group: release-profile-tests-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'scheduled' }}
   cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Check if release profile run is needed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit test gate logic
+        run: node --test scripts/ci/release-profile-gate.test.cjs
+      - name: Evaluate release profile gate
+        id: gate
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { evaluateGate } = require('./scripts/ci/release-profile-gate.cjs');
+            const result = await evaluateGate({ github, context, core });
+            core.setOutput('should_run', String(result.should_run));
+            core.setOutput('reason', result.reason);
+            core.info(`Release profile gate decision: should_run=${result.should_run} (${result.reason})`);
+
   core-tests:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -30,6 +56,8 @@ jobs:
         run: scripts/ci/test-core.sh --release
 
   ui-tests:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

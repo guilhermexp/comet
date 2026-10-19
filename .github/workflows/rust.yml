@@ -1,9 +1,8 @@
 name: rust
 
-# The Rust suite had no CI at all: deploy.yml only covers edge/ (npm), and
-# release.yml only builds binaries on tag. This job runs `cargo test
-# --workspace` on every push/PR to main so the suite stops depending on
-# whoever remembers to run it locally.
+# The complete Rust workspace and vendored unpeel suite run when Rust inputs
+# change. Native iOS-only and edge-only changes have their own workflows,
+# except the installer consumed by the Rust app tests.
 #
 # Runner: ubuntu-24.04. A execução 36260843927 comprovou fmt, workspace
 # e unpeel-core na revisão d14c8d0a89d861fe907c5dc1b58b508f4e2e6b5f.
@@ -14,10 +13,34 @@ name: rust
 on:
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**", "openspec/**"]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'crates/**'
+      - 'apps/zeron/**'
+      - 'third_party/**'
+      - 'scripts/**'
+      - '!scripts/ios/**'
+      - 'dist/**'
+      - 'edge/src/install.sh'
+      - '.github/workflows/rust.yml'
   pull_request:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**", "openspec/**"]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'crates/**'
+      - 'apps/zeron/**'
+      - 'third_party/**'
+      - 'scripts/**'
+      - '!scripts/ios/**'
+      - 'dist/**'
+      - 'edge/src/install.sh'
+      - '.github/workflows/rust.yml'
   workflow_dispatch:
 
 concurrency:

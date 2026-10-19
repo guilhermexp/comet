@@ -214,6 +214,8 @@ pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
 pub const WAIT_TIMED_OUT_NEXT: &str = "Worker still running. Either call wait_for_status again with a timeout_seconds sized to the remaining work (up to limits.wait_seconds), or end your turn: a [worker-task-notification] arrives in this chat when the worker finishes. Do not poll with short waits.";
 pub const WAIT_INTERRUPTED_NEXT: &str = "The worker's turn was interrupted (Escape) before it finished, so the task is not completed and no completion notification will come for it. Read its transcript to see where it stopped, then send_text to continue or redirect it.";
 pub const WAIT_BLOCKED_NEEDS_INPUT_NEXT: &str = "Worker is blocked waiting for input. Read the worker output and respond in that session. This is not completion, nothing was approved, and the episode is still open.";
+const WAIT_INCOMING_MESSAGE_REASON: &str = "incoming_message";
+const WAIT_INCOMING_MESSAGE_NEXT: &str = "Only the wait ended for an incoming message; the Worker was not stopped and its state was not changed.";
 
 /// Closed set of status strings accepted by `wait_for_status`.
 pub const ACCEPTED_WAIT_STATUSES: &[&str] = &[
@@ -1127,7 +1129,7 @@ fn dispatch_action(
                 .map_err(|error| error.to_string())?;
             Ok(json!({ "session_id": session.id, "sent": true, "key_count": keys.len() }))
         }
-        "wait_for_status" => wait_for_status(client, arguments, cancel),
+        "wait_for_status" => wait_for_status(client, arguments, parent_chat_id, cancel),
         "stop_worker" => {
             let session = find_session(client, arguments)?;
             client
@@ -1917,9 +1919,217 @@ fn validate_git_checkout(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+struct ParentMessageProbe {
+    endpoint: String,
+    chat_id: String,
+    worker_tx: Option<std::sync::mpsc::SyncSender<ProbeCommand>>,
+    worker_rx: Option<std::sync::mpsc::Receiver<Result<bool, String>>>,
+    shutdown: Arc<AtomicBool>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+enum ProbeCommand {
+    Check,
+    Shutdown,
+}
+
+impl ParentMessageProbe {
+    fn new(endpoint: String, chat_id: String) -> Self {
+        Self {
+            endpoint,
+            chat_id,
+            worker_tx: None,
+            worker_rx: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            worker_handle: None,
+        }
+    }
+
+    fn ensure_started(&mut self) -> Result<(), String> {
+        if self.worker_tx.is_none() {
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<ProbeCommand>(1);
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<Result<bool, String>>(1);
+            let endpoint = self.endpoint.clone();
+            let chat_id = self.chat_id.clone();
+            let shutdown = Arc::clone(&self.shutdown);
+            let handle = std::thread::Builder::new()
+                .name("workers-wait-engine-probe".into())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(err) => {
+                            while let Ok(cmd) = cmd_rx.recv() {
+                                if let ProbeCommand::Check = cmd {
+                                    let _ = reply_tx.send(Err(format!(
+                                        "failed to build runtime for engine probe: {err}"
+                                    )));
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    runtime.block_on(async move {
+                        let mut client: Option<zeron_rpc::RpcClient> = None;
+                        let url = if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+                            endpoint.clone()
+                        } else {
+                            format!("ws://{endpoint}")
+                        };
+                        while let Ok(cmd) = cmd_rx.recv() {
+                            match cmd {
+                                ProbeCommand::Shutdown => break,
+                                ProbeCommand::Check => {
+                                    if shutdown.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    let stop_signal = async {
+                                        loop {
+                                            tokio::time::sleep(Duration::from_millis(25)).await;
+                                            if shutdown.load(Ordering::SeqCst) {
+                                                return;
+                                            }
+                                        }
+                                    };
+                                    tokio::pin!(stop_signal);
+
+                                    if client.is_none() {
+                                        let dial = tokio::time::timeout(
+                                            Duration::from_millis(250),
+                                            zeron_rpc::connect_ws(&url),
+                                        );
+                                        tokio::select! {
+                                            _ = &mut stop_signal => {
+                                                break;
+                                            }
+                                            dial_res = dial => match dial_res {
+                                                Ok(Ok(c)) => client = Some(c),
+                                                Ok(Err(err)) => {
+                                                    let _ = reply_tx.send(Err(format!(
+                                                        "engine RPC unreachable at {url}: {err}"
+                                                    )));
+                                                    continue;
+                                                }
+                                                Err(_) => {
+                                                    let _ = reply_tx.send(Err(format!(
+                                                        "timed out connecting to engine RPC at {url}"
+                                                    )));
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let c = client.as_ref().unwrap();
+                                    let call_fut = c.call(
+                                        zeron_rpc::methods::WORKER_WAIT_STATE,
+                                        serde_json::json!({ "chatId": &chat_id }),
+                                    );
+                                    let timed_call =
+                                        tokio::time::timeout(Duration::from_millis(250), call_fut);
+
+                                    tokio::select! {
+                                        _ = &mut stop_signal => {
+                                            break;
+                                        }
+                                        call_res = timed_call => {
+                                            let res = match call_res {
+                                                Ok(Ok(val)) => {
+                                                    match serde_json::from_value::<
+                                                        zeron_rpc::WorkerWaitStateReply,
+                                                    >(val)
+                                                    {
+                                                        Ok(reply) => Ok(reply.pending_message),
+                                                        Err(err) => {
+                                                            client = None;
+                                                            Err(format!(
+                                                                "malformed WorkerWaitState reply: {err}"
+                                                            ))
+                                                        }
+                                                    }
+                                                }
+                                                Ok(Err(err)) => {
+                                                    client = None;
+                                                    Err(format!(
+                                                        "engine RPC call WorkerWaitState: {err}"
+                                                    ))
+                                                }
+                                                Err(_) => {
+                                                    client = None;
+                                                    Err("engine RPC call WorkerWaitState timed out"
+                                                        .to_string())
+                                                }
+                                            };
+                                            let _ = reply_tx.send(res);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                })
+                .map_err(|err| format!("failed to spawn engine probe thread: {err}"))?;
+            self.worker_tx = Some(cmd_tx);
+            self.worker_rx = Some(reply_rx);
+            self.worker_handle = Some(handle);
+        }
+        Ok(())
+    }
+
+    fn check(&mut self, cancel: &AtomicBool) -> Result<bool, String> {
+        self.ensure_started()?;
+        let tx = self.worker_tx.as_ref().unwrap();
+        let rx = self.worker_rx.as_ref().unwrap();
+        if cancel.load(Ordering::SeqCst) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            return Err("wait_for_status cancelled by the host".into());
+        }
+        tx.send(ProbeCommand::Check)
+            .map_err(|_| "engine probe worker thread terminated unexpectedly".to_string())?;
+
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            if cancel.load(Ordering::SeqCst) {
+                self.shutdown.store(true, Ordering::SeqCst);
+                return Err("wait_for_status cancelled by the host".into());
+            }
+            match rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(res) => return res,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("engine probe worker thread disconnected".to_string());
+                }
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            return Err("wait_for_status cancelled by the host".into());
+        }
+        Err(format!(
+            "engine RPC probe at {} did not respond within deadline",
+            self.endpoint
+        ))
+    }
+}
+
+impl Drop for ParentMessageProbe {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(tx) = self.worker_tx.take() {
+            let _ = tx.send(ProbeCommand::Shutdown);
+        }
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn wait_for_status(
     client: &LocalWorkersClient,
     arguments: &Value,
+    parent_chat_id: Option<&str>,
     cancel: &AtomicBool,
 ) -> Result<Value, String> {
     let session_id = required_string(arguments, "session_id")?;
@@ -1942,6 +2152,16 @@ fn wait_for_status(
     }
     let timeout =
         clamp_wait_for_status_timeout(arguments.get("timeout_seconds").and_then(Value::as_u64));
+    let engine_endpoint = std::env::var(ENGINE_ENDPOINT_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut probe = match (parent_chat_id, engine_endpoint) {
+        (Some(chat_id), Some(endpoint)) => {
+            Some(ParentMessageProbe::new(endpoint, chat_id.to_owned()))
+        }
+        _ => None,
+    };
     wait_until_settled(
         timeout,
         &wanted,
@@ -1957,6 +2177,10 @@ fn wait_for_status(
         },
         |session| tracked && crate::current_episode_completed(session),
         |session| crate::activity_bridge::turn_interrupted(&session.id),
+        || match probe.as_mut() {
+            Some(probe) => probe.check(cancel),
+            None => Ok(false),
+        },
     )
 }
 
@@ -1980,9 +2204,15 @@ pub fn wait_until_matching(
     poll: impl FnMut() -> Result<WorkersSession, String>,
     extra_match: impl FnMut(&WorkersSession) -> bool,
 ) -> Result<Value, String> {
-    wait_until_settled(timeout_seconds, wanted, cancel, poll, extra_match, |_| {
-        false
-    })
+    wait_until_settled(
+        timeout_seconds,
+        wanted,
+        cancel,
+        poll,
+        extra_match,
+        |_| false,
+        || Ok(false),
+    )
 }
 
 /// [`wait_until_matching`] that also ends a `completed` wait when the current
@@ -1995,6 +2225,7 @@ fn wait_until_settled(
     mut poll: impl FnMut() -> Result<WorkersSession, String>,
     mut extra_match: impl FnMut(&WorkersSession) -> bool,
     mut interrupted: impl FnMut(&WorkersSession) -> bool,
+    mut pending_message: impl FnMut() -> Result<bool, String>,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let mut initial_completion: Option<bool> = None;
@@ -2063,6 +2294,20 @@ fn wait_until_settled(
                     "worker": session_json(&session)
                 }));
             }
+        }
+
+        if cancel.load(Ordering::SeqCst) {
+            return Err("wait_for_status cancelled by the host".into());
+        }
+
+        if pending_message()? {
+            return Ok(json!({
+                "matched": false,
+                "interrupted": true,
+                "reason": WAIT_INCOMING_MESSAGE_REASON,
+                "worker": session_json(&session),
+                "next": WAIT_INCOMING_MESSAGE_NEXT
+            }));
         }
 
         if cancel.load(Ordering::SeqCst) {
@@ -2433,5 +2678,359 @@ mod transcript_page_tests {
         let whole = transcript_page("short", None, 30);
         assert_eq!(whole["truncated"], false);
         assert_eq!(whole["markdown"], "short");
+    }
+}
+#[cfg(test)]
+mod wait_core_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn test_worker(state: &str) -> WorkersSession {
+        WorkersSession {
+            id: "worker-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            title: "worker-1".to_owned(),
+            command: "test".to_owned(),
+            state: state.to_owned(),
+            activity: "working".to_owned(),
+            unread: false,
+            pinned: false,
+            archived: false,
+            provider_id: None,
+            active_runtime_id: None,
+            runtime_launch_pending: false,
+            runtime_generation: 0,
+            notify_when_done: false,
+            terminal_background_hex: None,
+            worktree_branch: None,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
+            total_tokens: None,
+            model_usage: Vec::new(),
+            capabilities: crate::WorkersSessionCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn wait_for_status_releases_600s_wait_promptly_on_pending_parent_message() {
+        let cancel = AtomicBool::new(false);
+        let polls = AtomicU32::new(0);
+        let started = Instant::now();
+        let result = wait_until_settled(
+            600,
+            "completed",
+            &cancel,
+            || {
+                let n = polls.fetch_add(1, Ordering::SeqCst);
+                if n >= 3 {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                Ok(test_worker("running"))
+            },
+            |_| false,
+            |_| false,
+            || Ok(true),
+        )
+        .expect("wait should return snapshot");
+
+        assert_eq!(result["matched"], false);
+        assert_eq!(result["interrupted"], true);
+        assert_eq!(result["reason"], WAIT_INCOMING_MESSAGE_REASON);
+        assert_ne!(result["timed_out"], true);
+        assert_ne!(result["completed"], true);
+        assert_ne!(result["episode_completed"], true);
+        assert_ne!(result["stopped"], true);
+        assert_eq!(result["worker"]["state"], "running");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "must release 600s wait promptly instead of waiting for timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn natural_match_wins_over_pending_parent_message() {
+        let cancel = AtomicBool::new(false);
+        let result = wait_until_settled(
+            600,
+            "running",
+            &cancel,
+            || Ok(test_worker("running")),
+            |_| false,
+            |_| false,
+            || Ok(true),
+        )
+        .expect("natural match should succeed");
+
+        assert_eq!(result["matched"], true);
+        assert_ne!(result["interrupted"], true);
+        assert_ne!(result["reason"], WAIT_INCOMING_MESSAGE_REASON);
+    }
+
+    #[test]
+    fn no_pending_parent_message_continues_wait_until_timeout() {
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let result = wait_until_settled(
+            1,
+            "completed",
+            &cancel,
+            || Ok(test_worker("running")),
+            |_| false,
+            |_| false,
+            || Ok(false),
+        )
+        .expect("timeout should return snapshot");
+
+        assert_eq!(result["matched"], false);
+        assert_eq!(result["timed_out"], true);
+        assert_ne!(result["interrupted"], true);
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "wait without pending message must continue until timeout"
+        );
+    }
+    struct FakeRpcWaitState;
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for FakeRpcWaitState {
+        async fn handle(
+            &self,
+            method: &str,
+            params: Value,
+        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            if method == zeron_rpc::methods::WORKER_WAIT_STATE {
+                let chat_id = params.get("chatId").and_then(Value::as_str).unwrap_or("");
+                return Ok(zeron_rpc::RpcReply::Value(json!({
+                    "pendingMessage": chat_id == "parent-active"
+                })));
+            }
+            Err(zeron_rpc::RpcError::UnknownMethod(method.to_owned()))
+        }
+    }
+
+    #[test]
+    fn wait_for_status_dispatch_with_parent_and_endpoint_releases_promptly_on_pending_message() {
+        if std::env::var("__COMET_ISOLATED_TEST__").is_err() {
+            let exe = std::env::current_exe().expect("current test exe");
+            let status = std::process::Command::new(exe)
+                .arg("--exact")
+                .arg("controller_mcp::wait_core_tests::wait_for_status_dispatch_with_parent_and_endpoint_releases_promptly_on_pending_message")
+                .arg("--nocapture")
+                .env("__COMET_ISOLATED_TEST__", "1")
+                .status()
+                .expect("spawn isolated child test process");
+            assert!(
+                status.success(),
+                "isolated child test process failed with status {status:?}"
+            );
+            return;
+        }
+
+        let home = tempfile::TempDir::new().unwrap();
+        let state_path = home.path().join("app-state.json");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&json!({
+                "projects": [],
+                "presets": [],
+                "active_tabs": {},
+                "pinned_sessions": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::register_worker_parent_at(&state_path, "worker-dispatch", "parent-active", 100)
+            .unwrap();
+
+        let session_dir = home.path().join("app-sessions").join("worker-dispatch");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "session": {
+                    "id": "worker-dispatch",
+                    "project_id": "proj-1",
+                    "label": "Worker Dispatch",
+                    "command": "test",
+                    "created_at": 100
+                },
+                "cwd": home.path().to_string_lossy(),
+                "state": "running",
+                "pid": std::process::id(),
+                "exit_code": null,
+                "has_been_written_to": true,
+                "updated_at": 100
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            runtime.block_on(async move {
+                tokio::select! {
+                    _ = zeron_rpc::serve_ws_listener(listener, Arc::new(FakeRpcWaitState)) => {}
+                    _ = shutdown_rx => {}
+                }
+            });
+        });
+
+        // Env mutations run exclusively in this isolated single-test child process
+        unsafe {
+            std::env::set_var("UNPEEL_HOME", home.path());
+            std::env::set_var("ZERON_WORKTREES_DIR", home.path().join("worktrees"));
+            std::env::set_var(
+                "ZERON_WORKTREE_OWNERSHIP_FILE",
+                home.path().join("worktree-ownership.json"),
+            );
+            std::env::set_var(ENGINE_ENDPOINT_ENV, &endpoint);
+        }
+
+        let cancel_ref = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel_ref);
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            cancel_clone.store(true, Ordering::SeqCst);
+        });
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workers",
+                "arguments": {
+                    "action": "wait_for_status",
+                    "session_id": "worker-dispatch",
+                    "status": "completed",
+                    "timeout_seconds": 600
+                }
+            }
+        });
+        let started = Instant::now();
+        let response = handle_request_with_parent(request, Some("parent-active"), &cancel_ref);
+        let elapsed = started.elapsed();
+        let _ = shutdown_tx.send(());
+        let _ = server_thread.join();
+        let _ = timer.join();
+
+        let response = response.expect("response should be present");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let parsed = &response["result"]["structuredContent"];
+        assert_eq!(parsed["matched"], false);
+        assert_eq!(parsed["interrupted"], true);
+        assert_eq!(parsed["reason"], WAIT_INCOMING_MESSAGE_REASON);
+        assert_ne!(parsed["timed_out"], true);
+        assert_ne!(parsed["completed"], true);
+        assert_ne!(parsed["stopped"], true);
+        assert_eq!(parsed["worker"]["state"], "running");
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn probe_cancellation_with_unresponsive_peer_returns_bounded_including_drop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server_stop_tx, mut server_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            runtime.block_on(async move {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (_socket, _) = accepted.expect("accept unresponsive peer");
+                        let _ = server_stop_rx.await;
+                    }
+                    _ = &mut server_stop_rx => {}
+                }
+            });
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            cancel_clone.store(true, Ordering::SeqCst);
+        });
+
+        let mut probe = ParentMessageProbe::new(format!("ws://{addr}"), "chat-test".into());
+        let started = Instant::now();
+        let res = probe.check(&cancel);
+        assert!(res.is_err(), "cancellation must return an error: {res:?}");
+        assert_eq!(res.unwrap_err(), "wait_for_status cancelled by the host");
+        drop(probe);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "cancellation including drop must return within 250ms, took {elapsed:?}"
+        );
+
+        let _ = server_stop_tx.send(());
+        let _ = server_thread.join();
+    }
+
+    struct MalformedRpcService;
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for MalformedRpcService {
+        async fn handle(
+            &self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            Ok(zeron_rpc::RpcReply::Value(json!({ "corrupted": true })))
+        }
+    }
+
+    #[test]
+    fn probe_rejects_malformed_reply() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            runtime.block_on(async move {
+                tokio::select! {
+                    _ = zeron_rpc::serve_ws_listener(listener, Arc::new(MalformedRpcService)) => {}
+                    _ = stop_rx => {}
+                }
+            });
+        });
+
+        let cancel = AtomicBool::new(false);
+        let mut probe = ParentMessageProbe::new(endpoint, "chat-test".into());
+        let res = probe.check(&cancel);
+        assert!(res.is_err(), "malformed reply must return an error");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("malformed WorkerWaitState reply"),
+            "expected malformed reply error, got: {err}"
+        );
+
+        drop(probe);
+        let _ = stop_tx.send(());
+        let _ = server_thread.join();
     }
 }

@@ -6,17 +6,22 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - '.cargo/**'
       - 'crates/**'
+      - 'apps/zeron/**'
+      - 'apps/ios/**'
       - 'third_party/zui/**'
+      - 'third_party/unpeel/**'
+      - 'edge/**'
+      - 'dist/macos/**'
       - '.github/actions/linux-ci/**'
       - 'scripts/ci/**'
       - 'scripts/*cursor-sdk*'
       - '.github/workflows/cursor-*.yml'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
-      - 'dist/macos/Info.plist'
-      - 'apps/ios/**'
       - 'scripts/test-browser-storage.py'
+      - 'scripts/ios/**'
       - '.github/workflows/ui-tests.yml'
   push:
     branches: [main]
@@ -24,89 +29,142 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - '.cargo/**'
       - 'crates/**'
+      - 'apps/zeron/**'
+      - 'apps/ios/**'
       - 'third_party/zui/**'
+      - 'third_party/unpeel/**'
+      - 'edge/**'
+      - 'dist/macos/**'
       - '.github/actions/linux-ci/**'
       - 'scripts/ci/**'
       - 'scripts/*cursor-sdk*'
       - '.github/workflows/cursor-*.yml'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
-      - 'dist/macos/Info.plist'
-      - 'apps/ios/**'
       - 'scripts/test-browser-storage.py'
+      - 'scripts/ios/**'
       - '.github/workflows/ui-tests.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ui-tests-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   changes:
     runs-on: ubuntu-24.04
-    permissions:
-      pull-requests: read
     outputs:
-      ios: ${{ steps.filter.outputs.ios }}
-      native: ${{ steps.filter.outputs.native }}
-      session_sync: ${{ steps.filter.outputs.session_sync }}
+      ios: ${{ steps.select.outputs.ios }}
+      ui: ${{ steps.select.outputs.ui }}
+      core: ${{ steps.select.outputs.core }}
+      linux_browser: ${{ steps.select.outputs.linux_browser }}
+      macos: ${{ steps.select.outputs.macos }}
+      macos_app_check: ${{ steps.select.outputs.macos_app_check }}
+      macos_geometry: ${{ steps.select.outputs.macos_geometry }}
+      macos_notify: ${{ steps.select.outputs.macos_notify }}
+      macos_attachments: ${{ steps.select.outputs.macos_attachments }}
+      macos_browser: ${{ steps.select.outputs.macos_browser }}
+      macos_preview: ${{ steps.select.outputs.macos_preview }}
+      macos_gpui: ${{ steps.select.outputs.macos_gpui }}
     steps:
-      - uses: actions/github-script@v8
-        id: filter
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test UI lane selector
+        run: python3 -m unittest scripts/ci/test_select_ui_tests.py
+      - name: Test release profile gate
+        run: node --test scripts/ci/release-profile-gate.test.cjs
+      - name: Determine base commit
+        id: base_commit
+        uses: actions/github-script@v8
         with:
           script: |
-            const lanes = ['ios', 'native', 'session_sync'];
-            const all = value => lanes.forEach(lane => core.setOutput(lane, value));
-            // Preserve full coverage for main pushes and manual runs.
-            if (context.eventName !== 'pull_request') return all(true);
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              ...context.repo,
-              pull_number: context.payload.pull_request.number,
-              per_page: 100,
-            });
-            // Run conservatively if the API did not return the full diff.
-            if (files.length < context.payload.pull_request.changed_files) return all(true);
-            const shared = path => ['Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-              '.github/workflows/ui-tests.yml'].includes(path);
-            const under = (path, prefixes) => prefixes.some(prefix => path?.startsWith(prefix));
-            // The app links the Rust mobile core and everything it depends on.
-            const mobileCore = ['apps/ios/', 'crates/mobile/', 'crates/client/', 'crates/text/',
-              'crates/markdown/', 'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/',
-              'crates/syntax/', 'crates/voice-session/', 'crates/voice-media/',
-              'crates/audio/', 'crates/orb/', 'crates/veil/', 'crates/visual/',
-              'crates/visual-gpu/', 'crates/zatex/', 'scripts/ios/'];
-            // Native macOS/Linux fixtures: browser, preview, notifications,
-            // diff font geometry and the vendored GPUI frame source.
-            const nativeSurfaces = ['crates/visual/', 'crates/visual-gpu/', 'crates/zatex/',
-              'crates/ui/src/visuals.rs', 'crates/ui/src/markdown/math.rs', 'crates/ui/src/browser/', 'crates/ui/src/file_preview/',
-              'crates/ui/src/notify.rs', 'crates/ui/src/changes.rs', 'crates/ui/src/attachments.rs',
-              'crates/ui/src/composer.rs', 'crates/ui/src/queue.rs', 'crates/ui/src/transcript.rs',
-              'crates/ui/src/shell/', 'crates/ui/src/voice.rs', 'crates/ui/src/orb/', 'crates/ui/examples/',
-              'crates/ui/Cargo.toml', 'crates/preview/', 'third_party/zui/', 'edge/', 'dist/macos/',
-              'scripts/run-macos-browser-fixture.sh', 'scripts/test-linux-browser.sh',
-              'scripts/test-browser-storage.py'];
-            // core-tests: every non-UI Linux suite (scripts/ci/test-core.sh).
-            const sessionSync = ['crates/harness/', 'crates/sync/', 'crates/update/',
-              'crates/engine/', 'crates/doc/', 'crates/proto/', 'crates/rpc/', 'crates/preview/',
-              'crates/visual/', 'crates/visual-gpu/', 'crates/zatex/',
-              'scripts/ci/', '.github/actions/linux-ci/'];
-            const touches = prefixes => files.some(file =>
-              [file.filename, file.previous_filename].some(path =>
-                shared(path) || under(path, prefixes)));
-            core.setOutput('ios', touches(mobileCore));
-            core.setOutput('native', touches(nativeSurfaces));
-            core.setOutput('session_sync', touches(sessionSync));
+            const { execFileSync } = require('child_process');
+            if (context.eventName === 'workflow_dispatch') {
+              core.setOutput('mode', 'all');
+              return;
+            }
+            if (context.eventName === 'pull_request') {
+              const baseSha = context.payload.pull_request?.base?.sha;
+              if (!baseSha) {
+                core.setOutput('mode', 'all');
+                return;
+              }
+              core.setOutput('mode', 'diff');
+              core.setOutput('is_pr', 'true');
+              core.setOutput('base_sha', baseSha);
+              core.setOutput('head_sha', context.payload.pull_request?.head?.sha || 'HEAD');
+              return;
+            }
+            if (context.eventName === 'push') {
+              try {
+                const branch = context.ref.replace('refs/heads/', '');
+                const runs = await github.rest.actions.listWorkflowRuns({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: 'ui-tests.yml',
+                  branch: branch,
+                  status: 'completed',
+                  per_page: 30,
+                });
+                const currentRunId = context.runId;
+                const successfulRuns = (runs.data.workflow_runs || []).filter(
+                  r => r.id !== currentRunId && r.conclusion === 'success' && r.head_sha
+                );
+                let ancestorSha = null;
+                for (const run of successfulRuns) {
+                  try {
+                    execFileSync('git', ['merge-base', '--is-ancestor', run.head_sha, 'HEAD'], { stdio: 'ignore' });
+                    ancestorSha = run.head_sha;
+                    break;
+                  } catch (e) {
+                    // Not an ancestor, continue searching
+                  }
+                }
+                if (ancestorSha) {
+                  core.setOutput('mode', 'diff');
+                  core.setOutput('is_pr', 'false');
+                  core.setOutput('base_sha', ancestorSha);
+                  core.setOutput('head_sha', 'HEAD');
+                } else {
+                  core.setOutput('mode', 'all');
+                }
+              } catch (err) {
+                core.warning(`Failed to determine previous successful run: ${err.message}`);
+                core.setOutput('mode', 'all');
+              }
+              return;
+            }
+            core.setOutput('mode', 'all');
+      - name: Select UI test targets
+        id: select
+        run: |
+          if [ "${{ steps.base_commit.outputs.mode }}" = "diff" ]; then
+            PR_FLAG=""
+            if [ "${{ steps.base_commit.outputs.is_pr }}" = "true" ]; then
+              PR_FLAG="--pr"
+            fi
+            python3 scripts/ci/select-ui-tests.py \
+              $PR_FLAG \
+              --base "${{ steps.base_commit.outputs.base_sha }}" \
+              --head "${{ steps.base_commit.outputs.head_sha }}" \
+              --github-output "$GITHUB_OUTPUT"
+          else
+            python3 scripts/ci/select-ui-tests.py --all --github-output "$GITHUB_OUTPUT"
+          fi
 
   # Every Linux Rust test that is not UI: one build, one nextest run (see
   # scripts/ci/test-core.sh). Replaces session-sync-regressions and the Rust
   # steps of cursor-compatibility and preview-tests.
   core-tests:
     needs: changes
-    if: needs.changes.outputs.session_sync == 'true'
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -119,6 +177,8 @@ jobs:
         run: scripts/ci/test-core.sh
 
   ui-tests:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -138,7 +198,7 @@ jobs:
 
   macos-frame-recovery:
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.macos == 'true'
     runs-on: macos-latest
     # A cold release build plus the feature-enabled browser fixtures exceeds 45m.
     # Keep the short execution timeouts on native regressions below.
@@ -155,13 +215,17 @@ jobs:
             .
             third_party/zui
       - name: Check macOS application
+        if: needs.changes.outputs.macos_app_check == 'true'
         run: cargo check --release --locked -p zeron
       - name: Native diff font geometry regression
+        if: needs.changes.outputs.macos_geometry == 'true'
         run: cargo test --release --locked -p zeron-ui --lib native_diff_font_geometry -- --test-threads=1
       - name: Native notification click regressions
+        if: needs.changes.outputs.macos_notify == 'true'
         run: |
           cargo test --release --locked -p zeron-ui --lib notify::tests:: -- --test-threads=1
       - name: Native attachment and composer chip regressions
+        if: needs.changes.outputs.macos_attachments == 'true'
         run: |
           for filter in attachments::tests:: composer::attachment_chip_tests:: shell::chat_dropzone_tests:: \
             queue_rows_label_attachment_chips_and_file_only_sends \
@@ -170,8 +234,10 @@ jobs:
             cargo test --release --locked -p zeron-ui --lib "$filter" -- --test-threads=1
           done
       - name: Build native browser fixture
-        run: cargo build --release --locked -p zeron-ui --example browser-fixture --example preview-fixture --features browser-fixture
+        if: needs.changes.outputs.macos_browser == 'true'
+        run: cargo build --release --locked -p zeron-ui --example browser-fixture --features browser-fixture
       - name: Native browser regression and screenshots
+        if: needs.changes.outputs.macos_browser == 'true'
         timeout-minutes: 3
         env:
           RUST_BACKTRACE: 1
@@ -182,21 +248,29 @@ jobs:
           bash scripts/run-macos-browser-fixture.sh target/release/examples/browser-fixture "$RUNNER_TEMP/browser-captures"
           test -f "$RUNNER_TEMP/browser-captures/result.txt"
       - name: Persistent browser profiles across app launches
+        if: needs.changes.outputs.macos_browser == 'true'
         timeout-minutes: 5
         run: python3 scripts/test-browser-storage.py --fixture target/release/examples/browser-fixture
       - name: Upload browser screenshots
-        if: always()
+        if: always() && needs.changes.outputs.macos_browser == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: browser-macos-captures
           path: ${{ runner.temp }}/browser-captures
           if-no-files-found: ignore
-      - uses: actions/setup-node@v4
+      - name: Build native preview fixture
+        if: needs.changes.outputs.macos_preview == 'true'
+        run: cargo build --release --locked -p zeron-ui --example preview-fixture --features browser-fixture
+      - name: Setup Node for preview
+        if: needs.changes.outputs.macos_preview == 'true'
+        uses: actions/setup-node@v4
         with:
           node-version: 24
       - name: Install preview fixture server
+        if: needs.changes.outputs.macos_preview == 'true'
         run: npm ci --prefix edge
       - name: Project discovery, stable URLs and HMR in native WebKit
+        if: needs.changes.outputs.macos_preview == 'true'
         timeout-minutes: 3
         env:
           ZERON_PREVIEW_AUTO_OPEN: 1
@@ -204,19 +278,22 @@ jobs:
           VITE_BINARY="$GITHUB_WORKSPACE/edge/node_modules/vite/bin/vite.js" bash scripts/run-macos-browser-fixture.sh target/release/examples/preview-fixture "$RUNNER_TEMP/preview-captures"
           test -f "$RUNNER_TEMP/preview-captures/result.txt"
       - name: Upload preview screenshots
-        if: always()
+        if: always() && needs.changes.outputs.macos_preview == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: preview-macos-captures
           path: ${{ runner.temp }}/preview-captures
           if-no-files-found: ignore
       - name: Native frame-source recovery regression
+        if: needs.changes.outputs.macos_gpui == 'true'
         working-directory: third_party/zui
         run: cargo test --release --locked -p gpui_macos --test frame_source_recovery
       - name: Build native window glass backing regression
+        if: needs.changes.outputs.macos_gpui == 'true'
         working-directory: third_party/zui
         run: cargo test --release --locked -p gpui_macos --features runtime_shaders --test window_glass_backing --no-run --message-format=json > "$RUNNER_TEMP/window-glass-build.jsonl"
       - name: Run native window glass backing regression
+        if: needs.changes.outputs.macos_gpui == 'true'
         timeout-minutes: 2
         run: |
           python3 - <<'PYTHON'
@@ -253,7 +330,7 @@ jobs:
           assert 'PASS: native window glass backing lifecycle and configuration' in log, 'native regression did not finish its assertions'
           PYTHON
       - name: Upload native window glass evidence
-        if: always()
+        if: always() && needs.changes.outputs.macos_gpui == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: window-glass-macos
@@ -311,7 +388,7 @@ jobs:
 
   linux-browser:
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.linux_browser == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

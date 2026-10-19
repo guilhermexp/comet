@@ -147,32 +147,41 @@ A `wait_for_status` on any accepted status other than `completed` SHALL also ret
 - **WHEN** the orchestrator waits on `working` with a short timeout
 - **THEN** the wait does not return early because of that prior completion
 
-### Requirement: A worker notification ends the parent's pending wait
+### Requirement: Incoming messages release pending Workers waits
 
-When a `[worker-task-notification]` is queued into a parent chat whose OMP turn has a pending Workers `wait_for_status` host tool call, the harness SHALL end that wait promptly instead of holding the notification until the wait times out. The wait's tool result SHALL be delivered first and SHALL state that it was interrupted by a worker notification (not a transport failure). The notification prompt SHALL then be processed exactly once. Steers that are not worker notifications, and pending host tools other than `wait_for_status`, SHALL keep the existing queue-until-result behaviour.
+An accepted incoming message SHALL release the Orchestrator's pending Workers `wait_for_status` before its timeout. This applies to user messages and Worker notices through the common controller used by native runtimes and the OMP bridge. The message SHALL be consumed exactly once. Releasing the wait SHALL NOT stop, restart or complete the Worker or abort unrelated tools. A natural wait result already available SHALL be preserved.
 
 #### Scenario: Notification during a pending wait is delivered without waiting for the timeout
-- Test: integration — harness integration test in `omp_rpc` with the fake OMP and fake Workers controller: a long `wait_for_status` is pending when a worker-notification steer arrives.
+- Test: integration — harness subprocess tests for an incoming Worker notification during a pending wait.
 
-- **GIVEN** an OMP turn with a pending `wait_for_status` whose timeout is far in the future
-- **WHEN** a `[worker-task-notification]` steer is queued for that chat
-- **THEN** the wait's tool result, marked as interrupted by a worker notification, is delivered before the steer
-- **AND** the steer prompt is delivered once, well before the wait's timeout
+- **GIVEN** an Orchestrator with a pending `wait_for_status` whose timeout is far in the future
+- **WHEN** a `[worker-task-notification]` message is accepted for that Chat
+- **THEN** the wait is released and the notification is consumed once, before the wait timeout
+- **AND** the Worker continues under its own lifecycle
 
-#### Scenario: Ordinary steer keeps queue-until-result
-- Test: integration — harness integration test in `omp_rpc` sending a non-notification steer during a pending `wait_for_status`.
+#### Scenario: Ordinary message interrupts a pending wait
+- Test: integration — engine pending-message state over RPC, controller wait release and OMP subprocess delivery; native UI remains a separate smoke observation.
 
-- **GIVEN** an OMP turn with a pending `wait_for_status`
-- **WHEN** a steer that is not a worker notification arrives
-- **THEN** the wait is not interrupted and the steer is delivered after the wait's own result
+- **GIVEN** an Orchestrator waiting only on a pending Workers `wait_for_status`
+- **WHEN** an ordinary user message is accepted for that Chat
+- **THEN** the wait is released and the message is processed once without waiting for the timeout
+- **AND** no Worker stop, restart or completion is requested
+
+#### Scenario: Unrelated tools are not interrupted
+- Test: integration — harness subprocess tests with an unrelated open tool and an incoming message.
+
+- **GIVEN** an unrelated tool is still running alongside or instead of the Workers wait
+- **WHEN** an ordinary message arrives
+- **THEN** the unrelated tool is allowed to finish under the existing steering policy
+- **AND** its result is not replaced by a wait-interruption result
 
 #### Scenario: A natural result racing the notification is preserved
-- Test: integration — harness integration test in `omp_rpc` where the controller answers the pending `wait_for_status` (matched) at the same time a worker-notification steer arrives.
+- Test: integration — `omp_rpc` subprocess fixture in which the controller answers the pending wait together with an incoming message.
 
-- **GIVEN** an OMP turn with a pending `wait_for_status` whose controller result arrives together with a worker-notification steer
+- **GIVEN** an OMP turn with a pending `wait_for_status` whose controller result arrives together with an incoming message
 - **WHEN** the harness delivers the tool result
 - **THEN** the controller's real result is delivered, not replaced by the interrupted marker
-- **AND** the steer is delivered once after it
+- **AND** the message is delivered once after it
 
 ### Requirement: Claude Workers expose no suggested prompt in their composer
 

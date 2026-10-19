@@ -14,8 +14,8 @@ Este arquivo é fino de propósito. O contrato do repo está em [`AGENTS.md`](AG
 
 ## Fluxo de merge
 
-- **Mudança pequena/localizada vai direto pra `main`** (decisão do dono, 2026-10-02): `cargo fmt --all`, testes só dos crates tocados (`cargo test -p <crate>`), commit e `git push origin HEAD:main`. Sem gate.
-- **O gate `no-mistakes` é só para mudança grande** (vários subsistemas, contrato de wire, migração) ou quando o dono pedir. Ele roda revisão + suíte inteira + CI completo e leva 1–2h.
+- **Publicação direta por padrão** (decisão do dono, 2026-10-19): checks focados necessários, reaproveitamento de provas válidas, commit e `git push origin HEAD:main`. Regressão ampla fica no CI; não repetir localmente só para espelhá-lo.
+- **`no-mistakes` está desativado como etapa automática deste projeto.** Só executar quando o usuário pedir explicitamente esse gate, inclusive para mudanças grandes, de wire ou múltiplos subsistemas. Não impor rodadas adicionais de revisão entre uma correção já verificada e sua publicação.
 
 ## Lessons Learned
 

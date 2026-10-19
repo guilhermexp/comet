@@ -339,6 +339,9 @@ rpc_methods! {
     /// with no timeout of its own. The engine's `recap::RUN_BUDGET_SECS` is the
     /// only real ceiling; tune it there.
     GENERATE_CHAT_RECAP / GenerateChatRecap = "GenerateChatRecap" { params: crate::GenerateChatRecapParams, reply: crate::GenerateChatRecapReply, local_only: true },
+    /// Read-only status wait inquiry for pending unconsumed steers in the live run ledger.
+    /// Strictly device-local: rejected at relay ingress, never forwarded.
+    WORKER_WAIT_STATE / WorkerWaitState = "WorkerWaitState" { params: crate::WorkerWaitStateParams, reply: crate::WorkerWaitStateReply, local_only: true },
     // Upstream v0.2.83 surface (sync/upstream-v0.2.83): explicit agent
     // installs, skills, the shared message queue (coexists with steering),
     // Project Actions, sidebar preferences and workspace image/save/git status.
@@ -470,6 +473,7 @@ mod tests {
             }
         }
         assert!(methods::is_local_only(methods::GENERATE_CHAT_RECAP));
+        assert!(methods::is_local_only(methods::WORKER_WAIT_STATE));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));
         assert!(!methods::is_local_only("Nope"));
     }

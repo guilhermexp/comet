@@ -465,6 +465,7 @@ apps/zeron (host-mode dispatch at startup).
   só o diretório gerenciado da sessão (stem exato, sem walk global nem
   `starts_with` lexical); `read_transcript` do controller MCP passa a
   resolver manifesto `omp`.
+- **Atualização de asset de lifecycle não faz hot-reload de CLI já em execução.** Reescrever o script/extensão de lifecycle (`assets/lifecycle-extension.js`) atualiza apenas novos launches; um Worker OMP antigo já vivo continua com a extensão carregada na sua inicialização (sem `PermissionRequest` de asks, por exemplo). Workers em execução com runtime defasado devem ser reiniciados em fronteira segura através do host atualizado; atualizar o aplicativo não retrofita processos antigos. Não adicionar fallbacks sintéticos por transcrição, terminal ou heurísticas de polling de atenção.
 - **Fim de turno não é fim de tarefa, e Esc encerra o turno** (2026-10-14).
   O Claude dispara `Stop` ao fechar um turno com shell/agente em background e
   abre outro sozinho quando a task avisa. `background_tasks` lê o JSONL do
@@ -480,6 +481,7 @@ apps/zeron (host-mode dispatch at startup).
   overlay report-only `turn_settled_by_interrupt` (nunca confirma `Stop`).
   `wait_for_status(completed)` devolve `interrupted: true` em vez de esperar o
   timeout. Cancelar a espera do orquestrador não é interromper o Worker.
+- **Mensagem recebida para o Chat pai libera o `wait_for_status` pendente.** Com `COMET_WORKERS_ENGINE_ENDPOINT` e Chat pai concedido ao controller, a espera consulta o ledger autoritativo de steers pendentes (`WorkerWaitState`) no intervalo de 250ms, reusando uma conexão por wait. Uma mensagem aceita e não consumida devolve `matched: false`, `interrupted: true`, `reason: "incoming_message"` e o estado observado do Worker, sem parar, completar ou alterar seu processo. Match natural já disponível vence. Sem endpoint ou sem Chat pai, preserva a espera normal; endpoint concedido mas indisponível ou resposta inválida é erro explícito. Cancelar o pedido também cancela a consulta em voo e sua limpeza, sem esperar o prazo de rede.
 - **`read_transcript` é o transcript nativo inteiro, paginado.** Sem `entries`
   usa a faixa de Settings → Transcripts (Whole = 0); `0` explícito também é
   tudo. A resposta é uma página de 96 KiB (`transcript_page`): sem `offset`, a

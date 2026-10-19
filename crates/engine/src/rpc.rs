@@ -2719,6 +2719,20 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
+            methods::WORKER_WAIT_STATE => {
+                let p: zeron_rpc::WorkerWaitStateParams = parse_params(params)?;
+                if let Some(chat) = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                {
+                    if chat.device_id != self.doc_host.device_id() {
+                        return Err(RpcError::Failed("chat belongs to another device".into()));
+                    }
+                }
+                let pending_message = self.sessions.has_pending_steers(&p.chat_id);
+                RpcReply::value(&zeron_rpc::WorkerWaitStateReply::new(pending_message))
+            }
             methods::GENERATE_CHAT_RECAP => {
                 let p: zeron_rpc::GenerateChatRecapParams = parse_params(params)?;
                 let chat = self
