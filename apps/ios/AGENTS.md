@@ -62,3 +62,5 @@ testes offline de voz.
 ## Child DOX Index
 
 Sem filhos.
+
+Chat drag sources use row identity plus movable/archive/search policy, independently of destination policy. Project groups remain disallowed destinations but their Chat rows can be dragged to Pinned/custom sections/Recent. `ZeronTests/SessionDragTests.swift` is a UIKit unit regression for the policy used by the actual drag delegate; execute it on an iOS Simulator, never infer native acceptance from Linux source review.

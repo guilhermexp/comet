@@ -36,6 +36,7 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
     /// Long-press drags a session between the list's sections (front page);
     /// `dropTarget` names what each section means as a destination.
     var movesAcrossSections = false
+    var dragSearchQuery: String { "" }
     private(set) var collapsed = Set(UserDefaults.standard.stringArray(forKey: "collapsedSections") ?? [])
     private var headerStates: [String: SectionHeaderCell.State] = [:]
 
@@ -350,14 +351,32 @@ enum SessionDropTarget: Equatable {
     case recent
 }
 
+/// A source row need not be a destination: project groups are views of Recent.
+/// Keep this policy independent of AppModel so drag rules need no account/engine.
+enum SessionDragPolicy {
+    static func items(id: String?, movable: Bool, archived: Bool, query: String) -> [UIDragItem] {
+        guard let id, movable, !archived, query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
+        let item = UIDragItem(itemProvider: NSItemProvider())
+        item.localObject = id
+        return [item]
+    }
+
+    static func destination(_ section: String, query: String, sections: Set<String>) -> SessionDropTarget? {
+        guard query.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        switch section {
+        case "pinned": return .pinned
+        case "recent": return .recent
+        default: return sections.contains(section) ? .section(section) : nil
+        }
+    }
+}
+
 // MARK: Drag between sections
 
 extension SessionListController: UICollectionViewDragDelegate, UICollectionViewDropDelegate {
     func collectionView(_ collectionView: UICollectionView, itemsForBeginning session: UIDragSession, at indexPath: IndexPath) -> [UIDragItem] {
-        guard let id = sessionId(indexPath), dropTarget(listSection(of: indexPath)) != nil else { return [] }
-        let item = UIDragItem(itemProvider: NSItemProvider())
-        item.localObject = id
-        return [item]
+        SessionDragPolicy.items(id: sessionId(indexPath), movable: movesAcrossSections,
+                                archived: archivedRows, query: dragSearchQuery)
     }
 
     func collectionView(_ collectionView: UICollectionView, canHandle session: UIDropSession) -> Bool {
@@ -463,6 +482,7 @@ class SessionsViewController: SessionListController {
     /// The chat wallpaper behind the top of the front page. Fixed behind the
     /// list, fading out as the list scrolls up over it.
     private let wallpaper = WallpaperView()
+    override var dragSearchQuery: String { query }
 
     override func viewDidLoad() {
         collapsible = true
@@ -507,12 +527,7 @@ class SessionsViewController: SessionListController {
 
     override func dropTarget(_ id: String) -> SessionDropTarget? {
         // Search results and project groups aren't places a session is put.
-        guard query.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        switch id {
-        case "pinned": return .pinned
-        case "recent": return .recent
-        default: return app.frontPage.folders.contains { $0.id == id } ? .section(id) : nil
-        }
+        SessionDragPolicy.destination(id, query: query, sections: Set(app.frontPage.folders.map(\.id)))
     }
 
     override func headerMenu(_ id: String) -> UIMenu? {
