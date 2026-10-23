@@ -2,6 +2,13 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-10-23 — Invocações registradas de skills por Project (não publicado)
+
+- Context sources passa a mostrar `xN` discretamente à direita de cada skill do projeto. O total agrega os Chats retidos do mesmo `space_id`, inclusive arquivados e worktrees, sem mudar a ordem, o header, as linhas de 24px, o viewport de sete linhas ou a abertura do arquivo.
+- A engine reconstrói o total do Chat Transcript local, incluindo outbox chat2, sem abrir rooms frias nem persistir um contador. Chaves de chamada/continuação e o marcador próprio de fork evitam inflação por resultados, replay e prefixos herdados; inclusão, purga e encerramento de turnos atualizam a projeção.
+- `x0` exige corpus coberto; carregamento mostra `…` e histórico parcial/host indisponível mostra `—`. São tentativas identificáveis, inclusive falhas, não prova de conformidade. Exec/eval opacos, menções, referências de apoio, histórico privado de providers e docs internos de subagentes não são inferidos; Codex e outros providers podem não preservar sinal estruturado suficiente.
+- Change: `openspec/changes/add-project-skill-usage-counts`. Provas focadas de engine/RPC e GPUI na box; aparência nativa macOS permanece `notProven`, sem lançar QA contra configurações reais de providers. Sem integração ou publicação nesta etapa.
+
 ## Baseline histórico
 
 - Branch: `main`

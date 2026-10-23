@@ -15,7 +15,6 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use zeron_sync::DocsStore;
 
-mod skill_usage;
 pub mod agent_accounts;
 pub(crate) mod antigravity_usage;
 pub mod auth;
@@ -47,6 +46,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+mod skill_usage;
 pub mod source_control;
 pub mod spaces;
 pub mod terminals;

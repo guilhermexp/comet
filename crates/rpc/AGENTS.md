@@ -49,6 +49,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `PublishVisual` is registered only in `rpc_methods!`, local-only and unary. The engine validates a live turn, bounded Luau and assets before storage/publication. New tools remain behind the existing root Chat MCP grant; no per-run MCP injection is restored.
 
+- `WatchProjectSkillUsage` é stream tipado aditivo e forwardable ao device do Project. O host valida a posse do Space; catálogo recebido apenas seleciona identidades, sem autorizar leitura de arquivos. Frames carregam cobertura explícita; host offline/antigo continua erro, nunca zero confirmado. O proxy usa a confirmação de assinatura existente para preservar `UnknownMethod` do host sem invalidar o link compartilhado.
+
 ## Work Guidance
 
 - RPC novo = tipo em `zeron-proto` + linha no `rpc_methods!` de `method.rs` + handler na engine. Os três no mesmo commit, senão a UI compila contra um contrato que não existe.

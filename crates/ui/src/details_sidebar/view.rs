@@ -238,10 +238,10 @@ use zeron_proto::{
 };
 use zeron_rpc::methods;
 
-#[path = "skill_usage.rs"]
-mod skill_usage;
 #[path = "session_card.rs"]
 mod session_card;
+#[path = "skill_usage.rs"]
+mod skill_usage;
 
 #[path = "dev_servers.rs"]
 mod dev_servers;
@@ -648,6 +648,7 @@ impl DetailsSidebar {
                 .and_then(|value| value.branch.clone());
             self.load_branch(cx);
             self.ensure_source_control_watch(cx);
+            self.ensure_project_skill_usage(cx);
             cx.notify();
             self.sync_idle_recap(cx);
         }
@@ -3090,6 +3091,7 @@ impl DetailsSidebar {
 
     fn render_details(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let Some(context) = self.sidebar.context().cloned() else {
+            self.hide_project_skill_usage();
             self.ensure_worked_project_diff_watch(Vec::new(), cx);
             self.ensure_dev_server_watch(None, Vec::new(), cx);
             return div()
@@ -3098,6 +3100,9 @@ impl DetailsSidebar {
                 .child("No workspace selected");
         };
         let hide_workspace = self.sidebar.widget_hidden("workspace-widget");
+        if hide_workspace {
+            self.hide_project_skill_usage();
+        }
         let hide_workers = self.sidebar.widget_hidden("chat-workers-widget");
         let hide_todos = self.sidebar.widget_hidden("todos-widget");
         let hide_usage = self.sidebar.widget_hidden("usage-widget");

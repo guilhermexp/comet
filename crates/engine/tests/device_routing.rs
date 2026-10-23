@@ -2076,25 +2076,132 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
 }
 
 #[tokio::test]
-async fn project_skill_usage_routes_to_project_host_and_preserves_unknown_method_errors() {
+async fn project_skill_usage_routes_to_project_host() {
     use serde_json::json;
     use zeron_proto::skill_usage::{ProjectSkillUsageSnapshot, SkillUsageCoverage};
-    let (relay_url, relay)=fake_device_room().await;
-    let dirs=tempfile::tempdir().unwrap();
-    let core_b=assemble(&dirs.path().join("b"),"device-b");
-    core_b.workspace.create_space("p","device-b","/main",None,false).unwrap();
-    core_b.workspace.create_chat("chat",Some("p"),None,None,Some("/main".into())).unwrap();
-    let doc=core_b.doc_host.open_local("chat").unwrap();
+    let (relay_url, relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let core_b = assemble(&dirs.path().join("b"), "device-b");
+    core_b
+        .workspace
+        .create_space("p", "device-b", "/main", None, false)
+        .unwrap();
+    core_b
+        .workspace
+        .create_chat("chat", Some("p"), None, None, Some("/main".into()))
+        .unwrap();
+    let doc = core_b.doc_host.open_local("chat").unwrap();
     let entry: zeron_doc::SessionMessageEntry=serde_json::from_value(json!({"id":"e","role":"assistant","createdAt":1,"deviceId":"device-b","parts":[{"kind":"tool","id":"t","call":{"kind":"readFile","path":"skill://a"}}]})).unwrap();
     doc.doc().push_message(&entry).unwrap();
-    let host=core_b.start_host_relay(&relay_url);
-    let core_a=assemble(&dirs.path().join("a"),"device-a");
-    let mut config=LinkCacheConfig::new(relay_url.clone(),Arc::new(StaticToken("test-user".into())));config.probe_timeout=Duration::from_secs(5);core_a.set_links(LinkCache::new(config));
-    let client=zeron_rpc::memory_client(core_a.rpc_service());
-    let params=json!({"projectId":"p","catalog":[{"name":"a","relativePath":".agents/skills/a/SKILL.md"}],"targetDeviceId":"device-b"});
-    let deadline=tokio::time::Instant::now()+Duration::from_secs(15);
-    let mut rx=loop { match client.subscribe_checked("WatchProjectSkillUsage",params.clone()).await {Ok(rx)=>break rx,Err(e)=>{assert!(tokio::time::Instant::now()<deadline,"{e}");tokio::time::sleep(Duration::from_millis(100)).await;}}};
-    loop { let f:ProjectSkillUsageSnapshot=serde_json::from_value(tokio::time::timeout(Duration::from_secs(5),rx.recv()).await.unwrap().unwrap()).unwrap();if f.coverage==SkillUsageCoverage::Loading {continue;}assert_eq!(f.host_device_id,"device-b");assert_eq!(f.coverage,SkillUsageCoverage::Complete);assert_eq!(f.counts[0].count,1);break; }
-    assert!(client.subscribe_checked("WatchProjectSkillUsage",json!({"projectId":"p","catalog":[]})).await.is_err());
-    drop(rx);drop(host);core_a.shutdown().await;core_b.shutdown().await;relay.abort();
+    let host = core_b.start_host_relay(&relay_url);
+    let core_a = assemble(&dirs.path().join("a"), "device-a");
+    let mut config =
+        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
+    config.probe_timeout = Duration::from_secs(5);
+    core_a.set_links(LinkCache::new(config));
+    let client = zeron_rpc::memory_client(core_a.rpc_service());
+    let params = json!({"projectId":"p","catalog":[{"name":"a","relativePath":".agents/skills/a/SKILL.md"}],"targetDeviceId":"device-b"});
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut rx = loop {
+        match client
+            .subscribe_checked("WatchProjectSkillUsage", params.clone())
+            .await
+        {
+            Ok(rx) => break rx,
+            Err(e) => {
+                assert!(tokio::time::Instant::now() < deadline, "{e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    loop {
+        let f: ProjectSkillUsageSnapshot = serde_json::from_value(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        if f.coverage == SkillUsageCoverage::Loading {
+            continue;
+        }
+        assert_eq!(f.host_device_id, "device-b");
+        assert_eq!(f.coverage, SkillUsageCoverage::Complete);
+        assert_eq!(f.counts[0].count, 1);
+        break;
+    }
+    assert!(
+        client
+            .subscribe_checked(
+                "WatchProjectSkillUsage",
+                json!({"projectId":"p","catalog":[]})
+            )
+            .await
+            .is_err()
+    );
+    drop(rx);
+    drop(host);
+    core_a.shutdown().await;
+    core_b.shutdown().await;
+    relay.abort();
+}
+
+#[tokio::test]
+async fn project_skill_usage_offline_and_legacy_hosts_never_return_confirmed_zero() {
+    use serde_json::json;
+    let dirs = tempfile::tempdir().unwrap();
+    let core = assemble(&dirs.path().join("viewer"), "viewer");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let params = json!({"projectId":"p","catalog":[],"targetDeviceId":"legacy"});
+    match client
+        .subscribe_checked("WatchProjectSkillUsage", params.clone())
+        .await
+    {
+        Err(error) => assert!(error.to_string().contains("remote routing unavailable")),
+        Ok(_) => panic!("offline host must not emit a total"),
+    }
+    let (relay_url, relay) = fake_device_room().await;
+    let legacy = Arc::new(LegacyChangeRequestService {
+        list_harnesses_calls: AtomicUsize::new(0),
+    });
+    let host = HostRelay::spawn(
+        HostRelayConfig::new(
+            &relay_url,
+            "legacy",
+            Arc::new(StaticToken("test-user".into())),
+        ),
+        legacy,
+        Arc::new(|_| true),
+    );
+    let mut config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    config.probe_timeout = Duration::from_secs(5);
+    core.set_links(LinkCache::new(config));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match client
+            .subscribe_checked("WatchProjectSkillUsage", params.clone())
+            .await
+        {
+            Err(RpcError::UnknownMethod(method)) => {
+                assert_eq!(method, "WatchProjectSkillUsage");
+                break;
+            }
+            Err(error) => {
+                assert!(tokio::time::Instant::now() < deadline, "{error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) => panic!("old host must not emit a total"),
+        }
+    }
+    assert_eq!(
+        client
+            .call(methods::LIST_HARNESSES, json!({"targetDeviceId":"legacy"}))
+            .await
+            .unwrap(),
+        json!([])
+    );
+    drop(host);
+    core.shutdown().await;
+    relay.abort();
 }

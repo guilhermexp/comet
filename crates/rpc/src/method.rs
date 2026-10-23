@@ -188,6 +188,7 @@ rpc_methods! {
     WATCH_TRANSFERS / WatchTransfers = "WatchTransfers" { params: serde_json::Value, reply: serde_json::Value },
     WATCH_CHATS / WatchChats = "WatchChats" { params: serde_json::Value, reply: serde_json::Value },
     WATCH_DEVICES / WatchDevices = "WatchDevices" { params: serde_json::Value, reply: serde_json::Value },
+    WATCH_PROJECT_SKILL_USAGE / WatchProjectSkillUsage = "WatchProjectSkillUsage" { params: zeron_proto::skill_usage::WatchProjectSkillUsageParams, reply: zeron_proto::skill_usage::ProjectSkillUsageSnapshot, forwardable: true, stream: true },
     WATCH_SESSIONS / WatchSessions = "WatchSessions" { params: serde_json::Value, reply: serde_json::Value },
     /// Spaces registry (device+folder pairs) from the workspace doc.
     WATCH_SPACES / WatchSpaces = "WatchSpaces" { params: serde_json::Value, reply: serde_json::Value },

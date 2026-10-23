@@ -158,12 +158,18 @@ impl DetailsSidebar {
                 .flatten()
                 .unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
+                if this.context_sources_pending.as_deref() != Some(key.as_str()) {
+                    return;
+                }
                 this.context_sources_task = None;
                 this.context_sources_pending = None;
                 this.context_sources = Some(ContextSources {
                     key,
+                    catalog: zeron_proto::skill_usage::project_skill_catalog(
+                        &skills,
+                        std::path::Path::new(&project_root),
+                    ),
                     skills: project_skills(skills, &project_root),
-                    catalog: Vec::new(),
                 });
                 cx.notify();
             });
@@ -183,6 +189,7 @@ impl DetailsSidebar {
     ) -> AnyElement {
         self.ensure_session_diff_watch(cx);
         self.ensure_context_sources(cx);
+        self.ensure_project_skill_usage(cx);
         let session = context
             .chat_id
             .as_deref()
@@ -537,6 +544,7 @@ impl DetailsSidebar {
             card = card.child(card_divider(theme)).child(
                 div()
                     .id("context-sources-header")
+                    .debug_selector(|| "context-sources-header".into())
                     .h(px(30.0))
                     .px(px(12.0))
                     .flex()
@@ -590,55 +598,86 @@ impl DetailsSidebar {
                 const ROW: f32 = 24.0;
                 const MAX_ROWS: usize = 7;
                 let skills = sources.skills.clone();
+                let usage = self.project_skill_usage.clone();
                 let entity = cx.entity();
                 let muted = theme.text_muted;
                 let hover = theme.element_hover.opacity(0.45);
                 let height = ROW * count.min(MAX_ROWS) as f32 + 4.0;
                 card = card.child(
-                    div().h(px(height)).pb(px(4.0)).child(
-                        gpui::uniform_list(
-                            "context-sources-list",
-                            count,
-                            move |range, _window, _app| {
-                                range
-                                    .filter_map(|ix| {
-                                        let skill = skills.get(ix)?.clone();
-                                        let entity = entity.clone();
-                                        let path = skill.relative_path.clone();
-                                        Some(
-                                            div()
-                                                .id(("context-source-skill", ix))
-                                                .h(px(ROW))
-                                                .mx(px(6.0))
-                                                .pl(px(29.0))
-                                                .pr(px(6.0))
-                                                .rounded(px(6.0))
-                                                .flex()
-                                                .items_center()
-                                                .cursor_pointer()
-                                                .hover(move |row| row.bg(hover))
-                                                .on_click(move |_, _, app| {
-                                                    entity.update(app, |this, cx| {
-                                                        this.emit_open_file(&path, cx)
-                                                    });
-                                                })
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .truncate()
-                                                        .text_size(px(12.0))
-                                                        .text_color(muted)
-                                                        .child(skill.name),
-                                                )
-                                                .into_any_element(),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                            },
-                        )
-                        .size_full()
-                        .track_scroll(&self.context_sources_scroll),
-                    ),
+                    div()
+                        .debug_selector(|| "project-skills-viewport".into())
+                        .h(px(height))
+                        .pb(px(4.0))
+                        .child(
+                            gpui::uniform_list(
+                                "context-sources-list",
+                                count,
+                                move |range, _window, _app| {
+                                    range
+                                        .filter_map(|ix| {
+                                            let skill = skills.get(ix)?.clone();
+                                            let entity = entity.clone();
+                                            let path = skill.relative_path.clone();
+                                            let (label, tooltip) = usage.presentation(&path);
+                                            Some(
+                                                div()
+                                                    .id(("context-source-skill", ix))
+                                                    .debug_selector(move || {
+                                                        format!("project-skill-row-{ix}")
+                                                    })
+                                                    .h(px(ROW))
+                                                    .mx(px(6.0))
+                                                    .pl(px(29.0))
+                                                    .pr(px(6.0))
+                                                    .rounded(px(6.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .cursor_pointer()
+                                                    .hover(move |row| row.bg(hover))
+                                                    .on_click(move |_, _, app| {
+                                                        entity.update(app, |this, cx| {
+                                                            this.emit_open_file(&path, cx)
+                                                        });
+                                                    })
+                                                    .child(
+                                                        div()
+                                                            .debug_selector(move || {
+                                                                format!("project-skill-name-{ix}")
+                                                            })
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .text_size(px(12.0))
+                                                            .text_color(muted)
+                                                            .child(skill.name),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(("project-skill-count", ix))
+                                                            .debug_selector(move || {
+                                                                format!("project-skill-count-{ix}")
+                                                            })
+                                                            .flex_shrink_0()
+                                                            .text_size(px(12.0))
+                                                            .text_color(muted)
+                                                            .child(label)
+                                                            .tooltip(move |_, cx| {
+                                                                cx.new(|_| ActionTooltip {
+                                                                    label: tooltip.clone().into(),
+                                                                })
+                                                                .into()
+                                                            }),
+                                                    )
+                                                    .into_any_element(),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                },
+                            )
+                            .size_full()
+                            .track_scroll(&self.context_sources_scroll),
+                        ),
                 );
             }
         }
@@ -653,22 +692,14 @@ pub(super) fn project_skills(
     skills: Vec<zeron_proto::invocation::Skill>,
     project_root: &str,
 ) -> Vec<ProjectSkill> {
-    let root = std::path::Path::new(project_root);
     skills
         .into_iter()
         .filter_map(|skill| {
-            if skill.path.is_empty() {
-                return None;
-            }
-            let path = std::path::Path::new(&skill.path);
-            let relative = if path.is_relative() {
-                path.to_path_buf()
-            } else {
-                path.strip_prefix(root).ok()?.to_path_buf()
-            };
+            let relative_path =
+                zeron_proto::skill_usage::project_skill_relative_path(&skill.path, project_root)?;
             Some(ProjectSkill {
                 name: skill.name.into(),
-                relative_path: relative.to_string_lossy().into_owned(),
+                relative_path,
             })
         })
         .collect()

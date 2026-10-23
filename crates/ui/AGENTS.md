@@ -393,6 +393,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Session information checkout totals use a scoped subscription only while their location metadata is visible. Settings/non-ready/Workers routes and hidden cards release it before early exits; the outgoing fade cannot resubscribe. This is independent of Worked Projects' existing local subscriptions.
 - Session hover cards reconcile once per sidebar render, honor dwell/warm timing and dismiss on scroll/drag/menu. Titles use the fork mention projection; confirmed PR badges retain device scope. Archived visibility is persisted by `apply_shell_settings`; Delete all snapshots only confirmed archived IDs and rechecks each before deletion.
 
+- Context sources conserva ordem e abertura de `ListSkills`, rows de 24px e viewport de sete rows. `skill_usage.rs` mantém catálogo completo (nomes externos só para colisões), estado e assinatura scoped por Project/host/catálogo normalizado, com geração e identidade da conexão. Exibe `xN` somente com cobertura Complete; Loading usa `…`, Partial/Unavailable usam `—`, sem badge/ícone/animação. Nome trunca antes do contador de 12px em `text_muted`. Trocar Chat equivalente reaproveita a assinatura; mudar escopo/host/catálogo ou ocultar Details cancela/ignora dados antigos. O hook existente de ocultação de Worked Projects também cancela esse stream. Aparência/tooltip/AppKit exigem aceite nativo separado.
+
 ## Work Guidance
 
 - **Workers / Projects:** ambas as telas agrupam checkouts pelo projeto
@@ -515,6 +517,7 @@ Additional integration coverage:
 | --- | --- | --- |
 | `src/{visuals,markdown/math}.rs` + `shell/{session_lanes,session_hover_card,sidebar_sections,session_info}.rs` | unit / GPUI; appearance and GPU interaction need isolated native smoke | `cargo test -p zeron-ui --lib` |
 | `src/settings.rs` + `settings/archived.rs` | unit / GPUI — central persistence, captured confirmation set and partial failures | `cargo test -p zeron-ui --lib settings` |
+| `src/details_sidebar/{skill_usage,session_card,view,worked_project_diffs}.rs` (contagens registradas de skills, cobertura, geração, assinatura RPC, geometria e gesto de abertura) | unit — reducer + GPUI com RPC controlado; aparência nativa continua none/notProven sem isolamento de providers | `cargo test --locked -p zeron-ui --lib project_skill_usage` · `cargo test --locked -p zeron-ui --lib session_card` |
 
 ## Child DOX Index
 

@@ -29,6 +29,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 - `visual` owns sandboxed Luau/native element trees and CPU raster/scene validation; `visual-gpu` owns bounded offscreen GPU state shared by desktop/mobile. `zatex` owns pure TeX layout and bundled math font provenance. None depends on UI or engine.
 
+- Totais históricos de skills de Project usam classificação pura em `proto::skill_usage`, backfill/stream host-local na engine e apresentação com cobertura explícita no Details. O corpus é o Chat Transcript retido por `space_id`, separado de Managed Provider Usage e dos CLI Workers.
+
 ## Work Guidance
 
 - Mudança que atravessa duas crates quase sempre indica que o tipo está na camada errada: tipo de fio vai pra `proto`, forma de documento vai pra `doc`.

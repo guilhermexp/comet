@@ -1288,6 +1288,7 @@ impl EngineRpc {
                     | methods::WATCH_CHECKOUT_CHANGE_REQUEST
                     | methods::WATCH_WORKSPACE_GIT_STATUS
                     | methods::WATCH_HARNESS_UPDATES
+                    | methods::WATCH_PROJECT_SKILL_USAGE
             ) {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
@@ -2696,6 +2697,20 @@ impl RpcService for EngineRpc {
                     },
                 );
                 Ok(RpcReply::Stream(Box::pin(stream)))
+            }
+            methods::WATCH_PROJECT_SKILL_USAGE => {
+                let p: zeron_proto::skill_usage::WatchProjectSkillUsageParams =
+                    parse_params(params)?;
+                let space = self.local_project_action_space(&p.project_id)?;
+                Ok(RpcReply::Stream(
+                    crate::skill_usage::watch_project_skill_usage(
+                        self.doc_host.clone(),
+                        self.workspace.clone(),
+                        &self.sessions,
+                        space,
+                        p.catalog,
+                    ),
+                ))
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))

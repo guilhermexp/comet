@@ -1172,30 +1172,67 @@ impl DocHost {
         &self,
         chat_id: &str,
     ) -> Result<Option<Arc<SessionDoc>>, EngineError> {
+        self.read_local_doc_with_coverage(chat_id)
+            .map(|read| read.map(|(doc, _)| doc))
+    }
+
+    /// Same local read path, with conservative completeness metadata. Existing
+    /// replay readers keep access to partial rows; projections must honor the flag.
+    pub(crate) fn read_local_doc_with_coverage(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<(Arc<SessionDoc>, bool)>, EngineError> {
         let cached = lock(&self.inner.handles).get(chat_id).cloned();
-        if cached
+        let mut complete = true;
+        if let Some(handle) = cached
             .as_ref()
-            .is_some_and(|handle| !handle.retired.load(Ordering::Acquire))
+            .filter(|handle| !handle.retired.load(Ordering::Acquire))
         {
-            return Ok(cached.map(|handle| handle.doc_arc()));
+            if let Some(stats) = ChatConnectionSnapshot::read(handle).stats
+                && stats.server_known
+                && stats.cursor < stats.head_seq
+            {
+                complete = false;
+            }
+            complete &= !handle.publication_failed.load(Ordering::Acquire);
+            if handle.room_gen >= 2 {
+                let pending = self.inner.store.pending_chat_updates(chat_id)?;
+                if !pending.is_empty() {
+                    // Validate on a private copy: never import or commit to a live
+                    // transcript as a side effect of reading a projection.
+                    let raw = handle.doc.doc().fork();
+                    for (_, bytes) in pending {
+                        let status = raw
+                            .import(&bytes)
+                            .map_err(|e| EngineError::Other(e.to_string()))?;
+                        complete &= status.pending.is_none();
+                    }
+                    return Ok(Some((Arc::new(SessionDoc::from_doc(raw)), complete)));
+                }
+            }
+            return Ok(Some((handle.doc_arc(), complete)));
         }
         let Some((bytes, _, epoch)) = self.inner.store.load_snapshot_with_cursor(chat_id)? else {
             // A retired handle can still be the only local copy during an
             // interrupted chat2 flip; use it until the thin lineage exists.
-            return Ok(cached.map(|handle| handle.doc_arc()));
+            return Ok(cached.map(|handle| (handle.doc_arc(), false)));
         };
         let raw = loro::LoroDoc::new();
-        raw.import(&bytes)
+        let status = raw
+            .import(&bytes)
             .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
+        complete &= status.pending.is_none();
         let doc = SessionDoc::from_doc(raw);
         if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
             for (_, bytes) in self.inner.store.pending_chat_updates(chat_id)? {
-                doc.doc()
+                let status = doc
+                    .doc()
                     .import(&bytes)
                     .map_err(|e| EngineError::Other(e.to_string()))?;
+                complete &= status.pending.is_none();
             }
         }
-        Ok(Some(Arc::new(doc)))
+        Ok(Some((Arc::new(doc), complete)))
     }
 
     /// Every background task rides the tracker, raced against the shutdown

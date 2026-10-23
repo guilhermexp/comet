@@ -133,6 +133,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 - `PublishVisual` is local-only and accepts only a live turn: it binds to `SessionsEngine::visual_turn` (run id + turn number, `None` while parked between turns) before decoding anything. Validate title/script bytes and named assets, run bounded Luau/control validation in `spawn_blocking`, store assets before the script, then `publish_visual` hands the event to the run loop, which acknowledges only when that same turn is still live (not parked, steered past, stopped or ended) and the part is written into the turn's entry. Success means persisted; any refusal or a dropped run removes the stored files. An accepted visual is turn activity (it restarts the quiesce window before the ack, as streamed events do); a refusal is not. The work runs in a detached task so a caller that goes away cannot strand files. This does not change root MCP grants or enable per-run MCP injection. `workspace_checkout` reuses the common bounded resolver: the canonical registered main folder is authorized even without Git, and additional checkouts come from NUL-safe Git enumeration. Deletion retains its separate Registration query and never treats that main-folder allowance as permission to delete it.
 
+- `skill_usage.rs` reconstrói tentativas identificáveis do Chat Transcript de todos os Chats retidos com `space_id` exato (inclusive arquivados/worktrees). Deduplica por Chat/raiz de continuação/tool e corta somente no fork próprio. O watch se inscreve antes do backfill, lê registro atual e docs frios/outbox em `spawn_blocking` sem abrir rooms, substitui contribuições e reconcilia Chats/Sessions ao fim do segmento/turno. Corpus ausente, descartado, causalmente incompleto ou de host estrangeiro é Partial; ownership inválido é Unavailable. Não usa Run Journal nem contador persistido.
+
 ## Work Guidance
 
 - O watchdog de quietude respeita `authoritative_prompt_end` em turnos com prompt: ACP permanece `Working` até o sinal autoritativo e aceita o próximo steer. Atividade autônoma mantém o fallback, coberto por `tests/acp_lifecycle.rs`.
@@ -191,6 +193,7 @@ Additional integration coverage:
 | Layer / path | Tier | Command |
 | --- | --- | --- |
 | `tests/e2e.rs::publish_visual_*` + `visual_publication_is_bound_to_the_turn_it_was_checked_in` + visual uploads | integration — actual RPC/Loro/host upload paths, parked runtime, turn binding/ack | `cargo test -p zeron-engine --test e2e visual` and `--test visual_quiesce` (paused time) |
+| `src/skill_usage.rs` + `tests/project_skill_usage.rs` + casos `project_skill_usage` de `tests/device_routing.rs` (identidade/replay/fork, corpus frio/outbox, cobertura, refresh e relay) | unit / integration — Loro, SQLite e RPC reais isolados | `cargo test --locked -p zeron-engine --lib skill_usage` · `cargo test --locked -p zeron-engine --test project_skill_usage` · `cargo test --locked -p zeron-engine --test device_routing project_skill_usage` |
 
 ## Child DOX Index
 
