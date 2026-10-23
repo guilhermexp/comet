@@ -15,6 +15,7 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use zeron_sync::DocsStore;
 
+mod skill_usage;
 pub mod agent_accounts;
 pub(crate) mod antigravity_usage;
 pub mod auth;
