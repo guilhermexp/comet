@@ -189,33 +189,31 @@ impl DetailsSidebar {
                 catalog: key.catalog,
                 target_device_id: Some(key.host),
             };
-            if let Ok(mut rx) = engine
-                .client()
-                .subscribe_scoped(
-                    methods::WATCH_PROJECT_SKILL_USAGE,
-                    serde_json::to_value(params).unwrap(),
-                )
-                .await
-            {
-                while let Some(value) = rx.recv().await {
-                    let snapshot = serde_json::from_value(value).ok();
-                    if this
-                        .update(cx, |this, cx| {
-                            if this.project_skill_usage.receive(generation, snapshot) {
-                                cx.notify();
-                            }
-                        })
-                        .is_err()
-                    {
-                        return;
+            let params = serde_json::to_value(params).unwrap();
+            let mut retry_seconds = 1;
+            loop {
+                let result = engine.client().subscribe_checked(methods::WATCH_PROJECT_SKILL_USAGE, params.clone()).await;
+                let unsupported = matches!(&result, Err(zeron_rpc::RpcError::UnknownMethod(_) | zeron_rpc::RpcError::BadParams(_) | zeron_rpc::RpcError::Capability(_)));
+                if let Ok(mut rx) = result {
+                    while let Some(value) = rx.recv().await {
+                        let snapshot = serde_json::from_value(value).ok();
+                        if this.update(cx, |this,cx| {
+                            if this.project_skill_usage.receive(generation,snapshot) { cx.notify(); }
+                        }).is_err() { return; }
                     }
                 }
+                let current = this.update(cx, |this,cx| {
+                    if this.project_skill_usage.generation != generation { return false; }
+                    if this.project_skill_usage.receive(generation,None) { cx.notify(); }
+                    true
+                }).unwrap_or(false);
+                if !current || unsupported { return; }
+                // A forwarded stream can end during a short host outage while
+                // presence remains online. Recovery belongs to this scoped task,
+                // never to redraw; dropping it cancels both timer and RPC.
+                cx.background_executor().timer(std::time::Duration::from_secs(retry_seconds)).await;
+                retry_seconds = (retry_seconds * 2).min(30);
             }
-            let _ = this.update(cx, |this, cx| {
-                if this.project_skill_usage.receive(generation, None) {
-                    cx.notify();
-                }
-            });
         }));
     }
 }
@@ -332,6 +330,8 @@ mod lifecycle_tests {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out,inbound)));state.local_device_id=Some("local".into());
             state.spaces=vec![serde_json::from_value(json!({"id":"p","deviceId":"project-host","path":"/main","createdAt":"2026-01-01T00:00:00Z"})).unwrap()];
             state.chats=vec![serde_json::from_value(json!({"id":"chat","spaceId":"p","deviceId":"chat-host","cwd":"/tree","archived":false,"createdAt":"2026-01-01T00:00:00Z"})).unwrap()];
+            state.connectivity.state=zeron_proto::ConnectivityState::Connected;
+            state.devices=vec![serde_json::from_value(json!({"id":"project-host","name":"host","platform":"linux","lastSeenAt":chrono::Utc::now()})).unwrap()];
         });
         let workers = cx.new(|cx| WorkersModel::detached(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -615,6 +615,27 @@ mod lifecycle_tests {
                 "EOF alone must not loop retries"
             );
         }
+        // The actual short outage: presence/global connectivity never went down.
+        window.executor().advance_clock(std::time::Duration::from_secs(1));
+        for _ in 0..12 {
+            sidebar.update(window, |s,cx|s.ensure_project_skill_usage(cx));
+            window.run_until_parked();
+            runtime.block_on(async {tokio::task::yield_now().await;});
+            while let Ok(request)=requests.try_recv() {
+                let request:zeron_rpc::ClientFrame=serde_json::from_str(&request).unwrap();
+                if request.cancel {cancellations.push(request.id);continue;}
+                if request.method.as_deref()==Some("WatchProjectSkillUsage") {
+                    watches.push(request.id);
+                    replies.try_send(serde_json::to_string(&zeron_rpc::ServerFrame{id:request.id,item:Some(json!({"projectId":"p","hostDeviceId":"project-host","counts":[{"relativePath":".agents/skills/0/SKILL.md","count":43}],"coverage":"complete","chatsTotal":2,"chatsCounted":2})),..Default::default()}).unwrap()).unwrap();
+                }
+            }
+        }
+        state.read_with(window,|s,_| {
+            assert!(s.device_online("project-host",chrono::Utc::now()));
+            assert_eq!(s.connectivity.state,zeron_proto::ConnectivityState::Connected);
+        });
+        assert_eq!(watches.len(),2,"short EOF must recover while presence stays online");
+        assert_eq!(sidebar.read_with(window,|s,_|s.project_skill_usage.presentation(".agents/skills/0/SKILL.md").0),"x43");
         for phase in 0..3 {
             let initial_offline = phase == 1;
             if initial_offline {
@@ -662,6 +683,41 @@ mod lifecycle_tests {
                 "x42"
             );
         }
+        // Terminate the healthy watch, then change catalog while recovery sleeps.
+        replies.try_send(serde_json::to_string(&zeron_rpc::ServerFrame{id:*watches.last().unwrap(),done:true,..Default::default()}).unwrap()).unwrap();
+        for _ in 0..6 { runtime.block_on(async{tokio::task::yield_now().await;}); window.run_until_parked(); }
+        for (name,error,permanent) in [("unsupported","unknown method: WatchProjectSkillUsage",true),("retrying","temporarily unavailable",false)] {
+            let before=watches.len();
+            sidebar.update(window,|s,cx| {
+                s.context_sources.as_mut().unwrap().catalog.push(SkillUsageCatalogEntry{name:name.into(),relative_path:None});
+                s.ensure_project_skill_usage(cx);
+            });
+            for _ in 0..12 {
+                window.run_until_parked();
+                runtime.block_on(async{tokio::task::yield_now().await;});
+                while let Ok(request)=requests.try_recv() {
+                    let request:zeron_rpc::ClientFrame=serde_json::from_str(&request).unwrap();
+                    if request.cancel {cancellations.push(request.id);continue;}
+                    if request.method.as_deref()==Some("WatchProjectSkillUsage") {
+                        watches.push(request.id);
+                        replies.try_send(serde_json::to_string(&zeron_rpc::ServerFrame{id:request.id,err:Some(error.into()),..Default::default()}).unwrap()).unwrap();
+                    }
+                }
+            }
+            assert_eq!(watches.len(),before+1);
+            assert_eq!(sidebar.read_with(window,|s,_|s.project_skill_usage.coverage),SkillUsageCoverage::Unavailable);
+            if permanent {
+                window.executor().advance_clock(std::time::Duration::from_secs(60));
+                for _ in 0..12 {
+                    sidebar.update(window,|s,cx|s.ensure_project_skill_usage(cx));
+                    window.run_until_parked(); runtime.block_on(async{tokio::task::yield_now().await;});
+                }
+                while let Ok(request)=requests.try_recv() {
+                    let request:zeron_rpc::ClientFrame=serde_json::from_str(&request).unwrap();
+                    assert_ne!(request.method.as_deref(),Some("WatchProjectSkillUsage"),"unsupported host and canceled old scope must not retry");
+                }
+            }
+        }
         sidebar.update(window, |s, cx| s.hide_worked_project_diffs(cx));
         window.run_until_parked();
         runtime.block_on(async {
@@ -674,8 +730,14 @@ mod lifecycle_tests {
             }
         }
         assert!(
-            cancellations.contains(watches.last().unwrap()),
-            "hiding Details cancels the RPC even if no further frame arrives"
+            cancellations.contains(&watches[1]),
+            "scope/availability changes cancel the previously healthy RPC"
         );
+        window.executor().advance_clock(std::time::Duration::from_secs(60));
+        for _ in 0..6 {window.run_until_parked();runtime.block_on(async{tokio::task::yield_now().await;});}
+        while let Ok(request)=requests.try_recv() {
+            let request:zeron_rpc::ClientFrame=serde_json::from_str(&request).unwrap();
+            assert_ne!(request.method.as_deref(),Some("WatchProjectSkillUsage"),"hide must cancel delayed recovery");
+        }
     }
 }
