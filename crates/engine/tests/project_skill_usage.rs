@@ -112,6 +112,7 @@ async fn project_skill_usage_cold_outbox_restart_replay_and_missing_history() {
             core.workspace
                 .create_chat("missing", Some("p"), None, None, Some("/tree".into()))
                 .unwrap();
+            store.delete_snapshot("missing").unwrap();
             let mut rx = client
                 .subscribe_scoped("WatchProjectSkillUsage", params("p"))
                 .await
@@ -342,4 +343,40 @@ fn project_skill_usage_update_during_backfill_is_not_lost() {
         drop(stream);
         core.shutdown().await;
     });
+}
+
+#[tokio::test]
+async fn project_skill_usage_review_f2_create_empty_chat_rpc_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    for pass in 0..2 {
+        let core = core(dir.path());
+        setup(&core);
+        let disk = store(dir.path());
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        if pass == 0 { seed(&core, &disk, "existing", "p", 5, 0); }
+        let mut old = client.subscribe_scoped("WatchProjectSkillUsage", params("p")).await.unwrap();
+        assert_eq!(settled(&mut old).await.counts[0].count, 5);
+        client.call("Mutate", json!({"op":"createChat","chatId":"empty","spaceId":"p"})).await.unwrap();
+        let mut new = client.subscribe_scoped("WatchProjectSkillUsage", params("p")).await.unwrap();
+        let snapshot = settled(&mut new).await;
+        assert_eq!(snapshot.coverage, SkillUsageCoverage::Complete, "new empty Chat has durable coverage");
+        assert_eq!(snapshot.counts[0].count, 5);
+        assert_eq!(snapshot.chats_counted, 2);
+        if pass == 0 { assert_eq!(settled(&mut old).await, snapshot); }
+        if pass == 0 {
+            // Recovery may have restored a snapshot before the row. Creation
+            // must not overwrite it even when the registry idempotence guard misses.
+            let recovered = SessionDoc::init("recovered-before-row").unwrap();
+            recovered.push_message(&entry("preserved", 2)).unwrap();
+            let bytes = recovered.export_snapshot().unwrap();
+            disk.save_snapshot("recovered-before-row", &bytes).unwrap();
+            client.call("Mutate", json!({"op":"createChat","chatId":"recovered-before-row","spaceId":"q"})).await.unwrap();
+            assert_eq!(disk.load_snapshot("recovered-before-row").unwrap(), Some(bytes));
+        }
+        // Retrying creation cannot reset an already populated transcript.
+        client.call("Mutate", json!({"op":"createChat","chatId":"existing","spaceId":"p"})).await.unwrap();
+        assert_eq!(disk.load_snapshot("existing").unwrap().map(|b| SessionDoc::from_doc({ let d=loro::LoroDoc::new(); d.import(&b).unwrap(); d }).read_entries().unwrap().len()), Some(1));
+        drop(old); drop(new);
+        core.shutdown().await;
+    }
 }

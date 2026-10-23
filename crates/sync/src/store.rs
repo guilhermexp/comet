@@ -134,6 +134,18 @@ impl DocsStore {
         })
     }
 
+    /// Persist a newly born local Chat without replacing any recovered history.
+    /// The caller must establish that the registry row does not yet exist.
+    pub fn initialize_chat_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        store_blocking(|| {
+            self.conn().execute(
+                "INSERT OR IGNORE INTO snapshots (doc_id,bytes,saved_at,cursor,epoch,cursor_verified) VALUES (?1,?2,?3,0,2,1)",
+                params![doc_id,bytes,now_ms()],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Insert before sending. Stable IDs make crash-after-ACK replay idempotent.
     pub fn enqueue_chat_update(
         &self,
@@ -776,6 +788,24 @@ mod tests {
         a.await.unwrap();
         b.await.unwrap();
         holding.join().unwrap();
+    }
+
+    #[test]
+    fn history_birth_is_atomic_and_never_replaces_recovered_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = DocsStore::open(dir.path()).unwrap();
+        let second = DocsStore::open(dir.path()).unwrap();
+        first.save_snapshot_with_cursor("recovered", b"real history", 42, 2).unwrap();
+        second.initialize_chat_snapshot("recovered", b"empty").unwrap();
+        assert_eq!(first.load_snapshot_with_cursor("recovered").unwrap(), Some((b"real history".to_vec(),42,2)));
+        std::thread::scope(|scope| {
+            scope.spawn(|| first.initialize_chat_snapshot("new", b"first").unwrap());
+            scope.spawn(|| second.initialize_chat_snapshot("new", b"second").unwrap());
+        });
+        let (bytes,cursor,epoch)=first.load_snapshot_with_cursor("new").unwrap().unwrap();
+        assert!(bytes == b"first" || bytes == b"second");
+        assert_eq!((cursor,epoch),(0,2));
+        assert!(first.snapshot_cursor_verified("new").unwrap());
     }
 
     #[test]

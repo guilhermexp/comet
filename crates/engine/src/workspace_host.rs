@@ -1029,6 +1029,13 @@ impl WorkspaceHost {
             }
             None => cwd.unwrap_or_default(),
         };
+        // Publish the registry row only after its empty local history is durable.
+        // Missing history for an existing/synced row remains unknown. INSERT OR
+        // IGNORE also preserves a transcript recovered before a creation retry.
+        if host_device == self.inner.config.device_id {
+            let doc = zeron_doc::SessionDoc::init(chat_id)?;
+            self.inner.store.initialize_chat_snapshot(chat_id, &doc.export_snapshot()?)?;
+        }
         self.mutate(|doc| {
             doc.upsert_chat(&Chat {
                 id: chat_id.to_string(),
