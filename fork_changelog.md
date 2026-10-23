@@ -2,7 +2,7 @@
 
 Tracks local/private fork changes against upstream.
 
-## 2026-10-23 — Invocações registradas de skills por Project (não publicado)
+## 2026-10-23 — v1.0.10: invocações registradas de skills por Project
 
 - Context sources passa a mostrar `xN` discretamente à direita de cada skill do projeto. O total agrega os Chats retidos do mesmo `space_id`, inclusive arquivados e worktrees, sem mudar a ordem, o header, as linhas de 24px, o viewport de sete linhas ou a abertura do arquivo.
 - A engine reconstrói o total do Chat Transcript local, incluindo outbox chat2, sem abrir rooms frias nem persistir um contador. Chaves de chamada/continuação e o marcador próprio de fork evitam inflação por resultados, replay e prefixos herdados; inclusão, purga e encerramento de turnos atualizam a projeção.
@@ -10,7 +10,7 @@ Tracks local/private fork changes against upstream.
 - Revisão F1–F5: reconnect do host rearma a assinatura sem loop de retry; Chat vazio novo conserva cobertura após restart; imports/sync normais invalidam a contribuição já calculada; reads com seletores válidos identificam o entrypoint preservando nomes com dois-pontos; replay cached continua disponível mesmo se a validação separada do outbox falhar.
 - Follow-up F1/F2/F4: EOF curto recupera com retry scoped e backoff mesmo com presença online; host não suportado não recebe loop de retries. A confirmação online de CreateChat do viewer conserva nascimento durável no owner via relay, sem abrir transcript e mantendo protocolo legado. Reads reconhecem ranges abertos, tail, raw isolado/posicional e listas da gramática completa do runtime.
 - CreateChat mantém criação local-first/offline e retry idempotente, sem exigir owner online: row existente pula o relay; confirmação opcional de nascimento de row nova tem budget de 1s e indisponibilidade segue a mutação local com cobertura honesta, sem fabricar histórico.
-- Change: `openspec/changes/add-project-skill-usage-counts`. Provas focadas de engine/RPC e GPUI na box; aparência nativa macOS permanece `notProven`, sem lançar QA contra configurações reais de providers. Sem integração ou publicação nesta etapa.
+- Change arquivada: `openspec/changes/archive/2026-10-23-add-project-skill-usage-counts`. Implementação e provas focadas de engine/RPC e GPUI na box, incluindo criação remota/offline; aparência nativa macOS permanece `notProven`, sem lançar QA contra configurações reais de providers. Publicação pelo fluxo existente do fork: tag `v1.0.10`, DMG, tarball arm64 do app e `manifest.json`.
 
 ## Baseline histórico
 
