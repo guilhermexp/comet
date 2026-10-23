@@ -89,12 +89,30 @@ struct UsageWatch {
     sessions: watch::Receiver<Vec<Session>>,
     spaces: watch::Receiver<Vec<Space>>,
     prior_sessions: Vec<Session>,
+    history: tokio::sync::broadcast::Receiver<String>,
+    history_dirty: std::collections::HashSet<String>,
     contributions: BTreeMap<String, (Chat, ChatSkillUsage)>,
     first: bool,
     last: Option<ProjectSkillUsageSnapshot>,
 }
 
 impl UsageWatch {
+    fn drain_history(&mut self) {
+        loop {
+            match self.history.try_recv() {
+                Ok(id) => { self.history_dirty.insert(id); }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    self.history_dirty.extend(self.contributions.keys().cloned());
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn history_ready(&self) -> bool {
+        self.history_dirty.iter().any(|id| !self.prior_sessions.iter().any(|s| &s.chat_id == id && s.status == SessionStatus::Working))
+    }
+
     fn snapshot(&self, coverage: SkillUsageCoverage) -> ProjectSkillUsageSnapshot {
         let mut totals: BTreeMap<String, u64> = self
             .catalog
@@ -172,6 +190,14 @@ impl UsageWatch {
                     .map(|s| s.chat_id.clone()),
             )
             .collect();
+        self.drain_history();
+        // Local streaming snapshots can be persisted during a turn. Coalesce
+        // those revisions until its existing Session completion notification.
+        let working: std::collections::HashSet<_> = sessions.iter().filter(|s| s.status == SessionStatus::Working).map(|s| s.chat_id.clone()).collect();
+        let mut dirty = dirty;
+        self.history_dirty.retain(|id| {
+            if working.contains(id) { true } else { dirty.insert(id.clone()); false }
+        });
         self.prior_sessions = sessions;
         let eligible: Vec<_> = current
             .into_iter()
@@ -179,6 +205,7 @@ impl UsageWatch {
             .collect();
         self.contributions
             .retain(|id, _| eligible.iter().any(|chat| &chat.id == id));
+        self.history_dirty.retain(|id| eligible.iter().any(|chat| &chat.id == id));
         for chat in eligible {
             if !root_changed
                 && !dirty.contains(&chat.id)
@@ -236,6 +263,7 @@ pub(crate) fn watch_project_skill_usage(
     let chats = workspace.watch_chats();
     let sessions = sessions.watch_sessions();
     let spaces = workspace.watch_spaces();
+    let history = host.watch_history_changes();
     let state = UsageWatch {
         host,
         workspace,
@@ -246,6 +274,8 @@ pub(crate) fn watch_project_skill_usage(
         sessions,
         spaces,
         prior_sessions: Vec::new(),
+        history,
+        history_dirty: Default::default(),
         contributions: BTreeMap::new(),
         first: true,
         last: None,
@@ -259,21 +289,37 @@ pub(crate) fn watch_project_skill_usage(
             ));
         }
         loop {
+            state.drain_history();
+            let history_ready = state.history_ready();
             if state.last.is_some()
+                && !history_ready
                 && !state.chats.has_changed().unwrap_or(false)
                 && !state.sessions.has_changed().unwrap_or(false)
                 && !state.spaces.has_changed().unwrap_or(false)
             {
                 tokio::select! {
+                    event = state.history.recv() => {
+                        match event {
+                            Ok(id) => {
+                                let working = state.prior_sessions.iter().any(|s| s.chat_id == id && s.status == SessionStatus::Working);
+                                state.history_dirty.insert(id);
+                                if working { continue; }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { state.history_dirty.extend(state.contributions.keys().cloned()); }
+                            Err(_) => return None,
+                        }
+                    },
                     changed = state.chats.changed() => { changed.ok()?; },
                     changed = state.sessions.changed() => { changed.ok()?; },
                     changed = state.spaces.changed() => { changed.ok()?; },
                 }
             }
             state.reconcile().await;
+            state.drain_history();
+            let history_ready = state.history_ready();
             // Reconcile queued updates before publishing: an older scan never
             // overwrites a newer contribution, including tools-only completions.
-            if state.chats.has_changed().unwrap_or(false)
+            if history_ready || state.chats.has_changed().unwrap_or(false)
                 || state.sessions.has_changed().unwrap_or(false)
                 || state.spaces.has_changed().unwrap_or(false)
             {

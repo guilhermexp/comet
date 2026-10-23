@@ -103,6 +103,7 @@ const MAINTENANCE_BUSY_TIMEOUT: Duration = Duration::ZERO;
 /// that gives command execution mark-BEFORE-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
+    history_changes: tokio::sync::broadcast::Sender<String>,
     failed_publications: Mutex<HashSet<String>>,
     /// Snapshot jobs wait here asynchronously before entering the blocking pool.
     pub snapshot_writer: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -129,9 +130,22 @@ impl DocsStore {
         conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            history_changes: tokio::sync::broadcast::channel(256).0,
             failed_publications: Mutex::new(HashSet::new()),
             snapshot_writer: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
+    }
+
+    /// Ephemeral local history invalidations. Consumers subscribe before reading;
+    /// lag requires rebuilding their own projection. No retained analytics state.
+    pub fn watch_history_changes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.history_changes.subscribe()
+    }
+
+    pub fn note_history_changed(&self, doc_id: &str) {
+        if self.history_changes.receiver_count() > 0 {
+            let _ = self.history_changes.send(doc_id.to_owned());
+        }
     }
 
     /// Persist a newly born local Chat without replacing any recovered history.
@@ -172,6 +186,7 @@ impl DocsStore {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(doc_id.to_string());
         }
+        self.note_history_changed(doc_id);
         result?;
         Ok(())
     }
@@ -246,6 +261,7 @@ impl DocsStore {
             "DELETE FROM chat_outbox WHERE doc_id=?1 AND batch_id=?2",
             params![doc_id, batch_id],
         )?;
+        self.note_history_changed(doc_id);
         Ok(())
     }
 
@@ -330,6 +346,7 @@ impl DocsStore {
         )?;
         self.invalidate_failed_publication(&tx, doc_id)?;
         tx.commit()?;
+        self.note_history_changed(doc_id);
         Ok(())
     }
 
@@ -363,6 +380,7 @@ impl DocsStore {
         )?;
         self.invalidate_failed_publication(&tx, doc_id)?;
         tx.commit()?;
+        self.note_history_changed(doc_id);
         Ok(())
     }
 
@@ -395,6 +413,7 @@ impl DocsStore {
         )?;
         self.invalidate_failed_publication(&tx, doc_id)?;
         tx.commit()?;
+        self.note_history_changed(doc_id);
         Ok(())
     }
 
@@ -493,6 +512,7 @@ impl DocsStore {
             params![doc_id],
         )?;
         tx.commit()?;
+        self.note_history_changed(doc_id);
         Ok(())
     }
 

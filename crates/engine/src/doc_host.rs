@@ -1181,6 +1181,10 @@ impl DocHost {
             .map(|read| read.map(|(doc, _)| doc))
     }
 
+    pub(crate) fn watch_history_changes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.inner.store.watch_history_changes()
+    }
+
     /// Same local read path, with conservative completeness metadata. Existing
     /// replay readers keep access to partial rows; projections must honor the flag.
     pub(crate) fn read_local_doc_with_coverage(
@@ -1788,7 +1792,12 @@ impl DocHost {
         let history = transcript_history.clone();
         let watched = messages_tx.clone();
         let weak_doc = Arc::downgrade(&doc);
+        let history_store = self.inner.store.clone();
+        let history_chat = chat_id.to_owned();
         let sub = doc.doc().subscribe_root(Arc::new(move |diff| {
+            if diff.triggered_by == loro::EventTriggerKind::Import {
+                history_store.note_history_changed(&history_chat);
+            }
             // This callback runs before the change worker can publish. The
             // import origin belongs to the event, so concurrent local commits
             // cannot inherit a remote replay's presentation classification.
@@ -2632,6 +2641,9 @@ impl DocHost {
                                             let Some(handle) = weak.upgrade() else { return };
                                             tracing::warn!(chat = %chat, "chat2 room reset; posting seed checkpoint");
                                             host.spawn_chat2_checkpoint(&handle, "server-reset");
+                                        }
+                                        Ok(ChatEvent::CaughtUp { .. }) => {
+                                            host.inner.store.note_history_changed(&chat);
                                         }
                                         Ok(ChatEvent::PushRejected) => {
                                             let Some(handle) = weak.upgrade() else { return };
