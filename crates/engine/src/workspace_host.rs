@@ -1034,7 +1034,9 @@ impl WorkspaceHost {
         // IGNORE also preserves a transcript recovered before a creation retry.
         if host_device == self.inner.config.device_id {
             let doc = zeron_doc::SessionDoc::init(chat_id)?;
-            self.inner.store.initialize_chat_snapshot(chat_id, &doc.export_snapshot()?)?;
+            self.inner
+                .store
+                .initialize_chat_snapshot(chat_id, &doc.export_snapshot()?)?;
         }
         self.mutate(|doc| {
             doc.upsert_chat(&Chat {

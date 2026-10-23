@@ -49,7 +49,7 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 - `AgentEvent::Visual` carries only id/path/title; the script and named assets remain host uploads, never inline CRDT bytes. Sidebar section order remains an additive neighbor-anchored capability with convergent registry positions.
 
-- `skill_usage` classifica somente chamadas estruturadas de Skill/entrypoint; nomes externos preservam colisões, caminhos são normalizados lexicalmente sem I/O. Cobertura do corpus não promete observar usos opacos do provider.
+- `skill_usage` classifica somente chamadas estruturadas de Skill/entrypoint; nomes externos preservam colisões, caminhos são normalizados lexicalmente sem I/O. Seletores positivos válidos de ReadFile (`:N`, `:N-M`, `:N+quantidade`, listas e `:raw:`) são removidos somente para identificar entrypoints; nomes literais com dois-pontos têm precedência no catálogo e drives Windows são preservados. Referências e sufixos inválidos não são adivinhados. Cobertura do corpus não promete observar usos opacos do provider.
 
 ## Work Guidance
 

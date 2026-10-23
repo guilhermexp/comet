@@ -85,3 +85,13 @@
 - Extensão mínima autorizada explicitamente pelo usuário: uma chamada de cancelamento em `worked_project_diffs.rs` no hook de ocultação já existente.
 - 5.2 permanece aberta: GPUI/RPC comprova geometria, scroll/colapso, gesto de OpenFile e cancelamento em fixtures; aparência, hover/tooltip e abertura nativos AppKit são **notProven**. Nenhuma cópia QA do app foi lançada contra configurações reais de providers.
 - 5.3 tem DOX/changelog atualizados e validação OpenSpec estrita válida; conferência do espelho e aceite final continuam com o orquestrador. Change não arquivada; sem push, merge, tag ou release. SHA final e relatório novo ficam em `.tmp/evidence/project-skill-usage/revision.txt` e `.tmp/reports/`.
+
+## Revisão F1–F5 na box (2026-10-23)
+
+- A entrega anterior `42fb2d90` não foi aceita; seus relatórios/logs permanecem preservados. Correções internas autorizadas em `.tmp/briefs/project-skill-usage-review.md`, com A1/A2 relidos por grupo.
+- F1: GPUI/RPC reproduziu EOF sem rearmar; recuperação por presença/conectividade e offline inicial passam sem duplicar watch estável ou retry por redraw. Geração e cancelamento permanecem cobertos.
+- F2: CreateChat RPC reproduziu Partial no Project com cinco usos. Snapshot vazio de nascimento é durável e insert-if-absent; restart/retry/recuperação anterior à row não substituem histórico. Ausência real/corrupção seguem Partial.
+- F3: import normal após scan reproduziu total obsoleto. Imports, CaughtUp e persistência/outbox local invalidam a contribuição afetada, com notificações efêmeras, coalescidas durante Working. Regressões incluem Partial recuperado e corrida durante backfill sem alterar metadados/Sessions.
+- F4: ranges de entrada antes não casavam; seletores válidos (incluindo raw/lista), nomes literais com dois-pontos, colisões e drives Windows estão cobertos sem alterar sanitizadores/TurnSteps.
+- F5: outbox malformado impedia replay cached; o caminho antigo volta a servir o mesmo Arc/entries e a leitura de cobertura continua falhando conservadoramente.
+- RED/GREEN e gate/smoke da revisão em `.tmp/evidence/project-skill-usage-review/`; SHA e mapa completo no relatório novo timestampado em `.tmp/reports/`. O gate final cobre todos os filtros afetados; 5.2 nativo e 5.3 aceite do orquestrador continuam abertos, sem archive ou publicação.

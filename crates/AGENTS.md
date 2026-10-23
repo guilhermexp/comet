@@ -54,7 +54,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 |---|---|---|
 | `zeron-proto` | [`proto/AGENTS.md`](proto/AGENTS.md) | Tipos de fio + derivações puras compartilhadas |
 | `zeron-doc` | [`doc/AGENTS.md`](doc/AGENTS.md) | Schemas Loro (session/workspace) + mirror layer |
-| `zeron-sync` | [`sync/AGENTS.md`](sync/AGENTS.md) | Cliente de room Loro + DocsStore |
+| `zeron-sync` | [`sync/AGENTS.md`](sync/AGENTS.md) | Cliente de room Loro + DocsStore (snapshot de nascimento e sinais efêmeros de histórico local) |
 | `zeron-harness` | [`harness/AGENTS.md`](harness/AGENTS.md) | Adaptadores Claude Code / Codex / mock |
 | `zeron-engine` | [`engine/AGENTS.md`](engine/AGENTS.md) | Backend: sessões, doc host, repos, terminais, uploads, auth |
 | `zeron-rpc` | [`rpc/AGENTS.md`](rpc/AGENTS.md) | UiRpc/ControlRpc tipados sobre WS + transporte in-memory |

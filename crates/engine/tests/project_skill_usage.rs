@@ -327,8 +327,10 @@ fn project_skill_usage_update_during_backfill_is_not_lost() {
         use zeron_sync::chat_client::ChatDocSink;
         let incoming = SessionDoc::from_doc(live.doc().doc().fork());
         incoming.push_message(&entry("during-backfill", 1)).unwrap();
-        let sink = zeron_engine::chat2_host::EngineChatSink::new(&live.doc_arc(), Arc::new(store), "b");
-        sink.apply_checkpoint(&incoming.export_snapshot().unwrap(), 0).unwrap();
+        let sink =
+            zeron_engine::chat2_host::EngineChatSink::new(&live.doc_arc(), Arc::new(store), "b");
+        sink.apply_checkpoint(&incoming.export_snapshot().unwrap(), 0)
+            .unwrap();
         release.send(()).unwrap();
         blocker.await.unwrap();
         let frame: ProjectSkillUsageSnapshot = serde_json::from_value(
@@ -353,16 +355,36 @@ async fn project_skill_usage_review_f2_create_empty_chat_rpc_restart() {
         setup(&core);
         let disk = store(dir.path());
         let client = zeron_rpc::memory_client(core.rpc_service());
-        if pass == 0 { seed(&core, &disk, "existing", "p", 5, 0); }
-        let mut old = client.subscribe_scoped("WatchProjectSkillUsage", params("p")).await.unwrap();
+        if pass == 0 {
+            seed(&core, &disk, "existing", "p", 5, 0);
+        }
+        let mut old = client
+            .subscribe_scoped("WatchProjectSkillUsage", params("p"))
+            .await
+            .unwrap();
         assert_eq!(settled(&mut old).await.counts[0].count, 5);
-        client.call("Mutate", json!({"op":"createChat","chatId":"empty","spaceId":"p"})).await.unwrap();
-        let mut new = client.subscribe_scoped("WatchProjectSkillUsage", params("p")).await.unwrap();
+        client
+            .call(
+                "Mutate",
+                json!({"op":"createChat","chatId":"empty","spaceId":"p"}),
+            )
+            .await
+            .unwrap();
+        let mut new = client
+            .subscribe_scoped("WatchProjectSkillUsage", params("p"))
+            .await
+            .unwrap();
         let snapshot = settled(&mut new).await;
-        assert_eq!(snapshot.coverage, SkillUsageCoverage::Complete, "new empty Chat has durable coverage");
+        assert_eq!(
+            snapshot.coverage,
+            SkillUsageCoverage::Complete,
+            "new empty Chat has durable coverage"
+        );
         assert_eq!(snapshot.counts[0].count, 5);
         assert_eq!(snapshot.chats_counted, 2);
-        if pass == 0 { assert_eq!(settled(&mut old).await, snapshot); }
+        if pass == 0 {
+            assert_eq!(settled(&mut old).await, snapshot);
+        }
         if pass == 0 {
             // Recovery may have restored a snapshot before the row. Creation
             // must not overwrite it even when the registry idempotence guard misses.
@@ -370,13 +392,41 @@ async fn project_skill_usage_review_f2_create_empty_chat_rpc_restart() {
             recovered.push_message(&entry("preserved", 2)).unwrap();
             let bytes = recovered.export_snapshot().unwrap();
             disk.save_snapshot("recovered-before-row", &bytes).unwrap();
-            client.call("Mutate", json!({"op":"createChat","chatId":"recovered-before-row","spaceId":"q"})).await.unwrap();
-            assert_eq!(disk.load_snapshot("recovered-before-row").unwrap(), Some(bytes));
+            client
+                .call(
+                    "Mutate",
+                    json!({"op":"createChat","chatId":"recovered-before-row","spaceId":"q"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                disk.load_snapshot("recovered-before-row").unwrap(),
+                Some(bytes)
+            );
         }
         // Retrying creation cannot reset an already populated transcript.
-        client.call("Mutate", json!({"op":"createChat","chatId":"existing","spaceId":"p"})).await.unwrap();
-        assert_eq!(disk.load_snapshot("existing").unwrap().map(|b| SessionDoc::from_doc({ let d=loro::LoroDoc::new(); d.import(&b).unwrap(); d }).read_entries().unwrap().len()), Some(1));
-        drop(old); drop(new);
+        client
+            .call(
+                "Mutate",
+                json!({"op":"createChat","chatId":"existing","spaceId":"p"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            disk.load_snapshot("existing")
+                .unwrap()
+                .map(|b| SessionDoc::from_doc({
+                    let d = loro::LoroDoc::new();
+                    d.import(&b).unwrap();
+                    d
+                })
+                .read_entries()
+                .unwrap()
+                .len()),
+            Some(1)
+        );
+        drop(old);
+        drop(new);
         core.shutdown().await;
     }
 }
@@ -385,34 +435,54 @@ async fn project_skill_usage_review_f2_create_empty_chat_rpc_restart() {
 async fn project_skill_usage_review_f3_normal_import_after_scan() {
     use zeron_sync::chat_client::ChatDocSink;
     let dir = tempfile::tempdir().unwrap();
-    let core = core(dir.path()); setup(&core);
+    let core = core(dir.path());
+    setup(&core);
     let disk = Arc::new(store(dir.path()));
     let source = seed(&core, &disk, "a", "p", 5, 0);
     let handle = core.doc_host.open_local("a").unwrap();
     let client = zeron_rpc::memory_client(core.rpc_service());
-    let mut rx = client.subscribe_scoped("WatchProjectSkillUsage", params("p")).await.unwrap();
+    let mut rx = client
+        .subscribe_scoped("WatchProjectSkillUsage", params("p"))
+        .await
+        .unwrap();
     assert_eq!(settled(&mut rx).await.counts[0].count, 5);
     let chats = core.workspace.read_chats().unwrap();
+    let sessions = core.sessions.watch_sessions().borrow().clone();
     source.push_message(&entry("imported", 1)).unwrap();
     let sink = zeron_engine::chat2_host::EngineChatSink::new(&handle.doc_arc(), disk.clone(), "a");
-    sink.apply_checkpoint(&source.export_snapshot().unwrap(), 0).unwrap();
-    let updated = tokio::time::timeout(Duration::from_secs(2), settled(&mut rx)).await.expect("normal import must invalidate scanned contribution");
+    sink.apply_checkpoint(&source.export_snapshot().unwrap(), 0)
+        .unwrap();
+    let updated = tokio::time::timeout(Duration::from_secs(2), settled(&mut rx))
+        .await
+        .expect("normal import must invalidate scanned contribution");
     assert_eq!(updated.coverage, SkillUsageCoverage::Complete);
     assert_eq!(updated.counts[0].count, 6);
     assert_eq!(core.workspace.read_chats().unwrap(), chats);
+    assert_eq!(*core.sessions.watch_sessions().borrow(), sessions);
     drop(rx);
     // Missing old history first scans Partial, then recovers through normal import.
-    core.workspace.create_chat("recover", Some("p"), None, None, None).unwrap();
+    core.workspace
+        .create_chat("recover", Some("p"), None, None, None)
+        .unwrap();
     disk.delete_snapshot("recover").unwrap();
-    let mut rx = client.subscribe_scoped("WatchProjectSkillUsage", params("p")).await.unwrap();
+    let mut rx = client
+        .subscribe_scoped("WatchProjectSkillUsage", params("p"))
+        .await
+        .unwrap();
     assert_eq!(settled(&mut rx).await.coverage, SkillUsageCoverage::Partial);
     let recovery = core.doc_host.open_local("recover").unwrap();
     let recovered_source = SessionDoc::init("recover").unwrap();
-    recovered_source.push_message(&entry("recovered", 2)).unwrap();
+    recovered_source
+        .push_message(&entry("recovered", 2))
+        .unwrap();
     let sink = zeron_engine::chat2_host::EngineChatSink::new(&recovery.doc_arc(), disk, "recover");
-    sink.apply_checkpoint(&recovered_source.export_snapshot().unwrap(), 0).unwrap();
-    let updated = tokio::time::timeout(Duration::from_secs(2), settled(&mut rx)).await.expect("import must recover incomplete contribution");
+    sink.apply_checkpoint(&recovered_source.export_snapshot().unwrap(), 0)
+        .unwrap();
+    let updated = tokio::time::timeout(Duration::from_secs(2), settled(&mut rx))
+        .await
+        .expect("import must recover incomplete contribution");
     assert_eq!(updated.coverage, SkillUsageCoverage::Complete);
     assert_eq!(updated.counts[0].count, 8);
-    drop(rx); core.shutdown().await;
+    drop(rx);
+    core.shutdown().await;
 }

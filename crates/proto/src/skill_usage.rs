@@ -110,13 +110,21 @@ fn reference(value: &str) -> Option<SkillInvocationRef<'_>> {
 /// arbitrary suffix. Name resolution still gives a literal catalog name priority.
 fn read_selector_base(path: &str) -> Option<&str> {
     let (base, selector) = path.rsplit_once(':')?;
-    let positive = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_ok_and(|n| n > 0);
+    let positive = |s: &str| {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u64>().is_ok_and(|n| n > 0)
+    };
     let valid = selector.split(',').all(|piece| {
         if let Some((start, end)) = piece.split_once('-') {
-            positive(start) && positive(end) && start.parse::<u64>().unwrap() <= end.parse::<u64>().unwrap()
+            positive(start)
+                && positive(end)
+                && start.parse::<u64>().unwrap() <= end.parse::<u64>().unwrap()
         } else if let Some((start, count)) = piece.split_once('+') {
             positive(start) && positive(count)
-        } else { positive(piece) }
+        } else {
+            positive(piece)
+        }
     });
     valid.then(|| base.strip_suffix(":raw").unwrap_or(base))
 }
@@ -128,8 +136,13 @@ pub fn skill_invocation_reference(call: &ToolCall) -> Option<SkillInvocationRef<
             if base.starts_with("skill://") {
                 let parsed = reference(base)?;
                 if base != path && !base.ends_with("/SKILL.md") {
-                    let SkillInvocationRef::Name(name) = parsed else { return None; };
-                    return Some(SkillInvocationRef::RangedReadName { literal: path.strip_prefix("skill://")?, name });
+                    let SkillInvocationRef::Name(name) = parsed else {
+                        return None;
+                    };
+                    return Some(SkillInvocationRef::RangedReadName {
+                        literal: path.strip_prefix("skill://")?,
+                        name,
+                    });
                 }
                 return Some(parsed);
             }
@@ -209,7 +222,11 @@ pub fn match_skill_reference(
 ) -> Option<String> {
     match reference {
         SkillInvocationRef::RangedReadName { literal, name } => {
-            let selected = if catalog.iter().any(|entry| entry.name == literal) { literal } else { name };
+            let selected = if catalog.iter().any(|entry| entry.name == literal) {
+                literal
+            } else {
+                name
+            };
             match_skill_reference(SkillInvocationRef::Name(selected), catalog, cwd, root)
         }
         SkillInvocationRef::Name(name) => {
@@ -361,19 +378,71 @@ mod tests {
     }
     #[test]
     fn skill_usage_review_f4_supported_read_selectors() {
-        let catalog = project_skill_catalog(&[skill("a", ".agents/skills/a/SKILL.md"), skill("plugin:tools", ".agents/skills/plugin/SKILL.md"), skill("literal:1-40", ".agents/skills/literal/SKILL.md")], Path::new("/main"));
-        let resolve = |path: &str| skill_invocation_reference(&read(path)).and_then(|r| match_skill_reference(r, &catalog, "/tree", "/main"));
-        for path in [".agents/skills/a/SKILL.md:1-40", "/tree/.agents/skills/a/SKILL.md:1-40", "/main/.agents/skills/a/SKILL.md:raw:1+80", "skill://a:1-40", "skill://a/SKILL.md:1-40", "skill://a:1-5,10-20"] {
-            assert_eq!(resolve(path), Some(".agents/skills/a/SKILL.md".into()), "{path}");
+        let catalog = project_skill_catalog(
+            &[
+                skill("a", ".agents/skills/a/SKILL.md"),
+                skill("plugin:tools", ".agents/skills/plugin/SKILL.md"),
+                skill("literal:1-40", ".agents/skills/literal/SKILL.md"),
+            ],
+            Path::new("/main"),
+        );
+        let resolve = |path: &str| {
+            skill_invocation_reference(&read(path))
+                .and_then(|r| match_skill_reference(r, &catalog, "/tree", "/main"))
+        };
+        for path in [
+            ".agents/skills/a/SKILL.md:1-40",
+            "/tree/.agents/skills/a/SKILL.md:1-40",
+            "/main/.agents/skills/a/SKILL.md:raw:1+80",
+            "skill://a:1-40",
+            "skill://a/SKILL.md:1-40",
+            "skill://a:1-5,10-20",
+        ] {
+            assert_eq!(
+                resolve(path),
+                Some(".agents/skills/a/SKILL.md".into()),
+                "{path}"
+            );
         }
-        assert_eq!(resolve("skill://plugin:tools"), Some(".agents/skills/plugin/SKILL.md".into()));
-        assert_eq!(resolve("skill://literal:1-40"), Some(".agents/skills/literal/SKILL.md".into()));
-        for path in ["skill://a/references/guide.md:1-40", ".agents/skills/a/SKILL.md:wat", ".agents/skills/a/SKILL.md:40-1", "skill://a:0-2", "skill://a:1-", "skill://a:raw:bad"] { assert_eq!(resolve(path), None, "{path}"); }
-        let windows = vec![SkillUsageCatalogEntry { name:"a".into(), relative_path:Some(".agents/skills/a/SKILL.md".into()) }];
+        assert_eq!(
+            resolve("skill://plugin:tools"),
+            Some(".agents/skills/plugin/SKILL.md".into())
+        );
+        assert_eq!(
+            resolve("skill://literal:1-40"),
+            Some(".agents/skills/literal/SKILL.md".into())
+        );
+        for path in [
+            "skill://a/references/guide.md:1-40",
+            ".agents/skills/a/SKILL.md:wat",
+            ".agents/skills/a/SKILL.md:40-1",
+            "skill://a:0-2",
+            "skill://a:1-",
+            "skill://a:raw:bad",
+        ] {
+            assert_eq!(resolve(path), None, "{path}");
+        }
+        let windows = vec![SkillUsageCatalogEntry {
+            name: "a".into(),
+            relative_path: Some(".agents/skills/a/SKILL.md".into()),
+        }];
         let call = read("C:\\tree\\.agents\\skills\\a\\SKILL.md:1-40");
-        assert_eq!(skill_invocation_reference(&call).and_then(|r| match_skill_reference(r,&windows,"C:/tree","C:/main")), Some(".agents/skills/a/SKILL.md".into()));
-        let collision = project_skill_catalog(&[skill("a", ".agents/skills/a/SKILL.md"),skill("a","/global/SKILL.md")],Path::new("/main"));
-        assert_eq!(skill_invocation_reference(&read("skill://a:1-40")).and_then(|r| match_skill_reference(r,&collision,"/tree","/main")),None);
+        assert_eq!(
+            skill_invocation_reference(&call)
+                .and_then(|r| match_skill_reference(r, &windows, "C:/tree", "C:/main")),
+            Some(".agents/skills/a/SKILL.md".into())
+        );
+        let collision = project_skill_catalog(
+            &[
+                skill("a", ".agents/skills/a/SKILL.md"),
+                skill("a", "/global/SKILL.md"),
+            ],
+            Path::new("/main"),
+        );
+        assert_eq!(
+            skill_invocation_reference(&read("skill://a:1-40"))
+                .and_then(|r| match_skill_reference(r, &collision, "/tree", "/main")),
+            None
+        );
     }
-
 }

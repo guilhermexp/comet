@@ -25,6 +25,8 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 - OS resume substitui sockets ativos de Registry/Chat, incluindo dial e handshake, preservando readiness e replay de batches. Wakes de consumidor e hints de conexão de outro room não derrubam sockets saudáveis.
 - Registry possui actor e fallback HTTP antes de esperar readiness; cancelar construção/shutdown não destaca tarefas. Shutdown interrompe dial/handshake/envio bloqueado e encerra o fallback antes do snapshot final.
 
+- `DocsStore::initialize_chat_snapshot` é insert-if-absent atômico, nunca substitui bytes/cursor recuperados. O host só o usa antes de publicar uma nova row local. `watch_history_changes` é um sinal transitório por store/perfil, somente com consumidores ativos, para mudanças de snapshots/outbox; não é ledger nem prova de completude. Consumidores assinam antes do scan, coalescem por doc e recuperam lag reconstruindo sua projeção. Imports quentes e CaughtUp são sinalizados pelo DocHost; o store não observa outras conexões SQLite externas.
+
 ## Work Guidance
 
 - Bug de "device sumiu" / "não converge": comece pelo `tests/registry_edge.rs`, que roda contra o edge real, antes de suspeitar do schema.
@@ -42,7 +44,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 | `src/registry/reliability_tests.rs` (resume, replay e ownership/cancelamento) | unit | `cargo test -p zeron-sync --features mock-server --lib registry::reliability_tests` |
 | `tests/registry_client.rs` | integration — cliente contra o DO mock in-process | `cargo test -p zeron-sync --features mock-server --test registry_client` |
 | `tests/registry_edge.rs` | e2e, `--ignored` por padrão; precisa de `wrangler dev` + `AUTH_MODE=dev` | `ZERON_EDGE_WS=ws://127.0.0.1:27640 cargo test -p zeron-sync --test registry_edge -- --ignored` |
-| `store.rs` outbox + `chat_client.rs` replay/ACK | unit | `cargo test -p zeron-sync --features mock-server --lib` |
+| `store.rs` nascimento atômico sem sobrescrita, invalidação local, outbox + `chat_client.rs` replay/ACK | unit | `cargo test -p zeron-sync --features mock-server --lib` |
 
 ## Child DOX Index
 

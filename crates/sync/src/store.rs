@@ -815,16 +815,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = DocsStore::open(dir.path()).unwrap();
         let second = DocsStore::open(dir.path()).unwrap();
-        first.save_snapshot_with_cursor("recovered", b"real history", 42, 2).unwrap();
-        second.initialize_chat_snapshot("recovered", b"empty").unwrap();
-        assert_eq!(first.load_snapshot_with_cursor("recovered").unwrap(), Some((b"real history".to_vec(),42,2)));
+        first
+            .save_snapshot_with_cursor("recovered", b"real history", 42, 2)
+            .unwrap();
+        second
+            .initialize_chat_snapshot("recovered", b"empty")
+            .unwrap();
+        assert_eq!(
+            first.load_snapshot_with_cursor("recovered").unwrap(),
+            Some((b"real history".to_vec(), 42, 2))
+        );
         std::thread::scope(|scope| {
             scope.spawn(|| first.initialize_chat_snapshot("new", b"first").unwrap());
             scope.spawn(|| second.initialize_chat_snapshot("new", b"second").unwrap());
         });
-        let (bytes,cursor,epoch)=first.load_snapshot_with_cursor("new").unwrap().unwrap();
+        let (bytes, cursor, epoch) = first.load_snapshot_with_cursor("new").unwrap().unwrap();
         assert!(bytes == b"first" || bytes == b"second");
-        assert_eq!((cursor,epoch),(0,2));
+        assert_eq!((cursor, epoch), (0, 2));
         assert!(first.snapshot_cursor_verified("new").unwrap());
     }
 
