@@ -16,6 +16,7 @@ pub mod motion;
 pub mod preview;
 pub mod projectless;
 pub mod sidebar_pins;
+pub mod skill_usage;
 pub mod view;
 pub mod voice;
 pub mod workspace;
