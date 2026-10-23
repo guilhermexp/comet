@@ -453,4 +453,21 @@ mod tests {
         assert!(core.doc_host.read_local_doc("a").unwrap().is_some());
         core.shutdown().await;
     }
+    #[tokio::test]
+    async fn skill_usage_review_f5_cached_replay_survives_bad_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(dir.path(), std::sync::Arc::new(crate::HarnessRegistry::new()), zeron_proto::HarnessId::Mock, None, "dev-org", "dev-user").unwrap();
+        core.workspace.create_space("p", &core.device_id, "/main", None, false).unwrap();
+        core.workspace.create_chat("child",Some("p"),None,None,Some("/tree".into())).unwrap();
+        let child = core.doc_host.open_local("child").unwrap();
+        child.doc().push_message(&entry("available", &["1"])).unwrap();
+        let store = zeron_sync::DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        store.enqueue_chat_update("child", "malformed", b"not a loro update").unwrap();
+        assert!(core.doc_host.read_local_doc_with_coverage("child").is_err());
+        let cached = core.doc_host.read_local_doc("child").expect("cached replay must not validate outbox").unwrap();
+        assert!(cached.read_entries().unwrap().iter().any(|e| e.id == "available"));
+        assert!(std::sync::Arc::ptr_eq(&cached, &child.doc_arc()));
+        core.shutdown().await;
+    }
+
 }

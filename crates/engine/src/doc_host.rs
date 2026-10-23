@@ -1172,6 +1172,11 @@ impl DocHost {
         &self,
         chat_id: &str,
     ) -> Result<Option<Arc<SessionDoc>>, EngineError> {
+        if let Some(handle) = lock(&self.inner.handles).get(chat_id).cloned()
+            && !handle.retired.load(Ordering::Acquire)
+        {
+            return Ok(Some(handle.doc_arc()));
+        }
         self.read_local_doc_with_coverage(chat_id)
             .map(|read| read.map(|(doc, _)| doc))
     }
