@@ -106,6 +106,7 @@ impl DetailsSidebar {
     pub(super) fn hide_project_skill_usage(&mut self) {
         self.project_skill_usage_watch = None;
         self.project_skill_usage_connection = None;
+        self.project_skill_usage_available = None;
         self.project_skill_usage.select(None);
     }
     pub(super) fn ensure_project_skill_usage(&mut self, cx: &mut Context<Self>) {
@@ -123,6 +124,9 @@ impl DetailsSidebar {
         let project = space.id.clone();
         let host = space.device_id.clone();
         let engine = state.engine().cloned();
+        let available = engine.is_some() && state.device_online(&host, chrono::Utc::now())
+            && (state.local_device_id.as_deref() == Some(host.as_str())
+                || !matches!(state.connectivity.state, zeron_proto::ConnectivityState::Offline | zeron_proto::ConnectivityState::Reconnecting));
         let catalog = self
             .context_sources
             .as_ref()
@@ -151,14 +155,22 @@ impl DetailsSidebar {
             (None, None) => false,
             _ => true,
         };
-        if connection_changed {
+        let availability_changed = self.project_skill_usage_available.is_some_and(|old| old != available);
+        if connection_changed || availability_changed {
             self.hide_project_skill_usage();
         }
-        if !self.project_skill_usage.select(Some(key.clone())) && !connection_changed {
+        self.project_skill_usage_available = Some(available);
+        let scope_changed = self.project_skill_usage.select(Some(key.clone()));
+        if !scope_changed && !connection_changed && !availability_changed {
             return;
         }
         self.project_skill_usage_watch = None;
         let generation = self.project_skill_usage.generation;
+        self.project_skill_usage_connection = engine.clone();
+        if !available {
+            self.project_skill_usage.receive(generation, None);
+            return;
+        }
         let Some(engine) = engine else {
             self.project_skill_usage.receive(generation, None);
             return;
@@ -294,7 +306,7 @@ mod lifecycle_tests {
     use gpui::{AppContext, Modifiers, Render, Window};
     use serde_json::json;
     #[gpui::test]
-    fn project_skill_usage_rpc_lifecycle_and_compact_rows(cx: &mut gpui::TestAppContext) {
+    fn project_skill_usage_review_f1_rpc_lifecycle_and_compact_rows(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -566,6 +578,43 @@ mod lifecycle_tests {
             let request: zeron_rpc::ClientFrame = serde_json::from_str(&request).unwrap();
             assert!(request.method.as_deref() != Some("WatchProjectSkillUsage"));
         }
+        // A remote EOF must clear the confirmed total but not retry on every draw.
+        replies.try_send(serde_json::to_string(&zeron_rpc::ServerFrame { id: watches[0], done: true, ..Default::default() }).unwrap()).unwrap();
+        for _ in 0..6 {
+            runtime.block_on(async { tokio::task::yield_now().await; });
+            window.run_until_parked();
+            sidebar.update(window, |s,cx| s.ensure_project_skill_usage(cx));
+        }
+        assert_eq!(sidebar.read_with(window, |s,_|s.project_skill_usage.coverage), SkillUsageCoverage::Unavailable);
+        while let Ok(request) = requests.try_recv() {
+            let request: zeron_rpc::ClientFrame = serde_json::from_str(&request).unwrap();
+            assert_ne!(request.method.as_deref(), Some("WatchProjectSkillUsage"), "EOF alone must not loop retries");
+        }
+        for initial_offline in [false, true] {
+            if initial_offline { sidebar.update(window, |s,_|s.hide_project_skill_usage()); }
+            let before = watches.len();
+            for available in [false,true] {
+                state.update(window, |s,_| {
+                    s.devices=vec![serde_json::from_value(json!({"id":"project-host","name":"host","platform":"linux","lastSeenAt":if available {chrono::Utc::now()} else {chrono::Utc::now()-chrono::Duration::days(1)}})).unwrap()];
+                });
+                for _ in 0..12 {
+                    sidebar.update(window, |s,cx| s.ensure_project_skill_usage(cx));
+                    window.run_until_parked();
+                    runtime.block_on(async { tokio::task::yield_now().await; });
+                    while let Ok(request) = requests.try_recv() {
+                        let request: zeron_rpc::ClientFrame=serde_json::from_str(&request).unwrap();
+                        if request.cancel { cancellations.push(request.id); continue; }
+                        if request.method.as_deref()==Some("WatchProjectSkillUsage") {
+                            assert!(available,"offline host must not create a watch");
+                            watches.push(request.id);
+                            replies.try_send(serde_json::to_string(&zeron_rpc::ServerFrame { id:request.id,item:Some(json!({"projectId":"p","hostDeviceId":"project-host","counts":[{"relativePath":".agents/skills/0/SKILL.md","count":42}],"coverage":"complete","chatsTotal":2,"chatsCounted":2})),..Default::default() }).unwrap()).unwrap();
+                        }
+                    }
+                }
+            }
+            assert_eq!(watches.len(),before+1,"host recovery must rearm exactly once in the same scope");
+            assert_eq!(sidebar.read_with(window, |s,_|s.project_skill_usage.presentation(".agents/skills/0/SKILL.md").0),"x42");
+        }
         sidebar.update(window, |s, cx| s.hide_worked_project_diffs(cx));
         window.run_until_parked();
         runtime.block_on(async {
@@ -578,7 +627,7 @@ mod lifecycle_tests {
             }
         }
         assert!(
-            cancellations.contains(&watches[0]),
+            cancellations.contains(watches.last().unwrap()),
             "hiding Details cancels the RPC even if no further frame arrives"
         );
     }
