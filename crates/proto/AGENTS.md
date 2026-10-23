@@ -49,6 +49,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 - `AgentEvent::Visual` carries only id/path/title; the script and named assets remain host uploads, never inline CRDT bytes. Sidebar section order remains an additive neighbor-anchored capability with convergent registry positions.
 
+- `skill_usage` classifica somente chamadas estruturadas de Skill/entrypoint; nomes externos preservam colisões, caminhos são normalizados lexicalmente sem I/O. Cobertura do corpus não promete observar usos opacos do provider.
+
 ## Work Guidance
 
 - Lógica de apresentação que a UI e a engine derivam do mesmo estado pertence a `view`, não a `zeron-ui` — duplicar ali é como o comportamento diverge entre headed e headless.
@@ -60,6 +62,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 | Camada / path | Tier exigido | Como rodar |
 | `src/view` (derivações puras) | unit | `cargo test -p zeron-proto` |
 | `src/**` (tipos serde) | unit — roundtrip de serialização quando o shape tem regra | `cargo test -p zeron-proto` |
+| `src/skill_usage.rs` (identidade, catálogo e colisões) | unit | `cargo test --locked -p zeron-proto skill_usage` |
+
 ## Child DOX Index
 
 Sem filhos.

@@ -36,9 +36,89 @@ pub struct ProjectSkillUsageSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillInvocationRef<'a> { Name(&'a str), EntryPath(&'a str) }
 
-pub fn skill_invocation_reference(_call: &ToolCall) -> Option<SkillInvocationRef<'_>> { None }
-pub fn project_skill_catalog(_skills: &[Skill], _root: &Path) -> Vec<SkillUsageCatalogEntry> { vec![] }
-pub fn match_skill_reference(_reference: SkillInvocationRef<'_>, _catalog: &[SkillUsageCatalogEntry], _cwd: &str, _root: &str) -> Option<String> { None }
+/// Lexical normalization only: no local filesystem or symlink assumptions.
+pub fn normalize_skill_path(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    let absolute = path.starts_with('/') || path.as_bytes().get(1) == Some(&b':');
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {},
+            ".." => { parts.pop()?; },
+            value => parts.push(value),
+        }
+    }
+    if parts.is_empty() { return None; }
+    Some(format!("{}{}", if absolute && path.starts_with('/') { "/" } else { "" }, parts.join("/")))
+}
+fn absolute(path: &str) -> bool { path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') }
+fn relative_to(path: &str, root: &str) -> Option<String> {
+    path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))).map(str::to_owned)
+}
+pub fn project_skill_relative_path(path: &str, root: &str) -> Option<String> {
+    let path = normalize_skill_path(path)?;
+    if absolute(&path) { relative_to(&path, &normalize_skill_path(root)?) } else { Some(path) }
+}
+fn reference(value: &str) -> Option<SkillInvocationRef<'_>> {
+    let value = value.trim();
+    if let Some(uri) = value.strip_prefix("skill://") {
+        let name = uri.strip_suffix("/SKILL.md").unwrap_or(uri);
+        return (!name.is_empty() && !name.contains(['/', '\\', '?', '#'])).then_some(SkillInvocationRef::Name(name));
+    }
+    if value.is_empty() { None }
+    else if value.contains(['/', '\\']) { Some(SkillInvocationRef::EntryPath(value)) }
+    else { Some(SkillInvocationRef::Name(value)) }
+}
+pub fn skill_invocation_reference(call: &ToolCall) -> Option<SkillInvocationRef<'_>> {
+    match call {
+        ToolCall::ReadFile { path } => {
+            if path.starts_with("skill://") { return reference(path); }
+            (path.replace('\\', "/").rsplit('/').next() == Some("SKILL.md"))
+                .then_some(SkillInvocationRef::EntryPath(path))
+        },
+        ToolCall::Unknown { name, input } | ToolCall::Mcp { tool: name, input, .. } => {
+            let name = name.rsplit("__").next()?.rsplit("::").next()?.rsplit('.').next()?;
+            if !name.eq_ignore_ascii_case("skill") { return None; }
+            let input = input.as_ref()?;
+            if let Some(path) = input.get("path").and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty()) { return reference(path); }
+            let skill = input.get("skill").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
+            let name = input.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
+            if matches!((skill, name), (Some(a),Some(b)) if a != b) { return None; }
+            reference(skill.or(name)?)
+        },
+        _ => None,
+    }
+}
+pub fn normalize_skill_catalog(mut catalog: Vec<SkillUsageCatalogEntry>) -> Vec<SkillUsageCatalogEntry> {
+    for entry in &mut catalog {
+        entry.relative_path = entry.relative_path.as_deref().and_then(normalize_skill_path).filter(|p| !absolute(p));
+    }
+    catalog.sort();
+    catalog.dedup();
+    catalog
+}
+pub fn project_skill_catalog(skills: &[Skill], root: &Path) -> Vec<SkillUsageCatalogEntry> {
+    normalize_skill_catalog(skills.iter().map(|s| SkillUsageCatalogEntry {
+        name: s.name.clone(), relative_path: project_skill_relative_path(&s.path, &root.to_string_lossy()),
+    }).collect())
+}
+pub fn match_skill_reference(reference: SkillInvocationRef<'_>, catalog: &[SkillUsageCatalogEntry], cwd: &str, root: &str) -> Option<String> {
+    match reference {
+        SkillInvocationRef::Name(name) => {
+            let mut matches = catalog.iter().filter(|e| e.name == name);
+            let first = matches.next()?;
+            if matches.next().is_some() { None } else { first.relative_path.clone() }
+        },
+        SkillInvocationRef::EntryPath(path) => {
+            let path = normalize_skill_path(path)?;
+            let relative = if absolute(&path) {
+                relative_to(&path, &normalize_skill_path(cwd)?)
+                    .or_else(|| normalize_skill_path(root).and_then(|root| relative_to(&path, &root)))?
+            } else { path };
+            catalog.iter().any(|e| e.relative_path.as_deref() == Some(relative.as_str())).then_some(relative)
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests {

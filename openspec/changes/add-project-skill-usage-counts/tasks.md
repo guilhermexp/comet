@@ -30,8 +30,8 @@
 
 ## 1. Preparar execução isolada na box
 
-- [ ] 1.1 Após aprovação deste plano, descobrir status, sessões, locations, runs e presets reais de `agents-us`; identificar o checkout exato do Comet e pedir somente a escolha de preset/modelo ainda não feita pelo usuário. Não assumir o preferido como autorizado.
-- [ ] 1.2 Criar a branch/worktree da tarefa a partir da base atual conferida, com espelho local na mesma revisão; copiar esta change/brief para a box sem absorver mudanças alheias. Executar preflight com o executor escolhido, Cargo e demais binários necessários; iniciar somente com preflight OK. O brief inclui o fluxo RED/GREEN, releitura de ajustes, limite de escopo, provas exigidas e proibição de merge/tag/release pelo executor antes do aceite.
+- [x] 1.1 Após aprovação deste plano, descobrir status, sessões, locations, runs e presets reais de `agents-us`; identificar o checkout exato do Comet e pedir somente a escolha de preset/modelo ainda não feita pelo usuário. Não assumir o preferido como autorizado.
+- [x] 1.2 Criar a branch/worktree da tarefa a partir da base atual conferida, com espelho local na mesma revisão; copiar esta change/brief para a box sem absorver mudanças alheias. Executar preflight com o executor escolhido, Cargo e demais binários necessários; iniciar somente com preflight OK. O brief inclui o fluxo RED/GREEN, releitura de ajustes, limite de escopo, provas exigidas e proibição de merge/tag/release pelo executor antes do aceite.
 
 ## 2. Identificar invocações e catálogo sem ambiguidade
 
@@ -39,8 +39,8 @@
 
 **Interfaces propostas:** `SkillInvocationRef<'a> { Name(&'a str), EntryPath(&'a str) }`; `skill_invocation_reference(call: &ToolCall) -> Option<SkillInvocationRef<'_>>`; `project_skill_catalog(skills: &[Skill], project_root: &Path) -> Vec<SkillUsageCatalogEntry>`. DTOs `SkillUsageCatalogEntry`, `ProjectSkillUsageCount`, `SkillUsageCoverage`, `WatchProjectSkillUsageParams`, `ProjectSkillUsageSnapshot` conforme design D3/D5. Casamento de referência com catálogo deve devolver somente a identidade relativa inequívoca, sem I/O.
 
-- [ ] 2.1 Adicionar testes RED co-located em `skill_usage.rs`: tool `Skill` Unknown/Mcp com `skill`/`name`/`path`, namespace, identificador vazio/conflitante; `skill://brainstorming`, `skill://brainstorming/SKILL.md` e entrypoint explícito elegíveis; `skill://brainstorming/references/guide.md`, Exec e eval inelegíveis. Nome igual global/projeto não pode casar por nome; path explícito resolve somente o entrypoint correto. Incluir nomes Unicode e paths com espaços. Rodar `cargo test --locked -p zeron-proto skill_usage` na box e guardar a falha esperada antes de implementar.
-- [ ] 2.2 Implementar os helpers puros e DTOs em `skill_usage.rs`, reutilizando a regra de pertencimento atual de `project_skills`, preservando nomes externos apenas para colisão e normalizando o catálogo uma vez. Rodar o mesmo filtro para GREEN, atualizar `crates/proto/AGENTS.md` com o contrato exercitado e registrar o commit; não contar menções ou mensagens de usuário e não modificar o resumo antigo de activities.
+- [x] 2.1 Adicionar testes RED co-located em `skill_usage.rs`: tool `Skill` Unknown/Mcp com `skill`/`name`/`path`, namespace, identificador vazio/conflitante; `skill://brainstorming`, `skill://brainstorming/SKILL.md` e entrypoint explícito elegíveis; `skill://brainstorming/references/guide.md`, Exec e eval inelegíveis. Nome igual global/projeto não pode casar por nome; path explícito resolve somente o entrypoint correto. Incluir nomes Unicode e paths com espaços. Rodar `cargo test --locked -p zeron-proto skill_usage` na box e guardar a falha esperada antes de implementar.
+- [x] 2.2 Implementar os helpers puros e DTOs em `skill_usage.rs`, reutilizando a regra de pertencimento atual de `project_skills`, preservando nomes externos apenas para colisão e normalizando o catálogo uma vez. Rodar o mesmo filtro para GREEN, atualizar `crates/proto/AGENTS.md` com o contrato exercitado e registrar o commit; não contar menções ou mensagens de usuário e não modificar o resumo antigo de activities.
 
 ## 3. Agregar histórico e expor stream no host do Project
 
