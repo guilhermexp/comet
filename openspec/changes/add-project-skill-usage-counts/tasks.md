@@ -95,3 +95,11 @@
 - F4: ranges de entrada antes não casavam; seletores válidos (incluindo raw/lista), nomes literais com dois-pontos, colisões e drives Windows estão cobertos sem alterar sanitizadores/TurnSteps.
 - F5: outbox malformado impedia replay cached; o caminho antigo volta a servir o mesmo Arc/entries e a leitura de cobertura continua falhando conservadoramente.
 - RED/GREEN e gate/smoke da revisão em `.tmp/evidence/project-skill-usage-review/`; SHA e mapa completo no relatório novo timestampado em `.tmp/reports/`. O gate final cobre todos os filtros afetados; 5.2 nativo e 5.3 aceite do orquestrador continuam abertos, sem archive ou publicação.
+
+## Follow-up das variantes restantes F1/F2/F4 (2026-10-23)
+
+- F3/F5 aceitos pelo orquestrador e preservados; suas REDs anteriores não foram repetidas.
+- F1: regressão GPUI/RPC fecha receiver mantendo presença online/Connected e o mesmo EngineHandle, e recupera x43 por assinatura nova após atraso. Recovery usa timer scoped/backoff, cessa em UnknownMethod e é cancelado em hide/mudança de catálogo; ausência de retry por redraw/host estável continua coberta.
+- F2: duas engines, RegistryRoom mock WebSocket e relay do device reproduzem CreateChat de A em Project de B → Partial(5). Correção confirma o nascimento durável em B pelo seam aditivo CreateChatOnHost, sem abrir doc/room ou mudar owner; assinaturas antiga/nova mantêm Complete(5) e restart mantém a prova. Retry de row antiga sem snapshot/corrupção continua Partial; owner antigo mantém protocolo compatível e não ganha zero inventado.
+- F4: o novo teste cobre todas as formas válidas da gramática fornecida, nos cinco formatos de recurso (incluindo Windows/URI), mantendo referências/malformed excluídos e nomes literais com dois-pontos. A antiga negativa incorreta de `:1-` foi removida.
+- Logs novos: `.tmp/evidence/project-skill-usage-review-followup/`. Relatórios/provas anteriores preservados. Gate relevante, smoke e SHA final serão mapeados no relatório timestampado novo. 5.2 nativo e 5.3 aceite permanecem abertos; sem archive/publicação.

@@ -2201,11 +2201,30 @@ async fn project_skill_usage_offline_and_legacy_hosts_never_return_confirmed_zer
             .unwrap(),
         json!([])
     );
-    core.workspace.create_space("legacy-project","legacy","/legacy",None,false).unwrap();
-    client.call("Mutate",json!({"op":"createChat","chatId":"legacy-birth","spaceId":"legacy-project"})).await.unwrap();
-    assert_eq!(core.workspace.chat("legacy-birth").unwrap().unwrap().device_id,"legacy");
-    let disk=zeron_sync::DocsStore::open(dirs.path().join("viewer/orgs/dev-org/dev-user")).unwrap();
-    assert!(!disk.has_snapshot("legacy-birth").unwrap(),"legacy fallback must not invent host history on the viewer");
+    core.workspace
+        .create_space("legacy-project", "legacy", "/legacy", None, false)
+        .unwrap();
+    client
+        .call(
+            "Mutate",
+            json!({"op":"createChat","chatId":"legacy-birth","spaceId":"legacy-project"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        core.workspace
+            .chat("legacy-birth")
+            .unwrap()
+            .unwrap()
+            .device_id,
+        "legacy"
+    );
+    let disk =
+        zeron_sync::DocsStore::open(dirs.path().join("viewer/orgs/dev-org/dev-user")).unwrap();
+    assert!(
+        !disk.has_snapshot("legacy-birth").unwrap(),
+        "legacy fallback must not invent host history on the viewer"
+    );
     drop(host);
     core.shutdown().await;
     relay.abort();
@@ -2217,81 +2236,175 @@ async fn project_skill_usage_followup_f2_viewer_creates_on_owner_before_open() {
     use zeron_proto::skill_usage::{ProjectSkillUsageSnapshot, SkillUsageCoverage};
     async fn settled(rx: &mut zeron_rpc::RpcSubscription) -> ProjectSkillUsageSnapshot {
         loop {
-            let f: ProjectSkillUsageSnapshot = serde_json::from_value(tokio::time::timeout(Duration::from_secs(10),rx.recv()).await.unwrap().unwrap()).unwrap();
-            if f.coverage != SkillUsageCoverage::Loading { return f; }
+            let f: ProjectSkillUsageSnapshot = serde_json::from_value(
+                tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            if f.coverage != SkillUsageCoverage::Loading {
+                return f;
+            }
         }
     }
     let (relay_url, relay) = fake_device_room().await;
     let registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
-    let dirs=tempfile::tempdir().unwrap();
-    let a=assemble(&dirs.path().join("a"),"device-a");
+    let dirs = tempfile::tempdir().unwrap();
+    let a = assemble(&dirs.path().join("a"), "device-a");
     a.workspace.connect_registry_url(&registry.url());
-    let params=json!({"projectId":"p","catalog":[{"name":"a","relativePath":".agents/skills/a/SKILL.md"}],"targetDeviceId":"device-b"});
+    let params = json!({"projectId":"p","catalog":[{"name":"a","relativePath":".agents/skills/a/SKILL.md"}],"targetDeviceId":"device-b"});
     for pass in 0..2 {
-        let b=assemble(&dirs.path().join("b"),"device-b");
-        let store=zeron_sync::DocsStore::open(dirs.path().join("b/orgs/dev-org/dev-user")).unwrap();
+        let b = assemble(&dirs.path().join("b"), "device-b");
+        let store =
+            zeron_sync::DocsStore::open(dirs.path().join("b/orgs/dev-org/dev-user")).unwrap();
         if pass == 0 {
-            b.workspace.create_space("p","device-b","/main",None,false).unwrap();
-            b.workspace.create_chat("existing",Some("p"),None,None,None).unwrap();
-            let doc=zeron_doc::SessionDoc::init("existing").unwrap();
+            b.workspace
+                .create_space("p", "device-b", "/main", None, false)
+                .unwrap();
+            b.workspace
+                .create_chat("existing", Some("p"), None, None, None)
+                .unwrap();
+            let doc = zeron_doc::SessionDoc::init("existing").unwrap();
             let entry=serde_json::from_value(json!({"id":"e","role":"assistant","createdAt":1,"deviceId":"device-b","parts":(0..5).map(|i|json!({"kind":"tool","id":format!("t{i}"),"call":{"kind":"readFile","path":"skill://a"}})).collect::<Vec<_>>()})).unwrap();
             doc.push_message(&entry).unwrap();
-            store.save_snapshot("existing",&doc.export_snapshot().unwrap()).unwrap();
+            store
+                .save_snapshot("existing", &doc.export_snapshot().unwrap())
+                .unwrap();
         }
         b.workspace.connect_registry_url(&registry.url());
-        let host=b.start_host_relay(&relay_url);
-        let mut config=LinkCacheConfig::new(relay_url.clone(),Arc::new(StaticToken("test-user".into())));
-        config.probe_timeout=Duration::from_secs(2);
+        let host = b.start_host_relay(&relay_url);
+        let mut config =
+            LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
+        config.probe_timeout = Duration::from_secs(2);
         a.set_links(LinkCache::new(config));
-        let client=zeron_rpc::memory_client(a.rpc_service());
+        let client = zeron_rpc::memory_client(a.rpc_service());
         eprintln!("remote birth pass={pass}: owner and relay started");
-        let deadline=tokio::time::Instant::now()+Duration::from_secs(15);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while a.workspace.space("p").unwrap().is_none() {
-            assert!(tokio::time::Instant::now()<deadline);
+            assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let mut old=loop {
-            match tokio::time::timeout(Duration::from_secs(3),client.subscribe_checked("WatchProjectSkillUsage",params.clone())).await {
-                Ok(Ok(rx))=>break rx,
-                error=>{assert!(tokio::time::Instant::now()<deadline,"owner subscription did not become ready: {}",error.is_err());tokio::time::sleep(Duration::from_millis(50)).await;}
+        let mut old = loop {
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                client.subscribe_checked("WatchProjectSkillUsage", params.clone()),
+            )
+            .await
+            {
+                Ok(Ok(rx)) => break rx,
+                error => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "owner subscription did not become ready: {}",
+                        error.is_err()
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             }
         };
-        let f=settled(&mut old).await;
-        assert_eq!((f.coverage,f.counts[0].count),(SkillUsageCoverage::Complete,5));
+        let f = settled(&mut old).await;
+        assert_eq!(
+            (f.coverage, f.counts[0].count),
+            (SkillUsageCoverage::Complete, 5)
+        );
         eprintln!("remote birth pass={pass}: existing total confirmed 5");
-        tokio::time::timeout(Duration::from_secs(5),client.call("Mutate",json!({"op":"createChat","chatId":"viewer-empty","spaceId":"p"}))).await.expect("remote birth reply deadline").unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call(
+                "Mutate",
+                json!({"op":"createChat","chatId":"viewer-empty","spaceId":"p"}),
+            ),
+        )
+        .await
+        .expect("remote birth reply deadline")
+        .unwrap();
         eprintln!("remote birth pass={pass}: CreateChat acknowledged");
         while b.workspace.chat("viewer-empty").unwrap().is_none() {
-            assert!(tokio::time::Instant::now()<deadline);
+            assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         if pass == 0 {
-            let f=settled(&mut old).await;
-            assert_eq!((f.coverage,f.counts[0].count),(SkillUsageCoverage::Complete,5),"viewer birth must preserve confirmed history on owner");
+            let f = settled(&mut old).await;
+            assert_eq!(
+                (f.coverage, f.counts[0].count),
+                (SkillUsageCoverage::Complete, 5),
+                "viewer birth must preserve confirmed history on owner"
+            );
         }
-        let mut new=client.subscribe_checked("WatchProjectSkillUsage",params.clone()).await.unwrap();
-        let f=settled(&mut new).await;
-        assert_eq!((f.coverage,f.counts[0].count,f.chats_counted),(SkillUsageCoverage::Complete,5,2));
-        assert_eq!(b.workspace.chat("viewer-empty").unwrap().unwrap().device_id,"device-b");
-        assert_eq!(b.doc_host.sync_resources()["openDocuments"],0,"birth proof must not open a transcript/room");
-        drop(new);drop(old);
+        let mut new = client
+            .subscribe_checked("WatchProjectSkillUsage", params.clone())
+            .await
+            .unwrap();
+        let f = settled(&mut new).await;
+        assert_eq!(
+            (f.coverage, f.counts[0].count, f.chats_counted),
+            (SkillUsageCoverage::Complete, 5, 2)
+        );
+        assert_eq!(
+            b.workspace.chat("viewer-empty").unwrap().unwrap().device_id,
+            "device-b"
+        );
+        assert_eq!(
+            b.doc_host.sync_resources()["openDocuments"],
+            0,
+            "birth proof must not open a transcript/room"
+        );
+        drop(new);
+        drop(old);
         assert!(client.call("CreateChatOnHost",json!({"op":"renameChat","chatId":"existing","title":"not allowed","targetDeviceId":"device-b"})).await.is_err());
-        assert!(client.call("CreateChatOnHost",json!({"op":"createChat","chatId":"wrong-owner","spaceId":"p"})).await.is_err());
+        assert!(
+            client
+                .call(
+                    "CreateChatOnHost",
+                    json!({"op":"createChat","chatId":"wrong-owner","spaceId":"p"})
+                )
+                .await
+                .is_err()
+        );
         assert!(a.workspace.chat("wrong-owner").unwrap().is_none());
-        assert_eq!(b.workspace.chat("existing").unwrap().unwrap().title,None);
+        assert_eq!(b.workspace.chat("existing").unwrap().unwrap().title, None);
         if pass == 1 {
             // A genuine missing/corrupt old corpus remains unknown.
             store.delete_snapshot("existing").unwrap();
-            client.call("Mutate",json!({"op":"createChat","chatId":"existing","spaceId":"p"})).await.unwrap();
-            assert!(!store.has_snapshot("existing").unwrap(),"a retry of an old registry row must not invent empty history");
-            let mut missing=client.subscribe_checked("WatchProjectSkillUsage",params.clone()).await.unwrap();
-            assert_eq!(settled(&mut missing).await.coverage,SkillUsageCoverage::Partial);drop(missing);
-            store.save_snapshot("existing",b"corrupt").unwrap();
-            let mut corrupt=client.subscribe_checked("WatchProjectSkillUsage",params.clone()).await.unwrap();
-            assert_eq!(settled(&mut corrupt).await.coverage,SkillUsageCoverage::Partial);drop(corrupt);
+            client
+                .call(
+                    "Mutate",
+                    json!({"op":"createChat","chatId":"existing","spaceId":"p"}),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !store.has_snapshot("existing").unwrap(),
+                "a retry of an old registry row must not invent empty history"
+            );
+            let mut missing = client
+                .subscribe_checked("WatchProjectSkillUsage", params.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                settled(&mut missing).await.coverage,
+                SkillUsageCoverage::Partial
+            );
+            drop(missing);
+            store.save_snapshot("existing", b"corrupt").unwrap();
+            let mut corrupt = client
+                .subscribe_checked("WatchProjectSkillUsage", params.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                settled(&mut corrupt).await.coverage,
+                SkillUsageCoverage::Partial
+            );
+            drop(corrupt);
         }
-        eprintln!("remote birth pass={pass}: Complete(5), chats=2, openDocuments=0; restart/legacy coverage checks passed");
-        drop(client); drop(host); b.shutdown().await;
+        eprintln!(
+            "remote birth pass={pass}: Complete(5), chats=2, openDocuments=0; restart/legacy coverage checks passed"
+        );
+        drop(client);
+        drop(host);
+        b.shutdown().await;
     }
-    a.shutdown().await; relay.abort();
+    a.shutdown().await;
+    relay.abort();
 }

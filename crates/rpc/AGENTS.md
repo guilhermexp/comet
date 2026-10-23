@@ -51,6 +51,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `WatchProjectSkillUsage` é stream tipado aditivo e forwardable ao device do Project. O host valida a posse do Space; catálogo recebido apenas seleciona identidades, sem autorizar leitura de arquivos. Frames carregam cobertura explícita; host offline/antigo continua erro, nunca zero confirmado. O proxy usa a confirmação de assinatura existente para preservar `UnknownMethod` do host sem invalidar o link compartilhado.
 
+- `CreateChatOnHost` é unary aditivo/forwardable, payload do op createChat existente e reply Chat canônico. O Mutate local chama esse seam somente para nascimento em outro owner com relay configurado; sucesso implica snapshot inicial durável no owner antes da row. Ingress rejeita outras mutações e owner incorreto. UnknownMethod mantém comportamento legado; falha de transporte é retornada sem criar row especulativa. O Mutate genérico não é forwardable.
+
 ## Work Guidance
 
 - RPC novo = tipo em `zeron-proto` + linha no `rpc_methods!` de `method.rs` + handler na engine. Os três no mesmo commit, senão a UI compila contra um contrato que não existe.

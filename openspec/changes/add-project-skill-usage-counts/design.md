@@ -43,6 +43,8 @@ Concentrar a nova regra em um helper puro; não aproveitar o prefix match de Tur
 
 **Limites explícitos:** Codex sem tool/read estruturado, execução opaca em eval/Exec, identificadores antigos descartados e docs internos de subagentes não são recuperáveis. `complete` significa leitura completa do corpus retido, não captura de todo uso possível.
 
+O parser de ReadFile segue a gramática do runtime: `:50`/`:50-`, `:50-200`, `:50+150`, `:-60`, listas por vírgula, `:raw` isolado e raw antes/depois de seletores (`:2-4:raw`, `:raw:2-4`, `:17:raw`, `:17-:raw`). Remove somente sufixos válidos de recursos de entrada; um nome literal com dois-pontos no catálogo tem precedência sobre a interpretação de range.
+
 ### D3 — Identidade pelo entrypoint relativo, nomes apenas quando inequívocos
 
 A UI já recebe o catálogo completo de `ListSkills`; conservar uma projeção mínima dele antes de filtrar as linhas. Proposta de tipo em `crates/proto/src/skill_usage.rs`:
@@ -84,11 +86,15 @@ O stream entrega frames completos e canceláveis. Concorrência entre primeiro b
 
 **Ajuste interno F2/F3/F5 autorizado na revisão de 2026-10-23:** a criação de uma row nova hospedada neste device persiste um SessionDoc vazio antes do upsert, com INSERT OR IGNORE no store (nunca substituir snapshot recuperado). Isso prova o zero legítimo após restart, sem reinterpretar história ausente. O caminho antigo `read_local_doc` conserva o fast path cached para replay; a projeção usa `read_local_doc_with_coverage`, cuja falha de outbox continua conservadora. Para sincronização sem mudança de metadados, o DocsStore expõe notificações efêmeras de snapshot/outbox a consumidores ativos; DocHost sinaliza imports e CaughtUp normais. O stream assina antes da varredura, invalida somente contribuições afetadas, recupera lag e coalesce gravações durante Working até o encerramento. Nenhum ledger, polling de transcripts, alteração de CRDT ou nova superfície RPC é introduzido. Uma conexão SQLite externa não emite sinais neste store; o caminho normal da engine compartilha o mesmo Arc<DocsStore>.
 
+**Complemento F2 autorizado no follow-up:** o Mutate(createChat) normal do viewer usa o seam aditivo `CreateChatOnHost` no relay configurado para o owner do Space. O owner valida a operação/posse e chama a criação legítima existente (snapshot INSERT OR IGNORE antes da row), devolvendo o Chat canônico para import no viewer. Nenhum marker de vazio é inferido de uma row sincronizada. UnknownMethod de owner antigo conserva o caminho legado sem alegar cobertura; falhas de transporte em rotas configuradas retornam erro retentável antes de anunciar sucesso. Sem relay configurado, permanece a mutação de registro existente (perfil local/legado). Não há novo ledger/CRDT ou mudança de ownership; o Mutate genérico permanece local.
+
 **Alternativa rejeitada:** abrir todas as conversas no frontend; fixa docs no LRU, aumenta sync e perde histórico frio/remoto. Se o host não tiver parte do histórico, usar `Partial` até a sincronização normal o disponibilizar, sem iniciar um download em massa específico deste contador.
 
 ### D6 — UI discreta e cobertura honesta
 
 Estado da contagem separado de `ContextSources`, com chave `(project_id, host_device_id, assinatura normalizada do catálogo)` e geração para descartar respostas atrasadas. Trocar entre Chats do mesmo Project com catálogo equivalente não reinicia a contagem. Trocar harness/catálogo revalida o casamento, mas nunca restringe o conjunto de Chats ao harness atual. Reutilizar a assinatura scoped do RPC e o padrão de cancelamento de `details_sidebar/worked_project_diffs.rs`. Host antigo, offline ou método desconhecido é `Unavailable`, não `x0`.
+
+EOF curto pode encerrar o receiver encaminhado sem alterar presença (grace de 70s), Connected ou EngineHandle. A recuperação fica no task scoped desta assinatura: subscribe_checked preserva UnknownMethod e encerra recovery para host permanentemente não suportado; falhas transitórias/EOF esperam backoff 1/2/4/8/16/30s, teto 30s. Ocultar/mudar Project/catálogo/host descarta task, timer e RPC. Não se usa redraw para disparar tentativas nem framework de rede novo.
 
 Na lista, preservar 24px/linha, sete linhas e clique existente. Nome com `flex_1/min_w_0/truncate`, contador com `flex_shrink_0`, tamanho de 12px, `theme.text_muted`; sem fundo de badge, ícone, nova animação ou cor de status para zero. O header permanece `29 skills`, não total de usos.
 

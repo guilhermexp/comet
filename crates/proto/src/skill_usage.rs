@@ -109,24 +109,38 @@ fn reference(value: &str) -> Option<SkillInvocationRef<'_>> {
 /// Strip only complete, positive read selectors; never a drive colon or
 /// arbitrary suffix. Name resolution still gives a literal catalog name priority.
 fn read_selector_base(path: &str) -> Option<&str> {
-    let positive = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_ok_and(|n| n > 0);
+    let positive = |s: &str| {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u64>().is_ok_and(|n| n > 0)
+    };
     let range = |piece: &str| {
-        if let Some(end) = piece.strip_prefix('-') { return positive(end); }
-        if let Some((start,end)) = piece.split_once('-') {
-            return positive(start) && (end.is_empty() || positive(end) && start.parse::<u64>().unwrap() <= end.parse::<u64>().unwrap());
+        if let Some(end) = piece.strip_prefix('-') {
+            return positive(end);
         }
-        if let Some((start,count)) = piece.split_once('+') { return positive(start) && positive(count); }
+        if let Some((start, end)) = piece.split_once('-') {
+            return positive(start)
+                && (end.is_empty()
+                    || positive(end)
+                        && start.parse::<u64>().unwrap() <= end.parse::<u64>().unwrap());
+        }
+        if let Some((start, count)) = piece.split_once('+') {
+            return positive(start) && positive(count);
+        }
         positive(piece)
     };
-    let (before,last) = path.rsplit_once(':')?;
+    let (before, last) = path.rsplit_once(':')?;
     if last == "raw" {
-        if let Some((base,selectors)) = before.rsplit_once(':')
-            && selectors.split(',').all(range) {
+        if let Some((base, selectors)) = before.rsplit_once(':')
+            && selectors.split(',').all(range)
+        {
             return Some(base);
         }
         return Some(before);
     }
-    last.split(',').all(range).then(|| before.strip_suffix(":raw").unwrap_or(before))
+    last.split(',')
+        .all(range)
+        .then(|| before.strip_suffix(":raw").unwrap_or(before))
 }
 
 pub fn skill_invocation_reference(call: &ToolCall) -> Option<SkillInvocationRef<'_>> {
@@ -378,26 +392,90 @@ mod tests {
     }
     #[test]
     fn skill_usage_followup_f4_full_read_grammar() {
-        let catalog = vec![SkillUsageCatalogEntry { name:"a".into(), relative_path:Some(".agents/skills/a/SKILL.md".into()) }];
-        for base in [".agents/skills/a/SKILL.md", "/tree/.agents/skills/a/SKILL.md", "skill://a", "skill://a/SKILL.md", "C:/tree/.agents/skills/a/SKILL.md"] {
-            for suffix in [":50",":50-",":50-200",":50+150",":-60",":5-16,960-973",":19,59",":raw",":2-4:raw",":raw:2-4",":17:raw",":17-:raw"] {
-                let call=read(&format!("{base}{suffix}"));
-                let cwd=if base.starts_with("C:") {"C:/tree"} else {"/tree"};
-                assert_eq!(skill_invocation_reference(&call).and_then(|r|match_skill_reference(r,&catalog,cwd,"/main")),Some(".agents/skills/a/SKILL.md".into()),"{base}{suffix}");
+        let catalog = vec![SkillUsageCatalogEntry {
+            name: "a".into(),
+            relative_path: Some(".agents/skills/a/SKILL.md".into()),
+        }];
+        for base in [
+            ".agents/skills/a/SKILL.md",
+            "/tree/.agents/skills/a/SKILL.md",
+            "skill://a",
+            "skill://a/SKILL.md",
+            "C:/tree/.agents/skills/a/SKILL.md",
+        ] {
+            for suffix in [
+                ":50",
+                ":50-",
+                ":50-200",
+                ":50+150",
+                ":-60",
+                ":5-16,960-973",
+                ":19,59",
+                ":raw",
+                ":2-4:raw",
+                ":raw:2-4",
+                ":17:raw",
+                ":17-:raw",
+            ] {
+                let call = read(&format!("{base}{suffix}"));
+                let cwd = if base.starts_with("C:") {
+                    "C:/tree"
+                } else {
+                    "/tree"
+                };
+                assert_eq!(
+                    skill_invocation_reference(&call)
+                        .and_then(|r| match_skill_reference(r, &catalog, cwd, "/main")),
+                    Some(".agents/skills/a/SKILL.md".into()),
+                    "{base}{suffix}"
+                );
             }
         }
-        for base in ["skill://a/references/guide.md",".agents/skills/a/references/guide.md"] {
-            for suffix in [":50-",":-60",":raw",":2-4:raw",":raw:2-4"] {
+        for base in [
+            "skill://a/references/guide.md",
+            ".agents/skills/a/references/guide.md",
+        ] {
+            for suffix in [":50-", ":-60", ":raw", ":2-4:raw", ":raw:2-4"] {
                 assert!(skill_invocation_reference(&read(&format!("{base}{suffix}"))).is_none());
             }
         }
-        for suffix in [":",":-",":0",":-0",":4-2",":1+0",":raw:raw",":2-4:raw:raw",":raw:bad",":1,,2",":1-2-3",":1+-2"] {
-            let call=read(&format!("skill://a{suffix}"));
-            assert_eq!(skill_invocation_reference(&call).and_then(|r|match_skill_reference(r,&catalog,"/tree","/main")),None,"{suffix}");
+        for suffix in [
+            ":",
+            ":-",
+            ":0",
+            ":-0",
+            ":4-2",
+            ":1+0",
+            ":raw:raw",
+            ":2-4:raw:raw",
+            ":raw:bad",
+            ":1,,2",
+            ":1-2-3",
+            ":1+-2",
+        ] {
+            let call = read(&format!("skill://a{suffix}"));
+            assert_eq!(
+                skill_invocation_reference(&call)
+                    .and_then(|r| match_skill_reference(r, &catalog, "/tree", "/main")),
+                None,
+                "{suffix}"
+            );
         }
-        for name in ["plugin:tools","literal:raw","literal:17-","literal:17:raw"] {
-            let literal=vec![SkillUsageCatalogEntry{name:name.into(),relative_path:Some("literal/SKILL.md".into())}];
-            assert_eq!(skill_invocation_reference(&read(&format!("skill://{name}"))).and_then(|r|match_skill_reference(r,&literal,"/tree","/main")),Some("literal/SKILL.md".into()));
+        for name in [
+            "plugin:tools",
+            "literal:raw",
+            "literal:17-",
+            "literal:17:raw",
+        ] {
+            let literal = vec![SkillUsageCatalogEntry {
+                name: name.into(),
+                relative_path: Some("literal/SKILL.md".into()),
+            }];
+            assert_eq!(
+                skill_invocation_reference(&read(&format!("skill://{name}")))
+                    .and_then(|r| match_skill_reference(r, &literal, "/tree", "/main")),
+                Some("literal/SKILL.md".into())
+            );
         }
     }
 
