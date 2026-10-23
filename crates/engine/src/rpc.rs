@@ -1483,6 +1483,17 @@ impl EngineRpc {
             .ok_or(VoiceRejection::Unsupported)
     }
 
+    fn chat_creation_host(&self, params: &MutateParams) -> Result<Option<String>, RpcError> {
+        let MutateParams::CreateChat { space_id, device_id, .. } = params else { return Ok(None); };
+        if let Some(id) = space_id {
+            let space = self.workspace.space(id).map_err(|e|RpcError::Failed(e.to_string()))?
+                .ok_or_else(||RpcError::Failed(format!("no such space: {id}")))?;
+            Ok(Some(space.device_id))
+        } else {
+            Ok(device_id.clone())
+        }
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -2909,8 +2920,46 @@ impl RpcService for EngineRpc {
                 let p: SetHarnessUpdatePolicyParams = parse_params(params)?;
                 RpcReply::value(&self.harness_updates()?.set_policy(p.harness, p.policy))
             }
-            methods::MUTATE => {
+            methods::CREATE_CHAT_ON_HOST => {
                 let p: MutateParams = parse_params(params)?;
+                let MutateParams::CreateChat { chat_id, .. } = &p else {
+                    return Err(RpcError::BadParams("CreateChatOnHost accepts only createChat".into()));
+                };
+                if self.chat_creation_host(&p)?.as_deref() != Some(self.workspace.device_id()) {
+                    return Err(RpcError::Failed("Chat birth must be handled by its owner".into()));
+                }
+                if self.workspace.chat(chat_id).map_err(|e|RpcError::Failed(e.to_string()))?
+                    .is_some_and(|chat|chat.device_id != self.workspace.device_id()) {
+                    return Err(RpcError::Failed("existing Chat belongs to another device".into()));
+                }
+                let id = chat_id.clone();
+                self.mutate(p)?;
+                let row = self.workspace.chat(&id).map_err(|e|RpcError::Failed(e.to_string()))?
+                    .ok_or_else(||RpcError::Failed("Chat birth did not publish its row".into()))?;
+                RpcReply::value(&row)
+            }
+            methods::MUTATE => {
+                let p: MutateParams = parse_params(params.clone())?;
+                if let Some(host) = self.chat_creation_host(&p)?
+                    && host != self.workspace.device_id()
+                    && self.links.is_some() {
+                    // Commit empty history on the owner BEFORE either registry
+                    // advertises a successful birth. A retry returns that row
+                    // without replacing a recovered/existing transcript.
+                    match self.forward(&host, methods::CREATE_CHAT_ON_HOST, params).await {
+                        Ok(RpcReply::Value(value)) => {
+                            let row: zeron_proto::Chat = parse_params(value)?;
+                            self.workspace.import_chat_row(&row).map_err(|e|RpcError::Failed(e.to_string()))?;
+                            return RpcReply::value(&serde_json::json!({"ok":true}));
+                        }
+                        Err(RpcError::UnknownMethod(_)) => {
+                            // Older owners retain the legacy registry mutation
+                            // protocol; no empty-history evidence is invented.
+                        }
+                        Err(error) => return Err(error),
+                        Ok(_) => return Err(RpcError::Failed("invalid Chat birth reply".into())),
+                    }
+                }
                 if let MutateParams::SetChatCwd { chat_id, cwd } = &p {
                     self.guard_chat_cwd_retarget(chat_id, cwd).await?;
                 }

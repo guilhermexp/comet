@@ -205,6 +205,9 @@ rpc_methods! {
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     MUTATE / Mutate = "Mutate" { params: serde_json::Value, reply: serde_json::Value },
+    /// Owner-authoritative Chat birth, called by Mutate(createChat) on a viewer.
+    /// Accepts only the existing createChat payload; returns the canonical row.
+    CREATE_CHAT_ON_HOST / CreateChatOnHost = "CreateChatOnHost" { params: serde_json::Value, reply: zeron_proto::Chat, forwardable: true },
     /// Create a child native chat from a parent row and queue its first run.
     /// Params `{parentChatId, prompt, spaceId?}`; reply `{chatId, spaceId?, deviceId}`.
     /// Local IPC only: the caller is the engine-stamped sessions server.
