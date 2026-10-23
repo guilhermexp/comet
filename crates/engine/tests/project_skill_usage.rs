@@ -460,6 +460,18 @@ async fn project_skill_usage_review_f3_normal_import_after_scan() {
     assert_eq!(core.workspace.read_chats().unwrap(), chats);
     assert_eq!(*core.sessions.watch_sessions().borrow(), sessions);
     drop(rx);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_skill_usage_review_f3_partial_recovers_after_scan() {
+    use zeron_sync::chat_client::ChatDocSink;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core(dir.path());
+    setup(&core);
+    let disk = Arc::new(store(dir.path()));
+    seed(&core, &disk, "a", "p", 5, 0);
+    let client = zeron_rpc::memory_client(core.rpc_service());
     // Missing old history first scans Partial, then recovers through normal import.
     core.workspace
         .create_chat("recover", Some("p"), None, None, None)
@@ -482,7 +494,7 @@ async fn project_skill_usage_review_f3_normal_import_after_scan() {
         .await
         .expect("import must recover incomplete contribution");
     assert_eq!(updated.coverage, SkillUsageCoverage::Complete);
-    assert_eq!(updated.counts[0].count, 8);
+    assert_eq!(updated.counts[0].count, 7);
     drop(rx);
     core.shutdown().await;
 }
