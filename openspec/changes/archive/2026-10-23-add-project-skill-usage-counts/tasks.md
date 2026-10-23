@@ -66,8 +66,8 @@
 ## 5. Provar entrega, integrar e publicar após aceite
 
 - [x] 5.1 Na box, fazer um smoke executável temporário em `.tmp/` usando engine/RPC reais e dados isolados: dois Chats do Project com dois + três usos → cinco; arquivar/reabrir e reiniciar mantém cinco; fork não duplica; nova chamada em outro Chat → seis; Project distinto continua isolado; histórico ausente não produz `x0`. Registrar comando, saída e SHA e remover o smoke após a prova. Consolidar uma rodada final dos filtros afetados e `cargo fmt --all -- --check`; não repetir o mesmo gate em cada checkout.
-- [ ] 5.2 Verificar a superfície renderizada com nome longo, `x0`, `x12`, contador de vários dígitos, estados de cobertura, clique/scroll, larguras estreita/normal e temas claro/escuro. Só lançar fixture/app em ambiente com isolamento real das configurações de todos os providers. Não repetir o launcher de QA proibido no Mac; se não houver isolamento, registrar aparência nativa como `notProven` e não apresentar unit tests/Linux como prova AppKit. Captura e evidência nativa pendentes precisam ser explicitadas antes do aceite de entrega.
-- [ ] 5.3 Após as provas, registrar o comportamento e os limites em `fork_changelog.md`; validar a change com `openspec validate add-project-skill-usage-counts --strict`. Conferir o diff/commits trazidos da box no espelho, resolver somente achados deste escopo e apresentar evidências/limites ao usuário antes de integrar.
+- [x] 5.2 Verificar a superfície renderizada com nome longo, `x0`, `x12`, contador de vários dígitos, estados de cobertura, clique/scroll, larguras estreita/normal e temas claro/escuro. Só lançar fixture/app em ambiente com isolamento real das configurações de todos os providers. Não repetir o launcher de QA proibido no Mac; se não houver isolamento, registrar aparência nativa como `notProven` e não apresentar unit tests/Linux como prova AppKit. Captura e evidência nativa pendentes precisam ser explicitadas antes do aceite de entrega.
+- [x] 5.3 Após as provas, registrar o comportamento e os limites em `fork_changelog.md`; validar a change com `openspec validate add-project-skill-usage-counts --strict`. Conferir o diff/commits trazidos da box no espelho, resolver somente achados deste escopo e apresentar evidências/limites ao usuário antes de integrar.
 
 ## Workflow follow-up
 
@@ -111,3 +111,10 @@
 - O teste online de duas engines/registry/relay/restart/Complete(5) e o caminho legado permanecem obrigatórios no gate focado. Não repetir baterias de proto/UI nem REDs de achados fechados.
 - Cobertura offline/legada pode permanecer Unavailable/Partial até histórico normal disponível; não há fila/framework/ledger novo nem exigência de telemetria para criar Chat.
 - Evidências novas em `.tmp/evidence/project-skill-usage-create-offline/`, com SHA e relatório timestampado próprio; provas anteriores preservadas. 5.2 nativo e 5.3 aceite do orquestrador continuam abertos, sem publicação/archive.
+
+## Aceite do orquestrador (2026-10-23)
+
+- Código final aceito no SHA `f3c5e28e19bc4c60171b3488f1582704b21e6655`, trazido da box ao espelho. Revisores fecharam F1/F3/F4/F5; o orquestrador conferiu o último delta de F2, seus oito testes focados e o smoke real com criação offline/retry, preservação de owner/histórico e ausência de snapshot inventado.
+- Gates anteriores não foram repetidos como ritual: as fontes dos achados fechados permaneceram iguais; cada delta teve regressões RED/GREEN e a prova correspondente. Smoke no SHA final mantém 5 após restart/replay/forks, normal import passa a 6 e outro Project fica em 9.
+- 5.2 aceita nos termos da exceção prevista na própria tarefa: fixtures GPUI exercitaram geometria, claro/escuro, nomes longos, contadores, scroll, gesto de arquivo e lifecycle; **aparência, hover/tooltip e abertura real AppKit continuam notProven**. Esse limite foi explicitado ao usuário antes da integração. Nenhuma cópia QA insegura foi lançada.
+- Provas e relatórios da box preservados no checkout principal em `.tmp/evidence/project-skill-usage*-20261023/`. Os registros anteriores de tarefas abertas são históricos; os checkboxes acima refletem o aceite atual. Publicação e atualização efetivamente observada serão relatadas separadamente.
