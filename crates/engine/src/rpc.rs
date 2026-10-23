@@ -2963,30 +2963,46 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params.clone())?;
-                if let Some(host) = self.chat_creation_host(&p)?
+                let new_chat = match &p {
+                    MutateParams::CreateChat { chat_id, .. } => self
+                        .workspace
+                        .chat(chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .is_none(),
+                    _ => false,
+                };
+                if new_chat
+                    && let Some(host) = self.chat_creation_host(&p)?
                     && host != self.workspace.device_id()
                     && self.links.is_some()
                 {
-                    // Commit empty history on the owner BEFORE either registry
-                    // advertises a successful birth. A retry returns that row
-                    // without replacing a recovered/existing transcript.
-                    match self
-                        .forward(&host, methods::CREATE_CHAT_ON_HOST, params)
-                        .await
+                    // Optional birth evidence must not gate local-first creation.
+                    // Existing rows bypass this hop entirely; a new row gets only
+                    // a short online opportunity before the normal local mutation.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        self.forward(&host, methods::CREATE_CHAT_ON_HOST, params),
+                    )
+                    .await
                     {
-                        Ok(RpcReply::Value(value)) => {
+                        Ok(Ok(RpcReply::Value(value))) => {
                             let row: zeron_proto::Chat = parse_params(value)?;
                             self.workspace
                                 .import_chat_row(&row)
                                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                             return RpcReply::value(&serde_json::json!({"ok":true}));
                         }
-                        Err(RpcError::UnknownMethod(_)) => {
-                            // Older owners retain the legacy registry mutation
-                            // protocol; no empty-history evidence is invented.
+                        Ok(Err(
+                            RpcError::UnknownMethod(_) | RpcError::Transport(_) | RpcError::Closed,
+                        ))
+                        | Err(_) => {
+                            // Offline/legacy/slow owners do not prevent creation.
+                            // Coverage remains unknown until normal history arrives.
                         }
-                        Err(error) => return Err(error),
-                        Ok(_) => return Err(RpcError::Failed("invalid Chat birth reply".into())),
+                        Ok(Err(error)) => return Err(error),
+                        Ok(Ok(_)) => {
+                            return Err(RpcError::Failed("invalid Chat birth reply".into()));
+                        }
                     }
                 }
                 if let MutateParams::SetChatCwd { chat_id, cwd } = &p {

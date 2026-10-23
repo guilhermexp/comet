@@ -103,3 +103,11 @@
 - F2: duas engines, RegistryRoom mock WebSocket e relay do device reproduzem CreateChat de A em Project de B → Partial(5). Correção confirma o nascimento durável em B pelo seam aditivo CreateChatOnHost, sem abrir doc/room ou mudar owner; assinaturas antiga/nova mantêm Complete(5) e restart mantém a prova. Retry de row antiga sem snapshot/corrupção continua Partial; owner antigo mantém protocolo compatível e não ganha zero inventado.
 - F4: o novo teste cobre todas as formas válidas da gramática fornecida, nos cinco formatos de recurso (incluindo Windows/URI), mantendo referências/malformed excluídos e nomes literais com dois-pontos. A antiga negativa incorreta de `:1-` foi removida.
 - Logs novos: `.tmp/evidence/project-skill-usage-review-followup/`. Relatórios/provas anteriores preservados. Gate relevante, smoke e SHA final serão mapeados no relatório timestampado novo. 5.2 nativo e 5.3 aceite permanecem abertos; sem archive/publicação.
+
+## Correção restrita da regressão CreateChat offline (2026-10-23)
+
+- F1/F3/F4/F5 fechados pelo orquestrador e preservados sem reauditoria. Somente o roteamento de CreateChat, seus testes e contratos relacionados foram ajustados.
+- RED: viewer real com LinkCache/Transport offline não criava row; retry de row existente exigia owner; probe sem resposta bloqueava criação. GREEN: criação local/offline preserva owner sem snapshot inventado; retry mantém row/bytes e não consulta link; oportunidade online tem teto de 1s e falha de validação não vira sucesso.
+- O teste online de duas engines/registry/relay/restart/Complete(5) e o caminho legado permanecem obrigatórios no gate focado. Não repetir baterias de proto/UI nem REDs de achados fechados.
+- Cobertura offline/legada pode permanecer Unavailable/Partial até histórico normal disponível; não há fila/framework/ledger novo nem exigência de telemetria para criar Chat.
+- Evidências novas em `.tmp/evidence/project-skill-usage-create-offline/`, com SHA e relatório timestampado próprio; provas anteriores preservadas. 5.2 nativo e 5.3 aceite do orquestrador continuam abertos, sem publicação/archive.

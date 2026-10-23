@@ -2408,3 +2408,215 @@ async fn project_skill_usage_followup_f2_viewer_creates_on_owner_before_open() {
     a.shutdown().await;
     relay.abort();
 }
+
+#[tokio::test]
+async fn project_skill_usage_create_offline_new_chat_preserves_local_first() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "viewer");
+    core.workspace
+        .create_space("p", "offline-owner", "/remote", None, false)
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let mut config =
+        LinkCacheConfig::new("http://127.0.0.1:1", Arc::new(StaticToken("test".into())));
+    config.liveness = Some(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        zeron_rpc::PeerLiveness::Dark
+    }));
+    let links = LinkCache::new(config);
+    match links.client("offline-owner").await {
+        Err(RpcError::Transport(message)) => assert!(message.contains("offline")),
+        _ => panic!("real offline LinkCache must yield Transport"),
+    }
+    core.set_links(links);
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.call(
+            "Mutate",
+            json!({"op":"createChat","chatId":"new-offline","spaceId":"p"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.is_ok(),
+        "offline owner must not prevent local Chat creation: {result:?}"
+    );
+    assert_eq!(result.unwrap()["ok"], true);
+    let row = core.workspace.chat("new-offline").unwrap().unwrap();
+    assert_eq!(row.device_id, "offline-owner");
+    assert_eq!(row.space_id.as_deref(), Some("p"));
+    let disk = zeron_sync::DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    assert!(
+        !disk.has_snapshot("new-offline").unwrap(),
+        "viewer cannot fabricate owner empty history"
+    );
+    assert!(
+        client
+            .subscribe_checked(
+                "WatchProjectSkillUsage",
+                json!({"projectId":"p","catalog":[],"targetDeviceId":"offline-owner"})
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .call(
+                "Mutate",
+                json!({"op":"createChat","chatId":"invalid","spaceId":"no-such-space"})
+            )
+            .await
+            .is_err()
+    );
+    assert!(core.workspace.chat("invalid").unwrap().is_none());
+    assert_eq!(core.doc_host.sync_resources()["openDocuments"], 0);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_skill_usage_create_offline_existing_retry_never_contacts_owner() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "viewer");
+    core.workspace
+        .create_space("p", "offline-owner", "/remote", None, false)
+        .unwrap();
+    core.workspace
+        .create_chat("existing", Some("p"), None, None, None)
+        .unwrap();
+    let before = core.workspace.chat("existing").unwrap().unwrap();
+    let disk = zeron_sync::DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    let doc = zeron_doc::SessionDoc::init("existing").unwrap();
+    let entry=serde_json::from_value(json!({"id":"original","role":"assistant","createdAt":1,"deviceId":"offline-owner","parts":[{"kind":"text","id":"original-text","text":"retained history"}]})).unwrap();
+    doc.push_message(&entry).unwrap();
+    let bytes = doc.export_snapshot().unwrap();
+    disk.save_snapshot("existing", &bytes).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let mut config =
+        LinkCacheConfig::new("http://127.0.0.1:1", Arc::new(StaticToken("test".into())));
+    config.liveness = Some(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        zeron_rpc::PeerLiveness::Dark
+    }));
+    core.set_links(LinkCache::new(config));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let result = client
+        .call(
+            "Mutate",
+            json!({"op":"createChat","chatId":"existing","spaceId":"p"}),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "idempotent retry cannot depend on unreachable owner: {result:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "existing row must bypass remote confirmation entirely"
+    );
+    assert_eq!(core.workspace.chat("existing").unwrap(), Some(before));
+    assert_eq!(disk.load_snapshot("existing").unwrap(), Some(bytes));
+    assert_eq!(core.doc_host.sync_resources()["openDocuments"], 0);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_skill_usage_create_offline_stalled_link_has_bounded_fallback() {
+    use serde_json::json;
+    let (relay_url, relay) = fake_device_room().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "viewer");
+    core.workspace
+        .create_space("p", "absent-owner", "/remote", None, false)
+        .unwrap();
+    let mut config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test".into())));
+    config.probe_timeout = Duration::from_secs(30);
+    core.set_links(LinkCache::new(config));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    // The room accepts the socket but has no host to answer its readiness probe.
+    // Its 30s probe must not turn an optional birth confirmation into a UI wait.
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.call(
+            "Mutate",
+            json!({"op":"createChat","chatId":"stalled","spaceId":"p"}),
+        ),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "stalled birth confirmation must have a short creation budget"
+    );
+    assert_eq!(result.unwrap().unwrap()["ok"], true);
+    assert_eq!(
+        core.workspace.chat("stalled").unwrap().unwrap().device_id,
+        "absent-owner"
+    );
+    let disk = zeron_sync::DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    assert!(!disk.has_snapshot("stalled").unwrap());
+    assert_eq!(core.doc_host.sync_resources()["openDocuments"], 0);
+    core.shutdown().await;
+    relay.abort();
+}
+
+#[tokio::test]
+async fn project_skill_usage_create_offline_owner_validation_is_not_suppressed() {
+    use serde_json::json;
+    struct RejectBirth;
+    #[async_trait]
+    impl RpcService for RejectBirth {
+        async fn handle(&self, method: &str, _: serde_json::Value) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::LIST_HARNESSES => RpcReply::value(&json!([])),
+                methods::CREATE_CHAT_ON_HOST => {
+                    Err(RpcError::BadParams("owner rejected birth input".into()))
+                }
+                _ => Err(RpcError::UnknownMethod(method.into())),
+            }
+        }
+    }
+    let (url, relay) = fake_device_room().await;
+    let host = HostRelay::spawn(
+        HostRelayConfig::new(&url, "owner", Arc::new(StaticToken("test".into()))),
+        Arc::new(RejectBirth),
+        Arc::new(|_| true),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "viewer");
+    core.workspace
+        .create_space("p", "owner", "/remote", None, false)
+        .unwrap();
+    let mut config = LinkCacheConfig::new(url, Arc::new(StaticToken("test".into())));
+    config.probe_timeout = Duration::from_millis(500);
+    core.set_links(LinkCache::new(config));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client
+        .call(methods::LIST_HARNESSES, json!({"targetDeviceId":"owner"}))
+        .await
+        .is_err()
+    {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    match client
+        .call(
+            "Mutate",
+            json!({"op":"createChat","chatId":"rejected","spaceId":"p"}),
+        )
+        .await
+    {
+        Err(RpcError::Failed(error)) => assert!(error.contains("owner rejected birth input")),
+        _ => panic!("remote validation failure must remain an error, not local success"),
+    }
+    assert!(core.workspace.chat("rejected").unwrap().is_none());
+    drop(host);
+    core.shutdown().await;
+    relay.abort();
+}
