@@ -238,6 +238,8 @@ use zeron_proto::{
 };
 use zeron_rpc::methods;
 
+#[path = "skill_usage.rs"]
+mod skill_usage;
 #[path = "session_card.rs"]
 mod session_card;
 
@@ -492,6 +494,9 @@ pub struct DetailsSidebar {
     dev_servers: Vec<zeron_proto::DevServer>,
     dev_server_stopping: std::collections::HashSet<u32>,
     dev_server_error: Option<SharedString>,
+    project_skill_usage: skill_usage::UsageModel,
+    project_skill_usage_watch: Option<Task<()>>,
+    project_skill_usage_connection: Option<crate::state::EngineHandle>,
     context_sources: Option<session_card::ContextSources>,
     context_sources_task: Option<Task<()>>,
     context_sources_pending: Option<String>,
@@ -591,6 +596,9 @@ impl DetailsSidebar {
             dev_servers: Vec::new(),
             dev_server_stopping: Default::default(),
             dev_server_error: None,
+            project_skill_usage: Default::default(),
+            project_skill_usage_watch: None,
+            project_skill_usage_connection: None,
             context_sources: None,
             context_sources_task: None,
             context_sources_pending: None,

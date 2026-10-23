@@ -19,6 +19,7 @@ pub(super) struct SessionDiffTotals {
 pub(super) struct ContextSources {
     pub key: String,
     pub skills: Vec<ProjectSkill>,
+    pub catalog: Vec<zeron_proto::skill_usage::SkillUsageCatalogEntry>,
 }
 
 /// A project skill: its name and its file, relative to the project folder.
@@ -162,6 +163,7 @@ impl DetailsSidebar {
                 this.context_sources = Some(ContextSources {
                     key,
                     skills: project_skills(skills, &project_root),
+                    catalog: Vec::new(),
                 });
                 cx.notify();
             });
