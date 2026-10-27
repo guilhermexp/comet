@@ -2,6 +2,13 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-10-27 — OMP: `agent_end` grande não derruba mais o run
+
+- Um run longo com screenshots fechava com "OMP RPC stdout closed before terminal agent_end" depois de a resposta já ter aparecido. O `agent_end` do omp carrega as mensagens do run (texto + imagens base64) e passava de 8 MiB; o omp parte em `rpc_chunk` até 64 MiB, mas o Comet usava o teto por linha (8 MiB) também para o payload remontado, matava o reader e o omp via EPIPE (`~/.omp/logs`, "RPC output delivery failed").
+- `MAX_ASSEMBLED_BYTES` (64 MiB, espelho do omp) passa a valer só para `rpc_chunk` remontado; o teto por linha segue 8 MiB.
+- Quando o reader de stdout morrer no meio do run, o erro do chat agora traz a razão dele (teto de frame, JSONL inválido, cauda do stderr), não só a frase genérica.
+- Testes: `an_agent_end_above_the_line_budget_but_within_the_omp_chunk_ceiling_completes` e `a_reader_that_dies_mid_run_reports_the_reason_not_a_bare_stdout_closed` em `crates/harness/tests/omp_rpc.rs`.
+
 ## 2026-10-23 — v1.0.10: invocações registradas de skills por Project
 
 - Context sources passa a mostrar `xN` discretamente à direita de cada skill do projeto. O total agrega os Chats retidos do mesmo `space_id`, inclusive arquivados e worktrees, sem mudar a ordem, o header, as linhas de 24px, o viewport de sete linhas ou a abertura do arquivo.

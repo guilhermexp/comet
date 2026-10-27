@@ -4,14 +4,27 @@ use std::sync::OnceLock;
 
 use crate::HarnessError;
 
+/// Teto por LINHA do JSONL. Um frame inteiro acima disso e o filho falando
+/// fora do protocolo, nao um frame grande.
 pub const MAX_INBOUND_BYTES: usize = 8 * 1024 * 1024;
+/// Teto do payload REMONTADO de `rpc_chunk`. Espelha o `MAX_RPC_CHUNKED_BYTES`
+/// do omp (`rpc-frame.ts`, 64 MiB): acima dele o proprio filho ja degrada o
+/// frame (`agent_end` chega com `messages: []`), entao tudo que o omp manda
+/// em pedacos cabe aqui. Era 8 MiB, igual ao teto por linha, e um run longo
+/// com screenshots fechava com um `agent_end` de ~9 MiB: o reader morria, o
+/// omp via EPIPE e o chat recebia "stdout closed before terminal agent_end".
+pub const MAX_ASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OUTBOUND_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PENDING_REQUESTS: usize = 64;
 
 pub fn parse_frame(line: &str) -> Result<Value, HarnessError> {
-    if line.len() > MAX_INBOUND_BYTES {
+    parse_frame_within(line, MAX_INBOUND_BYTES)
+}
+
+fn parse_frame_within(line: &str, limit: usize) -> Result<Value, HarnessError> {
+    if line.len() > limit {
         return Err(HarnessError::Protocol(format!(
-            "OMP RPC frame exceeded {MAX_INBOUND_BYTES} bytes"
+            "OMP RPC frame exceeded {limit} bytes"
         )));
     }
     let value: Value = serde_json::from_str(line).map_err(|_| {
@@ -99,10 +112,10 @@ impl ChunkAssembler {
             .get("byteLength")
             .and_then(Value::as_u64)
             .and_then(|bytes| usize::try_from(bytes).ok())
-            .filter(|bytes| *bytes > 0 && *bytes <= MAX_INBOUND_BYTES)
+            .filter(|bytes| *bytes > 0 && *bytes <= MAX_ASSEMBLED_BYTES)
             .ok_or_else(|| {
                 chunk_error(&format!(
-                    "declared length is missing or over {MAX_INBOUND_BYTES} bytes"
+                    "declared length is missing or over {MAX_ASSEMBLED_BYTES} bytes"
                 ))
             })?;
         let payload = frame
@@ -156,7 +169,7 @@ impl ChunkAssembler {
         }
         let line =
             String::from_utf8(partial.body).map_err(|_| chunk_error("frame is not UTF-8"))?;
-        parse_frame(&line).map(Some)
+        parse_frame_within(&line, MAX_ASSEMBLED_BYTES).map(Some)
     }
 }
 

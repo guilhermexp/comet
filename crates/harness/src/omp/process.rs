@@ -466,6 +466,14 @@ impl OmpProcess {
         Ok(receiver)
     }
 
+    /// Por que o reader de stdout parou, nas palavras dele (teto de frame,
+    /// JSONL invalido, chunk quebrado, EOF com a cauda do stderr). Gravado
+    /// ANTES de o canal de eventos fechar, entao quem ve `recv() == None` pode
+    /// consultar. `None` enquanto o reader esta vivo.
+    pub fn fatal_reason(&self) -> Option<String> {
+        lock(&self.inner.fatal).clone()
+    }
+
     /// Estado do filho para o log de timeout: "vivo" separa um boot lento de
     /// um processo que morreu calado.
     async fn child_state(&self) -> String {

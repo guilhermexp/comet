@@ -1550,6 +1550,59 @@ async fn a_dying_child_reports_its_own_stderr_not_a_bare_transport_error() {
 }
 
 #[tokio::test]
+async fn an_agent_end_above_the_line_budget_but_within_the_omp_chunk_ceiling_completes() {
+    // Um run longo com screenshots fecha com um `agent_end` de ~9 MiB (texto +
+    // imagens base64 das messages). O omp parte em `rpc_chunk` ate 64 MiB; o
+    // teto remontado de 8 MiB derrubava o reader e o chat via "stdout closed
+    // before terminal agent_end" depois de a resposta ja ter aparecido.
+    let harness = fake_harness("oversized-agent-end");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = harness.run(request("hello"), controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+    let done = events.last().unwrap();
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ),
+        "{done:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reader_that_dies_mid_run_reports_the_reason_not_a_bare_stdout_closed() {
+    // Um frame de 9 MiB numa unica linha excede o teto por linha. A razao
+    // registrada pelo reader tem de chegar ao chat, senao a proxima ocorrencia
+    // fica tao cega quanto esta ("stdout closed before terminal agent_end").
+    let harness = fake_harness("oversized-line-mid-run");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = harness.run(request("hello"), controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+    let error = match events.last().unwrap() {
+        AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(error),
+            ..
+        } => error.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        error.contains("stdout closed before terminal agent_end"),
+        "{error}"
+    );
+    assert!(error.contains("frame exceeded"), "{error}");
+}
+
+#[tokio::test]
 async fn an_oversized_image_degrades_to_its_path_instead_of_failing_the_run() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("large.png");

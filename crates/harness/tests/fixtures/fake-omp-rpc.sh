@@ -141,8 +141,8 @@ emit_chunked() {
   frame=$1
   total=$(printf '%s' "$frame" | wc -c | tr -d ' ')
   half=$((total / 2))
-  first_half=$(printf '%s' "$frame" | dd bs=1 count="$half" 2>/dev/null | base64 | tr -d '\n')
-  second_half=$(printf '%s' "$frame" | dd bs=1 skip="$half" 2>/dev/null | base64 | tr -d '\n')
+  first_half=$(printf '%s' "$frame" | head -c "$half" | base64 | tr -d '\n')
+  second_half=$(printf '%s' "$frame" | tail -c "+$((half + 1))" | base64 | tr -d '\n')
   emit "{\"type\":\"rpc_chunk\",\"chunkId\":\"rpc-1\",\"index\":0,\"count\":2,\"byteLength\":$total,\"data\":\"$first_half\"}"
   emit "{\"type\":\"rpc_chunk\",\"chunkId\":\"rpc-1\",\"index\":1,\"count\":2,\"byteLength\":$total,\"data\":\"$second_half\"}"
 }
@@ -279,6 +279,19 @@ while IFS= read -r line; do
         respond "$line" '{}'
         emit '{"type":"agent_start"}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"normal prompt output"}}'
+        emit '{"type":"agent_end","messages":[]}'
+      elif [ "$scenario" = "oversized-agent-end" ]; then
+        respond "$line" '{"agentInvoked":true}'
+        emit '{"type":"agent_start"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"done"}}'
+        # O omp parte um agent_end acima de 1 MiB em rpc_chunk ate 64 MiB. Um
+        # run longo com screenshots chega a ~9 MiB de messages (texto + imagens
+        # base64): acima do teto por linha, dentro do teto do omp.
+        emit_chunked "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"$(head -c 7077888 /dev/zero | base64 | tr -d '\n')\"}]}]}"
+      elif [ "$scenario" = "oversized-line-mid-run" ]; then
+        respond "$line" '{"agentInvoked":true}'
+        emit '{"type":"agent_start"}'
+        emit "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"$(head -c 7077888 /dev/zero | base64 | tr -d '\n')\"}}"
         emit '{"type":"agent_end","messages":[]}'
       else
         respond "$line" '{"agentInvoked":true}'

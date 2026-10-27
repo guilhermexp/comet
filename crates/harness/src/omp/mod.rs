@@ -1059,7 +1059,19 @@ async fn run_session(
             }
             frame = events.recv() => {
                 let Some(frame) = frame else {
-                    let message = "OMP RPC stdout closed before terminal agent_end".to_owned();
+                    // O reader grava a razao em `fatal` antes de fechar o canal;
+                    // sem ela o chat so via a frase generica e cada ocorrencia
+                    // exigia abrir o log do omp para descobrir o EPIPE.
+                    let mut message = "OMP RPC stdout closed before terminal agent_end".to_owned();
+                    if let Some(reason) = process.fatal_reason() {
+                        let reason = reason
+                            .strip_prefix("OMP RPC stdout closed")
+                            .map_or(reason.as_str(), |rest| rest.trim_start_matches(':').trim());
+                        if !reason.is_empty() {
+                            message.push_str(": ");
+                            message.push_str(reason);
+                        }
+                    }
                     let _ = emit(&event_tx, AgentEvent::Error { message: message.clone() }).await;
                     let _ = emit(&event_tx, AgentEvent::Done {
                         status: DoneStatus::Errored,
