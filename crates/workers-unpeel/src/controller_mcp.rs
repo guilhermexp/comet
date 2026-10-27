@@ -302,6 +302,8 @@ const ACTIONS: &[&str] = &[
 pub fn run_stdio() -> Result<(), String> {
     consume_authority_marker()?;
     let parent_chat_id = take_parent_chat_id();
+    // Before any Worker launch: they must not inherit the engine's bearer.
+    crate::space_registry::take_engine_ipc_credentials();
     let stdin = std::io::stdin();
     serve(stdin.lock(), std::io::stdout(), move |request, cancel| {
         handle_request_with_parent(request, parent_chat_id.as_deref(), cancel)
@@ -1998,7 +2000,7 @@ impl ParentMessageProbe {
                                     if client.is_none() {
                                         let dial = tokio::time::timeout(
                                             Duration::from_millis(250),
-                                            zeron_rpc::connect_ipc_url(&url, None),
+                                            crate::space_registry::connect_engine(&url),
                                         );
                                         tokio::select! {
                                             _ = &mut stop_signal => {

@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "a59bca0a6931665574af47e635d5af09a7a47630"
+vendored_tree = "54578d983326fd01b638a672a7087414e16fe9c8"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -164,3 +164,12 @@ base_revision_resolves_upstream = false
 # decision); its normalizer also drops a persisted managed
 # hooks/mcp-bridge-comet-computer-use.js argument. Local patch only, not an upstream update;
 # local_modifications_count remains the unrecomputed historical value above.
+
+# 2026-10-27 — sync v0.2.126 ajuste F2: the engine IPC bearer an embedder holds
+# (`ZERON_IPC_TOKEN`, `ZERON_IPC_TOKEN_FILE`) is stripped from the session
+# launcher (`session_ops` spawn), the detached host re-exec
+# (`spawn_host_process_from_launch_file`) and the Worker shell
+# (`strip_leaked_launcher_env`) through `strip_embedder_ipc_credentials`.
+# Unit test `shells_never_inherit_the_embedder_ipc_bearer`; downstream proof in
+# `crates/workers-unpeel/tests/controller_ipc_credentials.rs`. Local patch
+# only; local_modifications_count remains the unrecomputed historical value.

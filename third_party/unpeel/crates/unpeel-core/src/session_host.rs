@@ -2313,11 +2313,26 @@ where
     }
 }
 
+/// The engine IPC bearer an embedding app (Comet) may hold in its own
+/// environment. Only the embedder's controller dials the engine: a Worker
+/// session, its detached host and its shell never inherit it.
+const EMBEDDER_IPC_CREDENTIAL_ENV_KEYS: &[&str] = &["ZERON_IPC_TOKEN", "ZERON_IPC_TOKEN_FILE"];
+
+/// Remove [`EMBEDDER_IPC_CREDENTIAL_ENV_KEYS`] from a launcher/host command.
+pub fn strip_embedder_ipc_credentials(cmd: &mut std::process::Command) {
+    for key in EMBEDDER_IPC_CREDENTIAL_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+}
+
 pub(crate) fn strip_leaked_launcher_env(cmd: &mut CommandBuilder) {
     // Dev shells launched from `bunx tauri dev` inherit npm/bun lifecycle vars from the
     // app process. Some CLIs treat those vars as authoritative and rebuild their own
     // child-process invocation incorrectly, so strip them before opening user shells.
     for key in LEAKED_LAUNCHER_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    for key in EMBEDDER_IPC_CREDENTIAL_ENV_KEYS {
         cmd.env_remove(key);
     }
 }
@@ -4314,6 +4329,7 @@ pub fn spawn_host_process_from_launch_file(launch_file: impl AsRef<Path>) -> Res
     // Keeping that pane identity would let provider integrations race the
     // Unpeel TUI's aggregate status authority.
     strip_leaked_herdr_process_env(&mut command);
+    strip_embedder_ipc_credentials(&mut command);
 
     #[cfg(unix)]
     {
@@ -5901,6 +5917,16 @@ mod tests {
             .strip_inherited
             .iter()
             .any(|key| key == "CODEX_TUI_SESSION_LOG_PATH"));
+    }
+
+    #[test]
+    fn shells_never_inherit_the_embedder_ipc_bearer() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env("ZERON_IPC_TOKEN", "secret");
+        cmd.env("ZERON_IPC_TOKEN_FILE", "/data/ipc-token");
+        crate::session_host::strip_leaked_launcher_env(&mut cmd);
+        assert!(cmd.get_env("ZERON_IPC_TOKEN").is_none());
+        assert!(cmd.get_env("ZERON_IPC_TOKEN_FILE").is_none());
     }
 
     #[test]

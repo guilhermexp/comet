@@ -599,6 +599,17 @@ pub fn controller_mcp_consume_authority_marker() -> Result<(), String> {
 }
 
 #[doc(hidden)]
+pub fn controller_mcp_take_ipc_credentials() {
+    space_registry::take_engine_ipc_credentials()
+}
+
+/// Whether the controller reaches the engine at `url` (one dial, then closed).
+#[doc(hidden)]
+pub async fn controller_mcp_engine_reachable(url: &str) -> bool {
+    space_registry::connect_engine(url).await.is_ok()
+}
+
+#[doc(hidden)]
 pub fn controller_mcp_take_parent_chat_id() -> Option<String> {
     controller_mcp::take_parent_chat_id()
 }
