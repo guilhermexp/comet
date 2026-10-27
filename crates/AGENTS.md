@@ -70,6 +70,10 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-text` | — (`text/src/lib.rs`) | Medição e quebra de linha analítica (rustybuzz + fallback CoreText) do app iOS |
 | `zeron-client` | — (`client/src/lib.rs`) | Thin client sem engine (registry, chat2, ledger de comandos, recibos viewer-delivery, RPC via relay, modo Demo) |
 | `zeron-mobile` | [`mobile/AGENTS.md`](mobile/AGENTS.md) | Fachada UniFFI e projeção de transcript mobile; arquitetura em [`docs/mobile-rewrite.md`](../docs/mobile-rewrite.md), build por `scripts/ios/build-core.sh` |
+| `zeron-mobile-bindgen` | — (`mobile-bindgen/src/main.rs`) | `uniffi-bindgen` isolado do Android upstream; inerte no fork (fora de `default-members`) |
+| `zeron-term` | — (`term/src/lib.rs`) | Emulador de terminal (alacritty) e eco previsto compartilhados por desktop e mobile; mantém `retain_last_alternate_screen` do fork (Workers) |
+| `zeron-term-link` | — (`term-link/src/lib.rs`) | Link WebRTC direto do terminal entre devices do próprio usuário (nunca Cloud), com fallback pelo relay do DeviceRoom |
+| `zeron-notify` | — (`notify/src/lib.rs`) | Banners de desktop nativos; a engine posta só quando `desktop_notify::enable()` (engine embutida no app); daemon headless deixa a UI postar |
 
 | `zeron-audio` | [`audio/AGENTS.md`](audio/AGENTS.md) | PCM, dispositivos nativos, resampling e AEC opcional |
 | `zeron-voice-media` | [`voice-media/AGENTS.md`](voice-media/AGENTS.md) | Helper de voz da instalação standalone do Codex |

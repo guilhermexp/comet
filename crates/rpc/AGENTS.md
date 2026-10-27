@@ -53,6 +53,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `CreateChatOnHost` é unary aditivo/forwardable, payload do op createChat existente e reply Chat canônico. O Mutate local tenta esse seam somente para Chat novo em outro owner com relay configurado, com budget total de 1s para evidência opcional. Confirmação online implica snapshot inicial durável no owner antes da row. Retry de row existente retorna pelo caminho local idempotente, sem chamada remota. Transport/Closed, timeout ou UnknownMethod preservam criação local/offline com owner inalterado e cobertura desconhecida, sem snapshot remoto inventado. Ingress rejeita outras mutações/owner incorreto; erros de validação não são suprimidos. O Mutate genérico não é forwardable.
 
+- IPC com bearer (upstream #966, sync v0.2.126 D2): `ipc_auth` emite `{data_dir}/ipc-token` (0600); servidor recusa handshake sem `Authorization: Bearer` correto ou com `Origin`. Clientes resolvem `$ZERON_IPC_TOKEN`, `$ZERON_IPC_TOKEN_FILE`, `{data_dir}/ipc-token` (`connect_ipc(port, data_dir)`, `connect_ipc_url(url, data_dir)`); `connect_ws(url, token)` é o dial explícito. Mensagens WS acima de 1 MiB são fragmentadas (`ws.rs`). RPCs novos ficam no registry único `method.rs`: Cloud/Vault/Billing/GitHub como `local_only`, `Get/SetNativeSubagents` e `RelayAgentLoginCallback` forwardable, `SetViewportFocus` local; `Get/SetCommitCredit` não existem (recusados).
+
 ## Work Guidance
 
 - RPC novo = tipo em `zeron-proto` + linha no `rpc_methods!` de `method.rs` + handler na engine. Os três no mesmo commit, senão a UI compila contra um contrato que não existe.

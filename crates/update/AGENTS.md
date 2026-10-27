@@ -65,6 +65,8 @@ presentation of `UpdateStatus`.
 
 - Development launchers explicitly set `ZERON_AUTO_UPDATE=0`. macOS bundle detection treats `0|false|no` as Unmanaged, so the fork's UI strip remains advisory and cannot stage/swap a dev bundle. Absence retains installed-app auto-download behavior and the fork release feed. The Cargo native runner execs directly and must set the environment itself; LaunchServices plist variables alone are insufficient.
 
+- `harness_compatibility_url(edge_url)` monta a lista de releases ruins de CLIs (`harness-compatibility.json`) sobre `release_base`: `ZERON_RELEASES_URL` vence, `zeron.sh`/`*.zeron.sh` vira `COMET_RELEASES_URL`, edge self-hosted usa `{edge}/releases`. O monitor trata 404 como "sem versões ruins". `set_managed_restart*` do upstream entram dormentes (sem engine em background).
+
 ## Work Guidance
 
 - Keep everything async-tokio, filesystem effects behind the small

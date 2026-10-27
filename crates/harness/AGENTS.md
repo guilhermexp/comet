@@ -70,6 +70,9 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 Cursor catalog models and Max Mode default exclusions are one credential-scoped accepted snapshot under the catalog lock. Rejected/empty refreshes and cancelled discovery cannot publish companion metadata; credential changes invalidate both. `catalog::tests::snapshot_metadata_is_atomic_across_rejection_concurrency_and_credentials` (unit) and `tests/cursor.rs::rejected_catalog_refresh_keeps_max_mode_exclusions_for_start_and_switch` (integration) cover rejection/start/switch; explicit options remain authoritative.
 
+- Native subagents (upstream #1046, sync v0.2.126 D5): `--disallowedTools=Agent,Task,Workflow` na Claude só quando `crate::side_chats_only(request)`, isto é, o run tem o grant `sessions` e `SessionsGrant.side_chats_only`. Nunca a partir de `request.mcp` (sempre vazio no fork). `workers_mcp` põe `ZERON_SIDE_CHATS_ONLY=1` no servidor `zeron` nesse caso, `ZERON_IPC_TOKEN_FILE` (registrado por `note_workers_ipc_token_file`) em `comet-workers`/`comet-sessions`/`zeron`, e `default_tools_approval_mode="approve"` nos overrides Codex (#985).
+- Muse Code (upstream #978) roda sem grants MCP e segura a `execution_lease` do turno inteiro.
+
 ## Work Guidance
 
 - Comandos OMP locais bem-sucedidos publicam `contextUsage` via `get_state` antes de `Done`. **`/compact` roda em background no OMP: `agentInvoked:false` é só ACK, nunca conclusão.** O adapter espera `command_output` terminal (`Compaction complete.` / falha), ignora `agent_end` intermediário, mantém cancelamento e o deadline de prompt após o ACK, e só então lê usage. Sucesso suprime a prosa CLI duplicada; erro de argumento/provider termina com falha. Estado ausente não inventa contagem. `tests/omp_rpc.rs` cobre ACK antecipado com estado stale, aumento de tokens, resultado antes do ACK, falha, timeout e cancelamento.
