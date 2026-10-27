@@ -1874,7 +1874,13 @@ fn rows_for_entry_with_todo_history(
     let streaming = entry.status == Some(MessageStatus::Streaming);
     let entry_id: SharedString = entry.id.clone().into();
 
-    if entry.role == MessageRole::System {
+    // A provider-switch seam (a System entry holding `MessagePart::Switch`)
+    // projects through the part arms below as its marker row.
+    let switch_seam = entry
+        .parts
+        .iter()
+        .any(|part| matches!(part, MessagePart::Switch { .. }));
+    if entry.role == MessageRole::System && !switch_seam {
         let text: String = entry
             .parts
             .iter()

@@ -1025,10 +1025,14 @@ fn side_chat_rename_scrolls_to_its_row_in_a_floating_card_without_motion(cx: &mu
 #[gpui::test]
 fn the_session_card_lands_with_a_chat_switch_and_eases_on_its_toggle(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);
-    change(&shell, cx, |s, _, _| {
+    change(&shell, cx, |s, window, cx| {
         s.settings.session_info_hidden = false;
-        // b's surface host leaves its transcript no room for the card.
-        s.panels.update("b", |p| p.changes_open = true);
+        // b's surface host leaves its transcript no room for the card. In the
+        // fork a stored Changes flag is not a live surface: b gets a real
+        // Browser tab, then a is selected again.
+        select(s, Some("b"), cx);
+        s.add_browser_surface(None, window, cx);
+        select(s, Some("a"), cx);
     });
     settled(&shell, cx);
     let card = cx

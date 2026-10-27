@@ -1979,8 +1979,12 @@ mod tests {
             page.harnesses = super::Loadable::Ready(vec![descriptor(true)]);
         });
         cx.background_executor.run_until_parked();
-        let reload: serde_json::Value =
-            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        // The retarget also reloads the device's native-subagents switch
+        // (upstream #1046); the catalog reload is the request under test.
+        let reload: serde_json::Value = std::iter::from_fn(|| requests.try_recv().ok())
+            .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).unwrap())
+            .find(|request| request["method"] != super::methods::GET_NATIVE_SUBAGENTS)
+            .expect("the retarget reloads the catalog");
         assert_eq!(reload["method"], super::methods::LIST_HARNESSES);
         assert_eq!(reload["params"]["targetDeviceId"], "device-b");
 
