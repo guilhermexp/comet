@@ -2,6 +2,13 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-10-27 — v1.0.11: upstream até v0.2.126
+
+- Integra o upstream `c526d6f7..d5a01522` (74 commits) por merge real: troca de provider entre turnos, hardening e recuperação de run em todos os providers, lock de refresh do login Claude, updates de CLI pelo instalador real, terminal sem latência com eco previsto e link RTC entre devices do usuário, rail do transcript, caminho digitável no New project, destino de links de PR, legendas de remetente entre agentes, fechar pergunta sem responder, tooltips e correções macOS.
+- Cloud, Android, landing e Muse Code entram dormentes; bumps de versão, co-autoria `zeronsh[bot]`, engine em background e workflows do upstream ficam fora.
+- Preserva Workers, OMP/Kimi, grants MCP (`RunRequest.mcp` vazio), steering, transcript compacto, terminal no painel direito e o feed de update do fork. Token IPC do upstream entregue aos sidecars OMP e removido do ambiente dos Workers e dos descritores do Pi (F1–F3).
+- Registro: `.upstream-sync/history/20261027T012900Z-d5a01522.yaml`; change arquivada `openspec/changes/archive/2026-10-27-sync-upstream-v0-2-126`. Publicação pelo fluxo existente do fork: tag `v1.0.11`, DMG, tarball arm64 do app e `manifest.json`.
+
 ## 2026-10-23 — v1.0.10: invocações registradas de skills por Project
 
 - Context sources passa a mostrar `xN` discretamente à direita de cada skill do projeto. O total agrega os Chats retidos do mesmo `space_id`, inclusive arquivados e worktrees, sem mudar a ordem, o header, as linhas de 24px, o viewport de sete linhas ou a abertura do arquivo.
