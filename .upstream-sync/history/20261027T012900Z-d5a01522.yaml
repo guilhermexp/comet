@@ -2,7 +2,7 @@ schema_version: 1
 id: 20261027T012900Z-d5a01522
 skill_version: null
 started_at: '2026-10-27T01:29:00Z'
-finished_at: '2026-10-27T04:00:35Z'
+finished_at: '2026-10-27T04:16:37Z'
 finished_at_initial: '2026-10-27T03:19:25Z'
 request: 'Execute owner-approved brief sync-upstream-20261026 (D1-D7); real merge of pinned d5a01522, preserve fork 1.0.10, no push.'
 workflow_source: '.tmp/briefs/sync-upstream-20261026.md; .tmp/briefs/sync-upstream-20261026-auditoria.md; no ajustes file existed at any step.'
@@ -19,7 +19,7 @@ fork:
   target_branch: sync/upstream-20261026
   initial_sha: 0aa2344b1f562495ccffadbfa497331f1ea279fc
   observed_target_sha: 0aa2344b1f562495ccffadbfa497331f1ea279fc
-  result_sha: eabcadd1e
+  result_sha: 5107e85be
   result_sha_note: 'Code revision evaluated; this record arrives in the following docs-only commit.'
   initial_worktree: clean
 strategy:
@@ -37,6 +37,7 @@ strategy:
   - fd1823015
   - 1627106b4
   - eabcadd1e
+  - 5107e85be
 changes:
   incoming_range: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f..d5a0152265112c235d79b29df92b550c73a5ca1a
   incoming_count: 74
@@ -339,6 +340,7 @@ changes:
     decision: 'ADAPT'
     reason: 'typed fork tab filled while CLI holds it'
 customizations:
+- 'Ajustes 2 F3: Pi bridge descriptors (ZERON_PI_MCP, ZERON_PI_MCP_<n>) never reach a sidecar (pi/mcp.mjs sidecarEnv) nor Workers (controller startup drop; vendored unpeel-core strip, vendored_tree f85622c2).'
 - 'Ajustes 1 F1: OMP sidecars (comet-workers, comet-sessions, zeron) get ZERON_IPC_TOKEN_FILE through the same with_ipc_token_file filter as servers_for_request.'
 - 'Ajustes 1 F2: the Workers controller captures the IPC bearer at startup and removes ZERON_IPC_TOKEN/ZERON_IPC_TOKEN_FILE from its environment; vendored unpeel-core strips both from launcher, detached host and Worker shell (provenance in unpeel-upstream.toml, vendored_tree 54578d98).'
 - Version 1.0.10, release.yml/feed/updater (zeron.sh → COMET_RELEASES_URL), vendored zui unchanged (new upstream pin not required to compile; gpui-base stays 701ca97).
@@ -494,6 +496,16 @@ verification:
   result: failed_preexisting_only
   exit: 100
   observed: 'test-core 2262 run, 2261 passed, 1 failed (preexisting legacy_admission); harness 914/0; workers-unpeel 534/0; sessions-mcp 4/0; engine lib 784 passed, 1 failed (same preexisting).'
+- command: 'Ajustes 2 F3 RED/GREEN: cargo test -p zeron-harness --test pi_mcp; cargo test -p zeron-workers-unpeel --test controller_ipc_credentials; unpeel-core shells_never_inherit_the_embedder_ipc_bearer'
+  revision: 5107e85be
+  result: passed
+  exit: 0
+  observed: 'All three failed before (sidecar inherited ZERON_PI_MCP*; launcher child got ZERON_PI_MCP and ZERON_PI_MCP_1; shell builder kept ZERON_PI_MCP) and pass after.'
+- command: 'Ajustes 2 gate: fmt --check; check --workspace --all-targets; cargo test -p zeron-harness; -p zeron-workers-unpeel; unpeel-core --lib session_host'
+  revision: 5107e85be
+  result: passed
+  exit: 0
+  observed: 'fmt ok; check ok with no warning beyond 0aa2344b; harness 914/0; workers-unpeel 534/0; unpeel-core session_host 77/0.'
 limits:
 - macOS-only code (browser/macos.rs focus capture fbdda0a0c, Claude keychain/credentials fallback, notify crate AppKit bits, Metal) not compiled or run on Linux.
 - iOS app (Cloud/*, model picker, companions, terminals) not built; Swift bindings regenerated from the Linux host library only.
@@ -514,7 +526,7 @@ pending:
 delivery:
   integration: local_branch
   target_branch: sync/upstream-20261026
-  commit: eabcadd1e
+  commit: 5107e85be
   pr: null
   publication: not_authorized
   record_pushed: false

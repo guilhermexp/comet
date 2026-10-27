@@ -46,3 +46,8 @@
 - [x] 6.2 F2: Worker processes never inherit the engine IPC bearer (controller capture + vendored unpeel-core strip, provenance updated; `tests/controller_ipc_credentials.rs`).
 - [x] 6.3 W: no `cargo check --workspace --all-targets` warning beyond `0aa2344b`; macOS-reported `math_face`/`VisualSlot::height` cleared.
 - [x] 6.4 Gate: fmt, check, test-core (preexisting failure only), harness, workers-unpeel, sessions-mcp, engine lib.
+
+## 7. Ajustes 2 (F3)
+
+- [x] 7.1 F3: Pi bridge descriptors (`ZERON_PI_MCP*`) never reach sidecars or Workers (bridge, controller, vendored unpeel-core; RED/GREEN tests).
+- [x] 7.2 Gate: fmt, check (no new warnings), harness, workers-unpeel, unpeel-core `session_host`.
