@@ -109,6 +109,7 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
         worktree: None,
         resume: None,
         mcp: None,
+        env: Default::default(),
     }
 }
 
@@ -332,6 +333,7 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
                         parent_chat_id: "forged".into(),
                         endpoint: "ws://127.0.0.1:1".into(),
                         engine_id: "forged-engine".into(),
+                        side_chats_only: false,
                     }),
                     ..run_request("later turn", "/tmp/parent-space")
                 },

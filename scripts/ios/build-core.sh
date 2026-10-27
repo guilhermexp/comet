@@ -36,6 +36,14 @@ fi
 
 # Xcode exports SDKROOT/deployment vars for the *app* SDK; host build scripts
 # (proc macros, build.rs) must not see them, so cargo runs in a clean env.
+# Keep whichever cargo the caller's PATH finds, and rustup's homes: rustup
+# isn't always in ~/.cargo/bin (a CI runner image moved it).
+CARGO_DIRS="$HOME/.cargo/bin"
+if FOUND="$(command -v cargo)"; then CARGO_DIRS="$(dirname "$FOUND"):$CARGO_DIRS"; fi
+KEEP=()
+for name in CARGO_HOME RUSTUP_HOME; do
+  if [[ -n "${!name:-}" ]]; then KEEP+=("$name=${!name}"); fi
+done
 run_cargo() {
   if [[ "${CARGO_INCREMENTAL+x}" == "x" ]]; then
     set -- "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" cargo "$@"
@@ -46,7 +54,8 @@ run_cargo() {
     set -- "RUSTC=$RUSTC" "$@"
   fi
   env -i HOME="$HOME" USER="${USER:-}" TERM="${TERM:-dumb}" \
-    PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    ${KEEP[@]+"${KEEP[@]}"} \
+    PATH="$CARGO_DIRS:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     IPHONEOS_DEPLOYMENT_TARGET=26.0 \
     CARGO_TARGET_DIR="$CARGO_OUT" \
     CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \

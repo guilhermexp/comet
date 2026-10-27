@@ -23,6 +23,7 @@ mod capture;
 pub mod change_requests;
 pub mod changes;
 pub(crate) mod chat_export;
+pub mod cloud;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
@@ -56,7 +57,8 @@ pub mod motion;
 mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
-pub mod notify;
+pub use zeron_notify as notify;
+pub mod onboarding;
 pub mod orb;
 pub mod overscroll;
 pub mod pickers;
@@ -295,6 +297,13 @@ pub fn run_app(config: UiConfig) {
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
+                // A banner the background engine posted, clicked: the engine
+                // opens the app on `zeron://notification/<target>`.
+                if let Some(target) = notify::link_target(&url) {
+                    let target = target.to_owned();
+                    let _ = cx.update(|cx| open_notification_target(target, &url_state, cx));
+                    continue;
+                }
                 url_state.update(cx, |state, cx| state.open_deep_link(&url, cx));
             }
         })
@@ -330,6 +339,10 @@ pub fn run_app(config: UiConfig) {
             }
         })
         .detach();
+        // An embedded engine posts the desktop banners itself. The fork keeps
+        // its own engine lifecycle (no managed background engine, D2 of the
+        // v0.2.126 sync), so `state::launch_background_engine` is never armed.
+        zeron_engine::desktop_notify::enable();
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
@@ -339,6 +352,9 @@ pub fn run_app(config: UiConfig) {
         // handler is the fallback for quit paths that bypass that gate.
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
+            // The engine posts banners while the viewport is unfocused: report
+            // the close at once rather than after the last focus report goes stale.
+            let unfocus = quit_state.read(cx).viewport_closing();
             let drained = ENGINE_DRAIN.load(std::sync::atomic::Ordering::Acquire) == DRAIN_DONE;
             let task = (!drained)
                 .then(|| quit_state.read(cx).engine().cloned())
@@ -349,6 +365,9 @@ pub fn run_app(config: UiConfig) {
                     })
                 });
             async move {
+                if let Some(unfocus) = unfocus {
+                    unfocus.await;
+                }
                 if let Some(task) = task {
                     let _ = task.await;
                 }

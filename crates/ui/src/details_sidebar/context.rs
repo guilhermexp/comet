@@ -138,6 +138,7 @@ mod tests {
             checkout_id: Some("checkout-1".into()),
             repository_id: None,
             created_at: Utc::now(),
+            github_repo: None,
         }
     }
 
@@ -162,6 +163,7 @@ mod tests {
             room_gen: None,
             parent_chat_id: None,
             origin_chat_id: None,
+            harness_session_harness: None,
         }
     }
 

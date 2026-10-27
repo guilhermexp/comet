@@ -1636,7 +1636,7 @@ fn miniature_split(
         .into_any_element()
 }
 
-fn preview(
+pub(crate) fn preview(
     mode: AppearanceMode,
     themes: &ThemeSelection,
     accent: AccentSelection,
@@ -1682,7 +1682,7 @@ fn compact_action(
     label: &str,
     id: impl Into<SharedString>,
 ) -> gpui::Stateful<gpui::Div> {
-    widgets::text_action(theme, widgets::ActionTone::Outlined, label).id(id.into())
+    widgets::text_action(theme, widgets::ActionTone::Filled, label).id(id.into())
 }
 
 fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
@@ -1853,7 +1853,7 @@ fn report_panel(theme: &Theme, report: &ImportReport) -> impl IntoElement {
     )
 }
 
-fn accent_swatch(
+pub(crate) fn accent_swatch(
     page_theme: &Theme,
     selection: AccentSelection,
     selected: bool,
@@ -1900,6 +1900,7 @@ fn accent_swatch(
         .id(SharedString::from(format!("accent-{}", selection.label())))
         .aria_label(selection.label())
         .aria_selected(selected)
+        .tooltip(widgets::text_tooltip(selection.label()))
         .flex_none()
         .w(px(30.0))
         .h(px(34.0))
@@ -2597,7 +2598,9 @@ impl AppearancePage {
                     .justify_center()
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.surface_raised_hover))
+                    .tooltip(widgets::text_tooltip("Close"))
                     .tab_index(0).role(gpui::Role::Button)
+                    .aria_label("Close")
 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
 .on_click(cx.listener(|this, _, _, cx| {
                         this.import_dialog = None;
@@ -3020,6 +3023,7 @@ impl AppearancePage {
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .aria_label("Zoom out")
+                            .tooltip(widgets::text_tooltip("Zoom out"))
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let Some(dialog) = this.background_adjustment_dialog.as_ref()
@@ -3046,6 +3050,7 @@ impl AppearancePage {
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .aria_label("Zoom in")
+                            .tooltip(widgets::text_tooltip("Zoom in"))
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let Some(dialog) = this.background_adjustment_dialog.as_ref()
@@ -3130,6 +3135,7 @@ impl AppearancePage {
                     .tab_index(0)
                     .role(gpui::Role::Button)
                     .aria_label("Close background adjustment")
+                    .tooltip(widgets::text_tooltip("Close"))
                     .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.dismiss_background_adjustment(window, cx)

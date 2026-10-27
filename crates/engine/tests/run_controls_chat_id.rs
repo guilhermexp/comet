@@ -144,6 +144,7 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
                 worktree: None,
                 resume: None,
                 mcp: None,
+                env: Default::default(),
             },
             None,
         )

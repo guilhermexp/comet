@@ -130,7 +130,7 @@ impl RpcSpaceRegistry {
                 .build()
                 .map_err(|error| error.to_string())?;
             runtime.block_on(async move {
-                let client = zeron_rpc::connect_ws(&endpoint)
+                let client = zeron_rpc::connect_ipc_url(&endpoint, None)
                     .await
                     .map_err(|error| error.to_string())?;
                 operation(client).await

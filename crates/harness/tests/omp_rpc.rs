@@ -78,6 +78,7 @@ fn request(prompt: &str) -> RunRequest {
         attachments: Vec::new(),
         worktree: None,
         mcp: None,
+        env: Default::default(),
     }
 }
 
@@ -466,6 +467,7 @@ fn omp_runtime_identity_tracks_host_tool_grants_but_ignores_codex_mcp() {
         parent_chat_id: "root-chat".into(),
         endpoint: "ws://127.0.0.1:9".into(),
         engine_id: "engine-1".into(),
+        side_chats_only: false,
     });
     assert!(!harness.same_runtime(&live, &root_grant));
 
@@ -731,6 +733,7 @@ async fn root_grant_serves_every_zeron_chat_tool_as_a_host_tool() {
         parent_chat_id: "chat-1".into(),
         endpoint: "ws://127.0.0.1:9".into(),
         engine_id: "engine-1".into(),
+        side_chats_only: false,
     };
     let zeron = WorkersBridge::start_zeron(&fake_workers_controller_path(), &grant)
         .await
@@ -852,6 +855,7 @@ async fn sessions_and_workers_host_calls_are_answered_once_by_their_own_server()
         parent_chat_id: "chat-1".into(),
         endpoint: "ws://127.0.0.1:9".into(),
         engine_id: "engine-1".into(),
+        side_chats_only: false,
     });
     let mut stream = harness.run(run_request, controls).await.unwrap();
     let events = collect_until_done(&mut stream).await;

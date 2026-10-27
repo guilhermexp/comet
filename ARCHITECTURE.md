@@ -42,6 +42,14 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
   no current client dials it) + DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth.
   Absorbs the old `apps/server` responsibilities (WorkOS code exchange/refresh, orgs) so
   **Postgres and the Hono server are gone**. Chat synchronization uses the Loro rooms; the separate `zeron-preview` service uses WebRTC only for development-server HTTP/HMR, with authenticated PreviewRoom signaling (see `docs/preview-networking.md`).
+- **Cloud** (`docs/design/cloud-device.md`; dormant in this fork — no runner, Cloud status unavailable): a checkout option — a session in any project
+  whose GitHub repository the Zeron GitHub App reaches can run on its own hosted sandbox,
+  with Cloud's own providers — an ordinary headless engine
+  provisioned per session by the edge's CloudAccount DO + Workflows behind a provider-neutral
+  sandbox interface, sleeping when idle, authenticated with its own device key (runner tokens
+  scoped to that one session's device), and fed provider credentials by the separate
+  service-binding-only `zeron-vault` Worker (one Durable Object per account serializes
+  refreshes, so parallel sessions never race a refresh token).
 
 ### Headed / headless
 Single binary `zeron`:
@@ -51,6 +59,10 @@ Single binary `zeron`:
   port**. The embedded engine is not private: any other viewport can attach to the running app
   without it first being restarted as a daemon. Binding is best-effort — if the port is taken the
   window still opens, having lost only the ability to host peers.
+- Desktop banners are the engine's (`desktop_notify.rs`, advertised as `desktop-notifications-v1`):
+  finished runs, questions, failures, connection loss and agent updates come from the engine, so a
+  headless daemon keeps sending them with the app closed. Preferences come from the app's `ui-settings.json`; "only in the background" uses window
+  focus the app reports (`SetViewportFocus`). The app keeps the chimes, decided by the same baselines.
 - `zeron headless` — engine only. A clean installation immediately serves its local profile over localhost IPC; when a saved account selects the synced profile at startup and a bearer is available, it also hosts its DeviceRoom for remote control. A VPS can run this while a laptop's UI drives it.
 
 ### Local-first workspace profiles
@@ -211,8 +223,8 @@ feature spec `docs/research/feature-inventory.md` §1.
 - **Composer**: hand-rolled gpui text input (start from Zed's `examples/input.rs`: IME, selection,
   clipboard, key actions), compact↔expanded auto-flip by measured text width, auto-grow 76–260px,
   Enter/Shift+Enter, Send→Steer→Stop morph, drafts + attachments per chat, drag-drop/paste
-  images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
-  is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
+  images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance, a corner close / Escape that
+  answers nothing) replacing the composer while input is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade. `@` file completion uses the engine's
   checkout index; `@` and `/` menus span the pill, scroll internally, and keep keyboard selection
   visible. Double-click selects the complete field value.
@@ -223,9 +235,18 @@ feature spec `docs/research/feature-inventory.md` §1.
   conversation width. File preview contracts are specified in
   [`docs/plans/2026-08-20-file-preview-parity-design.md`](docs/plans/2026-08-20-file-preview-parity-design.md).
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
-  engine side; custom gpui grid element; 12ms input coalescing / 80ms resize debounce, 1MB
-  replay, detach ≠ close. Panel chrome (the shared full-height utility column, its Terminal +
-  Changes tab strip, drag-reorder) is specced in `docs/research/feature-inventory.md` §1.10.
+  engine side; custom gpui grid element; 80ms resize debounce, 1MB replay, detach ≠ close. No
+  artificial latency: keys are written the moment they land (one write in flight per tab keeps
+  them ordered) and output after a quiet spell is sent the moment it is read (only floods are
+  paced, 4ms). Typed text goes through the platform text input (IME, dead keys, layout symbols);
+  mouse/focus reporting, DECSCUSR cursors with a typing-aware blink, synchronized output, a
+  contrast floor for program colors. A terminal on another of the user's devices streams over a
+  direct WebRTC link (`crates/term-link`, `remote_terminals.rs`), falling back to the device-room
+  relay only when the devices can't reach each other and moving back mid-session without a gap
+  (input is numbered and acknowledged, so a path change neither drops nor repeats a keystroke);
+  on slow links the viewer predicts the echo of typed text (`crates/term`). Panel chrome (the
+  shared full-height utility column, its Terminal + Changes tab strip, drag-reorder) is specced
+  in `docs/research/feature-inventory.md` §1.10; there is no footer terminal.
 - **Diff pane**: unified-patch parser → unified or side-by-side virtualized file/hunk/line rows,
   paired no-newline markers, sticky active-file headers, per-file collapse (180ms height tween),
   time-sliced highlight, and an independently resizable/takeover-capable pane.

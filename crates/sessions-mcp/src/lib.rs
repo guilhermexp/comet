@@ -309,7 +309,7 @@ impl RpcEngine {
     fn connect(endpoint: &str) -> Result<Self, String> {
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
         let client = runtime
-            .block_on(zeron_rpc::connect_ws(endpoint))
+            .block_on(zeron_rpc::connect_ipc_url(endpoint, None))
             .map_err(|error| error.to_string())?;
         Ok(Self { runtime, client })
     }

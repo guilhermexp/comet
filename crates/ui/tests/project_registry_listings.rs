@@ -117,9 +117,17 @@ async fn chat_mcp_workers_controller_and_settings_list_the_same_projects() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let service: Arc<dyn zeron_rpc::RpcService> = core.rpc_service();
-    let _server = tokio::spawn(zeron_rpc::serve_ws_listener(listener, service));
-    // SAFETY: as above.
-    unsafe { std::env::set_var("COMET_WORKERS_ENGINE_ENDPOINT", &endpoint) };
+    let data = root.path().join("data");
+    let token = zeron_rpc::ipc_auth::issue_token(&data).unwrap();
+    let _server = tokio::spawn(zeron_rpc::serve_ws_listener(listener, service, token));
+    // SAFETY: as above. The Workers controller presents the engine's bearer.
+    unsafe {
+        std::env::set_var("COMET_WORKERS_ENGINE_ENDPOINT", &endpoint);
+        std::env::set_var(
+            zeron_rpc::ipc_auth::TOKEN_FILE_ENV,
+            zeron_rpc::ipc_auth::token_path(&data),
+        );
+    }
     let local = core.device_id.clone();
 
     // A project of another device, and local ones: one added through
@@ -170,8 +178,10 @@ async fn chat_mcp_workers_controller_and_settings_list_the_same_projects() {
     let reused = workers(json!({"action": "add_project", "path": orchestrator})).await;
     assert_eq!(reused["project_id"], "space-orch");
 
+    let port = endpoint.rsplit(':').next().unwrap().parse().unwrap();
     let chat = zeron_mcp::Tools::new(Arc::new(zeron_mcp::Zeron::new(
-        endpoint.clone(),
+        port,
+        Some(data.clone()),
         zeron_mcp::Origin::default(),
     )));
     let chat_projects = chat.call("list_projects", json!({})).await.unwrap();

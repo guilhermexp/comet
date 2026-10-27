@@ -159,6 +159,7 @@ async fn steering_never_aborts_a_running_tool() {
                     enable_workers_mcp: false,
                     workers_parent_chat_id: None,
                     sessions: None,
+                    env: Default::default(),
                 },
             },
         )

@@ -19,14 +19,16 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
+pub mod ipc_auth;
 pub mod method;
 mod server;
+mod ws;
 
-pub use client::{RpcClient, RpcSubscription, connect_ws};
+pub use client::{RpcClient, RpcSubscription, connect_ipc, connect_ipc_url, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
     NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
-    decode_device_frame, device_room_ws_url, encode_device_frame,
+    decode_device_frame, device_room_ws_url, encode_device_frame, is_liveness_probe,
 };
 pub use method::{ALL_METHOD_NAMES, MethodInfo, RpcMethod, info, methods};
 pub use server::{serve_connection, serve_ws_listener};
@@ -449,13 +451,26 @@ mod tests {
         assert_eq!(frame.ok, None);
     }
 
-    #[tokio::test]
-    async fn websocket_round_trip() {
+    /// Serve `TestService` on an ephemeral port behind `token`.
+    async fn serve_test(token: &str) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+        tokio::spawn(serve_ws_listener(
+            listener,
+            Arc::new(TestService),
+            token.to_string(),
+        ));
+        port
+    }
 
-        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+    #[tokio::test]
+    async fn websocket_round_trip() {
+        let token = ipc_auth::generate_token().unwrap();
+        let port = serve_test(&token).await;
+
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}"), Some(&token))
+            .await
+            .unwrap();
         let echoed = client
             .call("Echo", serde_json::json!("hello"))
             .await
@@ -471,32 +486,176 @@ mod tests {
         assert_eq!(items.recv().await, None);
     }
 
+    /// A reply past tungstenite's default 16 MiB frame cap (a long chat's
+    /// transcript watch) must arrive, not drop the connection.
     #[tokio::test]
-    async fn handshake_with_origin_header_is_rejected() {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    async fn websocket_carries_messages_past_the_default_frame_cap() {
+        let token = ipc_auth::generate_token().unwrap();
+        let port = serve_test(&token).await;
+        // Multi-byte chars so fragment boundaries land mid-codepoint.
+        let big = "é".repeat(9_500_000);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}"), Some(&token))
+            .await
+            .unwrap();
+        let echoed = client.call("Echo", serde_json::json!(big)).await.unwrap();
+        assert_eq!(echoed.as_str().map(str::len), Some(big.len()));
+        assert_eq!(client.close_reason(), None);
 
-        // A browser page opening ws://127.0.0.1:{port} always sends Origin;
-        // the server must refuse the handshake before serving any RPC.
+        // A peer still on tungstenite's default limits (an older app build)
+        // reassembles the fragmented reply too.
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
         let mut req = format!("ws://127.0.0.1:{port}")
             .into_client_request()
             .unwrap();
         req.headers_mut()
-            .insert("origin", "https://evil.example".parse().unwrap());
-        let result = tokio_tungstenite::connect_async(req).await;
-        assert!(
-            result.is_err(),
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut legacy, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let request = serde_json::to_string(&ClientFrame {
+            id: 1,
+            method: Some("Echo".into()),
+            params: serde_json::json!(big),
+            cancel: false,
+        })
+        .unwrap();
+        // It sends one unfragmented frame past 16 MiB: the raised cap takes it.
+        assert!(request.len() > 16 << 20);
+        legacy.send(Message::Text(request)).await.unwrap();
+        let reply = loop {
+            match legacy.next().await.unwrap().unwrap() {
+                Message::Text(text) => break text,
+                _ => continue,
+            }
+        };
+        let frame: ServerFrame = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            frame.ok.and_then(|v| v.as_str().map(str::len)),
+            Some(big.len())
+        );
+    }
+
+    /// Raw handshake status for a dial with the given headers (`None` = served).
+    async fn handshake_status(port: u16, headers: &[(&str, &str)]) -> Option<u16> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        for (name, value) in headers {
+            req.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                    .unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        match tokio_tungstenite::connect_async(req).await {
+            Ok(_) => None,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Some(response.status().as_u16())
+            }
+            Err(other) => panic!("unexpected handshake failure: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_with_origin_header_is_rejected() {
+        let token = ipc_auth::generate_token().unwrap();
+        let port = serve_test(&token).await;
+        let bearer = format!("Bearer {token}");
+
+        // A browser page opening ws://127.0.0.1:{port} always sends Origin;
+        // the server must refuse the handshake before serving any RPC — even
+        // when the bearer is right.
+        assert_eq!(
+            handshake_status(
+                port,
+                &[
+                    ("origin", "https://evil.example"),
+                    ("authorization", &bearer)
+                ]
+            )
+            .await,
+            Some(403),
             "handshake carrying an Origin header must be rejected"
         );
 
         // A native viewport (no Origin) still connects and can call RPC — the
         // reject must not be a blanket denial.
-        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}"), Some(&token))
+            .await
+            .unwrap();
         let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
         assert_eq!(echoed, serde_json::json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn handshake_requires_the_engine_bearer() {
+        let token = ipc_auth::generate_token().unwrap();
+        let port = serve_test(&token).await;
+
+        // Any local process can reach the port; without the token it gets 401.
+        assert_eq!(handshake_status(port, &[]).await, Some(401));
+        let wrong = format!("Bearer {}", ipc_auth::generate_token().unwrap());
+        assert_eq!(
+            handshake_status(port, &[("authorization", &wrong)]).await,
+            Some(401)
+        );
+        assert_eq!(
+            handshake_status(port, &[("authorization", &token)]).await,
+            Some(401),
+            "the Bearer scheme is required"
+        );
+        let url = format!("ws://127.0.0.1:{port}");
+        assert!(connect_ws(&url, None).await.is_err());
+        let error = match connect_ws(&url, Some("not-the-token")).await {
+            Ok(_) => panic!("a wrong token must not be served"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("401"), "{error}");
+
+        // The right token is served.
+        let right = format!("Bearer {token}");
+        assert_eq!(
+            handshake_status(port, &[("authorization", &right)]).await,
+            None
+        );
+        let client = connect_ws(&url, Some(&token)).await.unwrap();
+        assert_eq!(
+            client.call("Echo", serde_json::json!(7)).await.unwrap(),
+            serde_json::json!(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_ipc_reads_the_published_token_at_dial_time() {
+        let dir = tempfile::tempdir().unwrap();
+        // Engine start #1.
+        let first = ipc_auth::issue_token(dir.path()).unwrap();
+        let first_port = serve_test(&first).await;
+        let client = connect_ipc(first_port, Some(dir.path())).await.unwrap();
+        assert_eq!(
+            client.call("Echo", serde_json::json!(1)).await.unwrap(),
+            serde_json::json!(1)
+        );
+
+        // Engine restart: a new token replaces the file. The next dial picks
+        // it up without any client-side configuration.
+        let second = ipc_auth::issue_token(dir.path()).unwrap();
+        let second_port = serve_test(&second).await;
+        let client = connect_ipc(second_port, Some(dir.path())).await.unwrap();
+        assert_eq!(
+            client.call("Echo", serde_json::json!(2)).await.unwrap(),
+            serde_json::json!(2)
+        );
+
+        // A client holding only the stale file is refused with a clear reason.
+        let stale = tempfile::tempdir().unwrap();
+        ipc_auth::write_token(&ipc_auth::token_path(stale.path()), &first).unwrap();
+        let error = match connect_ipc(second_port, Some(stale.path())).await {
+            Ok(_) => panic!("a rotated token must not be served"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rejected"), "{error}");
     }
 
     #[tokio::test]

@@ -1998,7 +1998,7 @@ impl ParentMessageProbe {
                                     if client.is_none() {
                                         let dial = tokio::time::timeout(
                                             Duration::from_millis(250),
-                                            zeron_rpc::connect_ws(&url),
+                                            zeron_rpc::connect_ipc_url(&url, None),
                                         );
                                         tokio::select! {
                                             _ = &mut stop_signal => {
@@ -2686,6 +2686,16 @@ mod wait_core_tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
+    /// The bearer the fake engines serve; the controller presents it through
+    /// `$ZERON_IPC_TOKEN` (one fixed value, so tests never race on it).
+    fn test_ipc_token() -> String {
+        const TOKEN: &str = "comet-workers-test-ipc-token";
+        static SET: std::sync::Once = std::sync::Once::new();
+        // SAFETY: set once, to the same value, before any test dials.
+        SET.call_once(|| unsafe { std::env::set_var(zeron_rpc::ipc_auth::TOKEN_ENV, TOKEN) });
+        TOKEN.to_owned()
+    }
+
     fn test_worker(state: &str) -> WorkersSession {
         WorkersSession {
             id: "worker-1".to_owned(),
@@ -2882,7 +2892,7 @@ mod wait_core_tests {
         let server_thread = std::thread::spawn(move || {
             runtime.block_on(async move {
                 tokio::select! {
-                    _ = zeron_rpc::serve_ws_listener(listener, Arc::new(FakeRpcWaitState)) => {}
+                    _ = zeron_rpc::serve_ws_listener(listener, Arc::new(FakeRpcWaitState), test_ipc_token()) => {}
                     _ = shutdown_rx => {}
                 }
             });
@@ -3013,7 +3023,7 @@ mod wait_core_tests {
         let server_thread = std::thread::spawn(move || {
             runtime.block_on(async move {
                 tokio::select! {
-                    _ = zeron_rpc::serve_ws_listener(listener, Arc::new(MalformedRpcService)) => {}
+                    _ = zeron_rpc::serve_ws_listener(listener, Arc::new(MalformedRpcService), test_ipc_token()) => {}
                     _ = stop_rx => {}
                 }
             });

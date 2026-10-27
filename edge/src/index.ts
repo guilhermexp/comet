@@ -35,13 +35,21 @@
  *   GET|PUT  /chat2/:chatId/diff
  *   GET  /chat2/:chatId/stats
  *   POST /chat2/:chatId/reset
+ *
+ * Fork (D1, sync d5a01522): upstream's Cloud device, credential vault,
+ * runner bearers, Stripe/admin routes and the Cloud cron are NOT wired here.
+ * Their sources (src/cloud/**, src/runner-*.ts, src/registry-runner.ts,
+ * src/vault-routes.ts, vault/**) stay dormant in the tree, outside this
+ * module graph, the typecheck and the test runs (tsconfig/vitest excludes).
  */
 import { authenticate } from "./auth";
 import { chatRoute } from "./chat-route";
+import { deviceParam, forward } from "./forward";
 import { handleAuthRoute } from "./auth-routes";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import type { Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { previewRoute } from "./preview-route";
+import { releaseRoute } from "./releases";
 import { PreviewRoom } from "./preview-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
@@ -71,46 +79,6 @@ const json = (value: unknown, status = 200): Response =>
     headers: { "content-type": "application/json" }
   });
 
-/** Forward into a DO with the verified user stamped on the request. */
-const forward = (
-  ns: DurableObjectNamespace,
-  name: string,
-  request: Request,
-  userId: string,
-  path: string,
-  search?: string,
-  roomKind?: "workspace"
-): Promise<Response> => {
-  const stub = ns.get(ns.idFromName(name));
-  const url = new URL(request.url);
-  url.pathname = path;
-  if (search !== undefined) url.search = search;
-  const headers = new Headers(request.headers);
-  // room-kind is a Worker-controlled signal (the DO relaxes owner gating for
-  // workspace rooms): clear any inbound value so only the explicit set below —
-  // reached solely on workspace forwards, after the org-membership check —
-  // can assert it. Do not drop this line; passthrough would let a caller
-  // choose their own room kind.
-  headers.delete(ROOM_KIND_HEADER);
-  headers.set(AUTH_USER_HEADER, userId);
-  if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
-  return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
-};
-
-const requestInit = (request: Request): RequestInit => ({
-  method: request.method,
-  body: request.body
-});
-
-/** Carry the dialing engine's `&device=` through to the DO (socket
- * attribution in logs — the 2026-08-04 deaf socket was only identifiable by
- * reverse-engineering rotating IPv6 privacy addresses). Validated so a
- * hand-crafted value can't inject into log lines or the DO's query. */
-const deviceParam = (url: URL): string => {
-  const device = url.searchParams.get("device") ?? "";
-  return ID_RE.test(device) ? `&device=${device}` : "";
-};
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -130,29 +98,8 @@ export default {
         }
       });
     }
-    if (
-      parts[0] === "releases" &&
-      parts.length >= 2 &&
-      (request.method === "GET" || request.method === "HEAD")
-    ) {
-      const key = decodeURIComponent(url.pathname.slice("/releases/".length));
-      if (key.length === 0 || key.includes("..")) return json({ error: "bad request" }, 400);
-      const object = await env.RELEASES.get(key);
-      if (!object) return json({ error: "not_found" }, 404);
-      // latest.txt / manifest.json flip on release; artifacts are immutable by name.
-      const mutable = key.endsWith(".txt") || key.endsWith(".json");
-      const headers = new Headers({
-        "content-type": key.endsWith(".txt")
-          ? "text/plain; charset=utf-8"
-          : key.endsWith(".json")
-            ? "application/json"
-            : "application/octet-stream",
-        "content-length": String(object.size),
-        "cache-control": mutable ? "public, max-age=60" : "public, max-age=86400, immutable",
-        etag: object.httpEtag
-      });
-      return new Response(request.method === "HEAD" ? null : object.body, { headers });
-    }
+    const release = await releaseRoute(request, env, url);
+    if (release) return release;
 
     // ── WorkOS auth routes (pre-bearer: exchange/refresh/callback have no
     //    access token yet; the org routes verify the bearer themselves) ─────
@@ -179,25 +126,25 @@ export default {
         env.SESSION_ROOMS,
         `s2/${parts[1]}`,
         request,
-        auth.userId,
+        auth,
         "/ws",
         `?chatId=${parts[1]}${deviceParam(url)}`
       );
     }
     if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/tail", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/tail", "");
     }
     if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/stats", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/stats", "");
     }
     if (parts[0] === "diff" && parts[1] && ID_RE.test(parts[1])) {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/diff", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/diff", "");
     }
     if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/snapshot", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/snapshot", "");
     }
     if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/append", "");
     }
 
     // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
@@ -232,33 +179,33 @@ export default {
           env.SESSION_ROOMS,
           room,
           request,
-          auth.userId,
+          auth,
           "/ws",
           `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
           "workspace"
         );
       }
       if (parts[2] === "tail" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/tail", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/tail", "", "workspace");
       }
       // Observability: log/snapshot sizes for the per-user workspace room, so a
       // human can see whether the compaction budget is holding (org-membership
       // was already checked above; the DO bypasses the owner gate for
       // workspace kind).
       if (parts[2] === "stats" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/stats", "", "workspace");
       }
       // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
       // behind the shallow-locked rebuild converges by replacing its local
       // workspace doc with this — see the incident repair recipe).
       if (parts[2] === "snapshot" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/snapshot", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/snapshot", "", "workspace");
       }
       // Operator wedge-break: clear a workspace room whose update log grew big
       // enough to CPU-reset the DO on every cold start (org-membership already
       // checked; state re-uploads from each device's local doc on rejoin).
       if (parts[2] === "reset-log" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/reset-log", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/reset-log", "", "workspace");
       }
       // Merge-safe repair write (the chat rooms' /append, for the workspace
       // doc): lets an operator seed a reset room with ONE compact
@@ -266,7 +213,7 @@ export default {
       // re-upload its whole doc — the N-way redundant re-seed is what kept
       // ballooning the update log after the 2026-08-05 wedge breaks.
       if (parts[2] === "append" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/append", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/append", "", "workspace");
       }
     }
 
@@ -286,36 +233,36 @@ export default {
           env.REGISTRY_ROOMS,
           room,
           request,
-          auth.userId,
+          auth,
           "/ws",
           `?${deviceParam(url).replace(/^&/, "")}`
         );
       }
       if (parts[2] === "stats" && request.method === "GET") {
-        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/stats", "");
+        return forward(env.REGISTRY_ROOMS, room, request, auth, "/stats", "");
       }
       // Pull over plain HTTPS: `?since=` returns the same delta the WS
       // hello would (full table without it — the original repair read).
       // One round trip on any network that passes HTTPS at all, where the
       // WS upgrade needs 4 and a cooperative middlebox.
       if (parts[2] === "rows" && request.method === "GET") {
-        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/rows", url.search);
+        return forward(env.REGISTRY_ROOMS, room, request, auth, "/rows", url.search);
       }
       // Push over plain HTTPS — the WS push's fallback twin (LWW clocks
       // make replays no-ops, so at-least-once delivery is safe).
       if (parts[2] === "push" && request.method === "POST") {
-        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/push", url.search);
+        return forward(env.REGISTRY_ROOMS, room, request, auth, "/push", url.search);
       }
       // A phone's APNs token + notification choices (POST), or removal on
       // sign-out / turning notifications off (DELETE). `?device=` required.
       if (parts[2] === "push-target" && (request.method === "POST" || request.method === "DELETE")) {
-        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/push-target", url.search);
+        return forward(env.REGISTRY_ROOMS, room, request, auth, "/push-target", url.search);
       }
       // Operator wipe. Unlike the CRDT rooms this needs no recipe: clients
       // detect the seq regression on their next hello and re-seed the table
       // from local rows with original clocks, automatically.
       if (parts[2] === "reset" && request.method === "POST") {
-        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/reset", "");
+        return forward(env.REGISTRY_ROOMS, room, request, auth, "/reset", "");
       }
     }
 
@@ -333,22 +280,22 @@ export default {
           env.DEVICE_ROOMS,
           `d2/${deviceId}`,
           request,
-          auth.userId,
+          auth,
           "/ws",
           `?role=${role}&connId=${encodeURIComponent(connId)}`
         );
       }
       if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {
-        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, `/sidecar/${parts[3]}`, "");
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, `/sidecar/${parts[3]}`, "");
       }
       if (parts[2] === "status") {
-        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/status", "");
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, "/status", "");
       }
       // Durable command nudge (§7): "chat X has pending commands — open its
       // doc". Delivered live if the host is connected, else queued in the DO
       // and replayed on the host's next join.
       if (parts[2] === "nudge" && request.method === "POST") {
-        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/nudge", "");
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, "/nudge", "");
       }
     }
 

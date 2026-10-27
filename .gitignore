@@ -27,3 +27,5 @@ progress.md
 # Local agent worktrees and graft config — never committed.
 /.claude/worktrees/
 /.graft/
+.dev.vars
+.dev.vars.*

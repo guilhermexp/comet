@@ -149,6 +149,7 @@ async fn steer_now_interrupts_a_streaming_answer() {
                     enable_workers_mcp: false,
                     workers_parent_chat_id: None,
                     sessions: None,
+                    env: Default::default(),
                 },
             },
         )

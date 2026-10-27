@@ -249,7 +249,8 @@ impl ExportDoc {
                     | MessagePart::Input { .. }
                     | MessagePart::Error { .. }
                     | MessagePart::WorkflowTask { .. }
-                    | MessagePart::Fork { .. } => {}
+                    | MessagePart::Fork { .. }
+                    | MessagePart::Switch { .. } => {}
                 }
             }
             messages.push(ExportMessage {

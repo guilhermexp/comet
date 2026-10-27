@@ -220,12 +220,13 @@ impl TitleGenerator {
         let title_prompt = &title_prompt;
         let harness = harness.as_ref();
         let execution_lease = &execution_lease;
+        let registry = &self.inner.registry;
 
         crate::recap::with_retry_budget(
             deadline,
             std::time::Duration::from_secs(crate::recap::RUN_ATTEMPT_SECS),
             move |attempt| async move {
-                let request = RunRequest {
+                let mut request = RunRequest {
                     prompt: title_prompt.clone(),
                     harness: Some(harness_id),
                     model: cheap.clone(),
@@ -241,7 +242,11 @@ impl TitleGenerator {
                     resume: None,
                     worktree: None,
                     mcp: None,
+                    env: Default::default(),
                 };
+                // A Cloud device's credential broker supplies the CLI's login;
+                // without one there is no title to generate.
+                registry.prepare_run(harness_id, &mut request).await.ok()?;
                 match collect_text(harness, chat_id, request, Some(execution_lease.clone())).await {
                     Ok(raw) => Some(clean_title(&raw)).filter(|title| !title.is_empty()),
                     Err(err) => {
@@ -532,6 +537,7 @@ mod tests {
             resume: None,
             attachments: vec![],
             worktree: None,
+            env: Default::default(),
         };
         let result = collect_text(&harness, "title-test", request, None).await;
         assert!(

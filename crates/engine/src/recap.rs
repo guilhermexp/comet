@@ -428,6 +428,7 @@ pub async fn run_recap_model(
                 attachments: Vec::new(),
                 resume: None,
                 worktree: None,
+                env: Default::default(),
             };
 
             match collect_text(harness, chat_id, request, Some(execution_lease.clone())).await {

@@ -20,6 +20,8 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 
 - O campo opcional `answers` de input parts preserva `questionId` + `labels` nos dois sentidos de `toDocParts`/`fromDocParts`, em paridade com `zeron-doc`.
 
+- Cloud upstream (D1 do sync `d5a01522`) é **dormente**: `src/cloud/**`, `src/runner-*.ts`, `src/registry-runner.ts`, `src/vault-routes.ts` e `vault/**` ficam na árvore, mas fora do grafo de `src/index.ts`, do `tsconfig.json` (`exclude`) e das execuções do vitest (`exclude` comentado nos dois configs). O runtime publicado não tem runner bearers, VAULT, Workflows, cron nem rotas `/cloud`/`/vault`/`/runner`/`/admin`/`/stripe`. Religar exige change OpenSpec + bindings no `wrangler.jsonc`.
+- `/releases/*` vive em `src/releases.ts` (extraído do upstream); o forward para DOs em `src/forward.ts` (sem carimbo de runner no fork).
 - Decisão registrada em `docs/research/durable-objects-language.md`: **os DOs ficam em TypeScript**. Tudo device-side é Rust. Não portar DO pra Rust sem revisitar essa decisão.
 - `edge/src/session-doc/` é o gêmeo do schema de `crates/doc` — nome e shape de container casam byte a byte. Mudou lá, muda aqui, no mesmo commit.
 - Fala `loro-protocol` no fio; o lado Rust usa a crate oficial equivalente. Frames são idênticos por contrato, não por coincidência.

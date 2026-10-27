@@ -324,6 +324,19 @@ pub fn has_release_feed(edge_url: &str) -> bool {
     release_base(edge_url).is_ok()
 }
 
+/// The agent-CLI compatibility policy (`harness-compatibility.json`) beside
+/// this edge's release feed. Same base as the app updates: the upstream Zeron
+/// edge (`zeron.sh`/`*.zeron.sh`) maps to the fork's GitHub Releases
+/// ([`COMET_RELEASES_URL`]), `ZERON_RELEASES_URL` stays an explicit override,
+/// and self-hosted edges keep `{edge}/releases`. The fork may not publish the
+/// file; callers treat a 404 as "no known-bad releases". `None` when no feed
+/// can be resolved (invalid override).
+pub fn harness_compatibility_url(edge_url: &str) -> Option<String> {
+    release_base(edge_url)
+        .ok()
+        .map(|base| format!("{}/harness-compatibility.json", base.trim_end_matches('/')))
+}
+
 // ---------------------------------------------------------------------------
 // Install-kind detection
 // ---------------------------------------------------------------------------
@@ -394,12 +407,20 @@ fn desktop_updates_disabled() -> bool {
     })
 }
 
+/// Where this process was installed from, resolved once: an update moves
+/// the running image aside (Windows renames it to `zeron.exe.old`), and a
+/// long-running engine must still recognise the installation it belongs to.
 pub fn detect_install() -> InstallKind {
-    let Ok(exe) = std::env::current_exe() else {
-        return InstallKind::Unmanaged;
-    };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    detect_install_from(&exe, home.as_deref())
+    static INSTALL: std::sync::OnceLock<InstallKind> = std::sync::OnceLock::new();
+    INSTALL
+        .get_or_init(|| {
+            let Ok(exe) = std::env::current_exe() else {
+                return InstallKind::Unmanaged;
+            };
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            detect_install_from(&exe, home.as_deref())
+        })
+        .clone()
 }
 
 fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
@@ -590,10 +611,43 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     }
 }
 
+// Dormant in the fork: the upstream background engine (`engine/managed.rs`)
+// registers these. The fork's updater keeps its own `RestartGate` and does not
+// restart into a newer installed version on its own (no `SupersededRestart`).
+type ManagedRestart = Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+
+static MANAGED_RESTART: std::sync::OnceLock<ManagedRestart> = std::sync::OnceLock::new();
+
+/// This process is the desktop app's background engine, which no service
+/// manager supervises: `restart` relaunches it (the replacement waits for
+/// this one to let go of the data directory) and stops this one. With it set,
+/// [`restart_service`] calls it instead of the service manager.
+pub fn set_managed_restart(restart: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static) {
+    let _ = MANAGED_RESTART.set(Box::new(restart));
+}
+
+type ManagedRestartReady = Box<dyn Fn() -> bool + Send + Sync>;
+static MANAGED_RESTART_READY: std::sync::OnceLock<ManagedRestartReady> = std::sync::OnceLock::new();
+
+/// When the background engine may restart into a newer installed version,
+/// on top of nothing running (e.g. only while the app that starts it runs).
+/// Checked on every pass, so a restart it holds back happens on a later one.
+pub fn set_managed_restart_ready(ready: impl Fn() -> bool + Send + Sync + 'static) {
+    let _ = MANAGED_RESTART_READY.set(Box::new(ready));
+}
+
+#[allow(dead_code)]
+fn managed_restart_ready() -> bool {
+    MANAGED_RESTART_READY.get().is_none_or(|ready| ready())
+}
+
 /// Restart the installed engine service (the same units `zeron daemon` and the
 /// curl|sh installer manage). Called after a symlink swap so the running daemon
 /// picks up the new binary.
 pub fn restart_service() -> anyhow::Result<()> {
+    if let Some(restart) = MANAGED_RESTART.get() {
+        return restart();
+    }
     require_managed_update_platform()?;
     if cfg!(target_os = "macos") {
         let output = std::process::Command::new("id").arg("-u").output()?;
@@ -1417,6 +1471,13 @@ mod tests {
             "https://edge.example.com/releases"
         );
         assert!(edge_release_base("https://notzeron.sh").is_ok());
+    }
+
+    #[test]
+    fn harness_compatibility_feed_never_reads_the_upstream_zeron_edge() {
+        let url = harness_compatibility_url("https://edge.zeron.sh").unwrap();
+        assert!(url.ends_with("/harness-compatibility.json"), "{url}");
+        assert!(!url.contains("zeron.sh"), "{url}");
     }
 
     #[test]

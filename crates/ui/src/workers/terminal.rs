@@ -1146,10 +1146,18 @@ impl WorkersTerminal {
         let first_col = self.geometry.map_or(0, |geometry| {
             state.first_col(geometry.cell_w, geometry.cols)
         });
+        // The Workers host has no pixel scroll, cursor blink, input-method
+        // composition or copy flash: the engine panel's extras stay at rest.
         Some(GridSnapshot {
             lines: state.emulator.lines(),
+            line_above: None,
+            scroll_frac: 0.0,
             cursor: state.emulator.cursor(),
             first_col,
+            cursor_shape: state.emulator.cursor_style().0,
+            cursor_on: true,
+            marked_text: None,
+            copy_flash: 0.0,
         })
     }
 

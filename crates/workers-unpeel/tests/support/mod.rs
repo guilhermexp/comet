@@ -178,7 +178,11 @@ pub mod engine {
                 state: state.clone(),
                 spaces_tx: spaces_tx.clone(),
             });
-            runtime.spawn(zeron_rpc::serve_ws_listener(listener, service));
+            runtime.spawn(zeron_rpc::serve_ws_listener(
+                listener,
+                service,
+                super::test_ipc_token(),
+            ));
             Self {
                 state,
                 spaces_tx,
@@ -217,4 +221,15 @@ pub mod engine {
             self.state.lock().unwrap().spaces.clone()
         }
     }
+}
+
+/// The bearer every fake engine in these tests serves, presented by the
+/// controller through `$ZERON_IPC_TOKEN` (one fixed value, so concurrent tests
+/// never race on the environment).
+pub fn test_ipc_token() -> String {
+    const TOKEN: &str = "comet-workers-test-ipc-token";
+    static SET: std::sync::Once = std::sync::Once::new();
+    // SAFETY: set once, to the same value, before any test dials.
+    SET.call_once(|| unsafe { std::env::set_var(zeron_rpc::ipc_auth::TOKEN_ENV, TOKEN) });
+    TOKEN.to_owned()
 }
