@@ -2407,8 +2407,11 @@ impl SessionsEngine {
             }
         }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
+        // Concurrent, so one slow settlement can't hold the others (fork);
+        // `terminate`, not `interrupt`: a shutdown is not the user's Stop, and
+        // the turns it cuts off are revived at the next boot (2e151ca65).
         let results = futures::future::join_all(chats.into_iter().map(|chat_id| async move {
-            let result = self.interrupt(&chat_id).await;
+            let result = self.terminate(&chat_id).await;
             (chat_id, result)
         }))
         .await;
