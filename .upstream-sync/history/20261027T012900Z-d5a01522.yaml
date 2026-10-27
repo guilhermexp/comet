@@ -1,8 +1,8 @@
 schema_version: 1
 id: 20261027T012900Z-d5a01522
-skill_version: null
+skill_version: '1.1.0'
 started_at: '2026-10-27T01:29:00Z'
-finished_at: '2026-10-27T04:16:37Z'
+finished_at: '2026-10-27T06:28:52Z'
 finished_at_initial: '2026-10-27T03:19:25Z'
 request: 'Execute owner-approved brief sync-upstream-20261026 (D1-D7); real merge of pinned d5a01522, preserve fork 1.0.10, no push.'
 workflow_source: '.tmp/briefs/sync-upstream-20261026.md; .tmp/briefs/sync-upstream-20261026-auditoria.md; no ajustes file existed at any step.'
@@ -506,28 +506,41 @@ verification:
   result: passed
   exit: 0
   observed: 'fmt ok; check ok with no warning beyond 0aa2344b; harness 914/0; workers-unpeel 534/0; unpeel-core session_host 77/0.'
+- command: 'Mac (orchestrator): scripts/cargo-verify.py -- cargo check --workspace --all-targets; cargo test -p zeron-engine --lib claude_login; cargo test -p zeron-notify; cargo test -p zeron-ui --lib'
+  revision: a1fa9159
+  result: passed
+  exit: 0
+  observed: 'macOS check finished with no warnings; engine claude_login 2/0 (keychain fallback, spent login refused); zeron-notify 4/0; zeron-ui lib 2619 passed, 0 failed.'
+- command: 'Static security review (read-only reviewer) of IPC bearer, MCP grants, D5 and terminal RTC'
+  revision: a1fa9159
+  result: passed
+  exit: null
+  observed: 'Found F1 (OMP sidecars without bearer), F2 (Workers inherit bearer path), F3 (Pi descriptors carry the path); all three confirmed closed after fd182301, 1627106b, 5107e85b. RunRequest.mcp stays None; side_chats_only only with the root grant; terminal RTC refuses unauthenticated and Cloud peers.'
+- command: 'GitHub Actions on guilhermexp/comet push a1fa9159'
+  revision: a1fa9159
+  result: failed_preexisting_only
+  exit: 1
+  observed: 'deploy, Preview networking, Cursor compatibility success; UI tests: ui-tests, ios-tests, linux-browser, macos-frame-recovery success, core-tests failed only on legacy_admission_rechecks_owner_and_retires_only_the_captured_wake; rust failed on the same test, which also fails in CI on 0aa2344b (rust run of 2026-10-23).'
 limits:
-- macOS-only code (browser/macos.rs focus capture fbdda0a0c, Claude keychain/credentials fallback, notify crate AppKit bits, Metal) not compiled or run on Linux.
-- iOS app (Cloud/*, model picker, companions, terminals) not built; Swift bindings regenerated from the Linux host library only.
+- macOS-only code compiled and unit-tested on the Mac; browser focus capture (fbdda0a0c) and desktop banners not exercised interactively.
+- iOS app built and tested only by CI ios-tests; no device run of Cloud/*, model picker, companions or terminals.
 - Desktop app not run (dev-demo forbidden by the brief); no visual check of rail, captions, terminal, Settings.
 - No live provider (Claude/Codex/Muse/Pi) runs; no device-to-device WebRTC terminal exercised.
 - Logs live in the session scratchpad and are summarized in .tmp/reports/sync-upstream-20261026.md.
 references:
 - .tmp/briefs/sync-upstream-20261026.md
 - .tmp/reports/sync-upstream-20261026.md
-- openspec/changes/sync-upstream-v0-2-126/
+- openspec/changes/archive/2026-10-27-sync-upstream-v0-2-126/
 - docs/upstream-sync.md
-outcome: prepared
+outcome: integrated
 pending:
-- Native macOS/iOS acceptance and OpenSpec archive.
-- Owner decision on Workers-started servers in previews/Ports (no ZERON_ORIGIN stamp).
-- Preexisting doc_host legacy_admission test failure (also on 0aa2344b).
-- Push/publication not authorized.
+- Preexisting doc_host legacy_admission test failure (also on 0aa2344b, locally and in CI).
+- Visual/interactive desktop acceptance and live provider runs not performed.
 delivery:
-  integration: local_branch
-  target_branch: sync/upstream-20261026
-  commit: 5107e85be
+  integration: fast_forward
+  target_branch: main
+  commit: a1fa91597b2a60a5b7be2cc8940868d49a97defe
   pr: null
-  publication: not_authorized
-  record_pushed: false
-  deploy: not_authorized
+  publication: pushed to origin/main (0aa2344b..a1fa9159) on owner authorization
+  record_pushed: true
+  deploy: 'deploy workflow run 40456705223 success (edge, fork wrangler config)'

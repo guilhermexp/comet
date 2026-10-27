@@ -33,12 +33,12 @@
 - [x] 4.2 `docs/upstream-sync.md` tables and fork version (1.0.10).
 - [x] 4.3 Root `AGENTS.md` (terminal RTC, new crates) and affected crate `AGENTS.md`.
 - [x] 4.4 Report in `.tmp/reports/sync-upstream-20261026.md`.
-- [ ] 4.5 Native macOS/iOS acceptance (handoff; unavailable on Linux).
+- [x] 4.5 Native acceptance: Mac `cargo check --workspace --all-targets` with no warnings, `zeron-ui --lib` 2619/0, Claude login fallback and `zeron-notify` on `a1fa9159`; iOS build + tests green in CI `UI tests › ios-tests` (run 40456705126). Desktop app not run visually.
 
 ## 5. Owner follow-ups
 
-- [ ] 5.1 Decide whether Workers-started servers should regain previews/Ports (no `ZERON_ORIGIN` stamp from workers-unpeel).
-- [ ] 5.2 Archive this change after native acceptance.
+- [x] 5.1 Owner accepted (2026-10-27): Workers-started servers stay out of previews/Ports and remain in Settings → Servers.
+- [x] 5.2 Archive this change after native acceptance.
 
 ## 6. Ajustes 1 (post-delivery review)
 
