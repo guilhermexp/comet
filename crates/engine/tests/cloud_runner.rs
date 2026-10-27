@@ -40,6 +40,9 @@ type Handler = Box<dyn FnMut(&Req) -> (u16, Value) + Send>;
 struct Stub {
     port: u16,
     requests: Arc<Mutex<Vec<Req>>>,
+    // Cloud is dormant in the fork (sync v0.2.126 D1): upstream's swap of a
+    // running stub's handler (`set`) has no caller in this suite.
+    #[allow(dead_code)]
     handler: Arc<Mutex<Handler>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -91,6 +94,8 @@ impl Stub {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    // See `Stub::handler`: kept dormant with the rest of the Cloud runner.
+    #[allow(dead_code)]
     fn set(&self, handler: impl FnMut(&Req) -> (u16, Value) + Send + 'static) {
         *self.handler.lock().unwrap() = Box::new(handler);
     }

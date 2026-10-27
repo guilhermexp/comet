@@ -4233,12 +4233,6 @@ fn with_claude_ai_oauth(
     }
 }
 
-/// Meter label for a Codex rate-limit window from its span (shared with the
-/// clients through `zeron_proto::plan_usage`).
-fn codex_window_label(span_seconds: i64) -> &'static str {
-    zeron_proto::plan_usage::codex_window_label(span_seconds)
-}
-
 /// Parse a codex `auth.json` (the live one or a fresh login's).
 fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     if let Some(id_token) = auth
@@ -5990,12 +5984,18 @@ mod tests {
     fn codex_window_labels_track_the_window_span() {
         // Codex free tier: one 30-day window (observed live:
         // limit_window_seconds = 2_592_000) — NOT a week.
-        assert_eq!(codex_window_label(2_592_000), "Month");
+        assert_eq!(
+            zeron_proto::plan_usage::codex_window_label(2_592_000),
+            "Month"
+        );
         // Plus: 5-hour primary + weekly secondary.
-        assert_eq!(codex_window_label(18_000), "Session");
-        assert_eq!(codex_window_label(604_800), "Week");
+        assert_eq!(
+            zeron_proto::plan_usage::codex_window_label(18_000),
+            "Session"
+        );
+        assert_eq!(zeron_proto::plan_usage::codex_window_label(604_800), "Week");
         // Unknown/absent span falls back to the shortest label.
-        assert_eq!(codex_window_label(0), "Session");
+        assert_eq!(zeron_proto::plan_usage::codex_window_label(0), "Session");
     }
 
     #[test]

@@ -224,7 +224,9 @@ impl VisualSlot {
         })
     }
 
-    /// The measured height (at the latest width the worker laid out).
+    /// The measured height (at the latest width the worker laid out). Read by
+    /// the tests; layout reads [`Self::snapshot`] for the epoch with it.
+    #[cfg(test)]
     pub fn height(&self) -> Option<f32> {
         self.snapshot().1
     }
