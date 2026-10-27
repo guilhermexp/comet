@@ -278,6 +278,7 @@ Fechamento: accessor de índice explícito ilegível é recusado (só ausência 
 - **Resolver com agentes:** eles podem apagar código "morto" que outro arquivo ainda usa (por exemplo `motion::fast_tier`). A etapa de compilação precisa reconciliar isso.
 - **Trocar destino de worktree não muda a posse de checkouts existentes.** Nunca usar prefixo da raiz atual ou formato do basename para pular preparo: valide registro Git e consulte o journal comum; ausência de registro é no-op externo, estado malformado falha fechado.
 - **Session information responsiva usa o gutter do fork.** O upstream calcula com 48px; o transcript compacto usa `COLUMN_GUTTER` (16px), e Details também consome o orçamento real. Portar só o card sem essas duas alocações produz geometria errada.
+- **Credenciais da engine nos sidecars.** O OMP lança `comet-workers`/`comet-sessions`/`zeron` pelo `omp/workers_bridge.rs`, fora de `workers_mcp::servers_for_request`: todo env novo que os servidores do grant precisem (ex.: `ZERON_IPC_TOKEN_FILE`) tem de passar pelo helper comum nos dois caminhos. E o inverso: o controller Workers não pode repassar o bearer aos Workers (captura na partida + strip no `unpeel-core`).
 - **Guards de nesting dependem do layout real.** O root ancestral de um repo era recusado porque o upstream concatena seu basename; o serviço comum do fork cria diretório com hash fora desse repo. Valide o destino real, recuse roots internos antes de mutar e teste também a raiz ancestral válida.
 
 ## Integração v0.2.107

@@ -39,3 +39,10 @@
 
 - [ ] 5.1 Decide whether Workers-started servers should regain previews/Ports (no `ZERON_ORIGIN` stamp from workers-unpeel).
 - [ ] 5.2 Archive this change after native acceptance.
+
+## 6. Ajustes 1 (post-delivery review)
+
+- [x] 6.1 F1: OMP sidecars present the engine IPC bearer file (RED/GREEN test in `omp/workers_bridge.rs`).
+- [x] 6.2 F2: Worker processes never inherit the engine IPC bearer (controller capture + vendored unpeel-core strip, provenance updated; `tests/controller_ipc_credentials.rs`).
+- [x] 6.3 W: no `cargo check --workspace --all-targets` warning beyond `0aa2344b`; macOS-reported `math_face`/`VisualSlot::height` cleared.
+- [x] 6.4 Gate: fmt, check, test-core (preexisting failure only), harness, workers-unpeel, sessions-mcp, engine lib.

@@ -2,7 +2,8 @@ schema_version: 1
 id: 20261027T012900Z-d5a01522
 skill_version: null
 started_at: '2026-10-27T01:29:00Z'
-finished_at: '2026-10-27T03:19:25Z'
+finished_at: '2026-10-27T04:00:35Z'
+finished_at_initial: '2026-10-27T03:19:25Z'
 request: 'Execute owner-approved brief sync-upstream-20261026 (D1-D7); real merge of pinned d5a01522, preserve fork 1.0.10, no push.'
 workflow_source: '.tmp/briefs/sync-upstream-20261026.md; .tmp/briefs/sync-upstream-20261026-auditoria.md; no ajustes file existed at any step.'
 upstream:
@@ -18,7 +19,7 @@ fork:
   target_branch: sync/upstream-20261026
   initial_sha: 0aa2344b1f562495ccffadbfa497331f1ea279fc
   observed_target_sha: 0aa2344b1f562495ccffadbfa497331f1ea279fc
-  result_sha: a68c0ada0
+  result_sha: eabcadd1e
   result_sha_note: 'Code revision evaluated; this record arrives in the following docs-only commit.'
   initial_worktree: clean
 strategy:
@@ -33,6 +34,9 @@ strategy:
   repair_commits:
   - 77f542d1f
   - a68c0ada0
+  - fd1823015
+  - 1627106b4
+  - eabcadd1e
 changes:
   incoming_range: c526d6f7cfc7a53e5588e3e6c5df7484a14d649f..d5a0152265112c235d79b29df92b550c73a5ca1a
   incoming_count: 74
@@ -335,6 +339,8 @@ changes:
     decision: 'ADAPT'
     reason: 'typed fork tab filled while CLI holds it'
 customizations:
+- 'Ajustes 1 F1: OMP sidecars (comet-workers, comet-sessions, zeron) get ZERON_IPC_TOKEN_FILE through the same with_ipc_token_file filter as servers_for_request.'
+- 'Ajustes 1 F2: the Workers controller captures the IPC bearer at startup and removes ZERON_IPC_TOKEN/ZERON_IPC_TOKEN_FILE from its environment; vendored unpeel-core strips both from launcher, detached host and Worker shell (provenance in unpeel-upstream.toml, vendored_tree 54578d98).'
 - Version 1.0.10, release.yml/feed/updater (zeron.sh → COMET_RELEASES_URL), vendored zui unchanged (new upstream pin not required to compile; gpui-base stays 701ca97).
 - Root-only MCP grants (RunRequest.mcp empty); SessionsGrant.side_chats_only carries the native-subagents switch; ZERON_IPC_TOKEN_FILE reaches comet-workers/comet-sessions/zeron.
 - Fork main.rs/daemon.rs and packaging; engine/managed.rs dormant; deploy.yml and wrangler.jsonc fork; edge Cloud/vault/runner outside the index graph, tsconfig and tests.
@@ -473,6 +479,21 @@ verification:
   revision: 60682c5b0
   result: no_accidental_loss
   observed: 'Every missing group is a recorded decision, fork adaptation or reformatting; 164 upstream RPC names present in method.rs except Get/SetCommitCredit.'
+- command: 'Ajustes 1 RED/GREEN: cargo test -p zeron-harness --lib omp_sidecars; cargo test -p zeron-workers-unpeel --test controller_ipc_credentials; unpeel-core shells_never_inherit_the_embedder_ipc_bearer'
+  revision: eabcadd1e
+  result: passed
+  exit: 0
+  observed: 'F1 test failed before (OMP sidecar env without ZERON_IPC_TOKEN_FILE) and passes after; F2 test failed before (launcher child received ZERON_IPC_TOKEN and ZERON_IPC_TOKEN_FILE) and passes after, including the controller dial with the captured bearer.'
+- command: 'cargo check --workspace --all-targets warnings vs 0aa2344b'
+  revision: eabcadd1e
+  result: passed
+  exit: 0
+  observed: 'No warning beyond baseline (21 remaining, all present on 0aa2344b on Linux); math_face and VisualSlot::height also cleared.'
+- command: 'Ajustes 1 gate: fmt --check; check --workspace --all-targets; scripts/ci/test-core.sh; cargo test -p zeron-harness, -p zeron-workers-unpeel, -p zeron-sessions-mcp, -p zeron-engine --lib'
+  revision: eabcadd1e
+  result: failed_preexisting_only
+  exit: 100
+  observed: 'test-core 2262 run, 2261 passed, 1 failed (preexisting legacy_admission); harness 914/0; workers-unpeel 534/0; sessions-mcp 4/0; engine lib 784 passed, 1 failed (same preexisting).'
 limits:
 - macOS-only code (browser/macos.rs focus capture fbdda0a0c, Claude keychain/credentials fallback, notify crate AppKit bits, Metal) not compiled or run on Linux.
 - iOS app (Cloud/*, model picker, companions, terminals) not built; Swift bindings regenerated from the Linux host library only.
@@ -493,7 +514,7 @@ pending:
 delivery:
   integration: local_branch
   target_branch: sync/upstream-20261026
-  commit: a68c0ada0
+  commit: eabcadd1e
   pr: null
   publication: not_authorized
   record_pushed: false
