@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "54578d983326fd01b638a672a7087414e16fe9c8"
+vendored_tree = "f85622c2559aa8fb5f2709a206cd0754425fe9ac"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -173,3 +173,10 @@ base_revision_resolves_upstream = false
 # Unit test `shells_never_inherit_the_embedder_ipc_bearer`; downstream proof in
 # `crates/workers-unpeel/tests/controller_ipc_credentials.rs`. Local patch
 # only; local_modifications_count remains the unrecomputed historical value.
+
+# 2026-10-27 — sync v0.2.126 ajuste F3: `strip_embedder_ipc_credentials` and
+# `strip_leaked_launcher_env` also remove the embedder's Pi MCP bridge
+# descriptors (`ZERON_PI_MCP`, `ZERON_PI_MCP_<n>`), whose JSON carries the same
+# bearer file path. Unit test `shells_never_inherit_the_embedder_ipc_bearer`
+# extended; downstream proof stays `controller_ipc_credentials.rs`. Local
+# patch only; local_modifications_count remains the unrecomputed value.

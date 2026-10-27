@@ -10,6 +10,14 @@ if (process.argv[2] === 'server') {
     else if (msg.method === 'tools/call') {
       if (msg.params.arguments.mode === 'hang') return;
       if (msg.params.arguments.mode === 'crash') process.exit(1);
+      if (msg.params.arguments.mode === 'descriptors') {
+        // The bridge descriptors (and the bearer file path inside them) are
+        // the Pi process's: never a sidecar's, nor the Workers it launches.
+        const leaked = Object.keys(process.env).filter(key => /^ZERON_PI_MCP(_\d+)?$/.test(key));
+        result = {content:[{type:'text',text:leaked.join(',')}], isError:false};
+        process.stdout.write(JSON.stringify({jsonrpc:'2.0', id:msg.id, result})+'\n');
+        return;
+      }
       result = {content:[{type:'text',text:process.env.ZERON_CHAT_ID}], isError:msg.params.arguments.mode === 'error'};
     } else return;
     process.stdout.write(JSON.stringify({jsonrpc:'2.0', id:msg.id, result})+'\n');
@@ -18,6 +26,8 @@ if (process.argv[2] === 'server') {
   const {default: extension} = await import(process.argv[2]);
   for (const chat of ['first', 'second']) {
     process.env.ZERON_PI_MCP = JSON.stringify({name:'zeron',command:process.execPath,args:[process.argv[1],'server'],env:{ZERON_CHAT_ID:chat}});
+    // A sibling bridge's descriptor, carrying the engine bearer file path.
+    process.env.ZERON_PI_MCP_1 = JSON.stringify({name:'comet-workers',command:'/opt/zeron',args:[],env:{ZERON_IPC_TOKEN_FILE:'/data/ipc-token'}});
     const handlers = {}, tools = {};
     extension({on:(event,fn)=>handlers[event]=fn,registerTool:tool=>tools[tool.name]=tool});
     try {
@@ -25,6 +35,7 @@ if (process.argv[2] === 'server') {
       for (const name of ['create_chat','create_chats','read_chat','send_message','wait_for_turn']) {
         assert.equal((await tools[`zeron_${name}`].execute('delegation',{})).content[0].text, chat);
       }
+      assert.equal((await tools.zeron_whoami.execute('call',{mode:'descriptors'})).content[0].text, '', 'sidecar inherited ZERON_PI_MCP*');
       const tool = tools.zeron_whoami;
       assert.equal(tool.parameters.type,'object');
       const result = await tool.execute('call',{});

@@ -6,6 +6,8 @@ use std::process::Command;
 
 const TOKEN_ENV: &str = "ZERON_IPC_TOKEN";
 const TOKEN_FILE_ENV: &str = "ZERON_IPC_TOKEN_FILE";
+/// Pi bridge descriptors: the JSON carries the bearer file path too.
+const PI_BRIDGE_ENVS: [&str; 2] = ["ZERON_PI_MCP", "ZERON_PI_MCP_1"];
 
 /// The names of the variables a child process actually received.
 fn child_env_names(mut command: Command) -> Vec<String> {
@@ -20,7 +22,9 @@ fn child_env_names(mut command: Command) -> Vec<String> {
 fn leaked(names: &[String]) -> Vec<&String> {
     names
         .iter()
-        .filter(|name| *name == TOKEN_ENV || *name == TOKEN_FILE_ENV)
+        .filter(|name| {
+            *name == TOKEN_ENV || *name == TOKEN_FILE_ENV || PI_BRIDGE_ENVS.contains(&name.as_str())
+        })
         .collect()
 }
 
@@ -34,6 +38,12 @@ fn worker_processes_never_inherit_the_engine_ipc_bearer() {
     unsafe {
         std::env::set_var(TOKEN_ENV, "secret-token");
         std::env::set_var(TOKEN_FILE_ENV, "/data/ipc-token");
+        for name in PI_BRIDGE_ENVS {
+            std::env::set_var(
+                name,
+                r#"{"name":"comet-workers","env":{"ZERON_IPC_TOKEN_FILE":"/data/ipc-token"}}"#,
+            );
+        }
     }
 
     // A Worker launched by any embedder process (the app included) is
@@ -52,6 +62,9 @@ fn worker_processes_never_inherit_the_engine_ipc_bearer() {
     zeron_workers_unpeel::controller_mcp_take_ipc_credentials();
     assert!(std::env::var_os(TOKEN_ENV).is_none());
     assert!(std::env::var_os(TOKEN_FILE_ENV).is_none());
+    for name in PI_BRIDGE_ENVS {
+        assert!(std::env::var_os(name).is_none(), "{name}");
+    }
     let names = child_env_names(env_command());
     assert_eq!(
         leaked(&names),

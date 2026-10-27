@@ -127,7 +127,26 @@ pub fn take_engine_ipc_credentials() {
     unsafe {
         std::env::remove_var(zeron_rpc::ipc_auth::TOKEN_ENV);
         std::env::remove_var(zeron_rpc::ipc_auth::TOKEN_FILE_ENV);
+        // A controller launched by Pi also holds the bridge descriptors
+        // (`ZERON_PI_MCP`, `ZERON_PI_MCP_<n>`), whose JSON names the bearer
+        // file; they are Pi's, not the Workers'.
+        for (key, _) in std::env::vars_os() {
+            if is_pi_bridge_descriptor(&key) {
+                std::env::remove_var(key);
+            }
+        }
     }
+}
+
+/// `ZERON_PI_MCP` or `ZERON_PI_MCP_<n>`: a Pi MCP bridge descriptor.
+fn is_pi_bridge_descriptor(key: &std::ffi::OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    key == "ZERON_PI_MCP"
+        || key
+            .strip_prefix("ZERON_PI_MCP_")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Dial the engine at `url` with the bearer taken at startup (the file is
