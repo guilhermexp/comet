@@ -10,6 +10,7 @@ pub enum PreviewKind {
     Pdf,
     Video,
     Data,
+    Audio,
     Unsupported,
 }
 
@@ -119,6 +120,9 @@ pub fn classify_preview_kind(path: &str) -> PreviewKind {
         // WebKit renders these as a media document with its own player; see
         // the Video arm in `load_preview` for why they skip the byte cap.
         "mp4" | "mov" | "m4v" | "webm" => PreviewKind::Video,
+        "mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "aiff" | "aif" => {
+            PreviewKind::Audio
+        }
         "csv" | "tsv" | "xls" | "xlsx" => PreviewKind::Data,
         "rs" | "js" | "jsx" | "ts" | "tsx" | "py" | "go" | "json" | "jsonc" | "sh" | "bash"
         | "zsh" | "toml" | "css" | "scss" | "yaml" | "yml" | "c" | "h" | "cpp" | "cc" | "cxx"
@@ -129,5 +133,36 @@ pub fn classify_preview_kind(path: &str) -> PreviewKind {
             PreviewKind::Code
         }
         _ => PreviewKind::Unsupported,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_audio_extensions_case_insensitively() {
+        let cases = [
+            ("track.mp3", PreviewKind::Audio),
+            ("sound.wav", PreviewKind::Audio),
+            ("voice.m4a", PreviewKind::Audio),
+            ("sample.aac", PreviewKind::Audio),
+            ("song.flac", PreviewKind::Audio),
+            ("audio.ogg", PreviewKind::Audio),
+            ("stream.oga", PreviewKind::Audio),
+            ("speech.opus", PreviewKind::Audio),
+            ("music.aiff", PreviewKind::Audio),
+            ("tune.aif", PreviewKind::Audio),
+            ("UPPER.MP3", PreviewKind::Audio),
+            ("MIXED.FlAc", PreviewKind::Audio),
+            ("nested/dir/podcast.M4A:12", PreviewKind::Audio),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_preview_kind(path),
+                expected,
+                "path {path} must classify as {expected:?}"
+            );
+        }
     }
 }

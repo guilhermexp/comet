@@ -187,9 +187,10 @@ fn navigation_delegate() -> *mut Object {
 ///   frame**: a pagina fica em branco. Medido em 2026-08-28 num `WKWebView`
 ///   com a config deste arquivo — 0 pixels pintados desligado, 519 ligado, e a
 ///   chave legada nao muda nada nos dois casos.
-/// - `Video`: precisa da chave **legada** `javaScriptEnabled`, que e onde
-///   rodam os controles de midia embutidos (medido 2026-08-27: desligada, o
-///   player pinta uma barra morta e o frame colapsa num canto).
+/// - `Video` e `Audio`: compartilham o comportamento de midia — rodam na chave
+///   **legada** `javaScriptEnabled` (onde rodam os controles de midia embutidos;
+///   medido para video em 2026-08-27: desligada, o player pinta uma barra morta
+///   e colapsa num canto).
 /// - `Pdf`: nao precisa de nenhuma das duas.
 ///
 /// Ligar `allowsContentJavaScript` no HTML **nao** deixa o documento rodar
@@ -202,17 +203,18 @@ enum DocumentKind {
     Html,
     Pdf,
     Video,
+    Audio,
 }
 
 impl DocumentKind {
     /// Ler arquivo local do disco (`loadFileURL`).
     fn allows_file(self) -> bool {
-        matches!(self, Self::Pdf | Self::Video)
+        matches!(self, Self::Pdf | Self::Video | Self::Audio)
     }
 
     /// A chave legada — so os controles de midia dependem dela.
     fn legacy_javascript(self) -> bool {
-        matches!(self, Self::Video)
+        matches!(self, Self::Video | Self::Audio)
     }
 
     /// A chave moderna — so o iframe `srcdoc` do HTML depende dela.
@@ -273,6 +275,10 @@ impl NativeDocumentView {
 
     pub fn open_video(path: &Path) -> Option<Self> {
         Self::open_file(path, DocumentKind::Video)
+    }
+
+    pub fn open_audio(path: &Path) -> Option<Self> {
+        Self::open_file(path, DocumentKind::Audio)
     }
 
     fn open_file(path: &Path, kind: DocumentKind) -> Option<Self> {
@@ -366,6 +372,10 @@ mod tests {
         assert!(DocumentKind::Video.legacy_javascript());
         assert!(!DocumentKind::Video.content_javascript());
 
+        // Audio espelha a politica de midia do Video.
+        assert!(DocumentKind::Audio.legacy_javascript());
+        assert!(!DocumentKind::Audio.content_javascript());
+
         // PDF nao precisa de nenhuma das duas.
         assert!(!DocumentKind::Pdf.legacy_javascript());
         assert!(!DocumentKind::Pdf.content_javascript());
@@ -373,6 +383,7 @@ mod tests {
         // So o que vem de arquivo local recebe permissao de leitura.
         assert!(DocumentKind::Pdf.allows_file());
         assert!(DocumentKind::Video.allows_file());
+        assert!(DocumentKind::Audio.allows_file());
     }
 
     #[test]

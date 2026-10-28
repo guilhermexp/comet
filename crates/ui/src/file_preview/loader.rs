@@ -28,6 +28,7 @@ pub enum LoadedPreview {
     Image(Arc<Image>),
     Pdf,
     Video,
+    Audio,
     Table(Arc<[Vec<SharedString>]>),
     Unsupported,
 }
@@ -266,11 +267,14 @@ pub fn load_preview_with_typography(
         ));
     }
     let kind = classify_preview_kind(path.to_string_lossy().as_ref());
-    // A video is never read into memory: WebKit streams it off disk, so the
-    // binary byte cap below does not apply. Capping it would reject the
-    // ordinary case — a screen recording is routinely hundreds of megabytes.
+    // Media files (video/audio) are never read into memory: WebKit streams them off disk,
+    // so the binary byte cap below does not apply. Capping them would reject the
+    // ordinary case — a screen recording or audio track is routinely tens or hundreds of megabytes.
     if kind == PreviewKind::Video {
         return Ok(LoadedPreview::Video);
+    }
+    if kind == PreviewKind::Audio {
+        return Ok(LoadedPreview::Audio);
     }
     let metadata = fs::metadata(&path).map_err(|error| PreviewLoadError::Io(error.to_string()))?;
     let binary = matches!(kind, PreviewKind::Image | PreviewKind::Pdf)
@@ -551,6 +555,19 @@ mod tests {
     }
 
     #[test]
+    fn an_audio_past_the_binary_cap_is_still_previewable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("podcast.mp3");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        drop(file);
+        assert!(matches!(
+            load_preview(temp.path(), Path::new("podcast.mp3")).unwrap(),
+            LoadedPreview::Audio
+        ));
+    }
+
+    #[test]
     fn workbook_rows_are_bounded_and_render_cell_display_values() {
         let mut range = Range::new((0, 0), (1, 1));
         range.set_value((0, 0), Data::String("Name".into()));
@@ -806,7 +823,7 @@ pub(crate) fn load_text_preview(
                 parse_delimited_table(&source, separator, 2_000, 100).into(),
             ))
         }
-        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Video => {
+        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Video | PreviewKind::Audio => {
             Ok(LoadedPreview::Unsupported)
         }
     }

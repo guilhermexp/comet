@@ -5145,6 +5145,32 @@ impl Shell {
             return;
         }
         let (owner_chat, owner_state) = owner;
+        use crate::file_preview::model::{PreviewKind, classify_preview_kind};
+        if matches!(
+            classify_preview_kind(&path),
+            PreviewKind::Html
+                | PreviewKind::Pdf
+                | PreviewKind::Video
+                | PreviewKind::Data
+                | PreviewKind::Audio
+        ) {
+            let root = {
+                let state = owner_state.read(cx);
+                state
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == owner_chat)
+                    .filter(|chat| {
+                        state.local_device_id.as_deref() == Some(chat.device_id.as_str())
+                    })
+                    .and_then(|chat| chat.cwd.as_deref())
+                    .map(PathBuf::from)
+            };
+            if let Some(root) = root {
+                self.open_preview_surface(owner_chat, root, path, cx);
+                return;
+            }
+        }
         let from = self.eval_tween(self.right_tween, self.right_target(cx));
         let panel_key = self.panel_key(cx);
         self.panels.show(&panel_key);
@@ -20535,6 +20561,235 @@ mod exit_regressions {
                     Some(project_target.as_str())
                 );
                 assert_eq!(shell.file_surfaces[&id].read(cx).chat_id(), "owner");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn workspace_navigation_routes_local_rich_kinds_and_external_pdf_to_preview(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::markdown::render::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let local_pdf = root.join("doc.pdf");
+        std::fs::write(&local_pdf, b"%PDF-1.4\n%EOF\n").unwrap();
+        let local_html = root.join("page.html");
+        std::fs::write(&local_html, "<h1>hello</h1>").unwrap();
+        let local_mp4 = root.join("demo.mp4");
+        std::fs::write(&local_mp4, b"fake video bytes").unwrap();
+        let local_mp3 = root.join("voice.mp3");
+        std::fs::write(&local_mp3, b"fake audio bytes").unwrap();
+        let local_csv = root.join("data.csv");
+        std::fs::write(&local_csv, "col1,col2\n1,2\n").unwrap();
+
+        let local_png = root.join("picture.png");
+        std::fs::write(&local_png, b"fake png bytes").unwrap();
+        let local_md = root.join("notes.md");
+        std::fs::write(&local_md, "# Title\n").unwrap();
+        let local_rs = root.join("lib.rs");
+        std::fs::write(&local_rs, "pub fn x() {}\n").unwrap();
+        let local_bin = root.join("binary.unsupported");
+        std::fs::write(&local_bin, b"\x00\x01\x02").unwrap();
+
+        let outside_pdf = outside_dir.join("external.pdf");
+        std::fs::write(&outside_pdf, b"%PDF-1.4\nexternal\n%EOF\n").unwrap();
+
+        cx.update(|cx| {
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            crate::shell::test_shell(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+
+        window
+            .update(cx, |shell, window, cx| {
+                let mut local_owner =
+                    super::tests::chat_with_path(Some(&root.to_string_lossy()), None);
+                local_owner.id = "local-owner".into();
+                local_owner.device_id = "local-dev".into();
+
+                let mut remote_owner = super::tests::chat_with_path(Some("/remote/checkout"), None);
+                remote_owner.id = "remote-owner".into();
+                remote_owner.device_id = "remote-dev".into();
+
+                // The file owner, not the currently selected Chat, determines locality.
+                shell.active_chat = "remote-owner".into();
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("local-dev".into());
+                    state.apply_chats(vec![local_owner.clone(), remote_owner.clone()]);
+                    state.selected_chat = Some("remote-owner".into());
+                });
+
+                // Workspace navigation shares the same rich-format decision.
+                for file_rel in [
+                    "doc.pdf",
+                    "page.html",
+                    "demo.mp4",
+                    "voice.mp3",
+                    "data.csv",
+                    "data.tsv",
+                    "data.xls",
+                    "data.xlsx",
+                ] {
+                    let owner = ("local-owner".to_string(), shell.state.clone());
+                    shell.add_file_surface_at(owner, file_rel.to_string(), None, window, cx);
+                    let active = shell.resolved_right_active(cx);
+                    let RightSurface::Preview(id) = active else {
+                        panic!("Expected RightSurface::Preview for {file_rel}, got {active:?}");
+                    };
+                    let info = shell.preview_surfaces.get(&id).unwrap();
+                    assert_eq!(info.context_key, "local-owner");
+                    assert_eq!(info.root, root);
+                    assert_eq!(info.relative_path, file_rel);
+                }
+
+                // 2. Re-opening a preview in the same context reuses the existing tab (dedupe)
+                let previews_before = shell.preview_surfaces.len();
+                let tabs_before = shell.right_tabs.get(&shell.panel_key(cx)).unwrap().len();
+                let owner = ("local-owner".to_string(), shell.state.clone());
+                shell.add_file_surface_at(owner, "doc.pdf".to_string(), None, window, cx);
+                assert_eq!(shell.preview_surfaces.len(), previews_before);
+                assert_eq!(
+                    shell.right_tabs.get(&shell.panel_key(cx)).unwrap().len(),
+                    tabs_before
+                );
+
+                // 3. Editor kinds (Image, Markdown, Code, Unsupported) remain File surfaces
+                for file_rel in [
+                    "picture.png",
+                    "picture.svg",
+                    "notes.md",
+                    "lib.rs",
+                    "binary.unsupported",
+                ] {
+                    let owner = ("local-owner".to_string(), shell.state.clone());
+                    shell.add_file_surface_at(owner, file_rel.to_string(), None, window, cx);
+                    let active = shell.resolved_right_active(cx);
+                    let RightSurface::File(id) = active else {
+                        panic!("Expected RightSurface::File for {file_rel}, got {active:?}");
+                    };
+                    assert_eq!(
+                        shell.file_surface_paths.get(&id).map(String::as_str),
+                        Some(file_rel)
+                    );
+                }
+
+                // 4. Remote owner: rich formats remain File editor (no local preview / no local disk fallback)
+                shell.active_chat = "remote-owner".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("remote-owner".into());
+                });
+                let owner = ("remote-owner".to_string(), shell.state.clone());
+                shell.add_file_surface_at(owner, "doc.pdf".to_string(), None, window, cx);
+                let active = shell.resolved_right_active(cx);
+                let RightSurface::File(id) = active else {
+                    panic!("Expected RightSurface::File for remote doc.pdf, got {active:?}");
+                };
+                assert_eq!(
+                    shell.file_surface_paths.get(&id).map(String::as_str),
+                    Some("doc.pdf")
+                );
+
+                // Missing owners must not acquire local filesystem access.
+                let unk_owner = ("nonexistent-chat".to_string(), shell.state.clone());
+                shell.add_file_surface_at(unk_owner, "doc.pdf".to_string(), None, window, cx);
+                let active = shell.resolved_right_active(cx);
+                assert!(
+                    matches!(active, RightSurface::File(_)),
+                    "Chat without known checkout on this device must remain File surface"
+                );
+
+                shell
+                    .state
+                    .update(cx, |state, _| state.local_device_id = None);
+                shell.add_file_surface_at(
+                    ("local-owner".into(), shell.state.clone()),
+                    "unknown-device.pdf".into(),
+                    None,
+                    window,
+                    cx,
+                );
+                assert!(matches!(
+                    shell.resolved_right_active(cx),
+                    RightSurface::File(_)
+                ));
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("local-dev".into());
+                });
+
+                // 6. External absolute PDF link activated in Chat
+                shell.active_chat = "local-owner".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("local-owner".into());
+                });
+                let ext_target = outside_pdf.to_string_lossy().into_owned();
+                let activation = LinkActivation {
+                    target: LinkTarget::new("outside-pdf", &ext_target),
+                    action: LinkAction::Primary,
+                    source_session: Some("local-owner".into()),
+                };
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Internal
+                );
+                let active = shell.resolved_right_active(cx);
+                let RightSurface::Preview(id) = active else {
+                    panic!("Expected RightSurface::Preview for external PDF link, got {active:?}");
+                };
+                let info = shell.preview_surfaces.get(&id).unwrap();
+                assert_eq!(info.context_key, "local-owner");
+                assert_eq!(info.root, root);
+                assert_eq!(info.relative_path, ext_target);
+                assert!(matches!(
+                    crate::file_preview::loader::load_preview(
+                        &info.root,
+                        std::path::Path::new(&info.relative_path),
+                    )
+                    .unwrap(),
+                    crate::file_preview::loader::LoadedPreview::Pdf
+                ));
+                assert_eq!(
+                    shell
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == "local-owner")
+                        .unwrap()
+                        .cwd
+                        .as_deref(),
+                    Some(root.to_str().unwrap())
+                );
             })
             .unwrap();
     }
