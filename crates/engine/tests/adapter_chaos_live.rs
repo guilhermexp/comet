@@ -113,6 +113,7 @@ impl Suite {
 
     fn request(&self, prompt: &str) -> RunRequest {
         RunRequest {
+            env: Default::default(),
             mcp: None,
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
@@ -1180,6 +1181,7 @@ fn send_to(core: &EngineCore, request: RunRequest) {
 
 fn restart_request(name: &str, cwd: &str, prompt: &str) -> RunRequest {
     RunRequest {
+        env: Default::default(),
         mcp: None,
         enable_workers_mcp: false,
         workers_parent_chat_id: None,

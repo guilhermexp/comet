@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 
 // Runtime-real test tier: runs inside actual workerd via
@@ -12,19 +12,29 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 // base64-inlined module at startup (deployed edge and `wrangler dev` are
 // fine). loro-on-workerd coverage lives in the wrangler-dev scripts
 // (scripts/whale-check.mjs, scripts/fold-check.mjs).
+//
+// Fork (D1, sync d5a01522): no Cloud tier. Upstream's CloudAccount/CloudIndex
+// DOs, Workflows, VAULT service binding, Boat/Stripe fakes and runner JWT keys
+// are not configured here; the tests that need them are excluded below.
 export default defineConfig({
   plugins: [
     cloudflareTest({
       main: "./test/workerd/fixture.ts",
       miniflare: {
         compatibilityDate: "2026-07-01",
-        r2Buckets: ["BLOBS"],
+        r2Buckets: ["BLOBS", "RELEASES"],
         durableObjects: {
           DEVICE_ROOMS: { className: "DeviceRoom", useSQLite: true },
           TEST_LOG: { className: "TestLogRoom", useSQLite: true },
           CHAT_ROOMS: { className: "ChatRoom", useSQLite: true },
           PREVIEW_ROOMS: { className: "PreviewRoom", useSQLite: true },
           REGISTRY_ROOMS: { className: "RegistryRoom", useSQLite: true }
+        },
+        // The fixture authenticates through the production `authenticate`
+        // (dev mode: the bearer `userId@orgId` is the identity).
+        bindings: {
+          AUTH_MODE: "dev",
+          WORKOS_CLIENT_ID: "test-only"
         }
       }
     })
@@ -35,6 +45,14 @@ export default defineConfig({
     alias: { "loro-crdt": "loro-crdt/base64" }
   },
   test: {
-    include: ["test/workerd/**/*.test.ts"]
+    include: ["test/workerd/**/*.test.ts"],
+    // Fork (D1): dormant Cloud/runner/vault suites (they need the bindings
+    // above that the fork does not configure).
+    exclude: [
+      ...configDefaults.exclude,
+      "test/workerd/cloud*.workerd.test.ts",
+      "test/workerd/runner-boundary.workerd.test.ts",
+      "test/workerd/vault-routes.workerd.test.ts"
+    ]
   }
 });

@@ -236,6 +236,7 @@ fn request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        env: Default::default(),
         prompt: prompt.into(),
         harness: Some(HarnessId::Mock),
         model: Some("process-1".into()),

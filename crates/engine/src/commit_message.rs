@@ -139,6 +139,7 @@ pub(crate) async fn generate(
             attachments: Vec::new(),
             resume: None,
             worktree: None,
+            env: Default::default(),
         };
         let request_id = format!("commit-message-{}", uuid::Uuid::new_v4());
         let raw = crate::recap::collect_isolated_text(

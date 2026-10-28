@@ -2313,11 +2313,67 @@ where
     }
 }
 
+/// The engine IPC bearer an embedding app (Comet) may hold in its own
+/// environment. Only the embedder's controller dials the engine: a Worker
+/// session, its detached host and its shell never inherit it.
+const EMBEDDER_IPC_CREDENTIAL_ENV_KEYS: &[&str] = &["ZERON_IPC_TOKEN", "ZERON_IPC_TOKEN_FILE"];
+
+/// Pi MCP bridge descriptors an embedder's Pi process holds (`ZERON_PI_MCP`,
+/// `ZERON_PI_MCP_<n>`); their JSON names the same bearer file.
+fn is_embedder_bridge_descriptor(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    key == "ZERON_PI_MCP"
+        || key
+            .strip_prefix("ZERON_PI_MCP_")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn embedder_bridge_descriptor_keys<I>(vars: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    vars.into_iter()
+        .filter_map(|(key, _)| is_embedder_bridge_descriptor(&key).then_some(key))
+        .collect()
+}
+
+/// Remove [`EMBEDDER_IPC_CREDENTIAL_ENV_KEYS`] and the Pi bridge descriptors
+/// from a launcher/host command.
+pub fn strip_embedder_ipc_credentials(cmd: &mut std::process::Command) {
+    for key in EMBEDDER_IPC_CREDENTIAL_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    let explicit: Vec<OsString> = cmd.get_envs().map(|(key, _)| key.to_owned()).collect();
+    let inherited = std::env::vars_os().map(|(key, _)| key);
+    for key in embedder_bridge_descriptor_keys(
+        explicit
+            .into_iter()
+            .chain(inherited)
+            .map(|key| (key, OsString::new())),
+    ) {
+        cmd.env_remove(key);
+    }
+}
+
 pub(crate) fn strip_leaked_launcher_env(cmd: &mut CommandBuilder) {
     // Dev shells launched from `bunx tauri dev` inherit npm/bun lifecycle vars from the
     // app process. Some CLIs treat those vars as authoritative and rebuild their own
     // child-process invocation incorrectly, so strip them before opening user shells.
     for key in LEAKED_LAUNCHER_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    for key in EMBEDDER_IPC_CREDENTIAL_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    // The builder starts from the base environment, so its full view holds
+    // inherited and explicitly set descriptors alike.
+    let full: Vec<(OsString, OsString)> = cmd
+        .iter_full_env_as_str()
+        .map(|(key, _)| (OsString::from(key), OsString::new()))
+        .collect();
+    for key in embedder_bridge_descriptor_keys(full) {
         cmd.env_remove(key);
     }
 }
@@ -4314,6 +4370,7 @@ pub fn spawn_host_process_from_launch_file(launch_file: impl AsRef<Path>) -> Res
     // Keeping that pane identity would let provider integrations race the
     // Unpeel TUI's aggregate status authority.
     strip_leaked_herdr_process_env(&mut command);
+    strip_embedder_ipc_credentials(&mut command);
 
     #[cfg(unix)]
     {
@@ -5901,6 +5958,21 @@ mod tests {
             .strip_inherited
             .iter()
             .any(|key| key == "CODEX_TUI_SESSION_LOG_PATH"));
+    }
+
+    #[test]
+    fn shells_never_inherit_the_embedder_ipc_bearer() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env("ZERON_IPC_TOKEN", "secret");
+        cmd.env("ZERON_IPC_TOKEN_FILE", "/data/ipc-token");
+        // Pi bridge descriptors carry the bearer file path in their JSON.
+        cmd.env("ZERON_PI_MCP", "{}");
+        cmd.env("ZERON_PI_MCP_2", "{}");
+        crate::session_host::strip_leaked_launcher_env(&mut cmd);
+        assert!(cmd.get_env("ZERON_IPC_TOKEN").is_none());
+        assert!(cmd.get_env("ZERON_IPC_TOKEN_FILE").is_none());
+        assert!(cmd.get_env("ZERON_PI_MCP").is_none());
+        assert!(cmd.get_env("ZERON_PI_MCP_2").is_none());
     }
 
     #[test]

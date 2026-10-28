@@ -2,6 +2,19 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
+// The Pi process holds every bridge's descriptor (`ZERON_PI_MCP`,
+// `ZERON_PI_MCP_<n>`), and their env carries the engine IPC bearer file. A
+// sidecar gets its own descriptor's env only: never the descriptors themselves,
+// which would reach the Workers a controller launches.
+const BRIDGE_DESCRIPTOR = /^ZERON_PI_MCP(_\d+)?$/;
+function sidecarEnv(own) {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!BRIDGE_DESCRIPTOR.test(key)) env[key] = value;
+  }
+  return {...env, ...own};
+}
+
 export default function (pi) {
   const config = JSON.parse(process.env.ZERON_PI_MCP);
   let child, lines, nextId = 0;
@@ -48,7 +61,7 @@ export default function (pi) {
   pi.on("session_start", async () => {
     close();
     child = spawn(config.command, config.args, {
-      env: {...process.env, ...config.env}, stdio: ["pipe", "pipe", "inherit"],
+      env: sidecarEnv(config.env), stdio: ["pipe", "pipe", "inherit"],
     });
     const owned = child;
     const failed = error => { if (child === owned) fail(error); };

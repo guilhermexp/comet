@@ -106,7 +106,7 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 - **Visual:** Settings no layout do upstream #449, mas com as seções Projects e Accounts do fork; Changes dentro do Files, transcript compacto, sem anel de contexto e sem terminal de rodapé.
 - **Painel direito:** só conta como aberto se tiver aba viva.
 - **Publicação e update:**
-  - versão 1.0.7 nesta integração, `release.yml` do fork, zui vendorizado em `third_party/zui`; deltas de API do pin upstream são aplicados numa fonte separada e copiados com proveniência, sem trocar para git dependency;
+  - versão própria do fork (1.0.10 no sync v0.2.126), `release.yml` do fork, zui vendorizado em `third_party/zui`; deltas de API do pin upstream são aplicados numa fonte separada e copiados com proveniência, sem trocar para git dependency;
   - o updater mapeia `zeron.sh`/`*.zeron.sh` para `COMET_RELEASES_URL` (GitHub Releases do fork); `ZERON_RELEASES_URL` continua override explícito e edges self-hosted mantêm seu próprio feed.
 
 ## Recusado: continua a versão do fork
@@ -138,6 +138,12 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Ignorar `.agents`, `.claude` e `CLAUDE.md` no `.gitignore` | 7d454cfe | v0.2.102 | O fork versiona os três (skills, comandos OpenSpec, CLAUDE.md); a regra escondia arquivos novos ali |
 | Workflow macOS separado, pins de action por SHA, Dependabot | CI | v0.2.102 | O fork mantém os próprios workflows (gate por path). `macos.yml`, `dependabot.yml`, `run-macos-fixture.sh`, `cursor-sdk-update.yml` e `testflight.yml` ficam fora |
 | Instalador Linux com updater em `~/.zeron/app` | #627 | v0.2.102 | Fork sem feed próprio. Entraram só as licenças das fontes e do Parakeet |
+| Zeron Cloud (runner, credenciais, vault, billing, páginas Cloud/Billing, checkout Cloud, iOS `Cloud/*`, rotas `/cloud`, `/runner`, `/vault`, `/admin/cloud`, Stripe) | #966/#969/#973/#1016/#1069/#993 | v0.2.126 | Entra dormente: sem `ZERON_RUNNER_*` não há runner e a UI só oferece Cloud com status disponível. Na edge, `src/cloud/**`, `vault/**`, `runner-*`, `vault-routes` ficam fora do grafo do `index.ts`, do tsconfig e dos testes; `deploy.yml`/`wrangler.jsonc` são do fork |
+| Engine em background (`managed.rs`, binário `zeron-engine`, `apps/zeron/src/{lib,background}.rs`, `Zeron Engine` no packaging) | #966/#970 | v0.2.126 | Ficam `main.rs`/`daemon.rs` e o packaging do fork; `managed.rs` dormente, nada o chama |
+| Co-autoria `zeronsh[bot]` por `core.hooksPath`, RPCs `Get/SetCommitCredit`, Settings → Git | #972 | v0.2.126 | Marca do upstream no histórico do usuário; `commit_credit.rs` não existe no fork |
+| Orçar cards de subagente no fold compacto com `CHIP_HEIGHT` | #1025 | v0.2.126 | Bug inexistente no `TurnSteps` do fork; o example `subagent-fold-fixture` também saiu |
+| Workflows `macos.yml`, `testflight.yml`, `android.yml`, mudanças em `windows.yml`, `CODEOWNERS`, job `vault` no `preview-tests.yml` | CI | v0.2.126 | O fork mantém os próprios workflows |
+| Esc fecha a pergunta sem responder | #1022 (UI) | v0.2.126 | Esc continua subindo até o Stop; fechar sem responder é pelo botão |
 | Criação de worktree Windows em duas etapas e workaround de arquivos >300 unidades UTF-16 | #530 | v0.2.112 | Fork mantém o lifecycle comum Chat/Workers e ProcessRunner; algoritmo específico Windows não entra. Validação lexical de paths e rejeição de cwd não lançável foram mantidas |
 
 ## Aceito com adaptação
@@ -184,6 +190,16 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Scratch de Chat sem Project e home names-only | #876 | v0.2.112 | Capability do host conserva resume legado em `~`; novo cwd resolve em `data_dir/scratch`. Home usa índice bounded separado, nunca fff/content; grants e autorização de Files/terminal permanecem |
 | Localização customizada de worktree por device | #530 | v0.2.112 | Preferência da engine entra no lifecycle comum de Chat/Workers; criação usa hash de repo e journal já existente, não outro manager. Destinos de Workers standalone não mudam. Retry consulta posse independente da preferência atual |
 | PRs em panes/abas e Session information responsiva | #866/#867 | v0.2.112 | Registros novos de abas preservam URL + device/cache de credencial. Fit usa gutters de 16px e largura efetiva de Details; utility tabs conservam 118px, avatar de subagente e terminal à direita |
+| IPC local com bearer e fragmentação de mensagens grandes | #966/acd7c9ba | v0.2.126 | Token distribuído a `zeron mcp`, `comet-sessions`, controller Workers, `auth`/`sync` CLI, fixtures e testes por `ZERON_IPC_TOKEN_FILE`/`connect_ipc_url`; grants continuam só via `workers_mcp` |
+| Troca de provider entre turnos (`MessagePart::Switch`, `provider_sessions`, `resume_for`) | #966/#1052 | v0.2.126 | Entra viva; divisor `SwitchMarker` no transcript compacto, legenda de remetente no lugar do negrito, `SentMessage` dentro do `TurnSteps` |
+| Muse Code | #978 | v0.2.126 | Braços em todo `match` com OMP/Kimi; segura a execution lease do turno; sem grants MCP; fora do painel Usage |
+| Updates de CLI pelo dono da instalação e lista de releases ruins | #974/#978 | v0.2.126 | Modelo `Package{owner}`/`Homebrew`/`MuseLauncher` do upstream substitui `UpdatePlan::PackageManager`; Pi fica fora do `Package` e roda `pi update --all`; OMP/Antigravity/leases/Update all preservados; feed em `harness_compatibility_url` (fork, 404 = vazio) |
+| Switch "Native subagents" | #1046 | v0.2.126 | Religado pelo grant: `SessionsGrant.side_chats_only` só no orquestrador raiz; `RunRequest.mcp` continua vazio |
+| Fechar pergunta sem responder | #1022 | v0.2.126 | `[]` só quando nunca houve resposta; regra em `crates/doc/AGENTS.md` |
+| Terminal sem latência, eco previsto, link WebRTC entre devices | #975/#988/#1007 | v0.2.126 | Só no painel direito; `scroll.rs`, `retain_last_alternate_screen` e `panel.rs` do fork preservados; Workers terminal mantém o coalescer |
+| Previews só de portas carimbadas (`ZERON_ORIGIN`) e card "Ports" | #1023 | v0.2.126 | Card fora do gate do Details; servidores de Workers saem do catálogo por decisão do dono (2026-10-27) e seguem em Settings → Servers |
+| Retry de start e revival de turno cortado | #977 | v0.2.126 | Cada tentativa pega a execution lease de novo; o `shutdown` concorrente do fork usa `terminate` para permitir o revival |
+| Rail do transcript, caminho digitável do New project, destino de PR, card de sessão | #958/#1049/#998/#1026/#950/#1028 | v0.2.126 | Rail sobre `RailSnapshot`; alvo Worker local-only no ⌘L; `pullRequestOpenIn` + chave antiga; totais da branch sob `show_context_metadata` e ramo Workers; `clocked_tween` |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
 
 ## Integração local de 18/10/2026 (em revisão)
@@ -262,6 +278,7 @@ Fechamento: accessor de índice explícito ilegível é recusado (só ausência 
 - **Resolver com agentes:** eles podem apagar código "morto" que outro arquivo ainda usa (por exemplo `motion::fast_tier`). A etapa de compilação precisa reconciliar isso.
 - **Trocar destino de worktree não muda a posse de checkouts existentes.** Nunca usar prefixo da raiz atual ou formato do basename para pular preparo: valide registro Git e consulte o journal comum; ausência de registro é no-op externo, estado malformado falha fechado.
 - **Session information responsiva usa o gutter do fork.** O upstream calcula com 48px; o transcript compacto usa `COLUMN_GUTTER` (16px), e Details também consome o orçamento real. Portar só o card sem essas duas alocações produz geometria errada.
+- **Credenciais da engine nos sidecars.** O OMP lança `comet-workers`/`comet-sessions`/`zeron` pelo `omp/workers_bridge.rs`, fora de `workers_mcp::servers_for_request`: todo env novo que os servidores do grant precisem (ex.: `ZERON_IPC_TOKEN_FILE`) tem de passar pelo helper comum nos dois caminhos. E o inverso: o controller Workers não pode repassar o bearer aos Workers (captura na partida + strip no `unpeel-core`).
 - **Guards de nesting dependem do layout real.** O root ancestral de um repo era recusado porque o upstream concatena seu basename; o serviço comum do fork cria diretório com hash fora desse repo. Valide o destino real, recuse roots internos antes de mutar e teste também a raiz ancestral válida.
 
 ## Integração v0.2.107
@@ -292,3 +309,4 @@ A integração foi revisada com preservação dos contratos do fork. Workspace/a
 | 2026-10-02 | até `9e1a1115` (v0.2.102 + 21) | `openspec/changes/sync-upstream-v0-2-102/` | 56 commits; Pi nativo, ditado, seletor compacto opt-in, file tree actions; zui recebe 3 commits por patch |
 | 2026-10-07 | até `916cb1cc` (v0.2.106) | `openspec/changes/archive/2026-10-07-sync-upstream-v0-2-106/` | Merge `cd38b6dc`; 15 commits, Codex voice local/remoto/iOS, chips, identidade Git e catálogos; contratos do fork preservados. Prova desktop/iOS passou; RPC worktree e preview churn permanecem pendentes |
 | 2026-10-09 | `916cb1cc..1074bc54` (v0.2.107) | `openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/` | Oito commits: memória, runtimes/Stop, snapshots privados, entrega remota, imagens/badges e subagentes concluídos; contratos do fork preservados. Provas e limites registrados no arquivo verification.md |
+| 2026-10-26 | `c526d6f7..d5a01522` (v0.2.126) | `openspec/changes/archive/2026-10-27-sync-upstream-v0-2-126/` | 74 commits; Cloud e engine em background recusados/dormentes, IPC com bearer, troca de provider, Muse, terminal RTC; publicado em `a1fa9159`; relato em `.upstream-sync/history/` |

@@ -959,6 +959,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
     core.sessions
         .dispatch(chat_id, HarnessId::Mock, request, None)
@@ -1007,6 +1008,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
     core.sessions
         .dispatch(chat_id, HarnessId::Mock, request, None)
@@ -1196,6 +1198,7 @@ async fn titling_picks_the_live_haiku_out_of_a_raw_omp_inventory() {
                 worktree: None,
                 resume: None,
                 mcp: None,
+                env: Default::default(),
             },
             None,
         )

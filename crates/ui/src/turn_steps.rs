@@ -91,7 +91,9 @@ fn is_visible_part(part: &MessagePart) -> bool {
         | MessagePart::Visual { .. }
         | MessagePart::Tool { .. }
         | MessagePart::Input { .. } => true,
-        MessagePart::WorkflowTask { .. } | MessagePart::Fork { .. } => false,
+        MessagePart::WorkflowTask { .. }
+        | MessagePart::Fork { .. }
+        | MessagePart::Switch { .. } => false,
     }
 }
 
@@ -112,7 +114,8 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
         | MessagePart::Image { .. }
         | MessagePart::Visual { .. }
         | MessagePart::WorkflowTask { .. }
-        | MessagePart::Fork { .. } => false,
+        | MessagePart::Fork { .. }
+        | MessagePart::Switch { .. } => false,
     }
 }
 

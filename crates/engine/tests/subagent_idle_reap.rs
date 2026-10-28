@@ -55,6 +55,7 @@ fn run_request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        env: Default::default(),
     }
 }
 

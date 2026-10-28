@@ -8,6 +8,8 @@ members = [
     "crates/voice-session",
     "crates/orb",
     "crates/veil",
+    "crates/term",
+    "crates/term-link",
     "crates/theme",
     "crates/audio",
     "crates/proto",
@@ -22,8 +24,10 @@ members = [
     "crates/sessions-mcp",
     "crates/computer-use-mcp",
     "crates/ui",
+    "crates/notify",
     "crates/markdown",
     "crates/mobile",
+    "crates/mobile-bindgen",
     "crates/client",
     "crates/mcp",
     "crates/text",
@@ -41,7 +45,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.0.10"
+version = "1.0.11"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -50,6 +54,8 @@ publish = false
 zeron-voice-session = { path = "crates/voice-session" }
 zeron-orb = { path = "crates/orb" }
 zeron-veil = { path = "crates/veil" }
+zeron-term = { path = "crates/term" }
+zeron-term-link = { path = "crates/term-link" }
 zeron-voice-media = { path = "crates/voice-media" }
 zeron-audio = { path = "crates/audio" }
 zeron-preview = { path = "crates/preview" }
@@ -59,6 +65,7 @@ zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }
 zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
+zeron-notify = { path = "crates/notify" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-update = { path = "crates/update" }
 zeron-workers-unpeel = { path = "crates/workers-unpeel" }

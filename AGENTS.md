@@ -10,10 +10,10 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 ## Stack
 
-- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,visual,visual-gpu,zatex,update,workers-unpeel,sessions-mcp,computer-use-mcp,preview,voice,audio,voice-media,voice-session,orb,veil}` + `apps/zeron` (membro padrão do workspace).
+- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,visual,visual-gpu,zatex,update,workers-unpeel,sessions-mcp,computer-use-mcp,preview,voice,audio,voice-media,voice-session,orb,veil,term,term-link,notify,markdown,mobile,mobile-bindgen,client,mcp,text}` + `apps/zeron` (membro padrão do workspace). `apps/android`, `scripts/android` e `crates/mobile-bindgen` vêm do upstream e ficam inertes (fora de `default-members`).
 - **UI = gpui**, snapshot vendorizado de `zeronsh/zui` em `third_party/zui` (Apache-2.0; proveniência em `third_party/zui-upstream.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
-- **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres nem Hono server. Sync não usa WebRTC; previews de servidores usam RTC autenticado por PreviewRoom.
+- **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres nem Hono server. Sync não usa WebRTC; previews de servidores e o terminal entre devices do próprio usuário (`crates/term-link`, serviço `terminal/{id}`, nunca device Cloud, com fallback pelo DeviceRoom) usam RTC autenticado por PreviewRoom. O IPC local da engine exige bearer (`{data_dir}/ipc-token`, `crates/rpc/src/ipc_auth.rs`); os clientes do fork (`zeron mcp`, `comet-sessions`, controller Workers, CLI) recebem `ZERON_IPC_TOKEN_FILE`.
 - **apps/ios** — cliente iOS (projeto Xcode), fora do workspace Cargo.
 - Binário único `zeron`: headed (gpui) ou `zeron headless` (só engine).
 

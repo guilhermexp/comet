@@ -19,5 +19,15 @@
     "rootDir": "./src",
     "noEmit": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  // Fork (D1, sync d5a01522): upstream Cloud/runner/vault sources stay in
+  // the tree but dormant — outside index.ts's graph and outside typecheck
+  // (they need Env bindings/auth kinds the fork's runtime does not have).
+  "exclude": [
+    "src/cloud/**",
+    "src/runner-*.ts",
+    "src/registry-runner.ts",
+    "src/registry-runner.test.ts",
+    "src/vault-routes.ts"
+  ]
 }

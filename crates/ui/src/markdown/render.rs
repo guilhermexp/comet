@@ -2077,6 +2077,40 @@ pub(crate) fn selection_test_bounds(key: &str) -> gpui::Bounds<gpui::Pixels> {
     })
 }
 
+/// Where `needle` starts in the painted text that contains it, for tests
+/// that click into a surface without knowing its row keys.
+#[cfg(test)]
+pub(crate) fn selection_test_position(needle: &str) -> gpui::Point<gpui::Pixels> {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        // A run may be painted in fragments (the fork splits a link label
+        // around its trailing text), so a needle can start in one entry and
+        // end in the next ones.
+        let (entry, ix) = (0..registry.len())
+            .find_map(|start| {
+                let first = &registry[start];
+                let mut text = first.text.to_string();
+                for next in &registry[start + 1..] {
+                    if text.len() >= first.text.len() + needle.len() {
+                        break;
+                    }
+                    text.push_str(&next.text);
+                }
+                let ix = text.find(needle).filter(|ix| *ix < first.text.len())?;
+                Some((first, ix))
+            })
+            .unwrap_or_else(|| panic!("missing painted text: {needle}"));
+        let ix = entry
+            .offsets
+            .as_ref()
+            .map_or(ix, |offsets| offsets.displayed(ix));
+        entry
+            .layout
+            .position_for_index(ix)
+            .expect("painted text is laid out")
+    })
+}
+
 #[cfg(test)]
 pub(super) fn selection_test_snapshot(
     key: &str,

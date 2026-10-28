@@ -98,6 +98,83 @@ pub struct RpcSpaceRegistry {
     endpoint: String,
 }
 
+/// The engine IPC bearer this controller took out of its environment at
+/// startup ([`take_engine_ipc_credentials`]): only the controller dials the
+/// engine, and the Workers it launches (in process or detached) must not
+/// inherit the bearer. Unset outside a controller process, where dials read
+/// the environment as usual.
+static ENGINE_IPC_CREDENTIALS: std::sync::OnceLock<EngineIpcCredentials> =
+    std::sync::OnceLock::new();
+
+struct EngineIpcCredentials {
+    token: Option<String>,
+    token_file: Option<std::path::PathBuf>,
+}
+
+/// Controller startup: keep `$ZERON_IPC_TOKEN` / `$ZERON_IPC_TOKEN_FILE` for
+/// this process's own dials and remove them from its environment before it
+/// launches anything.
+pub fn take_engine_ipc_credentials() {
+    let token = std::env::var(zeron_rpc::ipc_auth::TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    let token_file = std::env::var_os(zeron_rpc::ipc_auth::TOKEN_FILE_ENV)
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from);
+    let _ = ENGINE_IPC_CREDENTIALS.set(EngineIpcCredentials { token, token_file });
+    // SAFETY: called at controller startup, before it starts threads or
+    // launches any Worker.
+    unsafe {
+        std::env::remove_var(zeron_rpc::ipc_auth::TOKEN_ENV);
+        std::env::remove_var(zeron_rpc::ipc_auth::TOKEN_FILE_ENV);
+        // A controller launched by Pi also holds the bridge descriptors
+        // (`ZERON_PI_MCP`, `ZERON_PI_MCP_<n>`), whose JSON names the bearer
+        // file; they are Pi's, not the Workers'.
+        for (key, _) in std::env::vars_os() {
+            if is_pi_bridge_descriptor(&key) {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
+/// `ZERON_PI_MCP` or `ZERON_PI_MCP_<n>`: a Pi MCP bridge descriptor.
+fn is_pi_bridge_descriptor(key: &std::ffi::OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    key == "ZERON_PI_MCP"
+        || key
+            .strip_prefix("ZERON_PI_MCP_")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Dial the engine at `url` with the bearer taken at startup (the file is
+/// re-read each time: a restarted engine rewrites it), else as
+/// [`zeron_rpc::connect_ipc_url`] does from the environment.
+pub(crate) async fn connect_engine(url: &str) -> Result<zeron_rpc::RpcClient, zeron_rpc::RpcError> {
+    let Some(credentials) = ENGINE_IPC_CREDENTIALS.get() else {
+        return zeron_rpc::connect_ipc_url(url, None).await;
+    };
+    let from_file = credentials
+        .token_file
+        .as_deref()
+        .and_then(|path| zeron_rpc::ipc_auth::read_token(path).ok().flatten());
+    let mut tokens: Vec<String> = credentials.token.iter().cloned().collect();
+    tokens.extend(from_file.filter(|token| !tokens.contains(token)));
+    let mut last = None;
+    for token in &tokens {
+        match zeron_rpc::connect_ws(url, Some(token)).await {
+            Ok(client) => return Ok(client),
+            Err(error) => last = Some(error),
+        }
+    }
+    match last {
+        Some(error) => Err(error),
+        None => zeron_rpc::connect_ws(url, None).await,
+    }
+}
+
 impl RpcSpaceRegistry {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
@@ -130,7 +207,7 @@ impl RpcSpaceRegistry {
                 .build()
                 .map_err(|error| error.to_string())?;
             runtime.block_on(async move {
-                let client = zeron_rpc::connect_ws(&endpoint)
+                let client = connect_engine(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?;
                 operation(client).await

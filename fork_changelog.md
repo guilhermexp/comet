@@ -2,12 +2,19 @@
 
 Tracks local/private fork changes against upstream.
 
-## 2026-10-27 — OMP: `agent_end` grande não derruba mais o run
+## 2026-10-27 — v1.0.12: `agent_end` grande no OMP e preview de PDF/HTML/mídia/tabela
 
-- Um run longo com screenshots fechava com "OMP RPC stdout closed before terminal agent_end" depois de a resposta já ter aparecido. O `agent_end` do omp carrega as mensagens do run (texto + imagens base64) e passava de 8 MiB; o omp parte em `rpc_chunk` até 64 MiB, mas o Comet usava o teto por linha (8 MiB) também para o payload remontado, matava o reader e o omp via EPIPE (`~/.omp/logs`, "RPC output delivery failed").
-- `MAX_ASSEMBLED_BYTES` (64 MiB, espelho do omp) passa a valer só para `rpc_chunk` remontado; o teto por linha segue 8 MiB.
-- Quando o reader de stdout morrer no meio do run, o erro do chat agora traz a razão dele (teto de frame, JSONL inválido, cauda do stderr), não só a frase genérica.
-- Testes: `an_agent_end_above_the_line_budget_but_within_the_omp_chunk_ceiling_completes` e `a_reader_that_dies_mid_run_reports_the_reason_not_a_bare_stdout_closed` em `crates/harness/tests/omp_rpc.rs`.
+- OMP: um run longo com screenshots fechava com "OMP RPC stdout closed before terminal agent_end" depois de a resposta já ter aparecido. O `agent_end` do omp carrega as mensagens do run (texto + imagens base64) e passava de 8 MiB; o omp parte em `rpc_chunk` até 64 MiB, mas o Comet usava o teto por linha (8 MiB) também para o payload remontado, matava o reader e o omp via EPIPE (`~/.omp/logs`, "RPC output delivery failed"). `MAX_ASSEMBLED_BYTES` (64 MiB, espelho do omp) vale só para `rpc_chunk` remontado; o teto por linha segue 8 MiB. Quando o reader de stdout morrer no meio do run, o erro do chat traz a razão dele (teto de frame, JSONL inválido, cauda do stderr). Testes em `crates/harness/tests/omp_rpc.rs`.
+- Preview: file tree, palette e links de arquivo do chat abrem PDF, HTML, vídeo, áudio e csv/tsv/xls/xlsx no previewer rico (WKWebView) em vez do editor de Files, que mostrava "Binary files cannot be previewed". Link absoluto fora do checkout (ex.: um PDF em Downloads) abre no previewer sem trocar o contexto do chat. Áudio é um `PreviewKind` novo (mp3, wav, m4a, aac, flac, ogg, oga, opus, aiff, aif), transmitido do disco sem teto de bytes, com os controles nativos do WebKit. PNG/SVG, Markdown e código seguem no editor de Files. Fonte remota e owner sem device local mantêm o fluxo anterior.
+- Provas: harness completo verde; `zeron-markdown` 103, `file_preview` 29, `shell` 346 (regressão de roteamento), foco nativo; capturas da camada nativa real (PDF, PDF externo, HTML, vídeo, áudio) em `.tmp/evidence/preview-rich-kinds/`. Aceite no app completo fica `notProven` até esta versão ser instalada: `scripts/AGENTS.md` proíbe lançar segunda cópia do app. Change `openspec/changes/fix-preview-rich-kinds-routing` fica ativa até esse aceite.
+- Publicação pelo fluxo existente do fork: tag `v1.0.12`, DMG, tarball arm64 do app e `manifest.json`.
+
+## 2026-10-27 — v1.0.11: upstream até v0.2.126
+
+- Integra o upstream `c526d6f7..d5a01522` (74 commits) por merge real: troca de provider entre turnos, hardening e recuperação de run em todos os providers, lock de refresh do login Claude, updates de CLI pelo instalador real, terminal sem latência com eco previsto e link RTC entre devices do usuário, rail do transcript, caminho digitável no New project, destino de links de PR, legendas de remetente entre agentes, fechar pergunta sem responder, tooltips e correções macOS.
+- Cloud, Android, landing e Muse Code entram dormentes; bumps de versão, co-autoria `zeronsh[bot]`, engine em background e workflows do upstream ficam fora.
+- Preserva Workers, OMP/Kimi, grants MCP (`RunRequest.mcp` vazio), steering, transcript compacto, terminal no painel direito e o feed de update do fork. Token IPC do upstream entregue aos sidecars OMP e removido do ambiente dos Workers e dos descritores do Pi (F1–F3).
+- Registro: `.upstream-sync/history/20261027T012900Z-d5a01522.yaml`; change arquivada `openspec/changes/archive/2026-10-27-sync-upstream-v0-2-126`. Publicação pelo fluxo existente do fork: tag `v1.0.11`, DMG, tarball arm64 do app e `manifest.json`.
 
 ## 2026-10-23 — v1.0.10: invocações registradas de skills por Project
 

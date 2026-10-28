@@ -85,6 +85,8 @@ fn init_repo(dir: &Path) -> PathBuf {
 struct TestEngine {
     core: EngineCore,
     endpoint: String,
+    /// The IPC bearer's data dir: every client presents its token.
+    data: PathBuf,
     _server: tokio::task::JoinHandle<()>,
 }
 
@@ -94,10 +96,12 @@ impl TestEngine {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let service: Arc<dyn zeron_rpc::RpcService> = core.rpc_service();
-        let server = tokio::spawn(zeron_rpc::serve_ws_listener(listener, service));
+        let token = zeron_rpc::ipc_auth::issue_token(data).unwrap();
+        let server = tokio::spawn(zeron_rpc::serve_ws_listener(listener, service, token));
         Self {
             core,
             endpoint,
+            data: data.to_path_buf(),
             _server: server,
         }
     }
@@ -134,7 +138,9 @@ impl TestEngine {
     }
 
     async fn chat_mcp(&self, tool: &str, args: Value) -> Value {
-        let zeron = zeron_mcp::Zeron::new(self.endpoint.clone(), zeron_mcp::Origin::default());
+        let port = self.endpoint.rsplit(':').next().unwrap().parse().unwrap();
+        let zeron =
+            zeron_mcp::Zeron::new(port, Some(self.data.clone()), zeron_mcp::Origin::default());
         zeron_mcp::Tools::new(Arc::new(zeron))
             .call(tool, args)
             .await
@@ -185,8 +191,13 @@ fn workers_home(root: &Path, projects: Value) -> PathBuf {
     home
 }
 
-fn controller_env(home: &Path, endpoint: &str) -> EnvGuard {
+fn controller_env(home: &Path, engine: &TestEngine) -> EnvGuard {
+    let endpoint = engine.endpoint.as_str();
     EnvGuard::set(vec![
+        (
+            "ZERON_IPC_TOKEN_FILE",
+            zeron_rpc::ipc_auth::token_path(&engine.data).into(),
+        ),
         ("UNPEEL_HOME", home.into()),
         ("ZERON_WORKTREES_DIR", home.join("worktrees").into()),
         (
@@ -219,7 +230,7 @@ async fn chat_mcp_and_workers_controller_list_the_same_project_ids() {
             "is_folder": false
         }]),
     );
-    let _env = controller_env(&home, &engine.endpoint);
+    let _env = controller_env(&home, &engine);
 
     let chat = engine.chat_mcp("list_projects", json!({})).await;
     let controller = workers(json!({ "action": "list_projects" })).await;

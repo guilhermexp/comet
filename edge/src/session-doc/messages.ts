@@ -76,7 +76,7 @@ export const toDocParts = (
           kind: "input",
           questions: p.questions,
           ...(typeof p.resolved === "boolean" ? { resolved: p.resolved } : {}),
-          ...(p.answers !== undefined ? { answers: p.answers } : {})
+          ...(p.answers ? { answers: p.answers } : {})
         };
       case "error":
         return { id: p.id, kind: "error", message: p.message };
@@ -115,7 +115,7 @@ export const fromDocParts = (
           requestId: p.id,
           questions: (p.questions ?? []) as never,
           ...(typeof p.resolved === "boolean" ? { resolved: p.resolved } : {}),
-          ...(p.answers !== undefined ? { answers: p.answers } : {})
+          ...(Array.isArray(p.answers) ? { answers: p.answers } : {})
         };
       case "error":
         return { kind: "error", id: p.id, message: p.message ?? "" };

@@ -7,5 +7,8 @@ declare module "cloudflare:test" {
     CHAT_ROOMS: DurableObjectNamespace;
     PREVIEW_ROOMS: DurableObjectNamespace;
     REGISTRY_ROOMS: DurableObjectNamespace;
+    BLOBS: R2Bucket;
+    RELEASES: R2Bucket;
+    AUTH_MODE: string;
   }
 }

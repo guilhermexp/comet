@@ -67,6 +67,9 @@ pub const TEXTAREA_MAX: f32 = 260.0;
 /// footer; attach/send remain bottom-anchored here.
 const ACTIONS_BOTTOM_PAD: f32 = 10.0;
 pub const ACTIONS_ROW_HEIGHT: f32 = 4.0 + 32.0 + ACTIONS_BOTTOM_PAD;
+/// How long after a send that brings a Cloud machine up its first setup step
+/// appears (the message and the working line land first).
+const CLOUD_SETUP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
 /// Corner radius shared by the composer and the queue tray behind it. The
@@ -1064,6 +1067,18 @@ fn wizard_escape_goes_back(key: &str, input_focused: bool, input_empty: bool) ->
     key == "escape" && (!input_focused || input_empty)
 }
 
+/// Escape with no page to go back to and nothing given on this one closes
+/// the questions unanswered, like any panel. Anything picked or typed holds
+/// the panel open: a stray Escape must not throw an answer away.
+///
+/// Fork: not wired to Escape. On page 0 Escape bubbles so Esc-Esc reaches
+/// the Stop the panel covers; closing unanswered is the explicit close
+/// button only. Kept (and tested) as upstream's rule for a future decision.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wizard_escape_dismisses(page: usize, page_has_pick: bool, input_empty: bool) -> bool {
+    page == 0 && !page_has_pick && input_empty
+}
+
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -1591,6 +1606,9 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
     links
 }
 
+/// What a masked input shows in place of each character.
+const MASK_GLYPH: char = '•';
+
 #[derive(Debug, Clone, Default)]
 struct TextProjection {
     display: String,
@@ -1962,6 +1980,21 @@ impl TextProjection {
     /// a dangling reference and shows as its plain label.
     fn rich(raw: &str, active: Option<Range<usize>>, live: Option<&HashSet<u32>>) -> Self {
         Self::project(raw, active, true, live)
+    }
+
+    /// Secret fields: every character shown as one bullet. A mapping per
+    /// character keeps the caret, selection and hit-testing exact.
+    fn masked(raw: &str) -> Self {
+        let mut projection = Self::default();
+        for (start, ch) in raw.char_indices() {
+            let display_start = projection.display.len();
+            projection.display.push(MASK_GLYPH);
+            projection.mappings.push((
+                start..start + ch.len_utf8(),
+                display_start..projection.display.len(),
+            ));
+        }
+        projection
     }
 
     fn project(
@@ -2809,6 +2842,8 @@ pub struct ComposerInput {
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
+    /// Secret entry (API keys): shown as bullets and never copied or cut.
+    masked: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -2917,6 +2952,7 @@ impl ComposerInput {
             projection: TextProjection::default(),
             ghost: None,
             mentions_enabled: false,
+            masked: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -2969,6 +3005,15 @@ impl ComposerInput {
     /// Join the window's Tab order, for a field the keyboard must reach.
     pub(crate) fn with_tab_stop(mut self) -> Self {
         self.focus_handle = self.focus_handle.tab_stop(true);
+        self
+    }
+
+    /// Secret entry: characters render as bullets, copy and cut do nothing,
+    /// and assistive tech is told it is a password field.
+    pub fn with_masked(mut self) -> Self {
+        self.masked = true;
+        self.accessibility_role = Role::PasswordInput;
+        self.refresh_projection();
         self
     }
 
@@ -3041,7 +3086,9 @@ impl ComposerInput {
         // Markdown stays paint-only (`markdown_decor`): markers remain visible,
         // so the live projection only swaps references for compact chips and
         // never hides syntax outside the editing line.
-        self.projection = if self.mentions_enabled {
+        self.projection = if self.masked {
+            TextProjection::masked(&self.content)
+        } else if self.mentions_enabled {
             let live: Option<HashSet<u32>> = self
                 .attachment_chips
                 .as_ref()
@@ -3915,6 +3962,10 @@ impl ComposerInput {
     }
 
     fn previous_word_boundary(&self, offset: usize) -> usize {
+        // Word stops would reveal where a secret's punctuation sits.
+        if self.masked {
+            return 0;
+        }
         if let Some(boundary) = self.projection.previous_boundary(offset) {
             return boundary;
         }
@@ -3926,6 +3977,9 @@ impl ComposerInput {
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
+        if self.masked {
+            return self.content.len();
+        }
         if let Some(boundary) = self.projection.next_boundary(offset) {
             return boundary;
         }
@@ -4191,7 +4245,8 @@ impl ComposerInput {
     }
 
     fn clipboard_selection(&self) -> Option<(String, String)> {
-        if self.selected_range.is_empty() {
+        // A masked field's text never leaves it through the clipboard.
+        if self.selected_range.is_empty() || self.masked {
             return None;
         }
         let selected = self.projection.normalize_range(self.selected_range.clone());
@@ -9996,10 +10051,37 @@ impl Composer {
         true
     }
 
+    /// The send would run on Cloud (a new session there, or a chat whose
+    /// machine is Cloud's) and Cloud is out of credits: it can't start or
+    /// wake a machine.
+    fn out_of_cloud_credits(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        if !state
+            .cloud_status
+            .as_ref()
+            .is_some_and(crate::cloud::out_of_credits)
+        {
+            return false;
+        }
+        match state.selected_chat.as_deref() {
+            // A chat hosted on a Cloud session machine — known from its host
+            // device even before the session list has been read.
+            Some(chat) => {
+                state.chat_cloud_session(chat).is_some()
+                    || state
+                        .chats
+                        .iter()
+                        .find(|c| c.id == chat)
+                        .is_some_and(|c| state.is_cloud_session_device(&c.device_id))
+            }
+            None => self.pickers.read(cx).runs_on_cloud(cx),
+        }
+    }
+
     /// New chats need a runnable agent, but may target the device's home
     /// directory without a project. Existing chats carry their own run config.
     fn send_blocked(&self, cx: &App) -> bool {
-        if self.queue_edit_finishing {
+        if self.queue_edit_finishing || self.out_of_cloud_credits(cx) {
             return true;
         }
         let state = self.state.read(cx);
@@ -10086,6 +10168,12 @@ impl Composer {
             // escape_stops_active_agent is enabled.
             SendButtonMode::Stop => {}
             _ if no_content => {}
+            // Out of credits, a Cloud send can't start or wake its machine:
+            // say so instead of a button that silently does nothing.
+            _ if self.out_of_cloud_credits(cx) => crate::cloud::show_out_of_credits(
+                "You're out of Cloud credits. Add credits to send.",
+                cx,
+            ),
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
             // Busy: steer the live run.
@@ -10140,7 +10228,7 @@ impl Composer {
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
-        let plan = self.pickers.read(cx).checkout_plan();
+        let plan = self.pickers.read(cx).session_checkout_plan(cx);
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
@@ -10386,7 +10474,12 @@ impl Composer {
         if is_new {
             cx.emit(ComposerEvent::NewThreadTransitionStarted);
         }
-        self.state.update(cx, |s, cx| {
+        // The fork always echoes (Enter steers; the queue tray coexists). A
+        // send that creates its chat is adopted by the first turn its host
+        // starts (`begin_first_send`), so leaving it before the message lands
+        // never reads Failed mid-run.
+        let creates_chat = is_new || create_side_chat.is_some();
+        let cloud_boot = self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
@@ -10394,12 +10487,47 @@ impl Composer {
                 s.begin_compaction(&chat_id, before);
             }
             s.push_echo(&chat_id, echo);
+            // A send that brings a Cloud machine up shows its first setup
+            // step (below); the machine adds the rest as it gets there.
+            // Dormant unless Cloud status reports available.
+            let boot = if is_new {
+                matches!(plan, crate::pickers::CheckoutPlan::Cloud { .. }).then_some(false)
+            } else {
+                s.cloud_machine_booting(&chat_id)
+                    .map(|state| state != zeron_proto::CloudState::Provisioning)
+            };
             // Working overlay until the host executes the queued command —
             // without it a remote send flashed Completed (and could ring the
             // done-chime) in the queue→drain→sync gap.
-            s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+            if creates_chat {
+                s.begin_first_send(&chat_id, &message_id, chrono::Utc::now());
+            } else {
+                s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+            }
+            if s.cloud_enabled() {
+                s.refresh_cloud_sessions(cx);
+                if boot.is_some() {
+                    s.recheck_cloud_credits(cx);
+                }
+            }
             cx.notify();
+            boot
         });
+        // The setup step arrives a beat after the message, like a turn's
+        // first tool call: the message lands with the working line under
+        // it, then the step reveals above that line.
+        if let Some(waking) = cloud_boot {
+            let state = self.state.clone();
+            let (chat_id, message_id) = (chat_id.clone(), message_id.clone());
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(CLOUD_SETUP_STEP_DELAY).await;
+                state.update(cx, |s, cx| {
+                    s.push_cloud_setup_echo(&chat_id, &message_id, created_at, waking);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
@@ -10630,10 +10758,17 @@ impl Composer {
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
                 let mut chat_branch: Option<String> = None;
+                // Cloud: the chat gets its own Cloud machine; its host and
+                // cwd come back from createChat.
+                let mut on_cloud = false;
                 if is_new && space_path.is_some() {
                     match &plan {
                         crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();
+                        }
+                        crate::pickers::CheckoutPlan::Cloud { branch } => {
+                            chat_branch = branch.clone();
+                            on_cloud = true;
                         }
                         crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
                             cwd = path.clone();
@@ -10675,7 +10810,7 @@ impl Composer {
                 // first command anyway, so failures are non-fatal).
                 if is_new {
                     let chat_config = resolved.chat_config();
-                    let mutate = create_chat_mutation(
+                    let mut mutate = create_chat_mutation(
                         &chat_id,
                         space_id.as_deref(),
                         &device_id,
@@ -10685,7 +10820,12 @@ impl Composer {
                         chat_branch.as_deref(),
                         chat_config.as_ref(),
                     );
-                    if let Err(err) = attachments::call_with_timeout(
+                    // Dormant Cloud: only a Cloud checkout plan (shown when
+                    // Cloud status reports available) sets `on_cloud`.
+                    if on_cloud && let Some(object) = mutate.as_object_mut() {
+                        object.insert("cloud".into(), serde_json::Value::Bool(true));
+                    }
+                    match attachments::call_with_timeout(
                         &engine,
                         cx.background_executor(),
                         methods::MUTATE,
@@ -10694,7 +10834,20 @@ impl Composer {
                     )
                     .await
                     {
-                        tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                        // A Cloud chat runs in its machine's checkout.
+                        Ok(reply) if on_cloud => {
+                            if let Some(machine_cwd) = reply.get("cwd").and_then(|v| v.as_str()) {
+                                cwd = machine_cwd.to_string();
+                            }
+                        }
+                        Ok(_) => {}
+                        // No machine, no session: say why (Cloud can't
+                        // reach the repository, Cloud is off, …) instead of
+                        // queueing a run nobody will pick up.
+                        Err(err) if on_cloud => return Err(err),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                        }
                     }
                 }
                 // A hand-started side chat is minted by its first send. Unlike
@@ -10750,6 +10903,7 @@ impl Composer {
                             attachments: attachment_paths,
                             worktree: run_worktree,
                             mcp: None,
+                            env: Default::default(),
                         },
                         message_id: message_id.clone(),
                     }
@@ -10923,6 +11077,10 @@ impl Composer {
                     composer.failure_key = Some(restore_key.clone());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
+                        s.remove_echo(
+                            &err_chat_id,
+                            &zeron_proto::cloud_setup_entry_id(&err_message_id),
+                        );
                         s.end_pending_send(&err_chat_id, &err_message_id);
                         if is_new && s.selected_chat.as_deref() == Some(err_chat_id.as_str()) {
                             // Back to the canvas; the navigation draft-swap
@@ -11110,6 +11268,13 @@ impl Composer {
         }
     }
 
+    /// Close the questions without answering: the same RespondInput as an
+    /// answer, with none — the run reads its own decline, the chip records
+    /// the questions closed, and the composer comes back.
+    fn wizard_dismiss(&mut self, cx: &mut Context<Self>) {
+        self.wizard_finish(Vec::new(), cx);
+    }
+
     /// Submit RespondInput and retire the panel.
     fn wizard_finish(&mut self, answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
         let Some(wizard) = self.wizard.take() else {
@@ -11135,6 +11300,11 @@ impl Composer {
             return;
         };
         let request_id = wizard.request_id.clone();
+        let failed = if answers.is_empty() {
+            "Closing the question failed"
+        } else {
+            "Answer failed"
+        };
         let command = SessionCommandPayload::RespondInput {
             request_id: request_id.clone(),
             answers,
@@ -11149,7 +11319,7 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Answer failed: {err}").into());
+                    composer.failure = Some(format!("{failed}: {err}").into());
                     composer.failure_key = Some(failure_chat);
                     // The answer never left this device — put the panel back.
                     composer.answered_requests.remove(&request_id);
@@ -11222,7 +11392,8 @@ impl Composer {
     /// place of the composer: the same floating-pill chrome (`rounded-[26px]
     /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
     /// "1/3" counter chip, option rows with number kbd chips, a free-text
-    /// override over a hairline, and Back / Next-Submit footer.
+    /// override over a hairline, and Back / Next-Submit footer — plus a corner
+    /// close that answers nothing (Escape on an untouched first page too).
     fn render_wizard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(wizard) = self.wizard.clone() else {
@@ -11254,6 +11425,7 @@ impl Composer {
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
         let can_advance = wizard.page_has_pick() || !typed_empty || question.multiline;
+        let dismiss_hover_key: SharedString = format!("wizard-dismiss-{}", cx.entity_id()).into();
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
@@ -11338,6 +11510,7 @@ impl Composer {
                 this.on_wizard_key(event, window, cx)
             }))
             .occlude()
+            .relative()
             .rounded(px(COMPOSER_RADIUS))
             .border_1()
             .border_color(theme.border)
@@ -11358,6 +11531,8 @@ impl Composer {
                             .flex_row()
                             .items_center()
                             .gap(px(10.0))
+                            // Clear of the corner close, like the question.
+                            .pr(px(32.0))
                             .child(
                                 div()
                                     .text_size(px(10.5))
@@ -11386,6 +11561,8 @@ impl Composer {
                     .child(
                         div()
                             .mt(px(6.0))
+                            // Wraps clear of the corner close (12px in, 28px wide).
+                            .pr(px(32.0))
                             .text_size(px(15.0))
                             .line_height(px(20.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
@@ -11462,6 +11639,51 @@ impl Composer {
                             .px(px(16.0))
                             .when(!can_advance, |el| el.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
+                    ),
+            )
+            // Close without answering — the composer's own close (Cancel
+            // dictation) on the same pill: 28px round, 16px cross. Pinned to
+            // the corner so the header keeps its layout, 12px in so it is
+            // concentric with the 26px radius. No tab stop: the panel owns the
+            // keyboard, and Enter on a focused close would reach Next first.
+            .child(
+                div()
+                    .id("wizard-dismiss")
+                    .role(gpui::Role::Button)
+                    .aria_label("Close without answering")
+                    .absolute()
+                    .top(px(12.0))
+                    .right(px(12.0))
+                    .size(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &dismiss_hover_key,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.10),
+                    ))
+                    .on_hover(motion::hover_listener(dismiss_hover_key))
+                    // Fork: Escape never closes the panel (it bubbles toward Stop).
+                    .tooltip(crate::settings::widgets::text_tooltip(
+                        "Close without answering",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.wizard_dismiss(cx);
+                    }))
+                    .on_a11y_action(gpui::AccessibleAction::Click, {
+                        let composer = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            composer.update(cx, |this, cx| this.wizard_dismiss(cx)).ok();
+                        }
+                    })
+                    .child(
+                        crate::icons::icon(crate::icons::CLOSE)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
                     ),
             );
         // Frosted, like the composer pill this panel replaces: the fill is a 3%
@@ -12017,12 +12239,16 @@ impl Composer {
                 // Share the submission guard with Enter, including pending
                 // edits and the new-session runnable-agent check.
                 let blocked = self.send_blocked(cx);
+                // Dimmed when out of Cloud credits, but a click still says why.
+                let explains = self.out_of_cloud_credits(cx);
                 send_circle("composer-send", blocked, theme)
-                    .when(!blocked, |el| {
+                    .when(!blocked || explains, |el| {
                         el.on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
                     .tooltip(crate::settings::widgets::text_tooltip(
-                        if mode == SendButtonMode::Steer {
+                        if self.out_of_cloud_credits(cx) {
+                            "Out of Cloud credits"
+                        } else if mode == SendButtonMode::Steer {
                             "Send (steers the current run)"
                         } else {
                             "Send message"
@@ -12348,6 +12574,8 @@ impl Render for Composer {
         // reconnect) instead of letting the button imply instant delivery.
         let queue_notice: Option<(SharedString, bool)> = {
             use zeron_proto::ConnectivityState as S;
+            // A new session on Cloud never waits on the project's device.
+            let runs_on_cloud = self.pickers.read(cx).runs_on_cloud(cx);
             let state = self.state.read(cx);
             let degraded = match state.selected_chat.as_deref() {
                 Some(id) => state.chat_delivery_degraded(id),
@@ -12357,6 +12585,7 @@ impl Render for Composer {
                         .effective_device_id()
                         .is_some_and(|id| state.local_device_id.as_deref() != Some(id.as_str()));
                     remote_target
+                        && !runs_on_cloud
                         && (matches!(state.connectivity.state, S::Offline | S::Reconnecting)
                             || state
                                 .effective_device_id()
@@ -12364,7 +12593,23 @@ impl Render for Composer {
                 }
             };
             let offline = state.connectivity.state == S::Offline;
-            degraded.then(|| {
+            // A sleeping Cloud device is woken by the send itself.
+            let cloud_asleep = !offline
+                && state
+                    .selected_chat
+                    .as_deref()
+                    .and_then(|id| state.chats.iter().find(|c| c.id == id))
+                    .map(|chat| chat.device_id.clone())
+                    .or_else(|| state.effective_device_id())
+                    .is_some_and(|id| {
+                        matches!(
+                            state.device_presence(&id, chrono::Utc::now()),
+                            crate::cloud::Presence::Asleep | crate::cloud::Presence::Waking
+                        )
+                    });
+            // A sleeping Cloud machine isn't a delivery problem — the send
+            // wakes it, and the session card shows it asleep.
+            (degraded && !cloud_asleep).then(|| {
                 let text: SharedString = if offline {
                     "Offline — messages will send when you're back online.".into()
                 } else {
@@ -13899,6 +14144,8 @@ mod tests {
                         last_completed_turn: None,
                         turn_stats: None,
                         running_subagents: 0,
+                        last_turn_outcome: None,
+                        terminal_activity: None,
                     }];
                     cx.notify();
                 });
@@ -14405,6 +14652,85 @@ mod tests {
         });
     }
 
+    /// The target the sidebar's "No project" `+` leaves: a project-less new
+    /// chat names its host outright, so it lands in that device's group.
+    #[gpui::test]
+    fn projectless_new_chat_is_created_on_the_picked_device(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.local_device_id = Some("local".into());
+            state.select_space(None, cx);
+            state.select_device("remote".into(), cx);
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("hello", cx));
+            composer.on_submit(cx);
+        });
+        cx.run_until_parked();
+        let create = std::iter::from_fn(|| requests.try_recv().ok())
+            .map(|frame| serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap())
+            .find(|frame| frame.params["op"] == "createChat")
+            .expect("the send creates the chat");
+        assert_eq!(create.params["deviceId"], "remote");
+        assert!(create.params.get("spaceId").is_none());
+    }
+
+    /// Out of credits, a send that would run on Cloud is held at the button:
+    /// Cloud can't start or wake its machine. Other chats are untouched.
+    #[gpui::test]
+    fn cloud_sends_wait_for_credits(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.cloud_status = Some(zeron_proto::CloudStatus {
+                state: zeron_proto::CloudState::Ready,
+                device_id: Some("cloud-1".into()),
+                available: true,
+                credits: Some(0.0),
+                ..Default::default()
+            });
+            state.cloud_sessions = Some(zeron_proto::CloudSessions {
+                sessions: vec![zeron_proto::CloudSession {
+                    chat_id: "on-cloud".into(),
+                    device_id: "cloud-s1".into(),
+                    state: zeron_proto::CloudState::Sleeping,
+                    ..Default::default()
+                }],
+                available: true,
+            });
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        state.update(cx, |state, _| state.selected_chat = Some("on-cloud".into()));
+        composer.update(cx, |composer, cx| {
+            assert!(composer.out_of_cloud_credits(cx));
+            assert!(composer.send_blocked(cx));
+        });
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("on-laptop".into())
+        });
+        composer.update(cx, |composer, cx| assert!(!composer.send_blocked(cx)));
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("on-cloud".into());
+            if let Some(status) = state.cloud_status.as_mut() {
+                status.credits = Some(30.0);
+            }
+        });
+        composer.update(cx, |composer, cx| assert!(!composer.send_blocked(cx)));
+    }
+
     #[gpui::test]
     fn submission_preserves_literal_command_and_skill_indentation(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -14534,6 +14860,8 @@ mod tests {
                 error: None,
                 turn_stats: None,
                 running_subagents: 0,
+                last_turn_outcome: None,
+                terminal_activity: None,
             }];
             state.set_test_engine(crate::state::EngineHandle::from_test_client(
                 zeron_rpc::RpcClient::new(out, inbound),
@@ -14723,6 +15051,8 @@ mod tests {
                 context_usage: None,
                 error: None,
                 turn_stats: None,
+                last_turn_outcome: None,
+                terminal_activity: None,
                 running_subagents: 0,
             }];
             state.selected_chat = Some("c".into());
@@ -16279,6 +16609,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn masked_input_shows_bullets_and_keeps_its_text_off_the_clipboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let input = cx.new(|cx| ComposerInput::new("API key", cx).with_masked());
+        input.update(cx, |input, cx| {
+            input.set_text("sk-é9", cx);
+            input.refresh_projection();
+            assert_eq!(input.projection.display, MASK_GLYPH.to_string().repeat(5));
+            // Every raw character boundary maps onto a bullet boundary and back.
+            for (bullet, (raw, _)) in input.content.char_indices().enumerate() {
+                let display = input.projection.raw_to_display(raw);
+                assert_eq!(display, bullet * MASK_GLYPH.len_utf8());
+                assert_eq!(input.projection.display_to_raw(display), raw);
+            }
+            assert_eq!(
+                input.projection.raw_to_display(input.content.len()),
+                input.projection.display.len()
+            );
+            input.selected_range = 0..input.content.len();
+            assert_eq!(input.clipboard_selection(), None);
+            assert_eq!(input.previous_word_boundary(4), 0);
+            assert_eq!(input.next_word_boundary(1), input.content.len());
+            assert_eq!(input.text(), "sk-é9");
+        });
+    }
+
+    #[gpui::test]
     fn changing_slash_skill_preference_invalidates_open_completion(cx: &mut gpui::TestAppContext) {
         let (_dir, handle) = composer_focus_window(cx);
         handle
@@ -16945,6 +17302,7 @@ mod tests {
             checkout_id: None,
             repository_id: None,
             created_at: at(created),
+            github_repo: None,
         };
         let device = |id: &str, name: &str| zeron_proto::Device {
             id: id.into(),
@@ -18053,6 +18411,13 @@ mod tests {
         assert!(wizard_escape_goes_back("escape", true, true));
         assert!(!wizard_escape_goes_back("escape", true, false));
         assert!(!wizard_escape_goes_back("enter", false, true));
+
+        // With nowhere to go back to, Escape closes an untouched panel —
+        // never one holding a pick or typed text.
+        assert!(wizard_escape_dismisses(0, false, true));
+        assert!(!wizard_escape_dismisses(0, true, true));
+        assert!(!wizard_escape_dismisses(0, false, false));
+        assert!(!wizard_escape_dismisses(1, false, true));
     }
 
     #[test]
@@ -18274,6 +18639,48 @@ mod tests {
                 c.drafts.get("b").map(String::as_str),
                 Some("ordinary draft b")
             );
+        });
+    }
+
+    #[gpui::test]
+    fn closing_the_wizard_unanswered_retires_it_and_returns_the_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        state.update(cx, |s, _| s.selected_chat = Some("a".into()));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            c.input.update(cx, |i, cx| i.set_text("draft", cx));
+        });
+        state.update(cx, |s, _| {
+            s.transcript = vec![SessionMessageEntry {
+                id: "assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Input {
+                    id: "input".into(),
+                    request_id: "r1".into(),
+                    questions: vec![question("q", &["a", "b"], false)],
+                    resolved: false,
+                    answers: None,
+                }],
+                created_at: 0,
+                device_id: "device".into(),
+                status: Some(zeron_doc::MessageStatus::Streaming),
+                continuation_of: None,
+                duration_ms: None,
+            }]
+        });
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert!(c.wizard.is_some());
+            c.wizard_dismiss(cx);
+            assert!(c.wizard.is_none());
+            assert_eq!(c.input.read(cx).text(), "draft");
+            // The question still reads open until the close lands: the latch
+            // keeps the panel from coming straight back.
+            c.on_state_changed(cx);
+            assert!(c.wizard.is_none());
         });
     }
 

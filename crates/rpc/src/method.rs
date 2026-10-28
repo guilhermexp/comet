@@ -385,6 +385,51 @@ rpc_methods! {
     CANCEL_HARNESS_UPDATE / CancelHarnessUpdate = "CancelHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     DISMISS_HARNESS_UPDATE / DismissHarnessUpdate = "DismissHarnessUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     SET_HARNESS_UPDATE_POLICY / SetHarnessUpdatePolicy = "SetHarnessUpdatePolicy" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    // Upstream v0.2.126 (sync/upstream-20261026). GetCommitCredit /
+    // SetCommitCredit (e680d5c98) are deliberately absent: refused.
+    /// Which providers on this device run without their own subagents
+    /// (`{switchable, off}`; set with `{harness, enabled}`).
+    GET_NATIVE_SUBAGENTS / GetNativeSubagents = "GetNativeSubagents" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SET_NATIVE_SUBAGENTS / SetNativeSubagents = "SetNativeSubagents" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    /// `{viewportId, focused}`: an app window gained or lost focus (desktop
+    /// banners hold back while one is focused). Focused viewports repeat it;
+    /// a report goes stale after 45 s.
+    SET_VIEWPORT_FOCUS / SetViewportFocus = "SetViewportFocus" { params: serde_json::Value, reply: serde_json::Value },
+    /// `{loginId, requesterDeviceId, path}`: replay a sign-in's browser
+    /// callback the requesting device caught on its own loopback (a phone
+    /// signing a computer's agent in). Answers `{status, location?}`.
+    RELAY_AGENT_LOGIN_CALLBACK / RelayAgentLoginCallback = "RelayAgentLoginCallback" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    /// Headless IPC only: stop starting work ahead of a Cloud sleep. Dormant
+    /// in the fork (no Cloud runner without `ZERON_RUNNER_*`).
+    QUIESCE_FOR_SLEEP / QuiesceForSleep = "QuiesceForSleep" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    // Cloud, billing and the credential vault (dormant in the fork). IPC-only:
+    // the engine calls the edge with the user's bearer; never routed by
+    // `targetDeviceId` and rejected at relay ingress.
+    /// The account: `{}` → `CloudStatus`.
+    CLOUD_STATUS / CloudStatus = "CloudStatus" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    CLOUD_ENABLE / CloudEnable = "CloudEnable" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    CLOUD_DELETE / CloudDelete = "CloudDelete" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    CLOUD_SESSIONS / CloudSessions = "CloudSessions" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    CLOUD_SESSION_WAKE / CloudSessionWake = "CloudSessionWake" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    CLOUD_SESSION_SLEEP / CloudSessionSleep = "CloudSessionSleep" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    CLOUD_SESSION_DELETE / CloudSessionDelete = "CloudSessionDelete" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    CLOUD_USAGE / CloudUsage = "CloudUsage" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    BILLING_STATUS / BillingStatus = "BillingStatus" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    BILLING_CHECKOUT / BillingCheckout = "BillingCheckout" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    BILLING_PORTAL / BillingPortal = "BillingPortal" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    VAULT_STATUS / VaultStatus = "VaultStatus" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    VAULT_CONNECT_CODEX / VaultConnectCodex = "VaultConnectCodex" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    VAULT_CONNECT_CLAUDE / VaultConnectClaude = "VaultConnectClaude" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    VAULT_PUT_API_KEY / VaultPutApiKey = "VaultPutApiKey" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    VAULT_AUTHORIZE / VaultAuthorize = "VaultAuthorize" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    VAULT_DISCONNECT / VaultDisconnect = "VaultDisconnect" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    VAULT_REVOKE_DEVICE / VaultRevokeDevice = "VaultRevokeDevice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    GITHUB_CONNECT_START / GithubConnectStart = "GithubConnectStart" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    GITHUB_CONNECT_POLL / GithubConnectPoll = "GithubConnectPoll" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    /// Upstream relays this to a Cloud session device; the fork keeps it
+    /// IPC-only while Cloud is dormant.
+    LIST_GITHUB_REPOS / ListGithubRepos = "ListGithubRepos" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    LIST_CLOUD_BRANCHES / ListCloudBranches = "ListCloudBranches" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
 }
 
 #[cfg(test)]
@@ -480,5 +525,28 @@ mod tests {
         assert!(methods::is_local_only(methods::WORKER_WAIT_STATE));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));
         assert!(!methods::is_local_only("Nope"));
+    }
+
+    #[test]
+    fn cloud_and_vault_are_ipc_only_and_commit_credit_is_absent() {
+        for name in ["GetCommitCredit", "SetCommitCredit"] {
+            assert!(info(name).is_none(), "refused method {name} is registered");
+        }
+        for name in [
+            methods::CLOUD_STATUS,
+            methods::CLOUD_ENABLE,
+            methods::BILLING_STATUS,
+            methods::VAULT_STATUS,
+            methods::VAULT_CONNECT_CLAUDE,
+            methods::GITHUB_CONNECT_START,
+            methods::LIST_GITHUB_REPOS,
+            methods::LIST_CLOUD_BRANCHES,
+            methods::QUIESCE_FOR_SLEEP,
+        ] {
+            let method = info(name).unwrap();
+            assert!(method.local_only && !method.forwardable, "{name}");
+        }
+        assert!(info(methods::GET_NATIVE_SUBAGENTS).unwrap().forwardable);
+        assert!(info(methods::SET_NATIVE_SUBAGENTS).unwrap().forwardable);
     }
 }

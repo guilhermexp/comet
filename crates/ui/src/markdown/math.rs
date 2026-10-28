@@ -280,7 +280,9 @@ fn nbsp_em() -> f32 {
 /// How many fonts glyphs can name ([`zatex::bundled::FONTS`]).
 const FONTS: usize = zatex::bundled::FONTS as usize;
 
-/// The bundled math face a glyph font index names, parsed on first use.
+/// The bundled math face a glyph font index names, parsed on first use. Only
+/// the paint-table test parses faces; rendering goes through the font table.
+#[cfg(test)]
 fn math_face(font: u8) -> Option<&'static ttf_parser::Face<'static>> {
     static FACES: [OnceLock<Option<ttf_parser::Face<'static>>>; FONTS] =
         [const { OnceLock::new() }; FONTS];

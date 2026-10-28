@@ -44,7 +44,7 @@ use gpui::{
 use zeron_doc::{
     FileChangePreview, MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus,
 };
-use zeron_proto::{TodoItem, ToolCall, view::tool_presentation};
+use zeron_proto::{HarnessId, TodoItem, ToolCall, view::tool_presentation};
 
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
@@ -327,6 +327,10 @@ fn user_message_attachment_summary(
         (n, _) => format!("Using {n} attachments").into(),
     })
 }
+
+/// Between a caption over a user bubble (provider switch, agent sender) and
+/// the bubble.
+const USER_CAPTION_GAP: f32 = 6.0;
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -863,8 +867,21 @@ pub enum RowKind {
         appshot_presentations: Arc<HashMap<String, crate::appshots::AppshotPresentation>>,
         /// Context the prompt folded in as text, lifted back out by `badges`.
         badges: Arc<Vec<crate::badges::MessageBadge>>,
+        /// The chat that sent this message through Zeron's `send_message`,
+        /// lifted out of the routing header the receiving agent still reads.
+        sender: Option<AgentSender>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
+    },
+    /// A message this chat's agent sent another chat through Zeron's
+    /// `send_message`: one `Message to [logo] Chat` line, not the tool call.
+    SentMessage {
+        /// The recipient as the call named it (id, id prefix, or title),
+        /// resolved against the chat list at render.
+        to: SharedString,
+        /// The call hasn't returned yet.
+        pending: bool,
+        failed: bool,
     },
     /// One top-level markdown block of a completed message.
     Markdown {
@@ -923,6 +940,13 @@ pub enum RowKind {
     ForkMarker {
         source_chat_id: SharedString,
         source_title: SharedString,
+    },
+    /// The provider-switch seam: a labeled divider over `[logo] From → [logo] To`.
+    SwitchMarker {
+        from: SharedString,
+        to: SharedString,
+        from_harness: Option<HarnessId>,
+        to_harness: Option<HarnessId>,
     },
     /// A subagent's "finished" timeline line (Codex-style lifecycle), placed
     /// where its terminal status arrived ([`zeron_doc::SubagentEnd`]).
@@ -1850,7 +1874,13 @@ fn rows_for_entry_with_todo_history(
     let streaming = entry.status == Some(MessageStatus::Streaming);
     let entry_id: SharedString = entry.id.clone().into();
 
-    if entry.role == MessageRole::System {
+    // A provider-switch seam (a System entry holding `MessagePart::Switch`)
+    // projects through the part arms below as its marker row.
+    let switch_seam = entry
+        .parts
+        .iter()
+        .any(|part| matches!(part, MessagePart::Switch { .. }));
+    if entry.role == MessageRole::System && !switch_seam {
         let text: String = entry
             .parts
             .iter()
@@ -1920,7 +1950,12 @@ fn rows_for_entry_with_todo_history(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(display_text);
-        let body = agent_message_display(&body);
+        // An agent message's routing header becomes a "Message from [logo]
+        // Chat" caption over the bubble; the bubble keeps only the body.
+        let (sender, body) = match agent_message_sender(&body) {
+            Some((sender, body)) => (Some(sender), body.to_owned()),
+            None => (None, body),
+        };
         // Chips stand in for their attachments: those leave the strip, and a
         // chip carries its upload's path for its progress and, for an image,
         // a click opening it.
@@ -1976,6 +2011,7 @@ fn rows_for_entry_with_todo_history(
                 attachments: Arc::new(attachments),
                 appshot_presentations,
                 badges: Arc::new(badges),
+                sender,
                 pending,
             },
             entry_id,
@@ -2104,6 +2140,45 @@ fn rows_for_entry_with_todo_history(
                         group_first_part_ix,
                         group_last_part_ix,
                     );
+                }
+                // A message to another chat reads as one line naming the
+                // recipient, one per recipient, out of the tool group. Compact
+                // mode folds these rows into `TurnSteps` with the rest of the
+                // work (`compact_entry_rows`, `is_work`).
+                if let Some(sent) = zeron_proto::agent_messages::outgoing_messages(call) {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                    for (message_ix, message) in sent.into_iter().enumerate() {
+                        let version = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            (&message.chat, *resolved, *is_error).hash(&mut h);
+                            h.finish()
+                        };
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}.m{message_ix}", entry.id, tool_id).into(),
+                                version,
+                                turn_start: false,
+                                kind: RowKind::SentMessage {
+                                    to: message.chat.into(),
+                                    pending: !*resolved,
+                                    failed: *is_error,
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                            },
+                        });
+                    }
+                    continue;
                 }
                 // The linked children already present this delegation. Keep
                 // failed wrappers and calls without a bound child inspectable.
@@ -2523,6 +2598,39 @@ fn rows_for_entry_with_todo_history(
                             },
                         });
                     }
+                    MessagePart::Switch {
+                        id: part_id,
+                        from,
+                        to,
+                        from_harness,
+                        to_harness,
+                    } => {
+                        let from_harness = from_harness.as_deref().and_then(HarnessId::from_slug);
+                        let to_harness = to_harness.as_deref().and_then(HarnessId::from_slug);
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: fnv1a(
+                                    format!(
+                                        "{from}\u{1}{to}\u{1}{from_harness:?}\u{1}{to_harness:?}"
+                                    )
+                                    .as_bytes(),
+                                ),
+                                turn_start: false,
+                                kind: RowKind::SwitchMarker {
+                                    from: single_line(from).into(),
+                                    to: single_line(to).into(),
+                                    from_harness,
+                                    to_harness,
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                            },
+                        });
+                    }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } | MessagePart::WorkflowTask { .. } => {}
                 }
@@ -2570,7 +2678,10 @@ fn rows_for_entry_with_todo_history(
             .iter_mut()
             .rev()
             .find(|row| !matches!(row.row.kind, RowKind::InlineImages { .. }))
-        && !matches!(last.row.kind, RowKind::ForkMarker { .. })
+        && !matches!(
+            last.row.kind,
+            RowKind::ForkMarker { .. } | RowKind::SwitchMarker { .. }
+        )
     {
         last.row.timestamp = Some(entry.created_at);
         last.row.copy_text = assistant_copy_text(entry);
@@ -2719,6 +2830,9 @@ fn compact_entry_rows(entry: &SessionMessageEntry, rows: Vec<Row>) -> Vec<Row> {
                 | RowKind::ToolGroup { .. }
                 | RowKind::TaskSnapshot { .. }
                 | RowKind::SubagentEnd(..)
+                // A message the agent sent another chat is part of the
+                // turn's work: it folds with the rest (upstream d8a14b35b).
+                | RowKind::SentMessage { .. }
         )
     };
     let stays_out = |row: &Row| {
@@ -2729,6 +2843,7 @@ fn compact_entry_rows(entry: &SessionMessageEntry, rows: Vec<Row>) -> Vec<Row> {
                 | RowKind::GeneratedImage { .. }
                 | RowKind::Notice { .. }
                 | RowKind::ForkMarker { .. }
+                | RowKind::SwitchMarker { .. }
         )
     };
     let fold_end = if streaming {
@@ -2988,9 +3103,16 @@ fn column_and_table_bleed_for(viewport_width: Option<f32>, max_column: f32) -> (
 /// [`render::block_gap`] between sibling block rows split from the same text
 /// part — the SAME rule the live row applies internally, so the live→split
 /// handoff cannot shift a pixel; the block gap otherwise.
+/// A provider-switch seam is the caption of the message under it, so that
+/// message sits right below it.
 pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     if matches!(row.kind, RowKind::InlineImages { .. }) {
         return 0.0;
+    }
+    if matches!(row.kind, RowKind::User { .. })
+        && prev.is_some_and(|prev| matches!(prev.kind, RowKind::SwitchMarker { .. }))
+    {
+        return USER_CAPTION_GAP;
     }
     if row.turn_start {
         return GAP_TURN;
@@ -4066,6 +4188,7 @@ impl HighlightStore {
                             Lang::Php => "php",
                             Lang::Sql => "sql",
                             Lang::Lua => "lua",
+                            Lang::Luau => "luau",
                             Lang::Dockerfile => "dockerfile",
                             Lang::Nix => "nix",
                             Lang::Make => "make",
@@ -4733,6 +4856,16 @@ pub struct Transcript {
     bottom_clearance: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
+    /// The rail's tick stack bounds (painted last frame): maps pointer y to
+    /// a prompt index.
+    rail_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The rail's own scroll, once its ticks outgrow the room beside the
+    /// reading column.
+    rail_scroll: gpui::ScrollHandle,
+    /// The lit tick span the rail last scrolled into view, by message id: it
+    /// follows only when what's lit changes, so scrolling the rail by hand
+    /// holds.
+    rail_followed: Option<(SharedString, SharedString)>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -4907,6 +5040,9 @@ pub enum TranscriptEvent {
         root: std::path::PathBuf,
         relative_path: String,
     },
+    /// An error card's "Log in": sign in to the provider this chat's run
+    /// was refused by (signed out, or out of usage).
+    SignIn { chat_id: String },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -4924,6 +5060,8 @@ pub enum TranscriptEvent {
         session_id: String,
         title: String,
     },
+    /// An agent message's sender caption: open the chat that sent it.
+    OpenChat { chat_id: String },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -5189,6 +5327,9 @@ impl Transcript {
             rail_snapshot: crate::rail::RailSnapshot::default(),
             bottom_clearance: 0.0,
             rail_hover: None,
+            rail_bounds: Rc::new(Cell::new(None)),
+            rail_scroll: gpui::ScrollHandle::new(),
+            rail_followed: None,
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -5275,6 +5416,26 @@ impl Transcript {
 
     pub(crate) fn set_rail_hover(&mut self, hover: Option<usize>) {
         self.rail_hover = hover;
+    }
+
+    pub(crate) fn rail_scroll(&self) -> &gpui::ScrollHandle {
+        &self.rail_scroll
+    }
+
+    pub(crate) fn rail_followed_mut(&mut self) -> &mut Option<(SharedString, SharedString)> {
+        &mut self.rail_followed
+    }
+
+    pub(crate) fn rail_bounds(&self) -> &Rc<Cell<Option<Bounds<Pixels>>>> {
+        &self.rail_bounds
+    }
+
+    pub(crate) fn bottom_clearance(&self) -> f32 {
+        self.bottom_clearance
+    }
+
+    pub(crate) fn rows(&self) -> &[Row] {
+        &self.rows
     }
 
     pub(crate) fn list_state(&self) -> &ListState {
@@ -5741,7 +5902,7 @@ impl Transcript {
         }
     }
 
-    fn own_send_inset(anchor_ix: usize) -> f32 {
+    pub(crate) fn own_send_inset(anchor_ix: usize) -> f32 {
         if anchor_ix == 0 {
             0.0
         } else {
@@ -6547,6 +6708,7 @@ impl Transcript {
                         self.render_cache.borrow_mut().invalidate_row(id);
                     });
                 }
+                let after = old_range.start + count;
                 if old_range.len() == count {
                     // In-place content change, same row count — notably the
                     // live→complete flip, where EVERY row of the streamed
@@ -6561,6 +6723,12 @@ impl Transcript {
                     self.list.remeasure_items(old_range);
                 } else {
                     self.list.splice(old_range, count);
+                }
+                // A row's top gap reads its predecessor, so the row after the
+                // splice can gain a new one (a switch seam landing over the
+                // message already shown under it).
+                if after < new_rows.len() {
+                    self.list.remeasure_items(after..after + 1);
                 }
                 self.viewport_layout_revision = self.viewport_layout_revision.wrapping_add(1);
             }
@@ -8442,6 +8610,7 @@ impl Transcript {
                 attachments,
                 appshot_presentations,
                 badges,
+                sender,
                 pending,
             } => {
                 let attachments = attachments.clone();
@@ -8454,6 +8623,11 @@ impl Transcript {
                 // Attachments, badges and the prompt bubble follow upstream's
                 // right-aligned user-message column.
                 let mut column = div().w_full().flex().flex_col();
+                // An agent-sent message: "Message from [logo] Chat" over the
+                // bubble, which keeps only the body.
+                if let Some(sender) = sender {
+                    column = column.child(self.render_agent_sender(&row.id, sender, &theme, cx));
+                }
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(
                         &row.id,
@@ -8859,9 +9033,65 @@ impl Transcript {
             RowKind::Visual { owner, path, title } => {
                 self.render_visual(&row.id, owner, path, title, cx)
             }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::SentMessage {
+                to,
+                pending,
+                failed,
+            } => {
+                let chat = {
+                    let state = self.state.read(cx);
+                    let chats: Vec<(&str, Option<&str>)> = state
+                        .chats
+                        .iter()
+                        .map(|chat| (chat.id.as_str(), chat.title.as_deref()))
+                        .collect();
+                    zeron_proto::agent_messages::resolve_chat_key(to, &chats).map(str::to_owned)
+                };
+                let lead = if *failed {
+                    "Couldn't message"
+                } else {
+                    "Message to"
+                };
+                div()
+                    .w_full()
+                    .when(*pending, |el| el.opacity(0.65))
+                    .child(self.render_chat_caption(
+                        &row.id,
+                        lead,
+                        chat.as_deref(),
+                        to.clone(),
+                        false,
+                        &theme,
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+            RowKind::ErrorChip { message } => {
+                // A refusal that signing in fixes (signed out, out of usage)
+                // carries a "Log in" for this chat's provider.
+                let problem = zeron_proto::run_errors::provider_problem(message);
+                let sign_in = self
+                    .chat_id
+                    .clone()
+                    .filter(|_| problem.is_some())
+                    .map(|chat_id| {
+                        let chat_id = chat_id.to_string();
+                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                            cx.emit(TranscriptEvent::SignIn {
+                                chat_id: chat_id.clone(),
+                            });
+                        })
+                    });
+                error_chip(message.clone(), problem, sign_in, &theme)
+            }
             RowKind::Notice { text } => notice_divider(text.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::SwitchMarker {
+                from,
+                to,
+                from_harness,
+                to_harness,
+            } => switch_marker(from.clone(), to.clone(), *from_harness, *to_harness, &theme),
             RowKind::WorkerNotice(notice) => {
                 let (verb, tone) = match notice.status.as_ref() {
                     "completed" => ("finished".to_owned(), theme.text_muted),
@@ -10452,6 +10682,101 @@ impl Transcript {
         ))
     }
 
+    /// `Message from [logo] Chat` over an agent-sent bubble, in the switch
+    /// seam's caption style: the sending chat's provider mark and live title
+    /// (the header's title for a chat this workspace doesn't list). A known
+    /// chat opens on click.
+    fn render_agent_sender(
+        &self,
+        row_id: &SharedString,
+        sender: &AgentSender,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .w_full()
+            .pb(px(USER_CAPTION_GAP))
+            .child(self.render_chat_caption(
+                row_id,
+                "Message from",
+                Some(sender.chat_id.as_ref()),
+                sender.title.clone(),
+                true,
+                theme,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// `{lead} [logo] Chat` over a message between chats: chat `chat_id`'s
+    /// provider mark and live title, `fallback` for one this workspace doesn't
+    /// list. A listed chat opens on click. `end` aligns it over a user bubble;
+    /// otherwise it sits over the agent's side.
+    #[allow(clippy::too_many_arguments)]
+    fn render_chat_caption(
+        &self,
+        row_id: &SharedString,
+        lead: &'static str,
+        chat_id: Option<&str>,
+        fallback: SharedString,
+        end: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat =
+            chat_id.and_then(|id| self.state.read(cx).chats.iter().find(|chat| chat.id == id));
+        let known = chat.is_some();
+        let title: SharedString = chat
+            .and_then(|chat| chat.title.as_deref())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map_or_else(
+                || {
+                    if chat.is_some() {
+                        // Listed but untitled: its short id, as the header says.
+                        chat_id
+                            .unwrap_or_default()
+                            .chars()
+                            .take(8)
+                            .collect::<String>()
+                            .into()
+                    } else {
+                        single_line(&fallback).into()
+                    }
+                },
+                |title| single_line(title).into(),
+            );
+        let mark = chat
+            .and_then(|chat| chat.config.as_ref())
+            .map(|config| crate::pickers::harness_brand_icon(config.harness))
+            .unwrap_or((crate::icons::CHAT_ROUND_LINE, None));
+        let chat_id = chat_id.unwrap_or_default().to_owned();
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .when(end, |el| el.justify_end())
+            .when(!end, |el| el.justify_start())
+            .child(
+                user_caption(theme)
+                    .id(SharedString::from(format!("{row_id}-chat")))
+                    .max_w(px(self.content_width * 0.8))
+                    .child(div().flex_none().child(lead))
+                    .child(caption_label(title, Some(mark), theme.text_muted))
+                    .when(known, |el| {
+                        el.role(gpui::Role::Link)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.text))
+                            .on_click(cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                                cx.emit(TranscriptEvent::OpenChat {
+                                    chat_id: chat_id.clone(),
+                                });
+                            }))
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_visual(
         &mut self,
         row_id: &SharedString,
@@ -11830,46 +12155,32 @@ impl Transcript {
     }
 }
 
-/// A sent message's text with its file-mention chips. The same recipe as the
-/// markdown renderer's inline code (`flat_text_element`): chip ranges shape in
-/// the mono font at the spectrum's `code_text`, [`StyledText`] supplies wrapped glyph
-/// geometry through its layout handle, and a canvas paints the rounded
-/// `code_wash` *beneath* the glyphs — so chips wrap, clip, and scroll exactly
-/// like the text they decorate.
-///
-/// Per-frame cost while an assistant message streams below: shaping hits
-/// gpui's line-layout cache (identical text + runs ⇒ reuse) and the underlay
-/// repaints O(chips) quads — no layout work, no re-projection (spans were
-/// computed once in [`rows_for_entry`]).
-/// The user bubble's text: runs split at mention-chip boundaries (one plain
-/// run when there are none), with the same selection machinery as rendered
-/// markdown — the element registers into the frame's document-ordered
-/// registry, so drags select, span into adjacent rows, and Cmd+C copies.
-/// Keep routing instructions in the stored prompt for agents, but show a
-/// concise attribution in the human transcript (including existing messages).
-fn agent_message_display(text: &str) -> String {
-    let Some(rest) = text.strip_prefix("[Message from Zeron chat ") else {
-        return text.to_owned();
-    };
-    let Some((header, body)) = rest.split_once("]\n\n") else {
-        return text.to_owned();
-    };
-    let Some((label, id)) =
-        header.rsplit_once(". Reply to it with the Zeron `send_message` tool, chat ")
-    else {
-        return text.to_owned();
-    };
-    let Some(id) = id.strip_suffix('.') else {
-        return text.to_owned();
-    };
-    let suffix = format!(" ({id})");
-    let name = label.strip_suffix(&suffix).unwrap_or(label);
-    format!("Message from {name}\n\n{body}")
+/// The chat an agent-to-agent message came from: its id, and its title as the
+/// sender's header recorded it (the live title wins when the chat is known).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSender {
+    pub chat_id: SharedString,
+    pub title: SharedString,
+}
+
+/// Split the routing header (`[Message from Zeron chat …]`) off a message an
+/// agent sent: the agent keeps reading it in the stored prompt, while the
+/// transcript shows the sender above the bubble and only the body inside it.
+/// Replaces the fork's former in-bubble bold "Message from" attribution.
+fn agent_message_sender(text: &str) -> Option<(AgentSender, &str)> {
+    let (sender, body) = zeron_proto::agent_messages::agent_message_sender(text)?;
+    Some((
+        AgentSender {
+            chat_id: sender.chat_id.into(),
+            title: sender.title.into(),
+        },
+        body,
+    ))
 }
 
 /// The bubble text's runs: the prompt body stays in the interface font,
 /// file mentions use the composer's padded chip face, and URL chips keep their
-/// code styling. Attribution names remain bold.
+/// code styling.
 fn user_bubble_runs(
     text: &str,
     mentions: &[crate::composer::SentMentionSpan],
@@ -11955,42 +12266,24 @@ fn user_bubble_runs(
     if at < text.len() {
         runs.push(body_run(text.len() - at));
     }
-    // Attribution names are bold sans text, never Markdown/italic. Split
-    // existing runs so chip styling and selection offsets stay intact.
-    if let Some(rest) = text.strip_prefix("Message from ")
-        && let Some((name, _)) = rest.split_once("\n\n")
-    {
-        let bold = "Message from ".len().."Message from ".len() + name.len();
-        let mut offset = 0;
-        runs = runs
-            .into_iter()
-            .flat_map(|run| {
-                let end = offset + run.len;
-                let mut pieces = Vec::new();
-                while offset < end {
-                    let in_name = bold.contains(&offset);
-                    let next = if offset < bold.start {
-                        end.min(bold.start)
-                    } else if in_name {
-                        end.min(bold.end)
-                    } else {
-                        end
-                    };
-                    let mut piece = run.clone();
-                    piece.len = next - offset;
-                    if in_name {
-                        piece.font.weight = gpui::FontWeight::BOLD;
-                    }
-                    pieces.push(piece);
-                    offset = next;
-                }
-                pieces
-            })
-            .collect();
-    }
     runs
 }
 
+/// A sent message's text with its file-mention chips. The same recipe as the
+/// markdown renderer's inline code (`flat_text_element`): chip ranges shape in
+/// the mono font at the spectrum's `code_text`, [`StyledText`] supplies wrapped glyph
+/// geometry through its layout handle, and a canvas paints the rounded
+/// `code_wash` *beneath* the glyphs — so chips wrap, clip, and scroll exactly
+/// like the text they decorate.
+///
+/// Per-frame cost while an assistant message streams below: shaping hits
+/// gpui's line-layout cache (identical text + runs ⇒ reuse) and the underlay
+/// repaints O(chips) quads — no layout work, no re-projection (spans were
+/// computed once in [`rows_for_entry`]).
+/// The user bubble's text: runs split at mention-chip boundaries (one plain
+/// run when there are none), with the same selection machinery as rendered
+/// markdown — the element registers into the frame's document-ordered
+/// registry, so drags select, span into adjacent rows, and Cmd+C copies.
 fn user_bubble_text(
     row_id: &SharedString,
     text: SharedString,
@@ -12355,23 +12648,135 @@ fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
                 )
                 .child(rule()),
         )
+        // Centered by flex, not `text_center()`: gpui registers a text line's
+        // layer at the line origin with the text's own width, so glyphs shifted
+        // by alignment paint outside it and can draw over popovers above them.
         .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .truncate()
-                .text_center()
-                .text_size(crate::typography::ui_rems(13.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text_muted)
-                .child(source_title),
+            div().w_full().min_w_0().flex().justify_center().child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(source_title),
+            ),
         )
         .into_any_element()
 }
 
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+/// `[mark] Name` in a user-message caption: a provider's brand mark (or any
+/// glyph) beside its name. A side without a mark shows its name alone.
+fn caption_label(
+    name: SharedString,
+    mark: Option<(&'static str, Option<gpui::Hsla>)>,
+    color: gpui::Hsla,
+) -> gpui::Div {
+    div()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .when_some(mark, |el, (path, tint)| {
+            el.child(
+                crate::icons::icon(path)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(tint.unwrap_or(color)),
+            )
+        })
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(name),
+        )
+}
+
+/// A muted one-line caption riding right-aligned over a user bubble: the
+/// provider-switch seam and an agent message's sender.
+fn user_caption(theme: &Theme) -> gpui::Div {
+    div()
+        .min_w_0()
+        .max_w_full()
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .text_size(crate::typography::ui_rems(13.0))
+        .text_color(theme.text_muted)
+}
+
+/// The provider-switch seam: `[logo] From → [logo] To`, each side in its
+/// provider's brand mark, right-aligned over the message that switched. A
+/// side without a known harness (a seam from a build that didn't record one)
+/// shows its name alone.
+fn switch_marker(
+    from: SharedString,
+    to: SharedString,
+    from_harness: Option<HarnessId>,
+    to_harness: Option<HarnessId>,
+    theme: &Theme,
+) -> AnyElement {
+    let mark = |harness: Option<HarnessId>| harness.map(crate::pickers::harness_brand_icon);
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .justify_end()
+        .child(
+            user_caption(theme)
+                .child(caption_label(from, mark(from_harness), theme.text_muted))
+                .child(
+                    crate::icons::icon(crate::icons::ARROW_RIGHT)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(caption_label(to, mark(to_harness), theme.text_muted)),
+        )
+        .into_any_element()
+}
+
+/// The transcript ErrorChip (fork treatment, see the doc above
+/// `notice_divider`). A refusal that signing in fixes (signed out, out of
+/// usage) says so in the label and carries a "Log in" button for that chat's
+/// provider under the message (upstream f30a8641b, ported onto the fork card).
+fn error_chip(
+    message: SharedString,
+    problem: Option<zeron_proto::run_errors::ProviderProblem>,
+    sign_in: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
+    theme: &Theme,
+) -> AnyElement {
+    use zeron_proto::run_errors::ProviderProblem;
+    let label = match problem {
+        Some(ProviderProblem::SignedOut) => "Signed out",
+        Some(ProviderProblem::LimitReached) => "Limit reached",
+        None => "Error",
+    };
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
+    let button = sign_in.map(|on_click| {
+        // The app's button metrics (popover::btn_*), compact for the card,
+        // tinted in the card's red rather than a solid fill.
+        div()
+            .id("error-sign-in")
+            .flex_none()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .bg(danger.opacity(0.14))
+            .text_color(theme.danger_muted)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(crate::typography::ui_rems(12.0))
+            .cursor_pointer()
+            .hover(move |s| s.bg(danger.opacity(0.22)))
+            .on_click(on_click)
+            .child(problem.map_or("Log in", ProviderProblem::action_label))
+    });
     div()
         .py(px(4.0))
         .w_full()
@@ -12411,14 +12816,18 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .flex_none()
                         .font_weight(gpui::FontWeight::NORMAL)
                         .text_color(red_300.opacity(0.8))
-                        .child(SharedString::from("Error")),
+                        .child(SharedString::from(label)),
                 )
                 .child(
                     div()
                         .min_w_0()
                         .flex_1()
                         .text_color(theme.text.opacity(0.8))
-                        .child(message),
+                        .child(message)
+                        // "Log in" goes under the message, inside the card.
+                        .when_some(button, |column, button| {
+                            column.child(div().pt(px(6.0)).flex().child(button))
+                        }),
                 ),
         )
         .into_any_element()
@@ -15042,6 +15451,191 @@ mod tests {
             name: "generated.png".into(),
             mime_type: "image/png".into(),
         }
+    }
+
+    fn user_text_entry(id: &str, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            role: MessageRole::User,
+            ..assistant(id, MessageStatus::Complete, vec![text_part("t0", text)])
+        }
+    }
+
+    fn switch_entry(from_harness: Option<&str>, to_harness: Option<&str>) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: "switch:1".into(),
+            role: MessageRole::System,
+            parts: vec![MessagePart::Switch {
+                id: "switch:1".into(),
+                from: "Claude Code".into(),
+                to: "Codex".into(),
+                from_harness: from_harness.map(Into::into),
+                to_harness: to_harness.map(Into::into),
+            }],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn provider_switch_seam_is_one_marker_row_carrying_both_providers() {
+        let rows = rows_for_entry(
+            &switch_entry(Some("claude-code"), Some("codex")),
+            false,
+            &mut parse,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].timestamp.is_none(), "a seam has no metadata strip");
+        match &rows[0].kind {
+            RowKind::SwitchMarker {
+                from,
+                to,
+                from_harness,
+                to_harness,
+            } => {
+                assert_eq!(from.as_ref(), "Claude Code");
+                assert_eq!(to.as_ref(), "Codex");
+                assert_eq!(*from_harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(*to_harness, Some(HarnessId::Codex));
+            }
+            _ => panic!("expected a switch marker row"),
+        }
+        // A seam written without provider ids (or by a newer peer naming a
+        // harness this build doesn't know) still renders, minus the logo.
+        for (from, to) in [(None, None), (Some("some-future-agent"), Some("codex"))] {
+            let rows = rows_for_entry(&switch_entry(from, to), false, &mut parse);
+            match &rows[0].kind {
+                RowKind::SwitchMarker { from_harness, .. } => assert_eq!(*from_harness, None),
+                _ => panic!("expected a switch marker row"),
+            }
+        }
+        // Changing a provider re-keys the row so a cached one is rebuilt.
+        let version = |from: Option<&str>| {
+            rows_for_entry(&switch_entry(from, Some("codex")), false, &mut parse)[0].version
+        };
+        assert_ne!(version(Some("claude-code")), version(Some("cursor")));
+    }
+
+    #[test]
+    fn provider_switch_seam_sits_close_over_the_message_it_switched() {
+        let seam = rows_for_entry(
+            &switch_entry(Some("claude-code"), Some("codex")),
+            false,
+            &mut parse,
+        );
+        let prompt = rows_for_entry(&user_text_entry("u1", "hi"), false, &mut parse);
+        assert_eq!(top_gap_for(Some(&seam[0]), &prompt[0]), USER_CAPTION_GAP);
+        assert_eq!(top_gap_for(None, &seam[0]), GAP_TURN);
+    }
+
+    #[test]
+    fn messages_the_agent_sent_read_as_messages_not_tools() {
+        let send = |id: &str, tool: &str, input: serde_json::Value| {
+            let mut part = tool_part(id, "");
+            if let MessagePart::Tool { call, resolved, .. } = &mut part {
+                *call = ToolCall::Mcp {
+                    server: "zeron".into(),
+                    tool: tool.into(),
+                    input: Some(input),
+                };
+                *resolved = false;
+            }
+            part
+        };
+        let entry = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("k0", "ls"),
+                send(
+                    "k1",
+                    "send_message",
+                    serde_json::json!({ "chat": "Windows lane", "text": "Run it." }),
+                ),
+                send(
+                    "k2",
+                    "send_messages",
+                    serde_json::json!({ "requests": [{ "chat": "a", "text": "one" }, { "chat": "b", "text": "two" }] }),
+                ),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let sent: Vec<&Row> = rows
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::SentMessage { .. }))
+            .collect();
+        // Each message is its own row, one per recipient; none rides a tool group.
+        assert_eq!(sent.len(), 3);
+        let RowKind::SentMessage {
+            to,
+            pending,
+            failed,
+        } = &sent[0].kind
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            (to.as_ref(), *pending, *failed),
+            ("Windows lane", true, false)
+        );
+        assert!(matches!(&sent[2].kind, RowKind::SentMessage { to, .. } if to.as_ref() == "b"));
+        assert!(rows.iter().all(|row| {
+            match &row.kind {
+                RowKind::ToolGroup { tools, .. } => tools
+                    .iter()
+                    .all(|tool| !matches!(tool.call, ToolCall::Mcp { .. })),
+                _ => true,
+            }
+        }));
+        // Compact mode folds the whole turn, sends included: they show when
+        // the `TurnSteps` fold opens.
+        let compact = compact_entry_rows(&entry, rows);
+        assert!(
+            !compact
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::SentMessage { .. }))
+        );
+        assert!(compact.iter().any(|row| matches!(
+            &row.kind,
+            RowKind::TurnSteps { rows, .. }
+                if rows.iter().any(|row| matches!(row.kind, RowKind::SentMessage { .. }))
+        )));
+    }
+
+    #[test]
+    fn agent_messages_show_their_sender_over_the_body() {
+        let id = "cd27c5c2-0000-4000-8000-000000000000";
+        let text = format!(
+            "[Message from Zeron chat zgui prod: Windows (WING-PC) (cd27c5c2). Reply to it with the Zeron `send_message` tool, chat {id}.]\n\nWindows lane: done."
+        );
+        let rows = rows_for_entry(&user_text_entry("u1", &text), false, &mut parse);
+        let RowKind::User {
+            text: shown,
+            sender,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("expected a user row");
+        };
+        assert_eq!(shown.as_ref(), "Windows lane: done.");
+        assert_eq!(
+            sender.as_ref(),
+            Some(&AgentSender {
+                chat_id: id.into(),
+                // Only the trailing short id goes; a title's own parens stay.
+                title: "zgui prod: Windows (WING-PC)".into(),
+            })
+        );
+        // An untitled sender is labelled by its short id alone.
+        let untitled = format!(
+            "[Message from Zeron chat cd27c5c2. Reply to it with the Zeron `send_message` tool, chat {id}.]\n\nhi"
+        );
+        let (sender, body) = agent_message_sender(&untitled).unwrap();
+        assert_eq!((sender.title.as_ref(), body), ("cd27c5c2", "hi"));
+        // A typed message that merely starts alike is left alone.
+        assert!(agent_message_sender("[Message from Zeron chat x]\n\nhi").is_none());
     }
 
     #[test]

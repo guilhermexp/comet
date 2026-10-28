@@ -627,6 +627,8 @@ apps/zeron (host-mode dispatch at startup).
 
 - `space_links::linked_checkouts_at` lê só `(path, space_id)` dos checkouts ligados. Não inicia host nem grava estado. A engine consulta em `spawn_blocking` e autoriza Source Control num checkout Worker apenas quando o Space ligado é deste device — estar em `projects[]` não autoriza nada.
 
+- O controller (`__workers_mcp__`) recebe o bearer IPC da engine (`ZERON_IPC_TOKEN_FILE`, ou `ZERON_IPC_TOKEN`), guarda-o em memória na partida (`space_registry::take_engine_ipc_credentials`) e o remove do próprio ambiente antes de lançar qualquer Worker; só ele disca a engine (`connect_engine`). O `unpeel-core` vendorizado também tira essas duas variáveis do launcher, do host destacado e do shell do Worker (`strip_embedder_ipc_credentials`), então Workers lançados pelo app também não as herdam. O mesmo vale para os descritores da ponte MCP do Pi (`ZERON_PI_MCP`, `ZERON_PI_MCP_<n>`), cujo JSON carrega o caminho do bearer: o controller os remove na partida e o `unpeel-core` os tira do launcher/host/shell. Prova: `tests/controller_ipc_credentials.rs`.
+
 ## Work Guidance
 
 - **Checkout lifecycle:** Chat e Workers usam o mesmo serviço. A raiz canônica

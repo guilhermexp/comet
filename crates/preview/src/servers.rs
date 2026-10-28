@@ -70,9 +70,11 @@ pub fn list(cwds: &[String]) -> Vec<DevServer> {
         return Vec::new();
     }
     let table = process_table();
-    rows(discovery::listeners(), &roots, &|pid| {
-        launchers(&table, pid)
-    })
+    rows(
+        discovery::listeners(&mut discovery::Origins::default()).unwrap_or_default(),
+        &roots,
+        &|pid| launchers(&table, pid),
+    )
 }
 
 /// `pid → (parent, command)` for every process, from one `ps`.
@@ -366,9 +368,11 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
         "that server already exited"
     );
     let table = process_table();
-    let listed = rows(discovery::listeners(), &roots, &|pid| {
-        launchers(&table, pid)
-    })
+    let listed = rows(
+        discovery::listeners(&mut discovery::Origins::default()).unwrap_or_default(),
+        &roots,
+        &|pid| launchers(&table, pid),
+    )
     .into_iter()
     .any(|server| server.pid == pid && server.started_at == started_at);
     anyhow::ensure!(listed, "that process is not a server in this project");
@@ -419,6 +423,8 @@ mod tests {
                 SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
             },
             zeron_owned: false,
+            chat_id: None,
+            origin: None,
         }
     }
 

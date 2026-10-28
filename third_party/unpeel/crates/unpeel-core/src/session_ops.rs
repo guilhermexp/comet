@@ -1624,7 +1624,9 @@ pub fn spawn_session(
     let host = resolve_host_binary()?;
     // Launcher argv mode: `unpeel-host <launch-file>` re-execs itself as
     // `__session_host__` fully detached (setsid) and returns immediately.
-    let status = std::process::Command::new(&host)
+    let mut launcher = std::process::Command::new(&host);
+    crate::session_host::strip_embedder_ipc_credentials(&mut launcher);
+    let status = launcher
         .arg(&launch_file)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

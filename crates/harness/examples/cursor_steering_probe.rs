@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        env: Default::default(),
     };
     let mut stream = CursorHarness::new()
         .run(

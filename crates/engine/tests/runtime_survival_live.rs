@@ -103,6 +103,7 @@ fn run(
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        env: Default::default(),
         prompt: prompt.into(),
         harness: Some(harness),
         model: model.clone(),

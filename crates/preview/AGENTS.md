@@ -21,6 +21,8 @@ Catálogo, descoberta de listeners/processos, proxy HTTP/WebSocket, multiplexaç
 
 - `servers.rs` (Details → Servers) é separado do catálogo: lista só **servidores de dev** sob as raízes pedidas (pasta do chat + Projects worked): o listener ou um launcher acima dele (até shell/agente) precisa casar com um comando de dev (`dev_signatures`: `npm run dev`, `next dev`, `vite`, `cargo run`, `mix phx.server`…). Postgres, redis, minio, agentes e browsers ficam de fora. Cada linha leva as `signatures` para a UI casar com os comandos do chat. `stop` revalida pid + start time + raiz no host e manda SIGTERM ao listener e aos launchers acima dele com cwd na mesma raiz, parando em shell, CLI de agente, Zeron ou após 3 níveis — nunca derruba o agente que lançou o servidor.
 
+- Previews (upstream #1023): só entram no catálogo/"Ports" servidores carimbados com `ZERON_ORIGIN=chat:<id>`/`terminal:<id>` de um chat hospedado aqui (`PreviewService.chat_id`). Servidores iniciados por Workers (host Unpeel) não têm carimbo e saem do catálogo; continuam em Settings → Servers (`servers.rs`, por raiz de projeto, `Origins` vazio). Pendência de produto registrada no sync v0.2.126.
+
 ## Work Guidance
 
 Preservar limites de frames, backpressure e teardown de peers. Não colocar credenciais, caminhos ou parâmetros de processo extras no signaling.

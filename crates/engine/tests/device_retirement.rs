@@ -78,6 +78,8 @@ struct World {
     core: EngineCore,
     client: zeron_rpc::RpcClient,
     endpoint: String,
+    /// The IPC bearer's data dir: every client presents its token.
+    data: std::path::PathBuf,
     local: String,
     _server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
@@ -99,12 +101,15 @@ impl World {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let service: Arc<dyn zeron_rpc::RpcService> = core.rpc_service();
-        let server = tokio::spawn(zeron_rpc::serve_ws_listener(listener, service));
+        let data = dir.path().join("data");
+        let token = zeron_rpc::ipc_auth::issue_token(&data).unwrap();
+        let server = tokio::spawn(zeron_rpc::serve_ws_listener(listener, service, token));
         let local = core.device_id.clone();
         Self {
             core,
             client,
             endpoint,
+            data,
             local,
             _server: server,
             _dir: dir,
@@ -167,6 +172,7 @@ impl World {
                         attachments: Vec::new(),
                         worktree: None,
                         resume: None,
+                        env: Default::default(),
                     },
                     message_id: format!("msg-{chat_id}-{prompt}"),
                 },
@@ -227,7 +233,9 @@ impl World {
     }
 
     async fn chat_mcp(&self, tool: &str) -> Value {
-        let zeron = zeron_mcp::Zeron::new(self.endpoint.clone(), zeron_mcp::Origin::default());
+        let port = self.endpoint.rsplit(':').next().unwrap().parse().unwrap();
+        let zeron =
+            zeron_mcp::Zeron::new(port, Some(self.data.clone()), zeron_mcp::Origin::default());
         zeron_mcp::Tools::new(Arc::new(zeron))
             .call(tool, json!({}))
             .await

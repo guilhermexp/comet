@@ -54,6 +54,11 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
     match id {
         Mock | Kimi | Omp => vec![],
         Antigravity => vec![Archive],
+        Muse if windows => vec![PowerShell("irm https://dev.meta.ai/install.ps1 | iex")],
+        Muse => vec![Shell(
+            "curl -fsSL https://dev.meta.ai/install.sh | sh",
+            "sh",
+        )],
         ClaudeCode if windows => vec![PowerShell("irm https://claude.ai/install.ps1 | iex")],
         ClaudeCode => vec![Shell(
             "curl -fsSL https://claude.ai/install.sh | bash",
@@ -158,6 +163,7 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Grok => "npm install -g @xai-official/grok",
         Hermes => "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
         Devin => "curl -fsSL https://cli.devin.ai/install.sh | bash",
+        Muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
         Antigravity | Mock | Kimi | Omp => return None,
     })
 }
@@ -176,6 +182,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Antigravity => ("agy_acp_server", "~/.zeron/adapters"),
         Omp => ("omp", "the npm global bin"),
         Kimi => ("kimi", "PATH"),
+        Muse => ("muse", "~/.local/bin"),
         Mock => ("mock", "PATH"),
     }
 }
@@ -193,6 +200,7 @@ pub fn installed(id: HarnessId) -> bool {
         Devin => crate::AcpHarness::devin().installed(),
         Antigravity => crate::AcpHarness::antigravity().installed(),
         Omp => crate::OmpHarness::new().installed(),
+        Muse => crate::MuseHarness::new().installed(),
         Kimi | Mock => false,
     }
 }
@@ -227,8 +235,8 @@ fn configure(command: &mut Command) {
     let mut paths: Vec<_> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    if let Some(path) = crate::shell_env::login_shell_path() {
-        paths.extend(std::env::split_paths(path));
+    if let Some(path) = crate::shell_env::user_path() {
+        paths.extend(std::env::split_paths(&path));
     }
     // npm can be found in a managed toolchain even when shell startup was disabled.
     if let Some(npm) =

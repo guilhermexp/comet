@@ -43,6 +43,33 @@ pub(crate) fn engine_endpoint() -> Option<String> {
         .clone()
 }
 
+/// The engine's IPC bearer file (`{data_dir}/ipc-token`), recorded once IPC is
+/// served. Every Comet server that dials the engine gets its PATH as
+/// `ZERON_IPC_TOKEN_FILE` (never the token itself: some runtimes put this env
+/// on a command line any local user can read).
+static IPC_TOKEN_FILE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Record the IPC bearer file every Comet MCP server spawned from now on gets.
+pub fn note_workers_ipc_token_file(path: &Path) {
+    *IPC_TOKEN_FILE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
+}
+
+pub(crate) fn ipc_token_file() -> Option<PathBuf> {
+    IPC_TOKEN_FILE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Mirrors `zeron_rpc::ipc_auth::TOKEN_FILE_ENV` (the harness doesn't link the
+/// RPC crate).
+const TOKEN_FILE_ENV: &str = "ZERON_IPC_TOKEN_FILE";
+
+/// Mirrors `zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV`.
+const SIDE_CHATS_ONLY_ENV: &str = "ZERON_SIDE_CHATS_ONLY";
+
 /// Resolve the controller from the process environment: the descriptor is
 /// dropped entirely when Workers are off, when `ZERON_DISABLE_WORKERS_MCP=1`,
 /// or when the executable is not an absolute path (a child spawned by name
@@ -140,7 +167,17 @@ pub(crate) fn resolve_zeron_for(
             ("ZERON_IPC_PORT".into(), port.to_string()),
             ("ZERON_CHAT_ID".into(), grant.parent_chat_id.clone()),
             ("ZERON_DEVICE_ID".into(), grant.engine_id.clone()),
-        ],
+        ]
+        .into_iter()
+        // The host turned the provider's native subagents off: this server
+        // tells the agent to delegate through side chats instead (b8ed9d9c2,
+        // re-wired through the fork's root grant instead of `request.mcp`).
+        .chain(
+            grant
+                .side_chats_only
+                .then(|| (SIDE_CHATS_ONLY_ENV.to_owned(), "1".to_owned())),
+        )
+        .collect(),
         timeout_secs: ZERON_TIMEOUT_SECS,
     })
 }
@@ -189,7 +226,25 @@ pub(crate) fn servers_for_request(request: &zeron_proto::RunRequest) -> Vec<Work
     else {
         return Vec::new();
     };
-    servers_for(&executable, request, disabled)
+    let mut servers = servers_for(&executable, request, disabled);
+    with_ipc_token_file(&mut servers, ipc_token_file().as_deref());
+    servers
+}
+
+/// The servers that dial the engine's IPC present its bearer, read from the
+/// file the engine published.
+pub(crate) fn with_ipc_token_file(servers: &mut [WorkersMcpServer], token_file: Option<&Path>) {
+    let Some(path) = token_file.and_then(Path::to_str) else {
+        return;
+    };
+    for server in servers
+        .iter_mut()
+        .filter(|server| [NAME, SESSIONS_NAME, ZERON_NAME].contains(&server.name))
+    {
+        server
+            .env
+            .push((TOKEN_FILE_ENV.to_owned(), path.to_owned()));
+    }
 }
 
 pub(crate) fn servers_for(
@@ -306,6 +361,14 @@ impl WorkersMcpServer {
                 "mcp_servers.{}.tool_timeout_sec={}",
                 self.name, self.timeout_secs
             ),
+            // The fork runs Codex with `approvalPolicy: "never"`, which forbids
+            // approval prompts; explicitly approve our servers' tools so Codex
+            // does not reject calls that need approval (#985).
+            format!(
+                "mcp_servers.{}.default_tools_approval_mode={}",
+                self.name,
+                quote("approve")
+            ),
         ];
         overrides.extend(
             self.env.iter().map(|(name, value)| {
@@ -396,11 +459,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_overrides_approve_our_tools_under_never_policy() {
+        assert!(
+            server()
+                .codex_overrides()
+                .iter()
+                .any(|o| o == "mcp_servers.comet-workers.default_tools_approval_mode=\"approve\"")
+        );
+    }
+
+    #[test]
+    fn engine_dialing_servers_carry_the_ipc_token_file() {
+        let mut servers = servers_for(Path::new("/opt/zeron"), &request(true, true), false);
+        with_ipc_token_file(&mut servers, Some(Path::new("/data/ipc-token")));
+        for server in &servers {
+            let carries = server
+                .env
+                .iter()
+                .any(|(k, v)| k == TOKEN_FILE_ENV && v == "/data/ipc-token");
+            assert_eq!(
+                carries,
+                server.name != COMPUTER_USE_NAME,
+                "{} token file",
+                server.name
+            );
+        }
+    }
+
+    #[test]
+    fn side_chats_only_rides_the_root_grant() {
+        let env_of = |grant: &zeron_proto::SessionsGrant| {
+            resolve_zeron_for(Path::new("/opt/zeron"), grant)
+                .expect("zeron server")
+                .env
+        };
+        let off = grant();
+        assert!(!env_of(&off).iter().any(|(k, _)| k == SIDE_CHATS_ONLY_ENV));
+        let on = zeron_proto::SessionsGrant {
+            side_chats_only: true,
+            ..grant()
+        };
+        assert!(
+            env_of(&on)
+                .iter()
+                .any(|(k, v)| k == SIDE_CHATS_ONLY_ENV && v == "1")
+        );
+    }
+
     fn grant() -> zeron_proto::SessionsGrant {
         zeron_proto::SessionsGrant {
             parent_chat_id: "parent".into(),
             endpoint: "ws://127.0.0.1:9".into(),
             engine_id: "engine-1".into(),
+            side_chats_only: false,
         }
     }
 
@@ -421,6 +533,7 @@ mod tests {
             resume: None,
             worktree: None,
             mcp: None,
+            env: Default::default(),
         }
     }
 

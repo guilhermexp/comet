@@ -209,6 +209,7 @@ mod tests {
             checkout_id: None,
             repository_id: None,
             created_at: Utc.timestamp_millis_opt(created_ms).unwrap(),
+            github_repo: None,
         }
     }
 
@@ -246,6 +247,7 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             origin_chat_id: None,
+            harness_session_harness: None,
         }
     }
 

@@ -874,6 +874,7 @@ async fn target_device_id_routes_over_the_relay() {
             attachments: Vec::new(),
             worktree: None,
             resume: None,
+            env: Default::default(),
         },
         message_id: "m-a-1".into(),
     })
@@ -1933,6 +1934,7 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         Origin {
             chat_id: Some("coordinator".into()),
             device_id: Some("device-a".into()),
+            ..Default::default()
         },
     )));
     a.workspace
