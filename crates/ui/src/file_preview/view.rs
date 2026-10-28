@@ -44,6 +44,7 @@ enum NativeDocumentAction {
     OpenHtml,
     OpenPdf,
     OpenVideo,
+    OpenAudio,
 }
 
 fn native_document_action(
@@ -55,6 +56,7 @@ fn native_document_action(
         PreviewLoadState::Ready(LoadedPreview::Html(_)) => NativeDocumentAction::OpenHtml,
         PreviewLoadState::Ready(LoadedPreview::Pdf) => NativeDocumentAction::OpenPdf,
         PreviewLoadState::Ready(LoadedPreview::Video) => NativeDocumentAction::OpenVideo,
+        PreviewLoadState::Ready(LoadedPreview::Audio) => NativeDocumentAction::OpenAudio,
         _ => return NativeDocumentAction::Hide,
     };
     if existing == Some(absolute) {
@@ -687,7 +689,8 @@ impl FilePreview {
             }
             PreviewLoadState::Ready(LoadedPreview::Html(_))
             | PreviewLoadState::Ready(LoadedPreview::Pdf)
-            | PreviewLoadState::Ready(LoadedPreview::Video) => {
+            | PreviewLoadState::Ready(LoadedPreview::Video)
+            | PreviewLoadState::Ready(LoadedPreview::Audio) => {
                 self.render_native_document(window, theme)
             }
             PreviewLoadState::Ready(LoadedPreview::Image(image)) => render_image(image, theme),
@@ -753,6 +756,14 @@ impl FilePreview {
                     self.clear_native_document();
                     if let Some(view) =
                         super::native_document::NativeDocumentView::open_video(&absolute)
+                    {
+                        self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
+                    }
+                }
+                NativeDocumentAction::OpenAudio => {
+                    self.clear_native_document();
+                    if let Some(view) =
+                        super::native_document::NativeDocumentView::open_audio(&absolute)
                     {
                         self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
                     }
@@ -1116,6 +1127,24 @@ mod tests {
         assert_eq!(
             native_document_action(&video, Path::new("/tmp/a.mp4"), None),
             NativeDocumentAction::OpenVideo
+        );
+        let audio = PreviewLoadState::Ready(LoadedPreview::Audio);
+        let audio_path = Path::new("/tmp/a.mp3");
+        assert_eq!(
+            native_document_action(&audio, audio_path, None),
+            NativeDocumentAction::OpenAudio
+        );
+        assert_eq!(
+            native_document_action(&audio, audio_path, Some(audio_path)),
+            NativeDocumentAction::Keep
+        );
+        assert_eq!(
+            native_document_action(&audio, audio_path, Some(path)),
+            NativeDocumentAction::OpenAudio
+        );
+        assert_eq!(
+            native_document_action(&audio, path, Some(audio_path)),
+            NativeDocumentAction::OpenAudio
         );
         assert_eq!(
             native_document_action(&PreviewLoadState::Loading, path, Some(path)),
