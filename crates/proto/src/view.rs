@@ -97,16 +97,17 @@ fn indicator_for_status(
 /// Fallback label when a failed run carries no reason of its own.
 pub const RUN_FAILED_LABEL: &str = "Run failed";
 
-/// What the status strip shows for a failed run: the harness's own reason when
-/// the row carries one, else [`RUN_FAILED_LABEL`]. The engine already journals
+/// What the status strip shows for a failed run: a human provider-limit summary,
+/// otherwise the harness's reason, else [`RUN_FAILED_LABEL`]. The engine journals
 /// that reason, so a run that failed for a knowable cause — an oversized
 /// attachment, a rejected provider — must say so instead of "Run failed". Pure.
-pub fn run_failure_text(session: Option<&Session>) -> &str {
-    session
+pub fn run_failure_text(session: Option<&Session>) -> std::borrow::Cow<'_, str> {
+    let reason = session
         .and_then(|session| session.error.as_deref())
         .map(str::trim)
         .filter(|reason| !reason.is_empty())
-        .unwrap_or(RUN_FAILED_LABEL)
+        .unwrap_or(RUN_FAILED_LABEL);
+    crate::run_errors::provider_error_message(reason)
 }
 
 #[cfg(test)]
@@ -139,6 +140,21 @@ mod failure_text_tests {
             run_failure_text(Some(&session)),
             "harness protocol error: OMP image attachments exceed the RPC frame budget"
         );
+    }
+
+    #[test]
+    fn provider_limit_status_uses_the_shared_message_without_changing_the_session() {
+        let raw = r#"429 {"error":{"type":"rate_limit_error"},"request_id":"req_synthetic"} retry-after-ms=8564000"#;
+        let session = errored(Some(raw));
+        assert_eq!(
+            run_failure_text(Some(&session)),
+            "Provider limit reached. Retry delay reported: 2h 23m."
+        );
+        assert_eq!(
+            run_failure_text(Some(&session)),
+            crate::run_errors::provider_error_message(raw)
+        );
+        assert_eq!(session.error.as_deref(), Some(raw));
     }
 
     #[test]

@@ -1159,11 +1159,12 @@ impl SessionsEngine {
                             });
                             permit.send(message);
                         };
-                        // Worker notifications must reach a running orchestrator
-                        // turn or its background work even while an update is
-                        // pending; ordinary prompts keep the update gate and
-                        // are dispatched only after it clears.
-                        if worker_notification
+                        // OMP input and Worker notices belong to the active
+                        // process, whose execution lease still excludes the
+                        // installer. Rejecting a compatible OMP send here would
+                        // fall through to terminate() below. Empty parked
+                        // runtimes still yield to the update.
+                        if (worker_notification || harness_id == HarnessId::Omp)
                             && (self.turn_in_flight(chat_id) || self.holds_background_work(chat_id))
                         {
                             Some(enqueue())
@@ -1693,11 +1694,10 @@ impl SessionsEngine {
             });
             permit.send(message);
         };
-        // Genuine Worker notices must reach the parent run so it can finish
-        // and release an update waiting for that run. Ordinary user steers
-        // remain ordered behind the accepted update. The running process still
-        // holds its execution lease until it exits, keeping installation safe.
-        let accepted = if worker_notification
+        // OMP steers must remain usable while its active process holds the
+        // installer off, just like genuine Worker notices. No new lease is
+        // acquired: installation remains exclusive until this process drains.
+        let accepted = if (worker_notification || harness_id == HarnessId::Omp)
             && (self.turn_in_flight(chat_id) || self.holds_background_work(chat_id))
         {
             Some(enqueue())
@@ -4932,16 +4932,28 @@ async fn drive_run(
                     if idle_since.is_some()
                         && !resume_state.voice_active.live()
                         && inner.registry.update_pending(harness_id)
+                        && (harness_id != HarnessId::Omp
+                            || !inner.has_pending_steers(&chat_id, &run_id))
                         && !turn_control.background_live()
                         && (subagents.is_empty()
                             || last_subagent_activity.is_none_or(|at| at.elapsed() >= subagent_silence)) =>
                 {
-                    if let Some(token) = lock(&inner.runs)
+                    if let Some(handle) = lock(&inner.runs)
                         .get(&chat_id)
                         .filter(|h| h.run_id == run_id)
-                        .map(|h| h.interrupt_token.clone())
                     {
-                        token.cancel();
+                        // Serialize retirement with OMP mailbox acceptance.
+                        // A steer accepted after the select guard was checked
+                        // owns this runtime; a later send sees retiring and is
+                        // replayed by the existing exit drain.
+                        let pending = lock(&handle.routed_steers);
+                        if harness_id == HarnessId::Omp {
+                            if !pending.is_empty() || turn_control.background_live() {
+                                continue;
+                            }
+                            handle.retiring.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        handle.interrupt_token.cancel();
                     }
                     break (SessionStatus::Idle, None);
                 }
@@ -5887,7 +5899,9 @@ async fn drive_run(
             if (*status == DoneStatus::Completed || stopped_in_place)
                 && steerable
                 && !interrupted
-                && !inner.registry.update_pending(harness_id)
+                // OMP must drain accepted input/background work at the idle
+                // retirement check above, not exit on the foreground Done.
+                && (harness_id == HarnessId::Omp || !inner.registry.update_pending(harness_id))
             {
                 folded.clear();
                 dirty = false;

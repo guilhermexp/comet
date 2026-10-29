@@ -9,7 +9,7 @@
 //! `run()` is a spawn, the `interrupt` token is its death, a turn stop ends
 //! only the turn, and the test decides when the "background task" finishes.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +42,9 @@ struct Ledger {
     spawned_models: Mutex<Vec<Option<String>>>,
     /// Ends a turn whose prompt contains `wait`.
     release: tokio::sync::Notify,
+    /// Hold mailbox consumption across a foreground Done.
+    pause_steering: AtomicBool,
+    resume_steering: tokio::sync::Notify,
 }
 
 /// One persistent agent process per `run()`. A prompt containing `hold`
@@ -49,6 +52,7 @@ struct Ledger {
 /// steer containing `vanish` kills the process before it confirms the steer.
 /// A prompt containing `wait` runs until the test releases it.
 struct ProcessHarness {
+    id: HarnessId,
     ledger: Arc<Ledger>,
     /// Model changes apply to the live process (`set_model`-style).
     adopts_config: bool,
@@ -69,7 +73,7 @@ fn done(status: DoneStatus) -> AgentEvent {
 #[async_trait]
 impl Harness for ProcessHarness {
     fn id(&self) -> HarnessId {
-        HarnessId::Mock
+        self.id
     }
     fn display_name(&self) -> &str {
         "Process"
@@ -105,6 +109,7 @@ impl Harness for ProcessHarness {
         mut controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let ledger = self.ledger.clone();
+        let harness_id = self.id;
         ledger.spawns.fetch_add(1, Ordering::SeqCst);
         ledger
             .spawned_models
@@ -128,7 +133,7 @@ impl Harness for ProcessHarness {
                 text.contains("hold")
             };
             let _ = send(AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
+                harness: harness_id,
                 model: "process".into(),
                 tools: vec![],
                 cwd: request.cwd.clone(),
@@ -148,6 +153,7 @@ impl Harness for ProcessHarness {
             loop {
                 tokio::select! {
                     biased;
+                    _ = ledger.resume_steering.notified() => {}
                     _ = ledger.release.notified(), if waiting => {
                         waiting = false;
                         if !send(done(DoneStatus::Completed)).await {
@@ -165,7 +171,7 @@ impl Harness for ProcessHarness {
                             return;
                         }
                     }
-                    steer = controls.steering.recv() => {
+                    steer = controls.steering.recv(), if !ledger.pause_steering.load(Ordering::SeqCst) => {
                         let Some(steer) = steer else { return };
                         if steer.prompt.contains("vanish") {
                             return;
@@ -213,15 +219,20 @@ fn rig_with(adopts_config: bool) -> Rig {
 }
 
 fn rig_full(adopts_config: bool, turn_boundary: bool) -> Rig {
+    rig_for_harness(adopts_config, turn_boundary, HarnessId::Mock)
+}
+
+fn rig_for_harness(adopts_config: bool, turn_boundary: bool, id: HarnessId) -> Rig {
     let ledger = Arc::new(Ledger::default());
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(ProcessHarness {
+        id,
         ledger: ledger.clone(),
         adopts_config,
         turn_boundary,
     }));
     let dir = tempfile::tempdir().unwrap();
-    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), id, None)
         .expect("engine core assembles");
     Rig {
         core,
@@ -1171,5 +1182,239 @@ async fn worker_notice_to_a_parked_parent_waits_for_the_update_and_runs_once() {
     settle(&rig, 2).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(delivered(), 1, "the notice was replayed");
+    rig.core.sessions.shutdown().await;
+}
+
+/// A pending writer must not turn a compatible OMP send into terminate(),
+/// or strand a steer behind the very turn it is meant to guide.
+#[tokio::test]
+async fn omp_update_keeps_active_steers_and_sends_in_the_same_runtime() {
+    for direct_send in [false, true] {
+        let rig = rig_for_harness(false, false, HarnessId::Omp);
+        let omp_request = |prompt| RunRequest {
+            harness: Some(HarnessId::Omp),
+            ..request(prompt)
+        };
+        let original = rig
+            .core
+            .sessions
+            .dispatch(
+                CHAT,
+                HarnessId::Omp,
+                omp_request("hold original tool"),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_for(
+            || rig.ledger.prompts.lock().unwrap().len() == 1,
+            "initial OMP turn",
+        )
+        .await;
+        rig.core.registry.begin_update(HarnessId::Omp);
+        let mut writer = Box::pin(rig.core.registry.update_lease(HarnessId::Omp));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut writer)
+                .await
+                .is_err()
+        );
+
+        if direct_send {
+            let routed = rig
+                .core
+                .sessions
+                .dispatch(
+                    CHAT,
+                    HarnessId::Omp,
+                    omp_request("hold compatible follow-up"),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(routed, original, "the update replaced an active runtime");
+        } else {
+            rig.core
+                .doc_host
+                .queue_command(
+                    CHAT,
+                    SessionCommandPayload::Steer {
+                        prompt: "hold compatible follow-up".into(),
+                        message_id: Some("omp-active-steer".into()),
+                    },
+                )
+                .unwrap();
+        }
+        wait_for(
+            || rig.ledger.prompts.lock().unwrap().len() == 2,
+            "active input before update",
+        )
+        .await;
+        assert_eq!(rig.ledger.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut writer)
+                .await
+                .is_err()
+        );
+
+        rig.core
+            .doc_host
+            .queue_worker_notification(
+                CHAT,
+                "worker-notify:omp-active".into(),
+                SessionCommandPayload::Steer {
+                    prompt: "[worker-task-notification] hold worker result".into(),
+                    message_id: Some("worker-notify-message:omp-active".into()),
+                },
+            )
+            .unwrap();
+        wait_for(
+            || rig.ledger.prompts.lock().unwrap().len() == 3,
+            "Worker notice before update",
+        )
+        .await;
+        assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
+        rig.core
+            .sessions
+            .dispatch(CHAT, HarnessId::Omp, omp_request("complete the turn"), None)
+            .await
+            .unwrap();
+        let lease = tokio::time::timeout(Duration::from_secs(5), &mut writer)
+            .await
+            .expect("drained OMP runtime releases the update");
+        assert_eq!(rig.ledger.prompts.lock().unwrap().len(), 4);
+        drop(lease);
+        rig.core.registry.end_update(HarnessId::Omp);
+        rig.core.sessions.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn omp_update_waits_for_background_work_after_done() {
+    let rig = rig_for_harness(false, false, HarnessId::Omp);
+    rig.core
+        .sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Omp,
+            RunRequest {
+                harness: Some(HarnessId::Omp),
+                ..request("wait for foreground completion")
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 1,
+        "initial OMP turn",
+    )
+    .await;
+    let turn = rig.ledger.turn.lock().unwrap().clone().unwrap();
+    turn.set_background(1);
+    rig.core.registry.begin_update(HarnessId::Omp);
+    let mut writer = Box::pin(rig.core.registry.update_lease(HarnessId::Omp));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut writer)
+            .await
+            .is_err()
+    );
+    rig.ledger.release.notify_one();
+    settle(&rig, 1).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut writer)
+            .await
+            .is_err(),
+        "foreground Done released installation over background work"
+    );
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
+
+    rig.core
+        .doc_host
+        .queue_worker_notification(
+            CHAT,
+            "worker-notify:omp-background".into(),
+            SessionCommandPayload::Steer {
+                prompt: "[worker-task-notification] wait for remaining tools".into(),
+                message_id: Some("worker-notify-message:omp-background".into()),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 2,
+        "background Worker notice",
+    )
+    .await;
+    assert_eq!(rig.ledger.spawns.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
+    turn.set_background(0);
+    rig.ledger.release.notify_one();
+    let lease = tokio::time::timeout(Duration::from_secs(5), &mut writer)
+        .await
+        .expect("fully drained OMP releases installation");
+    drop(lease);
+    rig.core.registry.end_update(HarnessId::Omp);
+    rig.core.sessions.shutdown().await;
+}
+
+#[tokio::test]
+async fn omp_update_drains_an_accepted_steer_before_retiring_at_done() {
+    let rig = rig_for_harness(false, false, HarnessId::Omp);
+    rig.ledger.pause_steering.store(true, Ordering::SeqCst);
+    let omp_request = |prompt| RunRequest {
+        harness: Some(HarnessId::Omp),
+        ..request(prompt)
+    };
+    let original = rig
+        .core
+        .sessions
+        .dispatch(CHAT, HarnessId::Omp, omp_request("wait first turn"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 1,
+        "initial OMP turn",
+    )
+    .await;
+    // Accept before the update so this isolates retirement from admission.
+    assert_eq!(
+        rig.core
+            .sessions
+            .dispatch(
+                CHAT,
+                HarnessId::Omp,
+                omp_request("wait accepted continuation"),
+                None,
+            )
+            .await
+            .unwrap(),
+        original
+    );
+    assert!(rig.core.sessions.has_pending_steers(CHAT));
+    rig.core.registry.begin_update(HarnessId::Omp);
+    rig.ledger.release.notify_one();
+    let mut writer = Box::pin(rig.core.registry.update_lease(HarnessId::Omp));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut writer)
+            .await
+            .is_err(),
+        "update overtook an accepted continuation at Done"
+    );
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
+    assert!(rig.core.sessions.has_pending_steers(CHAT));
+    rig.ledger.pause_steering.store(false, Ordering::SeqCst);
+    rig.ledger.resume_steering.notify_one();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 2,
+        "accepted continuation",
+    )
+    .await;
+    assert_eq!(rig.ledger.spawns.load(Ordering::SeqCst), 1);
+    rig.ledger.release.notify_one();
+    let lease = tokio::time::timeout(Duration::from_secs(5), &mut writer)
+        .await
+        .expect("update after continuation completes");
+    drop(lease);
+    rig.core.registry.end_update(HarnessId::Omp);
     rig.core.sessions.shutdown().await;
 }

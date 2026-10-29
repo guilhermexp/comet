@@ -15,7 +15,13 @@ fn native_package(root: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
     std::fs::write(
         root.join("codex-package.json"),
-        r#"{"layoutVersion":1,"version":"0.159.0"}"#,
+        json!({
+            "layoutVersion":1,"version":"0.159.0","variant":"codex",
+            "target":format!("{}-{}", std::env::consts::ARCH,
+                if cfg!(target_os = "macos") { "apple-darwin" } else { "unknown-linux-gnu" }),
+            "entrypoint":"bin/codex","resourcesDir":"codex-resources","pathDir":"codex-path"
+        })
+        .to_string(),
     )
     .unwrap();
     for (source, target) in [

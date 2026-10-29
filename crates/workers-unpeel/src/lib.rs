@@ -1484,6 +1484,26 @@ pub struct WorkersOutput {
     pub truncated: bool,
 }
 
+/// A bounded terminal page and the journal boundary observed before its read.
+/// The UI latches the first boundary; output appended later is live output.
+#[derive(Debug)]
+pub struct WorkersTerminalOutput {
+    pub output: WorkersOutput,
+    pub available_end: u64,
+}
+
+fn validate_terminal_session_id(session_id: &str) -> Result<(), WorkersError> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+    {
+        return Err(WorkersError::Protocol("Invalid session id".into()));
+    }
+    Ok(())
+}
+
 /// Most common length of a `─` run of at least 40 cells, seen at least 3
 /// times. A shorter or rarer run is a box border, not the row-wide rule.
 fn dominant_rule_width(data: &[u8]) -> Option<u16> {
@@ -2177,21 +2197,54 @@ impl LocalWorkersClient {
         })
     }
 
-    pub fn read_viewport(
+    /// Local terminal recovery, distinct from the diagnostic tail endpoint.
+    /// Reads at most 256 KiB, including when the cursor predates retention.
+    /// Must run on a background executor; never performs control-socket IPC.
+    pub fn read_terminal_output(
         &self,
         session_id: &str,
-        columns: u16,
-        rows: u16,
-    ) -> Result<WorkersViewport, WorkersError> {
-        let snapshot = unpeel_core::terminal_viewport::read_terminal_viewport_snapshot(
-            session_id.to_owned(),
-            columns.clamp(2, 300),
-            rows.clamp(2, 120),
-            None,
-            Some(0),
-            Some(rows.clamp(2, 120)),
-        )
-        .map_err(WorkersError::Protocol)?;
+        offset: u64,
+        wait_ms: u64,
+    ) -> Result<WorkersTerminalOutput, WorkersError> {
+        validate_terminal_session_id(session_id)?;
+        let path = session_host::output_path(session_id);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(wait_ms.min(180));
+        let available_end = loop {
+            let len = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => {
+                    return Err(WorkersError::Protocol(format!(
+                        "Cannot read terminal journal: {error}"
+                    )));
+                }
+            };
+            if len > offset || std::time::Instant::now() >= deadline {
+                break len;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        };
+        let chunk = session_host::read_retained_output_chunk(session_id, offset, 256 * 1024)
+            .map_err(WorkersError::Protocol)?;
+        let start = chunk.next_offset.saturating_sub(chunk.data.len() as u64);
+        Ok(WorkersTerminalOutput {
+            output: WorkersOutput {
+                offset: start,
+                next_offset: chunk.next_offset,
+                data: chunk.data,
+                truncated: start != offset,
+            },
+            available_end,
+        })
+    }
+
+    /// Input modes at the actual Host geometry. A virtual resized snapshot
+    /// replays its byte tail under the viewport lock and is not needed here.
+    pub fn read_current_viewport(&self, session_id: &str) -> Result<WorkersViewport, WorkersError> {
+        validate_terminal_session_id(session_id)?;
+        let snapshot = session_host::request_current_viewport_snapshot(session_id, 0, None)
+            .map_err(WorkersError::Protocol)?;
         let ansi = viewport_snapshot_to_ansi(&snapshot);
         Ok(WorkersViewport {
             output_offset: snapshot.output_offset,

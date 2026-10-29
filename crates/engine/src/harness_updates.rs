@@ -3128,6 +3128,124 @@ mod tests {
     struct ExecutableHarness(PathBuf, HarnessId);
 
     #[cfg(unix)]
+    const LONG_OMP_FIXTURE: &str = r#"#!/bin/sh
+root="$(dirname "$0")"
+test "$1" != "--no-extensions" || shift
+case "$1" in
+  --version) cat "$root/version" ;;
+  run)
+    version="$(cat "$root/version")"
+    while IFS= read -r prompt; do
+      printf '%s:%s\n' "$version" "$prompt"
+    done ;;
+  update)
+    touch "$root/install-started"
+    while test ! -f "$root/allow-install"; do sleep 0.01; done
+    printf '2.0.0\n' > "$root/version"
+    touch "$root/installed" ;;
+  *) exit 2 ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn omp_update_waits_for_long_process_then_next_execution_uses_new_install() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-omp");
+        std::fs::write(&executable, LONG_OMP_FIXTURE).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(temp.path().join("version"), "1.0.0\n").unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(
+            executable.clone(),
+            HarnessId::Omp,
+        )));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Omp, |status| {
+            status.phase = HarnessUpdatePhase::Available;
+            status.installed_version = Some("1.0.0".into());
+            status.latest_version = Some("2.0.0".into());
+        });
+        let running = registry.execution_lease(HarnessId::Omp).await;
+        let mut child = tokio::process::Command::new(&executable)
+            .arg("run")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        coordinator.set_policy(
+            HarnessId::Omp,
+            zeron_proto::HarnessUpdatePolicy::AutoWhenIdle,
+        );
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Omp,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+        let mut next = Box::pin(async {
+            let _lease = registry.execution_lease(HarnessId::Omp).await;
+            super::run_version_command(HarnessId::Omp, &executable, &["--version"]).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut next)
+                .await
+                .is_err()
+        );
+        for prompt in ["long-turn", "tool-finished", "steer", "worker-notice"] {
+            input
+                .write_all(format!("{prompt}\n").as_bytes())
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), output.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply, format!("1.0.0:{prompt}"));
+            assert!(!temp.path().join("install-started").exists());
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        drop(input);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        drop(running);
+        wait_for_phase(&coordinator, HarnessId::Omp, HarnessUpdatePhase::Installing).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut next)
+                .await
+                .is_err()
+        );
+        std::fs::write(temp.path().join("allow-install"), "").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), &mut next)
+                .await
+                .unwrap()
+                .unwrap(),
+            "2.0.0"
+        );
+        assert!(temp.path().join("installed").exists());
+        wait_for_phase(&coordinator, HarnessId::Omp, HarnessUpdatePhase::Updated).await;
+        let status = coordinator.status(HarnessId::Omp);
+        assert_eq!(status.installed_version.as_deref(), Some("2.0.0"));
+        assert!(status.error.is_none());
+        assert!(!registry.update_pending(HarnessId::Omp));
+        coordinator.shutdown().await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn updater_timeout_stops_descendants_before_returning() {
         for leader_exits in [false, true] {

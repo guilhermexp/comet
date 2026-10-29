@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "f85622c2559aa8fb5f2709a206cd0754425fe9ac"
+vendored_tree = "54cd15248b3c74aca11181abb12c9e277a4ac574"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -180,3 +180,8 @@ base_revision_resolves_upstream = false
 # bearer file path. Unit test `shells_never_inherit_the_embedder_ipc_bearer`
 # extended; downstream proof stays `controller_ipc_credentials.rs`. Local
 # patch only; local_modifications_count remains the unrecomputed value.
+
+# 2026-10-28 — passive retained-output reader for Worker terminal attach.
+# Downstream consumer: crates/workers-unpeel/tests/terminal_history.rs.
+# vendored_tree includes the local reader change and vendored documentation;
+# this is a local patch, not an upstream revision or dependency version bump.

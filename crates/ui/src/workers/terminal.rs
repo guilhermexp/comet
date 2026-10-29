@@ -41,23 +41,6 @@ enum MouseReportKind {
     Move,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalRefresh {
-    Snapshot,
-    Incremental,
-    Idle,
-}
-
-fn terminal_refresh(viewport_dirty: bool, truncated: bool, has_data: bool) -> TerminalRefresh {
-    if viewport_dirty || truncated {
-        TerminalRefresh::Snapshot
-    } else if has_data {
-        TerminalRefresh::Incremental
-    } else {
-        TerminalRefresh::Idle
-    }
-}
-
 /// Quantas linhas do fim da grade a dica de jump pode ocupar. As duas pontas
 /// (o scan e a montagem do texto) leem daqui: divergir custaria um falso
 /// negativo silencioso na pilula de "jump to bottom".
@@ -365,7 +348,7 @@ impl HistoricalReplay {
     }
 
     /// Fim do catch-up: o backlog que existia QUANDO O TERMINAL ABRIU. O
-    /// primeiro snapshot traz o `output_offset` da sessao naquele instante;
+    /// primeiro stat do journal fixa o limite antes da leitura da pagina;
     /// tudo depois dele e output ao vivo por definicao. "Ficou quieto" nao
     /// serve de saida sozinho — `read_output` faz long-poll de 180 ms, entao
     /// uma sessao viva que imprime qualquer coisa nesse intervalo nunca
@@ -394,9 +377,9 @@ fn should_paint(
     was_catching_up: bool,
     catching_up: bool,
     had_data: bool,
-    viewport_dirty: bool,
+    status_changed: bool,
 ) -> bool {
-    !catching_up && (had_data || viewport_dirty || was_catching_up)
+    !catching_up && (had_data || status_changed || was_catching_up)
 }
 
 #[derive(Default)]
@@ -465,7 +448,11 @@ struct WorkersTerminalState {
     emulator: Emulator,
     stopped: bool,
     offset: u64,
+    history_unavailable: bool,
     viewport_dirty: bool,
+    /// Recover a missing screen prefix only at the consumed journal cursor,
+    /// without canceling recovery when more journal output arrives.
+    screen_recovery_pending: bool,
     modes_from_snapshot: bool,
     /// Quando o host respondeu o ultimo snapshot de modos. `None` = nunca.
     modes_synced_at: Option<Instant>,
@@ -488,6 +475,28 @@ struct WorkersTerminalState {
 }
 
 impl WorkersTerminalState {
+    fn mouse_input_modes(&self) -> WorkersViewportInputModes {
+        if self.stopped || self.emulator.display_offset() > 0 {
+            WorkersViewportInputModes::default()
+        } else {
+            self.input_modes
+        }
+    }
+
+    fn wheel_action(
+        &self,
+        steps: i32,
+        col: usize,
+        row: usize,
+        shift: bool,
+    ) -> TerminalScrollAction {
+        if self.stopped || shift || self.emulator.display_offset() > 0 {
+            TerminalScrollAction::Scrollback
+        } else {
+            scroll_action(self.input_modes, self.mouse_protocol, steps, col, row)
+        }
+    }
+
     fn new(cols: u16, rows: u16) -> Self {
         let mut emulator = Emulator::new(cols, rows);
         emulator.retain_last_alternate_screen();
@@ -495,7 +504,9 @@ impl WorkersTerminalState {
             emulator,
             stopped: false,
             offset: 0,
+            history_unavailable: false,
             viewport_dirty: true,
+            screen_recovery_pending: false,
             modes_from_snapshot: false,
             modes_synced_at: None,
             historical_replay: HistoricalReplay::default(),
@@ -511,6 +522,25 @@ impl WorkersTerminalState {
             geometry_marks: None,
             h_scroll_px: 0.0,
         }
+    }
+
+    fn restore_empty_gap(&mut self, viewport: &zeron_workers_unpeel::WorkersViewport) -> bool {
+        if !self.screen_recovery_pending || viewport.output_offset != self.offset {
+            return false;
+        }
+        if self.emulator.cols() != viewport.cols as usize
+            || self.emulator.rows() != viewport.rows as usize
+        {
+            self.emulator.resize(viewport.cols, viewport.rows);
+        }
+        // A replacement frame must not inherit old VT painting state. Reset
+        // that state in place: replacing the emulator would discard scrollback.
+        let _ = self
+            .emulator
+            .feed(b"\x18\x1b[?1049l\x1b[?6l\x1b[4l\x1b[r\x1b[0m\x1b(B\x0f");
+        let _ = self.emulator.feed(&viewport.ansi);
+        self.screen_recovery_pending = false;
+        true
     }
 
     /// A stopped Worker's TUI cannot redraw, and reflowing its rows into a
@@ -542,17 +572,16 @@ impl WorkersTerminalState {
                 .is_some_and(|marks| !marks.is_empty())
     }
 
-    /// Este refresh precisa de um snapshot do host?
-    ///
-    /// `viewport_dirty` sao os one-shots que TEM que pintar agora (troca de
-    /// sessao, resize). O re-sync de modo pos-truncamento anda no relogio de
-    /// [`MODE_RESYNC_INTERVAL`] — ver o porque la.
+    /// Input-mode snapshots run independently of output and painting.
+    /// Resize/selection request a one-shot; truncated streams also resync on
+    /// [`MODE_RESYNC_INTERVAL`] because the parser never saw their prefix.
     fn needs_viewport(&self, now: Instant) -> bool {
-        self.viewport_dirty
-            || (self.modes_from_snapshot
-                && self
-                    .modes_synced_at
-                    .is_none_or(|at| now.saturating_duration_since(at) >= MODE_RESYNC_INTERVAL))
+        !self.stopped
+            && (self.viewport_dirty
+                || (self.modes_from_snapshot
+                    && self.modes_synced_at.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= MODE_RESYNC_INTERVAL
+                    })))
     }
 
     fn observe_failure(&mut self) {
@@ -579,22 +608,31 @@ impl WorkersTerminalState {
         self.resize_error = None;
         let had_data = !output.data.is_empty();
         let truncated = output.truncated;
+        if truncated && !had_data {
+            self.screen_recovery_pending = true;
+            self.viewport_dirty = true;
+        }
         let backlog_end = viewport.as_ref().map(|viewport| viewport.output_offset);
         if truncated {
-            let (cols, rows) = viewport
-                .as_ref()
-                .map(|viewport| (viewport.cols, viewport.rows))
-                .unwrap_or((self.emulator.cols() as u16, self.emulator.rows() as u16));
-            let cols = if self.stopped
-                && self.historical_replay.is_catching_up()
-                && !self.replays_recorded_geometry()
-            {
-                300
-            } else {
-                cols
-            };
-            self.emulator = Emulator::new(cols, rows);
-            self.emulator.retain_last_alternate_screen();
+            self.history_unavailable |= output.offset > 0;
+            // With no replacement bytes, keep the last known frame until a
+            // matching Host snapshot arrives instead of publishing a blank grid.
+            if had_data || viewport.is_some() {
+                let (cols, rows) = viewport
+                    .as_ref()
+                    .map(|viewport| (viewport.cols, viewport.rows))
+                    .unwrap_or((self.emulator.cols() as u16, self.emulator.rows() as u16));
+                let cols = if self.stopped
+                    && self.historical_replay.is_catching_up()
+                    && !self.replays_recorded_geometry()
+                {
+                    300
+                } else {
+                    cols
+                };
+                self.emulator = Emulator::new(cols, rows);
+                self.emulator.retain_last_alternate_screen();
+            }
             self.modes_from_snapshot = true;
         }
         if had_data {
@@ -613,15 +651,13 @@ impl WorkersTerminalState {
         }
         self.offset = output.next_offset;
         if let Some(viewport) = viewport {
+            self.restore_empty_gap(&viewport);
             self.input_modes = viewport.input_modes;
             self.modes_synced_at = Some(Instant::now());
             // Consumir o one-shot so aqui: sem snapshot na mao, um
             // `viewport_dirty` levantado enquanto a leitura estava em voo
             // (resize, troca de sessao) tem que sobreviver para o proximo poll.
             self.viewport_dirty = false;
-            if output.truncated && !had_data {
-                let _ = self.emulator.feed(&viewport.ansi);
-            }
         } else if had_data && !self.modes_from_snapshot {
             self.input_modes = WorkersViewportInputModes {
                 known: true,
@@ -637,6 +673,7 @@ impl WorkersTerminalState {
             .observe_output(had_data, self.offset, backlog_end);
         if self.stopped && !self.historical_replay.is_catching_up() {
             self.emulator.prepare_stopped_screen();
+            self.input_modes = WorkersViewportInputModes::default();
         }
         if !self.has_tui_jump_hint() {
             self.tui_jump_suppressed = false;
@@ -724,6 +761,7 @@ pub struct WorkersTerminal {
     focus_pending: bool,
     coalescer: InputCoalescer,
     flush_task: Option<Task<()>>,
+    mode_task: Option<Task<()>>,
     scrollbar_drag: Option<ScrollbarDrag>,
     terminal_hovered: bool,
     scrollbar_hovered: bool,
@@ -734,6 +772,61 @@ pub struct WorkersTerminal {
 }
 
 impl WorkersTerminal {
+    /// Mode IPC is independent of journal acquisition: a slow Host must not
+    /// hold successfully read output or the first complete frame hostage.
+    fn sync_input_modes(&mut self, cx: &mut Context<Self>) {
+        if self.mode_task.is_some()
+            || !self.active_state().is_some_and(|state| {
+                !state.stopped
+                    && !state.historical_replay.is_catching_up()
+                    && state.needs_viewport(Instant::now())
+            })
+        {
+            return;
+        }
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        let generation = self.generation;
+        let resize_epoch = self.active_state().unwrap().resize_sync.epoch();
+        let client = self.client.clone();
+        self.mode_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.read_current_viewport(&session_id) })
+                .await;
+            let _ = this.update(cx, |terminal, cx| {
+                if terminal.generation != generation {
+                    return;
+                }
+                if let Some(state) = terminal.active_state_mut()
+                    && !state.stopped
+                    && state.resize_sync.epoch() == resize_epoch
+                    && let Ok(viewport) = result
+                {
+                    let restored = state.restore_empty_gap(&viewport);
+                    // A complete journal has fresher parser-owned modes.
+                    // Only a truncated stream needs the Host's missing prefix.
+                    if state.modes_from_snapshot {
+                        state.input_modes = viewport.input_modes;
+                    }
+                    state.modes_synced_at = Some(Instant::now());
+                    state.viewport_dirty = false;
+                    if restored {
+                        cx.notify();
+                    }
+                }
+            });
+            // Also bounds retry cadence when the socket is absent or stale.
+            cx.background_executor().timer(MODE_RESYNC_INTERVAL).await;
+            let _ = this.update(cx, |terminal, _| {
+                if terminal.generation == generation {
+                    terminal.mode_task = None;
+                }
+            });
+        }));
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let poll_task = cx.spawn(async move |this, cx| {
             let mut error_backoff_ms = 0_u64;
@@ -744,8 +837,6 @@ impl WorkersTerminal {
                     generation,
                     client,
                     can_consume_output,
-                    geometry,
-                    viewport_dirty,
                     resize_epoch,
                     visible,
                     catching_up,
@@ -762,8 +853,6 @@ impl WorkersTerminal {
                             state.historical_replay.can_consume_output()
                                 && !state.resize_sync.pending()
                         }),
-                        terminal.geometry,
-                        state.is_some_and(|state| state.needs_viewport(Instant::now())),
                         state.map_or(0, |state| state.resize_sync.epoch()),
                         is_visible(terminal.last_prepaint, Instant::now()),
                         state.is_some_and(|state| state.historical_replay.is_catching_up()),
@@ -816,30 +905,15 @@ impl WorkersTerminal {
                         } else {
                             0
                         };
-                        let output =
-                            client.read_output(&request_session_id, Some(offset), wait_ms)?;
-                        let refresh = terminal_refresh(
-                            viewport_dirty,
-                            output.truncated,
-                            !output.data.is_empty(),
-                        );
-                        let viewport = if refresh == TerminalRefresh::Snapshot {
-                            let geometry = geometry.expect("historical replay waits for geometry");
-                            Some(client.read_viewport(
-                                &request_session_id,
-                                geometry.cols,
-                                geometry.rows,
-                            )?)
-                        } else {
-                            None
-                        };
-                        Ok::<_, zeron_workers_unpeel::WorkersError>((output, viewport, marks))
+                        let page =
+                            client.read_terminal_output(&request_session_id, offset, wait_ms)?;
+                        Ok::<_, zeron_workers_unpeel::WorkersError>((page, marks))
                     })
                     .await;
                 let failed = result.is_err();
                 let had_data = result
                     .as_ref()
-                    .is_ok_and(|(output, _, _)| !output.data.is_empty());
+                    .is_ok_and(|(page, _)| !page.output.data.is_empty());
                 if this
                     .update(cx, |terminal, cx| {
                         if terminal.generation != generation
@@ -854,23 +928,33 @@ impl WorkersTerminal {
                             return;
                         }
                         match result {
-                            Ok((output, viewport, marks)) => {
+                            Ok((page, marks)) => {
                                 if let Some(marks) = marks {
                                     state.geometry_marks = Some(marks);
                                 }
                                 let was_catching_up = state.historical_replay.is_catching_up();
-                                let had_data = state.apply_refresh(output, viewport);
+                                let status_changed =
+                                    page.output.truncated || state.resize_error.is_some();
+                                state
+                                    .historical_replay
+                                    .backlog_end
+                                    .get_or_insert(page.available_end);
+                                let had_data = state.apply_refresh(page.output, None);
                                 let catching_up = state.historical_replay.is_catching_up();
                                 state.resize_error = None;
+                                let status_changed = status_changed || terminal.error.is_some();
                                 terminal.error = None;
+                                // Mode resync is not a visible change: a missing
+                                // Host socket must not repaint an idle terminal.
                                 if should_paint(
                                     was_catching_up,
                                     catching_up,
                                     had_data,
-                                    viewport_dirty,
+                                    status_changed,
                                 ) {
                                     cx.notify();
                                 }
+                                terminal.sync_input_modes(cx);
                             }
                             Err(error) => {
                                 state.observe_failure();
@@ -916,6 +1000,7 @@ impl WorkersTerminal {
             focus_pending: false,
             coalescer: InputCoalescer::default(),
             flush_task: None,
+            mode_task: None,
             scrollbar_drag: None,
             terminal_hovered: false,
             scrollbar_hovered: false,
@@ -932,6 +1017,7 @@ impl WorkersTerminal {
         // so typing/pasting immediately before a switch is not discarded.
         self.flush_input(cx);
         self.flush_task = None;
+        self.mode_task = None;
 
         self.focus_pending = session_id.is_some();
         self.session_id = session_id.clone();
@@ -1033,10 +1119,9 @@ impl WorkersTerminal {
                 state.emulator.resize(cols, geometry.rows);
             }
         }
-        if self
-            .active_state()
-            .is_some_and(|state| state.resize_sync.pending() || state.stopped)
-        {
+        if self.active_state().is_some_and(|state| {
+            state.resize_sync.pending() || state.stopped || state.historical_replay.is_catching_up()
+        }) {
             return;
         }
         let Some(session_id) = self.session_id.clone() else {
@@ -1138,6 +1223,12 @@ impl WorkersTerminal {
         .detach();
     }
 
+    /// Read-only progress probe for the isolated native fixture. Never starts a Host.
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_output_offset(&self) -> u64 {
+        self.active_state().map_or(0, |state| state.offset)
+    }
+
     pub fn active_grid_snapshot(&self) -> Option<GridSnapshot> {
         let state = self.active_state()?;
         if state.historical_replay.is_catching_up() {
@@ -1175,6 +1266,9 @@ impl WorkersTerminal {
     }
 
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if self.active_state().is_some_and(|state| state.stopped) {
+            return;
+        }
         if self.session_id.is_none() || !self.coalescer.push(bytes) {
             return;
         }
@@ -1527,7 +1621,7 @@ impl WorkersTerminal {
         window.focus(&self.focus_handle, cx);
         let (input_modes, mouse_protocol) = self.active_state().map_or(
             (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
-            |state| (state.input_modes, state.mouse_protocol),
+            |state| (state.mouse_input_modes(), state.mouse_protocol),
         );
         if input_modes.known && input_modes.mouse_reporting {
             let Some(hit) = self.cell_hit_at(event.position) else {
@@ -1600,7 +1694,7 @@ impl WorkersTerminal {
         }
         let (input_modes, mouse_protocol) = self.active_state().map_or(
             (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
-            |state| (state.input_modes, state.mouse_protocol),
+            |state| (state.mouse_input_modes(), state.mouse_protocol),
         );
         if input_modes.known && input_modes.mouse_reporting {
             let kind = match event.pressed_button {
@@ -1654,7 +1748,7 @@ impl WorkersTerminal {
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let (input_modes, mouse_protocol) = self.active_state().map_or(
             (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
-            |state| (state.input_modes, state.mouse_protocol),
+            |state| (state.mouse_input_modes(), state.mouse_protocol),
         );
         if input_modes.known && input_modes.mouse_reporting {
             if let Some(hit) = self.cell_hit_at(event.position) {
@@ -1680,7 +1774,9 @@ impl WorkersTerminal {
         let line_height = crate::theme::Theme::of(cx).terminal_font_size
             * super::super::terminal::view::TERM_LINE_HEIGHT
             / super::super::terminal::view::TERM_FONT_SIZE;
-        if self.scroll_horizontally(event, line_height, cx) {
+        let local_history =
+            event.modifiers.shift && self.active_state().is_some_and(|state| !state.stopped);
+        if !local_history && self.scroll_horizontally(event, line_height, cx) {
             return;
         }
         let Some(hit) = self.cell_hit_at(event.position) else {
@@ -1695,13 +1791,7 @@ impl WorkersTerminal {
         if steps == 0 {
             return;
         }
-        let action = scroll_action(
-            state.input_modes,
-            state.mouse_protocol,
-            steps,
-            hit.col,
-            hit.row,
-        );
+        let action = state.wheel_action(steps, hit.col, hit.row, event.modifiers.shift);
         match action {
             TerminalScrollAction::Write(bytes) => self.queue_input(&bytes, cx),
             TerminalScrollAction::Scrollback => self.scroll(steps, cx),
@@ -1778,6 +1868,9 @@ impl Render for WorkersTerminal {
         let catching_up = self
             .active_state()
             .is_some_and(|state| state.historical_replay.is_catching_up());
+        let history_unavailable = self
+            .active_state()
+            .is_some_and(|state| state.history_unavailable);
         let scrollbar = (!catching_up)
             .then(|| self.render_scrollbar(&theme, cx))
             .flatten();
@@ -1788,6 +1881,8 @@ impl Render for WorkersTerminal {
             .id("workers-terminal")
             .role(gpui::Role::Terminal)
             .size_full()
+            .flex()
+            .flex_col()
             .relative()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
@@ -1798,36 +1893,54 @@ impl Render for WorkersTerminal {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(|this, event, _, cx| this.on_scroll_wheel(event, cx)))
-            .child(TerminalElement::new_workers(cx.entity(), focused))
-            .children(scrollbar)
-            .children(jump_to_bottom)
-            .when(catching_up, |el| {
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(TerminalElement::new_workers(cx.entity(), focused))
+                    .children(scrollbar)
+                    .children(jump_to_bottom)
+                    .when(catching_up, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child("Loading history…"),
+                        )
+                    })
+                    .when_some(error, |el, error| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(8.0))
+                                .right(px(8.0))
+                                .max_w(px(420.0))
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(7.0))
+                                .bg(crate::theme::ink(0.82))
+                                .text_size(px(10.0))
+                                .text_color(crate::theme::Theme::of(cx).danger_muted)
+                                .child(format!("Worker terminal disconnected: {error}")),
+                        )
+                    }),
+            )
+            .when(history_unavailable && !catching_up, |el| {
+                // Reserve space instead of covering the earliest retained row.
                 el.child(
                     div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_faint)
-                        .child("Loading history…"),
-                )
-            })
-            .when_some(error, |el, error| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(px(8.0))
-                        .right(px(8.0))
-                        .max_w(px(420.0))
+                        .flex_shrink_0()
                         .px(px(8.0))
-                        .py(px(5.0))
-                        .rounded(px(7.0))
-                        .bg(crate::theme::ink(0.82))
-                        .text_size(px(10.0))
-                        .text_color(crate::theme::Theme::of(cx).danger_muted)
-                        .child(format!("Worker terminal disconnected: {error}")),
+                        .py(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Earlier terminal output is no longer retained."),
                 )
             })
     }
@@ -1847,10 +1960,9 @@ mod tests {
 
     use super::{
         Emulator, HistoricalReplay, MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync,
-        RetainedWorkerTerminals, TerminalRefresh, TerminalScrollAction, WorkersGeometryMark,
-        WorkersTerminalView, feed_at_recorded_geometry, is_expected_session_exit,
-        mouse_report_bytes, scroll_action, should_paint, terminal_refresh,
-        viewport_has_tui_jump_hint,
+        RetainedWorkerTerminals, TerminalScrollAction, WorkersGeometryMark, WorkersTerminalView,
+        feed_at_recorded_geometry, is_expected_session_exit, mouse_report_bytes, scroll_action,
+        should_paint, viewport_has_tui_jump_hint,
     };
 
     fn screen(emulator: &Emulator) -> Vec<String> {
@@ -1867,6 +1979,232 @@ mod tests {
         out.extend_from_slice(b"\r\nold tail");
         out.extend_from_slice(b"\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\rfresh");
         out
+    }
+
+    #[test]
+    fn retained_large_replay_preserves_start_while_live_output_arrives() {
+        let mut state = super::WorkersTerminalState::new(80, 24);
+        state.historical_replay.start();
+        state.historical_replay.observe_geometry();
+        let floor = 4096;
+        state.geometry_marks = Some(vec![WorkersGeometryMark {
+            offset: floor,
+            cols: 80,
+            rows: 24,
+        }]);
+        let mut journal = b"EARLIEST AVAILABLE\r\n".to_vec();
+        for row in 0..512 {
+            // Large byte history without exceeding the existing 10k-line cap.
+            // Split VT sequences across pages just as the real reader does.
+            journal.extend(b"\x1b[0m".repeat(4096));
+            journal.extend(format!("retained row {row}\r\n").bytes());
+        }
+        let boundary = floor + journal.len() as u64;
+        state.historical_replay.backlog_end = Some(boundary);
+        let mut offset = floor;
+        for data in journal.chunks(256 * 1024) {
+            let end = offset + data.len() as u64;
+            state.apply_refresh(
+                zeron_workers_unpeel::WorkersOutput {
+                    offset,
+                    next_offset: end,
+                    data: data.to_vec(),
+                    truncated: offset == floor,
+                },
+                None,
+            );
+            assert_eq!(state.historical_replay.is_catching_up(), end < boundary);
+            offset = end;
+        }
+        assert!(state.history_unavailable);
+        // The missing prefix's live modes may include mouse reporting.
+        state.input_modes = WorkersViewportInputModes {
+            known: true,
+            mouse_reporting: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.wheel_action(1000, 0, 0, false),
+            TerminalScrollAction::Write(_)
+        ));
+        assert!(matches!(
+            state.wheel_action(1000, 0, 0, true),
+            TerminalScrollAction::Scrollback
+        ));
+        state.emulator.scroll(100_000);
+        assert_eq!(screen(&state.emulator)[0], "EARLIEST AVAILABLE");
+        let anchor = screen(&state.emulator);
+        let live = b"live row after opening boundary\r\n";
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset,
+                next_offset: offset + live.len() as u64,
+                data: live.to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+        assert_eq!(
+            screen(&state.emulator),
+            anchor,
+            "new output must not move the reader"
+        );
+        assert!(matches!(
+            state.wheel_action(1, 0, 0, false),
+            TerminalScrollAction::Scrollback
+        ));
+        assert!(!state.mouse_input_modes().mouse_reporting);
+        state.emulator.scroll(-100_000);
+        assert!(
+            screen(&state.emulator)
+                .iter()
+                .any(|row| row.contains("live row"))
+        );
+        assert!(state.mouse_input_modes().mouse_reporting);
+    }
+
+    #[test]
+    fn stopped_tui_mouse_and_alternate_modes_never_capture_history_navigation() {
+        let mut state = super::WorkersTerminalState::new(40, 6);
+        state
+            .emulator
+            .feed(b"primary history\r\n\x1b[?1049h\x1b[?1000hfull screen footer");
+        state.input_modes = WorkersViewportInputModes {
+            known: true,
+            mouse_reporting: true,
+            alternate_screen: true,
+            mouse_alternate_scroll: true,
+            application_cursor: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.wheel_action(1, 0, 0, false),
+            TerminalScrollAction::Write(_)
+        ));
+        state.stopped = true;
+        // set_stopped must work even before the next refresh clears modes.
+        assert!(matches!(
+            state.wheel_action(1, 0, 0, false),
+            TerminalScrollAction::Scrollback
+        ));
+        assert!(!state.mouse_input_modes().mouse_reporting);
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 0,
+                next_offset: 0,
+                data: Vec::new(),
+                truncated: false,
+            },
+            None,
+        );
+        assert!(!state.input_modes.alternate_screen);
+        assert!(!state.emulator.alternate_screen_mode());
+        let needs_snapshot = state.needs_viewport(std::time::Instant::now());
+        assert!(
+            !needs_snapshot,
+            "a stopped TUI cannot change its input modes"
+        );
+        assert!(!super::should_paint(false, false, false, needs_snapshot));
+        state.stopped = false;
+        assert!(state.needs_viewport(std::time::Instant::now()));
+    }
+
+    #[gpui::test]
+    fn shift_wheel_reads_local_history_while_mouse_reporting_is_live(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.update(|cx| cx.set_global(crate::theme::Theme::default()));
+        let terminal = cx.new(super::WorkersTerminal::new);
+        terminal.update(cx, |terminal, cx| {
+            terminal
+                .terminals
+                .select(Some("wheel-fixture".into()), 20, 6);
+            // No transport session is selected: a regression cannot write to a Host.
+            terminal.on_grid_metrics(
+                crate::terminal::panel::GridGeometry {
+                    bounds: gpui::Bounds::new(
+                        gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                        gpui::size(gpui::px(160.0), gpui::px(96.0)),
+                    ),
+                    origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                    cell_w: 8.0,
+                    line_h: 16.0,
+                    cols: 20,
+                    rows: 6,
+                },
+                cx,
+            );
+            let state = terminal.active_state_mut().unwrap();
+            let mut data = b"\x1b[?1000hSTART\r\n".to_vec();
+            for row in 0..40 {
+                data.extend(format!("row {row}\r\n").bytes());
+            }
+            state.apply_refresh(
+                zeron_workers_unpeel::WorkersOutput {
+                    offset: 0,
+                    next_offset: data.len() as u64,
+                    data,
+                    truncated: false,
+                },
+                None,
+            );
+            terminal.on_scroll_wheel(
+                &gpui::ScrollWheelEvent {
+                    position: gpui::point(gpui::px(20.0), gpui::px(20.0)),
+                    delta: gpui::ScrollDelta::Lines(gpui::point(0.0, 1000.0)),
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                cx,
+            );
+            let state = terminal.active_state().unwrap();
+            assert_eq!(screen(&state.emulator)[0], "START");
+            assert!(state.emulator.display_offset() > 0);
+            assert!(terminal.coalescer.take().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn initial_history_does_not_start_host_resize(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let terminal = cx.new(super::WorkersTerminal::new);
+        terminal.update(cx, |terminal, cx| {
+            terminal
+                .terminals
+                .select(Some("initial-history-fixture".into()), 80, 24);
+            terminal.session_id = Some("initial-history-fixture".into());
+            terminal
+                .active_state_mut()
+                .unwrap()
+                .historical_replay
+                .start();
+            terminal.on_grid_metrics(
+                crate::terminal::panel::GridGeometry {
+                    bounds: gpui::Bounds::default(),
+                    origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                    cell_w: 8.0,
+                    line_h: 16.0,
+                    cols: 40,
+                    rows: 10,
+                },
+                cx,
+            );
+            let state = terminal.active_state().unwrap();
+            assert!(state.historical_replay.can_consume_output());
+            assert!(!state.resize_sync.pending());
+            assert!(
+                terminal
+                    .remote_grids
+                    .record_resize("initial-history-fixture", 40, 10),
+                "no remote grid was recorded during catch-up"
+            );
+            // No poll can reach even the synthetic session after this update.
+            terminal.session_id = None;
+        });
     }
 
     #[test]
@@ -2173,6 +2511,128 @@ mod tests {
     }
 
     #[test]
+    fn empty_truncated_gap_restores_only_a_matching_host_screen() {
+        let mut state = super::WorkersTerminalState::new(40, 4);
+        state.emulator.feed(b"LAST KNOWN FRAME");
+        let gap = |offset| zeron_workers_unpeel::WorkersOutput {
+            offset,
+            next_offset: offset,
+            data: Vec::new(),
+            truncated: true,
+        };
+        let mut viewport = zeron_workers_unpeel::WorkersViewport {
+            output_offset: 65,
+            cols: 80,
+            rows: 4,
+            ansi: b"\x1b[H\x1b[2JRESTORED SCREEN AT THE HOST ORIGINAL WIDTH (NOT PANEL WIDTH)"
+                .to_vec(),
+            input_modes: WorkersViewportInputModes::default(),
+        };
+        state.apply_refresh(gap(64), None);
+        assert_eq!(screen(&state.emulator)[0], "LAST KNOWN FRAME");
+        assert!(
+            !state.restore_empty_gap(&viewport),
+            "a newer snapshot would duplicate unread bytes"
+        );
+        viewport.output_offset = 64;
+        assert!(state.restore_empty_gap(&viewport));
+        assert_eq!(
+            screen(&state.emulator)[0],
+            "RESTORED SCREEN AT THE HOST ORIGINAL WIDTH (NOT PANEL WIDTH)"
+        );
+        state.apply_refresh(gap(80), None);
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 80,
+                next_offset: 85,
+                data: b"FRESH".to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+        viewport.output_offset = 80;
+        assert!(
+            !state.restore_empty_gap(&viewport),
+            "a late snapshot cannot overwrite journal output"
+        );
+        assert!(screen(&state.emulator)[0].ends_with("FRESH"));
+        viewport.output_offset = 85;
+        viewport.ansi = b"\x1b[H\x1b[2JCURRENT HOST SCREEN\r\nFRESH".to_vec();
+        assert!(
+            state.restore_empty_gap(&viewport),
+            "journal progress must not cancel pending screen recovery"
+        );
+        assert_eq!(screen(&state.emulator)[0], "CURRENT HOST SCREEN");
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 85,
+                next_offset: 90,
+                data: b"-NEXT".to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+        assert_eq!(screen(&state.emulator)[1], "FRESH-NEXT");
+    }
+
+    #[test]
+    fn host_screen_recovery_resets_stale_modes_without_losing_primary_history() {
+        let mut state = super::WorkersTerminalState::new(40, 4);
+        state
+            .emulator
+            .feed(b"PRIMARY HISTORY\r\none\r\ntwo\r\nthree\r\n");
+        state
+            .emulator
+            .feed(b"\x1b[?1049h\x1b[2;3r\x1b[?6h\x1b[4h\x1b[?7lOLD ALT FRAME");
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 64,
+                next_offset: 64,
+                data: Vec::new(),
+                truncated: true,
+            },
+            None,
+        );
+        let viewport = zeron_workers_unpeel::WorkersViewport {
+            output_offset: 64,
+            cols: 40,
+            rows: 4,
+            ansi: b"\x1b[2J\x1b[H\x1b[?7lHOST SCREEN\r\nROW TWO\x1b[4;1HROW FOUR\x1b[?7h".to_vec(),
+            input_modes: WorkersViewportInputModes::default(),
+        };
+        assert!(state.restore_empty_gap(&viewport));
+        assert!(!state.emulator.alternate_screen_mode());
+        assert_eq!(screen(&state.emulator)[0], "HOST SCREEN");
+        assert_eq!(screen(&state.emulator)[3], "ROW FOUR");
+        let edit = b"\x1b[1;1HNEW";
+        let after_edit = 64 + edit.len() as u64;
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 64,
+                next_offset: after_edit,
+                data: edit.to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+        assert_eq!(screen(&state.emulator)[0], "NEWT SCREEN");
+        let tail = b"\x1b[4;9H\r\nNEXT";
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: after_edit,
+                next_offset: after_edit + tail.len() as u64,
+                data: tail.to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+        assert_eq!(screen(&state.emulator)[0], "ROW TWO");
+        assert_eq!(screen(&state.emulator)[3], "NEXT");
+        state.emulator.scroll(10_000);
+        assert_eq!(screen(&state.emulator)[0], "PRIMARY HISTORY");
+    }
+
+    #[test]
     fn truncated_rebase_preserves_the_last_known_mouse_protocol() {
         let mut state = super::WorkersTerminalState::new(8, 2);
         state.apply_refresh(
@@ -2291,23 +2751,6 @@ mod tests {
 
         assert_eq!(view_drops.load(Ordering::SeqCst), 1);
         assert_eq!(lifecycle_mutations.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn terminal_refresh_reuses_the_existing_emulator_for_incremental_output() {
-        assert_eq!(
-            terminal_refresh(false, false, true),
-            TerminalRefresh::Incremental
-        );
-        assert_eq!(terminal_refresh(false, false, false), TerminalRefresh::Idle);
-        assert_eq!(
-            terminal_refresh(true, false, true),
-            TerminalRefresh::Snapshot
-        );
-        assert_eq!(
-            terminal_refresh(false, true, true),
-            TerminalRefresh::Snapshot
-        );
     }
 
     #[test]

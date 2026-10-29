@@ -7672,11 +7672,18 @@ impl Composer {
     /// The failure notice this draft renders. Chat-scoped failures render
     /// only under their own chat; a global failure (no key) renders everywhere.
     pub(crate) fn visible_failure(&self) -> Option<SharedString> {
-        self.failure.clone().filter(|_| {
-            self.failure_key
-                .as_ref()
-                .is_none_or(|key| *key == self.current_key)
-        })
+        self.failure
+            .as_ref()
+            .filter(|_| {
+                self.failure_key
+                    .as_ref()
+                    .is_none_or(|key| *key == self.current_key)
+            })
+            .map(|message| {
+                zeron_proto::run_errors::provider_error_message(message)
+                    .into_owned()
+                    .into()
+            })
     }
 
     /// Show a dismissable failure chip for the current draft's session.
@@ -13376,6 +13383,26 @@ mod attachment_chip_tests;
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn provider_limit_composer_failure_is_readable_and_stays_chat_scoped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            let raw = r#"harness protocol error: OMP: 429 {"error":{"type":"rate_limit_error"},"request_id":"req_synthetic"} retry-after-ms=8564000"#;
+            composer.show_error(raw, cx);
+            assert_eq!(
+                composer.visible_failure().as_deref(),
+                Some("Provider limit reached. Retry delay reported: 2h 23m.")
+            );
+            assert_eq!(composer.failure().map(|value| value.as_ref()), Some(raw));
+            composer.current_key = "another-chat".into();
+            assert!(composer.visible_failure().is_none());
+            composer.show_error("Harness exited with status 1", cx);
+            assert_eq!(composer.visible_failure().as_deref(), Some("Harness exited with status 1"));
+        });
+    }
 
     #[gpui::test]
     fn shift_backspace_deletes_text_and_selection_in_all_input_contexts(

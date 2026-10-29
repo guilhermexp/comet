@@ -9067,13 +9067,14 @@ impl Transcript {
                     .into_any_element()
             }
             RowKind::ErrorChip { message } => {
-                // A refusal that signing in fixes (signed out, out of usage)
-                // carries a "Log in" for this chat's provider.
+                // Only authentication failures offer login for this Chat.
                 let problem = zeron_proto::run_errors::provider_problem(message);
                 let sign_in = self
                     .chat_id
                     .clone()
-                    .filter(|_| problem.is_some())
+                    .filter(|_| {
+                        problem == Some(zeron_proto::run_errors::ProviderProblem::SignedOut)
+                    })
                     .map(|chat_id| {
                         let chat_id = chat_id.to_string();
                         cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
@@ -12740,9 +12741,8 @@ fn switch_marker(
 }
 
 /// The transcript ErrorChip (fork treatment, see the doc above
-/// `notice_divider`). A refusal that signing in fixes (signed out, out of
-/// usage) says so in the label and carries a "Log in" button for that chat's
-/// provider under the message (upstream f30a8641b, ported onto the fork card).
+/// `notice_divider`). Only signed-out errors carry a "Log in" button; quota
+/// errors share the composer's human summary while retaining stored diagnostics.
 fn error_chip(
     message: SharedString,
     problem: Option<zeron_proto::run_errors::ProviderProblem>,
@@ -12750,6 +12750,9 @@ fn error_chip(
     theme: &Theme,
 ) -> AnyElement {
     use zeron_proto::run_errors::ProviderProblem;
+    let message: SharedString = zeron_proto::run_errors::provider_error_message(&message)
+        .into_owned()
+        .into();
     let label = match problem {
         Some(ProviderProblem::SignedOut) => "Signed out",
         Some(ProviderProblem::LimitReached) => "Limit reached",
@@ -12757,26 +12760,29 @@ fn error_chip(
     };
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
-    let button = sign_in.map(|on_click| {
-        // The app's button metrics (popover::btn_*), compact for the card,
-        // tinted in the card's red rather than a solid fill.
-        div()
-            .id("error-sign-in")
-            .flex_none()
-            .px(px(10.0))
-            .py(px(4.0))
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
-            .bg(danger.opacity(0.14))
-            .text_color(theme.danger_muted)
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(crate::typography::ui_rems(12.0))
-            .cursor_pointer()
-            .hover(move |s| s.bg(danger.opacity(0.22)))
-            .on_click(on_click)
-            .child(problem.map_or("Log in", ProviderProblem::action_label))
-    });
+    let button = sign_in
+        .filter(|_| problem == Some(ProviderProblem::SignedOut))
+        .map(|on_click| {
+            // The app's button metrics (popover::btn_*), compact for the card,
+            // tinted in the card's red rather than a solid fill.
+            div()
+                .id("error-sign-in")
+                .debug_selector(|| "error-sign-in".into())
+                .flex_none()
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .bg(danger.opacity(0.14))
+                .text_color(theme.danger_muted)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(crate::typography::ui_rems(12.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(danger.opacity(0.22)))
+                .on_click(on_click)
+                .child(problem.map_or("Log in", ProviderProblem::action_label))
+        });
     div()
         .py(px(4.0))
         .w_full()
@@ -12830,6 +12836,32 @@ fn error_chip(
                         }),
                 ),
         )
+        .into_any_element()
+}
+
+/// Isolated native QA of the production error cards, without provider bootstrap.
+#[cfg(feature = "appshots-fixture")]
+pub fn provider_limit_fixture(theme: &Theme) -> AnyElement {
+    let quota: SharedString =
+        r#"429 {"error":{"type":"rate_limit_error"},"request_id":"synthetic"} retry-after-ms=8564000"#
+            .into();
+    let auth: SharedString = "Authentication failed — sign in to Claude again.".into();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(20.0))
+        .child(error_chip(
+            quota.clone(),
+            zeron_proto::run_errors::provider_problem(&quota),
+            Some(|_: &gpui::ClickEvent, _: &mut Window, _: &mut gpui::App| {}),
+            theme,
+        ))
+        .child(error_chip(
+            auth.clone(),
+            zeron_proto::run_errors::provider_problem(&auth),
+            Some(|_: &gpui::ClickEvent, _: &mut Window, _: &mut gpui::App| {}),
+            theme,
+        ))
         .into_any_element()
 }
 
@@ -20266,6 +20298,67 @@ mod tests {
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
     }
+    #[gpui::test]
+    fn provider_limit_card_keeps_login_only_for_authentication(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+        use std::cell::Cell;
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        struct Fixture {
+            message: SharedString,
+            clicks: Rc<Cell<usize>>,
+        }
+        impl Render for Fixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                div().w(px(600.0)).child(error_chip(
+                    self.message.clone(),
+                    zeron_proto::run_errors::provider_problem(&self.message),
+                    Some(
+                        move |_: &gpui::ClickEvent, _: &mut Window, _: &mut gpui::App| {
+                            clicks.set(clicks.get() + 1);
+                        },
+                    ),
+                    Theme::of(cx),
+                ))
+            }
+        }
+        let clicks = Rc::new(Cell::new(0));
+        let (view, window) = cx.add_window_view(|_, _| Fixture {
+            message: r#"429 {"error":{"type":"rate_limit_error"}} retry-after-ms=8564000"#.into(),
+            clicks: clicks.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        assert!(window.debug_bounds("error-sign-in").is_none());
+        assert_eq!(clicks.get(), 0);
+
+        window.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.message = "Authentication failed — sign in to Claude again.".into();
+                cx.notify();
+            });
+            window.draw(cx).clear();
+        });
+        let button = window
+            .debug_bounds("error-sign-in")
+            .expect("auth offers login");
+        assert_eq!(clicks.get(), 0, "rendering never starts login");
+        window.simulate_click(button.center(), Modifiers::default());
+        assert_eq!(clicks.get(), 1);
+
+        window.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.message = "Harness exited with status 1".into();
+                cx.notify();
+            });
+            window.draw(cx).clear();
+        });
+        assert!(window.debug_bounds("error-sign-in").is_none());
+    }
+
     #[test]
     fn adoption_deduplicates_errors_per_entry_without_losing_distinct_errors() {
         let parts = ["boom", "boom", "other"]

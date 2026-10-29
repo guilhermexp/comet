@@ -4242,7 +4242,33 @@ pub fn read_output_chunk(
     max_bytes: Option<usize>,
     tail_bytes: Option<usize>,
 ) -> Result<SessionOutputChunk, String> {
-    read_output_chunk_with_retries(session_id, offset, max_bytes, tail_bytes, 3)
+    read_output_chunk_with_retries(session_id, offset, max_bytes, tail_bytes, 3, true)
+}
+
+/// Passive local terminal recovery: page from the earliest retained byte when
+/// the cursor aged out, without pinging the Host or changing manifest health.
+/// Tail selection spans the retained journal; allocation remains page-bounded.
+pub fn read_retained_output_chunk(
+    session_id: &str,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<SessionOutputChunk, String> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+    {
+        return Err("Invalid session id".into());
+    }
+    read_output_chunk_with_retries(
+        session_id,
+        Some(offset),
+        Some(max_bytes.clamp(1, 256 * 1024)),
+        Some(usize::MAX),
+        3,
+        false,
+    )
 }
 
 fn read_output_chunk_with_retries(
@@ -4251,12 +4277,17 @@ fn read_output_chunk_with_retries(
     max_bytes: Option<usize>,
     tail_bytes: Option<usize>,
     retries: u8,
+    probe_health: bool,
 ) -> Result<SessionOutputChunk, String> {
     let path = output_path(session_id);
     let exists = path.exists();
 
     if !exists {
-        let manifest = refresh_manifest_health_cached(session_id, MANIFEST_HEALTH_CACHE_TTL_MS);
+        let manifest = if probe_health {
+            refresh_manifest_health_cached(session_id, MANIFEST_HEALTH_CACHE_TTL_MS)
+        } else {
+            load_manifest(session_id)
+        };
         let exited = manifest
             .as_ref()
             .map(|value| value.state == HostedSessionState::Exited)
@@ -4312,7 +4343,11 @@ fn read_output_chunk_with_retries(
             .map_err(|e| format!("Failed to read output log: {e}"))?;
     }
 
-    let manifest = refresh_manifest_health_cached(session_id, MANIFEST_HEALTH_CACHE_TTL_MS);
+    let manifest = if probe_health {
+        refresh_manifest_health_cached(session_id, MANIFEST_HEALTH_CACHE_TTL_MS)
+    } else {
+        load_manifest(session_id)
+    };
     let exited = manifest
         .as_ref()
         .map(|value| value.state == HostedSessionState::Exited)
@@ -4334,6 +4369,7 @@ fn read_output_chunk_with_retries(
                 max_bytes,
                 tail_bytes,
                 retries - 1,
+                probe_health,
             );
         }
         data.clear();

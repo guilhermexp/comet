@@ -925,6 +925,7 @@ exist.
 
 | Layer / path | Tier | Verification |
 |---|---|---|
+| `session_host::read_retained_output_chunk` — bounded passive recovery, aged cursors and retained floors | integration | Comet downstream: `cargo test -p zeron-workers-unpeel --test terminal_history` |
 | `runtimes/setup_conformance_tests.rs`: ten executable shell reporters and shared transport | integration | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib setup_conformance` |
 | OMP/Pi/Amp/OpenCode adapter and callback contracts; Prime native ownership, framing, cancellation and resume | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib` |
 | Prime native lifecycle through Comet Host/journal, same-PTY resume and private daemon teardown | integration | Manual official 0.10 CLI probe with private HOME/provider/XDG, hook root distinct from state, managed and external saved history, real Host input/resume/stop APIs and loopback model; record actual generations/provider UUID, never a hosted-model/production-profile substitute |
@@ -1013,3 +1014,14 @@ validated launch columns/rows, including resumed Hosts. A hard-coded 80×24
 emulator corrupts output from a 120×40 PTY before any desktop attach. Text-only
 controllers use `request_current_viewport_snapshot`; a virtual resized replay
 cannot substitute for the live grid when cursor movement depends on wrapping.
+
+### Passive retained-journal consumer (Comet fork)
+
+`session_host::read_retained_output_chunk` is the local terminal recovery API:
+page at most 256 KiB from the earliest retained byte for an aged cursor,
+reusing the existing three bounded retention-race retries. It only loads
+manifest metadata; it must never ping the Host or mutate manifest health.
+The generic tail reader keeps its existing health/diagnostic semantics.
+Downstream consumer coverage is `crates/workers-unpeel/tests/terminal_history.rs`
+in the Comet workspace (integration); stopped/live VT navigation belongs to
+Comet's `crates/ui/src/workers/terminal.rs`, not the Host reader.

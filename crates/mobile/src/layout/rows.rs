@@ -95,8 +95,8 @@ pub(crate) struct Chip {
     pub text: PText,
 }
 
-/// An error, as a card: a red wash with lighter red text, and, when signing
-/// in fixes it (signed out, a usage limit), a button that starts that.
+/// An error, as a card: a red wash with lighter red text, and a sign-in
+/// button only when the error reports a missing or expired login.
 pub(crate) struct Notice {
     pub text: PText,
     pub action: Option<(&'static str, &'static str)>,
@@ -1133,6 +1133,7 @@ fn notice_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, message: &str) -> Ro
     let style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
     let lh = ctx.typo.px(lh);
     let action = zeron_proto::run_errors::provider_problem(message)
+        .filter(|problem| *problem == zeron_proto::run_errors::ProviderProblem::SignedOut)
         .map(|problem| ("sign-in", problem.action_label()));
     RowCore {
         key: row_key(&format!("{entry_id}#{part_id}")),

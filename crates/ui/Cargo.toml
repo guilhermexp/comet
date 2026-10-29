@@ -43,6 +43,14 @@ name = "windows-render-fixture"
 required-features = ["windows-render-fixture"]
 
 [[example]]
+name = "worker-terminal-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "provider-limit-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "appshots-fixture"
 required-features = ["appshots-fixture"]
 

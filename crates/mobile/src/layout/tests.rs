@@ -2273,7 +2273,7 @@ fn errors_render_as_cards_with_a_log_in_button_when_signing_in_fixes_them() {
     ];
     w.input = input;
     let frame = w.pass();
-    for (i, wants_button) in [(0, true), (1, true), (2, false)] {
+    for (i, wants_button) in [(0, true), (1, false), (2, false)] {
         let d = frame.display(i).unwrap();
         // The card: a red wash under lighter red text.
         assert!(

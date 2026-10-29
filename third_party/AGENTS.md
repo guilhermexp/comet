@@ -118,6 +118,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   `session_ops::write_session_input` (marker + lifecycle lock). `session_ops`
   segura o lifecycle lock, espera o manifest `exited` e só então grava Archive.
   O Archive manual permanece sem precondição.
+- **Replay local Comet usa o reader passivo do Unpeel.** `read_retained_output_chunk` recupera desde o piso retido em páginas de até 256 KiB e mantém retry contra hole-punch concorrente, sem sondagem IPC de saúde. O endpoint diagnóstico `/mobile/output` mantém tail; a UI usa stat/long-poll local com a mesma cadência de 4 ms. Cobertura downstream em `crates/workers-unpeel/tests/terminal_history.rs`; proveniência em `unpeel-upstream.toml`.
 - **Os dois relógios do caminho de output andam juntos.**
   `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
   `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são

@@ -15,6 +15,7 @@ This crate owns `Cargo.toml` and `src/`. The Swift app and generated binding lif
 - `layout` emits platform-neutral row text, links, and widgets. The iOS transcript renderer consumes these values; keep labels, colors, preview references, and row geometry consistent with that contract.
 - Canonical attachment links are parsed and paired through `zeron-proto`. Use `pair_attachment_mentions` so each attachment path is consumed at most once; image chips retain their full upload path for preview activation, and unmatched uploads remain in the image or file strip.
 - Copy text uses the canonical attachment prompt projection, while display text may replace the links with chips.
+- Provider error cards expose a sign-in action only for `run_errors::ProviderProblem::SignedOut`, never for exhausted quota/rate limits.
 
 - `visual/` projects sandboxed Luau trees, assets, charts and GPU scenes/shaders into platform-neutral display lists with bounded input/layout/resource use. A display never carries two surfaces with one id, and never a static paint over the platform bitmap budget at the source pixel scale (16,384 px per side, 16 Mi px in all; `VisualPainter` on iOS mirrors it): both lay out a short danger-colored error instead. Transcript rows retain visual slot versions/heights; teardown belongs to the owning view. Math emits glyph primitives using six bundled faces, bounded source/layout/table area and cache budgets, retaining source copy text. UniFFI changes require regeneration and native iOS linking/testing; Linux tests do not certify UIKit.
 

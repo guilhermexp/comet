@@ -13933,7 +13933,7 @@ impl Shell {
             Indicator::Errored => strip
                 .text_color(theme.danger)
                 .child(div().min_w_0().truncate().child(SharedString::from(
-                    zeron_proto::view::run_failure_text(state.session_for(&chat_id)).to_owned(),
+                    zeron_proto::view::run_failure_text(state.session_for(&chat_id)).into_owned(),
                 )))
                 .into_any_element(),
             Indicator::None if sending => strip

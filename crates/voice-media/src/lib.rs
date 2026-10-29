@@ -287,6 +287,11 @@ const HELPER: &str = if cfg!(windows) {
 } else {
     "bin/codex-voice-host"
 };
+const CODEX: &str = if cfg!(windows) {
+    "bin/codex.exe"
+} else {
+    "bin/codex"
+};
 
 /// The helper shipped inside the device's standalone Codex installation (layout
 /// 1, version 0.159 or later), resolved from its `codex` executable. Zeron never
@@ -308,24 +313,93 @@ pub fn installed_helper(codex_executable: &Path) -> Result<PathBuf, VoiceRejecti
         .as_str()
         .and_then(|v| semver::Version::parse(v).ok())
         .ok_or(VoiceRejection::Unsupported)?;
-    if manifest["layoutVersion"] != 1 || version < semver::Version::new(0, 159, 0) {
+    if manifest["layoutVersion"] != 1
+        || version < semver::Version::new(0, 159, 0)
+        || manifest["variant"] != "codex"
+        || manifest["target"] != runtime_target()?
+        || manifest["entrypoint"] != CODEX
+        || manifest["resourcesDir"] != "codex-resources"
+    {
         return Err(VoiceRejection::Unsupported);
+    }
+    if binary != root.join(CODEX) || !binary.is_file() {
+        return Err(VoiceRejection::NativeRuntimeUnavailable);
     }
     let path = root.join("codex-resources/voice").join(HELPER);
     if path.canonicalize().ok().as_ref() != Some(&path) || !path.is_file() {
         return Err(VoiceRejection::NativeRuntimeUnavailable);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(&path)
+            .map_err(|_| VoiceRejection::NativeRuntimeUnavailable)?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
+        {
+            return Err(VoiceRejection::NativeRuntimeUnavailable);
+        }
+    }
     Ok(path)
 }
 
-/// Client media for a remote call: an explicit development runtime
-/// (`ZERON_VOICE_MEDIA_DIR`, see `scripts/package-voice-runtime.py`), otherwise
-/// this device's standalone Codex installation. Never reads Codex credentials.
+/// Local host and remote client media: an explicit development runtime
+/// (`ZERON_VOICE_MEDIA_DIR`, see `scripts/package-voice-runtime.py`), then the
+/// Chat CLI's package or an active official package in the device's Codex home.
+/// Never changes the Chat executable, reads credentials or searches plugin caches.
 pub fn media_helper(codex_executable: Option<&Path>) -> Result<PathBuf, VoiceRejection> {
-    if let Some(path) = std::env::var_os("ZERON_VOICE_MEDIA_DIR") {
-        return verify_runtime(Path::new(&path));
+    let override_dir = std::env::var_os("ZERON_VOICE_MEDIA_DIR").map(PathBuf::from);
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|home| PathBuf::from(home).join(".codex"))
+        });
+    media_helper_with(
+        codex_executable,
+        override_dir.as_deref(),
+        codex_home.as_deref(),
+    )
+}
+
+fn media_helper_with(
+    codex_executable: Option<&Path>,
+    override_dir: Option<&Path>,
+    codex_home: Option<&Path>,
+) -> Result<PathBuf, VoiceRejection> {
+    if let Some(path) = override_dir {
+        // An explicit but broken development runtime must never be ignored.
+        return verify_runtime(path);
     }
-    installed_helper(codex_executable.ok_or(VoiceRejection::NativeRuntimeUnavailable)?)
+    let mut rejection = VoiceRejection::NativeRuntimeUnavailable;
+    if let Some(executable) = codex_executable {
+        match installed_helper(executable) {
+            Ok(helper) => return Ok(helper),
+            Err(reason) => rejection = reason,
+        }
+    }
+    if let Some(home) = codex_home.filter(|home| home.is_absolute()) {
+        // Only active official installs; do not enumerate cached releases or
+        // borrow the Codex copy owned by a plugin. `current` may be a symlink.
+        for package in ["standalone", "app-server-daemon"] {
+            let executable = home
+                .join("packages")
+                .join(package)
+                .join("current")
+                .join(CODEX);
+            match installed_helper(&executable) {
+                Ok(helper) => return Ok(helper),
+                Err(reason) if rejection == VoiceRejection::NativeRuntimeUnavailable => {
+                    rejection = reason;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    Err(rejection)
 }
 
 pub const BUILD_COMMIT: &str = "a956835d020762cb2b570053af06f643a11c0ecc";
@@ -387,13 +461,27 @@ mod tests {
         std::fs::write(&codex, "").unwrap();
         std::fs::write(
             root.join("codex-package.json"),
-            json!({"layoutVersion":1,"version":version}).to_string(),
+            json!({
+                "layoutVersion":1,
+                "version":version,
+                "variant":"codex",
+                "target":runtime_target().unwrap(),
+                "entrypoint":if cfg!(windows) { "bin/codex.exe" } else { "bin/codex" },
+                "resourcesDir":"codex-resources",
+                "pathDir":"codex-path"
+            })
+            .to_string(),
         )
         .unwrap();
         if helper {
             let path = root.join("codex-resources/voice").join(HELPER);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, "").unwrap();
+            std::fs::write(&path, "").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
         codex
     }
@@ -422,6 +510,242 @@ mod tests {
         std::fs::remove_file(npm.join("codex-package.json")).unwrap();
         assert_eq!(
             installed_helper(&codex).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+    }
+
+    #[test]
+    fn media_resolution_empty_codex_home_uses_home() {
+        const CHILD_HOME: &str = "COMET_TEST_VOICE_EMPTY_CODEX_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let expected = PathBuf::from(home)
+                .join(".codex/packages/app-server-daemon/current/codex-resources/voice")
+                .join(HELPER);
+            assert_eq!(media_helper(None).unwrap(), expected);
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        codex_package(
+            &home.join(".codex/packages/app-server-daemon/current"),
+            "0.165.0",
+            true,
+        );
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::media_resolution_empty_codex_home_uses_home",
+            ])
+            .env(CHILD_HOME, &home)
+            .env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &home)
+            .env("CODEX_HOME", "")
+            .env_remove("ZERON_VOICE_MEDIA_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+    }
+
+    #[test]
+    fn media_resolution_finds_active_packages_without_changing_npm_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("codex-home");
+        let npm = root.join("node_modules/@openai/codex/bin/codex.js");
+        std::fs::create_dir_all(npm.parent().unwrap()).unwrap();
+        std::fs::write(&npm, "npm launcher, not a native package").unwrap();
+        for package in ["standalone", "app-server-daemon"] {
+            let package_root = home.join("packages").join(package).join("current");
+            codex_package(&package_root, "0.165.0", true);
+            let expected = package_root.join("codex-resources/voice").join(HELPER);
+            assert_eq!(
+                media_helper_with(Some(&npm), None, Some(&home)).unwrap(),
+                expected
+            );
+            // A remote media client may have no Chat CLI on this device at all.
+            assert_eq!(
+                media_helper_with(None, None, Some(&home)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                std::fs::read_to_string(&npm).unwrap(),
+                "npm launcher, not a native package"
+            );
+            std::fs::remove_dir_all(package_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn media_resolution_prefers_adjacent_then_standalone_then_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("codex-home");
+        let adjacent = root.join("chat-package");
+        let standalone = home.join("packages/standalone/current");
+        let daemon = home.join("packages/app-server-daemon/current");
+        let codex = codex_package(&adjacent, "0.160.0", true);
+        codex_package(&standalone, "0.165.0", true);
+        codex_package(&daemon, "0.166.0", true);
+        for preferred in [&adjacent, &standalone, &daemon] {
+            assert_eq!(
+                media_helper_with(Some(&codex), None, Some(&home)).unwrap(),
+                preferred.join("codex-resources/voice").join(HELPER)
+            );
+            std::fs::remove_dir_all(preferred).unwrap();
+        }
+        assert_eq!(
+            media_helper_with(Some(&codex), None, Some(&home)).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+    }
+
+    #[test]
+    fn media_resolution_does_not_search_plugins_or_inactive_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        for path in [
+            "plugins/.plugin-appserver/codex-cli",
+            "packages/standalone/releases/0.165.0",
+            "packages/app-server-daemon/releases/0.165.0",
+            "vendor/codex",
+        ] {
+            codex_package(&home.join(path), "0.165.0", true);
+        }
+        for home in [
+            Some(home.as_path()),
+            None,
+            Some(Path::new("")),
+            Some(Path::new("relative")),
+        ] {
+            assert_eq!(
+                media_helper_with(None, None, home).unwrap_err(),
+                VoiceRejection::NativeRuntimeUnavailable
+            );
+        }
+    }
+
+    #[test]
+    fn installed_package_rejects_wrong_identity_layout_target_and_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let package = root.join("packages/standalone/current");
+        let codex = codex_package(&package, "0.165.0", true);
+        let manifest_path = package.join("codex-package.json");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        for (field, value) in [
+            ("layoutVersion", json!(2)),
+            ("variant", json!("other")),
+            ("target", json!("wrong-platform")),
+            ("entrypoint", json!("bin/other")),
+            ("resourcesDir", json!("../resources")),
+            ("version", json!("0.158.9")),
+            ("version", json!("invalid")),
+            ("variant", Value::Null),
+        ] {
+            let mut invalid = manifest.clone();
+            invalid[field] = value;
+            std::fs::write(&manifest_path, invalid.to_string()).unwrap();
+            assert_eq!(
+                installed_helper(&codex).unwrap_err(),
+                VoiceRejection::Unsupported,
+                "{field}"
+            );
+            assert_eq!(
+                media_helper_with(None, None, Some(&root)).unwrap_err(),
+                VoiceRejection::Unsupported,
+                "{field}"
+            );
+        }
+        std::fs::write(&manifest_path, "{").unwrap();
+        assert_eq!(
+            media_helper_with(None, None, Some(&root)).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_resolution_accepts_active_symlink_but_rejects_redirected_helper() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let root = home.join("packages/standalone/releases/0.165.0");
+        codex_package(&root, "0.165.0", true);
+        symlink(&root, home.join("packages/standalone/current")).unwrap();
+        let helper = root.join("codex-resources/voice").join(HELPER);
+        assert_eq!(media_helper_with(None, None, Some(&home)).unwrap(), helper);
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            media_helper_with(None, None, Some(&home)).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+        let elsewhere = home.join("redirected-helper");
+        std::fs::rename(&helper, &elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&elsewhere, &helper).unwrap();
+        assert_eq!(
+            media_helper_with(None, None, Some(&home)).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+    }
+
+    #[test]
+    fn media_resolution_override_is_authoritative_and_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let codex = codex_package(&root.join("packages/standalone/current"), "0.165.0", true);
+        let dir = root.join("development/codex-resources/voice");
+        assert_eq!(
+            media_helper_with(Some(&codex), Some(&dir), Some(&root)).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+        let mut hashes = serde_json::Map::new();
+        for name in [HELPER, "runtime.json", "NOTICE.md"] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, name).unwrap();
+            hashes.insert(
+                name.into(),
+                json!(format!("{:x}", Sha256::digest(name.as_bytes()))),
+            );
+        }
+        let manifest = json!({"protocol":1,"buildCommit":BUILD_COMMIT,"target":runtime_target().unwrap(),"sha256":hashes});
+        std::fs::write(dir.join("zeron-runtime.json"), manifest.to_string()).unwrap();
+        assert_eq!(
+            media_helper_with(Some(&codex), Some(&dir), Some(&root)).unwrap(),
+            dir.join(HELPER)
+        );
+        for (field, value) in [
+            ("protocol", json!(2)),
+            ("buildCommit", json!("wrong-build")),
+            ("target", json!("wrong-target")),
+        ] {
+            let mut invalid = manifest.clone();
+            invalid[field] = value;
+            std::fs::write(dir.join("zeron-runtime.json"), invalid.to_string()).unwrap();
+            assert_eq!(
+                media_helper_with(Some(&codex), Some(&dir), Some(&root)).unwrap_err(),
+                VoiceRejection::Unsupported,
+                "{field}"
+            );
+        }
+        std::fs::write(dir.join("zeron-runtime.json"), "{").unwrap();
+        assert_eq!(
+            media_helper_with(Some(&codex), Some(&dir), Some(&root)).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+        std::fs::write(dir.join("zeron-runtime.json"), manifest.to_string()).unwrap();
+        std::fs::write(dir.join("runtime.json"), "tampered").unwrap();
+        assert_eq!(
+            media_helper_with(Some(&codex), Some(&dir), Some(&root)).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+        assert_eq!(
+            media_helper_with(Some(&codex), Some(Path::new("")), Some(&root)).unwrap_err(),
             VoiceRejection::NativeRuntimeUnavailable
         );
     }
