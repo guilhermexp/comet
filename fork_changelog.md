@@ -2,7 +2,7 @@
 
 Tracks local/private fork changes against upstream.
 
-## 2026-10-28 — Limites legíveis, descoberta de voz e continuidade de OMP/Workers
+## 2026-10-28 — v1.0.13: Limites legíveis, descoberta de voz e continuidade de OMP/Workers
 
 - Erros de cota Anthropic/OMP ganham resumo legível e intervalo informado, sem JSON/request ID na apresentação normal nem login indevido. O diagnóstico original permanece armazenado; autenticação real conserva login e mensagens já legíveis conservam o horário de reset.
 - Voz procura o helper do pacote Codex do CLI e depois as instalações oficiais ativas `standalone/current` e `app-server-daemon/current`, sem trocar o CLI do Chat, baixar runtime ou varrer caches de plugins. Override explícito continua autoritativo; pacote precisa declarar identidade/layout/target válidos. O runtime oficial já instalado neste Mac inicializou com rede negada, sem abrir dispositivos ou provider.
