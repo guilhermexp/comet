@@ -2059,10 +2059,12 @@ impl Pickers {
                 pickers.harnesses_revalidating = false;
                 pickers.catalog_rev += 1;
                 pickers.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                        Ok(list) => Loadable::Ready(list),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
+                    Ok(value) => {
+                        match zeron_proto::decode_harness_catalog::<HarnessDescriptor>(value) {
+                            Ok(list) => Loadable::Ready(list),
+                            Err(err) => Loadable::Error(err.to_string()),
+                        }
+                    }
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 pickers.prefetch_models(false, cx);

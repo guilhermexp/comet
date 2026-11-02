@@ -80,6 +80,49 @@ impl HarnessId {
     }
 }
 
+/// Decode a discovery catalog, omitting rows for harnesses unknown to this build.
+/// Malformed discriminators and malformed rows for known harnesses remain errors.
+pub fn decode_harness_catalog<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> serde_json::Result<Vec<T>> {
+    decode_harness_rows(value, "id")
+}
+
+fn decode_harness_rows<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    field: &str,
+) -> serde_json::Result<Vec<T>> {
+    let serde_json::Value::Array(rows) = value else {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "expected an array of harness discovery rows",
+        ));
+    };
+    let mut known = Vec::with_capacity(rows.len());
+    for row in rows {
+        let slug = row
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                <serde_json::Error as serde::de::Error>::custom(format!(
+                    "missing or non-string harness discriminator {field}"
+                ))
+            })?;
+        if HarnessId::from_slug(slug).is_some() {
+            known.push(serde_json::from_value(row)?);
+        }
+    }
+    Ok(known)
+}
+
+pub(crate) fn deserialize_harness_rows<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    decode_harness_rows(value, "harness").map_err(serde::de::Error::custom)
+}
+
 /// Durable user preference for one agent's independently-installed CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

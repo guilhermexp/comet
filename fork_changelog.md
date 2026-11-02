@@ -2,6 +2,12 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-02 — Compatibilidade da descoberta remota de harnesses
+
+- Catálogos de harnesses e snapshots de contas agora preservam rows suportadas quando um device anuncia uma identidade mais nova desconhecida. Dados malformados de identidades conhecidas continuam erros; a mudança não adiciona Fx nem altera requests de execução ou IDs de modelo.
+- O MCP distingue endpoint de contas indisponível de resposta inválida; Settings exibe falhas de decode do toggle. O app já em execução não é substituído nem reiniciado por esta alteração.
+- Verificação: 126 testes `zeron-proto`, 39 `zeron-mcp` e dois testes focados de retarget na UI passaram. Um cliente MCP compilado nesta revisão descobriu Codex e oito modelos na VPS, criou um Chat temporário somente-leitura e recebeu `CODEX_REMOTE_OK`; o Chat foi arquivado. A interface do app instalado ainda não foi validada com esta versão.
+
 ## 2026-10-28 — v1.0.13: Limites legíveis, descoberta de voz e continuidade de OMP/Workers
 
 - Erros de cota Anthropic/OMP ganham resumo legível e intervalo informado, sem JSON/request ID na apresentação normal nem login indevido. O diagnóstico original permanece armazenado; autenticação real conserva login e mensagens já legíveis conservam o horário de reset.

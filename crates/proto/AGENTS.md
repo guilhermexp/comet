@@ -40,6 +40,7 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - `view` é puro: sem I/O, sem tokio, sem gpui. É o que permite testar as regras sem subir engine nem janela.
 - Tipos de Managed Provider Usage são compatíveis por serde e cruzam apenas engine↔UI; não são persistidos em Loro nem sincronizados pelo edge.
 - `HarnessId` também chaveia providers device-local de conta/Usage. Uma variante não torna um runtime executável — só o registry de harness da engine publica descritores runnable. Snapshots do Kimi carregam apenas campos normalizados de conta/quota, nunca material de credencial.
+- Catálogos tipados de descoberta usam `decode_harness_catalog` e snapshots de contas filtram rows cujo discriminador string é desconhecido. Campos ausentes/não-string e rows conhecidas inválidas continuam erro; `HarnessId`, conta individual e requests de execução permanecem estritos.
 
 - `Session.running_subagents` é aditivo, default zero em peers antigos. `view::running_subagents` aplica a mesma janela de staleness de status; contagem expirada nunca mantém badge de execução. Contexto e estatísticas do fork continuam campos independentes.
 

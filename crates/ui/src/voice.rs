@@ -98,7 +98,9 @@ impl VoiceController {
                 .await
                 .ok()
                 .and_then(|value| {
-                    serde_json::from_value::<Vec<zeron_engine::registry::HarnessDescriptor>>(value)
+                    zeron_proto::decode_harness_catalog::<
+                            zeron_engine::registry::HarnessDescriptor,
+                        >(value)
                         .ok()
                 })
                 .map(|list| {

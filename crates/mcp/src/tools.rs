@@ -1618,6 +1618,7 @@ mod tests {
         /// `ListAgentAccounts` reply; absent = the method is unknown.
         accounts: Option<Value>,
         remote_accounts: Option<Value>,
+        remote_catalog: Option<Value>,
         beta_remote: bool,
         extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
@@ -1703,7 +1704,11 @@ mod tests {
                     RpcReply::Value(self.accounts.clone().unwrap())
                 }
                 methods::WATCH_SESSIONS => stream(json!([])),
+                methods::LIST_HARNESSES if remote && self.remote_catalog.is_some() => {
+                    RpcReply::Value(self.remote_catalog.clone().unwrap())
+                }
                 methods::LIST_HARNESSES if remote => RpcReply::Value(json!([
+                    {"id":"fx", "name":"Newer harness", "installed":true},
                     {"id":"codex", "name":"Remote Codex", "installed":true},
                     {"id":"cursor", "name":"Disabled Cursor", "installed":true, "enabled":false}
                 ])),
@@ -2358,9 +2363,12 @@ mod tests {
             deep: true,
             accounts: Some(json!({"accounts": [], "warnings": []})),
             remote_accounts: Some(json!({"accounts": [{
+                "id": "fx-account", "harness": "fx", "active": true,
+                "email": null, "planLabel": null
+            }, {
                 "id": "remote-account", "harness": "codex", "active": true,
                 "email": null, "planLabel": null
-            }], "warnings": []})),
+            }], "warnings": [{"harness":"fx", "message":"unavailable"}]})),
             ..Default::default()
         });
         let top = tools(world.clone(), origin("chat-alpha-1"));
@@ -2370,6 +2378,10 @@ mod tests {
             .unwrap();
         assert_eq!(listed["harnesses"][0]["signedIn"], true);
         assert_eq!(listed["harnesses"][0]["connected"], true);
+        assert_eq!(listed["harnesses"][0]["id"], "codex");
+        assert_eq!(listed["harnesses"][0]["installed"], true);
+        assert_eq!(listed["harnesses"][0]["available"], true);
+        assert_eq!(listed["harnesses"].as_array().unwrap().len(), 2);
         assert_eq!(listed["harnesses"][1]["connected"], false);
         let created = top
             .call("create_chat", json!({"kind":"side", "device":"Worker"}))
@@ -2600,6 +2612,114 @@ mod tests {
             );
             assert!(broken.writes.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn remote_catalog_filters_only_unknown_harness_rows() {
+        let world = Arc::new(World {
+            remote_catalog: Some(json!([
+                {"id":"fx", "name":"Unknown"},
+                {"id":"codex", "name":"Codex"},
+                {"id":"cursor", "name":"Cursor", "installed":false, "enabled":false}
+            ])),
+            ..Default::default()
+        });
+        let tools = tools(world, Origin::default());
+        let listed = tools
+            .call("list_harnesses", json!({"device":"Worker"}))
+            .await
+            .unwrap();
+        assert_eq!(listed["harnesses"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["harnesses"][0]["id"], "codex");
+        assert_eq!(listed["harnesses"][0]["installed"], true);
+        assert_eq!(listed["harnesses"][0]["available"], true);
+        assert_eq!(listed["harnesses"][1]["id"], "cursor");
+        assert_eq!(listed["harnesses"][1]["installed"], false);
+        assert_eq!(listed["harnesses"][1]["available"], false);
+        let world = Arc::new(World {
+            remote_catalog: Some(json!([{"id":"fx"}])),
+            ..Default::default()
+        });
+        let only_unknown = self::tools(world, Origin::default())
+            .call("list_harnesses", json!({"device":"Worker"}))
+            .await
+            .unwrap();
+        assert!(only_unknown["harnesses"].as_array().unwrap().is_empty());
+        for row in [
+            json!({}),
+            json!({"id":null}),
+            json!({"id":9}),
+            json!({"id":"codex", "name":7}),
+        ] {
+            let world = Arc::new(World {
+                remote_catalog: Some(json!([row])),
+                ..Default::default()
+            });
+            assert!(
+                self::tools(world, Origin::default())
+                    .call("list_harnesses", json!({"device":"Worker"}))
+                    .await
+                    .is_err()
+            );
+        }
+        let world = Arc::new(World {
+            remote_catalog: Some(json!({})),
+            ..Default::default()
+        });
+        assert!(
+            self::tools(world, Origin::default())
+                .call("list_harnesses", json!({"device":"Worker"}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_remote_discovery_never_creates_or_sends() {
+        for world in [
+            World {
+                remote_catalog: Some(json!([{"id":"codex", "name":7}])),
+                beta_remote: true,
+                ..Default::default()
+            },
+            World {
+                remote_accounts: Some(json!({
+                    "accounts":[{"id":"bad", "harness":"codex", "active":"yes"}],
+                    "warnings":[]
+                })),
+                beta_remote: true,
+                ..Default::default()
+            },
+        ] {
+            let world = Arc::new(world);
+            let tools = tools(world.clone(), Origin::default());
+            assert!(
+                tools
+                    .call("create_chat", json!({"device":"Worker"}))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tools
+                    .call("send_message", json!({"chat":"Beta", "text":"go"}))
+                    .await
+                    .is_err()
+            );
+            assert!(world.writes.lock().unwrap().is_empty());
+        }
+        let tools = tools(Arc::new(World::default()), Origin::default());
+        assert!(
+            tools
+                .call("list_models", json!({"device":"Worker", "harness":"fx"}))
+                .await
+                .is_err()
+        );
+        assert!(
+            tools
+                .call("create_chat", json!({"device":"Worker", "harness":"fx"}))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -285,17 +285,26 @@ impl Zeron {
             .call(methods::LIST_HARNESSES, params.clone())
             .await
             .with_context(|| format!("harness catalog on device {}", device.unwrap_or("local")))?;
-        let mut harnesses: Vec<HarnessInfo> = serde_json::from_value(value).with_context(|| {
-            format!(
-                "ListHarnesses: unexpected catalog on device {}",
-                device.unwrap_or("local")
-            )
-        })?;
-        let accounts = self
-            .call(methods::LIST_AGENT_ACCOUNTS, params)
-            .await
-            .ok()
-            .and_then(|v| serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(v).ok());
+        let mut harnesses: Vec<HarnessInfo> = zeron_proto::decode_harness_catalog(value)
+            .with_context(|| {
+                format!(
+                    "ListHarnesses: unexpected catalog on device {}",
+                    device.unwrap_or("local")
+                )
+            })?;
+        let accounts = match self.call(methods::LIST_AGENT_ACCOUNTS, params).await {
+            Ok(value) => Some(
+                serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(value).with_context(
+                    || {
+                        format!(
+                            "ListAgentAccounts: unexpected snapshot on device {}",
+                            device.unwrap_or("local")
+                        )
+                    },
+                )?,
+            ),
+            Err(_) => None,
+        };
         if let Some(snapshot) = accounts {
             for harness in &mut harnesses {
                 harness.signed_in = Some(

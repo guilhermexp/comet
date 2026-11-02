@@ -15,6 +15,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.
 - `edition = "2024"` em todas.
 - `zeron-client` mantém o recibo durável `viewer-delivery` separado do outbox de Chat: descoberta reabre Chats sem viewport, refaz wake com credenciais atuais e só conclui a versão depois do ACK das rows e uma wake final. `hostDevice` é hint de roteamento, nunca grant. Working exige posse do host/output; envio ainda não adotado permanece Sending/Queued.
+- Descoberta tipada de harness entre versões usa a política de `zeron-proto` em desktop e `zeron-mcp`; identidades desconhecidas não viram runtimes executáveis. O catálogo string de `zeron-client` continua aberto.
 - Runtime async é **tokio** em todo lugar; a UI faz a ponte por `gpui_tokio` (`Tokio::spawn` vira `Task` do gpui). A UI nunca bloqueia na engine.
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
 - **Configured worker presets receive `launch_worker` briefing at native
@@ -62,6 +63,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-syntax` | [`syntax/AGENTS.md`](syntax/AGENTS.md) | Tokenizer tree-sitter paint-only compartilhado pelas surfaces |
 | `zeron-theme` | [`theme/AGENTS.md`](theme/AGENTS.md) | Modelo source-neutral, catálogo e importação de temas |
 | `zeron-sessions-mcp` | [`sessions-mcp/AGENTS.md`](sessions-mcp/AGENTS.md) | MCP `comet-sessions` (`help`, `list_spaces`, `create`) |
+| `zeron-mcp` | — (`mcp/src/lib.rs`) | Ferramentas de Chat via IPC, incluindo descoberta de harness por device |
 | `zeron-computer-use-mcp` | [`computer-use-mcp/AGENTS.md`](computer-use-mcp/AGENTS.md) | MCP `comet-computer-use` (`computer_use`, `computer_use_reset`), proxy do `cua_repl` |
 | `zeron-workers-unpeel` | [`workers-unpeel/AGENTS.md`](workers-unpeel/AGENTS.md) | Fronteira tipada sobre `third_party/unpeel`: projetos, worktrees, sessões de Worker, controller MCP, notificações ao parent; leitores de Settings → Projects (atividade e tickets por projeto) compartilhados com o controller |
 | `zeron-preview` | [`preview/AGENTS.md`](preview/AGENTS.md) | Catálogo, proxy HTTP/WebSocket e pairing RTC autenticado |
