@@ -2,7 +2,7 @@
 
 Tracks local/private fork changes against upstream.
 
-## 2026-11-02 — Compatibilidade da descoberta remota de harnesses
+## 2026-11-02 — v1.0.14: Compatibilidade da descoberta remota de harnesses
 
 - Catálogos de harnesses e snapshots de contas agora preservam rows suportadas quando um device anuncia uma identidade mais nova desconhecida. Dados malformados de identidades conhecidas continuam erros; a mudança não adiciona Fx nem altera requests de execução ou IDs de modelo.
 - O MCP distingue endpoint de contas indisponível de resposta inválida; Settings exibe falhas de decode do toggle. O app já em execução não é substituído nem reiniciado por esta alteração.
