@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `ListDevServersParams.chatId` e `DevServer.previewEligible` são opcionais/default None; dados antigos não prometem elegibilidade. `preview_visible_to_chat` é o predicado compartilhado de device/ownership e Chat-origem OU project cwd exato, usado no watch e na elegibilidade host-side. Não altera autorização de proxy nem persistência Loro.
+
 - `run_errors::provider_error_message` projeta erros técnicos de limite sem alterar o diagnóstico armazenado: 429/Anthropic via OMP vira mensagem curta; `retry-after-ms` positivo e inteiro vira intervalo informado, arredondado para cima, nunca countdown/reset inventado. Erros desconhecidos e resets já legíveis permanecem. `view::run_failure_text` usa a mesma projeção; login é recuperação de `SignedOut`, não de `LimitReached`.
 
 - `ContextUsage` conserva `tokens`/`contextWindow` numéricos no fio; `tokensReported: false` é aditivo e distingue tokens ausentes de zero (ausência do flag mantém semântica legada). `reported_tokens`/`reported_window` e `merge` são a fonte compartilhada para snapshots parciais. Contexto do Chat é distinto de Managed Provider Usage e continua sincronizado nas rows de Session.

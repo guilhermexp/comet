@@ -1,0 +1,12 @@
+## Decisions
+GL1 retains the failed package attempt’s launcher fingerprint, owner, package/tag and candidate in coordinator memory, then snapshots that record before Retry waits. A new check or invalidation discards it; success clears it. A failed diagnostic may permit only existing Failed/Install Retry on that unchanged identity and original family, with no prior invalidation. It remains an unsuccessful observation, never Current. Existing owner serialization, final identity check, cancellation and post-install verification remain authoritative.
+
+GL2 reuses host preview candidate attribution before HTTP discovery, with optional eligibility in DevServer. Unknown old-host state does not promise eligibility. An already-authorized published preview remains usable. A selected known-ineligible/unknown remote port reports a port-specific reason without local loopback or external fallback. Local selection and eligible delayed discovery stay unchanged.
+
+GL3/4 preserve controller CR repaint and raw output while fixing peer CRLF and ESC intermediate consumption. GL7 uses the existing async intent waiter. GL8 supplies explicit manifest/mask for advertisement assertions, preserving call denial. GL9 only updates public guidance.
+
+## Verification
+Disposable npm/CLI scripts, fake listener/host snapshots, genuine terminal-output consumers, focused existing compatibility tests, and safe component-only native Browser/menu fixtures. Delivery3 used one canonical guarded queue with receipts in local-codex-final-3, based on 3f7683b. Delivery4 preserves that accepted input tree f18d86f and all its evidence, and uses a new single guarded queue in local-codex-final-4 for only GL1/GL2: three causal reds, focused coordinator/host/Browser/Details tests and the affected Browser component smoke. No terminal, menu or MCP suites repeat.
+
+## Delivery4 parent follow-up
+Repair provenance must belong to the failed package attempt, not a newly resolved Retry alias. Retain it only in coordinator memory and compare fingerprint, package/owner and candidate. Selected Chat/device/cwd visibility must share the watch predicate; chatId belongs in the host query and polling key. Browser keeps requested port/eligibility as user intent across the first subscription snapshot; unavailable rendering is settled separately, published URLs retain precedence, and manual navigation or watch rebind clears the intent. No watch still produces immediate unavailable feedback.

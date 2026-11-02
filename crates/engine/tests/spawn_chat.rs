@@ -206,7 +206,7 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
     core.workspace
         .create_space(
             "space-parent",
-            &core.device_id,
+            "space-host-distinct-from-chat",
             "/tmp/parent-space",
             Some("Parent".into()),
             false,
@@ -222,9 +222,10 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
         )
         .unwrap();
     core.workspace
-        .create_chat(
+        .create_chat_hosted(
             "parent",
             Some("space-parent"),
+            Some(&core.device_id),
             Some(&core.device_id),
             Some(ChatConfig {
                 harness: HarnessId::Mock,
@@ -233,6 +234,7 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
             }),
+            Some("/tmp/worktrees/feature".into()),
             None,
         )
         .unwrap();
@@ -254,7 +256,7 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
         .queue_command(
             "parent",
             SessionCommandPayload::Run {
-                request: run_request("parent turn", "/tmp/parent-space"),
+                request: run_request("parent turn", "/tmp/worktrees/feature"),
                 message_id: "parent-msg".into(),
             },
         )
@@ -305,11 +307,14 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
 
     let child = core.workspace.chat(&child_id).unwrap().unwrap();
     assert_eq!(child.space_id.as_deref(), Some("space-parent"));
-    assert_eq!(child.cwd.as_deref(), Some("/tmp/parent-space"));
+    assert_eq!(child.cwd.as_deref(), Some("/tmp/worktrees/feature"));
+    assert_eq!(child.device_id, core.device_id);
+    assert_eq!(created["deviceId"], core.device_id);
     assert_eq!(child.config.as_ref(), Some(&parent_config()));
     wait_for(|| assistant_complete(&core, &child_id), "child first run").await;
     assert_eq!(user_text(&core, &child_id), vec!["child prompt".to_owned()]);
     let first = &requests_for(&log, &child_id)[0];
+    assert_eq!(first.cwd, "/tmp/worktrees/feature");
     assert!(
         first.sessions.is_none(),
         "child first run has no sessions grant"
@@ -421,4 +426,57 @@ async fn projectless_parent_spawns_a_projectless_child_and_no_endpoint_drops_ses
     assert_eq!(child.cwd, parent.cwd);
     assert_eq!(child.origin_chat_id.as_deref(), Some("loose"));
     core.shutdown().await;
+}
+
+/// F7: the engine refuses to spawn from a Chat that is itself spawned,
+/// whichever lineage field marks it, so no IPC caller can make grandchildren.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_chat_refuses_a_spawned_parent() {
+    let (_tmp, core, log) = assemble();
+    core.workspace
+        .create_chat(
+            "root",
+            None,
+            Some(&core.device_id),
+            Some(parent_config()),
+            None,
+        )
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let child = spawn(&client, "root", "first", None)
+        .await
+        .expect("a root Chat spawns");
+    let child_id = child["chatId"].as_str().unwrap().to_owned();
+    wait_for(
+        || {
+            core.workspace
+                .chat(&child_id)
+                .ok()
+                .flatten()
+                .is_some_and(|chat| chat.origin_chat_id.as_deref() == Some("root"))
+        },
+        "child origin lineage",
+    )
+    .await;
+    // Counted BEFORE the refused call, so a guard that wrote the
+    // grandchild and then errored would be caught.
+    let before = core.workspace.read_chats().unwrap();
+    let refused = spawn(&client, &child_id, "grandchild", None)
+        .await
+        .expect_err("origin-only spawned Chat is not root");
+    assert!(
+        refused.to_string().contains("itself a delegated chat"),
+        "{refused}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = core.workspace.read_chats().unwrap();
+    assert_eq!(after.len(), before.len(), "nothing created");
+    assert!(
+        after.iter().all(
+            |chat| chat.origin_chat_id.as_deref() != Some(child_id.as_str())
+                && chat.parent_chat_id.as_deref() != Some(child_id.as_str())
+        ),
+        "no grandchild row"
+    );
+    assert!(requests_for(&log, &child_id).len() <= 1);
 }

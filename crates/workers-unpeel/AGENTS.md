@@ -54,6 +54,8 @@ apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
 
+- O cleaner compartilhado normaliza CRLF uma vez e consome intermediários ESC até seu final (ex. ESC(B/ESC)0/ESC$)C). CR isolado mantém repaint no controller e vira quebra no peer; replay bruto não passa pelo cleaner. O fallback de repaint do controller também consome a sequência ESC completa antes de continuar o texto, preservando seus controles de cursor. Prova de consumidor: `controller_mcp::terminal_text_consumers_normalize_crlf_and_designation_escapes` e casos `semantic_fallback_`.
+
 - **Servidores MCP extras dos Workers** (`register_worker_mcp_servers`, chamado no `main` antes de qualquer host mode): registra `comet-computer-use` (`zeron __computer_use_mcp__ --worker`) em `unpeel_core::extra_mcp`. Os adapters com seam MCP escrevem o servidor ao lado de `unpeel` — claude-code (`claude-unpeel-mcp.json`), cursor-agent (`~/.cursor/mcp.json`), cline (settings por sessão), kimi (`kimi-unpeel-mcp.json` e, no Kimi Code, entrada persistente em `~/.kimi-code/mcp.json` que não sobrescreve entrada do usuário com o mesmo nome) — e omp e pi carregam uma extensão-ponte gerada por servidor (`<unpeel_home>/hooks/mcp-bridge-<nome>.js`, fonte `zeron_harness::pi::MCP_BRIDGE_SOURCE`). Codex não recebe: segue o Computer Use nativo. Prime Agent também não (decisão do dono, 2026-10-18): o binário Rust 0.10 rejeita `--extension`, e o launcher remove a ponte gerenciada `…/hooks/mcp-bridge-comet-computer-use.js` de comandos Prime persistidos. O `--worker` faz o escopo "Comet only" de Settings recusar Workers.
 
 - **Um projeto é um Space; Workers só guardam checkouts.** O registro único é
@@ -143,10 +145,41 @@ apps/zeron (host-mode dispatch at startup).
   at startup dispatches into the host instead of the app. **Never kill
   `__session_host__` processes when rebuilding the app** — kill only the exact
   main PID (root AGENTS.md). Other internal host modes dispatched here:
-  `CONTROLLER_MCP_ARG`, `MCP_HOST_ARG`, `MCP_GATE_ARG`, the browser/computer
-  cleanup args, `COMPACT_OUTPUT_JOURNALS_ARG`, and legacy MCP gate kinds
-  (`unpeel_core::integrations::legacy_mcp_gate_kind`). Browser is a *domain* of
-  `MCP_HOST_ARG`, never its own server.
+  `CONTROLLER_MCP_ARG`, `MCP_HOST_ARG`, `MCP_GATE_ARG`,
+  `COMPACT_OUTPUT_JOURNALS_ARG`, and legacy MCP gate kinds
+  (`unpeel_core::integrations::legacy_mcp_gate_kind`). The legacy Browser and
+  Computer engines are retired for Comet: `register_worker_mcp_servers` calls
+  `unpeel_core::embedding::retire_legacy_engines()`, so no Comet Worker is
+  granted, advertised or able to call `browser`/`computer`, and their cleanup
+  args are no longer Comet entry points (`legacy_engine_helpers_are_not_comet_entry_points`).
+- **Worker control shares `unpeel_core::session_control`.** The controller's
+  `send_text`/`send_keys`/initial briefing call it with
+  `InputAuthority::Controller` (task receipt only there); `encode_keys` and
+  `clean_output` wrap its vocabulary/cleanup with this tool's own caps;
+  `clean_output` uses `CarriageReturns::Keep` so `parent_notifications` can
+  fold a redrawn status line to its last paint (never the peer profile).
+  `wait_for_status` validates with `WaitVocabulary::Controller` and judges each
+  poll with `judge_wait` (`completed` only from current-episode evidence, never
+  idle/exited); `read_transcript` pages with `page_text` at 96 KiB; list,
+  inspect and output reach the Host's shared `hosted_sessions`/`read_output`
+  through the client tunnel. Do not re-copy key tables, ANSI parsers, wait
+  vocabularies or pagers here.
+- **Worker worktree root = device preference.** `worktree_ownership::common_worktrees_root`
+  applies `ZERON_WORKTREES_DIR`, else the saved enabled absolute folder in
+  `{data_dir}/worktree-settings.json` (the engine's Settings → General file),
+  else `~/.zeron/worktrees` — the same precedence as Chat worktrees. One
+  creation resolves it once (`canonical_root`) and builds its journal from that
+  root (`OwnershipJournal::at(current_journal_path()?, root)`); never re-read
+  the preference through `for_current_user` mid-creation. The data dir
+  follows the app's rule (`apps/zeron/src/paths.rs`): `ZERON_DATA_DIR` whenever
+  present, even empty (the working directory, like the app), else
+  on Windows `%LOCALAPPDATA%\Zeron` or `%USERPROFILE%\AppData\Local\Zeron`,
+  else `~/.zeron` (`resolve_zeron_data_dir`, pure). Proof:
+  `tests/worktree_destination.rs` (temp HOME/data dir/repos, Git isolated
+  from inherited config and repository variables; its default-root stage is
+  Unix-only, since only there does HOME redirect the home dir) and the unit
+  test `worktree_root_snapshot_tests` (preference switched after resolution
+  through a `cfg(test)`-only seam; no test hook ships in the product).
 - **Controller MCP is Comet-owned.** Only ACP controller sessions receive this
   process in their `mcpServers` list (resolved by zeron-harness's
   `workers_mcp.rs` and rendered into each runtime's dialect); it is NOT

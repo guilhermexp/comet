@@ -15,10 +15,9 @@ pub(super) struct WorktreeSettingsCard {
     state: Entity<AppState>,
     target: Option<String>,
     device_select: widgets::SelectState,
+    /// The switch always presents this persisted state: an enable that still
+    /// needs a folder is a folder choice, never an unsaved "on".
     settings: Loadable<WorktreeSettingsStatus>,
-    /// The switch, ahead of the saved settings while a folder is still to be
-    /// chosen.
-    enabled: bool,
     error: Option<String>,
     saving: bool,
     task: Option<Task<()>>,
@@ -34,7 +33,6 @@ impl WorktreeSettingsCard {
             target: None,
             device_select: widgets::SelectState::default(),
             settings: Loadable::Idle,
-            enabled: false,
             error: None,
             saving: false,
             task: None,
@@ -130,7 +128,6 @@ impl WorktreeSettingsCard {
         self.folder_task = None;
         self.target = target;
         self.settings = Loadable::Loading;
-        self.enabled = false;
         self.saving = false;
         self.error = None;
         self.browsing = false;
@@ -176,7 +173,6 @@ impl WorktreeSettingsCard {
                 card.saving = false;
                 match result {
                     Ok(status) => {
-                        card.enabled = status.settings.use_custom_directory;
                         card.settings = Loadable::Ready(status);
                         card.browsing = false;
                     }
@@ -207,24 +203,20 @@ impl WorktreeSettingsCard {
         self.request(Some(settings), cx);
     }
 
-    /// Turning on reuses the remembered folder, or waits for Browse to pick
-    /// one; turning off keeps the folder for next time.
+    /// Turning on reuses the remembered folder or first asks for one; turning
+    /// off keeps the folder for next time. The switch moves only when the
+    /// engine confirms the saved state, so a cancelled or failed choice
+    /// leaves the previous preference in place.
     fn toggle(&mut self, cx: &mut Context<Self>) {
         let Some(saved) = self.saved().cloned() else {
             return;
         };
-        self.enabled = !self.enabled;
         self.browsing = false;
         self.folder_task = None;
         self.error = None;
-        if self.enabled != saved.use_custom_directory && saved.custom_directory.is_some() {
-            self.save(
-                WorktreeSettings {
-                    use_custom_directory: self.enabled,
-                    ..saved
-                },
-                cx,
-            );
+        match toggle_intent(&saved) {
+            ToggleIntent::Save(next) => self.save(next, cx),
+            ToggleIntent::ChooseFolder => self.browse_folder(cx),
         }
         cx.notify();
     }
@@ -234,7 +226,6 @@ impl WorktreeSettingsCard {
             return;
         };
         let changed = *saved != WorktreeSettings::default();
-        self.enabled = false;
         self.browsing = false;
         self.folder_task = None;
         self.error = None;
@@ -494,12 +485,10 @@ impl Render for WorktreeSettingsCard {
         let status = self.settings.ready();
         let overridden = status.is_some_and(|s| s.environment_override.is_some());
         let interactive = status.is_some() && !self.saving && !overridden;
-        let enabled = self.enabled;
+        let enabled = status.is_some_and(|status| status.settings.use_custom_directory);
         let mut meta = vec![match status {
-            Some(status) if overridden || (enabled && status.settings.use_custom_directory) => {
-                status.effective_directory.clone()
-            }
-            Some(_) if enabled => "Choose a folder for new worktrees".into(),
+            Some(status) if overridden || enabled => status.effective_directory.clone(),
+            Some(_) if self.browsing => "Choose a folder for new worktrees".into(),
             Some(status) => status.default_directory.clone(),
             None if matches!(self.settings, Loadable::Error(_)) => {
                 "Couldn't load worktree settings".into()
@@ -629,10 +618,63 @@ impl Render for WorktreeSettingsCard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToggleIntent {
+    /// Persist this state; the switch follows once the engine confirms it.
+    Save(WorktreeSettings),
+    /// First enable without a remembered folder: choose one, then save.
+    ChooseFolder,
+}
+
+fn toggle_intent(saved: &WorktreeSettings) -> ToggleIntent {
+    if saved.use_custom_directory {
+        ToggleIntent::Save(WorktreeSettings {
+            use_custom_directory: false,
+            ..saved.clone()
+        })
+    } else if saved.custom_directory.is_some() {
+        ToggleIntent::Save(WorktreeSettings {
+            use_custom_directory: true,
+            ..saved.clone()
+        })
+    } else {
+        ToggleIntent::ChooseFolder
+    }
+}
+
 fn description(theme: &Theme, text: &str) -> gpui::Div {
     div()
         .text_size(crate::typography::ui_rems(widgets::ROW_DESCRIPTION_SIZE))
         .line_height(crate::typography::ui_rems(16.0))
         .text_color(theme.text_muted)
         .child(text.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W1: an enable without a remembered folder never becomes an unsaved
+    /// "on"; it asks for the folder and saves nothing until one is chosen.
+    #[test]
+    fn first_enable_chooses_a_folder_instead_of_presenting_pending_on() {
+        assert_eq!(
+            toggle_intent(&WorktreeSettings::default()),
+            ToggleIntent::ChooseFolder
+        );
+    }
+
+    #[test]
+    fn toggles_persist_and_keep_the_remembered_folder() {
+        let remembered = WorktreeSettings {
+            use_custom_directory: false,
+            custom_directory: Some("/srv/worktrees".into()),
+        };
+        let on = WorktreeSettings {
+            use_custom_directory: true,
+            ..remembered.clone()
+        };
+        assert_eq!(toggle_intent(&remembered), ToggleIntent::Save(on.clone()));
+        assert_eq!(toggle_intent(&on), ToggleIntent::Save(remembered));
+    }
 }

@@ -95,6 +95,7 @@ struct Inner {
     catalog: Catalog,
     stop: CancellationToken,
     started: AtomicBool,
+    projects: std::sync::OnceLock<Projects>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Sign-in callbacks peers may reach on this device (see [`login`]).
     callback_routes: CallbackRoutes,
@@ -131,6 +132,15 @@ fn candidates(
     scope: Scope,
     origins: &mut discovery::Origins,
 ) -> Option<Vec<(PathBuf, discovery::Listener)>> {
+    Some(attributed_candidates(scope, discovery::listeners(origins)?))
+}
+
+/// Shared host authority for discovery and Details eligibility. This does not
+/// promise HTTP availability or grant proxy/exposure access.
+pub(crate) fn attributed_candidates(
+    scope: Scope,
+    listeners: Vec<discovery::Listener>,
+) -> Vec<(PathBuf, discovery::Listener)> {
     let Scope {
         chats,
         terminals,
@@ -154,40 +164,37 @@ fn candidates(
         .into_iter()
         .collect();
     if roots.is_empty() {
-        return Some(Vec::new());
+        return Vec::new();
     }
     roots.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-    let listeners = discovery::listeners(origins)?;
-    Some(
-        listeners
-            .into_iter()
-            .filter(|l| {
-                l.zeron_owned
-                    && l.address.port() != zeron_proto::PREVIEW_PROXY_PORT
-                    && !reserved_ports.contains(&l.address.port())
-                    && l.pid != std::process::id()
-                    && !l.is_authentication_command()
-                    && !l.is_zeron_engine()
-            })
-            .filter_map(|mut listener| {
-                // A chat this device no longer hosts (or another engine's,
-                // inherited by a nested one) owns nothing here.
-                let chat = match listener.origin.as_deref()?.split_once(':')? {
-                    ("chat", chat) => chat.to_owned(),
-                    ("terminal", terminal) => terminals.get(terminal)?.clone(),
-                    _ => return None,
-                };
-                let chat_root = chats.get(&chat)?;
-                listener.chat_id = Some(chat);
-                let root = roots
-                    .iter()
-                    .find(|root| listener.belongs_to(root))
-                    .unwrap_or(chat_root)
-                    .clone();
-                Some((root, listener))
-            })
-            .collect(),
-    )
+    listeners
+        .into_iter()
+        .filter(|l| {
+            l.zeron_owned
+                && l.address.port() != zeron_proto::PREVIEW_PROXY_PORT
+                && !reserved_ports.contains(&l.address.port())
+                && l.pid != std::process::id()
+                && !l.is_authentication_command()
+                && !l.is_zeron_engine()
+        })
+        .filter_map(|mut listener| {
+            // A chat this device no longer hosts (or another engine's,
+            // inherited by a nested one) owns nothing here.
+            let chat = match listener.origin.as_deref()?.split_once(':')? {
+                ("chat", chat) => chat.to_owned(),
+                ("terminal", terminal) => terminals.get(terminal)?.clone(),
+                _ => return None,
+            };
+            let chat_root = chats.get(&chat)?;
+            listener.chat_id = Some(chat);
+            let root = roots
+                .iter()
+                .find(|root| listener.belongs_to(root))
+                .unwrap_or(chat_root)
+                .clone();
+            Some((root, listener))
+        })
+        .collect()
 }
 impl PreviewService {
     pub fn new(file: PathBuf, device_id: String, device_name: String) -> anyhow::Result<Self> {
@@ -195,6 +202,7 @@ impl PreviewService {
             catalog: Catalog::open(file, device_id, device_name)?,
             stop: CancellationToken::new(),
             started: AtomicBool::new(false),
+            projects: std::sync::OnceLock::new(),
             tasks: Mutex::new(Vec::new()),
             callback_routes: CallbackRoutes::default(),
             callback_tunnels: CallbackTunnels::default(),
@@ -241,6 +249,18 @@ impl PreviewService {
         })?;
         peers.open(device, service, false).await
     }
+    pub fn list_dev_servers(
+        &self,
+        cwds: &[String],
+        selected: Option<(&str, &str, Option<&std::path::Path>)>,
+    ) -> Vec<zeron_proto::DevServer> {
+        crate::servers::list_with_scope(
+            cwds,
+            self.0.projects.get().map(|projects| projects()),
+            self.0.catalog.device_id(),
+            selected,
+        )
+    }
     pub fn catalog(&self) -> &Catalog {
         &self.0.catalog
     }
@@ -285,6 +305,7 @@ impl PreviewService {
         if self.0.started.swap(true, Ordering::SeqCst) {
             return;
         }
+        let _ = self.0.projects.set(projects.clone());
         let connector = Arc::new(LocalConnector(
             self.0.catalog.clone(),
             self.0.callback_routes.clone(),

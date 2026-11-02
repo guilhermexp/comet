@@ -358,7 +358,7 @@ impl EngineHandle {
                 None
             }
         };
-        // The fork's `comet-sessions` MCP dials the IPC endpoint THIS window
+        // The fork's `zeron` chat MCP dials the IPC endpoint THIS window
         // serves; recorded on the runtime once assembly opens it.
         let sessions_endpoint = ipc_task
             .as_ref()

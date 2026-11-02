@@ -158,13 +158,6 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     attach_parent_console();
-    if std::env::args().nth(1).as_deref() == Some(zeron_sessions_mcp::SESSIONS_MCP_ARG) {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.len() != 1 {
-            anyhow::bail!("usage: zeron {}", zeron_sessions_mcp::SESSIONS_MCP_ARG);
-        }
-        return zeron_sessions_mcp::run_stdio().map_err(anyhow::Error::msg);
-    }
     if std::env::args().nth(1).as_deref() == Some(zeron_computer_use_mcp::COMPUTER_USE_MCP_ARG) {
         let args: Vec<String> = std::env::args().skip(2).collect();
         return zeron_computer_use_mcp::run_stdio(&args).map_err(anyhow::Error::msg);

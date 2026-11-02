@@ -116,7 +116,6 @@ use side_chats::SideChatTab;
 mod tabs;
 use tabs::NewSessionTarget;
 mod voice_stage;
-use voice_stage::VOICE_STAGE_ORB_SCALE;
 
 use spaces::{AddSpaceFlow, ProjectPickerTarget, RenameSpaceDialog};
 
@@ -1774,8 +1773,8 @@ impl Render for SurfaceTabGhost {
     }
 }
 
-struct SurfaceTabTooltip {
-    text: SharedString,
+pub(crate) struct SurfaceTabTooltip {
+    pub(crate) text: SharedString,
 }
 
 impl Render for SurfaceTabTooltip {
@@ -2541,8 +2540,12 @@ pub struct Shell {
     /// Sidebar footer orb (session live) and the full-window stage's orb.
     voice_footer_orb: Entity<crate::orb::Orb>,
     voice_stage_orb: Entity<crate::orb::Orb>,
-    /// Above the composer, only while the orchestrator's own chat is open.
-    voice_composer_orb: Entity<crate::orb::Orb>,
+    /// The compact live-call widget's orb (lower-right, any route).
+    voice_widget_orb: Entity<crate::orb::Orb>,
+    /// Pointer over the widget capsule: reveals its hang-up slot.
+    voice_widget_hovered: bool,
+    /// Contains the widget's controls; any focused control reveals hang-up.
+    voice_widget_focus: FocusHandle,
     /// The stage caption's streaming veil (shared with mobile).
     voice_caption: zeron_veil::CaptionVeil,
     voice_stage_focus: FocusHandle,
@@ -2684,6 +2687,8 @@ pub struct Shell {
     /// A detail view a history step landed on, opened by the next render
     /// (creating it needs the window).
     pending_pull_request: Option<(String, Option<String>)>,
+    /// A Details Servers row waiting for the render's window: (Chat, port).
+    pending_server: Option<(String, zeron_proto::DevServer)>,
     pull_request_cache:
         std::rc::Rc<std::cell::RefCell<crate::pull_request_detail::PullRequestCache>>,
     devices_page: Option<Entity<DevicesPage>>,
@@ -2920,6 +2925,9 @@ pub struct Shell {
     fit_memo: [std::cell::Cell<Option<(FitInputs, HorizontalPanelFit)>>; 2],
     /// The closed surface host already released its image previews.
     right_images_suspended: bool,
+    /// The (panel, Browser) last presented in the visible right pane; a new
+    /// one closes Details once (`sync_browser_details`).
+    presented_browser: Option<(String, u64)>,
     sidebar_edge_bounce: Option<motion::ResizeEdgeBounce>,
     /// Boundary currently held during a sidebar drag. Cleared on re-entry or
     /// release so the next genuine edge crossing can acknowledge the limit.
@@ -3083,19 +3091,8 @@ impl Shell {
                 .state_transition(Duration::from_millis(300))
                 .visible(false)
         });
-        let voice_stage_orb = cx.new(|_| {
-            crate::orb::Orb::new()
-                .size(crate::orb::OrbSize::Hero)
-                .state_transition(Duration::from_millis(300))
-                .scale(VOICE_STAGE_ORB_SCALE)
-                .visible(false)
-        });
-        let voice_composer_orb = cx.new(|_| {
-            crate::orb::Orb::new()
-                .size(crate::orb::OrbSize::Avatar)
-                .state_transition(Duration::from_millis(300))
-                .visible(false)
-        });
+        let voice_stage_orb = cx.new(|_| crate::voice_surfaces::stage_orb());
+        let voice_widget_orb = cx.new(|_| crate::voice_surfaces::widget_orb());
         let voice_observation = cx.observe(&voice, |_: &mut Shell, _, cx| cx.notify());
         // Settings → Agents installed or toggled Codex: voice follows.
         let voice_catalog =
@@ -3192,13 +3189,7 @@ impl Shell {
         let details_sub = cx.subscribe(
             &details_sidebar,
             move |this: &mut Shell, _, event: &DetailsSidebarEvent, cx| match event {
-                DetailsSidebarEvent::Close => {
-                    let from = this.details_target(cx);
-                    this.settings.details_sidebar_open = false;
-                    this.details_tween = Some(this.clocked_tween(from, 0.0));
-                    this.schedule_save(cx);
-                    cx.notify();
-                }
+                DetailsSidebarEvent::Close => this.close_details_sidebar(cx),
                 DetailsSidebarEvent::PreferencesChanged(preferences) => {
                     this.settings.details_sidebar_preferences = preferences.clone();
                     this.schedule_save(cx);
@@ -3263,6 +3254,11 @@ impl Shell {
                 }
                 DetailsSidebarEvent::OpenWorkingTreeDiff { path } => {
                     this.focus_working_tree_diff(path.clone(), cx);
+                }
+                // Needs a window for the Browser: opened on the next render.
+                DetailsSidebarEvent::OpenServer { chat_id, server } => {
+                    this.pending_server = Some((chat_id.clone(), server.clone()));
+                    cx.notify();
                 }
                 DetailsSidebarEvent::NewSideChat => this.create_child_chat(None, cx),
                 DetailsSidebarEvent::ForkChat => this.create_side_chat(cx),
@@ -3372,7 +3368,9 @@ impl Shell {
             voice,
             voice_footer_orb,
             voice_stage_orb,
-            voice_composer_orb,
+            voice_widget_orb,
+            voice_widget_hovered: false,
+            voice_widget_focus: cx.focus_handle(),
             voice_caption: zeron_veil::CaptionVeil::new(voice_stage::STAGE_CAPTION_CHARS),
             voice_stage_focus: cx.focus_handle(),
             voice_stage_was_open: false,
@@ -3460,6 +3458,7 @@ impl Shell {
             pull_requests_page: None,
             pull_request_pane: Default::default(),
             pending_pull_request: None,
+            pending_server: None,
             pull_request_cache: Default::default(),
             devices_page: None,
             cloud_page: None,
@@ -3591,6 +3590,7 @@ impl Shell {
             split_viewport: None,
             fit_memo: Default::default(),
             right_images_suspended: false,
+            presented_browser: None,
             sidebar_edge_bounce: None,
             sidebar_resize_edge: None,
             pane_resize_active: None,
@@ -4109,6 +4109,11 @@ impl Shell {
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
+            // The restored destination is a surface coming into view like any
+            // other: a Browser closes Details once, and a destination without
+            // one clears the tracked Browser. Only a Chat switch reaches here,
+            // so a manual reopen on the same Browser survives later updates.
+            self.sync_browser_details(cx);
         }
         match state.read(cx).connection {
             ConnectionStatus::Ready => {
@@ -4269,6 +4274,7 @@ impl Shell {
         if from != to {
             self.right_tween = Some(self.panel_tween(from, to));
         }
+        self.sync_browser_details(cx);
         cx.notify();
     }
 
@@ -4288,7 +4294,13 @@ impl Shell {
         }
     }
 
+    /// Effective Details visibility. The full voice stage (including its
+    /// exit fade) presents no Details body, header or resize target; the
+    /// saved preference and width stay untouched for the return trip.
     fn details_sidebar_open(&self, cx: &App) -> bool {
+        if self.voice_stage_presented(cx) {
+            return false;
+        }
         let has_context = self.details_context(cx).is_some();
         self.settings.details_sidebar_open
             && details_sidebar_available(
@@ -4323,6 +4335,19 @@ impl Shell {
             self.settings.details_sidebar_width,
         )
         .1
+    }
+
+    /// Details' own close: tween out, save the closed preference (its width
+    /// stays), repaint. A no-op when it is already closed.
+    fn close_details_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.details_sidebar_open {
+            return;
+        }
+        let from = self.details_target(cx);
+        self.settings.details_sidebar_open = false;
+        self.details_tween = Some(self.clocked_tween(from, 0.0));
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     fn toggle_details_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -4534,6 +4559,23 @@ impl Shell {
         } else {
             self.show_changes(window, cx);
         }
+        self.sync_browser_details(cx);
+    }
+
+    /// A Browser coming into view gives it and the Chat the room: Details
+    /// closes through its own sequence when a Browser becomes the visible
+    /// surface (the first Browser, a switch to another, or the pane
+    /// reopening onto one). While the same Browser stays visible a manual
+    /// Details reopen is kept. File previews keep Details.
+    fn sync_browser_details(&mut self, cx: &mut Context<Self>) {
+        let shown = match self.resolved_right_active(cx) {
+            RightSurface::Browser(id) if self.right_pane_open(cx) => Some((self.panel_key(cx), id)),
+            _ => None,
+        };
+        if shown.is_some() && shown != self.presented_browser {
+            self.close_details_sidebar(cx);
+        }
+        self.presented_browser = shown;
     }
 
     fn right_terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
@@ -4831,11 +4873,13 @@ impl Shell {
             self.state
                 .update(cx, |state, cx| state.focus_subagent_sync(&doc_id, cx));
         }
-        if self.resolved_right_active(cx) != surface {
+        let previous = self.resolved_right_active(cx);
+        if previous != surface {
             self.suspend_file_images(cx);
         }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
+        self.sync_browser_details(cx);
         if self.right_pane_open(cx) {
             self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
         }
@@ -5093,6 +5137,49 @@ impl Shell {
             self.add_browser_surface(activation.target.navigation.clone().ok(), window, cx);
         }
         outcome
+    }
+
+    /// A Details Servers row: the Chat's own server opens in the internal
+    /// browser through the same routing as a Chat link. A local host follows
+    /// the link preference (an explicit external choice still leaves Zeron);
+    /// a remote host's loopback is reachable only through its preview route,
+    /// so it always opens internally. A stale Chat opens nothing.
+    fn open_chat_server(
+        &mut self,
+        chat_id: &str,
+        server: &zeron_proto::DevServer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::markdown::links::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
+        let remote = {
+            let state = self.state.read(cx);
+            if self.active_chat != chat_id || state.selected_chat.as_deref() != Some(chat_id) {
+                return;
+            }
+            state.selected_chat_row().is_some_and(|chat| {
+                Some(chat.device_id.as_str()) != state.local_device_id.as_deref()
+            })
+        };
+        if !remote {
+            let url = format!("http://127.0.0.1:{}", server.port);
+            let activation = LinkActivation {
+                target: LinkTarget::new(&url, &url),
+                action: LinkAction::Primary,
+                source_session: Some(chat_id.to_owned()),
+            };
+            if let LinkOutcome::External(url) = self.activate_session_link(&activation, window, cx)
+            {
+                cx.open_url(&url);
+            }
+            return;
+        }
+        self.add_browser_surface(None, window, cx);
+        if let RightSurface::Browser(id) = self.resolved_right_active(cx)
+            && let Some(browser) = self.browsers.get(&id).cloned()
+        {
+            browser.update(cx, |browser, cx| browser.open_server(server, window, cx));
+        }
     }
 
     fn sync_browser_profile(&mut self, cx: &mut Context<Self>) {
@@ -13696,7 +13783,6 @@ impl Shell {
                         .absolute()
                         .inset_0(),
                     )
-                    .children(self.render_voice_composer_orb(composer_width, cx))
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
                         let composer_opacity = self.composer_dock.borrow().opacity();
@@ -14221,6 +14307,13 @@ impl Shell {
         )
     }
 
+    fn details_visible_width(&self, cx: &App) -> f32 {
+        let target = self.details_target(cx);
+        crate::voice_surfaces::painted_details_width(target, || {
+            self.eval_tween(self.details_tween, target)
+        })
+    }
+
     fn render_details_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let target = self.details_target(cx);
         if target <= 0.5 {
@@ -14244,10 +14337,12 @@ impl Shell {
         // Animated width container: tweens on collapse/expand and clips the
         // inner so content never reflows mid-transition.
         div()
+            .id("details-sidebar-column")
+            .debug_selector(|| "details-sidebar-column".into())
             .h_full()
             .flex_none()
             .overflow_hidden()
-            .w(px(self.eval_tween(self.details_tween, target)))
+            .w(px(self.details_visible_width(cx)))
             .child(
                 div()
                     .h_full()
@@ -14270,6 +14365,8 @@ impl Shell {
             .update(cx, |sidebar, cx| sidebar.render_shell_header(cx));
         Some(
             div()
+                .id("details-header-overlay")
+                .debug_selector(|| "details-header-overlay".into())
                 .absolute()
                 .top_0()
                 .right_0()
@@ -15487,6 +15584,7 @@ impl Render for Shell {
         }
         settings::wallpaper::preload(cx);
         self.sync_voice_stage(window, cx);
+        self.sync_voice_orbs(cx);
         // Settings → Cloud lives only while shown: dropping it cancels a
         // GitHub sign-in poll and its slow status re-checks.
         if self.cloud_page.is_some() && self.route != Route::Settings(SettingsSection::Cloud) {
@@ -15629,6 +15727,13 @@ impl Render for Shell {
             0.0
         });
         let selected_surface = self.resolved_right_active(cx);
+        // The live-call widget's band along the bottom stays GPUI.
+        let widget_band = px(self
+            .voice_widget_placement(f32::from(window.viewport_size().width), cx)
+            .native_band);
+        self.file_preview.update(cx, |preview, cx| {
+            preview.set_bottom_reserve(f32::from(widget_band), cx)
+        });
         for (id, browser) in &self.browsers {
             let presentation = crate::browser::model::presentation(
                 browser_active && selected_surface == RightSurface::Browser(*id),
@@ -15639,6 +15744,7 @@ impl Render for Shell {
                 browser.set_resize_inset(browser_resize_inset, cx);
                 #[cfg(any(target_os = "macos", windows))]
                 browser.set_right_occlusion(browser_overlay_width, cx);
+                browser.set_bottom_occlusion(widget_band, cx);
                 browser.set_shortcuts(&self.settings.keymap);
                 browser.set_presentation(presentation, cx);
             });
@@ -16137,6 +16243,7 @@ impl Render for Shell {
                     let settings_page = self.render_settings_page(section, window, cx);
                     // A call started from Settings opens its stage here too.
                     let voice_stage = self.render_voice_stage(window, cx);
+                    let voice_widget = self.render_voice_widget(window, cx);
                     let overlays = self.render_overlays(window.viewport_size(), window, cx);
                     let border_color = Theme::of(cx).border;
                     let window_corner = Self::window_corner_radius(window);
@@ -16170,6 +16277,7 @@ impl Render for Shell {
                         .child(settings_page)
                         .children(voice_stage)
                         .child(drag)
+                        .children(voice_widget)
                         .children(overlays);
                     break 'ready root
                         .child(sidebar_tone)
@@ -16179,6 +16287,9 @@ impl Render for Shell {
                 // side pane: opened pull requests as tabs beside the board.
                 let on_chat = matches!(self.route, Route::Chat);
                 let on_pull_requests = matches!(self.route, Route::PullRequests);
+                if let Some((chat_id, server)) = self.pending_server.take() {
+                    self.open_chat_server(&chat_id, &server, window, cx);
+                }
                 if on_pull_requests && let Some((url, device)) = self.pending_pull_request.take() {
                     self.show_pull_request_detail(url, device, window, cx);
                 }
@@ -16302,6 +16413,9 @@ impl Render for Shell {
                 // Full-window voice stage: above the page chrome, below dialogs.
                 let voice_stage = self.render_voice_stage(window, cx);
                 let under_stage = self.voice_stage_underlay_opacity(cx);
+                // The compact call controls follow the call, not the chat:
+                // above the page and its chrome, below dialogs and toasts.
+                let voice_widget = self.render_voice_widget(window, cx);
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
                 // No inset cards (user request): the conversation column sits
@@ -16452,6 +16566,7 @@ impl Render for Shell {
                     .children(voice_stage)
                     .child(self.render_titlebar_cluster(cx))
                     .children(self.render_sidebar_options_titlebar(cx))
+                    .children(voice_widget)
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))

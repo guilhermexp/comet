@@ -360,13 +360,17 @@ impl HostedSessionManifest {
     }
 
     pub fn browser_mcp_enabled(&self) -> bool {
-        self.browser_mcp_enabled
-            .unwrap_or(self.browser_client_registered)
+        !crate::embedding::legacy_engines_retired()
+            && self
+                .browser_mcp_enabled
+                .unwrap_or(self.browser_client_registered)
     }
 
     pub fn computer_mcp_enabled(&self) -> bool {
-        self.computer_mcp_enabled
-            .unwrap_or(self.computer_client_registered)
+        !crate::embedding::legacy_engines_retired()
+            && self
+                .computer_mcp_enabled
+                .unwrap_or(self.computer_client_registered)
     }
 }
 

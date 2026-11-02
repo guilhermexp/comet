@@ -398,8 +398,8 @@ pub async fn connect_ipc(
     connect_ipc_url(&format!("ws://127.0.0.1:{port}"), data_dir).await
 }
 
-/// [`connect_ipc`] for a full engine IPC URL (the fork's Workers and
-/// `comet-sessions` servers receive the endpoint, not the port).
+/// [`connect_ipc`] for a full engine IPC URL (the fork's Workers and chat
+/// MCP servers receive the endpoint, not the port).
 pub async fn connect_ipc_url(
     url: &str,
     data_dir: Option<&std::path::Path>,

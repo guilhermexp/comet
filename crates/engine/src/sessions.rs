@@ -409,7 +409,7 @@ struct Inner {
     turn_listener: OnceLock<TurnListener>,
     restart_gate: Mutex<Option<zeron_update::RestartGate>>,
     /// Bound local IPC endpoint (`ws://127.0.0.1:<port>`). Empty when this
-    /// process lost the bind, so `comet-sessions` is not pointed at another engine.
+    /// process lost the bind, so the `zeron` chat MCP is not pointed at another engine.
     local_ipc: Mutex<Option<String>>,
     #[cfg(test)]
     admission_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -425,15 +425,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Lineage of a chat as far as the engine could read its row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatOrigin {
-    /// Row read, no `origin_chat_id`: a human-opened chat.
+    /// Row read, neither `origin_chat_id` nor `parent_chat_id`: a
+    /// human-opened chat.
     Root,
-    /// Row read, opened by `sessions`.
+    /// Row read, opened by another Chat (`create_chat` either mode, or a UI
+    /// side chat).
     Spawned,
     /// No doc host, no row or a read error.
     Unknown,
 }
 
-/// Engine authority for `comet-sessions`. Client values are discarded.
+/// Engine authority for the root-only `zeron` chat MCP. Client values are
+/// discarded.
 pub(crate) fn stamp_sessions(
     request: &mut RunRequest,
     chat_id: &str,
@@ -592,8 +595,7 @@ impl SessionsEngine {
     /// The injected MCP server gets `ZERON_IPC_TOKEN_FILE` and reads the file
     /// at dial time, so it follows token rotation across engine restarts.
     pub fn set_ipc_token_file(&self, path: std::path::PathBuf) {
-        // The fork's grant-built servers (`comet-workers`, `comet-sessions`,
-        // `zeron`) dial this engine's IPC and present this bearer.
+        // The fork's grant-built servers (`comet-workers`, `zeron`) dial this engine's IPC and present this bearer.
         zeron_harness::note_workers_ipc_token_file(&path);
         *lock(&self.inner.ipc_token_file) = Some(path);
     }

@@ -1072,6 +1072,90 @@ mod composer_tests {
             .unwrap()
     }
 
+    /// C1: a long paste's card renders INSIDE the composer chrome, above the
+    /// editable text, and the chrome grows to hold it — never overlapping the
+    /// Todo tray above or the actions — in narrow and wide composers, with an
+    /// empty or typed draft and several cards. The full text stays staged.
+    #[gpui::test]
+    fn pasted_text_card_sits_inside_the_composer_below_the_todo(cx: &mut gpui::TestAppContext) {
+        use gpui::Bounds;
+        let (_dir, state, handle) = window(cx);
+        show_todo(
+            &state,
+            &handle,
+            "a",
+            vec![assistant_with_todo(items(12, 16))],
+            cx,
+        );
+        let pasted = format!("# Entender Projeto\n{}", "linha de contexto\n".repeat(2000));
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.stage_long_paste_for_test(pasted.clone(), cx)
+            })
+            .unwrap();
+        let contains = |outer: Bounds<gpui::Pixels>, inner: Bounds<gpui::Pixels>| {
+            inner.left() >= outer.left()
+                && inner.right() <= outer.right()
+                && inner.top() >= outer.top()
+                && inner.bottom() <= outer.bottom()
+        };
+        let disjoint = |a: Bounds<gpui::Pixels>, b: Bounds<gpui::Pixels>| {
+            a.bottom() <= b.top() || b.bottom() <= a.top()
+        };
+        for (width, typed, cards) in [
+            (360.0, "", 1),
+            (760.0, "sim pode fazer, dps ja faz um teste real", 1),
+            (360.0, "uma linha\nduas linhas\ntres linhas", 3),
+            (760.0, "", 3),
+        ] {
+            handle
+                .update(cx, |composer, _, cx| {
+                    composer.set_available_width(width, cx);
+                    while composer.staged().len() < cards {
+                        composer.stage_long_paste_for_test(format!("extra {width}\n{pasted}"), cx);
+                    }
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text(typed, cx));
+                })
+                .unwrap();
+            for _ in 0..2 {
+                cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                    .unwrap();
+            }
+            let bounds = |selector: &'static str, cx: &mut gpui::TestAppContext| {
+                gpui::VisualTestContext::from_window(handle.into(), cx)
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} rendered"))
+            };
+            let pill = bounds("composer-pill", cx);
+            let strip = bounds("composer-attachment-strip", cx);
+            let input = bounds("composer-input-frame", cx);
+            let todo = bounds("composer-todo-tray", cx);
+            let case = format!("{width}px, {cards} card(s), typed {typed:?}");
+            assert!(contains(pill, strip), "card inside the composer: {case}");
+            assert!(contains(pill, input), "{case}");
+            assert!(strip.bottom() <= input.top(), "card above the text: {case}");
+            assert!(
+                disjoint(todo, pill),
+                "no overlap with the Todo tray: {case}"
+            );
+            assert!(todo.bottom() <= pill.top(), "{case}");
+        }
+        // The staged card still carries the whole paste for send.
+        handle
+            .read_with(cx, |composer, _| {
+                let staged = composer.staged();
+                assert!(staged.len() >= 3);
+                assert!(staged.iter().any(|att| matches!(
+                    &att.content,
+                    crate::attachments::AttachmentContent::File(bytes)
+                        if bytes.as_slice() == pasted.as_bytes()
+                )));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn tray_appears_only_when_the_chat_has_a_todo(cx: &mut gpui::TestAppContext) {
         let (_dir, state, handle) = window(cx);

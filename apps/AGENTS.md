@@ -22,7 +22,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 - Bind da porta é best-effort: porta ocupada não impede a janela de abrir, só perde a capacidade de hospedar peers.
 - **Modo headless**: só engine; imprime URL de sign-in no TTY (fluxo de paste-code), serve IPC em localhost e hospeda o próprio DeviceRoom.
 - Subcomandos vivem em arquivos separados (`auth_cli.rs`, `update_cli.rs`, `daemon.rs`) — `main.rs` só despacha.
-- `zeron __sessions_mcp__` é interceptado em `main` antes do parse de CLI e do host de workers, e delega para `zeron-sessions-mcp`. Argumento extra recusa com usage. Não é subcomando clap.
+- `comet-sessions`/`zeron __sessions_mcp__` foi retirado (change `consolidate-chat-creation`): a criação de Chat por agentes é só `zeron mcp` `create_chat` (modos `configured`/`inherit`). Não reintroduzir o entry point.
 - `zeron mcp` usa um runtime Tokio de dois workers por bridge de agente; não
   dimensionar cada bridge pelo número de cores. Grants continuam definidos
   pelo orquestrador raiz na engine/harness, não por esse sizing.

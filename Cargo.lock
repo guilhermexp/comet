@@ -13701,7 +13701,6 @@ dependencies = [
  "zeron-mcp",
  "zeron-proto",
  "zeron-rpc",
- "zeron-sessions-mcp",
  "zeron-theme",
  "zeron-ui",
  "zeron-update",
@@ -13990,16 +13989,6 @@ dependencies = [
  "zeron-doc",
  "zeron-proto",
  "zeron-sync",
-]
-
-[[package]]
-name = "zeron-sessions-mcp"
-version = "1.0.13"
-dependencies = [
- "serde_json",
- "tokio",
- "zeron-proto",
- "zeron-rpc",
 ]
 
 [[package]]

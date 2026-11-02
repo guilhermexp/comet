@@ -524,8 +524,8 @@ impl EngineCore {
         zeron_rpc::HostRelay::spawn(config, service, on_nudge)
     }
 
-    /// Remember the IPC endpoint this process bound. `comet-sessions` is
-    /// granted only after this call; a lost bind leaves the tool off.
+    /// Remember the IPC endpoint this process bound. The `zeron` chat MCP
+    /// is granted only after this call; a lost bind leaves the tool off.
     pub fn note_local_ipc(&self, endpoint: &str) {
         self.sessions.note_local_ipc(endpoint);
     }

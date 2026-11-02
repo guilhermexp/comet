@@ -261,6 +261,9 @@ impl Orb {
             if !visible {
                 self.animator.stop(Instant::now());
                 self.animator.cancel_transition();
+                // The documented gate: a hidden orb keeps no timer in flight,
+                // even when its host stops rendering it this very frame.
+                self.tick = None;
             }
             self.geometry_dirty = true;
             cx.notify();
@@ -301,6 +304,11 @@ impl Orb {
 
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// Whether an animation tick is scheduled (hosts prove hidden orbs idle).
+    pub fn has_pending_tick(&self) -> bool {
+        self.tick.is_some()
     }
 
     /// Ink direction, resolved against the installed bezel appearance —

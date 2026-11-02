@@ -259,7 +259,17 @@ impl VoiceController {
     pub fn muted(&self) -> bool {
         self.snapshot.as_ref().is_some_and(|s| s.muted)
     }
+    /// Mute is meaningful only once the provider reported the call's audio
+    /// state and the control channel is up; before that a toggle would
+    /// claim a change nothing applied.
+    pub fn can_mute(&self) -> bool {
+        self.snapshot.is_some() && self.controls.is_some()
+    }
+
     pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        if !self.can_mute() {
+            return;
+        }
         let muted = self.muted();
         if let Some(snapshot) = &mut self.snapshot {
             snapshot.muted = !muted;
@@ -271,6 +281,15 @@ impl VoiceController {
                 self.reason = Some(VoiceRejection::Overflow);
             }
         }
+    }
+
+    /// Test seam: a control channel as `start` would open, without a
+    /// provider behind it.
+    #[cfg(test)]
+    pub(crate) fn attach_test_controls(&mut self) -> tokio::sync::mpsc::Receiver<VoiceControl> {
+        let (controls, rx) = tokio::sync::mpsc::channel(8);
+        self.controls = Some(controls);
+        rx
     }
 
     /// The utterance the caption shows (a speaker turn), if the provider names it.

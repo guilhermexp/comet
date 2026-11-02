@@ -6,18 +6,27 @@
 use super::*;
 use zeron_proto::voice::{VoicePhase, VoiceWork};
 
-/// The stage paints the hero preset magnified to fill the canvas.
-pub(super) const VOICE_STAGE_ORB_SCALE: f32 = 2.25;
-/// Stage orb footprint, including breathing room around the artwork.
-const STAGE_ORB_BOX: f32 = 128.0 * VOICE_STAGE_ORB_SCALE + 112.0;
+// Geometry and presenters are shared with the hermetic review fixture.
+use crate::voice_surfaces::VOICE_STAGE_ORB_SCALE;
+use crate::voice_surfaces::{
+    VoiceCallBarProps, VoiceCommand, VoiceCommands, VoiceStageProps, VoiceWidgetPlacement,
+    VoiceWidgetProps, tooltip as stage_tooltip,
+};
 const STAGE_ENTER_MS: f32 = 460.0;
 const STAGE_EXIT_MS: f32 = 220.0;
 /// Captions show the tail of a long utterance rather than wrapping off-stage.
 pub(super) const STAGE_CAPTION_CHARS: usize = 160;
 const FOOTER_HOVER: &str = "voice-footer-orb";
-/// Call-bar geometry: round controls inside a floating pill.
-const BAR_CONTROL: f32 = 44.0;
-const BAR_PAD: f32 = 8.0;
+
+/// Which voice-orb presentations are on screen: the sidebar trigger, the
+/// full stage and the compact widget. One predicate feeds both the
+/// presenters and the per-frame sync, so a hidden orb never keeps ticking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VoiceOrbsShown {
+    pub footer: bool,
+    pub stage: bool,
+    pub widget: bool,
+}
 
 /// Stage visibility for a transition that flipped `elapsed_ms` ago.
 pub(super) fn stage_reveal(open: bool, elapsed_ms: f32, reduced: bool) -> f32 {
@@ -88,6 +97,52 @@ impl Shell {
             .update(cx, |voice, cx| voice.set_stage_open(open, cx));
     }
 
+    /// The stage covers the page, including its exit fade.
+    pub(super) fn voice_stage_presented(&self, cx: &App) -> bool {
+        self.voice_stage_reveal(cx) > 0.001
+    }
+
+    /// The compact call widget: a live call whose stage is not presented.
+    pub(super) fn voice_widget_shown(&self, cx: &App) -> bool {
+        self.voice.read(cx).is_live() && !self.voice_stage_presented(cx)
+    }
+
+    pub(super) fn voice_orbs_shown(&self, cx: &App) -> VoiceOrbsShown {
+        if !settings::current(cx).voice_orb_enabled {
+            return VoiceOrbsShown {
+                footer: false,
+                stage: false,
+                widget: false,
+            };
+        }
+        let voice = self.voice.read(cx);
+        // The trigger lives in the orchestrator sidebar footer (and the
+        // Settings page's own footer); a collapsed sidebar shows neither.
+        let footer_displayed = match self.route {
+            Route::Settings(_) => self.sidebar_mode == SidebarMode::Orchestrator,
+            _ => self.sidebar_mode.shows_orchestrator_content() && self.sidebar_now() > 0.5,
+        };
+        VoiceOrbsShown {
+            footer: voice.is_live() && footer_displayed,
+            stage: voice.stage_open,
+            widget: self.voice_widget_shown(cx),
+        }
+    }
+
+    /// Hide every orb whose presentation is not on screen this frame —
+    /// collapsed sidebar, closed stage, preference off — so retained
+    /// entities drop their animation timers even when no presenter runs.
+    pub(super) fn sync_voice_orbs(&mut self, cx: &mut Context<Self>) {
+        let shown = self.voice_orbs_shown(cx);
+        for (orb, visible) in [
+            (self.voice_footer_orb.clone(), shown.footer),
+            (self.voice_stage_orb.clone(), shown.stage),
+            (self.voice_widget_orb.clone(), shown.widget),
+        ] {
+            orb.update(cx, |orb, cx| orb.set_visible(visible, cx));
+        }
+    }
+
     /// Track stage open/close flips for the transition clock and hand focus
     /// over: the stage owns the keyboard while it is up. Navigating to
     /// another thread or to Settings steps the stage aside; voice continues.
@@ -143,8 +198,9 @@ impl Shell {
             voice.speaker_level(),
         );
         let reduced = self.reduced_motion;
+        let orb_shown = self.voice_orbs_shown(cx).footer;
         self.voice_footer_orb.update(cx, |orb, cx| {
-            orb.set_visible(live, cx);
+            orb.set_visible(orb_shown, cx);
             orb.set_state(orb_state, cx);
             orb.set_audio_levels(microphone, speaker, cx);
             orb.set_reduced_motion(reduced, cx);
@@ -186,7 +242,15 @@ impl Shell {
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.set_voice_stage_open(!stage_open, cx)),
                 )
-                .child(self.voice_footer_orb.clone())
+                .child(if orb_shown {
+                    self.voice_footer_orb.clone().into_any_element()
+                } else {
+                    // Orbs off: a static, identified way back to the call.
+                    icon(icons::MICROPHONE)
+                        .size(px(15.0))
+                        .text_color(theme.success)
+                        .into_any_element()
+                })
                 .into_any_element()
                 .into();
         }
@@ -275,60 +339,6 @@ impl Shell {
             .into()
     }
 
-    /// The live orb above the orchestrator chat's composer. Every other chat
-    /// keeps its plain composer; pressing the orb returns to the stage.
-    pub(super) fn render_voice_composer_orb(
-        &mut self,
-        composer_width: f32,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let voice = self.voice.read(cx);
-        let shown = matches!(self.route, Route::Chat)
-            && voice.is_live()
-            && voice.chat_id.is_some()
-            && voice.chat_id == self.state.read(cx).selected_chat;
-        let (orb_state, microphone, speaker) = (
-            voice.orb_state(),
-            voice.microphone_level(),
-            voice.speaker_level(),
-        );
-        let reduced = self.reduced_motion;
-        self.voice_composer_orb.update(cx, |orb, cx| {
-            orb.set_visible(shown, cx);
-            orb.set_state(orb_state, cx);
-            orb.set_audio_levels(microphone, speaker, cx);
-            orb.set_reduced_motion(reduced, cx);
-        });
-        if !shown {
-            return None;
-        }
-        let orb = div()
-            .id("voice-composer-orb")
-            .debug_selector(|| "voice-composer-orb".into())
-            .role(gpui::Role::Button)
-            .aria_label("Open voice")
-            .tab_index(0)
-            .rounded_full()
-            .cursor_pointer()
-            .tooltip(stage_tooltip("Open voice"))
-            .on_click(cx.listener(|this, _, _, cx| this.set_voice_stage_open(true, cx)))
-            .child(self.voice_composer_orb.clone());
-        Some(
-            motion::fade_in(
-                "voice-composer-orb-in",
-                div()
-                    .w_full()
-                    .max_w(px(composer_width))
-                    .mx_auto()
-                    .pb(px(4.0))
-                    .flex()
-                    .justify_center()
-                    .child(orb),
-            )
-            .into_any_element(),
-        )
-    }
-
     /// How far the stage has arrived: 0 hidden, 1 fully covering the page.
     pub(super) fn voice_stage_reveal(&self, cx: &App) -> f32 {
         let elapsed = self
@@ -355,7 +365,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let open = self.voice.read(cx).stage_open;
         let reveal = self.voice_stage_reveal(cx);
         if reveal > 0.0 && reveal < 1.0 {
             self.motion_active.set(true);
@@ -376,8 +385,9 @@ impl Shell {
             .as_ref()
             .is_some_and(|s| s.work == VoiceWork::AwaitingInput);
         let reduced = self.reduced_motion;
+        let orb_shown = self.voice_orbs_shown(cx).stage;
         self.voice_stage_orb.update(cx, |orb, cx| {
-            orb.set_visible(open, cx);
+            orb.set_visible(orb_shown, cx);
             orb.set_state(orb_state, cx);
             orb.set_audio_levels(microphone, speaker, cx);
             orb.set_reduced_motion(reduced, cx);
@@ -456,46 +466,27 @@ impl Shell {
                 )
         });
 
-        let orb_block = div()
-            .relative()
-            .size(px(STAGE_ORB_BOX))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(self.voice_stage_orb.clone());
-
-        let center = div()
-            .relative()
-            .top(px(18.0 * (1.0 - reveal)))
-            .flex()
-            .flex_col()
-            .items_center()
-            .child(orb_block)
-            .child(
-                div()
-                    .relative()
-                    .mt(px(10.0))
-                    .w(px(560.0))
-                    .max_w(px((width - 48.0).max(200.0)))
-                    .h(px(48.0))
-                    .overflow_hidden()
-                    .text_center()
-                    .text_size(crate::typography::ui_rems(14.0))
-                    .line_height(px(22.0))
-                    .text_color(theme.text_muted)
-                    .child(veiled_caption(caption.text, &caption.spans, &theme, window))
-                    .children(caption.previous.map(|(previous, opacity)| {
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .opacity(opacity)
-                            .child(previous)
-                    })),
-            );
-
-        let controls = self.render_voice_call_bar(&theme, awaiting, chat_id, cx);
+        // Orbs off: no orb and no orb-sized placeholder; the caption and
+        // the call bar carry the stage on their own.
+        let orb = settings::current(cx)
+            .voice_orb_enabled
+            .then(|| self.voice_stage_orb.clone().into_any_element());
+        let commands = self.voice_commands(cx);
+        let voice = self.voice.read(cx);
+        let controls = crate::voice_surfaces::voice_call_bar(
+            &theme,
+            VoiceCallBarProps {
+                muted: voice.muted(),
+                can_mute: voice.can_mute(),
+                awaiting,
+                elapsed: voice
+                    .active_since
+                    .map(|since| crate::voice::format_elapsed(since.elapsed().as_secs())),
+                host_name: voice.host_name.clone().map(SharedString::from),
+                transcript: chat_id.is_some(),
+            },
+            &commands,
+        );
         // The stage occludes the conversation titlebar. Restore its native
         // drag and double-click behavior above the stage artwork and controls.
         let titlebar = self.titlebar_drag_region(
@@ -508,274 +499,150 @@ impl Shell {
                 .h(px(Theme::TITLEBAR_HEIGHT)),
             cx,
         );
+        Some(crate::voice_surfaces::voice_stage(
+            &theme,
+            VoiceStageProps {
+                reveal,
+                left,
+                width,
+                focus: self.voice_stage_focus.clone(),
+                hero: hero.map(IntoElement::into_any_element),
+                orb,
+                caption: crate::voice_surfaces::veiled_caption(
+                    caption.text,
+                    &caption.spans,
+                    &theme,
+                    window,
+                ),
+                previous_caption: caption
+                    .previous
+                    .map(|(previous, opacity)| (previous.into_any_element(), opacity)),
+                controls,
+                titlebar: titlebar.into_any_element(),
+            },
+            &commands,
+        ))
+    }
 
-        Some(
-            div()
-                .id("voice-stage")
-                .debug_selector(|| "voice-stage".into())
-                .track_focus(&self.voice_stage_focus)
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .left(px(left))
-                .occlude()
-                .opacity(reveal)
-                // On glass the stage shows the window frost like the new-thread
-                // page; the page beneath fades out instead (see `render`).
-                .when(!theme.is_glass(), |stage| stage.bg(theme.bg))
-                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                    let key = event.keystroke.key.as_str();
-                    let plain = !event.keystroke.modifiers.modified();
-                    if key == "escape" {
-                        this.set_voice_stage_open(false, cx);
-                        cx.stop_propagation();
-                    } else if key == "m" && plain {
-                        this.voice.update(cx, |voice, cx| voice.toggle_mute(cx));
-                        cx.stop_propagation();
-                    }
-                }))
-                .child(div().absolute().inset_0().children(hero))
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .pb(px(64.0))
-                        .child(center),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom(px(32.0 - 16.0 * (1.0 - reveal)))
-                        .flex()
-                        .justify_center()
-                        .child(controls),
-                )
-                .child(titlebar)
-                .into_any_element(),
+    /// The Shell's handler for every voice-surface intent: the presenters
+    /// hold no state, they only report what the user asked for.
+    pub(super) fn voice_commands(&self, cx: &mut Context<Self>) -> VoiceCommands {
+        let shell = cx.entity().downgrade();
+        std::rc::Rc::new(move |command, _window, cx| {
+            shell
+                .update(cx, |shell, cx| shell.apply_voice_command(command, cx))
+                .ok();
+        })
+    }
+
+    fn apply_voice_command(&mut self, command: VoiceCommand, cx: &mut Context<Self>) {
+        match command {
+            VoiceCommand::ToggleMute => self.voice.update(cx, |voice, cx| voice.toggle_mute(cx)),
+            VoiceCommand::OpenStage => self.set_voice_stage_open(true, cx),
+            VoiceCommand::CloseStage => self.set_voice_stage_open(false, cx),
+            VoiceCommand::End => self.end_voice(cx),
+            VoiceCommand::OpenTranscript => {
+                if let Some(chat_id) = self.voice.read(cx).chat_id.clone() {
+                    self.open_chat(chat_id, cx);
+                }
+            }
+            VoiceCommand::WidgetHover(hovered) => {
+                if self.voice_widget_hovered != hovered {
+                    self.voice_widget_hovered = hovered;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Where the widget sits and which bottom band native views must leave
+    /// uncovered. Native views (the Browser's web view, rich file previews)
+    /// paint above GPUI content: the widget moves beside them when the
+    /// window holds it, and otherwise keeps the corner with its band cropped
+    /// out of the native view (painting and hit testing), never under it.
+    pub(super) fn voice_widget_placement(
+        &self,
+        viewport_width: f32,
+        cx: &App,
+    ) -> VoiceWidgetPlacement {
+        crate::voice_surfaces::voice_widget_placement(
+            self.voice_widget_shown(cx),
+            viewport_width,
+            self.voice_widget_right_inset(cx),
         )
     }
 
-    /// Video-call style bar: session time, the call controls grouped around
-    /// a red hang-up, and the way back to the chats.
-    fn render_voice_call_bar(
-        &mut self,
-        theme: &Theme,
-        awaiting: bool,
-        chat_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let popup = theme.for_popup();
-        let voice = self.voice.read(cx);
-        let muted = voice.muted();
-        let elapsed = voice
-            .active_since
-            .map(|since| crate::voice::format_elapsed(since.elapsed().as_secs()));
-        let live_tone = if awaiting {
-            popup.warning
-        } else if muted {
-            popup.text_faint
-        } else {
-            popup.success
-        };
-
-        // Session clock, like a meeting's running time.
-        let clock = div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .pl(px(10.0))
-            .pr(px(6.0))
-            .child(div().size(px(7.0)).rounded_full().bg(live_tone))
-            .child(
-                div()
-                    .min_w(px(40.0))
-                    .font_family(popup.font_mono.clone())
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .text_color(popup.text_muted)
-                    .child(SharedString::from(elapsed.unwrap_or_else(|| "–:––".into()))),
+    /// The native view's occupancy follows its animated visible width, not
+    /// whether the pane is (still) shown: a pane closing, or slid out by the
+    /// fit, keeps presenting the page until its width reaches zero, and the
+    /// widget and the native crop must account for it on every such frame.
+    fn voice_widget_right_inset(&self, cx: &App) -> f32 {
+        let native = matches!(self.route, Route::Chat)
+            && matches!(
+                self.resolved_right_active(cx),
+                RightSurface::Browser(_) | RightSurface::Preview(_)
             );
-
-        let clock = clock.children(voice.host_name.clone().map(|name| {
-            div()
-                .text_size(crate::typography::ui_rems(12.0))
-                .text_color(popup.text_faint)
-                .child(name)
-        }));
-
-        // Microphone: inverted plate while muted.
-        let mic = round_control("voice-bar-mic", &popup, muted)
-            .aria_label(if muted {
-                "Unmute microphone"
-            } else {
-                "Mute microphone"
-            })
-            .tooltip(stage_tooltip(if muted {
-                "Unmute · M"
-            } else {
-                "Mute · M"
-            }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.voice.update(cx, |voice, cx| voice.toggle_mute(cx))
-            }))
-            .child(
-                icon(if muted {
-                    icons::MICROPHONE_OFF
-                } else {
-                    icons::MICROPHONE
-                })
-                .size(px(19.0))
-                .text_color(if muted { popup.on_solid } else { popup.text }),
-            );
-
-        let transcript = chat_id.map(|chat_id| {
-            round_control("voice-bar-transcript", &popup, false)
-                .aria_label(if awaiting {
-                    "Answer Codex in the transcript"
-                } else {
-                    "Open the voice transcript"
-                })
-                .tooltip(stage_tooltip(if awaiting {
-                    "Codex is asking you something"
-                } else {
-                    "Transcript"
-                }))
-                .on_click(cx.listener(move |this, _, _, cx| this.open_chat(chat_id.clone(), cx)))
-                .child(
-                    icon(icons::CHAT_ROUND_LINE)
-                        .size(px(19.0))
-                        .text_color(if awaiting { popup.warning } else { popup.text }),
-                )
-                .when(awaiting, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .top(px(9.0))
-                            .right(px(9.0))
-                            .size(px(8.0))
-                            .rounded_full()
-                            .border_2()
-                            .border_color(popover::surface_bg(&popup))
-                            .bg(popup.warning),
-                    )
-                })
-        });
-
-        // The hang-up: the one saturated control, wide enough to never be
-        // mistaken for its neighbours.
-        let end = div()
-            .id("voice-bar-end")
-            .role(gpui::Role::Button)
-            .aria_label("End voice")
-            .tab_index(0)
-            .h(px(BAR_CONTROL))
-            .px(px(20.0))
-            .rounded_full()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .cursor_pointer()
-            .bg(motion::hover_blend(
-                "voice-bar-end",
-                popup.danger,
-                popup.danger.blend(gpui::black().opacity(0.14)),
-            ))
-            .on_hover(motion::hover_listener("voice-bar-end"))
-            .focus_visible(|s| s.border_2().border_color(popup.accent))
-            .tooltip(stage_tooltip("End voice"))
-            .on_click(cx.listener(|this, _, _, cx| this.end_voice(cx)))
-            .child(
-                icon(icons::PHONE_HANG_UP)
-                    .size(px(19.0))
-                    .text_color(gpui::white()),
-            )
-            .child(
-                div()
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(gpui::white())
-                    .child(SharedString::from("End")),
-            );
-
-        let back = round_control("voice-bar-back", &popup, false)
-            .aria_label("Back to chats")
-            .tooltip(stage_tooltip("Back to chats · Esc"))
-            .on_click(cx.listener(|this, _, _, cx| this.set_voice_stage_open(false, cx)))
-            .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(19.0))
-                    .text_color(popup.text_muted),
-            );
-
-        let divider = || div().w(px(1.0)).h(px(24.0)).mx(px(4.0)).bg(popup.border);
-        let radius = BAR_CONTROL / 2.0 + BAR_PAD;
-        let bar = div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .p(px(BAR_PAD))
-            .rounded(px(radius))
-            .border_1()
-            .border_color(popup.border.opacity(0.7))
-            .bg(popover::surface_bg(&popup))
-            .when(!popup.is_frost(), |el| el.shadow_lg())
-            .text_color(popup.text)
-            .child(clock)
-            .child(divider())
-            .child(mic)
-            .children(transcript)
-            .child(end)
-            .child(divider())
-            .child(back);
-        crate::frost::frosted(radius, 18.0, bar).into_any_element()
+        if !native {
+            return 0.0;
+        }
+        crate::voice_surfaces::native_right_inset(
+            true,
+            self.right_visible_width(cx),
+            self.files_visible_width(cx) + self.details_visible_width(cx),
+        )
     }
-}
 
-/// The caption with its fading words recolored, paint-only (`apply_veil`).
-fn veiled_caption(
-    text: String,
-    spans: &[zeron_veil::VeilSpan],
-    theme: &Theme,
-    window: &Window,
-) -> gpui::StyledText {
-    let mut run = window.text_style().to_run(text.len());
-    run.color = theme.text_muted;
-    let runs = crate::markdown::veil::apply_veil(vec![run], spans);
-    gpui::StyledText::new(text).with_runs(runs)
-}
+    /// The compact live-call widget: one capsule 16px from the window's
+    /// lower-right corner while a call is live and its stage is hidden, on
+    /// any Chat, Workers or Settings route. It drives the same
+    /// `VoiceController` as the stage: mute, return to the stage and hang
+    /// up. Hang-up owns a fixed slot revealed by hovering the capsule or
+    /// focusing any of its controls, so no target moves or changes meaning.
+    pub(super) fn render_voice_widget(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let shown = self.voice_widget_shown(cx);
+        let orb_shown = self.voice_orbs_shown(cx).widget;
+        let voice = self.voice.read(cx);
+        let (orb_state, microphone, speaker) = (
+            voice.orb_state(),
+            voice.microphone_level(),
+            voice.speaker_level(),
+        );
+        let (muted, can_mute) = (voice.muted(), voice.can_mute());
+        let reduced = self.reduced_motion;
+        self.voice_widget_orb.update(cx, |orb, cx| {
+            orb.set_visible(orb_shown, cx);
+            orb.set_state(orb_state, cx);
+            orb.set_audio_levels(microphone, speaker, cx);
+            orb.set_reduced_motion(reduced, cx);
+        });
+        if !shown {
+            self.voice_widget_hovered = false;
+            return None;
+        }
 
-fn stage_tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
-    move |_, cx| cx.new(|_| SurfaceTabTooltip { text: text.into() }).into()
-}
-
-/// A round call-bar control; `active` inverts it onto the solid plate.
-fn round_control(id: &'static str, theme: &Theme, active: bool) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .role(gpui::Role::Button)
-        .tab_index(0)
-        .relative()
-        .size(px(BAR_CONTROL))
-        .flex_none()
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .text_color(if active { theme.on_solid } else { theme.text })
-        .bg(if active {
-            theme.solid
-        } else {
-            motion::hover_blend(id, theme.glass_hover().opacity(0.5), theme.glass_hover())
-        })
-        .on_hover(motion::hover_listener(id))
-        .focus_visible(|s| s.border_2().border_color(theme.accent))
+        let revealed =
+            self.voice_widget_hovered || self.voice_widget_focus.contains_focused(window, cx);
+        let right = self
+            .voice_widget_placement(f32::from(window.viewport_size().width), cx)
+            .right;
+        let commands = self.voice_commands(cx);
+        Some(crate::voice_surfaces::voice_widget(
+            VoiceWidgetProps {
+                muted,
+                can_mute,
+                revealed,
+                orb: orb_shown.then(|| self.voice_widget_orb.clone().into_any_element()),
+                focus: self.voice_widget_focus.clone(),
+                right,
+            },
+            &commands,
+            cx,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1020,59 +887,6 @@ mod tests {
         open_stage(cx);
         shell.update(cx, |shell, cx| shell.open_chat("other".into(), cx));
         stepped_aside(cx, "other");
-    }
-
-    #[gpui::test]
-    fn composer_orb_shows_only_on_the_orchestrator_chat_and_returns_to_the_call(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        struct OrbHost(Entity<Shell>);
-        impl Render for OrbHost {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                self.0.update(cx, |shell, cx| {
-                    div()
-                        .size_full()
-                        .children(shell.render_voice_composer_orb(600.0, cx))
-                })
-            }
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        cx.update(|cx| {
-            gpui_base::init(cx);
-            cx.set_global(Theme::default());
-            crate::app_menus::init(cx);
-            settings::init(settings::UiSettings::default(), dir.path(), cx);
-        });
-        let orchestrator = format!("{}1", zeron_proto::voice::ORCHESTRATOR_CHAT_PREFIX);
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            OrbHost(cx.new(|cx| {
-                let shell = voice_test_shell(dir.path(), cx);
-                shell.voice.update(cx, |voice, _| {
-                    voice.phase = VoicePhase::Active;
-                    voice.chat_id = Some(orchestrator.clone());
-                });
-                shell
-            }))
-        });
-        let shell = host.read_with(cx, |host, _| host.0.clone());
-        let select = |chat: &str, cx: &mut gpui::VisualTestContext| {
-            let chat = chat.to_owned();
-            shell.update(cx, |shell, cx| {
-                shell
-                    .state
-                    .update(cx, |state, _| state.selected_chat = Some(chat));
-            });
-            cx.update(|window, cx| window.draw(cx).clear());
-        };
-
-        select("another-chat", cx);
-        assert!(cx.debug_bounds("voice-composer-orb").is_none());
-
-        select(&orchestrator, cx);
-        let orb = cx.debug_bounds("voice-composer-orb").unwrap();
-        cx.simulate_click(orb.center(), gpui::Modifiers::default());
-        shell.read_with(cx, |shell, cx| assert!(shell.voice.read(cx).stage_open));
     }
 
     #[test]

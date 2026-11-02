@@ -65,16 +65,62 @@ fn canonical_roots(cwds: &[String]) -> Vec<PathBuf> {
 
 /// Dev servers under `cwds`, one row per (process, port), sorted by port.
 pub fn list(cwds: &[String]) -> Vec<DevServer> {
+    list_with_scope(cwds, None, "", None)
+}
+
+pub(crate) fn list_with_scope(
+    cwds: &[String],
+    scope: Option<crate::service::Scope>,
+    host_device: &str,
+    selected: Option<(&str, &str, Option<&Path>)>,
+) -> Vec<DevServer> {
     let roots = canonical_roots(cwds);
     if roots.is_empty() {
         return Vec::new();
     }
     let table = process_table();
-    rows(
+    rows_with_eligibility(
         discovery::listeners(&mut discovery::Origins::default()).unwrap_or_default(),
         &roots,
         &|pid| launchers(&table, pid),
+        scope,
+        host_device,
+        selected,
     )
+}
+
+fn rows_with_eligibility(
+    listeners: Vec<Listener>,
+    roots: &[PathBuf],
+    launchers: &dyn Fn(u32) -> Vec<String>,
+    scope: Option<crate::service::Scope>,
+    host_device: &str,
+    selected: Option<(&str, &str, Option<&Path>)>,
+) -> Vec<DevServer> {
+    let eligible = scope.zip(selected).map(|(scope, (device, chat, cwd))| {
+        crate::service::attributed_candidates(scope, listeners.clone())
+            .into_iter()
+            .filter(|(root, listener)| {
+                zeron_proto::preview_visible_to_chat(
+                    host_device,
+                    listener.zeron_owned,
+                    listener.chat_id.as_deref(),
+                    root,
+                    device,
+                    chat,
+                    cwd,
+                )
+            })
+            .map(|(_, listener)| (listener.pid, listener.started_at, listener.address.port()))
+            .collect::<std::collections::HashSet<_>>()
+    });
+    let mut servers = rows(listeners, roots, launchers);
+    for server in &mut servers {
+        server.preview_eligible = eligible
+            .as_ref()
+            .map(|eligible| eligible.contains(&(server.pid, server.started_at, server.port)));
+    }
+    servers
 }
 
 /// `pid → (parent, command)` for every process, from one `ps`.
@@ -147,6 +193,7 @@ fn rows(
         // `*:3000` expands to an IPv4 and an IPv6 loopback address (deduped above).
         let port = listener.address.port();
         servers.push(DevServer {
+            preview_eligible: None,
             pid: listener.pid,
             started_at: listener.started_at,
             port,
@@ -426,6 +473,146 @@ mod tests {
             chat_id: None,
             origin: None,
         }
+    }
+
+    #[test]
+    fn details_eligibility_uses_preview_host_attribution_before_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut listeners = Vec::new();
+        for (index, (owned, origin)) in [
+            (false, None),
+            (true, Some("chat:here")),
+            (true, Some("terminal:t")),
+            (true, Some("chat:elsewhere")),
+            (true, Some("chat:here")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = listener(
+                100 + index as u32,
+                root.to_str().unwrap(),
+                3210 + index as u16,
+                &["next", "dev"],
+                false,
+            );
+            row.zeron_owned = owned;
+            row.origin = origin.map(str::to_owned);
+            listeners.push(row);
+        }
+        let scope = crate::service::Scope {
+            chats: vec![("here".into(), root.clone())],
+            terminals: [("t".into(), "here".into())].into(),
+            reserved_ports: [3214].into(),
+        };
+        let servers = rows_with_eligibility(
+            listeners.clone(),
+            &[root.clone()],
+            &|_| Vec::new(),
+            Some(scope),
+            "host",
+            Some(("host", "here", Some(root.as_path()))),
+        );
+        assert_eq!(
+            servers.len(),
+            5,
+            "Details still lists independent dev servers"
+        );
+        assert!(servers.iter().all(|s| s.signatures == ["next dev"]));
+        assert_eq!(
+            servers
+                .iter()
+                .map(|s| s.preview_eligible)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false)
+            ]
+        );
+        assert!(
+            rows_with_eligibility(listeners, &[root], &|_| Vec::new(), None, "host", None)
+                .iter()
+                .all(|s| s.preview_eligible.is_none()),
+            "unavailable host scope is unknown"
+        );
+    }
+
+    #[test]
+    fn worked_root_eligibility_matches_the_selected_chats_watch() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let a = a.canonicalize().unwrap();
+        let b = b.canonicalize().unwrap();
+        let scope = crate::service::Scope {
+            chats: vec![
+                ("A".into(), a.clone()),
+                ("B".into(), b.clone()),
+                ("C".into(), a.clone()),
+            ],
+            ..Default::default()
+        };
+        let rows = [("B", &b), ("A", &b), ("C", &a)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (chat, cwd))| {
+                let mut l = listener(
+                    100 + index as u32,
+                    cwd.to_str().unwrap(),
+                    3210 + index as u16,
+                    &["next", "dev"],
+                    false,
+                );
+                l.zeron_owned = true;
+                l.origin = Some(format!("chat:{chat}"));
+                l
+            })
+            .collect::<Vec<_>>();
+        let selected = Some(("host", "A", Some(a.as_path())));
+        let servers = rows_with_eligibility(
+            rows.clone(),
+            &[a.clone(), b.clone()],
+            &|_| vec![],
+            Some(scope.clone()),
+            "host",
+            selected,
+        );
+        assert_eq!(servers.len(), 3, "worked-root listeners remain listed");
+        assert_eq!(
+            servers
+                .iter()
+                .map(|s| s.preview_eligible)
+                .collect::<Vec<_>>(),
+            vec![Some(false), Some(true), Some(true)],
+            "B/b is absent from A's watch; own A elsewhere and another Chat in exact cwd remain visible"
+        );
+        let wrong_device = rows_with_eligibility(
+            rows.clone(),
+            &[a.clone(), b.clone()],
+            &|_| vec![],
+            Some(scope.clone()),
+            "host",
+            Some(("another-device", "A", Some(a.as_path()))),
+        );
+        assert!(
+            wrong_device
+                .iter()
+                .all(|s| s.preview_eligible == Some(false))
+        );
+        let old: zeron_proto::ListDevServersParams =
+            serde_json::from_value(serde_json::json!({"cwds":[a,b]})).unwrap();
+        assert!(old.chat_id.is_none());
+        assert!(
+            rows_with_eligibility(rows, &[a, b], &|_| vec![], Some(scope), "host", None)
+                .iter()
+                .all(|s| s.preview_eligible.is_none())
+        );
     }
 
     #[test]

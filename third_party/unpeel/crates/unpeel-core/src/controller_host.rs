@@ -238,7 +238,9 @@ impl DiskCatalog {
                     .unwrap_or(usize::MAX)
             });
         }
-        let manifests = session_host::list_manifests();
+        // Every hosted session; the display order is applied below.
+        let manifests =
+            crate::session_control::hosted_sessions(crate::session_control::SessionFilter::All);
         let pinned = pinned_session_ids(&state);
         let activity = activity_state();
         let known_ids: HashSet<String> =
@@ -1354,11 +1356,7 @@ fn body_session_id(request: &ControllerRequest) -> Option<&str> {
 }
 
 fn safe_session_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_SESSION_ID_BYTES
-        && !value.contains('/')
-        && !value.contains('\\')
-        && !value.contains("..")
+    value.len() <= MAX_SESSION_ID_BYTES && crate::session_control::safe_session_id(value)
 }
 
 fn output(request: &ControllerRequest, cancelled: &AtomicBool) -> (u16, Value) {
@@ -1394,20 +1392,23 @@ fn output(request: &ControllerRequest, cancelled: &AtomicBool) -> (u16, Value) {
             std::thread::sleep(Duration::from_millis(OUTPUT_WAIT_POLL_MS));
         }
     }
-    let chunk = match session_host::read_output_chunk(session_id, offset, Some(limit), Some(limit))
-    {
-        Ok(chunk) => chunk,
+    // The controller's paged read: the same shared operation as the peer's
+    // tail, from an explicit cursor.
+    let read = match crate::session_control::read_output(
+        session_id,
+        crate::session_control::OutputCursor::From { offset, max: limit },
+    ) {
+        Ok(read) => read,
         Err(message) => return (500, json!({ "error": message })),
     };
-    let start = chunk.next_offset.saturating_sub(chunk.data.len() as u64);
     (
         200,
         json!({
             "sessionID": session_id,
-            "offset": start,
-            "nextOffset": chunk.next_offset,
-            "dataBase64": base64::engine::general_purpose::STANDARD.encode(chunk.data),
-            "truncated": offset.map_or(start > 0, |requested| requested != start),
+            "offset": read.offset,
+            "nextOffset": read.next_offset,
+            "dataBase64": base64::engine::general_purpose::STANDARD.encode(read.data),
+            "truncated": read.truncated,
             "capturedAtUnixMs": crate::state::current_timestamp_ms(),
         }),
     )
@@ -1417,7 +1418,7 @@ fn organization(request: &ControllerRequest) -> (u16, Value) {
     let Some(session_id) = body_session_id(request) else {
         return (400, json!({ "error": "invalid session id" }));
     };
-    if session_host::load_manifest(session_id).is_none() {
+    if crate::session_control::read_target(session_id).is_err() {
         return (404, json!({ "error": "unknown session" }));
     }
     let title = match request.body.get("title") {
@@ -1961,5 +1962,27 @@ mod tests {
                 subject: Some("uid:501".into()),
             }
         );
+    }
+
+    #[test]
+    fn controller_output_refuses_hostile_ids_before_the_shared_read() {
+        for id in ["../other", "a/b", "a\\b", ""] {
+            let request = ControllerRequest {
+                id: None,
+                method: "GET".into(),
+                path: "/mobile/output".into(),
+                query: HashMap::from([("session_id".to_string(), id.to_string())]),
+                body: Value::Null,
+                content_type: None,
+                body_base64: None,
+                principal: ControllerPrincipal::OwnerTransport {
+                    transport: "test".into(),
+                    subject: None,
+                },
+            };
+            let (status, body) = output(&request, &AtomicBool::new(false));
+            assert_eq!(status, 400, "{id:?}");
+            assert_eq!(body["error"], "invalid session id");
+        }
     }
 }

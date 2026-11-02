@@ -10,15 +10,16 @@ const DEV_SERVER_ROW_HEIGHT: f32 = 28.0;
 /// Rows shown before the list scrolls inside the card.
 const DEV_SERVER_VISIBLE_ROWS: f32 = 3.5;
 
-pub(super) type DevServerKey = (Option<String>, Vec<String>);
+pub(super) type DevServerKey = (Option<String>, Vec<String>, Option<String>);
 
 impl DetailsSidebar {
-    /// Keep one poll loop for `(target device, roots)`; an empty root list
+    /// Keep one poll loop for `(target device, roots, selected Chat)`; an empty root list
     /// stops it and clears the rows.
     pub(super) fn ensure_dev_server_watch(
         &mut self,
         target_device: Option<String>,
         mut roots: Vec<String>,
+        chat_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         roots.retain(|root| !root.trim().is_empty());
@@ -30,7 +31,7 @@ impl DetailsSidebar {
             self.dev_servers.clear();
             return;
         }
-        let key = (target_device, roots);
+        let key = (target_device, roots, chat_id);
         if self.dev_server_key.as_ref() == Some(&key) {
             return;
         }
@@ -43,7 +44,7 @@ impl DetailsSidebar {
         self.dev_server_key = Some(key.clone());
         self.dev_server_watch = Some(cx.spawn(async move |this, cx| {
             loop {
-                let mut params = serde_json::json!({ "cwds": key.1 });
+                let mut params = serde_json::json!({ "cwds": key.1, "chatId": key.2 });
                 if let Some(device) = key.0.as_ref() {
                     params["targetDeviceId"] = device.clone().into();
                 }
@@ -164,7 +165,11 @@ impl DetailsSidebar {
             .map(|(index, server)| {
                 let group = SharedString::from(format!("dev-server-{index}"));
                 let stopping = self.dev_server_stopping.contains(&server.pid);
-                let url = format!("http://127.0.0.1:{}", server.port);
+                let selected_server = server.clone();
+                let chat_id = self
+                    .sidebar
+                    .context()
+                    .and_then(|context| context.chat_id.clone());
                 let port_label = format!(":{}", server.port);
                 let project = std::path::Path::new(&server.root)
                     .file_name()
@@ -211,7 +216,16 @@ impl DetailsSidebar {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|style| style.bg(crate::theme::ink(0.045)))
-                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
+                    // Never a direct external launch: the Shell routes the
+                    // server through the internal browser for this Chat.
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(chat_id) = chat_id.clone() {
+                            cx.emit(DetailsSidebarEvent::OpenServer {
+                                chat_id,
+                                server: selected_server.clone(),
+                            });
+                        }
+                    }))
                     .child(
                         div()
                             .flex_none()
@@ -355,6 +369,7 @@ mod tests {
 
     fn server(port: u16, signatures: &[&str]) -> DevServer {
         DevServer {
+            preview_eligible: None,
             pid: 1,
             started_at: 1,
             port,

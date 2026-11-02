@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use unpeel_core::session_control::{
+    WaitObservation, WaitVerdict, WaitVocabulary, judge_wait, page_text, parse_wait_target,
+};
 
 use crate::project_activity::{self, ArchiveFailure, ProjectEntry};
 use crate::project_tickets::{self, Ticket};
@@ -217,33 +220,16 @@ pub const WAIT_BLOCKED_NEEDS_INPUT_NEXT: &str = "Worker is blocked waiting for i
 const WAIT_INCOMING_MESSAGE_REASON: &str = "incoming_message";
 const WAIT_INCOMING_MESSAGE_NEXT: &str = "Only the wait ended for an incoming message; the Worker was not stopped and its state was not changed.";
 
-/// Closed set of status strings accepted by `wait_for_status`.
-pub const ACCEPTED_WAIT_STATUSES: &[&str] = &[
-    "completed",
-    "running",
-    "exited",
-    "starting",
-    "working",
-    "blocked",
-    "done",
-    "idle",
-];
+/// Closed set of status strings accepted by `wait_for_status`: the shared
+/// controller wait vocabulary.
+pub const ACCEPTED_WAIT_STATUSES: &[&str] = WaitVocabulary::CONTROLLER_STATUSES;
 
 pub fn is_accepted_wait_status(status: &str) -> bool {
-    ACCEPTED_WAIT_STATUSES
-        .iter()
-        .any(|accepted| accepted.eq_ignore_ascii_case(status))
+    parse_wait_target(status, WaitVocabulary::Controller).is_ok()
 }
 
 pub fn validate_wait_status(status: &str) -> Result<(), String> {
-    if is_accepted_wait_status(status) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Unknown status '{status}'. Accepted values are: {}",
-            ACCEPTED_WAIT_STATUSES.join(", ")
-        ))
-    }
+    parse_wait_target(status, WaitVocabulary::Controller).map(|_| ())
 }
 
 /// Requested creation details for an isolated Worker checkout. This is kept
@@ -599,71 +585,22 @@ fn validate_git_branch(branch: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The controller's `send_keys` encoding: the shared vocabulary and bounds
+/// (`unpeel_core::session_control`), concatenated into one write.
 pub fn encode_keys(keys: &[String]) -> Result<String, String> {
-    if keys.len() > 64 {
-        return Err("send_keys accepts at most 64 entries".into());
-    }
-    let mut encoded = String::new();
-    for key in keys {
-        match key.as_str() {
-            "enter" | "return" => encoded.push('\r'),
-            "escape" | "esc" => encoded.push('\u{1b}'),
-            "tab" => encoded.push('\t'),
-            "backspace" => encoded.push('\u{7f}'),
-            "up" => encoded.push_str("\u{1b}[A"),
-            "down" => encoded.push_str("\u{1b}[B"),
-            "right" => encoded.push_str("\u{1b}[C"),
-            "left" => encoded.push_str("\u{1b}[D"),
-            "ctrl-c" => encoded.push('\u{3}'),
-            value if value.starts_with("text:") => {
-                let value = value.trim_start_matches("text:");
-                if value.len() > 16 * 1024 {
-                    return Err("one text: key entry exceeds 16 KiB".into());
-                }
-                encoded.push_str(value);
-            }
-            value if value.chars().count() == 1 => encoded.push_str(value),
-            _ => {
-                return Err(format!(
-                    "Unknown key '{key}'. Use action=help for valid keys."
-                ));
-            }
-        }
-    }
-    Ok(encoded)
+    unpeel_core::session_control::encode_keys(keys).map(|sequences| sequences.concat())
 }
 
+/// Model-facing terminal text: the shared cleanup, then this tool's own cap.
 pub fn clean_output(text: &str, max_bytes: usize) -> String {
-    #[derive(Clone, Copy)]
-    enum State {
-        Text,
-        Escape,
-        Csi,
-        Osc,
-        OscEscape,
-    }
-    let mut state = State::Text;
-    let mut clean = String::with_capacity(text.len().min(max_bytes));
-    for character in text.chars() {
-        state = match state {
-            State::Text if character == '\u{1b}' => State::Escape,
-            State::Text => {
-                clean.push(character);
-                State::Text
-            }
-            State::Escape if character == '[' => State::Csi,
-            State::Escape if character == ']' => State::Osc,
-            State::Escape => State::Text,
-            State::Csi if ('@'..='~').contains(&character) => State::Text,
-            State::Csi => State::Csi,
-            State::Osc if character == '\u{7}' => State::Text,
-            State::Osc if character == '\u{1b}' => State::OscEscape,
-            State::Osc => State::Osc,
-            State::OscEscape if character == '\\' => State::Text,
-            State::OscEscape => State::Osc,
-        };
-    }
-    truncate_tail(&clean, max_bytes)
+    // The controller profile keeps in-line carriage returns, as this cleaner
+    // always did: parent notifications fold repainted status lines to their
+    // last paint, which needs to tell `\r` from a new line.
+    let clean = unpeel_core::session_control::clean_terminal_text(
+        text,
+        unpeel_core::session_control::CarriageReturns::Keep,
+    );
+    truncate_tail(clean.trim_end_matches('\n'), max_bytes)
 }
 
 pub(crate) fn choose_semantic_output(
@@ -690,6 +627,7 @@ fn project_terminal_fallback(raw: &str, max_bytes: usize) -> String {
     enum State {
         Text,
         Escape,
+        EscapeIntermediate,
         Csi,
         Osc,
         OscEscape,
@@ -740,8 +678,16 @@ fn project_terminal_fallback(raw: &str, max_bytes: usize) -> String {
             State::Escape => match character {
                 '[' => State::Csi,
                 ']' => State::Osc,
+                '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
                 _ => State::Text,
             },
+            State::EscapeIntermediate => {
+                if ('\u{20}'..='\u{2f}').contains(&character) {
+                    State::EscapeIntermediate
+                } else {
+                    State::Text
+                }
+            }
             State::Csi => {
                 if ('@'..='~').contains(&character) {
                     if matches!(character, 'H' | 'f' | 'G' | 'K') {
@@ -1085,20 +1031,14 @@ fn dispatch_action(
             let episode = track_episode
                 .then(|| crate::prepare_worker_parent_task(&session.id, submitted_at_unix_ms))
                 .transpose()?;
-            let delivery = match episode {
-                Some(episode) => {
-                    unpeel_core::session_input::deliver_sanitized_text_with_task_receipt(
-                        &session.id,
-                        &sanitized,
-                        episode,
-                    )
-                }
-                None => unpeel_core::session_input::deliver_sanitized_text(
-                    &session.id,
-                    &sanitized,
-                    submit,
-                ),
-            };
+            let delivery = unpeel_core::session_control::send_text(
+                &session.id,
+                &sanitized,
+                submit,
+                unpeel_core::session_control::InputAuthority::Controller {
+                    task_episode: episode,
+                },
+            );
             if let Err(error) = delivery {
                 if let Some(episode) = episode {
                     return Err(cancelled_submission_error(&session.id, episode, &error));
@@ -1126,9 +1066,11 @@ fn dispatch_action(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let data = encode_keys(&keys)?;
-            client
-                .write(&session.id, &data)
-                .map_err(|error| error.to_string())?;
+            unpeel_core::session_control::send_keys(
+                &session.id,
+                &data,
+                unpeel_core::session_control::InputAuthority::Controller { task_episode: None },
+            )?;
             Ok(json!({ "session_id": session.id, "sent": true, "key_count": keys.len() }))
         }
         "wait_for_status" => wait_for_status(client, arguments, parent_chat_id, cancel),
@@ -1350,16 +1292,14 @@ fn submit_initial_briefing(
             .then(|| crate::prepare_worker_parent_task(session_id, submitted_at_unix_ms))
             .transpose()?;
         loop {
-            let delivery = match episode {
-                Some(episode) => {
-                    unpeel_core::session_input::deliver_sanitized_text_with_task_receipt(
-                        session_id, briefing, episode,
-                    )
-                }
-                None => {
-                    unpeel_core::session_input::deliver_sanitized_text(session_id, briefing, true)
-                }
-            };
+            let delivery = unpeel_core::session_control::send_text(
+                session_id,
+                briefing,
+                true,
+                unpeel_core::session_control::InputAuthority::Controller {
+                    task_episode: episode,
+                },
+            );
             match delivery {
                 Ok(()) => {
                     if let Some(episode) = episode {
@@ -2229,25 +2169,35 @@ fn wait_until_settled(
     mut interrupted: impl FnMut(&WorkersSession) -> bool,
     mut pending_message: impl FnMut() -> Result<bool, String>,
 ) -> Result<Value, String> {
+    let target = parse_wait_target(wanted, WaitVocabulary::Controller)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let mut initial_completion: Option<bool> = None;
     loop {
         let session = poll()?;
         let is_completed = extra_match(&session);
-        if initial_completion.is_none() {
-            initial_completion = Some(is_completed);
-        }
-
-        let activity_blocked = session.activity.eq_ignore_ascii_case("blocked");
-        let wants_terminal =
-            wanted.eq_ignore_ascii_case("completed") || wanted.eq_ignore_ascii_case("exited");
-        if wanted.eq_ignore_ascii_case("completed") {
-            let status_matched = session.activity.eq_ignore_ascii_case(wanted)
-                || session.state.eq_ignore_ascii_case(wanted);
-            if status_matched {
+        let completed_at_start = *initial_completion.get_or_insert(is_completed);
+        // Interruption is consulted only for a completion wait that has not
+        // otherwise settled, as before the shared verdict existed.
+        let interrupted = target.wants_completion()
+            && !is_completed
+            && !session.activity.eq_ignore_ascii_case("working")
+            && !session.activity.eq_ignore_ascii_case("blocked")
+            && interrupted(&session);
+        let verdict = judge_wait(
+            &target,
+            WaitObservation {
+                activity: &session.activity,
+                state: &session.state,
+                task_completed: is_completed,
+                completed_at_start,
+                interrupted,
+            },
+        );
+        match verdict {
+            WaitVerdict::Matched => {
                 return Ok(json!({ "matched": true, "worker": session_json(&session) }));
             }
-            if activity_blocked {
+            WaitVerdict::NeedsInput => {
                 if cancel.load(Ordering::SeqCst) {
                     return Err("wait_for_status cancelled by the host".into());
                 }
@@ -2259,10 +2209,7 @@ fn wait_until_settled(
                     "next": WAIT_BLOCKED_NEEDS_INPUT_NEXT
                 }));
             }
-            if is_completed {
-                return Ok(json!({ "matched": true, "worker": session_json(&session) }));
-            }
-            if !session.activity.eq_ignore_ascii_case("working") && interrupted(&session) {
+            WaitVerdict::Interrupted => {
                 return Ok(json!({
                     "matched": false,
                     "interrupted": true,
@@ -2270,25 +2217,7 @@ fn wait_until_settled(
                     "next": WAIT_INTERRUPTED_NEXT
                 }));
             }
-        } else {
-            let matched = session.activity.eq_ignore_ascii_case(wanted)
-                || session.state.eq_ignore_ascii_case(wanted);
-            if matched {
-                return Ok(json!({ "matched": true, "worker": session_json(&session) }));
-            }
-            if wants_terminal && activity_blocked {
-                if cancel.load(Ordering::SeqCst) {
-                    return Err("wait_for_status cancelled by the host".into());
-                }
-                return Ok(json!({
-                    "matched": false,
-                    "needs_input": true,
-                    "blocked": true,
-                    "worker": session_json(&session),
-                    "next": WAIT_BLOCKED_NEEDS_INPUT_NEXT
-                }));
-            }
-            if !initial_completion.unwrap_or(false) && is_completed {
+            WaitVerdict::EpisodeCompleted => {
                 return Ok(json!({
                     "matched": false,
                     "completed": true,
@@ -2296,6 +2225,7 @@ fn wait_until_settled(
                     "worker": session_json(&session)
                 }));
             }
+            WaitVerdict::Pending => {}
         }
 
         if cancel.load(Ordering::SeqCst) {
@@ -2375,35 +2305,21 @@ const TRANSCRIPT_PAGE_BYTES: usize = 96 * 1024;
 /// conversation — a long message included — without asking the Worker for it
 /// again.
 fn transcript_page(markdown: &str, offset: Option<u64>, page_bytes: usize) -> Value {
-    let total = markdown.len();
-    let boundary = |mut index: usize, forward: bool| {
-        index = index.min(total);
-        while !markdown.is_char_boundary(index) {
-            index = if forward { index + 1 } else { index - 1 };
-        }
-        index
-    };
-    let (start, end) = match offset {
-        Some(offset) => {
-            let start = boundary(usize::try_from(offset).unwrap_or(usize::MAX), false);
-            (start, boundary(start.saturating_add(page_bytes), false))
-        }
-        None => (boundary(total.saturating_sub(page_bytes), true), total),
-    };
-    let mut page = json!({
-        "markdown": &markdown[start..end],
-        "start_offset": start,
-        "end_offset": end,
-        "total_bytes": total,
-        "truncated": start > 0 || end < total,
+    let page = page_text(markdown, offset, page_bytes);
+    let mut value = json!({
+        "markdown": page.text,
+        "start_offset": page.start,
+        "end_offset": page.end,
+        "total_bytes": page.total,
+        "truncated": page.truncated(),
     });
-    if end < total {
-        page["next_offset"] = json!(end);
+    if let Some(next) = page.next_offset {
+        value["next_offset"] = json!(next);
     }
-    if start > 0 {
-        page["previous_offset"] = json!(start.saturating_sub(page_bytes));
+    if let Some(previous) = page.previous_offset {
+        value["previous_offset"] = json!(previous);
     }
-    page
+    value
 }
 
 fn truncate_tail(text: &str, max_bytes: usize) -> String {
@@ -3044,5 +2960,43 @@ mod wait_core_tests {
         drop(probe);
         let _ = stop_tx.send(());
         let _ = server_thread.join();
+    }
+
+    #[test]
+    fn controller_wait_uses_the_shared_vocabulary_and_completion_boundary() {
+        assert_eq!(
+            ACCEPTED_WAIT_STATUSES,
+            unpeel_core::session_control::WaitVocabulary::CONTROLLER_STATUSES
+        );
+        assert!(validate_wait_status("Completed").is_ok());
+        // `unknown` is a peer label, not a controller target.
+        assert!(validate_wait_status("unknown").is_err());
+        // An idle or exited Worker without episode evidence has not
+        // completed its task: the wait times out instead of matching.
+        for state in ["idle", "exited"] {
+            let mut worker = test_worker(state);
+            worker.activity = "idle".into();
+            let result = wait_until_matching(
+                0,
+                "completed",
+                &AtomicBool::new(false),
+                || Ok(worker.clone()),
+                |_| false,
+            )
+            .unwrap();
+            assert_eq!(result["matched"], false, "{state}");
+            assert_eq!(result["timed_out"], true, "{state}");
+        }
+        let mut worker = test_worker("running");
+        worker.activity = "idle".into();
+        let result = wait_until_matching(
+            0,
+            "completed",
+            &AtomicBool::new(false),
+            || Ok(worker.clone()),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(result["matched"], true);
     }
 }

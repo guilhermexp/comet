@@ -2298,11 +2298,10 @@ fn workers_wait_until_times_out_with_next_guidance_and_stops_on_cancel() {
 
     let cancel = AtomicBool::new(false);
     let started = Instant::now();
-    let result =
-        zeron_workers_unpeel::controller_mcp_wait_until(1, "gone-for-test", &cancel, || {
-            Ok(worker_with_state("running"))
-        })
-        .expect("timeout is a normal read");
+    let result = zeron_workers_unpeel::controller_mcp_wait_until(1, "exited", &cancel, || {
+        Ok(worker_with_state("running"))
+    })
+    .expect("timeout is a normal read");
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert_eq!(result["timed_out"], true);
     assert_eq!(result["worker"]["state"], "running");
@@ -2311,7 +2310,6 @@ fn workers_wait_until_times_out_with_next_guidance_and_stops_on_cancel() {
         next.contains("[worker-task-notification]") && next.contains("end your turn"),
         "{next}"
     );
-    assert_eq!(next, zeron_workers_unpeel::WAIT_TIMED_OUT_NEXT);
 
     let cancel = Arc::new(AtomicBool::new(false));
     let flip = Arc::clone(&cancel);
@@ -2320,22 +2318,20 @@ fn workers_wait_until_times_out_with_next_guidance_and_stops_on_cancel() {
         flip.store(true, Ordering::SeqCst);
     });
     let started = Instant::now();
-    let error =
-        zeron_workers_unpeel::controller_mcp_wait_until(60, "gone-for-test", &cancel, || {
-            Ok(worker_with_state("running"))
-        })
-        .expect_err("cancellation interrupts the wait");
+    let error = zeron_workers_unpeel::controller_mcp_wait_until(60, "exited", &cancel, || {
+        Ok(worker_with_state("running"))
+    })
+    .expect_err("cancellation interrupts the wait");
     assert!(error.contains("cancelled"), "{error}");
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "cancel must not wait for the deadline"
     );
 
-    let matched =
-        zeron_workers_unpeel::controller_mcp_wait_until(60, "gone-for-test", &cancel, || {
-            Ok(worker_with_state("gone-for-test"))
-        })
-        .expect("match wins even when cancelled");
+    let matched = zeron_workers_unpeel::controller_mcp_wait_until(60, "exited", &cancel, || {
+        Ok(worker_with_state("exited"))
+    })
+    .expect("match wins even when cancelled");
     assert_eq!(matched["matched"], true);
 }
 
@@ -2969,4 +2965,28 @@ fn pause_hook_wait_completed_or_exited_returns_needs_input_when_blocked() {
             started.elapsed()
         );
     }
+}
+
+#[test]
+fn terminal_text_consumers_normalize_crlf_and_designation_escapes() {
+    let raw = "first\r\n\x1b(Bé\x1b)0 second\r\nold\rnew\x1b$)C tail\r\n";
+    assert_eq!(
+        unpeel_core::session_control::strip_ansi(raw),
+        "first\né second\nold\nnew tail\n"
+    );
+    assert_eq!(
+        controller_mcp_clean_output(raw, 64 * 1024),
+        "first\né second\nold\rnew tail"
+    );
+    assert_eq!(
+        controller_mcp_choose_semantic_output(raw, None, 64 * 1024),
+        "first\né second\nnew tail"
+    );
+    assert_eq!(
+        unpeel_core::session_control::clean_terminal_text(
+            raw,
+            unpeel_core::session_control::CarriageReturns::Keep
+        ),
+        "first\né second\nold\rnew tail\n"
+    );
 }

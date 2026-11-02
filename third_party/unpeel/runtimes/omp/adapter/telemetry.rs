@@ -231,8 +231,13 @@ fn read_path_typed(
     }))
 }
 
-fn nonempty_env(name: &str) -> Option<PathBuf> {
+/// The process environment, the production input to root resolution.
+fn process_env(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name)
+}
+
+fn nonempty_env(env: &dyn Fn(&str) -> Option<std::ffi::OsString>, name: &str) -> Option<PathBuf> {
+    env(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -251,10 +256,14 @@ fn command_option(command: &str, name: &str) -> Option<String> {
     value
 }
 
-fn profile_name(command: &str) -> Result<Option<String>, String> {
+fn profile_name(
+    command: &str,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<String>, String> {
+    let variable = |name: &str| env(name).and_then(|value| value.into_string().ok());
     let profile = command_option(command, "--profile")
-        .or_else(|| std::env::var("OMP_PROFILE").ok())
-        .or_else(|| std::env::var("PI_PROFILE").ok());
+        .or_else(|| variable("OMP_PROFILE"))
+        .or_else(|| variable("PI_PROFILE"));
     let Some(profile) = profile.map(|value| value.trim().to_owned()) else {
         return Ok(None);
     };
@@ -276,7 +285,14 @@ fn profile_name(command: &str) -> Result<Option<String>, String> {
     Ok(Some(profile))
 }
 
-fn omp_sessions_root(command: &str, cwd: &Path) -> Result<PathBuf, String> {
+/// The canonical OMP Session root for `command` over an environment lookup:
+/// production passes [`process_env`]; tests pass their own inputs instead of
+/// mutating the process environment.
+fn omp_sessions_root_in(
+    command: &str,
+    cwd: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
     if let Some(path) = command_option(command, "--session-dir") {
         let path = PathBuf::from(path.trim());
         if path.as_os_str().is_empty() {
@@ -288,12 +304,10 @@ fn omp_sessions_root(command: &str, cwd: &Path) -> Result<PathBuf, String> {
             cwd.join(path)
         });
     }
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
+    let home = nonempty_env(env, "HOME")
         .or_else(dirs::home_dir)
         .ok_or_else(|| "could not resolve OMP Session root".to_string())?;
-    let config_root = nonempty_env("PI_CONFIG_DIR")
+    let config_root = nonempty_env(env, "PI_CONFIG_DIR")
         .map(|path| {
             if path.is_absolute() {
                 path
@@ -302,8 +316,8 @@ fn omp_sessions_root(command: &str, cwd: &Path) -> Result<PathBuf, String> {
             }
         })
         .unwrap_or_else(|| home.join(".omp"));
-    let xdg_root = nonempty_env("XDG_DATA_HOME").map(|path| path.join("omp"));
-    if let Some(profile) = profile_name(command)? {
+    let xdg_root = nonempty_env(env, "XDG_DATA_HOME").map(|path| path.join("omp"));
+    if let Some(profile) = profile_name(command, env)? {
         if let Some(root) = xdg_root
             .as_ref()
             .map(|root| root.join("profiles").join(&profile))
@@ -317,7 +331,7 @@ fn omp_sessions_root(command: &str, cwd: &Path) -> Result<PathBuf, String> {
             .join("agent")
             .join("sessions"));
     }
-    if let Some(agent_dir) = nonempty_env("PI_CODING_AGENT_DIR") {
+    if let Some(agent_dir) = nonempty_env(env, "PI_CODING_AGENT_DIR") {
         return Ok(agent_dir.join("sessions"));
     }
     if let Some(root) = xdg_root.filter(|root| root.is_dir()) {
@@ -330,7 +344,16 @@ pub(crate) fn is_nested_provider_transcript(
     manifest: &HostedSessionManifest,
     transcript_path: &Path,
 ) -> bool {
-    let Ok(root) = omp_sessions_root(&manifest.session.command, Path::new(&manifest.cwd)) else {
+    is_nested_provider_transcript_in(manifest, transcript_path, &process_env)
+}
+
+fn is_nested_provider_transcript_in(
+    manifest: &HostedSessionManifest,
+    transcript_path: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    let Ok(root) = omp_sessions_root_in(&manifest.session.command, Path::new(&manifest.cwd), env)
+    else {
         return false;
     };
     if transcript_path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
@@ -355,14 +378,27 @@ pub(crate) fn is_nested_provider_transcript(
 pub(crate) fn read(
     manifest: &HostedSessionManifest,
 ) -> Result<Option<SessionTelemetry>, SessionTelemetryReadError> {
-    let (provider_session_id, provider_transcript_path) =
-        crate::session_ops::provider_session_marker(&manifest.session.id);
+    read_in(
+        manifest,
+        crate::session_ops::provider_session_marker(&manifest.session.id),
+        &process_env,
+    )
+}
+
+/// [`read`] with the Session's provider marker and the environment passed
+/// in, so tests never read Unpeel home or mutate the process environment.
+fn read_in(
+    manifest: &HostedSessionManifest,
+    marker: (Option<String>, Option<String>),
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<SessionTelemetry>, SessionTelemetryReadError> {
+    let (provider_session_id, provider_transcript_path) = marker;
     let provider_session_id = provider_session_id.or_else(|| manifest.provider_session_id.clone());
     let path = provider_transcript_path.or_else(|| manifest.provider_transcript_path.clone());
     let (Some(provider_session_id), Some(path)) = (provider_session_id, path) else {
         return Ok(None);
     };
-    let root = omp_sessions_root(&manifest.session.command, Path::new(&manifest.cwd))
+    let root = omp_sessions_root_in(&manifest.session.command, Path::new(&manifest.cwd), env)
         .map_err(SessionTelemetryReadError::Rejected)?;
     read_path_typed(Path::new(&path), &root, &provider_session_id)
 }
@@ -370,44 +406,26 @@ pub(crate) fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        previous: Vec<(&'static str, Option<OsString>)>,
+    /// An explicit environment for root resolution: only the named variables
+    /// exist. Nothing reads or mutates the process environment, so these
+    /// tests never race other tests that resolve HOME or UNPEEL_HOME.
+    fn env(entries: &[(&str, &Path)]) -> impl Fn(&str) -> Option<OsString> {
+        let entries: HashMap<String, OsString> = entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.as_os_str().to_owned()))
+            .collect();
+        move |name| entries.get(name).cloned()
     }
 
-    impl EnvGuard {
-        fn set(entries: &[(&'static str, Option<&Path>)]) -> Self {
-            let previous = entries
-                .iter()
-                .map(|(key, _)| (*key, std::env::var_os(key)))
-                .collect();
-            for (key, value) in entries {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.previous.drain(..) {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
+    /// `read` without a provider marker: the manifest binding is the input.
+    fn read_with(
+        manifest: &HostedSessionManifest,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<SessionTelemetry>, SessionTelemetryReadError> {
+        read_in(manifest, (None, None), env)
     }
 
     fn manifest(command: &str, transcript: &Path) -> HostedSessionManifest {
@@ -551,16 +569,10 @@ mod tests {
 
     #[test]
     fn identifies_nested_transcripts_under_the_default_omp_sessions_root() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let home = tempfile::tempdir().expect("temporary user home");
-        let _env = EnvGuard::set(&[
-            ("HOME", Some(home.path())),
-            ("PI_CONFIG_DIR", None),
-            ("PI_CODING_AGENT_DIR", None),
-            ("XDG_DATA_HOME", None),
-            ("PI_PROFILE", None),
-            ("OMP_PROFILE", None),
-        ]);
+        // Only HOME is set: no PI_CONFIG_DIR, PI_CODING_AGENT_DIR,
+        // XDG_DATA_HOME, PI_PROFILE or OMP_PROFILE.
+        let env = env(&[("HOME", home.path())]);
         let root = home.path().join(".omp/agent/sessions");
         let primary = root.join("primary.jsonl");
         let child = root.join("primary/PgliteSqlCheck.jsonl");
@@ -569,8 +581,8 @@ mod tests {
         let mut manifest = manifest("omp", &primary);
         manifest.cwd = home.path().to_string_lossy().into_owned();
 
-        assert!(is_nested_provider_transcript(&manifest, &child));
-        assert!(!is_nested_provider_transcript(&manifest, &primary));
+        assert!(is_nested_provider_transcript_in(&manifest, &child, &env));
+        assert!(!is_nested_provider_transcript_in(&manifest, &primary, &env));
     }
 
     #[test]
@@ -715,115 +727,98 @@ mod tests {
 
     #[test]
     fn rejects_jsonl_beside_the_sessions_directory() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let unpeel_home = tempfile::tempdir().expect("Unpeel home");
         let home = tempfile::tempdir().expect("user home");
-        let _env = EnvGuard::set(&[
-            ("UNPEEL_HOME", Some(unpeel_home.path())),
-            ("HOME", Some(home.path())),
-            ("PI_CODING_AGENT_DIR", None),
-            ("OMP_PROFILE", None),
-            ("PI_PROFILE", None),
-            ("XDG_DATA_HOME", None),
-            ("PI_CONFIG_DIR", None),
-        ]);
+        let env = env(&[("HOME", home.path())]);
         let transcript = home.path().join(".omp/agent/not-a-session.jsonl");
         write_usage_transcript(&transcript);
 
-        assert!(read(&manifest("omp", &transcript)).is_err());
+        assert!(read_with(&manifest("omp", &transcript), &env).is_err());
     }
 
     #[test]
     fn resolves_custom_profile_and_xdg_session_roots() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let unpeel_home = tempfile::tempdir().expect("Unpeel home");
         let home = tempfile::tempdir().expect("user home");
         let custom_agent = home.path().join("custom-agent");
         let xdg = home.path().join("xdg-data");
 
+        // A custom agent dir wins over the default agent.
         let custom_transcript = custom_agent.join("sessions/project/custom.jsonl");
         write_usage_transcript(&custom_transcript);
-        {
-            let _env = EnvGuard::set(&[
-                ("UNPEEL_HOME", Some(unpeel_home.path())),
-                ("HOME", Some(home.path())),
-                ("PI_CODING_AGENT_DIR", Some(custom_agent.as_path())),
-                ("OMP_PROFILE", None),
-                ("PI_PROFILE", None),
-                ("XDG_DATA_HOME", None),
-                ("PI_CONFIG_DIR", None),
-            ]);
-            assert!(
-                read(&manifest("omp", &custom_transcript))
-                    .expect("custom agent telemetry")
-                    .is_some()
-            );
-        }
+        let custom_env = env(&[
+            ("HOME", home.path()),
+            ("PI_CODING_AGENT_DIR", custom_agent.as_path()),
+        ]);
+        assert!(
+            read_with(&manifest("omp", &custom_transcript), &custom_env)
+                .expect("custom agent telemetry")
+                .is_some()
+        );
 
+        // A named profile wins over the custom agent dir.
         let profile_transcript = home
             .path()
             .join(".omp/profiles/work/agent/sessions/project/profile.jsonl");
         write_usage_transcript(&profile_transcript);
-        {
-            let _env = EnvGuard::set(&[
-                ("UNPEEL_HOME", Some(unpeel_home.path())),
-                ("HOME", Some(home.path())),
-                ("PI_CODING_AGENT_DIR", Some(custom_agent.as_path())),
-                ("OMP_PROFILE", None),
-                ("PI_PROFILE", None),
-                ("XDG_DATA_HOME", None),
-                ("PI_CONFIG_DIR", None),
-            ]);
-            assert!(
-                read(&manifest("omp --profile work", &profile_transcript))
-                    .expect("named profile telemetry")
-                    .is_some()
-            );
-        }
+        assert!(
+            read_with(&manifest("omp --profile work", &profile_transcript), &custom_env)
+                .expect("named profile telemetry")
+                .is_some()
+        );
 
+        // An existing XDG profile root wins for that profile.
         let xdg_transcript = xdg.join("omp/profiles/work/sessions/project/xdg.jsonl");
         write_usage_transcript(&xdg_transcript);
-        {
-            let _env = EnvGuard::set(&[
-                ("UNPEEL_HOME", Some(unpeel_home.path())),
-                ("HOME", Some(home.path())),
-                ("PI_CODING_AGENT_DIR", Some(custom_agent.as_path())),
-                ("OMP_PROFILE", None),
-                ("PI_PROFILE", None),
-                ("XDG_DATA_HOME", Some(xdg.as_path())),
-                ("PI_CONFIG_DIR", None),
+        let xdg_env = env(&[
+            ("HOME", home.path()),
+            ("PI_CODING_AGENT_DIR", custom_agent.as_path()),
+            ("XDG_DATA_HOME", xdg.as_path()),
+        ]);
+        assert!(
+            read_with(&manifest("omp --profile=work", &xdg_transcript), &xdg_env)
+                .expect("XDG profile telemetry")
+                .is_some()
+        );
+
+        // OMP_PROFILE / PI_PROFILE under PI_CONFIG_DIR select the same roots.
+        let config = home.path().join("omp-config");
+        let env_profile_transcript = config.join("profiles/team/agent/sessions/p/env.jsonl");
+        write_usage_transcript(&env_profile_transcript);
+        for variable in ["OMP_PROFILE", "PI_PROFILE"] {
+            let profile_env = env(&[
+                ("HOME", home.path()),
+                ("PI_CONFIG_DIR", config.as_path()),
+                (variable, Path::new("team")),
             ]);
             assert!(
-                read(&manifest("omp --profile=work", &xdg_transcript))
-                    .expect("XDG profile telemetry")
-                    .is_some()
+                read_with(&manifest("omp", &env_profile_transcript), &profile_env)
+                    .unwrap_or_else(|error| panic!("{variable} telemetry: {error:?}"))
+                    .is_some(),
+                "{variable}"
             );
         }
     }
 
     #[test]
     fn resolves_explicit_session_directory_before_implicit_roots() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let unpeel_home = tempfile::tempdir().expect("Unpeel home");
         let home = tempfile::tempdir().expect("user home");
         let explicit_root = tempfile::tempdir().expect("explicit Session root");
         let transcript = explicit_root.path().join("project/explicit.jsonl");
         write_usage_transcript(&transcript);
-        let _env = EnvGuard::set(&[
-            ("UNPEEL_HOME", Some(unpeel_home.path())),
-            ("HOME", Some(home.path())),
-            ("PI_CODING_AGENT_DIR", None),
-            ("OMP_PROFILE", None),
-            ("PI_PROFILE", None),
-            ("XDG_DATA_HOME", None),
-            ("PI_CONFIG_DIR", None),
+        // An implicit root is set too, so the explicit flag must win.
+        let custom_agent = home.path().join("custom-agent");
+        let env = env(&[
+            ("HOME", home.path()),
+            ("PI_CODING_AGENT_DIR", custom_agent.as_path()),
         ]);
 
         assert!(
-            read(&manifest(
-                &format!("omp --session-dir={}", explicit_root.path().display()),
-                &transcript,
-            ))
+            read_with(
+                &manifest(
+                    &format!("omp --session-dir={}", explicit_root.path().display()),
+                    &transcript,
+                ),
+                &env,
+            )
             .expect("explicit Session directory telemetry")
             .is_some()
         );

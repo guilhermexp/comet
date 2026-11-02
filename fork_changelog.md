@@ -2,6 +2,60 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-01 — Correções desktop V1–V3, W1, W2, C1, B1, B2, U1, F1/F3/F4/F5/F7 (branch de tarefa, sem release)
+
+- Voz: o stage não mostra Details (corpo, header, resize) nem na saída, sem salvar preferência; Settings → Voice "Show voice orb" (`voiceOrbEnabled`) remove todas as orbs e seus ticks sem afetar chamada, ditado ou Reduce motion; widget compacto global (mudo, voltar, encerrar no hover/foco) substitui a orb do composer.
+- Worktrees: o switch de local personalizado só mostra "ligado" depois de salvo (primeiro enable escolhe a pasta); checkouts de Worker passam a respeitar a pasta salva, como os de Chat (env `ZERON_WORKTREES_DIR` continua vencendo).
+- Menu bar de Workers ativos mantém a posição de cada Worker desde que o popover o viu; atividade não reordena linhas e Worker novo entra no fim. All recent continua por atividade.
+- Card de texto colado fica dentro do composer, acima do texto, sem sobrepor o Todo.
+- Abrir o Browser fecha Details (previews de arquivo não); links de Servers abrem no Browser interno (host remoto pela rota de preview).
+- Update do OMP em espera reconcilia instalação externa sem tocar trabalho ativo; timeout/falha mostram o fim redigido da saída.
+- Workers do Comet sem os motores legados Browser/Computer do Unpeel; aliases antigos (`list_sessions`, `report_to_parent`, `browser_*`, …) removidos; envio de texto/teclas compartilhado entre peer e controller com autoridade explícita.
+- Criação de Chat por agente unificada em `zeron.create_chat` com `mode: configured|inherit`; `comet-sessions` retirado; checagens de raiz/delegação usam as duas linhagens.
+- Provas remotas (Linux): suítes focadas verdes conforme `.tmp/evidence/desktop-corrections/DELIVERY.md`. Aceite nativo macOS pendente (checklist no mesmo diretório). Nenhum push na `main`, tag ou release.
+- Rodada 2 (revisão independente no Mac, MR1–MR10): cancelar um update do OMP durante a releitura de versão solta tudo na hora; uma criação de Worker resolve a raiz de worktree uma vez só; `zeron mcp` só usa o engine concedido (também após reconexão); `inherit` aceita projeto de outro device e recusa `model_options`/`modelOptions`; list/inspect/output/transcript/wait de peer e controller passam por operações tipadas compartilhadas com autoridades, perfis e vocabulários separados; o primeiro Browser e a reabertura do pane fecham Details; o widget de voz nunca fica sob o WebKit (faixa inferior recortada da máscara nativa); navegação manual cancela servidor pendente. Presenters de voz extraídos para `voice_surfaces.rs`, usados pelo Shell e por uma fixture nativa sem Shell/Workers/engine/providers. Evidências em `.tmp/evidence/desktop-corrections/round2/`; aceite visual macOS continua pendente da execução da fixture pelo orquestrador.
+- Rodada 3 (gate em par, GR1–GR9, GR12):
+  - A reconciliação de update externo do OMP lê o executável atual, mesmo em outro caminho.
+  - O widget só fica ao lado de uma view nativa quando a cápsula inteira (154×62) cabe.
+  - O stage focado volta a ser um grupo acessível "Voice call".
+  - No Windows, Workers leem o mesmo diretório de dados do app (fallback `USERPROFILE`).
+  - A paginação para trás não perde caracteres multibyte.
+  - A fixture exige a página loopback correta e falha se não conseguir gravar o relatório.
+  - O seam de teste do MR2 só existe em `cfg(test)`.
+  - Teste de recusa do SpawnChat e AGENTS do harness corrigidos.
+  - GR10/GR11 refutados com fontes.
+  - GR13: sem wrapper só para seletor de teste; LinkUi do chip só para mensagens com chips. GR14: a limpeza de saída do controller volta a manter `\r` dentro da linha (perfil explícito no cleaner compartilhado), e a notificação ao Chat pai mostra só o último paint de uma status line.
+  - Rodada 6: a fixture nativa falha com exit 1 no macOS quando o relatório não grava ou um check falha (antes, `terminate:` dava exit 0); testes de telemetria OMP sem mutar HOME/UNPEEL_HOME; CaptureServer dos hooks lê sockets em modo bloqueante e só conta `POST /hook/<id>`.
+  - Rodada 7 (GR19): fixture nativa de aceite do W2 (`workers-menu-fixture`) sobre o popover real do menu bar, com clique real pelo alvo/ponte de produção; a parte tautológica do teste de projeção saiu. Execução macOS pendente no Mac.
+  - Rodada 8: smokes operacionais descartáveis com binários da fonte — F4 em 3 Hosts/PTYs reais (controller, peer e /mobile/write entregam bytes exatos; peer de outro grupo sob Deny recusado sem bytes), F1/F3/F5 em `zeron __mcp__` por stdio (só `sessions`; domínios aposentados e aliases recusados), F7 em `zeron mcp` com porta-guarda (overrides do inherit recusados com 0 conexões). Descrições de aceite do OpenSpec ajustadas para a fronteira comum.
+  - Rodada 9: a fixture W2 espera a âncora nativa do status item (janela visível na tela, app ativo) antes do único toggle, com janela GPUI vazia só para ativação, e registra no JSON o estado da âncora e as notificações do NSPopover; no Comet, `browser_*` removido aponta para o painel Browser integrado em vez da ferramenta `browser` aposentada.
+  - Rodada 10: a fixture W2 abre o popover pelo caminho do produto (clique nativo no botão do status item → `TogglePopover` da ponte → toggle do controller), exige app ativo na prontidão e registra só sob `appshots-fixture` cada estágio da op de popover (hop agendado, entrada na main queue, estado antes/depois do show/close).
+  - Rodada 11 (gate final em par; change `fix-desktop-final-review-findings`, sync do estado do Mac primeiro):
+    - **Update de CLI:** só o binário de fato probado conta, e um binário mais antigo não é reprobado a cada tick.
+    - **Workers:** `ZERON_DATA_DIR` vazio segue o app.
+    - **Widget de voz:** fica fora do Browser nativo também durante fechamento e despejo por fit.
+    - **Switch "Show voice orb":** um toggle por tecla.
+    - **Browser:** a descoberta tardia de servidor não rouba foco.
+    - **Ferramenta `sessions`:** anuncia o limite real de 64 teclas.
+    - **Menu bar:** ordem retida própria, com Worker de mesmo instante entrando no fim; All recent volta a ordenar por atividade.
+    - **Fixture desktop:** captura só a própria janela no Linux.
+    - **Testes e specs:**
+      - Git isolado no teste de destino de Workers;
+      - Purposes das specs arquivadas preenchidos;
+      - texto do `inherit` corrigido;
+      - GF8/GF11 refutados.
+  - Rodada 13 (segundo gate final em par; change `fix-desktop-acceptance-edges`, sync do estado do Mac primeiro):
+    - **Update de CLI (GH1):** o update que esperou atualiza a instalação atual ao obter a lease, nunca o plano de uma instalação trocada ou removida.
+    - **Browser (GH5):** voltar a um Chat cujo Browser é restaurado fecha Details uma vez; a reabertura manual é mantida.
+    - **QA:**
+      - **GH2:** a fixture desktop mede as probes pela geometria viva.
+      - **GH3:** a fixture exige visibilidade nativa atual em cada frame de saída e tem um modo negativo.
+      - **GH4:** a captura X11 ignora só `BadWindow` de janelas que sumiram.
+      - **GH6:** a etapa do root padrão do teste de destino roda só em Unix.
+    - **Sem mudança:** GH7/GH8/GH10/GH11/GH12 refutados e GH9 duplicado.
+  - B2 comparado com o upstream atual `2500e8b3`: links colados na própria mensagem (chips GitHub/YouTube) passam a seguir o roteador de links do Chat; o default continua interno e a preferência externa explícita é respeitada.
+  - Evidências em `.tmp/evidence/desktop-corrections/round3/`.
+
 ## 2026-10-28 — v1.0.13: Limites legíveis, descoberta de voz e continuidade de OMP/Workers
 
 - Erros de cota Anthropic/OMP ganham resumo legível e intervalo informado, sem JSON/request ID na apresentação normal nem login indevido. O diagnóstico original permanece armazenado; autenticação real conserva login e mensagens já legíveis conservam o horário de reset.

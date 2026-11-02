@@ -485,8 +485,8 @@ pub fn appshot_strip_height(count: usize) -> f32 {
 /// Height the staged wrap strip adds to the composer column for `count`
 /// thumbnails at an `inner_width` content width (0 when empty). Mirrors
 /// flex-wrap: as many 56px thumbs per row as fit with 8px gaps inside the 16px
-/// side insets. The strip sits above the pill, so the pill itself never grows;
-/// the shell still reserves this height for transcript clearance.
+/// side insets (thumbnail estimate). The strip renders inside the composer
+/// chrome above the input; the layout itself measures the real cards.
 pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
     if count == 0 {
         return 0.0;
@@ -7699,6 +7699,27 @@ impl Composer {
         cx.notify();
     }
 
+    /// Fixture seam: a long paste staged exactly as `PastedLongText` does.
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_stage_long_paste(&mut self, text: String, cx: &mut Context<Self>) {
+        self.next_pasted_text += 1;
+        let staged = staged_pasted_text(self.next_pasted_text, text);
+        self.add_staged(vec![staged], cx);
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_set_draft(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+    }
+
+    /// Test seam: a long paste as the input's `PastedLongText` stages it.
+    #[cfg(test)]
+    pub(crate) fn stage_long_paste_for_test(&mut self, text: String, cx: &mut Context<Self>) {
+        self.next_pasted_text += 1;
+        let staged = staged_pasted_text(self.next_pasted_text, text);
+        self.add_staged(vec![staged], cx);
+    }
+
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
         if self.queue_edit_finishing {
             return;
@@ -8126,8 +8147,10 @@ impl Composer {
             .flex_wrap()
             .gap(px(STRIP_GAP))
             .px(px(STRIP_PAD_X))
-            // The strip sits above the input pill, so the spacing belongs below.
-            .pb(px(STRIP_PAD_TOP));
+            // Inside the composer, above the editor: its inset is on top,
+            // the editor's own top padding separates the text below.
+            .pt(px(STRIP_PAD_TOP))
+            .debug_selector(|| "composer-attachment-strip".into());
         for (ix, att) in staged.iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
             let remove_id = att.id.clone();
@@ -12767,7 +12790,14 @@ impl Render for Composer {
         let has_queue = !self.state.read(cx).queue.is_empty();
         let container = container.when_some(
             self.render_todo_panel(has_queue, window, cx),
-            |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
+            |el, panel| {
+                el.child(motion::fade_quick(
+                    "composer-todo",
+                    div()
+                        .debug_selector(|| "composer-todo-tray".into())
+                        .child(panel),
+                ))
+            },
         );
         let container = container.when_some(
             self.render_queue_panel(show_queue_latest_shortcut, window, cx),
@@ -12819,8 +12849,8 @@ impl Render for Composer {
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
         // `morph_t`) animates. Steady state renders exactly the target.
-        // Attachments sit above the pill in the outer composer; they never
-        // increase the input pill's content height.
+        // Staged cards sit inside the composer chrome above the input frame;
+        // they never change this explicit input height (the chrome grows).
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if self.dock_frame.is_some() {
             dock_layout.height(dock_amount)
@@ -13076,7 +13106,14 @@ impl Render for Composer {
         // No drop shadow on glass: it paints BEHIND the translucent fill and
         // shows through as an inner glow (theme.rs's card_selected_shadows
         // lesson; user report).
-        let pill = div()
+        // The chrome (border, fill, corners) wraps the staged cards and the
+        // input: cards sit INSIDE the composer above the editable text, and
+        // the chrome's natural height reserves exactly their measured layout.
+        // The input frame keeps the explicit morph height, so attachments
+        // never change the editor's own geometry.
+        let chrome = div()
+            .id("composer-pill")
+            .debug_selector(|| "composer-pill".into())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -13090,7 +13127,13 @@ impl Render for Composer {
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
-            .when(!theme.is_frost(), |el| el.shadow_lg());
+            .when(!theme.is_frost(), |el| el.shadow_lg())
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+        let pill = div().debug_selector(|| "composer-input-frame".into());
+        // The border now belongs to the chrome around this frame.
+        let frame_height = (pill_height - PILL_BORDER_V).max(0.0);
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -13133,7 +13176,7 @@ impl Render for Composer {
             // over the controls. Its width stays fixed (no tween rewraps);
             // top padding eases 12→16. Attach and send stay at full alpha and
             // remain near-stationary on the bottom anchor.
-            pill.h(px(pill_height))
+            pill.h(px(frame_height))
                 .overflow_hidden()
                 .relative()
                 .flex()
@@ -13188,7 +13231,7 @@ impl Render for Composer {
             // top sweeps down over a stationary row, the text walks down from
             // its expanded resting place via a decaying relative offset, and
             // the inline attach/send cluster holds its spot at full alpha.
-            pill.h(px(pill_height))
+            pill.h(px(frame_height))
                 .overflow_hidden()
                 .flex()
                 .flex_col()
@@ -13234,6 +13277,7 @@ impl Render for Composer {
                         .children(voice_track),
                 )
         };
+        let body = chrome.children(strip).child(body);
         let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
             self.pickers.update(cx, |pickers, cx| {
                 pickers.render_new_thread_target_selectors(cx)
@@ -13305,7 +13349,7 @@ impl Render for Composer {
             container
         };
         let dictation_status = self.render_dictation_status(cx);
-        let container = container.children(appshot_strip).children(strip).child(
+        let container = container.children(appshot_strip).child(
             div()
                 .track_focus(&self.dictation_focus)
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {

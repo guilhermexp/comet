@@ -752,7 +752,7 @@ pub(crate) fn send_signal(job: &std::sync::Arc<windows_process::Job>, _signal: S
 
 /// Fork D5 (upstream #1046 re-wired to the grant): whether this run launches
 /// without its provider's own subagent tools. Only a run holding the fork's
-/// `sessions` grant has the replacement (the `comet-sessions`/`zeron` side
+/// `sessions` grant has the replacement (`zeron` `create_chat` side
 /// chats), and only when the engine stamped that grant `side_chats_only`
 /// (Settings → Providers switch off, root chat). Never read from
 /// `request.mcp`, which the fork always leaves unset.

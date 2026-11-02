@@ -124,6 +124,18 @@ impl BrowserSurface {
                     .text_color(theme.text_muted)
                     .child(subtitle),
             );
+        if let Some(reason) = &self.server_unavailable {
+            let notice = div()
+                .id("remote-server-unavailable")
+                .role(gpui::Role::Status)
+                .text_size(crate::typography::ui_rems(12.0))
+                .line_height(px(19.0))
+                .text_color(theme.text_muted)
+                .child(reason.clone());
+            #[cfg(test)]
+            let notice = notice.debug_selector(|| "remote-server-unavailable".into());
+            content = content.child(notice);
+        }
         for service in &snapshot.services {
             let url = service.url(snapshot.proxy_port);
             let row_url = url.clone();
@@ -227,7 +239,7 @@ impl BrowserSurface {
                     ),
             );
         }
-        if snapshot.services.is_empty() {
+        if snapshot.services.is_empty() && self.server_unavailable.is_none() {
             let message = if self.previews_loading {
                 "Looking for dev servers…"
             } else if snapshot.remote {
@@ -281,7 +293,9 @@ impl BrowserSurface {
     }
 
     fn empty_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        if self.page.url.is_none() && self.previews_task.is_some() {
+        if self.page.url.is_none()
+            && (self.previews_task.is_some() || self.server_unavailable.is_some())
+        {
             return self.preview_body(theme, cx);
         }
         let external = !cfg!(any(target_os = "macos", target_os = "linux", windows));
@@ -432,14 +446,18 @@ impl BrowserSurface {
             }
         };
         let right_occlusion = self.right_occlusion;
+        let bottom_occlusion = self.bottom_occlusion;
         let mut body = body.cursor(self.page_cursor).child(
             gpui::canvas(
                 |_, _, _| (),
                 move |bounds, _, window, _| {
-                    // The Files panel slides over the page from the right.
+                    // The Files panel slides over the page from the right;
+                    // the live-call widget's band sits along the bottom.
                     let mut mask = window.content_mask().bounds;
                     let right = (window.viewport_size().width - right_occlusion).max(mask.left());
                     mask.size.width = mask.size.width.min(right - mask.left());
+                    let bottom = (window.viewport_size().height - bottom_occlusion).max(mask.top());
+                    mask.size.height = mask.size.height.min(bottom - mask.top());
                     let scale = window.scale_factor();
                     let composition = window.native_composition();
                     let page = std::rc::Rc::downgrade(&host);
@@ -538,6 +556,7 @@ impl BrowserSurface {
 
 impl Render for BrowserSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.resolve_pending_server(window, cx);
         let theme = Theme::of(cx).clone();
         #[cfg(target_os = "macos")]
         let persistence_notice = self.context.data.persistence_notice();
@@ -666,6 +685,7 @@ impl Render for BrowserSurface {
                 let native = native.handle();
                 let resize_inset = self.resize_inset;
                 let right_occlusion = self.right_occlusion;
+                let bottom_occlusion = self.bottom_occlusion;
                 body.child(
                     gpui::canvas(
                         |_, _, _| (),
@@ -675,6 +695,9 @@ impl Render for BrowserSurface {
                             let right =
                                 (window.viewport_size().width - right_occlusion).max(mask.left());
                             mask.size.width = mask.size.width.min(right - mask.left());
+                            let bottom =
+                                (window.viewport_size().height - bottom_occlusion).max(mask.top());
+                            mask.size.height = mask.size.height.min(bottom - mask.top());
                             let dragging = cx.has_active_drag();
                             // GPUIView refuses first responder, so a click on GPUI
                             // content leaves the keyboard with the page. AppKit

@@ -2576,3 +2576,29 @@ fn a_deleted_device_row_reads_as_deleted_not_unknown() {
     ws.upsert_device(&back).unwrap();
     assert!(!ws.device_deleted("cloud-1"));
 }
+
+/// F7: a seeded snapshot keeps a spawned Chat's `originChatId` (distinct from
+/// a UI side chat's `parentChatId`), so lineage-based root checks see it.
+#[test]
+fn seeded_snapshot_keeps_spawned_chat_origin_lineage() {
+    let mut doc = RegistryDoc::new("dev-a");
+    let mut spawned = chat("chat-spawned", "dev-a");
+    spawned.parent_chat_id = None;
+    spawned.origin_chat_id = Some("chat-root".into());
+    let mut side = chat("chat-side", "dev-a");
+    side.parent_chat_id = Some("chat-root".into());
+    side.origin_chat_id = None;
+    let state = WorkspaceState {
+        devices: vec![device("dev-a", "laptop")],
+        spaces: vec![],
+        chats: vec![chat("chat-root", "dev-a"), spawned, side],
+        sessions: vec![],
+    };
+    doc.seed_from_workspace(&state).unwrap();
+    let spawned = doc.chat("chat-spawned").unwrap().unwrap();
+    assert_eq!(spawned.origin_chat_id.as_deref(), Some("chat-root"));
+    assert_eq!(spawned.parent_chat_id, None);
+    let side = doc.chat("chat-side").unwrap().unwrap();
+    assert_eq!(side.parent_chat_id.as_deref(), Some("chat-root"));
+    assert_eq!(side.origin_chat_id, None);
+}

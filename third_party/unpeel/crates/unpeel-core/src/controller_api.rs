@@ -22,7 +22,6 @@ use crate::session_host::{self, HostedSessionState, SessionHostCommand};
 use crate::session_input;
 use crate::session_ops;
 use crate::state::{current_timestamp_ms, SessionInfo};
-use crate::transcripts;
 
 const SESSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_CREATE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1171,13 +1170,12 @@ fn resize_session(body: &Value) -> Result<Value, ControllerApiError> {
 /// attempted, any socket/write/read/reply failure is ambiguous: the PTY may
 /// already have consumed the bytes before its acknowledgement was lost.
 fn validate_terminal_effect_target(session_id: &str) -> Result<(), ControllerApiError> {
-    let Some(manifest) = session_host::load_manifest(session_id) else {
-        return Err(ControllerApiError::new(404, "unknown session"));
-    };
-    if manifest.state != HostedSessionState::Running {
-        return Err(ControllerApiError::new(409, "session has exited"));
+    use crate::session_control::{live_target, TargetError};
+    match live_target(session_id) {
+        Ok(_) => Ok(()),
+        Err(TargetError::Unknown) => Err(ControllerApiError::new(404, "unknown session")),
+        Err(TargetError::Exited) => Err(ControllerApiError::new(409, "session has exited")),
     }
-    Ok(())
 }
 
 fn terminal_effect_dispatch_result(
@@ -1561,7 +1559,10 @@ fn route_uncached(
                 .get("entries")
                 .and_then(|value| value.parse::<i64>().ok())
                 .map(|value| value.max(0) as usize);
-            match transcripts::read_session_transcript_markdown(session_id, entries, false) {
+            match crate::session_control::read_transcript(
+                session_id,
+                crate::session_control::TranscriptProfile::Whole { entries },
+            ) {
                 Ok(markdown) => json!({
                     "sessionID": session_id,
                     "markdown": markdown.trim(),

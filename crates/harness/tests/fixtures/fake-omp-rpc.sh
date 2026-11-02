@@ -200,8 +200,10 @@ while IFS= read -r line; do
     set_host_tools)
       if [ "$scenario" = "mixed-host-tools" ]; then
         has "$line" '"name":"workers"' || exit 60
-        has "$line" '"name":"sessions"' || exit 61
-        respond "$line" '{"toolNames":["workers","sessions"]}'
+        has "$line" '"name":"create_chat"' || exit 61
+        # Chat creation has one surface: no retired `sessions` host tool.
+        has "$line" '"name":"sessions"' && exit 64
+        respond "$line" '{"toolNames":["workers","list_chats","create_chat"]}'
       elif [ "$scenario" = "computer-use-host-tools" ]; then
         has "$line" '"name":"computer_use"' || exit 62
         has "$line" '"name":"computer_use_reset"' || exit 62
@@ -390,12 +392,12 @@ while IFS= read -r line; do
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "mixed-host-tools" ]; then
         emit '{"type":"agent_start"}'
-        emit '{"type":"host_tool_call","id":"host-sessions","toolCallId":"sessions-1","toolName":"sessions","arguments":{"action":"help"}}'
+        emit '{"type":"host_tool_call","id":"host-chat","toolCallId":"chat-1","toolName":"create_chat","arguments":{"mode":"inherit","prompt":"p"}}'
         read -r host_result
         has "$host_result" '"type":"host_tool_result"' || fail_stage mixed 70
-        has "$host_result" '"id":"host-sessions"' || fail_stage mixed 70
+        has "$host_result" '"id":"host-chat"' || fail_stage mixed 70
         has "$host_result" '"isError":false' || fail_stage mixed 70
-        has "$host_result" 'sessions help' || fail_stage mixed 71
+        has "$host_result" 'zeron chat-1' || fail_stage mixed 71
         emit '{"type":"host_tool_call","id":"host-workers","toolCallId":"workers-1","toolName":"workers","arguments":{"action":"help"}}'
         read -r host_result
         has "$host_result" '"id":"host-workers"' || fail_stage mixed 72

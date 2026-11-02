@@ -118,13 +118,23 @@ pub struct BrowserSurface {
     previews: zeron_proto::PreviewSnapshot,
     previews_loading: bool,
     previews_task: Option<gpui::Task<()>>,
+    /// User selection survives the first snapshot, including explicit
+    /// unavailable feedback. Only an authorized advertisement can resolve it;
+    /// navigation/rebinding cancels it. It is not a visual loading flag.
+    requested_preview: Option<zeron_proto::DevServer>,
+    server_unavailable: Option<String>,
     #[cfg(feature = "browser-fixture")]
     fixture_preview_open: std::rc::Rc<std::cell::Cell<Option<gpui::Point<gpui::Pixels>>>>,
+    #[cfg(feature = "browser-fixture")]
+    fixture_fail_native_init: bool,
     presentation: Presentation,
     #[cfg(target_os = "macos")]
     resize_inset: gpui::Pixels,
     #[cfg(any(target_os = "macos", windows))]
     right_occlusion: gpui::Pixels,
+    /// A GPUI band along the window's bottom edge (the live-call widget)
+    /// cropped out of native painting and hit testing.
+    bottom_occlusion: gpui::Pixels,
     _input_sub: Subscription,
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     native: Option<native::NativePage>,
@@ -201,13 +211,18 @@ impl BrowserSurface {
             previews: zeron_proto::PreviewSnapshot::default(),
             previews_loading: true,
             previews_task: None,
+            requested_preview: None,
+            server_unavailable: None,
             #[cfg(feature = "browser-fixture")]
             fixture_preview_open: Default::default(),
+            #[cfg(feature = "browser-fixture")]
+            fixture_fail_native_init: false,
             presentation: Presentation::Hidden,
             #[cfg(target_os = "macos")]
             resize_inset: gpui::px(0.0),
             #[cfg(any(target_os = "macos", windows))]
             right_occlusion: gpui::px(0.0),
+            bottom_occlusion: gpui::px(0.0),
             _input_sub: input_sub,
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             native: None,
@@ -274,6 +289,20 @@ impl BrowserSurface {
         }
     }
 
+    /// Crop a band along the window's bottom edge out of native painting
+    /// and native hit testing, so a GPUI overlay there stays visible and
+    /// clickable above the page.
+    pub fn set_bottom_occlusion(&mut self, height: gpui::Pixels, cx: &mut Context<Self>) {
+        if self.bottom_occlusion != height {
+            self.bottom_occlusion = height;
+            cx.notify();
+        }
+    }
+
+    pub fn bottom_occlusion(&self) -> gpui::Pixels {
+        self.bottom_occlusion
+    }
+
     pub fn set_presentation(&mut self, presentation: Presentation, cx: &mut Context<Self>) {
         if self.presentation == presentation {
             return;
@@ -295,6 +324,98 @@ impl BrowserSurface {
         self.fixture_preview_open.get()
     }
 
+    /// Component-fixture fault injection; never compiled into the shipping app.
+    #[cfg(feature = "browser-fixture")]
+    pub fn fixture_fail_native_init(&mut self) {
+        self.fixture_fail_native_init = true;
+    }
+
+    /// Open the selected process on the Chat's host. A local host opens its
+    /// loopback directly; a remote host waits for discovery to advertise this
+    /// exact pid, start time and port. Until then
+    /// the tab shows its preview list instead of guessing an address.
+    pub fn open_server(
+        &mut self,
+        server: &zeron_proto::DevServer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let port = server.port;
+        self.server_unavailable = None;
+        self.requested_preview = None;
+        if !self.remote {
+            self.navigate(&format!("http://127.0.0.1:{port}"), window, cx);
+            return;
+        }
+        match self.preview_url_for_server(server) {
+            Some(url) => self.navigate(&url, window, cx),
+            None => {
+                self.requested_preview = Some(server.clone());
+                self.resolve_pending_server(window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn preview_url_for_server(&self, server: &zeron_proto::DevServer) -> Option<String> {
+        self.previews
+            .services
+            .iter()
+            .find(|service| {
+                service.port == server.port
+                    && service.pid == server.pid
+                    && service.started_at == server.started_at
+            })
+            .map(|service| service.url(self.previews.proxy_port))
+    }
+
+    /// Resolve a pending server once discovery lists it (render-time, where a
+    /// window is at hand; taken once).
+    pub(crate) fn resolve_pending_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(server) = self.requested_preview.as_ref() else {
+            return;
+        };
+        let port = server.port;
+        let eligible = server.preview_eligible;
+        if let Some(url) = self.preview_url_for_server(server) {
+            self.requested_preview = None;
+            // Discovery is not a user action: whatever the user is typing
+            // into keeps keyboard focus.
+            self.load(&url, false, window, cx);
+        } else if eligible != Some(true)
+            && (!self.previews_loading || self.previews_task.is_none())
+            && self.server_unavailable.is_none()
+        {
+            self.server_unavailable = Some(match eligible {
+                Some(false) => format!(
+                    "Port {port} is unavailable remotely: this server is not eligible for a preview on its host."
+                ),
+                _ => format!(
+                    "Port {port} is unavailable remotely: its host has not confirmed preview eligibility."
+                ),
+            });
+        }
+    }
+
+    #[cfg(any(test, feature = "browser-fixture"))]
+    pub fn pending_server_port(&self) -> Option<u16> {
+        self.requested_preview
+            .as_ref()
+            .filter(|_| self.server_unavailable.is_none())
+            .map(|server| server.port)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn address_input(&self) -> Entity<ComposerInput> {
+        self.address.clone()
+    }
+
+    #[cfg(any(test, feature = "browser-fixture"))]
+    pub fn set_test_previews(&mut self, previews: zeron_proto::PreviewSnapshot) {
+        self.previews = previews;
+        self.previews_loading = false;
+    }
+
     /// The daemon resolves the session's current cwd for every update, so a
     /// checkout change cannot leave this tab discovering the previous project.
     pub fn watch_previews(
@@ -303,6 +424,15 @@ impl BrowserSurface {
         chat_id: String,
         cx: &mut Context<Self>,
     ) {
+        // A replacement watch belongs to a new Chat context. Its snapshots
+        // must not fulfil a selection made against the previous watch.
+        self.requested_preview = None;
+        self.server_unavailable = None;
+        self.previews_loading = true;
+        self.previews = zeron_proto::PreviewSnapshot {
+            remote: self.remote,
+            ..Default::default()
+        };
         self.previews_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 let subscription = handle
@@ -355,6 +485,13 @@ impl BrowserSurface {
     }
 
     pub fn navigate(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.load(input, true, window, cx);
+    }
+
+    /// Loads `input`. `user` is a navigation the user asked for, which moves
+    /// keyboard focus to the page; a background resolution leaves focus, and
+    /// an address the user is editing, exactly as they are.
+    fn load(&mut self, input: &str, user: bool, window: &mut Window, cx: &mut Context<Self>) {
         let url = match model::normalize_address(input) {
             Ok(url) => url,
             Err(message) => {
@@ -364,9 +501,15 @@ impl BrowserSurface {
             }
         };
         self.validation = None;
-        self.address
-            .update(cx, |input, cx| input.set_text(url.clone(), cx));
-        self.address_edited = false;
+        // An explicit navigation supersedes a server still waiting for
+        // discovery, so a late preview snapshot cannot replace this page.
+        self.requested_preview = None;
+        self.server_unavailable = None;
+        if user || !self.address.focus_handle(cx).is_focused(window) {
+            self.address
+                .update(cx, |input, cx| input.set_text(url.clone(), cx));
+            self.address_edited = false;
+        }
         self.page.url = Some(url.clone());
         self.page.title.clear();
         self.page.error = None;
@@ -383,7 +526,16 @@ impl BrowserSurface {
             } else {
                 #[cfg(any(target_os = "macos", windows))]
                 {
-                    native::NativePage::new(window, &self.context.data, self.native_tx.clone())
+                    #[cfg(feature = "browser-fixture")]
+                    let construction = if self.fixture_fail_native_init {
+                        Err("fixture: native construction unavailable".to_string())
+                    } else {
+                        native::NativePage::new(window, &self.context.data, self.native_tx.clone())
+                    };
+                    #[cfg(not(feature = "browser-fixture"))]
+                    let construction =
+                        native::NativePage::new(window, &self.context.data, self.native_tx.clone());
+                    construction
                         .map(|mut native| {
                             native.present(self.presentation);
                             self.native = Some(native);
@@ -399,7 +551,9 @@ impl BrowserSurface {
             if let Err(error) = result {
                 self.page.error = Some(format!("Could not open this page: {error}"));
             }
-            window.focus(&self.focus, cx);
+            if user {
+                window.focus(&self.focus, cx);
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
@@ -744,8 +898,11 @@ impl BrowserSurface {
         self.native.as_ref().unwrap().fixture_backdrop_layers()
     }
     #[cfg(target_os = "macos")]
-    pub fn fixture_page_hit(&self, x: f64, y: f64) -> bool {
-        self.native.as_ref().unwrap().fixture_page_hit(x, y)
+    /// None means native construction was unavailable, not that the point is clear.
+    pub fn fixture_page_hit(&self, x: f64, y: f64) -> Option<bool> {
+        self.native
+            .as_ref()
+            .map(|native| native.fixture_page_hit(x, y))
     }
     #[cfg(target_os = "macos")]
     pub fn fixture_backdrops(&self) -> Vec<(f64, f64, f64, f64)> {
@@ -780,6 +937,247 @@ impl BrowserSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn selected_server(port: u16, preview_eligible: Option<bool>) -> zeron_proto::DevServer {
+        serde_json::from_value(serde_json::json!({
+            "pid":7,"startedAt":1,"port":port,"cwd":"/srv/p","root":"/srv/p","command":"next dev","previewEligible":preview_eligible
+        })).unwrap()
+    }
+    #[gpui::test]
+    fn remote_server_selection_precedes_the_first_subscription_snapshot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            cx.set_global(crate::theme::Theme::default());
+        });
+        for eligibility in [None, Some(false)] {
+            for case in ["published", "absent", "manual", "later-published"] {
+                let window = cx.add_window(|window, cx| {
+                    BrowserSurface::new(BrowserContext::default(), true, window, cx)
+                });
+                let (send, receive) = futures::channel::oneshot::channel();
+                window
+                    .update(cx, |browser, window, cx| {
+                        // A real asynchronous first delivery, after open, without
+                        // launching an engine or pre-seeding a preview snapshot.
+                        browser.previews_task = Some(cx.spawn(async move |this, cx| {
+                            let snapshot = receive.await.unwrap();
+                            this.update(cx, |browser, cx| {
+                                browser.set_test_previews(snapshot);
+                                cx.notify();
+                            })
+                            .unwrap();
+                        }));
+                        browser.open_server(&selected_server(3210, eligibility), window, cx);
+                        if case == "manual" {
+                            browser.navigate("https://example.test/manual", window, cx);
+                        }
+                    })
+                    .unwrap();
+                let service: zeron_proto::PreviewService = serde_json::from_value(serde_json::json!({
+                    "id":"svc","projectId":"p","projectName":"p","projectCwd":"/srv/p",
+                    "deviceId":"remote","deviceName":"Build box","hostname":"p3210.preview.localhost",
+                    "name":"vite","port":3210,"pid":7,"cwd":"/srv/p","startedAt":1,"zeronOwned":true,"chatId":"a"
+                })).unwrap();
+                send.send(zeron_proto::PreviewSnapshot {
+                    services: if matches!(case, "published" | "manual") {
+                        vec![service.clone()]
+                    } else {
+                        vec![]
+                    },
+                    remote: true,
+                    ..Default::default()
+                })
+                .unwrap();
+                cx.run_until_parked();
+                window
+                    .update(cx, |browser, window, cx| {
+                        browser.resolve_pending_server(window, cx);
+                        match case {
+                            "manual" => assert_eq!(
+                                browser.page.url.as_deref(),
+                                Some("https://example.test/manual")
+                            ),
+                            "published" => {
+                                assert!(browser.page.url.as_deref().is_some_and(|url| {
+                                    url.starts_with("http://p3210.preview.localhost:7331")
+                                }))
+                            }
+                            _ => {
+                                assert!(
+                                    browser
+                                        .server_unavailable
+                                        .as_deref()
+                                        .is_some_and(|s| s.contains("3210"))
+                                );
+                                assert_eq!(
+                                    browser.pending_server_port(),
+                                    None,
+                                    "settled unavailability is not loading"
+                                );
+                                assert_eq!(browser.page.url, None);
+                                if case == "later-published" {
+                                    browser.set_test_previews(zeron_proto::PreviewSnapshot {
+                                        services: vec![service],
+                                        remote: true,
+                                        ..Default::default()
+                                    });
+                                    browser.resolve_pending_server(window, cx);
+                                    assert!(browser.page.url.as_deref().is_some_and(|url| {
+                                        url.starts_with("http://p3210.preview.localhost:7331")
+                                    }));
+                                }
+                            }
+                        }
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn remote_server_selection_rejects_unrelated_same_port(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            BrowserSurface::new(BrowserContext::default(), true, window, cx)
+        });
+        let selected: zeron_proto::DevServer = serde_json::from_value(serde_json::json!({
+            "pid":8,"startedAt":2,"port":3210,"cwd":"/b","root":"/b","command":"next dev","previewEligible":false
+        })).unwrap();
+        let mut service: zeron_proto::PreviewService = serde_json::from_value(serde_json::json!({
+            "id":"a","projectId":"a","projectName":"a","projectCwd":"/a",
+            "deviceId":"remote","deviceName":"Build box","hostname":"a.preview.localhost",
+            "name":"vite","port":3210,"pid":7,"cwd":"/a","startedAt":1,"zeronOwned":true,"chatId":"a"
+        })).unwrap();
+        window
+            .update(cx, |browser, window, cx| {
+                browser.set_test_previews(zeron_proto::PreviewSnapshot {
+                    services: vec![service.clone()],
+                    remote: true,
+                    ..Default::default()
+                });
+                browser.open_server(&selected, window, cx);
+                assert_eq!(
+                    browser.page.url, None,
+                    "B must never navigate to unrelated A at the same port"
+                );
+                for (pid, started_at) in [(7, 1), (8, 1)] {
+                    service.pid = pid;
+                    service.started_at = started_at;
+                    browser.set_test_previews(zeron_proto::PreviewSnapshot {
+                        services: vec![service.clone()],
+                        remote: true,
+                        ..Default::default()
+                    });
+                    browser.resolve_pending_server(window, cx);
+                    assert_eq!(
+                        browser.page.url, None,
+                        "pending B survives unrelated publication and PID reuse"
+                    );
+                }
+                service.pid = selected.pid;
+                service.started_at = selected.started_at;
+                service.hostname = "b.preview.localhost".into();
+                browser.set_test_previews(zeron_proto::PreviewSnapshot {
+                    services: vec![service],
+                    remote: true,
+                    ..Default::default()
+                });
+                browser.resolve_pending_server(window, cx);
+                assert!(
+                    browser
+                        .page
+                        .url
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("http://b.preview.localhost:7331")
+                );
+                assert!(browser.server_unavailable.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn remote_server_unavailable_is_painted_without_a_watch(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let (browser, cx) = cx.add_window_view(|window, cx| {
+            BrowserSurface::new(BrowserContext::default(), true, window, cx)
+        });
+        cx.simulate_resize(gpui::size(gpui::px(800.0), gpui::px(500.0)));
+        cx.update(|window, cx| {
+            browser.update(cx, |browser, cx| {
+                browser.set_test_previews(zeron_proto::PreviewSnapshot {
+                    remote: true,
+                    ..Default::default()
+                });
+                browser.open_server(&selected_server(3210, Some(false)), window, cx);
+                assert!(browser.previews_task.is_none());
+            })
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| window.draw(cx).clear());
+        }
+        let bounds = cx
+            .debug_bounds("remote-server-unavailable")
+            .expect("the unavailable notice must actually be painted");
+        assert!(bounds.size.width > gpui::px(0.0) && bounds.size.height > gpui::px(0.0));
+    }
+
+    #[gpui::test]
+    fn remote_server_eligibility_survives_finished_empty_snapshots(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            BrowserSurface::new(BrowserContext::default(), true, window, cx)
+        });
+        // The old-host wire shape must pass through the real Browser consumer
+        // without being interpreted as a promise of eventual discovery.
+        let old: zeron_proto::DevServer = serde_json::from_value(serde_json::json!({
+            "pid":7,"startedAt":1,"port":3210,"cwd":"/srv/p","root":"/srv/p","command":"next dev"
+        }))
+        .unwrap();
+        window.update(cx, |browser, window, cx| {
+            for eligibility in [old.preview_eligible, Some(false)] {
+                browser.set_test_previews(zeron_proto::PreviewSnapshot { remote: true, ..Default::default() });
+                browser.open_server(&zeron_proto::DevServer { preview_eligible: eligibility, ..old.clone() }, window, cx);
+                // A completed second snapshot cannot resolve an excluded listener.
+                browser.set_test_previews(zeron_proto::PreviewSnapshot { remote: true, ..Default::default() });
+                browser.resolve_pending_server(window, cx);
+                assert_eq!(browser.page.url, None);
+                assert_eq!(browser.pending_server_port(), None);
+                assert!(browser.server_unavailable.as_deref().unwrap().contains("Port 3210"));
+            }
+            browser.open_server(&selected_server(5173, Some(true)), window, cx);
+            assert_eq!(browser.pending_server_port(), Some(5173));
+            assert!(browser.server_unavailable.is_none());
+            let service: zeron_proto::PreviewService = serde_json::from_value(serde_json::json!({
+                "id":"svc","projectId":"p","projectName":"p","projectCwd":"/srv/p",
+                "deviceId":"remote","deviceName":"Build box","hostname":"p5173.preview.localhost",
+                "name":"vite","port":5173,"pid":7,"cwd":"/srv/p","startedAt":1,"zeronOwned":true,"chatId":"a"
+            })).unwrap();
+            browser.set_test_previews(zeron_proto::PreviewSnapshot { services: vec![service], remote: true, ..Default::default() });
+            browser.resolve_pending_server(window, cx);
+            assert!(browser.page.url.as_deref().unwrap().starts_with("http://p5173.preview.localhost:7331"));
+            assert_eq!(browser.pending_server_port(), None);
+            // Published authorized routes remain usable with old-host metadata.
+            browser.open_server(&selected_server(5173, None), window, cx);
+            assert!(browser.server_unavailable.is_none());
+            assert!(browser.page.url.as_deref().unwrap().starts_with("http://p5173.preview.localhost:7331"));
+        }).unwrap();
+    }
+
     #[gpui::test]
     fn address_enter_rejects_unsupported_schemes_and_escape_restores_url(
         cx: &mut gpui::TestAppContext,

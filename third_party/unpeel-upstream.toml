@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "54cd15248b3c74aca11181abb12c9e277a4ac574"
+vendored_tree = "f1449525c8007824c905d2c7b3bb01ed75261e0a"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -185,3 +185,73 @@ base_revision_resolves_upstream = false
 # Downstream consumer: crates/workers-unpeel/tests/terminal_history.rs.
 # vendored_tree includes the local reader change and vendored documentation;
 # this is a local patch, not an upstream revision or dependency version bump.
+
+# 2026-11-01 — desktop corrections F1/F3/F4/F5 (local patch only, not an
+# upstream update; local_modifications_count remains the unrecomputed value):
+# - `embedding.rs` (new): an embedder can retire the legacy Browser
+#   (agent-browser) and Computer (cua-driver) engines process-wide. Comet calls
+#   `retire_legacy_engines()` from `register_worker_mcp_servers`; launch and
+#   resume then grant neither domain (`session_ops`, manifest accessors) and
+#   `mcp_host` masks both domains before advertising or dispatching, `help`
+#   and `context` included. Standalone Unpeel never calls it: defaults and
+#   engines unchanged. Comet no longer routes `__browser_cleanup__` /
+#   `__computer_cleanup__`.
+# - `mcp_host`: removed callable legacy aliases (`browser_*` tool names, every
+#   legacy session tool name such as `list_sessions`/`read_transcript`, and the
+#   familial `list_children`/`wait_for_children`/`summarize_children`/
+#   `report_to_parent`, as tools and as `sessions` actions). They fail before
+#   any handler with the canonical replacement; canonical actions unchanged.
+# - `session_control.rs` (new): shared key encoding (superset vocabulary,
+#   64 keys, 16 KiB `text:` entries), ANSI cleanup, live-target check and the
+#   text/keys delivery path with an explicit `InputAuthority` (Peer /
+#   Controller with optional task receipt). Peer `sessions`, `controller_api`
+#   and Comet's controller `workers` tool use it; their policies stay separate.
+# Tests: `mcp_host::removed_aliases_are_rejected_without_side_effects`,
+# `retired_embedding_has_no_browser_or_computer_surface`,
+# `session_ops::embedding_launch_tests`, `session_control::tests`; downstream
+# `crates/workers-unpeel` host-mode and controller tests.
+
+# 2026-11-01 — round 2 (MR7, local patch only, not an upstream update):
+# - `session_control.rs`: typed read operations shared by the peer `sessions`
+#   tool and Comet's controller — `read_target`/`hosted_sessions`,
+#   `read_output` (`OutputCursor::Tail`/`From`), `read_transcript`
+#   (`TranscriptProfile::Compact`/`Whole`) with `page_text`, and the wait
+#   vocabulary/verdict (`WaitVocabulary::Peer`/`Controller`, `judge_wait`;
+#   `completed` is controller-only and never satisfied by idle/exited).
+# - `mcp_host`: list/inspect/read_output/read_transcript/wait_for_status and
+#   manifest loads use them after the unchanged peer authorization.
+# - `controller_host`: bootstrap enumeration, `/mobile/output` and target
+#   checks; `controller_api`: `/mobile/transcript-markdown` (`Whole`).
+# Answer shapes are unchanged. Tests: `session_control::tests`,
+# `mcp_host::{peer_reads_refuse_hostile_targets_before_any_shared_read,
+# peers_cannot_wait_for_task_completion}`,
+# `controller_host::controller_output_refuses_hostile_ids_before_the_shared_read`;
+# downstream `controller_mcp::controller_wait_uses_the_shared_vocabulary_and_completion_boundary`.
+
+# 2026-11-02 — round 3 (GR7, local patch only): `session_control::page_text`
+# rounds `previous_offset` forward to a char boundary so backward paging never
+# skips a character. Test: `session_control::tests::backward_pages_cover_the_text_without_gaps`.
+
+# 2026-11-02 — GR14 (local patch only): `session_control::clean_terminal_text`
+# with `CarriageReturns::{AsLineBreaks, Keep}`; `strip_ansi` is the peer
+# profile. Comet's controller `clean_output` keeps in-line CR. Test:
+# `session_control::tests::carriage_return_profiles_share_one_cleaner`.
+
+# 2026-11-02 — round 6 (GR17/GR18, test infrastructure only; no production
+# path, auth or preflight semantics changed):
+# - `runtimes/omp/adapter/telemetry.rs`: root resolution and `read` take an
+#   explicit environment/marker (`omp_sessions_root_in`, `read_in`); production
+#   passes the process environment. Tests no longer mutate HOME/UNPEEL_HOME.
+# - `runtimes/setup_conformance_tests.rs`: CaptureServer reads accepted sockets
+#   blocking, requires complete requests, counts only `POST /hook/<id>`, and
+#   the rejected-preflight test isolates the port registry and checks Stop,
+#   generation 42, runtime id and Session route of each preflight.
+
+# 2026-11-02 — canonical peer send_keys help/schema advertises the existing
+# text:<literal> vocabulary and shared 16 KiB UTF-8 bound. Metadata and owning
+# documentation only; encoding, input authority and receipts are unchanged.
+
+# 2026-11-02 — GL3/4/8/9: normalize CRLF once, consume ESC designation
+# intermediates, isolate embedding advertisement assertions from ambient
+# caller manifests, and name canonical browser/action screenshot in guidance.
+# Raw replay, call authority and standalone dispatcher keys are unchanged.

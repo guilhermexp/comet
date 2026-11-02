@@ -1065,7 +1065,8 @@ impl WorkspaceHost {
     }
 
     /// Same upsert as [`Self::create_chat`], with the parent chat recorded as
-    /// origin (`originChatId`) — the `sessions` tool's link.
+    /// origin (`originChatId`) — the `sessions` tool's link. An explicit
+    /// device is the inherited/resolved execution host, not the Space owner.
     pub fn create_child_chat(
         &self,
         chat_id: &str,
@@ -1079,7 +1080,7 @@ impl WorkspaceHost {
             chat_id,
             space_id,
             device_id,
-            None,
+            device_id,
             config,
             cwd,
             None,

@@ -1,4 +1,4 @@
-//! Comet MCP servers (`comet-workers`, `comet-sessions`, `zeron`,
+//! Comet MCP servers (`comet-workers`, `zeron`,
 //! `comet-computer-use`), resolved together and rendered in each runtime's
 //! own config dialect.
 use std::path::{Path, PathBuf};
@@ -101,46 +101,15 @@ pub(crate) fn resolve_for(
     })
 }
 
-pub(crate) const SESSIONS_MCP_ARG: &str = "__sessions_mcp__";
-const SESSIONS_NAME: &str = "comet-sessions";
-const SESSIONS_TIMEOUT_SECS: u64 = 120;
-
-pub(crate) fn resolve_sessions_for(
-    executable: &Path,
-    grant: &zeron_proto::SessionsGrant,
-) -> Option<WorkersMcpServer> {
-    if !executable.is_absolute()
-        || grant.parent_chat_id.trim().is_empty()
-        || grant.endpoint.trim().is_empty()
-        || grant.engine_id.trim().is_empty()
-    {
-        return None;
-    }
-    Some(WorkersMcpServer {
-        name: SESSIONS_NAME,
-        command: executable.to_path_buf(),
-        args: vec![SESSIONS_MCP_ARG.to_owned()],
-        env: vec![
-            ("COMET_SESSIONS_CONTROLLER".into(), "1".into()),
-            (
-                "COMET_SESSIONS_PARENT_CHAT_ID".into(),
-                grant.parent_chat_id.clone(),
-            ),
-            ("COMET_SESSIONS_ENDPOINT".into(), grant.endpoint.clone()),
-            ("COMET_SESSIONS_ENGINE_ID".into(), grant.engine_id.clone()),
-        ],
-        timeout_secs: SESSIONS_TIMEOUT_SECS,
-    })
-}
-
 const ZERON_NAME: &str = "zeron";
 /// `wait_for_turn` blocks up to an hour; the client must outlast it.
 const ZERON_TIMEOUT_SECS: u64 = 3660;
 
 /// Zeron's own chat MCP (`zeron mcp`: list/read/create/send/wait on chats,
 /// batch `create_chats`/`send_messages`). Upstream injects it into every run;
-/// the fork rides the same root-orchestrator grant as `comet-sessions`, so
-/// subagents, Workers and child chats never gain chat control. Chats it
+/// the fork mounts it only under the root-orchestrator sessions grant, so
+/// subagents, Workers and child chats never gain chat control. It is the one
+/// agent Chat-creation surface (`create_chat` modes `configured`/`inherit`). Chats it
 /// creates link back to `grant.parent_chat_id` (`ZERON_CHAT_ID`).
 pub(crate) fn resolve_zeron_for(
     executable: &Path,
@@ -239,7 +208,7 @@ pub(crate) fn with_ipc_token_file(servers: &mut [WorkersMcpServer], token_file: 
     };
     for server in servers
         .iter_mut()
-        .filter(|server| [NAME, SESSIONS_NAME, ZERON_NAME].contains(&server.name))
+        .filter(|server| [NAME, ZERON_NAME].contains(&server.name))
     {
         server
             .env
@@ -263,7 +232,6 @@ pub(crate) fn servers_for(
         servers.push(server);
     }
     if let Some(grant) = &request.sessions {
-        servers.extend(resolve_sessions_for(executable, grant));
         servers.extend(resolve_zeron_for(executable, grant));
     }
     if request.enable_workers_mcp {
@@ -538,32 +506,27 @@ mod tests {
     }
 
     #[test]
-    fn both_grants_render_workers_and_sessions() {
+    fn both_grants_render_workers_and_chat_tools_without_comet_sessions() {
         let servers = servers_for(Path::new("/opt/zeron"), &request(true, true), false);
-        assert_eq!(servers.len(), 4);
+        assert_eq!(servers.len(), 3);
         let claude: serde_json::Value =
             serde_json::from_str(&claude_config_json(&servers).unwrap()).unwrap();
         assert!(claude["mcpServers"].get("comet-workers").is_some());
-        assert_eq!(
-            claude["mcpServers"]["comet-sessions"]["env"]["COMET_SESSIONS_ENGINE_ID"],
-            "engine-1"
-        );
+        assert!(claude["mcpServers"].get("zeron").is_some());
+        // F7: Chat creation has one surface; the retired server is gone.
+        assert!(claude["mcpServers"].get("comet-sessions").is_none());
         let codex: Vec<_> = servers
             .iter()
             .flat_map(|server| server.codex_overrides())
             .collect();
-        assert!(
-            codex
-                .iter()
-                .any(|line| line.contains("mcp_servers.comet-sessions."))
-        );
+        assert!(!codex.iter().any(|line| line.contains("comet-sessions")));
         assert!(
             codex
                 .iter()
                 .any(|line| line.contains("mcp_servers.comet-workers.tool_timeout_sec="))
         );
         let acp: Vec<_> = servers.iter().map(|server| server.acp_value()).collect();
-        assert_eq!(acp.len(), 4);
+        assert_eq!(acp.len(), 3);
     }
 
     #[test]
@@ -588,17 +551,13 @@ mod tests {
         assert!(request.mcp.is_none());
         let servers = servers_for(Path::new("/opt/zeron"), &request, false);
         let names: Vec<_> = servers.iter().map(|server| server.name).collect();
-        assert_eq!(names, ["comet-sessions", "zeron"]);
+        assert_eq!(names, ["zeron"]);
 
         let codex: Vec<_> = servers
             .iter()
             .flat_map(|server| server.codex_overrides())
             .collect();
-        assert!(
-            codex
-                .iter()
-                .any(|line| line.contains("mcp_servers.comet-sessions."))
-        );
+        assert!(!codex.iter().any(|line| line.contains("comet-sessions")));
         assert!(codex.iter().any(|line| line.contains("mcp_servers.zeron.")));
         assert!(!codex.iter().any(|line| line.contains("comet-workers")));
     }

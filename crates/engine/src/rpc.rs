@@ -1729,6 +1729,14 @@ impl EngineRpc {
             .chat(&params.parent_chat_id)
             .map_err(|error| RpcError::Failed(error.to_string()))?
             .ok_or_else(|| RpcError::Failed(format!("no such chat: {}", params.parent_chat_id)))?;
+        // Delegation is one level deep for every caller of this IPC method:
+        // a Chat spawned through either lineage field never spawns again.
+        if parent.parent_chat_id.is_some() || parent.origin_chat_id.is_some() {
+            return Err(RpcError::Failed(format!(
+                "{} is itself a delegated chat: only top-level chats spawn chats",
+                params.parent_chat_id
+            )));
+        }
         let (space_id, device_id, cwd) = if let Some(requested) = params
             .space_id
             .as_deref()
@@ -1741,22 +1749,11 @@ impl EngineRpc {
                 .map_err(|error| RpcError::Failed(error.to_string()))?
                 .ok_or_else(|| RpcError::Failed(format!("no such space: {requested}")))?;
             (Some(space.id), space.device_id, space.path)
-        } else if let Some(parent_space) = parent.space_id.clone() {
-            let space = self
-                .workspace
-                .space(&parent_space)
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-            match space {
-                Some(space) => (Some(space.id), space.device_id, space.path),
-                None => (
-                    Some(parent_space),
-                    parent.device_id.clone(),
-                    parent.cwd.clone().unwrap_or_else(|| "~".into()),
-                ),
-            }
         } else {
+            // Space membership is not the execution destination: the parent
+            // may be running a worktree or a checkout on another device.
             (
-                None,
+                parent.space_id.clone(),
                 parent.device_id.clone(),
                 parent.cwd.clone().unwrap_or_else(|| "~".into()),
             )
@@ -3289,10 +3286,31 @@ impl RpcService for EngineRpc {
             ))),
             methods::LIST_DEV_SERVERS => {
                 let p: zeron_proto::ListDevServersParams = parse_params(params)?;
-                let servers =
-                    tokio::task::spawn_blocking(move || zeron_preview::servers::list(&p.cwds))
-                        .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let previews = self.previews.clone();
+                let selected = p
+                    .chat_id
+                    .as_deref()
+                    .map(|chat| self.workspace.chat(chat))
+                    .transpose()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .flatten();
+                let servers = tokio::task::spawn_blocking(move || match previews {
+                    // Remote watchers use the selected Chat's document cwd
+                    // verbatim; never canonicalize a path on the viewing Mac.
+                    Some(previews) => previews.list_dev_servers(
+                        &p.cwds,
+                        selected.as_ref().map(|chat| {
+                            (
+                                chat.device_id.as_str(),
+                                chat.id.as_str(),
+                                chat.cwd.as_deref().map(std::path::Path::new),
+                            )
+                        }),
+                    ),
+                    None => zeron_preview::servers::list(&p.cwds),
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&servers)
             }
             methods::STOP_DEV_SERVER => {
@@ -3360,12 +3378,15 @@ impl RpcService for EngineRpc {
                         // or terminals started elsewhere. Only Zeron-started
                         // ones: an older peer advertises every listener.
                         snapshot.services.retain(|service| {
-                            service.device_id == device
-                                && service.zeron_owned
-                                && (service.chat_id.as_deref() == Some(chat_id.as_str())
-                                    || cwd.as_ref().is_some_and(|cwd| {
-                                        cwd == std::path::Path::new(&service.project_cwd)
-                                    }))
+                            zeron_proto::preview_visible_to_chat(
+                                &service.device_id,
+                                service.zeron_owned,
+                                service.chat_id.as_deref(),
+                                std::path::Path::new(&service.project_cwd),
+                                &device,
+                                &chat_id,
+                                cwd.as_deref(),
+                            )
                         });
                         let value = serde_json::to_value(snapshot).ok()?;
                         Some((value, (changes, chats, false, workspace, catalog, chat_id)))

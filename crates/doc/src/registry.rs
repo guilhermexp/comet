@@ -1843,7 +1843,9 @@ impl RegistryDoc {
                     ("spaceId", opt_str(chat.space_id.as_deref())),
                     ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
                     ("lastSeenAt", opt_ms(chat.last_seen_at)),
-                    ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+                    // Spawned-Chat lineage is distinct from a UI side chat's
+                    // parent and must survive a seeded snapshot.
+                    ("originChatId", opt_str(chat.origin_chat_id.as_deref())),
                 ]),
             );
         }

@@ -17,10 +17,6 @@ elif [ "${1:-}" = "__computer_use_mcp__" ]; then
   else
     tools="[{\"name\":\"computer_use\",\"description\":\"Drive apps\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"computer_use_reset\",\"description\":\"Reset\",\"inputSchema\":{\"type\":\"object\"}}]"
   fi
-elif [ "${1:-}" = "__sessions_mcp__" ]; then
-  [ "${COMET_SESSIONS_CONTROLLER:-}" = "1" ] || exit 12
-  tool=sessions
-  label="sessions help"
 else
   [ "${COMET_WORKERS_CONTROLLER:-}" = "1" ] || exit 12
   tool=workers

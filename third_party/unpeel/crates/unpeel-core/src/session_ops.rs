@@ -1578,7 +1578,25 @@ pub(crate) fn browser_mcp_enabled_from_app_state(state: &serde_json::Value) -> b
     access != BrowserAccess::Off
 }
 
+#[cfg(test)]
+mod embedding_launch_tests {
+    #[test]
+    fn retired_embedding_never_grants_the_legacy_browser_at_launch() {
+        crate::embedding::set_retired_for_test(Some(true));
+        assert!(!super::browser_mcp_enabled_for_launch());
+        crate::embedding::set_retired_for_test(None);
+        // Standalone default (absent inherited state) stays On.
+        assert!(super::browser_mcp_enabled_from_app_state(
+            &serde_json::json!({})
+        ));
+    }
+}
+
 fn browser_mcp_enabled_for_launch() -> bool {
+    // An embedding that retired the legacy engine (Comet) never grants it.
+    if crate::embedding::legacy_engines_retired() {
+        return false;
+    }
     match crate::app_state::load() {
         Ok(state) => browser_mcp_enabled_from_app_state(&state),
         Err(error) => {

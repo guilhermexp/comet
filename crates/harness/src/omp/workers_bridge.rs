@@ -71,20 +71,8 @@ impl WorkersBridge {
         Self::launch(server, "workers").await.map(Some)
     }
 
-    pub async fn start_sessions(
-        executable: &std::path::Path,
-        grant: &zeron_proto::SessionsGrant,
-    ) -> Result<Option<Self>, HarnessError> {
-        let Some(server) =
-            sessions_server(executable, grant, workers_mcp::ipc_token_file().as_deref())
-        else {
-            return Ok(None);
-        };
-        Self::launch(server, "sessions").await.map(Some)
-    }
-
-    /// `zeron mcp` (chat tools) under the same root-orchestrator grant as
-    /// `comet-sessions`; every tool it lists becomes an OMP host tool.
+    /// `zeron mcp` (chat tools) under the root-orchestrator sessions grant;
+    /// every tool it lists becomes an OMP host tool.
     pub async fn start_zeron(
         executable: &std::path::Path,
         grant: &zeron_proto::SessionsGrant,
@@ -425,15 +413,6 @@ fn workers_server(
     Some(with_engine_credentials(server, token_file))
 }
 
-fn sessions_server(
-    executable: &std::path::Path,
-    grant: &zeron_proto::SessionsGrant,
-    token_file: Option<&std::path::Path>,
-) -> Option<workers_mcp::WorkersMcpServer> {
-    let server = workers_mcp::resolve_sessions_for(executable, grant)?;
-    Some(with_engine_credentials(server, token_file))
-}
-
 fn zeron_server(
     executable: &std::path::Path,
     grant: &zeron_proto::SessionsGrant,
@@ -444,7 +423,7 @@ fn zeron_server(
 }
 
 /// The same filter `servers_for_request` applies: only the servers that dial
-/// the engine (`comet-workers`, `comet-sessions`, `zeron`) get the file.
+/// the engine (`comet-workers`, `zeron`) get the file.
 fn with_engine_credentials(
     mut server: workers_mcp::WorkersMcpServer,
     token_file: Option<&std::path::Path>,
@@ -477,8 +456,7 @@ mod credential_tests {
     }
 
     /// The root OMP run's sidecars dial the engine's IPC: each presents the
-    /// bearer file the engine registered, or `comet-sessions` gets a 401 and
-    /// the run never starts.
+    /// bearer file the engine registered, or the sidecar gets a 401.
     #[test]
     fn omp_sidecars_carry_the_engine_ipc_token_file() {
         let executable = Path::new("/opt/zeron");
@@ -491,10 +469,6 @@ mod credential_tests {
         let workers = workers_server(&options, Some("ws://127.0.0.1:27654"), token).unwrap();
         assert!(carries_token(&workers), "comet-workers");
         assert!(
-            carries_token(&sessions_server(executable, &grant(), token).unwrap()),
-            "comet-sessions"
-        );
-        assert!(
             carries_token(&zeron_server(executable, &grant(), token).unwrap()),
             "zeron"
         );
@@ -503,7 +477,7 @@ mod credential_tests {
     #[test]
     fn omp_sidecars_without_a_registered_token_file_stay_bare() {
         let executable = Path::new("/opt/zeron");
-        let server = sessions_server(executable, &grant(), None).unwrap();
+        let server = zeron_server(executable, &grant(), None).unwrap();
         assert!(
             !server
                 .env

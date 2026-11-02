@@ -39,7 +39,8 @@
 //! return the file path — never inline image bytes — so the desktop and phone
 //! galleries pick them up like browser captures.
 
-use crate::mcp_host::{app_request_with_timeout, self_session_id, strip_ansi};
+use crate::mcp_host::{app_request_with_timeout, self_session_id};
+use crate::session_control::strip_ansi;
 use crate::session_host;
 use crate::state::{current_timestamp_ms, ComputerAccess, ComputerSettings};
 use serde_json::{json, Map, Value};

@@ -95,6 +95,7 @@ pub mod typography;
 mod url_chips;
 pub mod visuals;
 pub mod voice;
+pub mod voice_surfaces;
 pub mod workers;
 mod workspace_links;
 

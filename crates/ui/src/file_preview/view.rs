@@ -112,6 +112,9 @@ pub struct FilePreview {
     scroll_handles: HashMap<(String, String), UniformListScrollHandle>,
     markdown_lists: HashMap<(String, String), (ListState, u32)>,
     markdown_cache: Rc<RefCell<markdown_render::RenderCache>>,
+    /// A GPUI band along the window's bottom edge (the live-call widget)
+    /// the native document view must leave uncovered.
+    bottom_reserve: f32,
     #[cfg(target_os = "macos")]
     native_document: Option<(
         PathBuf,
@@ -134,9 +137,23 @@ impl FilePreview {
             scroll_handles: HashMap::new(),
             markdown_lists: HashMap::new(),
             markdown_cache: Rc::default(),
+            bottom_reserve: 0.0,
             #[cfg(target_os = "macos")]
             native_document: None,
         }
+    }
+
+    /// Keep the native document view above a band along the window's bottom
+    /// edge, so the GPUI overlay there stays visible and clickable.
+    pub fn set_bottom_reserve(&mut self, height: f32, cx: &mut Context<Self>) {
+        if self.bottom_reserve != height {
+            self.bottom_reserve = height;
+            cx.notify();
+        }
+    }
+
+    pub fn bottom_reserve(&self) -> f32 {
+        self.bottom_reserve
     }
 
     pub fn set_resource_source(
@@ -780,13 +797,18 @@ impl FilePreview {
             };
             let view = view.clone();
             let viewport_height = f32::from(window.viewport_size().height) as f64;
+            let reserved_top = viewport_height - self.bottom_reserve as f64;
             return gpui::canvas(
                 move |bounds, _, _| {
+                    let top = f32::from(bounds.origin.y) as f64;
+                    let height = (f32::from(bounds.size.height) as f64)
+                        .min(reserved_top - top)
+                        .max(0.0);
                     view.borrow_mut().attach_and_layout(
                         f32::from(bounds.origin.x) as f64,
-                        f32::from(bounds.origin.y) as f64,
+                        top,
                         f32::from(bounds.size.width) as f64,
-                        f32::from(bounds.size.height) as f64,
+                        height,
                         viewport_height,
                     );
                 },

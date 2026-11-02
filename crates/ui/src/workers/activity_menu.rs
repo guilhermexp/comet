@@ -136,6 +136,8 @@ pub fn project_activity_menu(snapshot: &WorkersBootstrap) -> WorkersActivityMenu
         })
         .filter(|session| seen.insert(session.id.clone()))
         .collect::<Vec<_>>();
+    // All recent's Active section reads this order (most recently updated
+    // first). The menu bar keeps its own retained order: `MenuBarRowOrder`.
     jobs.sort_by(|left, right| {
         right
             .updated_at_unix_ms
@@ -173,6 +175,51 @@ pub fn project_activity_menu(snapshot: &WorkersBootstrap) -> WorkersActivityMenu
         blockers,
         jobs,
         finished,
+    }
+}
+
+/// W2: the macOS menu-bar popover's row order, and only its. Each Worker
+/// keeps the ordinal it got when the popover first saw it, so activity
+/// bursts and snapshots reordered by recent activity never move a row, and a
+/// newly seen Worker appends even when it was created at the same instant as
+/// an existing one (Worker ids are not ordered). Workers first seen together
+/// take creation time, then id. Only a real section change moves a row.
+/// All recent and the sidebar keep their own activity ordering.
+#[derive(Debug, Default)]
+pub struct MenuBarRowOrder {
+    ordinals: HashMap<String, u64>,
+    next: u64,
+}
+
+impl MenuBarRowOrder {
+    pub fn arrange(&mut self, snapshot: &WorkersBootstrap) -> WorkersActivityMenu {
+        let present = snapshot
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<HashSet<_>>();
+        self.ordinals.retain(|id, _| present.contains(id.as_str()));
+        let mut unseen = snapshot
+            .sessions
+            .iter()
+            .filter(|session| !self.ordinals.contains_key(&session.id))
+            .collect::<Vec<_>>();
+        unseen.sort_by(|left, right| {
+            left.created_at_unix_ms
+                .cmp(&right.created_at_unix_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for session in unseen {
+            if !self.ordinals.contains_key(&session.id) {
+                self.ordinals.insert(session.id.clone(), self.next);
+                self.next += 1;
+            }
+        }
+        let mut menu = project_activity_menu(snapshot);
+        for rows in [&mut menu.blockers, &mut menu.jobs, &mut menu.finished] {
+            rows.sort_by_key(|row| self.ordinals.get(&row.session_id).copied());
+        }
+        menu
     }
 }
 
@@ -245,8 +292,8 @@ mod tests {
     };
 
     use super::{
-        WorkersActivityMenu, WorkersActivityRowKind, WorkersMenuBarMode, menu_popover_size,
-        project_activity_menu,
+        MenuBarRowOrder, WorkersActivityMenu, WorkersActivityRowKind, WorkersMenuBarMode,
+        menu_popover_size, project_activity_menu,
     };
 
     fn session(id: &str, activity: &str, unread: bool) -> WorkersSession {
@@ -279,7 +326,11 @@ mod tests {
     }
 
     fn menu(sessions: Vec<WorkersSession>) -> WorkersActivityMenu {
-        project_activity_menu(&WorkersBootstrap {
+        project_activity_menu(&snapshot(sessions))
+    }
+
+    fn snapshot(sessions: Vec<WorkersSession>) -> WorkersBootstrap {
+        WorkersBootstrap {
             mac_name: "Mac".to_owned(),
             protocol: WorkersProtocol {
                 major_version: 1,
@@ -311,7 +362,7 @@ mod tests {
             presets: Vec::new(),
             sessions,
             activity_log: Vec::new(),
-        })
+        }
     }
 
     #[test]
@@ -390,6 +441,123 @@ mod tests {
         assert_eq!(projection.blockers[0].kind, WorkersActivityRowKind::Blocked);
         assert_eq!(projection.jobs[0].session_id, "working-b");
         assert_eq!(projection.finished[0].session_id, "finished-a");
+    }
+
+    fn ids(rows: &[super::WorkersActivityRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.session_id.as_str()).collect()
+    }
+
+    fn at(id: &str, activity: &str, unread: bool, created: u64, updated: u64) -> WorkersSession {
+        let mut session = session(id, activity, unread);
+        session.created_at_unix_ms = created;
+        session.updated_at_unix_ms = updated;
+        session
+    }
+
+    /// W2: in the menu bar, activity and command bursts and snapshots
+    /// reordered by recent activity never reorder rows inside a section; new
+    /// Workers append; only a real section change moves a row. Native tags
+    /// and clicks are proven by the macOS fixture
+    /// `examples/workers-menu-fixture.rs`, not here.
+    #[test]
+    fn menu_bar_rows_keep_their_order_through_activity_bursts() {
+        let mut order = MenuBarRowOrder::default();
+        let mut fleet = |updates: [u64; 5]| {
+            // Snapshots arrive ordered by recent activity, like the sidebar.
+            let mut sessions = vec![
+                at("w-a", "working", false, 10, updates[0]),
+                at("w-b", "working", false, 20, updates[1]),
+                at("w-c", "working", false, 20, updates[2]),
+                at("blk-x", "blocked", false, 15, updates[3]),
+                at("blk-y", "blocked", false, 5, updates[4]),
+            ];
+            sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
+            order.arrange(&snapshot(sessions))
+        };
+        for burst in [
+            [100, 200, 300, 1, 2],
+            [900, 200, 300, 7, 1],
+            [100, 950, 300, 3, 9],
+            [5, 6, 999, 50, 40],
+        ] {
+            let projection = fleet(burst);
+            assert_eq!(ids(&projection.jobs), ["w-a", "w-b", "w-c"], "{burst:?}");
+            assert_eq!(ids(&projection.blockers), ["blk-y", "blk-x"], "{burst:?}");
+        }
+
+        // New Worker appends; a transition moves only that Worker.
+        let sessions = vec![
+            at("w-new", "working", false, 30, 1_000),
+            at("w-c", "working", false, 20, 900),
+            at("w-a", "blocked", false, 10, 800),
+            at("w-b", "working", false, 20, 700),
+            at("done-1", "done", true, 3, 600),
+            at("done-0", "done", true, 2, 500),
+        ];
+        let projection = order.arrange(&snapshot(sessions));
+        assert_eq!(ids(&projection.jobs), ["w-b", "w-c", "w-new"]);
+        assert_eq!(ids(&projection.blockers), ["w-a"]);
+        assert_eq!(ids(&projection.finished), ["done-0", "done-1"]);
+    }
+
+    /// GF13: a new Worker created at the same instant as existing ones, with
+    /// an id that sorts first (ids are UUIDs, not ordered), appends; the
+    /// existing rows keep their ids and positions through later bursts and
+    /// reordered snapshots.
+    #[test]
+    fn an_equal_time_new_worker_appends_in_the_menu_bar() {
+        let mut order = MenuBarRowOrder::default();
+        let existing = |updates: [u64; 2]| {
+            vec![
+                at("m-1", "working", false, 50, updates[0]),
+                at("z-2", "working", false, 50, updates[1]),
+            ]
+        };
+        let first = order.arrange(&snapshot(existing([10, 20])));
+        assert_eq!(ids(&first.jobs), ["m-1", "z-2"]);
+        for (updates, newest) in [([30, 40], 99), ([300, 100], 5), ([7, 900], 1_000)] {
+            let mut sessions = existing(updates);
+            sessions.push(at("a-0", "working", false, 50, newest));
+            sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
+            let projection = order.arrange(&snapshot(sessions));
+            assert_eq!(ids(&projection.jobs), ["m-1", "z-2", "a-0"], "{updates:?}");
+        }
+    }
+
+    /// GF20: All recent's Active section reads the shared projection, which
+    /// keeps its activity order (most recently updated first, id tie-break),
+    /// while the menu bar over the same snapshots stays fixed.
+    #[test]
+    fn all_recent_follows_activity_while_the_menu_bar_stays_fixed() {
+        let mut order = MenuBarRowOrder::default();
+        // Created first but less recently active, and the other way round.
+        for (old_update, young_update, recent_first) in
+            [(10, 20, ["young", "old"]), (30, 20, ["old", "young"])]
+        {
+            let fleet = snapshot(vec![
+                at("old", "working", false, 1, old_update),
+                at("young", "working", false, 2, young_update),
+            ]);
+            let recent = crate::workers::recent::recent_activity_sections(&fleet, 100);
+            let active = recent
+                .iter()
+                .find(|section| section.label == "Active")
+                .expect("an Active section");
+            assert_eq!(
+                active
+                    .rows
+                    .iter()
+                    .map(|row| row.target.as_ref().unwrap().session_id.as_str())
+                    .collect::<Vec<_>>(),
+                recent_first,
+                "All recent follows activity"
+            );
+            assert_eq!(
+                ids(&order.arrange(&fleet).jobs),
+                ["old", "young"],
+                "the menu bar stays fixed"
+            );
+        }
     }
 
     #[test]

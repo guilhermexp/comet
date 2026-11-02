@@ -844,7 +844,7 @@ async fn computer_use_switched_off_registers_no_host_tool() {
 }
 
 #[tokio::test]
-async fn sessions_and_workers_host_calls_are_answered_once_by_their_own_server() {
+async fn chat_and_workers_host_calls_are_answered_once_by_their_own_server() {
     let harness = fake_harness("mixed-host-tools")
         .with_workers_mcp_executable(fake_workers_controller_path());
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");

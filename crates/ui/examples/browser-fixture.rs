@@ -411,9 +411,9 @@ fn main() -> anyhow::Result<()> {
                     // by 5px after its one-point panel border. That full overlap
                     // must reach GPUI, while content beyond it stays native.
                     for offset in [-6., -2., 0., 3., 4.5] {
-                        anyhow::ensure!(!first.read_with(cx,|b,_|b.fixture_page_hit((left+offset) as f64,(top+120.) as f64)),"native page stole the resize target at offset {offset}");
+                        anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((left+offset) as f64,(top+120.) as f64)) == Some(false),"native page stole the resize target at offset {offset}");
                     }
-                    anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((left+6.) as f64,(top+120.) as f64)),"resize target blocked adjacent page content");
+                    anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((left+6.) as f64,(top+120.) as f64)) == Some(true),"resize target blocked adjacent page content");
                     let start=gpui::point(px(left+3.),px(top+120.));
                     gpui::AnyWindowHandle::from(window).update(cx,|_,w,cx| {w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent{position:start,button:gpui::MouseButton::Left,click_count:1,..Default::default()}),cx);})?;
                     let mut widths=Vec::new();
@@ -426,7 +426,7 @@ fn main() -> anyhow::Result<()> {
                         let (layout,native,clip)=first.read_with(cx,|b,_|b.fixture_geometry());
                         widths.push(layout);
                         let (x,y)=first.read_with(cx,|b,_|b.fixture_origin());
-                        anyhow::ensure!(!first.read_with(cx,|b,_|b.fixture_page_hit((x+100.) as f64,(y+100.) as f64)),"native page intercepted the resize drag");
+                        anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((x+100.) as f64,(y+100.) as f64)) == Some(false),"native page intercepted the resize drag");
                         anyhow::ensure!((layout-native).abs()<1.1 && clip<=layout+1.,"native browser geometry diverged while resizing");
                         anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_native_visible() && b.fixture_visibility_changes()==before),"resize hid the live browser");
                     }
@@ -435,7 +435,7 @@ fn main() -> anyhow::Result<()> {
                     anyhow::ensure!(!cx.update(|cx|cx.has_active_drag()),"resize drag did not end");
                     anyhow::ensure!(widths.iter().copied().fold(f32::MIN,f32::max)-widths.iter().copied().fold(f32::MAX,f32::min)>150.,"resize did not exercise both viewport sizes");
                     let (x,y)=first.read_with(cx,|b,_|b.fixture_origin());
-                    anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((x+100.) as f64,(y+100.) as f64)),"resize release did not restore page hit testing");
+                    anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((x+100.) as f64,(y+100.) as f64)) == Some(true),"resize release did not restore page hit testing");
                     // CSS viewport must follow the native frame, rather than a scaled image.
                     first.read_with(cx,|b,_|b.fixture_eval("document.title='Viewport:'+window.innerWidth"));
                     let deadline=std::time::Instant::now()+Duration::from_secs(5);

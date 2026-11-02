@@ -118,10 +118,11 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session with kind chat, or a child with kind side. Omitted kind defaults to side with an origin/parent, standalone otherwise. Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
+            description: "Create a chat. mode configured (default): a standalone session with kind chat, or a child with kind side; omitted kind defaults to side with an origin/parent, standalone otherwise. mode inherit: a child that runs with its parent's exact configuration (provider, model, reasoning, sandbox, model options) in the parent's project or a named project, started on the required prompt; provider/model/config/destination overrides are rejected. Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "mode": { "type": "string", "enum": ["configured", "inherit"], "default": "configured", "description": "configured: choose provider/model/destination here. inherit: copy the parent's full configuration and destination (prompt required; only project, parent, title, prompt, wait and timeout_secs apply)." },
                     "kind": { "type": "string", "enum": ["chat", "side"], "description": "chat: standalone, no parent allowed. side: requires parent or origin. Omit for legacy defaults." },
                     "project": { "type": "string", "description": "Project id, path, or name. Belongs to a specific device; when device is supplied, search only there. Optional." },
                     "device": { "type": "string", "description": "Host device (id or name). With project, it must own that project. Without either, use the local engine." },
@@ -509,8 +510,28 @@ struct PendingTurn {
     start: TurnStart,
 }
 
+/// How `create_chat` configures the new Chat.
+#[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum CreateMode {
+    /// Harness/model/destination from the arguments and the host catalog;
+    /// records `parentChatId`.
+    #[default]
+    Configured,
+    /// The parent's full configuration and destination, an immediate first
+    /// prompt, `originChatId` lineage, no overrides (engine `SpawnChat`).
+    Inherit,
+}
+
+/// Root = not spawned by another Chat through either lineage field.
+fn is_root_chat(chat: &Chat) -> bool {
+    chat.parent_chat_id.is_none() && chat.origin_chat_id.is_none()
+}
+
 #[derive(Deserialize, Default)]
 struct CreateChatArgs {
+    #[serde(default)]
+    mode: CreateMode,
     kind: Option<ChatKind>,
     project: Option<String>,
     device: Option<String>,
@@ -528,6 +549,20 @@ struct CreateChatArgs {
     #[serde(default)]
     wait: bool,
     timeout_secs: Option<u64>,
+    /// Presence only (a null or empty value counts): inherit mode refuses
+    /// per-chat model options in either spelling instead of dropping them.
+    #[serde(
+        default,
+        rename = "model_options",
+        alias = "modelOptions",
+        deserialize_with = "present"
+    )]
+    model_options: bool,
+}
+
+/// True whenever the key is present, whatever its value (null included).
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 #[derive(Deserialize)]
@@ -642,6 +677,7 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
         "reasoning": chat.config.as_ref().and_then(|c| c.reasoning),
         "archived": chat.archived,
         "parentChatId": chat.parent_chat_id,
+        "originChatId": chat.origin_chat_id,
         "status": status,
         "sessionStatus": session.as_ref().map(|s| s.status),
         "statusStale": session.as_ref().is_some_and(|s| zeron_proto::view::session_stale(s, now)),
@@ -868,7 +904,10 @@ impl Tools {
         }
         if let Some(parent) = args.parent.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
-            chats.retain(|c| c.parent_chat_id.as_deref() == Some(parent.id.as_str()));
+            chats.retain(|c| {
+                c.parent_chat_id.as_deref() == Some(parent.id.as_str())
+                    || c.origin_chat_id.as_deref() == Some(parent.id.as_str())
+            });
         }
         chats.sort_by(|a, b| {
             let a_at = a.last_message_at.unwrap_or(a.created_at);
@@ -905,6 +944,9 @@ impl Tools {
     }
 
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+        if args.mode == CreateMode::Inherit {
+            return self.create_inherited_chat(args).await;
+        }
         // Parent: the explicit `parent` argument, else the chat this server
         // speaks for. Resolved so a prefix/title works and a typo fails loud.
         let explicit_parent = args
@@ -943,14 +985,14 @@ impl Tools {
         {
             let origin = self.zeron.resolve_chat(origin).await?;
             anyhow::ensure!(
-                origin.parent_chat_id.is_none(),
+                is_root_chat(&origin),
                 "A delegated chat can't create chats of its own. Do the work in this chat, or ask the chat that started you."
             );
         }
         if let Some(parent) = parent_chat_id.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
             anyhow::ensure!(
-                parent.parent_chat_id.is_none(),
+                is_root_chat(&parent),
                 "{} is itself a delegated chat: only top-level chats have side chats.",
                 parent.title.as_deref().unwrap_or(&parent.id)
             );
@@ -1148,6 +1190,147 @@ impl Tools {
                     .await_pending_turn(&chat, pending, wait_duration(args.timeout_secs))
                     .await?;
             }
+        }
+        Ok(result)
+    }
+
+    /// `mode: inherit`: a Chat that runs with its parent's full
+    /// configuration (harness, model, reasoning, sandbox, model options) in
+    /// the parent's destination or a named Project, started on a required
+    /// prompt, recorded with `originChatId`. The engine's `SpawnChat` copies
+    /// the configuration; nothing here can override it.
+    async fn create_inherited_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+        let overrides = [
+            ("kind", args.kind.is_some()),
+            ("device", args.device.is_some()),
+            ("harness", args.harness.is_some()),
+            ("model", args.model.is_some()),
+            ("reasoning", args.reasoning.is_some()),
+            ("sandbox", args.sandbox.is_some()),
+            ("branch", args.branch.is_some()),
+            ("cwd", args.cwd.is_some()),
+            ("cloud", args.cloud),
+            ("model_options", args.model_options),
+        ];
+        let rejected: Vec<_> = overrides
+            .iter()
+            .filter(|(_, set)| *set)
+            .map(|(name, _)| *name)
+            .collect();
+        anyhow::ensure!(
+            rejected.is_empty(),
+            "mode inherit copies the parent's configuration and destination; remove {} (or use mode configured)",
+            rejected.join(", ")
+        );
+        let prompt = args
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .context("mode inherit requires a prompt; the new chat starts on it")?
+            .to_owned();
+        // Same authority as configured mode: only a root Chat delegates, and
+        // only from a root parent (either lineage field disqualifies).
+        if let Some(origin) = self.zeron.origin().chat_id.as_deref()
+            && !zeron_proto::voice::is_orchestrator_chat(origin)
+        {
+            let origin = self.zeron.resolve_chat(origin).await?;
+            anyhow::ensure!(
+                is_root_chat(&origin),
+                "A delegated chat can't create chats of its own. Do the work in this chat, or ask the chat that started you."
+            );
+        }
+        let parent_key = args
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.zeron.origin().chat_id.clone())
+            .context("mode inherit needs a parent chat to inherit from")?;
+        let parent = self.zeron.resolve_chat(&parent_key).await?;
+        anyhow::ensure!(
+            !zeron_proto::voice::is_orchestrator_chat(&parent.id),
+            "the voice orchestrator has no configuration to inherit; use mode configured"
+        );
+        anyhow::ensure!(
+            is_root_chat(&parent),
+            "{} is itself a delegated chat: only top-level chats have side chats.",
+            parent.title.as_deref().unwrap_or(&parent.id)
+        );
+        let space = match args.project.as_deref() {
+            Some(project) => {
+                // An explicit project may live on any device the engine
+                // reaches; the engine starts the side chat on that host.
+                self.zeron.resolve_target(Some(project), None).await?.0
+            }
+            None => None,
+        };
+        let spawned: zeron_proto::SpawnChatResult = serde_json::from_value(
+            self.zeron
+                .spawn_chat(&parent.id, &prompt, space.as_ref().map(|s| s.id.as_str()))
+                .await?,
+        )
+        .context("the engine's SpawnChat reply")?;
+        if let Some(title) = args
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            self.zeron
+                .mutate(json!({ "op": "renameChat", "chatId": spawned.chat_id, "title": title }))
+                .await?;
+        }
+        let config = parent.config.clone();
+        let mut result = json!({
+            "chatId": spawned.chat_id,
+            "mode": "inherit",
+            "kind": ChatKind::Side,
+            "deviceId": spawned.device_id,
+            "spaceId": spawned.space_id,
+            "harness": config.as_ref().map(|c| c.harness),
+            "model": config.as_ref().and_then(|c| c.model.clone()),
+            "reasoning": config.as_ref().and_then(|c| c.reasoning),
+            "title": args.title,
+            "originChatId": parent.id,
+            "sent": true,
+        });
+        // The engine queued the first run; track it like any sent turn.
+        let chat = Chat {
+            id: spawned.chat_id.clone(),
+            device_id: spawned.device_id.clone(),
+            title: args.title.clone(),
+            archived: false,
+            cwd: parent.cwd.clone(),
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            harness_session_harness: None,
+            parent_chat_id: None,
+            origin_chat_id: Some(parent.id.clone()),
+            space_id: spawned.space_id.clone(),
+            last_seen_at: None,
+            room_gen: None,
+        };
+        let pending = Arc::new(PendingTurn {
+            baseline: None,
+            start: TurnStart::default(),
+        });
+        self.pending_turns
+            .lock()
+            .await
+            .insert(chat.id.clone(), pending.clone());
+        if args.wait {
+            result["turn"] = self
+                .await_pending_turn(&chat, pending, wait_duration(args.timeout_secs))
+                .await?;
         }
         Ok(result)
     }
@@ -1413,8 +1596,8 @@ impl Tools {
                     .or_else(|| space.map(|s| s.path.clone()))
                     .unwrap_or_else(|| "~".into());
                 // Same grant as a run the user starts from the composer: the
-                // engine stamps Workers and, for a root chat, `zeron` +
-                // `comet-sessions`. Without it the target ran with no way to
+                // engine stamps Workers and, for a root chat, `zeron`.
+                // Without it the target ran with no way to
                 // answer the `send_message` the attribution asks for.
                 let request = RunRequest {
                     enable_workers_mcp: true,
@@ -1622,6 +1805,8 @@ mod tests {
         extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
+        /// `EngineInfo.deviceId`; `None` = `dev-local`.
+        engine_device: Option<&'static str>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1647,7 +1832,7 @@ mod tests {
             Ok(match method {
                 methods::LOCAL_DEVICE => RpcReply::Value(json!({ "deviceId": "dev-local" })),
                 methods::ENGINE_INFO => RpcReply::Value(json!({
-                    "deviceId": "dev-local", "workspaceScope": "local"
+                    "deviceId": self.engine_device.unwrap_or("dev-local"), "workspaceScope": "local"
                 })),
                 methods::WATCH_DEVICES => stream(json!([{
                     "id": "dev-local", "name": "Laptop", "platform": "linux",
@@ -1732,6 +1917,17 @@ mod tests {
                         .unwrap()
                         .push((method.to_owned(), params.clone()));
                     RpcReply::Value(json!({ "id": "v:1", "title": params["title"] }))
+                }
+                methods::SPAWN_CHAT => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({
+                        "chatId": "spawned-1",
+                        "deviceId": "dev-local",
+                        "spaceId": params.get("spaceId").cloned().unwrap_or(json!("space-1")),
+                    }))
                 }
                 methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
                     // A Cloud chat gets a machine of its own from the engine.
@@ -1831,6 +2027,53 @@ mod tests {
         assert_eq!(method, methods::PUBLISH_VISUAL);
         assert_eq!(params["chatId"], "chat-alpha-1");
         assert_eq!(params["script"], "return ui.text 'chart'");
+    }
+
+    #[tokio::test]
+    async fn creator_query_lists_both_lineages_without_reparenting() {
+        let world = Arc::new(World {
+            beta_parent: Some("chat-alpha-1".into()),
+            extra_chats: vec![
+                json!({
+                    "id": "inherited", "deviceId": "dev-local", "title": "Inherited",
+                    "originChatId": "chat-alpha-1", "archived": false,
+                    "createdAt": "2026-09-03T00:00:00Z"
+                }),
+                json!({
+                    "id": "unrelated", "deviceId": "dev-local", "archived": false,
+                    "createdAt": "2026-09-04T00:00:00Z"
+                }),
+            ],
+            ..Default::default()
+        });
+        let tools = tools(world, Origin::default());
+        let listed = tools
+            .call("list_chats", json!({"parent": "Alpha"}))
+            .await
+            .unwrap();
+        assert_eq!(listed["total"], 2);
+        let rows = listed["chats"].as_array().unwrap();
+        let inherited = rows.iter().find(|r| r["id"] == "inherited").unwrap();
+        assert_eq!(inherited["originChatId"], "chat-alpha-1");
+        assert!(inherited["parentChatId"].is_null());
+        let child = rows.iter().find(|r| r["id"] == "chat-beta-2").unwrap();
+        assert_eq!(child["parentChatId"], "chat-alpha-1");
+        assert!(child["originChatId"].is_null());
+        let chats = tools.zeron.chats().await.unwrap();
+        assert!(
+            chats
+                .iter()
+                .find(|c| c.id == "inherited")
+                .unwrap()
+                .is_top_level()
+        );
+        assert!(
+            !chats
+                .iter()
+                .find(|c| c.id == "chat-beta-2")
+                .unwrap()
+                .is_top_level()
+        );
     }
 
     #[tokio::test]
@@ -2207,6 +2450,249 @@ mod tests {
             device_id: None,
             ..Default::default()
         }
+    }
+
+    /// F7: mode inherit spawns from the parent through the engine (which
+    /// copies its full configuration), records origin lineage, rejects every
+    /// override before any write, and keeps the one-level rule for both
+    /// lineage fields.
+    #[tokio::test]
+    async fn inherit_mode_spawns_from_the_parent_and_rejects_overrides() {
+        let world = Arc::new(World {
+            extra_chats: vec![json!({
+                "id": "chat-spawned-9", "deviceId": "dev-local", "title": "Spawned",
+                "originChatId": "chat-alpha-1", "archived": false, "spaceId": "space-1",
+                "createdAt": "2026-09-04T00:00:00Z"
+            })],
+            ..Default::default()
+        });
+        let alpha = tools(world.clone(), origin("chat-alpha-1"));
+        let created = alpha
+            .call(
+                "create_chat",
+                json!({ "mode": "inherit", "prompt": "review the parser", "title": "Review" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["mode"], "inherit");
+        assert_eq!(created["chatId"], "spawned-1");
+        assert_eq!(created["originChatId"], "chat-alpha-1");
+        assert!(created.get("parentChatId").is_none());
+        // Configuration comes from the parent, not from arguments.
+        assert_eq!(created["harness"], "claude-code");
+        assert_eq!(created["model"], "opus");
+        {
+            let writes = world.writes.lock().unwrap();
+            let spawn: Vec<_> = writes
+                .iter()
+                .filter(|(method, _)| method == methods::SPAWN_CHAT)
+                .collect();
+            assert_eq!(spawn.len(), 1);
+            assert_eq!(spawn[0].1["parentChatId"], "chat-alpha-1");
+            assert_eq!(spawn[0].1["prompt"], "review the parser");
+            // No configured-mode createChat for the same request.
+            assert!(!writes.iter().any(|(_, w)| w["op"] == "createChat"));
+            assert!(
+                writes
+                    .iter()
+                    .any(|(_, w)| w["op"] == "renameChat" && w["title"] == "Review")
+            );
+        }
+        // Project targeting maps to the Space on the parent's host.
+        let targeted = alpha
+            .call(
+                "create_chat",
+                json!({ "mode": "inherit", "prompt": "p", "project": "space-1" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(targeted["spaceId"], "space-1");
+
+        let before = world.writes.lock().unwrap().len();
+        for args in [
+            json!({ "mode": "inherit", "prompt": "p", "harness": "codex" }),
+            json!({ "mode": "inherit", "prompt": "p", "model": "sonnet" }),
+            json!({ "mode": "inherit", "prompt": "p", "device": "dev-remote" }),
+            json!({ "mode": "inherit", "prompt": "p", "cwd": "/tmp" }),
+            json!({ "mode": "inherit", "prompt": "p", "branch": "x" }),
+            json!({ "mode": "inherit", "prompt": "p", "cloud": true }),
+            json!({ "mode": "inherit", "prompt": "p", "sandbox": "read-only" }),
+            json!({ "mode": "inherit", "prompt": "p", "kind": "side" }),
+            json!({ "mode": "inherit" }),
+            json!({ "mode": "inherit", "prompt": "  " }),
+        ] {
+            let refused = alpha.call("create_chat", args.clone()).await.unwrap_err();
+            assert!(refused.contains("mode inherit"), "{args}: {refused}");
+        }
+        assert_eq!(
+            world.writes.lock().unwrap().len(),
+            before,
+            "nothing written"
+        );
+
+        // An origin-only spawned Chat is not root: it cannot create (either
+        // mode) and cannot be named as a parent.
+        let spawned = tools(world.clone(), origin("chat-spawned-9"));
+        for args in [json!({}), json!({ "mode": "inherit", "prompt": "p" })] {
+            let refused = spawned.call("create_chat", args).await.unwrap_err();
+            assert!(
+                refused.contains("can't create chats of its own"),
+                "{refused}"
+            );
+        }
+        let root = tools(world.clone(), Origin::default());
+        for args in [
+            json!({ "parent": "Spawned" }),
+            json!({ "mode": "inherit", "prompt": "p", "parent": "Spawned" }),
+        ] {
+            let refused = root.call("create_chat", args).await.unwrap_err();
+            assert!(refused.contains("itself a delegated chat"), "{refused}");
+        }
+        assert_eq!(world.writes.lock().unwrap().len(), before);
+    }
+
+    fn spawn_or_create_writes(world: &World) -> usize {
+        world
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, params)| {
+                method == methods::SPAWN_CHAT
+                    || method == methods::QUEUE_COMMAND
+                    || params["op"] == "createChat"
+            })
+            .count()
+    }
+
+    /// MR4: the server is bound to the engine its grant names. A first
+    /// connection or a reconnect to another engine creates and runs nothing;
+    /// the right engine keeps both creation modes.
+    #[tokio::test]
+    async fn chat_tools_refuse_an_engine_other_than_the_granted_one() {
+        let bound = |device: &str| Origin {
+            chat_id: Some("chat-alpha-1".into()),
+            device_id: Some(device.into()),
+            ..Default::default()
+        };
+        let world = Arc::new(World::default());
+        // The connected engine reports `dev-local`; the grant names another.
+        let wrong = Tools::new(Arc::new(Zeron::with_client(
+            memory_client(world.clone()),
+            bound("dev-elsewhere"),
+        )));
+        for args in [
+            json!({ "prompt": "p" }),
+            json!({ "mode": "inherit", "prompt": "p" }),
+        ] {
+            let refused = wrong.call("create_chat", args).await.unwrap_err();
+            assert!(refused.contains("engine identity mismatch"), "{refused}");
+        }
+        assert_eq!(spawn_or_create_writes(&world), 0);
+
+        // Right engine first, then the socket drops and the redial lands on
+        // an engine that is not the granted one: nothing more is written.
+        let right = Arc::new(World::default());
+        let other = Arc::new(World {
+            engine_device: Some("dev-other"),
+            ..Default::default()
+        });
+        let redial_target = other.clone();
+        let zeron = Arc::new(Zeron::with_client_and_redial(
+            memory_client(right.clone()),
+            bound("dev-local"),
+            move || memory_client(redial_target.clone()),
+        ));
+        let tools = Tools::new(zeron.clone());
+        tools
+            .call("create_chat", json!({ "mode": "inherit", "prompt": "p" }))
+            .await
+            .expect("inherit on the granted engine");
+        tools
+            .call("create_chat", json!({ "prompt": "p" }))
+            .await
+            .expect("configured on the granted engine");
+        assert!(spawn_or_create_writes(&right) >= 2);
+        zeron.simulate_disconnect().await;
+        for args in [
+            json!({ "prompt": "p" }),
+            json!({ "mode": "inherit", "prompt": "p" }),
+        ] {
+            let refused = tools.call("create_chat", args).await.unwrap_err();
+            assert!(refused.contains("engine identity mismatch"), "{refused}");
+        }
+        assert_eq!(spawn_or_create_writes(&other), 0);
+
+        // A terminal user (no granted engine) is not bound.
+        let terminal = Tools::new(Arc::new(Zeron::with_client(
+            memory_client(Arc::new(World {
+                engine_device: Some("dev-other"),
+                ..Default::default()
+            })),
+            Origin::default(),
+        )));
+        terminal
+            .call("list_chats", json!({}))
+            .await
+            .expect("unbound CLI");
+    }
+
+    /// MR5: an explicitly selected Project/Space may live on another device;
+    /// inherit mode keeps the parent's full configuration and lets the
+    /// engine resolve that Space's host.
+    #[tokio::test]
+    async fn inherit_mode_targets_a_space_on_another_device() {
+        let world = Arc::new(World::default());
+        let alpha = tools(world.clone(), origin("chat-alpha-1"));
+        let created = alpha
+            .call(
+                "create_chat",
+                json!({ "mode": "inherit", "prompt": "p", "project": "space-unique" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["mode"], "inherit");
+        assert_eq!(created["spaceId"], "space-unique");
+        assert_eq!(created["harness"], "claude-code");
+        let writes = world.writes.lock().unwrap();
+        let spawn: Vec<_> = writes
+            .iter()
+            .filter(|(method, _)| method == methods::SPAWN_CHAT)
+            .collect();
+        assert_eq!(spawn.len(), 1);
+        assert_eq!(spawn[0].1["spaceId"], "space-unique");
+        assert_eq!(spawn[0].1["parentChatId"], "chat-alpha-1");
+        assert!(!writes.iter().any(|(_, w)| w["op"] == "createChat"));
+    }
+
+    /// MR6: model options are configuration; inherit refuses them in either
+    /// spelling before any write or queued run.
+    #[tokio::test]
+    async fn inherit_mode_refuses_model_options_in_both_spellings() {
+        let world = Arc::new(World::default());
+        let alpha = tools(world.clone(), origin("chat-alpha-1"));
+        for args in [
+            json!({ "mode": "inherit", "prompt": "execute", "model_options": { "effort": "low" } }),
+            json!({ "mode": "inherit", "prompt": "execute", "modelOptions": { "effort": "low" } }),
+            json!({ "mode": "inherit", "prompt": "execute", "model_options": null }),
+            json!({ "mode": "inherit", "prompt": "execute", "modelOptions": {} }),
+        ] {
+            let refused = alpha.call("create_chat", args.clone()).await.unwrap_err();
+            assert!(
+                refused.contains("mode inherit") && refused.contains("model"),
+                "{args}: {refused}"
+            );
+        }
+        assert_eq!(spawn_or_create_writes(&world), 0);
+        // Without them the parent's options are inherited by the engine.
+        alpha
+            .call(
+                "create_chat",
+                json!({ "mode": "inherit", "prompt": "execute" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spawn_or_create_writes(&world), 1);
     }
 
     #[tokio::test]

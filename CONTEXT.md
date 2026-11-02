@@ -32,7 +32,7 @@ O estado de execução de um Chat num device — parado, trabalhando, esperando 
 _Avoid_: run state, chat status, sessão (quando se quer dizer Chat)
 
 **Agent-created Chat**:
-Chat aberto pela tool `sessions` a partir de um Chat de orquestrador. Grava o Chat pai em `origin_chat_id`, herda a configuração efetiva do pai e nunca recebe a tool `sessions` de novo. Continua recebendo `workers`. Não confundir com o filho do Zeron MCP (`zeron mcp` `create_chat`, `parent_chat_id`), que some da sidebar e escolhe harness/modelo livremente; o filho de `sessions` aparece na sidebar. Nenhum dos dois recebe `sessions`.
+Chat aberto por um Chat de orquestrador raiz pela tool `create_chat` do `zeron mcp` (única superfície; a antiga tool `sessions`/`comet-sessions` foi retirada). Dois modos explícitos: `inherit` herda a configuração completa e o destino do pai (um `project` explícito pode estar em qualquer device; `model_options`/`modelOptions` são recusados, mesmo nulos) e grava o pai em `origin_chat_id` (aparece na sidebar); `configured` escolhe harness/modelo/destino e grava `parent_chat_id` (side chat). Um Chat com qualquer dos dois campos não é raiz: não cria Chats nem recebe a concessão `sessions`. Continua recebendo `workers`.
 _Avoid_: child session, subagent, worker
 
 **Chat Transcript**:

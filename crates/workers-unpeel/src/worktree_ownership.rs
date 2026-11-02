@@ -72,13 +72,87 @@ pub struct ReconciliationReport {
     pub unresolved_operation_ids: Vec<String>,
 }
 
-/// Comet's configured common worktree root. An empty override is treated as
-/// unset. The returned path is absolute but need not exist yet.
+/// Comet's configured common worktree root, shared by Chat and Workers:
+/// a nonempty `ZERON_WORKTREES_DIR`, else the device's saved custom location
+/// (Settings → General, `{data_dir}/worktree-settings.json`), else
+/// `~/.zeron/worktrees`. The returned path is absolute but need not exist yet.
 pub fn common_worktrees_root() -> PathBuf {
-    common_worktrees_root_from(
-        &dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let saved = saved_worktrees_root(&zeron_data_dir(&home));
+    common_worktrees_root_with(
+        &home,
         std::env::var_os("ZERON_WORKTREES_DIR").as_deref(),
+        saved.as_deref(),
     )
+}
+
+/// Test seam (unit tests only): runs right after a creation resolved its
+/// worktree root, so a test can change the saved preference at exactly that
+/// point. Not compiled into the product.
+#[cfg(test)]
+static AFTER_ROOT_RESOLVED: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_after_root_resolved_hook(hook: Option<fn()>) {
+    *AFTER_ROOT_RESOLVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+}
+
+#[cfg(test)]
+pub(crate) fn after_root_resolved() {
+    let hook = *AFTER_ROOT_RESOLVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// The engine's device-local preference file inside the app data dir.
+pub const WORKTREE_SETTINGS_FILE: &str = "worktree-settings.json";
+
+/// The app data dir by the app's own rule (`apps/zeron/src/paths.rs`).
+fn zeron_data_dir(home: &Path) -> PathBuf {
+    resolve_zeron_data_dir(|name| std::env::var_os(name), home, cfg!(windows))
+}
+
+/// Pure form of [`zeron_data_dir`]: `$ZERON_DATA_DIR` whenever it is present
+/// (even empty, exactly like the app, which then uses the working
+/// directory), else on Windows `%LOCALAPPDATA%\Zeron` or
+/// `%USERPROFILE%\AppData\Local\Zeron` (empty values count as unset), else
+/// `~/.zeron`. Nothing is migrated.
+fn resolve_zeron_data_dir(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: &Path,
+    windows: bool,
+) -> PathBuf {
+    if let Some(dir) = env("ZERON_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    let set = |name: &str| env(name).filter(|value| !value.is_empty());
+    if windows {
+        let local = set("LOCALAPPDATA").map(PathBuf::from).or_else(|| {
+            set("USERPROFILE").map(|profile| PathBuf::from(profile).join("AppData").join("Local"))
+        });
+        if let Some(local) = local {
+            return local.join("Zeron");
+        }
+    }
+    home.join(".zeron")
+}
+
+/// The saved custom root, only when it is enabled with an absolute folder —
+/// the same acceptance the engine applies when it loads the file. Absent,
+/// disabled or malformed preferences yield `None` (the default root).
+pub fn saved_worktrees_root(data_dir: &Path) -> Option<PathBuf> {
+    let bytes = fs::read(data_dir.join(WORKTREE_SETTINGS_FILE)).ok()?;
+    let settings = serde_json::from_slice::<zeron_proto::WorktreeSettings>(&bytes).ok()?;
+    settings
+        .use_custom_directory
+        .then_some(settings.custom_directory?)
+        .filter(|path| !path.trim().is_empty() && Path::new(path).is_absolute())
+        .map(PathBuf::from)
 }
 
 /// Ensure and return the configured canonical worktree root. Mutating callers
@@ -94,9 +168,19 @@ pub fn canonical_root() -> Result<PathBuf> {
 
 /// Pure form used by tests and callers with an explicit home/override.
 pub fn common_worktrees_root_from(home: &Path, override_dir: Option<&OsStr>) -> PathBuf {
+    common_worktrees_root_with(home, override_dir, None)
+}
+
+/// Pure precedence: environment override, saved preference, default.
+pub fn common_worktrees_root_with(
+    home: &Path,
+    override_dir: Option<&OsStr>,
+    saved: Option<&Path>,
+) -> PathBuf {
     let configured = override_dir
         .filter(|value| !value.to_string_lossy().trim().is_empty())
         .map(PathBuf::from)
+        .or_else(|| saved.map(Path::to_path_buf))
         .unwrap_or_else(|| home.join(".zeron").join("worktrees"));
     canonical_future_path(&configured).unwrap_or(configured)
 }
@@ -1111,6 +1195,83 @@ fn inode(_: &fs::Metadata) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GR6: Workers read the same data dir as the app
+    /// (`apps/zeron/src/paths.rs`). On Windows that is `%LOCALAPPDATA%\Zeron`,
+    /// else `%USERPROFILE%\AppData\Local\Zeron`, never `HOME\.zeron`.
+    /// Pure inputs: nothing reads or mutates the real environment.
+    #[test]
+    fn data_dir_follows_the_app_rule_for_windows_and_unix_inputs() {
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+        let resolve = |vars: &[(&str, &str)], windows: bool| {
+            let vars: HashMap<String, OsString> = vars
+                .iter()
+                .map(|(key, value)| (key.to_string(), OsString::from(value)))
+                .collect();
+            resolve_zeron_data_dir(
+                |name| vars.get(name).cloned(),
+                Path::new("/home/u"),
+                windows,
+            )
+        };
+        let profile = PathBuf::from("C:\\Users\\u");
+        let app_local = |root: PathBuf| root.join("AppData").join("Local").join("Zeron");
+        // An explicit data dir wins everywhere.
+        assert_eq!(
+            resolve(&[("ZERON_DATA_DIR", "/data")], true),
+            PathBuf::from("/data")
+        );
+        assert_eq!(
+            resolve(&[("ZERON_DATA_DIR", "/data")], false),
+            PathBuf::from("/data")
+        );
+        // Windows: LOCALAPPDATA, else USERPROFILE\AppData\Local (empty = unset).
+        assert_eq!(
+            resolve(
+                &[
+                    ("LOCALAPPDATA", "L:\\local"),
+                    ("USERPROFILE", "C:\\Users\\u")
+                ],
+                true
+            ),
+            PathBuf::from("L:\\local").join("Zeron")
+        );
+        for vars in [
+            &[("USERPROFILE", "C:\\Users\\u")][..],
+            &[("LOCALAPPDATA", ""), ("USERPROFILE", "C:\\Users\\u")][..],
+        ] {
+            assert_eq!(resolve(vars, true), app_local(profile.clone()), "{vars:?}");
+        }
+        // GF5: a present but empty data dir is honored as the app honors it
+        // (the working directory), before any Windows fallback.
+        for windows in [true, false] {
+            assert_eq!(
+                resolve(
+                    &[
+                        ("ZERON_DATA_DIR", ""),
+                        ("LOCALAPPDATA", "L:\\local"),
+                        ("USERPROFILE", "C:\\Users\\u")
+                    ],
+                    windows
+                ),
+                PathBuf::new(),
+                "windows: {windows}"
+            );
+        }
+        // Unix ignores the Windows variables.
+        assert_eq!(
+            resolve(
+                &[
+                    ("LOCALAPPDATA", "L:\\local"),
+                    ("USERPROFILE", "C:\\Users\\u")
+                ],
+                false
+            ),
+            PathBuf::from("/home/u/.zeron")
+        );
+        assert_eq!(resolve(&[], false), PathBuf::from("/home/u/.zeron"));
+    }
     use std::process::Command;
 
     fn git(cwd: &Path, args: &[&str]) {
@@ -1188,6 +1349,94 @@ mod tests {
             repository_worktrees_dir(&root, &first_worktree).unwrap(),
             first_dir
         );
+    }
+
+    #[test]
+    fn saved_preference_is_used_only_when_enabled_with_an_absolute_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let write = |json: &str| fs::write(temp.path().join(WORKTREE_SETTINGS_FILE), json).unwrap();
+        assert_eq!(saved_worktrees_root(temp.path()), None, "absent file");
+        // Native absolute paths on every platform (GF6).
+        let custom = temp.path().join("srv-worktrees");
+        let forced = temp.path().join("forced");
+        let preference = |enabled: bool, folder: &str| {
+            serde_json::json!({ "useCustomDirectory": enabled, "customDirectory": folder })
+                .to_string()
+        };
+        write(&preference(true, custom.to_str().unwrap()));
+        assert_eq!(saved_worktrees_root(temp.path()), Some(custom.clone()));
+        write(&preference(false, custom.to_str().unwrap()));
+        assert_eq!(saved_worktrees_root(temp.path()), None, "disabled");
+        write(r#"{"useCustomDirectory": true, "customDirectory": "relative/dir"}"#);
+        assert_eq!(saved_worktrees_root(temp.path()), None, "relative");
+        write(r#"{"useCustomDirectory": true}"#);
+        assert_eq!(saved_worktrees_root(temp.path()), None, "no folder");
+        write("{not json");
+        assert_eq!(saved_worktrees_root(temp.path()), None, "malformed");
+
+        let saved = custom.as_path();
+        assert_eq!(
+            common_worktrees_root_with(temp.path(), None, Some(saved)),
+            canonical_future_path(saved).unwrap()
+        );
+        assert_eq!(
+            common_worktrees_root_with(temp.path(), Some(forced.as_os_str()), Some(saved)),
+            canonical_future_path(&forced).unwrap()
+        );
+        assert_eq!(
+            common_worktrees_root_with(temp.path(), Some(OsStr::new(" ")), Some(saved)),
+            canonical_future_path(saved).unwrap()
+        );
+    }
+
+    /// GF5: with `ZERON_DATA_DIR` present but empty the app keeps its data
+    /// in the working directory, so Workers must read the saved custom root
+    /// from there too. Runs this test binary again as a child with an
+    /// isolated HOME, working directory and environment; nothing real is read.
+    #[test]
+    fn empty_data_dir_override_reads_the_saved_root_like_the_app() {
+        const CHILD: &str = "ZERON_WORKTREE_ROOT_PROBE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            println!("ROOT={}", common_worktrees_root().display());
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let home = temp.path().join("home");
+        let custom = temp.path().join("custom-root");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(home.join(".zeron")).unwrap();
+        fs::write(
+            cwd.join(WORKTREE_SETTINGS_FILE),
+            serde_json::json!({ "useCustomDirectory": true, "customDirectory": custom })
+                .to_string(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_ownership::tests::empty_data_dir_override_reads_the_saved_root_like_the_app",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(&cwd)
+            .env_clear()
+            .env(CHILD, "1")
+            .env("HOME", &home)
+            .env("ZERON_DATA_DIR", "")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let root = stdout
+            .lines()
+            .find_map(|line| line.split_once("ROOT=").map(|(_, root)| root.trim()))
+            .expect("the child printed its root");
+        assert_eq!(PathBuf::from(root), canonical_future_path(&custom).unwrap());
     }
 
     #[test]

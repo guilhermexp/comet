@@ -21,6 +21,8 @@ mod tests {
         port: u16,
         events: Arc<Mutex<Vec<Value>>>,
         preflights: Arc<Mutex<Vec<Value>>>,
+        /// Request path of each counted preflight, in arrival order.
+        preflight_routes: Arc<Mutex<Vec<String>>>,
         stop: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<()>>,
     }
@@ -42,49 +44,60 @@ mod tests {
             let port = listener.local_addr().expect("capture addr").port();
             let events = Arc::new(Mutex::new(Vec::new()));
             let preflights = Arc::new(Mutex::new(Vec::new()));
+            let preflight_routes = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let events_for_thread = Arc::clone(&events);
             let preflights_for_thread = Arc::clone(&preflights);
+            let routes_for_thread = Arc::clone(&preflight_routes);
             let stop_for_thread = Arc::clone(&stop);
             let handle = thread::spawn(move || {
                 while !stop_for_thread.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // The listener is nonblocking so `stop` is
+                            // polled; an accepted socket can inherit that
+                            // (macOS does). Read it blocking, bounded by the
+                            // timeout, so a request split across packets is
+                            // never mistaken for a short one.
+                            if let Err(error) = stream.set_nonblocking(false) {
+                                eprintln!("capture server: blocking socket: {error}");
+                                continue;
+                            }
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let mut reader = BufReader::new(&stream);
-                            let mut request_line = String::new();
-                            if reader.read_line(&mut request_line).is_err() {
+                            let request = match read_capture_request(&stream) {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    eprintln!("capture server: incomplete request: {error}");
+                                    let _ = write!(
+                                        stream,
+                                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                    );
+                                    continue;
+                                }
+                            };
+                            // Only a hook POST is evidence; probes such as
+                            // HEAD or other routes are answered, not counted.
+                            let value = (request.method == "POST"
+                                && request.path.starts_with("/hook/"))
+                            .then(|| serde_json::from_slice::<Value>(&request.body).ok())
+                            .flatten();
+                            let Some(value) = value else {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                );
                                 continue;
-                            }
-
-                            let is_preflight = request_line.contains("?validate=1")
-                                || request_line.contains("&validate=1");
-
-                            let mut content_length = 0usize;
-                            loop {
-                                let mut line = String::new();
-                                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-                                    break;
-                                }
-                                if let Some(value) = line
-                                    .to_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|value| value.trim().to_string())
-                                {
-                                    content_length = value.parse().unwrap_or(0);
-                                }
-                            }
-
-                            let mut body = vec![0u8; content_length];
-                            if content_length > 0 && reader.read_exact(&mut body).is_err() {
-                                continue;
-                            }
-                            if let Ok(value) = serde_json::from_slice::<Value>(&body) {
-                                if is_preflight {
-                                    preflights_for_thread.lock().unwrap().push(value);
-                                } else {
-                                    events_for_thread.lock().unwrap().push(value);
-                                }
+                            };
+                            let is_preflight = request
+                                .query
+                                .split('&')
+                                .any(|pair| pair == "validate=1");
+                            if is_preflight {
+                                // Publish metadata before waking payload observers.
+                                routes_for_thread.lock().unwrap().push(request.path);
+                                preflights_for_thread.lock().unwrap().push(value);
+                            } else {
+                                events_for_thread.lock().unwrap().push(value);
                             }
 
                             if is_preflight && reject {
@@ -111,6 +124,7 @@ mod tests {
                 port,
                 events,
                 preflights,
+                preflight_routes,
                 stop,
                 handle: Some(handle),
             }
@@ -177,6 +191,58 @@ mod tests {
         fn preflights_snapshot(&self) -> Vec<Value> {
             self.preflights.lock().unwrap().clone()
         }
+
+        fn preflight_routes(&self) -> Vec<String> {
+            self.preflight_routes.lock().unwrap().clone()
+        }
+    }
+
+    struct CaptureRequest {
+        method: String,
+        path: String,
+        query: String,
+        body: Vec<u8>,
+    }
+
+    /// One complete HTTP/1.1 request: request line, headers through the
+    /// blank line and exactly Content-Length body bytes. A read error, EOF
+    /// or timeout before that is an error, never a shorter request.
+    fn read_capture_request(stream: &std::net::TcpStream) -> std::io::Result<CaptureRequest> {
+        use std::io::{Error, ErrorKind};
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "no request line"));
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+            return Err(Error::new(ErrorKind::InvalidData, format!("request line {line:?}")));
+        };
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let (method, path, query) = (method.to_owned(), path.to_owned(), query.to_owned());
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "headers ended early"));
+            }
+            if header == "\r\n" || header == "\n" {
+                break;
+            }
+            if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = value.trim().parse().map_err(|_| {
+                    Error::new(ErrorKind::InvalidData, format!("content-length {value:?}"))
+                })?;
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        Ok(CaptureRequest {
+            method,
+            path,
+            query,
+            body,
+        })
     }
 
     impl Drop for CaptureServer {
@@ -685,6 +751,7 @@ mod tests {
             script: &'static str,
             args: &'static [&'static str],
             input: &'static str,
+            expected_runtime_id: &'static str,
         }
 
         let cases = [
@@ -693,60 +760,70 @@ mod tests {
                 script: super::CLAUDE_HOOK_SCRIPT,
                 args: &[],
                 input: r#"{"hook_event_name":"Stop"}"#,
+                expected_runtime_id: "claude",
             },
             Case {
                 label: "notify-reject",
                 script: super::NOTIFY_HOOK_SCRIPT,
                 args: &[r#"{"hook_event_name":"Stop","unpeel_runtime_id":"codex"}"#],
                 input: "",
+                expected_runtime_id: "codex",
             },
             Case {
                 label: "gemini-reject",
                 script: super::GEMINI_HOOK_SCRIPT,
                 args: &[],
                 input: r#"{"hook_event_name":"AfterAgent"}"#,
+                expected_runtime_id: "gemini",
             },
             Case {
                 label: "kimi-reject",
                 script: super::KIMI_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "kimi",
             },
             Case {
                 label: "kiro-reject",
                 script: super::KIRO_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "kiro-cli",
             },
             Case {
                 label: "cline-reject",
                 script: super::CLINE_HOOK_SCRIPT,
                 args: &["TaskComplete", "{}"],
                 input: "",
+                expected_runtime_id: "cline",
             },
             Case {
                 label: "copilot-reject",
                 script: super::COPILOT_HOOK_SCRIPT,
                 args: &["sessionEnd"],
                 input: "{}",
+                expected_runtime_id: "copilot",
             },
             Case {
                 label: "cursor-reject",
                 script: super::CURSOR_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "cursor-agent",
             },
             Case {
                 label: "grok-reject",
                 script: super::GROK_HOOK_SCRIPT,
                 args: &["Stop"],
                 input: "{}",
+                expected_runtime_id: "grok",
             },
             Case {
                 label: "muse-reject",
                 script: super::MUSE_HOOK_SCRIPT,
                 args: &[],
                 input: r#"{"hook_event_name":"Stop"}"#,
+                expected_runtime_id: "muse",
             },
         ];
 
@@ -769,6 +846,11 @@ mod tests {
                     .env("UNPEEL_SESSION_ID", "unpeel-reject-session")
                     .env("UNPEEL_SESSION_DIR", &session_dir)
                     .env("UNPEEL_RUNTIME_GENERATION", "42")
+                    // Only this capture server: no inherited app-port registry.
+                    .env(
+                        "UNPEEL_APP_PORT_REGISTRY_FILE",
+                        session_dir.join("no-extra-ports"),
+                    )
                     .env("UNPEEL_HOOK_TRACE_FILE", hook_trace_file(case.label))
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -792,12 +874,40 @@ mod tests {
                     case.label
                 );
 
-                // Preflight arrived and was rejected
+                // Preflight arrived (Stop, generation 42, this runtime, this
+                // Session's route) and was rejected.
+                let mode = if sync_mode { "sync" } else { "async" };
+                let preflight = capture
+                    .wait_for_preflight_payload("Stop", Duration::from_secs(5))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{}-{mode} preflight not received; preflights {:?}",
+                            case.label,
+                            capture.preflights_snapshot()
+                        )
+                    });
+                assert_eq!(
+                    preflight
+                        .get("unpeel_runtime_generation")
+                        .and_then(Value::as_u64),
+                    Some(42),
+                    "{}-{mode} preflight generation",
+                    case.label
+                );
+                assert_eq!(
+                    preflight.get("unpeel_runtime_id").and_then(Value::as_str),
+                    Some(case.expected_runtime_id),
+                    "{}-{mode} preflight runtime",
+                    case.label
+                );
                 assert!(
-                    capture.wait_for_preflight("Stop", Duration::from_secs(5)),
-                    "{}-{} preflight not received",
+                    capture
+                        .preflight_routes()
+                        .iter()
+                        .all(|route| route == "/hook/unpeel-reject-session"),
+                    "{}-{mode} preflight route {:?}",
                     case.label,
-                    if sync_mode { "sync" } else { "async" }
+                    capture.preflight_routes()
                 );
 
                 // Give background async processes a brief moment to finish

@@ -429,7 +429,7 @@ use unpeel_core::activity_log::{ActivityLogEntry, ActivityLogKind, ActivityLogSt
 use unpeel_core::controller_host::ControllerHostRuntime;
 use unpeel_core::relay_crypto::TunnelRequest;
 use unpeel_core::terminal_viewport::{TerminalViewportSnapshot, TerminalViewportStyleRun};
-use unpeel_core::{browser_mcp, computer_mcp, mcp_gate, mcp_host, session_host};
+use unpeel_core::{mcp_gate, mcp_host, session_host};
 
 pub fn is_session_host_mode(args: &[String]) -> bool {
     session_host_launch_args(args).is_some() || is_internal_host_mode(args)
@@ -444,8 +444,6 @@ fn is_internal_host_mode(args: &[String]) -> bool {
         controller_mcp::CONTROLLER_MCP_ARG
             | mcp_host::MCP_HOST_ARG
             | mcp_gate::MCP_GATE_ARG
-            | browser_mcp::BROWSER_CLEANUP_ARG
-            | computer_mcp::COMPUTER_CLEANUP_ARG
             | session_host::COMPACT_OUTPUT_JOURNALS_ARG
     ) || unpeel_core::integrations::legacy_mcp_gate_kind(argument).is_some()
 }
@@ -473,6 +471,9 @@ pub fn session_host_launcher_path(args: &[String]) -> Option<&Path> {
 /// adapters' MCP configs, or loaded through `pi_bridge` by the pi family
 /// (see `unpeel_core::extra_mcp`). Call before the session host runs.
 pub fn register_worker_mcp_servers(pi_bridge: &'static str) {
+    // Comet retired the vendored legacy Browser and Computer engines (F1/F3):
+    // no grant, advertisement or dispatch in any Comet process.
+    unpeel_core::embedding::retire_legacy_engines();
     static SERVERS: &[unpeel_core::extra_mcp::ExtraMcpServer] =
         &[unpeel_core::extra_mcp::ExtraMcpServer {
             name: zeron_computer_use_mcp::SERVER_NAME,
@@ -527,16 +528,6 @@ pub fn run_session_host_mode_if_requested() -> Result<bool, String> {
         .and_then(|argument| unpeel_core::integrations::legacy_mcp_gate_kind(argument))
     {
         mcp_gate::run_stdio(kind)?;
-        return Ok(true);
-    }
-    if args.first().map(String::as_str) == Some(browser_mcp::BROWSER_CLEANUP_ARG) {
-        args.remove(0);
-        browser_mcp::run_cleanup(&args)?;
-        return Ok(true);
-    }
-    if args.first().map(String::as_str) == Some(computer_mcp::COMPUTER_CLEANUP_ARG) {
-        args.remove(0);
-        computer_mcp::run_cleanup(&args)?;
         return Ok(true);
     }
     if let Some(host_args) = session_host_launch_args(&args) {
@@ -2885,12 +2876,19 @@ impl LocalWorkersClient {
         }
         let production = state_path == unpeel_core::app_paths::app_state_path();
         let (root, journal) = if production {
-            (
-                worktree_ownership::canonical_root()
+            // Resolve the saved root once: the destination and the journal
+            // that validates it share this snapshot, so a preference change
+            // mid-creation affects only later creations.
+            let root = worktree_ownership::canonical_root()
+                .map_err(|error| WorkersError::State(error.to_string()))?;
+            #[cfg(test)]
+            worktree_ownership::after_root_resolved();
+            let journal = worktree_ownership::OwnershipJournal::at(
+                worktree_ownership::current_journal_path()
                     .map_err(|error| WorkersError::State(error.to_string()))?,
-                worktree_ownership::OwnershipJournal::for_current_user()
-                    .map_err(|error| WorkersError::State(error.to_string()))?,
-            )
+                root.clone(),
+            );
+            (root, journal)
         } else {
             let home = state_path.parent().ok_or_else(|| {
                 WorkersError::State("isolated app state has no parent directory".into())
@@ -4644,6 +4642,20 @@ mod host_mode_tests {
 
     use super::is_session_host_mode;
 
+    /// F1/F3: Comet no longer routes the legacy engines' cleanup helpers, and
+    /// registering Comet's Worker servers retires those engines process-wide.
+    #[test]
+    fn legacy_engine_helpers_are_not_comet_entry_points() {
+        for argument in [
+            browser_mcp::BROWSER_CLEANUP_ARG,
+            computer_mcp::COMPUTER_CLEANUP_ARG,
+        ] {
+            assert!(!is_session_host_mode(&[argument.to_owned()]), "{argument}");
+        }
+        super::register_worker_mcp_servers("bridge");
+        assert!(unpeel_core::embedding::legacy_engines_retired());
+    }
+
     #[test]
     fn every_detached_unpeel_helper_is_routed_before_the_app_starts() {
         for argument in [
@@ -4651,8 +4663,6 @@ mod host_mode_tests {
             session_host::COMPACT_OUTPUT_JOURNALS_ARG,
             mcp_host::MCP_HOST_ARG,
             mcp_gate::MCP_GATE_ARG,
-            browser_mcp::BROWSER_CLEANUP_ARG,
-            computer_mcp::COMPUTER_CLEANUP_ARG,
         ] {
             assert!(
                 is_session_host_mode(&[argument.to_owned()]),
@@ -6262,5 +6272,162 @@ mod legacy_geometry_tests {
         assert_eq!(dominant_rule_width(log.as_bytes()), Some(120));
         assert_eq!(dominant_rule_width(rule(90).as_bytes()), None);
         assert_eq!(dominant_rule_width(b"plain shell output"), None);
+    }
+}
+
+/// MR2/GR12: one creation resolves the saved worktree root once. Switching
+/// the preference A→B right after that resolution must not make the journal
+/// validate the A destination against B: the checkout lands under A and is
+/// owned, and the next creation uses B. Runs the real production creation
+/// path with temporary HOME, data dir and Unpeel home; the switch point is a
+/// `cfg(test)` seam that does not exist in the product build.
+#[cfg(test)]
+mod worktree_root_snapshot_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn apply(values: &[(&'static str, Option<PathBuf>)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            // SAFETY: the caller holds activity_bridge::TEST_ENV_LOCK.
+            unsafe {
+                for (key, value) in values {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the caller still holds activity_bridge::TEST_ENV_LOCK.
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    fn save_preference(data_dir: &Path, folder: &Path) {
+        std::fs::create_dir_all(data_dir).unwrap();
+        std::fs::write(
+            data_dir.join(worktree_ownership::WORKTREE_SETTINGS_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "useCustomDirectory": true,
+                "customDirectory": folder,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn switch_preference() {
+        let data = PathBuf::from(std::env::var_os("ZERON_DATA_DIR").unwrap());
+        let next = PathBuf::from(std::env::var_os("MR2_SWITCH_TO").unwrap());
+        save_preference(&data, &next);
+    }
+
+    fn create(branch: &str) -> Result<WorkersWorktreeResult, WorkersError> {
+        LocalWorkersClient::create_worktree_at(
+            &unpeel_core::app_paths::app_state_path(),
+            WorkersCreateWorktreeRequest {
+                project_id: "root".into(),
+                branch: branch.into(),
+                name: None,
+                base_ref: Some("main".into()),
+            },
+        )
+    }
+
+    fn canonical(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::canonicalize(path).unwrap()
+    }
+
+    #[test]
+    fn a_preference_switch_mid_creation_keeps_one_root_snapshot() {
+        let _lock = crate::activity_bridge::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let unpeel_home = temp.path().join("unpeel");
+        let first = temp.path().join("root-a");
+        let second = temp.path().join("root-b");
+        let repo = temp.path().join("repo");
+        for dir in [&home, &data_dir, &unpeel_home, &repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "workers@example.test"]);
+        git(&repo, &["config", "user.name", "Workers Tests"]);
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "fixture"]);
+        std::fs::write(
+            unpeel_home.join("app-state.json"),
+            serde_json::to_vec_pretty(&json!({
+                "projects": [{
+                    "id": "root", "name": "Root", "path": repo,
+                    "workspace_id": "personal", "sort_order": 0
+                }],
+                "presets": [], "active_tabs": {}, "pinned_sessions": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _env = EnvGuard::apply(&[
+            ("HOME", Some(home.clone())),
+            ("ZERON_DATA_DIR", Some(data_dir.clone())),
+            ("UNPEEL_HOME", Some(unpeel_home.clone())),
+            (
+                "ZERON_WORKTREE_OWNERSHIP_FILE",
+                Some(temp.path().join("worktree-ownership.json")),
+            ),
+            ("ZERON_WORKTREES_DIR", None),
+            ("MR2_SWITCH_TO", Some(second.clone())),
+        ]);
+        save_preference(&data_dir, &first);
+        worktree_ownership::set_after_root_resolved_hook(Some(switch_preference));
+        let created = create("feature/snapshot");
+        worktree_ownership::set_after_root_resolved_hook(None);
+        let created =
+            std::fs::canonicalize(created.expect("created under the resolved root").path).unwrap();
+        assert!(
+            created.starts_with(canonical(&first)),
+            "{}",
+            created.display()
+        );
+        // The switch itself took effect for later creations.
+        let later = std::fs::canonicalize(create("feature/after-switch").unwrap().path).unwrap();
+        assert!(later.starts_with(canonical(&second)), "{}", later.display());
     }
 }

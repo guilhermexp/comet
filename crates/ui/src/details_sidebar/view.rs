@@ -367,6 +367,12 @@ pub enum DetailsSidebarEvent {
     OpenWorkingTreeDiff {
         path: String,
     },
+    /// A Servers row: open this Chat's server in the internal browser. The
+    /// port is on the Chat's host; the Shell resolves how to reach it.
+    OpenServer {
+        chat_id: String,
+        server: zeron_proto::DevServer,
+    },
     /// Session header buttons: the same verbs as the titlebar session card.
     NewSideChat,
     ForkChat,
@@ -3095,7 +3101,7 @@ impl DetailsSidebar {
         let Some(context) = self.sidebar.context().cloned() else {
             self.hide_project_skill_usage();
             self.ensure_worked_project_diff_watch(Vec::new(), cx);
-            self.ensure_dev_server_watch(None, Vec::new(), cx);
+            self.ensure_dev_server_watch(None, Vec::new(), None, cx);
             return div()
                 .p(px(16.0))
                 .text_color(theme.text_muted)
@@ -3160,7 +3166,12 @@ impl DetailsSidebar {
                 .chain(worked.iter().map(|project| project.path.clone()))
                 .collect()
         };
-        self.ensure_dev_server_watch(context.target_device_id.clone(), server_roots, cx);
+        self.ensure_dev_server_watch(
+            context.target_device_id.clone(),
+            server_roots,
+            context.chat_id.clone(),
+            cx,
+        );
         if context.mode == super::context::DetailsMode::Orchestrator {
             if !worked.is_empty() {
                 let collapsed = self.sidebar.projects_worked_collapsed();
@@ -3899,6 +3910,64 @@ mod tests {
             target_device_id: None,
             mode: DetailsMode::Workers,
         }
+    }
+
+    #[gpui::test]
+    fn changing_chat_invalidates_server_rows_with_identical_device_and_roots(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| crate::state::AppState::new());
+        let workers = cx.new(|cx| crate::workers::model::WorkersModel::detached(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let pickers = composer.read_with(cx, |composer, _| composer.pickers().clone());
+        let sidebar = cx.new(|cx| {
+            DetailsSidebar::new(
+                state,
+                workers,
+                DetailsSidebarPreferences::default(),
+                pickers,
+                composer,
+                cx,
+            )
+        });
+        // Detached state only: no Workers bootstrap, engine or provider.
+        sidebar.update(cx, |sidebar, cx| {
+            let device = Some("host".to_string());
+            let roots = vec!["/a".into(), "/b".into()];
+            sidebar.dev_server_key = Some((device.clone(), roots.clone(), Some("A".into())));
+            sidebar.dev_servers = vec![zeron_proto::DevServer {
+                pid: 7,
+                started_at: 1,
+                port: 3210,
+                cwd: "/b".into(),
+                root: "/b".into(),
+                command: "next dev".into(),
+                signatures: vec![],
+                preview_eligible: Some(true),
+            }];
+            sidebar.ensure_dev_server_watch(device.clone(), roots.clone(), Some("A".into()), cx);
+            assert_eq!(
+                sidebar.dev_servers.len(),
+                1,
+                "same Chat retains current rows"
+            );
+            sidebar.ensure_dev_server_watch(device, roots, Some("B".into()), cx);
+            assert!(
+                sidebar.dev_servers.is_empty(),
+                "a new Chat cannot inherit the old eligibility even when offline"
+            );
+            assert!(
+                sidebar.dev_server_key.is_none(),
+                "no engine means a new poll cannot start"
+            );
+        });
     }
 
     #[test]

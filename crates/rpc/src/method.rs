@@ -210,7 +210,8 @@ rpc_methods! {
     CREATE_CHAT_ON_HOST / CreateChatOnHost = "CreateChatOnHost" { params: serde_json::Value, reply: zeron_proto::Chat, forwardable: true },
     /// Create a child native chat from a parent row and queue its first run.
     /// Params `{parentChatId, prompt, spaceId?}`; reply `{chatId, spaceId?, deviceId}`.
-    /// Local IPC only: the caller is the engine-stamped sessions server.
+    /// Local IPC only: the caller is `zeron mcp` `create_chat` mode inherit,
+    /// under the engine-stamped root grant. Refuses spawned parents.
     SPAWN_CHAT / SpawnChat = "SpawnChat" { params: zeron_proto::SpawnChatParams, reply: zeron_proto::SpawnChatResult, local_only: true },
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).

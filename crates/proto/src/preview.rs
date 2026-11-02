@@ -48,6 +48,22 @@ impl PreviewService {
     }
 }
 
+/// The selected Chat's catalog visibility, shared by its watch and host
+/// dev-server eligibility. The caller supplies the watch's effective cwd.
+pub fn preview_visible_to_chat(
+    device_id: &str,
+    zeron_owned: bool,
+    chat_id: Option<&str>,
+    project_cwd: &std::path::Path,
+    selected_device: &str,
+    selected_chat: &str,
+    selected_cwd: Option<&std::path::Path>,
+) -> bool {
+    device_id == selected_device
+        && zeron_owned
+        && (chat_id == Some(selected_chat) || selected_cwd.is_some_and(|cwd| cwd == project_cwd))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewSnapshot {
@@ -98,12 +114,18 @@ pub struct DevServer {
     /// matched against the chat's own commands to tell what its agent started.
     #[serde(default)]
     pub signatures: Vec<String>,
+    /// Host ownership/origin and selected Chat visibility, before HTTP discovery.
+    /// Missing context or old hosts are unknown, never a publication promise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_eligible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListDevServersParams {
     pub cwds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

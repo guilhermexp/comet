@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use gpui::{Context, Entity, Global, Subscription, Task};
 
-use super::activity_menu::project_activity_menu;
+use super::activity_menu::MenuBarRowOrder;
 use super::model::{WorkersModel, WorkersSessionTarget};
 
 pub const ALL_RECENT_TAG: i64 = 10_000;
@@ -47,6 +47,8 @@ pub struct WorkersMenuBarController {
     model: Entity<WorkersModel>,
     native: platform::NativeMenuBar,
     receiver: Receiver<MenuBarIntent>,
+    /// The popover's retained row order (W2), fed every snapshot.
+    order: MenuBarRowOrder,
     _model_observation: Subscription,
     _intent_task: Task<()>,
     _spinner_task: Task<()>,
@@ -55,11 +57,12 @@ pub struct WorkersMenuBarController {
 impl WorkersMenuBarController {
     pub fn new(model: Entity<WorkersModel>, cx: &mut Context<Self>) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let mut order = MenuBarRowOrder::default();
         let menu = model
             .read(cx)
             .snapshot
             .as_ref()
-            .map(project_activity_menu)
+            .map(|snapshot| order.arrange(snapshot))
             .unwrap_or_default();
         let native = platform::NativeMenuBar::new(sender, &menu);
         let model_observation = cx.observe(&model, |this, model, cx| {
@@ -67,7 +70,7 @@ impl WorkersMenuBarController {
                 .read(cx)
                 .snapshot
                 .as_ref()
-                .map(project_activity_menu)
+                .map(|snapshot| this.order.arrange(snapshot))
                 .unwrap_or_default();
             this.native.update(&menu);
         });
@@ -119,11 +122,175 @@ impl WorkersMenuBarController {
         Self {
             model,
             native,
+            order,
             receiver,
             _model_observation: model_observation,
             _intent_task: intent_task,
             _spinner_task: spinner_task,
         }
+    }
+}
+
+/// Fixture seam (`appshots-fixture` only): the real status item and popover,
+/// driven by an isolated example without a `WorkersModel`. It only exposes
+/// inspection of the native views and a real click (hit-test +
+/// `performClick:` through the production target/action and bridge); it adds
+/// no behavior to the product. Off macOS there is no popover: the stub
+/// reports nothing and the example refuses to run.
+#[cfg(feature = "appshots-fixture")]
+pub mod fixture {
+    use std::sync::mpsc::Sender;
+
+    use super::MenuBarIntent;
+    use super::platform::NativeMenuBar;
+    use crate::workers::activity_menu::WorkersActivityMenu;
+
+    /// One native button in the popover content view: its tag, the title
+    /// label drawn on the same row (the footer's own title for the footer)
+    /// and its frame in content-view points (origin bottom-left).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct NativeRow {
+        pub tag: i64,
+        pub title: String,
+        pub frame: [f64; 4],
+    }
+
+    pub struct FixtureMenuBar(NativeMenuBar);
+
+    impl FixtureMenuBar {
+        pub fn new(sender: Sender<MenuBarIntent>, menu: &WorkersActivityMenu) -> Self {
+            Self(NativeMenuBar::new(sender, menu))
+        }
+
+        pub fn update(&mut self, menu: &WorkersActivityMenu) {
+            self.0.update(menu);
+        }
+
+        /// Opens the popover through the production toggle (status-item
+        /// button, main-queue hop).
+        pub fn toggle(&mut self) {
+            self.0.toggle();
+        }
+
+        pub fn close(&mut self) {
+            self.0.close();
+        }
+
+        pub fn is_shown(&self) -> bool {
+            self.0.fixture_is_shown()
+        }
+
+        pub fn rows(&self) -> Vec<NativeRow> {
+            self.0
+                .fixture_rows()
+                .into_iter()
+                .map(|(tag, title, frame)| NativeRow { tag, title, frame })
+                .collect()
+        }
+
+        /// Hit-tests the content view at `(x, y)` and, when the hit view is
+        /// an NSButton, clicks it with `performClick:`. Returns its tag.
+        pub fn click_at(&self, x: f64, y: f64) -> Option<i64> {
+            self.0.fixture_click_at(x, y)
+        }
+
+        /// The popover's own NSWindow number, for a window-server capture.
+        pub fn popover_window_number(&self) -> Option<i64> {
+            self.0.fixture_window_number()
+        }
+
+        /// The status-item anchor as AppKit sees it right now.
+        pub fn anchor(&self) -> AnchorState {
+            self.0.fixture_anchor_state()
+        }
+
+        /// Starts recording the popover's own NSPopover notifications
+        /// (will/did show, will/did close and the close reason).
+        pub fn observe_popover(&self) {
+            self.0.fixture_observe_popover();
+        }
+
+        /// The NSPopover notifications recorded so far, in order.
+        pub fn popover_events(&self) -> Vec<PopoverEvent> {
+            self.0.fixture_popover_events()
+        }
+
+        /// Clicks the real status-item button (`performClick:`), so its
+        /// production target/action and bridge emit whatever intent they
+        /// emit. Returns false when the status item has no button.
+        pub fn click_status_button(&self) -> bool {
+            self.0.fixture_click_status_button()
+        }
+
+        /// Every stage the production popover op reached, in order: hop
+        /// scheduled, hop entered on the main queue, state before and after
+        /// `showRelativeToRect:` / `performClose:`.
+        pub fn popover_ops(&self) -> Vec<PopoverOpTrace> {
+            self.0.fixture_popover_ops()
+        }
+    }
+
+    impl Drop for FixtureMenuBar {
+        fn drop(&mut self) {
+            self.0.fixture_stop_observing();
+        }
+    }
+
+    /// Native readiness of the status-item button the popover is shown from:
+    /// `showRelativeToRect:ofView:` can only anchor to a button whose
+    /// status-bar window is on a screen and visible.
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+    pub struct AnchorState {
+        pub status_item_visible: bool,
+        pub button: bool,
+        pub window: bool,
+        pub window_number: Option<i64>,
+        pub window_visible: bool,
+        pub window_occlusion_visible: bool,
+        pub window_on_screen: bool,
+        /// The button's frame in screen points (origin bottom-left).
+        pub button_screen_frame: [f64; 4],
+        pub app_active: bool,
+        /// `NSApplicationActivationPolicy`: 0 regular, 1 accessory, 2 prohibited.
+        pub activation_policy: i64,
+    }
+
+    impl AnchorState {
+        pub fn ready(&self) -> bool {
+            self.status_item_visible
+                && self.button
+                && self.window
+                && self.window_visible
+                && self.window_occlusion_visible
+                && self.window_on_screen
+                && self.button_screen_frame[2] > 0.0
+                && self.button_screen_frame[3] > 0.0
+        }
+    }
+
+    /// One stage of a production popover op (`appshots-fixture` only).
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+    pub struct PopoverOpTrace {
+        /// `scheduled`, `entered`, `before_show`, `after_show`, `after_close`.
+        pub stage: String,
+        /// true for a show op, false for a close op.
+        pub show: bool,
+        pub at_ms: u128,
+        pub main_thread: bool,
+        pub is_shown: bool,
+        pub app_active: bool,
+        pub has_content_view: bool,
+        pub content_window: bool,
+        pub button_window: Option<bool>,
+        /// The rect passed to `showRelativeToRect:` (button bounds).
+        pub positioning_bounds: Option<[f64; 4]>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    pub struct PopoverEvent {
+        pub name: String,
+        pub close_reason: Option<String>,
+        pub at_ms: u128,
     }
 }
 
@@ -258,6 +425,10 @@ mod platform {
     /// the borrowed App: "RefCell already borrowed" (twice) on every session
     /// picked from the menu bar. Run the AppKit side after the update instead.
     unsafe fn post_popover_op(popover: *mut Object, button: *mut Object) {
+        #[cfg(feature = "appshots-fixture")]
+        unsafe {
+            fixture_trace_op("scheduled", popover, button, None)
+        };
         unsafe {
             let _: *mut Object = msg_send![popover, retain];
             if !button.is_null() {
@@ -273,14 +444,24 @@ mod platform {
 
     extern "C" fn run_popover_op(context: *mut c_void) {
         let op = unsafe { Box::from_raw(context.cast::<PopoverOp>()) };
+        #[cfg(feature = "appshots-fixture")]
+        unsafe {
+            fixture_trace_op("entered", op.popover, op.button, None)
+        };
         unsafe {
             if op.button.is_null() {
                 let _: () = msg_send![op.popover, performClose: std::ptr::null_mut::<Object>()];
+                #[cfg(feature = "appshots-fixture")]
+                fixture_trace_op("after_close", op.popover, op.button, None);
             } else {
                 let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
                 let _: () = msg_send![app, activateIgnoringOtherApps: true];
                 let bounds: NSRect = msg_send![op.button, bounds];
+                #[cfg(feature = "appshots-fixture")]
+                fixture_trace_op("before_show", op.popover, op.button, Some(bounds));
                 let _: () = msg_send![op.popover, showRelativeToRect: bounds ofView: op.button preferredEdge: 1_u64];
+                #[cfg(feature = "appshots-fixture")]
+                fixture_trace_op("after_show", op.popover, op.button, Some(bounds));
                 let _: () = msg_send![op.button, release];
             }
             let _: () = msg_send![op.popover, release];
@@ -471,6 +652,329 @@ mod platform {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    impl NativeMenuBar {
+        pub fn fixture_is_shown(&self) -> bool {
+            unsafe { msg_send![self.popover, isShown] }
+        }
+
+        unsafe fn fixture_content(&self) -> *mut Object {
+            unsafe {
+                let controller: *mut Object = msg_send![self.popover, contentViewController];
+                if controller.is_null() {
+                    return std::ptr::null_mut();
+                }
+                msg_send![controller, view]
+            }
+        }
+
+        pub fn fixture_rows(&self) -> Vec<(i64, String, [f64; 4])> {
+            unsafe {
+                let view = self.fixture_content();
+                if view.is_null() {
+                    return Vec::new();
+                }
+                let subviews: *mut Object = msg_send![view, subviews];
+                let count: usize = msg_send![subviews, count];
+                let mut labels = Vec::new();
+                let mut buttons = Vec::new();
+                for index in 0..count {
+                    let child: *mut Object = msg_send![subviews, objectAtIndex: index];
+                    let frame: NSRect = msg_send![child, frame];
+                    let is_button: bool = msg_send![child, isKindOfClass: class!(NSButton)];
+                    let is_label: bool = msg_send![child, isKindOfClass: class!(NSTextField)];
+                    if is_button {
+                        let tag: i64 = msg_send![child, tag];
+                        let title: *mut Object = msg_send![child, title];
+                        buttons.push((tag, rust_string(title), frame));
+                    } else if is_label {
+                        let value: *mut Object = msg_send![child, stringValue];
+                        labels.push((frame, rust_string(value)));
+                    }
+                }
+                buttons
+                    .into_iter()
+                    .map(|(tag, own_title, frame)| {
+                        // `add_row` draws the title at x 38, 20pt above the
+                        // row button's origin.
+                        let title = labels
+                            .iter()
+                            .find(|(label, _)| {
+                                (label.origin.x - 38.0).abs() < 0.5
+                                    && (label.origin.y - (frame.origin.y + 20.0)).abs() < 0.5
+                            })
+                            .map(|(_, title)| title.clone())
+                            .unwrap_or(own_title);
+                        (
+                            tag,
+                            title,
+                            [
+                                frame.origin.x,
+                                frame.origin.y,
+                                frame.size.width,
+                                frame.size.height,
+                            ],
+                        )
+                    })
+                    .collect()
+            }
+        }
+
+        pub fn fixture_click_at(&self, x: f64, y: f64) -> Option<i64> {
+            unsafe {
+                let view = self.fixture_content();
+                if view.is_null() {
+                    return None;
+                }
+                // `hitTest:` takes a point in the superview's coordinates.
+                let superview: *mut Object = msg_send![view, superview];
+                let point: NSPoint =
+                    msg_send![view, convertPoint: NSPoint { x, y } toView: superview];
+                let hit: *mut Object = msg_send![view, hitTest: point];
+                if hit.is_null() {
+                    return None;
+                }
+                let is_button: bool = msg_send![hit, isKindOfClass: class!(NSButton)];
+                if !is_button {
+                    return None;
+                }
+                let tag: i64 = msg_send![hit, tag];
+                let _: () = msg_send![hit, performClick: std::ptr::null_mut::<Object>()];
+                Some(tag)
+            }
+        }
+
+        pub fn fixture_window_number(&self) -> Option<i64> {
+            unsafe {
+                let view = self.fixture_content();
+                if view.is_null() {
+                    return None;
+                }
+                let window: *mut Object = msg_send![view, window];
+                if window.is_null() {
+                    return None;
+                }
+                let number: i64 = msg_send![window, windowNumber];
+                Some(number)
+            }
+        }
+
+        pub fn fixture_anchor_state(&self) -> super::fixture::AnchorState {
+            let mut state = super::fixture::AnchorState::default();
+            unsafe {
+                let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+                state.app_active = msg_send![app, isActive];
+                state.activation_policy = msg_send![app, activationPolicy];
+                state.status_item_visible = msg_send![self.status_item, isVisible];
+                let button: *mut Object = msg_send![self.status_item, button];
+                state.button = !button.is_null();
+                if button.is_null() {
+                    return state;
+                }
+                let window: *mut Object = msg_send![button, window];
+                state.window = !window.is_null();
+                if window.is_null() {
+                    return state;
+                }
+                let number: i64 = msg_send![window, windowNumber];
+                state.window_number = Some(number);
+                state.window_visible = msg_send![window, isVisible];
+                // NSWindowOcclusionStateVisible
+                let occlusion: u64 = msg_send![window, occlusionState];
+                state.window_occlusion_visible = occlusion & (1 << 1) != 0;
+                let screen: *mut Object = msg_send![window, screen];
+                state.window_on_screen = !screen.is_null();
+                let bounds: NSRect = msg_send![button, bounds];
+                let in_window: NSRect =
+                    msg_send![button, convertRect: bounds toView: std::ptr::null_mut::<Object>()];
+                let on_screen: NSRect = msg_send![window, convertRectToScreen: in_window];
+                state.button_screen_frame = [
+                    on_screen.origin.x,
+                    on_screen.origin.y,
+                    on_screen.size.width,
+                    on_screen.size.height,
+                ];
+            }
+            state
+        }
+
+        pub fn fixture_observe_popover(&self) {
+            fixture_clock();
+            unsafe {
+                let center: *mut Object = msg_send![class!(NSNotificationCenter), defaultCenter];
+                // `name: nil` - every notification this popover posts.
+                let _: () = msg_send![center,
+                    addObserver: fixture_observer()
+                    selector: sel!(popoverEvent:)
+                    name: std::ptr::null_mut::<Object>()
+                    object: self.popover];
+            }
+        }
+
+        pub fn fixture_stop_observing(&self) {
+            unsafe {
+                let center: *mut Object = msg_send![class!(NSNotificationCenter), defaultCenter];
+                let _: () = msg_send![center,
+                    removeObserver: fixture_observer()
+                    name: std::ptr::null_mut::<Object>()
+                    object: self.popover];
+            }
+        }
+
+        pub fn fixture_popover_events(&self) -> Vec<super::fixture::PopoverEvent> {
+            fixture_events()
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default()
+        }
+
+        pub fn fixture_click_status_button(&self) -> bool {
+            unsafe {
+                let button: *mut Object = msg_send![self.status_item, button];
+                if button.is_null() {
+                    return false;
+                }
+                let _: () = msg_send![button, performClick: std::ptr::null_mut::<Object>()];
+                true
+            }
+        }
+
+        pub fn fixture_popover_ops(&self) -> Vec<super::fixture::PopoverOpTrace> {
+            fixture_ops()
+                .lock()
+                .map(|ops| ops.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    fn fixture_ops() -> &'static Mutex<Vec<super::fixture::PopoverOpTrace>> {
+        static OPS: OnceLock<Mutex<Vec<super::fixture::PopoverOpTrace>>> = OnceLock::new();
+        OPS.get_or_init(Default::default)
+    }
+
+    /// Records one stage of a production popover op. Read-only: it only
+    /// queries state, so the op behaves exactly as without the feature.
+    #[cfg(feature = "appshots-fixture")]
+    unsafe fn fixture_trace_op(
+        stage: &str,
+        popover: *mut Object,
+        button: *mut Object,
+        bounds: Option<NSRect>,
+    ) {
+        let start = fixture_clock();
+        unsafe {
+            let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+            let main_thread: bool = msg_send![class!(NSThread), isMainThread];
+            let is_shown: bool = msg_send![popover, isShown];
+            let app_active: bool = msg_send![app, isActive];
+            let controller: *mut Object = msg_send![popover, contentViewController];
+            let view: *mut Object = if controller.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg_send![controller, view]
+            };
+            let content_window = if view.is_null() {
+                false
+            } else {
+                let window: *mut Object = msg_send![view, window];
+                !window.is_null()
+            };
+            let button_window = (!button.is_null()).then(|| {
+                let window: *mut Object = msg_send![button, window];
+                !window.is_null()
+            });
+            if let Ok(mut ops) = fixture_ops().lock() {
+                ops.push(super::fixture::PopoverOpTrace {
+                    stage: stage.to_owned(),
+                    show: !button.is_null(),
+                    at_ms: start.elapsed().as_millis(),
+                    main_thread,
+                    is_shown,
+                    app_active,
+                    has_content_view: !view.is_null(),
+                    content_window,
+                    button_window,
+                    positioning_bounds: bounds.map(|rect| {
+                        [
+                            rect.origin.x,
+                            rect.origin.y,
+                            rect.size.width,
+                            rect.size.height,
+                        ]
+                    }),
+                });
+            }
+        }
+    }
+
+    /// Event times are measured from the moment observation starts.
+    #[cfg(feature = "appshots-fixture")]
+    fn fixture_clock() -> std::time::Instant {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        *START.get_or_init(std::time::Instant::now)
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    fn fixture_events() -> &'static Mutex<Vec<super::fixture::PopoverEvent>> {
+        static EVENTS: OnceLock<Mutex<Vec<super::fixture::PopoverEvent>>> = OnceLock::new();
+        EVENTS.get_or_init(Default::default)
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    extern "C" fn fixture_popover_event(_this: &Object, _cmd: Sel, notification: *mut Object) {
+        let start = fixture_clock();
+        unsafe {
+            let name: *mut Object = msg_send![notification, name];
+            let info: *mut Object = msg_send![notification, userInfo];
+            let close_reason = if info.is_null() {
+                None
+            } else {
+                let reason: *mut Object =
+                    msg_send![info, objectForKey: ns_string("NSPopoverCloseReasonKey")];
+                (!reason.is_null()).then(|| rust_string(reason))
+            };
+            if let Ok(mut events) = fixture_events().lock() {
+                events.push(super::fixture::PopoverEvent {
+                    name: rust_string(name),
+                    close_reason,
+                    at_ms: start.elapsed().as_millis(),
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    fn fixture_observer() -> *mut Object {
+        static OBSERVER: OnceLock<usize> = OnceLock::new();
+        *OBSERVER.get_or_init(|| unsafe {
+            let mut declaration =
+                ClassDecl::new("ZeronWorkersMenuFixtureObserver", class!(NSObject))
+                    .expect("fixture observer class registered once");
+            declaration.add_method(
+                sel!(popoverEvent:),
+                fixture_popover_event as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            let class = declaration.register();
+            let observer: *mut Object = msg_send![class, new];
+            observer as usize
+        }) as *mut Object
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    unsafe fn rust_string(value: *mut Object) -> String {
+        if value.is_null() {
+            return String::new();
+        }
+        let bytes: *const std::ffi::c_char = unsafe { msg_send![value, UTF8String] };
+        if bytes.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(bytes) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     impl Drop for NativeMenuBar {
@@ -780,6 +1284,36 @@ mod platform {
         pub fn toggle(&mut self) {}
         pub fn close(&mut self) {}
         pub fn tick_spinner(&mut self) {}
+    }
+
+    #[cfg(feature = "appshots-fixture")]
+    impl NativeMenuBar {
+        pub fn fixture_is_shown(&self) -> bool {
+            false
+        }
+        pub fn fixture_rows(&self) -> Vec<(i64, String, [f64; 4])> {
+            Vec::new()
+        }
+        pub fn fixture_click_at(&self, _x: f64, _y: f64) -> Option<i64> {
+            None
+        }
+        pub fn fixture_window_number(&self) -> Option<i64> {
+            None
+        }
+        pub fn fixture_anchor_state(&self) -> super::fixture::AnchorState {
+            Default::default()
+        }
+        pub fn fixture_observe_popover(&self) {}
+        pub fn fixture_stop_observing(&self) {}
+        pub fn fixture_popover_events(&self) -> Vec<super::fixture::PopoverEvent> {
+            Vec::new()
+        }
+        pub fn fixture_click_status_button(&self) -> bool {
+            false
+        }
+        pub fn fixture_popover_ops(&self) -> Vec<super::fixture::PopoverOpTrace> {
+            Vec::new()
+        }
     }
 }
 

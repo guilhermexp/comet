@@ -16,7 +16,8 @@
 //! with sockets kept under `~/.unpeel/browser/sockets` so Unpeel never
 //! collides with a user's own agent-browser use.
 
-use crate::mcp_host::{self_session_id, strip_ansi};
+use crate::mcp_host::self_session_id;
+use crate::session_control::strip_ansi;
 use crate::session_host;
 use crate::state::{current_timestamp_ms, BrowserAccess};
 use serde_json::{json, Value};
@@ -1176,7 +1177,7 @@ pub(crate) fn tool_browser_context() -> Result<String, String> {
     ));
     lines.push(
         "video: not available in this engine mode (recording silently produces no file) — \
-capture browser_screenshot at each meaningful step instead."
+call the browser tool with action screenshot at each meaningful step instead."
             .into(),
     );
     let allowed = options.settings.allowed_domains.trim();
@@ -1241,8 +1242,8 @@ explicitly asks."
             .into(),
     );
     lines.push(
-        "core loop: browser_open → browser_snapshot (refs like @e1) → browser_click/browser_fill \
-by ref → re-snapshot after navigation or DOM changes."
+        "core loop: open → snapshot (refs like @e1) → click/fill by ref → re-snapshot after \
+navigation or DOM changes."
             .into(),
     );
     Ok(lines.join("\n"))

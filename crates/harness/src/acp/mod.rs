@@ -3464,7 +3464,7 @@ async fn open_session(
     load_timeout: Duration,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) -> Result<(String, Value), HarnessError> {
-    // Fork grant (comet-workers/comet-sessions) plus any host-injected
+    // Fork grant (comet-workers/zeron) plus any host-injected
     // server on `request.mcp` (the engine leaves it unset: D3). Every
     // restore/new attempt carries the same grant.
     let mut mcp_servers = workers_mcp_servers(request);

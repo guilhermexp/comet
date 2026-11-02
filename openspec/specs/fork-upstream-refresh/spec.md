@@ -77,7 +77,7 @@ The integration SHALL incorporate the upstream commits through `d5a01522` by rea
 Test: unit
 
 #### Scenario: IPC clients authenticate
-- **WHEN** a fork IPC client (`comet-sessions`, `zeron mcp`, Workers, auth/sync CLI) connects to the engine
+- **WHEN** a fork IPC client (`zeron mcp`, Workers, auth/sync CLI) connects to the engine
 - **THEN** it SHALL present the bearer token from the data dir
 - **AND** a connection without the token SHALL be refused
 
@@ -85,7 +85,7 @@ Test: integration
 
 #### Scenario: MCP grants stay root-only
 - **WHEN** any run is dispatched, including Muse and runs with native subagents disabled
-- **THEN** `RunRequest.mcp` SHALL be empty and `comet-sessions`/`zeron` SHALL reach only the root orchestrator with IPC
+- **THEN** `RunRequest.mcp` SHALL be empty and `zeron` SHALL reach only the root orchestrator with IPC
 - **AND** native subagent tools SHALL only be disallowed when the run has the fork `sessions` grant
 
 Test: unit

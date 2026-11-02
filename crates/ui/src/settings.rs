@@ -1413,6 +1413,10 @@ pub struct UiSettings {
     /// Local preference: never transfers an active call or credentials.
     #[serde(default)]
     pub codex_voice_device: Option<String>,
+    /// Show the voice-agent orbs (stage, sidebar trigger, call widget).
+    /// Independent of `reduce_motion`; off removes the orbs and their ticks
+    /// without touching the call. Older files without the key show them.
+    pub voice_orb_enabled: bool,
     /// Comet's Computer Use server (`comet-computer-use`) for sessions whose
     /// agent runs on this device. Codex's native Computer Use ignores it.
     pub codex_computer_use_enabled: bool,
@@ -1526,6 +1530,7 @@ impl Default for UiSettings {
             pause_animations_in_background: false,
             codex_voice: None,
             codex_voice_device: None,
+            voice_orb_enabled: true,
             codex_computer_use_enabled: true,
             codex_computer_use_scope: ComputerUseScope::ChatsAndWorkers,
             legacy_accent_color: None,
@@ -2177,6 +2182,7 @@ impl UiSettings {
             pause_animations_in_background,
             codex_voice,
             codex_voice_device,
+            voice_orb_enabled,
             codex_computer_use_enabled,
             codex_computer_use_scope,
             legacy_accent_color,
@@ -3308,6 +3314,43 @@ mod tests {
     }
 
     #[test]
+    fn voice_orb_preference_defaults_on_and_survives_shell_save() {
+        // Files written before the preference existed keep their orbs.
+        let legacy = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(legacy.path()),
+            r#"{"sidebarWidth": 280, "reduceMotion": "on"}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(legacy.path());
+        assert!(loaded.voice_orb_enabled);
+        assert_eq!(loaded.reduce_motion, crate::motion::ReduceMotion::On);
+
+        // Settings → Voice turns it off; the Shell's working copy predates
+        // that and later saves a panel width. The stale copy must not
+        // resurrect the orb, and the other preferences stay independent.
+        let base = UiSettings::default();
+        let mut disabled = base.clone();
+        disabled.voice_orb_enabled = false;
+        let mut shell_copy = base.clone();
+        shell_copy.details_sidebar_width = 412.0;
+        let merged = UiSettings::merge_changes(&base, &shell_copy, disabled);
+        assert!(!merged.voice_orb_enabled);
+        assert_eq!(merged.details_sidebar_width, 412.0);
+        assert_eq!(merged.reduce_motion, base.reduce_motion);
+        assert_eq!(merged.dictation_enabled, base.dictation_enabled);
+        assert_eq!(merged.codex_voice, base.codex_voice);
+
+        let dir = tempfile::tempdir().unwrap();
+        merged.save(dir.path()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(UiSettings::path(dir.path())).unwrap())
+                .unwrap();
+        assert_eq!(json["voiceOrbEnabled"], serde_json::json!(false));
+        assert!(!UiSettings::load(dir.path()).voice_orb_enabled);
+    }
+
+    #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
@@ -3316,6 +3359,7 @@ mod tests {
             window_geometry: None,
             codex_voice: Some("ember".into()),
             codex_voice_device: Some("fedora".into()),
+            voice_orb_enabled: false,
             codex_computer_use_enabled: false,
             codex_computer_use_scope: ComputerUseScope::Chats,
             sidebar_width: 300.0,

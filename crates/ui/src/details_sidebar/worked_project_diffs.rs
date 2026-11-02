@@ -5,7 +5,7 @@ impl DetailsSidebar {
     pub(crate) fn hide_worked_project_diffs(&mut self, cx: &mut Context<Self>) {
         self.hide_project_skill_usage();
         self.ensure_worked_project_diff_watch(Vec::new(), cx);
-        self.ensure_dev_server_watch(None, Vec::new(), cx);
+        self.ensure_dev_server_watch(None, Vec::new(), None, cx);
     }
 
     pub(super) fn ensure_worked_project_diff_watch(

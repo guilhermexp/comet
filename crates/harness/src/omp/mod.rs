@@ -409,14 +409,6 @@ impl Harness for OmpHarness {
         } else {
             None
         };
-        let sessions = if let Some(grant) = &request.sessions {
-            let executable = executable.clone().expect("checked");
-            WorkersBridge::start_sessions(&executable, grant)
-                .await?
-                .map(Arc::new)
-        } else {
-            None
-        };
         let zeron = if let Some(grant) = &request.sessions {
             let executable = executable.clone().expect("checked");
             // Optional: a run without chat tools beats a run that fails to
@@ -451,7 +443,6 @@ impl Harness for OmpHarness {
         };
         let host_tools: Vec<_> = workers
             .iter()
-            .chain(sessions.iter())
             .chain(zeron.iter())
             .chain(computer_use.iter())
             .flat_map(|bridge| bridge.definitions().iter().cloned())
@@ -527,7 +518,6 @@ impl Harness for OmpHarness {
             event_tx,
             controls,
             workers,
-            sessions,
             zeron,
             computer_use,
             request.cwd,
@@ -792,7 +782,6 @@ async fn run_session(
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     workers: Option<Arc<WorkersBridge>>,
-    sessions: Option<Arc<WorkersBridge>>,
     zeron: Option<Arc<WorkersBridge>>,
     computer_use: Option<Arc<WorkersBridge>>,
     cwd: String,
@@ -1117,7 +1106,6 @@ async fn run_session(
                             && arguments.get("action").and_then(Value::as_str) == Some("wait_for_status")
                             || tool == "wait_for_status";
                         let bridge = match tool {
-                            "sessions" => sessions.as_ref(),
                             _ if computer_use
                                 .as_ref()
                                 .is_some_and(|bridge| bridge.serves(tool)) =>
@@ -1175,9 +1163,6 @@ async fn run_session(
                             pending_wait_for_status.remove(target_id);
                             if let Some(workers) = &workers {
                                 workers.cancel_call(target_id);
-                            }
-                            if let Some(sessions) = &sessions {
-                                sessions.cancel_call(target_id);
                             }
                             if let Some(zeron) = &zeron {
                                 zeron.cancel_call(target_id);
@@ -1289,9 +1274,6 @@ async fn run_session(
 
     if let Some(workers) = workers {
         let _ = workers.shutdown().await;
-    }
-    if let Some(sessions) = sessions {
-        let _ = sessions.shutdown().await;
     }
     if let Some(zeron) = zeron {
         let _ = zeron.shutdown().await;

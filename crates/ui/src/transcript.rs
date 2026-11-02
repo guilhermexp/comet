@@ -8693,19 +8693,25 @@ impl Transcript {
                     let hold_height = measured_h.clone();
                     let hold_selection: Arc<str> = format!("{}:u", row.id).into();
                     let chip_overlays = self.chip_overlays(&row.id, &mentions, &theme, cx);
-                    let text_body = div().child(user_bubble_text(
-                        &row.id,
-                        text.clone(),
-                        mentions,
-                        url_chips,
-                        &theme,
-                        measured_h.clone(),
-                        cx.entity_id(),
-                        chip_overlays,
-                        Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
-                            this.open_chip_image(path, window, cx);
-                        })),
-                    ));
+                    // Only a message with URL chips can activate a link.
+                    let chip_link = (!url_chips.is_empty()).then(|| self.link_ui(cx)).flatten();
+                    let text_body =
+                        div()
+                            .debug_selector(|| "user-bubble-text".into())
+                            .child(user_bubble_text(
+                                &row.id,
+                                text.clone(),
+                                mentions,
+                                url_chips,
+                                &theme,
+                                measured_h.clone(),
+                                cx.entity_id(),
+                                chip_overlays,
+                                Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
+                                    this.open_chip_image(path, window, cx);
+                                })),
+                                chip_link,
+                            ));
                     let body = div()
                         .id(SharedString::from(format!("{}-body", row.id)))
                         .when(collapsible, |el| {
@@ -12295,6 +12301,7 @@ fn user_bubble_text(
     entity_id: gpui::EntityId,
     overlays: Vec<ChipOverlay>,
     open_image: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)>,
+    link: Option<render::LinkUi>,
 ) -> AnyElement {
     let runs = user_bubble_runs(&text, &mentions, &url_chips, theme);
     let styled = StyledText::new(text.clone()).with_runs(runs);
@@ -12318,10 +12325,18 @@ fn user_bubble_text(
             .map(|chip| (chip.range.clone(), chip.url.clone()))
             .unzip();
         gpui::InteractiveText::new(SharedString::from(format!("{row_id}#url-chips")), styled)
-            .on_click(click_ranges, move |clicked_ix, _, cx| {
+            // A pasted link is a Chat link: the same router as Markdown
+            // links (preference, pull request policy, Browser surface).
+            .on_click(click_ranges, move |clicked_ix, window, cx| {
                 if let Some(url) = click_urls.get(clicked_ix) {
                     cx.stop_propagation();
-                    cx.open_url(url);
+                    render::activate_link(
+                        render::LinkTarget::new(url, url),
+                        render::LinkAction::Primary,
+                        link.as_ref(),
+                        window,
+                        cx,
+                    );
                 }
             })
             .into_any_element()

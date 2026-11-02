@@ -12,6 +12,8 @@ Catálogo, descoberta de listeners/processos, proxy HTTP/WebSocket, multiplexaç
 
 ## Local Contracts
 
+- `DevServer.preview_eligible` combina `service::attributed_candidates` com `zeron_proto::preview_visible_to_chat`: device, origem própria OU project cwd exato do Chat selecionado, como seu watch. Raízes Projects worked não autorizam previews de outro Chat/pasta. `PreviewService` usa o mesmo provider de Scope da descoberta; o contexto de seleção vem da engine, não do comando/porta da UI. Sem Scope/Chat, `None`; `Some(true)` ainda não promete HTTP ou exposição adicional. Provas: `worked_root_eligibility_matches_the_selected_chats_watch` e `details_eligibility_uses_preview_host_attribution_before_discovery`.
+
 - Port adaptado de upstream #290/#295 (MIT). URLs persistidas não dependem da porta do processo. Revalidar PID, início do processo, cwd e listener antes de conectar evita reutilização indevida de porta.
 - Proxy escuta apenas loopback. Só serviços anunciados e validados podem ser alvos; destinos externos arbitrários não são aceitos.
 - O patch licenciado de `rtc-sctp` mantém SCTP + DTLS + UDP/IPv6 dentro de 1280 bytes para não travar em VPN; ver `third_party/rust/PATCHES.md`.

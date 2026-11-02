@@ -129,7 +129,14 @@ pub struct Zeron {
     /// Data dir whose `ipc-token` authenticates each (re)dial.
     data_dir: Option<std::path::PathBuf>,
     origin: Origin,
+    /// The current connection, once its engine identity was checked
+    /// against [`Origin::device_id`] (see [`Self::bind`]).
     rpc: Mutex<Option<Arc<RpcClient>>>,
+    /// A wrapped client not yet bound to the expected engine.
+    unbound: Mutex<Option<RpcClient>>,
+    /// Test seam: what a redial connects to.
+    #[cfg(test)]
+    redial: Option<Box<dyn Fn() -> RpcClient + Send + Sync>>,
 }
 
 impl Zeron {
@@ -142,6 +149,9 @@ impl Zeron {
             data_dir,
             origin,
             rpc: Mutex::new(None),
+            unbound: Mutex::new(None),
+            #[cfg(test)]
+            redial: None,
         }
     }
 
@@ -151,7 +161,10 @@ impl Zeron {
             port: None,
             data_dir: None,
             origin,
-            rpc: Mutex::new(Some(Arc::new(client))),
+            rpc: Mutex::new(None),
+            unbound: Mutex::new(Some(client)),
+            #[cfg(test)]
+            redial: None,
         }
     }
 
@@ -159,24 +172,77 @@ impl Zeron {
         &self.origin
     }
 
+    /// Wrapped client plus a redial that connects to another engine (tests).
+    #[cfg(test)]
+    pub(crate) fn with_client_and_redial(
+        client: RpcClient,
+        origin: Origin,
+        redial: impl Fn() -> RpcClient + Send + Sync + 'static,
+    ) -> Self {
+        let mut zeron = Self::with_client(client, origin);
+        zeron.redial = Some(Box::new(redial));
+        zeron
+    }
+
+    /// Every connection — first dial, wrapped client or a reconnect after the
+    /// engine restarted — must belong to the engine the harness granted
+    /// (`ZERON_DEVICE_ID`) before any operation runs on it. A terminal user
+    /// (`zeron mcp` without an origin device) has no expected engine.
+    async fn bind(&self, client: RpcClient) -> anyhow::Result<Arc<RpcClient>> {
+        if let Some(expected) = self.origin.device_id.as_deref() {
+            let info = client
+                .call(methods::ENGINE_INFO, json!({}))
+                .await
+                .map_err(|e| anyhow!("EngineInfo: {e}"))?;
+            let actual = info.get("deviceId").and_then(Value::as_str);
+            if actual != Some(expected) {
+                let refusal = anyhow!(
+                    "engine identity mismatch: this server is bound to engine {expected}, but the connected engine is {}; nothing was done",
+                    actual.unwrap_or("unknown")
+                );
+                // The connection stays unbound: every later call verifies
+                // it again and is refused the same way, never run on it.
+                *self.unbound.lock().await = Some(client);
+                return Err(refusal);
+            }
+        }
+        Ok(Arc::new(client))
+    }
+
     async fn client(&self) -> anyhow::Result<Arc<RpcClient>> {
         let mut slot = self.rpc.lock().await;
         if let Some(client) = slot.as_ref() {
             return Ok(client.clone());
         }
-        let Some(port) = self.port else {
-            bail!("engine connection closed");
+        let client = if let Some(client) = self.unbound.lock().await.take() {
+            client
+        } else {
+            #[cfg(test)]
+            if let Some(redial) = &self.redial {
+                let client = self.bind(redial()).await?;
+                *slot = Some(client.clone());
+                return Ok(client);
+            }
+            let Some(port) = self.port else {
+                bail!("engine connection closed");
+            };
+            connect_ipc(port, self.data_dir.as_deref())
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "no Zeron engine reachable at ws://127.0.0.1:{port} ({e}) — is Zeron running?"
+                    )
+                })?
         };
-        let client = connect_ipc(port, self.data_dir.as_deref())
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "no Zeron engine reachable at ws://127.0.0.1:{port} ({e}) — is Zeron running?"
-                )
-            })?;
-        let client = Arc::new(client);
+        let client = self.bind(client).await?;
         *slot = Some(client.clone());
         Ok(client)
+    }
+
+    /// Drop the current connection, as a closed socket does (tests).
+    #[cfg(test)]
+    pub(crate) async fn simulate_disconnect(&self) {
+        self.forget_client().await;
     }
 
     async fn forget_client(&self) {
@@ -381,6 +447,22 @@ impl Zeron {
 
     pub async fn mutate(&self, params: Value) -> anyhow::Result<Value> {
         self.call(methods::MUTATE, params).await
+    }
+
+    /// A Chat that inherits `parent_chat_id`'s full configuration and runs
+    /// `prompt` (`create_chat` mode inherit). The engine enforces the root
+    /// parent and records `originChatId`.
+    pub async fn spawn_chat(
+        &self,
+        parent_chat_id: &str,
+        prompt: &str,
+        space_id: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let mut params = json!({ "parentChatId": parent_chat_id, "prompt": prompt });
+        if let Some(space_id) = space_id {
+            params["spaceId"] = json!(space_id);
+        }
+        self.call(methods::SPAWN_CHAT, params).await
     }
 
     /// Durable command into the chat doc; the host device drains it.

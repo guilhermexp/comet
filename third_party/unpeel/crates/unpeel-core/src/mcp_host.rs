@@ -8,15 +8,15 @@
 //! (`~/.unpeel/app-sessions/<id>/session.sock`); no running desktop app is
 //! required beyond the hosts themselves.
 
+use crate::session_control::{strip_ansi, InputAuthority};
 use crate::session_host::{self, HostedSessionManifest, HostedSessionState};
 use crate::session_input::sanitize_paste_text;
 #[cfg(test)]
 use crate::session_input::{encode_bracketed_paste, looks_like_it_contains_a_path};
 use crate::state::{current_timestamp_ms, McpGrant, McpRole, McpScope};
 use crate::transcripts::{
-    format_transcript_markdown, load_transcript_settings, provider_label_for_command,
-    read_transcript_snapshot, resolve_provider_transcript, transcript_provider_for_command,
-    transcript_status_hint, TranscriptEntry,
+    provider_label_for_command, read_transcript_snapshot, resolve_provider_transcript,
+    transcript_provider_for_command, transcript_status_hint, TranscriptEntry,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -50,10 +50,22 @@ impl McpDomainMask {
             SESSIONS_TOOL => self.sessions,
             BROWSER_TOOL => self.browser,
             COMPUTER_TOOL => self.computer,
-            name if name.strip_prefix("browser_").is_some_and(is_browser_action) => self.browser,
             "start_session" | "delegate_task" | "delegate_batch" => self.sessions,
-            name if legacy_sessions_action(name).is_some() => self.sessions,
             _ => true,
+        }
+    }
+
+    /// The mask this process may actually serve: an embedding that retired
+    /// the legacy engines removes their domains whatever was registered.
+    fn effective(self) -> Self {
+        if crate::embedding::legacy_engines_retired() {
+            Self {
+                browser: false,
+                computer: false,
+                ..self
+            }
+        } else {
+            self
         }
     }
 }
@@ -70,7 +82,6 @@ const PROTOCOL_VERSION_FALLBACK: &str = "2025-06-18";
 const SERVER_NAME: &str = "unpeel";
 const KEY_DELAY_DEFAULT_MS: u64 = 60;
 const KEY_DELAY_MAX_MS: u64 = 1_000;
-const MAX_KEYS_PER_CALL: usize = 40;
 const START_MESSAGE_TIMEOUT_MS: u64 = 20_000;
 const START_MESSAGE_POLL_MS: u64 = 100;
 const READ_OUTPUT_DEFAULT_TAIL_BYTES: usize = 16 * 1024;
@@ -153,6 +164,7 @@ fn handle_message(message: &Value) -> Option<Value> {
 }
 
 fn handle_message_with_domains(message: &Value, domains: McpDomainMask) -> Option<Value> {
+    let domains = domains.effective();
     let method = message.get("method").and_then(Value::as_str)?;
     let id = match message.get("id") {
         Some(id) if !id.is_null() => id.clone(),
@@ -277,20 +289,13 @@ fn run_tool(name: &str, arguments: &Value) -> Result<String, String> {
             let action = required_action(arguments, computer_action_names())?;
             run_computer_action(&action, arguments)
         }
-        // Legacy per-capability tool names: stale clients from before the
-        // unified surface (a live session whose CLI reconnects its MCP server
-        // onto an updated binary) keep working, unadvertised.
-        name if name.strip_prefix("browser_").is_some_and(is_browser_action) => {
-            run_browser_action(name.strip_prefix("browser_").unwrap(), arguments)
-        }
+        // Removed per-capability and familial names: a stale client is told
+        // the canonical call; nothing runs.
+        name if removed_tool_replacement(name).is_some() => Err(removed_tool_message(name)),
         // Session creation is a user-only action in Unpeel — agents never spawn
         // sessions. These tools are no longer advertised; refuse them explicitly
         // in case a stale client still calls one.
         "start_session" | "delegate_task" | "delegate_batch" => Err(creation_disabled_message()),
-        name if legacy_sessions_action(name).is_some() => {
-            sessions_gate()?;
-            run_sessions_tool(name, arguments)
-        }
         _ => Err(format!(
             "Unknown tool: {name}. This server exposes one tool per domain ('sessions', \
 'browser') taking an 'action' parameter; call {{\"action\":\"help\"}} on a tool for docs."
@@ -364,21 +369,48 @@ fn is_browser_action(action: &str) -> bool {
     BROWSER_ACTIONS.contains(&action)
 }
 
-fn legacy_sessions_action(legacy_name: &str) -> Option<&'static str> {
+/// The action whose private handler key (and doc source) is `key`.
+fn sessions_action_for_key(key: &str) -> Option<&'static str> {
     SESSIONS_ACTIONS
         .iter()
-        .find(|(_, legacy)| *legacy == legacy_name)
+        .find(|(_, handler)| *handler == key)
         .map(|(action, _)| *action)
-        .or(match legacy_name {
-            // Decode-only compatibility for live sessions whose provider
-            // cached the pre-group tool names. They now operate on peers in
-            // the caller's effective group; no lineage is consulted.
-            "list_children" => Some("list_group"),
-            "wait_for_children" => Some("wait_for_group"),
-            "summarize_children" => Some("summarize_group"),
-            "report_to_parent" => Some("report_to_group"),
-            _ => None,
-        })
+}
+
+/// Canonical call for a removed public name: the pre-unified per-capability
+/// tools and the familial names that now mean peer-group operations. They
+/// are not callable; a stale client gets this hint and nothing runs.
+fn removed_tool_replacement(name: &str) -> Option<String> {
+    match name {
+        "list_children" => Some("sessions {\"action\":\"list_group\"}".into()),
+        "wait_for_children" => Some("sessions {\"action\":\"wait_for_group\"}".into()),
+        "summarize_children" => Some("sessions {\"action\":\"summarize_group\"}".into()),
+        "report_to_parent" => {
+            Some("sessions {\"action\":\"report_to_group\"} with an explicit peer target".into())
+        }
+        name if name.strip_prefix("browser_").is_some_and(is_browser_action) => Some(format!(
+            "browser {{\"action\":\"{}\"}}",
+            name.trim_start_matches("browser_")
+        )),
+        name => sessions_action_for_key(name)
+            .map(|action| format!("sessions {{\"action\":\"{action}\"}}")),
+    }
+}
+
+fn removed_tool_message(name: &str) -> String {
+    // An embedding that retired the legacy engines (Comet) has no `browser`
+    // tool to point at: its browsing lives in the app's own Browser panel.
+    if crate::embedding::legacy_engines_retired()
+        && name.strip_prefix("browser_").is_some_and(is_browser_action)
+    {
+        return format!(
+            "The '{name}' tool was removed, and this app has no browser tool. Use the app's integrated Browser panel instead."
+        );
+    }
+    match removed_tool_replacement(name) {
+        Some(canonical) => format!("The '{name}' tool was removed. Call {canonical} instead."),
+        None => format!("Unknown tool: {name}."),
+    }
 }
 
 fn required_action(arguments: &Value, valid: Vec<&'static str>) -> Result<String, String> {
@@ -395,20 +427,13 @@ fn run_sessions_action(action: &str, arguments: &Value) -> Result<String, String
     if action == "help" {
         return Ok(sessions_help(optional_trimmed_str(arguments, "help_for")));
     }
-    let normalized = match action {
-        "list_children" => "list_group",
-        "wait_for_children" => "wait_for_group",
-        "summarize_children" => "summarize_group",
-        "report_to_parent" => "report_to_group",
-        _ => action,
-    };
-    let Some((_, legacy)) = SESSIONS_ACTIONS
-        .iter()
-        .find(|(name, _)| *name == normalized)
-    else {
+    let Some((_, legacy)) = SESSIONS_ACTIONS.iter().find(|(name, _)| *name == action) else {
+        let hint = removed_tool_replacement(action)
+            .map(|canonical| format!(" '{action}' was removed; call {canonical}."))
+            .unwrap_or_default();
         return Err(format!(
-            "Unknown sessions action: {action}. Valid actions: {}. Call {{\"action\":\"help\"}} \
-for per-action docs.",
+            "Unknown sessions action: {action}.{hint} Valid actions: {}. Call \
+{{\"action\":\"help\"}} for per-action docs.",
             sessions_action_names().join(", ")
         ));
     };
@@ -519,10 +544,10 @@ fn run_sessions_tool(name: &str, arguments: &Value) -> Result<String, String> {
         "wait_for_status" => tool_wait_for_status(arguments),
         "send_text" => tool_send_text(arguments),
         "send_keys" => tool_send_keys(arguments),
-        "list_group" | "list_children" => tool_list_group(arguments),
-        "wait_for_group" | "wait_for_children" => tool_wait_for_group(arguments),
-        "summarize_group" | "summarize_children" => tool_summarize_group(arguments),
-        "report_to_group" | "report_to_parent" => tool_report_to_group(arguments),
+        "list_group" => tool_list_group(arguments),
+        "wait_for_group" => tool_wait_for_group(arguments),
+        "summarize_group" => tool_summarize_group(arguments),
+        "report_to_group" => tool_report_to_group(arguments),
         "add_to_gallery" => tool_add_to_gallery(arguments),
         "list_presets" => tool_list_presets(arguments),
         "create_worktree" => tool_create_worktree(arguments),
@@ -707,18 +732,32 @@ pub(crate) fn activity_status_for_manifest(
 /// user's UI focus, so waiting for the "wrong" label would hang until timeout.
 /// Treating them as one "the turn finished" target is what an agent driving a
 /// session actually means.
+#[cfg(test)]
 fn status_matches(current: &str, desired: &str) -> bool {
-    if current == desired {
-        return true;
+    use crate::session_control::{judge_wait, parse_wait_target, WaitVerdict, WaitVocabulary};
+    parse_wait_target(desired, WaitVocabulary::Peer).is_ok_and(|target| {
+        judge_wait(&target, peer_wait_observation(current)) == WaitVerdict::Matched
+    })
+}
+
+/// A peer observes only the derived activity label; it holds no task
+/// authority, so completion evidence never enters its wait.
+fn peer_wait_observation(current: &str) -> crate::session_control::WaitObservation<'_> {
+    crate::session_control::WaitObservation {
+        activity: current,
+        state: if current == "exited" {
+            "exited"
+        } else {
+            "running"
+        },
+        task_completed: false,
+        completed_at_start: false,
+        interrupted: false,
     }
-    matches!((current, desired), ("done", "idle") | ("idle", "done"))
 }
 
 fn valid_activity_status(status: &str) -> bool {
-    matches!(
-        status,
-        "starting" | "working" | "blocked" | "done" | "idle" | "exited" | "unknown"
-    )
+    crate::session_control::WaitVocabulary::PEER_STATUSES.contains(&status)
 }
 
 impl McpSecurity {
@@ -1018,7 +1057,7 @@ fn sessions_tool_definition() -> Value {
                 "session_id": { "type": "string", "description": "Target session id (most actions; from action 'list')" },
                 "text": { "type": "string", "description": "send_text: text to type; wait_for_text: substring to wait for" },
                 "submit": { "type": "boolean", "description": "send_text/report_to_group: press Enter after (default true)" },
-                "keys": { "type": "array", "items": { "type": "string" }, "description": "send_keys: keys in order, e.g. [\"down\",\"enter\"] (max 40)" },
+                "keys": { "type": "array", "items": { "type": "string" }, "description": format!("send_keys: named keys, printable single characters or text:<literal> in order (max {} entries; each literal max {} KiB UTF-8)", crate::session_control::MAX_KEYS_PER_CALL, crate::session_control::MAX_TEXT_KEY_BYTES / 1024) },
                 "delay_ms": { "type": "integer", "description": "send_keys: delay between keys in ms (default 60, max 1000)" },
                 "timeout_ms": { "type": "integer", "description": "wait_* actions: wait budget in ms (default 30000, max 120000)" },
                 "status": { "type": "string", "description": "wait_for_status: idle (turn finished; also matches done), working, blocked, starting, exited; report_to_group: update|done|blocked" },
@@ -1098,7 +1137,7 @@ fn sessions_help(help_for: Option<&str>) -> String {
         .into_iter()
         .filter_map(|definition| {
             let legacy = definition.get("name").and_then(Value::as_str)?;
-            let action = legacy_sessions_action(legacy)?;
+            let action = sessions_action_for_key(legacy)?;
             Some((action.to_string(), definition))
         })
         .collect();
@@ -1358,11 +1397,12 @@ pub(crate) fn legacy_sessions_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "send_keys",
-            "description": "Send individual keystrokes to another session, e.g. to \
+            "description": format!("Send individual keystrokes to another session, e.g. to \
         answer an interactive prompt: [\"down\", \"enter\"] selects the second option of \
         a menu. Supported keys: enter, tab, shift+tab, space, esc, up, down, left, right, \
-        home, end, pageup, pagedown, backspace, delete, ctrl+<letter>, or any single character. \
-        Same approval rule as send_text: cross-group targets ask the user first.",
+        home, end, pageup, pagedown, backspace, delete, ctrl+<letter>, any printable single character, \
+        or text:<literal> (up to {} KiB UTF-8 per literal). \
+        Same approval rule as send_text: cross-group targets ask the user first.", crate::session_control::MAX_TEXT_KEY_BYTES / 1024),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1370,7 +1410,11 @@ pub(crate) fn legacy_sessions_tool_definitions() -> Vec<Value> {
                     "keys": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Keys to send in order (max 40)",
+                        "description": format!(
+                            "Named keys, printable single characters or text:<literal> in order (max {} entries; each literal max {} KiB UTF-8)",
+                            crate::session_control::MAX_KEYS_PER_CALL,
+                            crate::session_control::MAX_TEXT_KEY_BYTES / 1024
+                        ),
                     },
                     "delay_ms": { "type": "integer", "description": "Delay between keys in milliseconds (default 60, max 1000)" },
                 },
@@ -1615,15 +1659,12 @@ fn tool_list_sessions(_args: &Value) -> Result<String, String> {
     let caller_group = caller
         .as_ref()
         .map(|manifest| effective_group_id(manifest, &known_projects));
-    let mut manifests = session_host::list_manifests();
     // Show only running sessions the caller is actually allowed to reach
     // (same project tree when its reach is 'project'). This is the same gate
     // require_session enforces on writes.
-    manifests.retain(|manifest| {
-        manifest.state == HostedSessionState::Running
-            && security.permits_manifest(caller.as_ref(), manifest)
-    });
-    manifests.sort_by_key(|entry| std::cmp::Reverse(entry.session.created_at));
+    let mut manifests =
+        crate::session_control::hosted_sessions(crate::session_control::SessionFilter::Running);
+    manifests.retain(|manifest| security.permits_manifest(caller.as_ref(), manifest));
 
     let sessions: Vec<Value> = manifests
         .iter()
@@ -1671,7 +1712,7 @@ fn tool_inspect_session(args: &Value) -> Result<String, String> {
     let session_id = required_str(args, "session_id")?;
     require_session(session_id, WriteAccess::Read)?;
     let manifest = load_manifest(session_id).ok_or_else(|| {
-        format!("Unknown session id '{session_id}'. Use list_sessions to find valid targets.")
+        format!("Unknown session id '{session_id}'. Call sessions with action 'list' to find valid targets.")
     })?;
     let session = &manifest.session;
     let provider = provider_label_for_command(&session.command);
@@ -1847,8 +1888,10 @@ fn tool_read_output(args: &Value) -> Result<String, String> {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
-    let chunk =
-        session_host::read_output_chunk(session_id, None, Some(tail_bytes), Some(tail_bytes))?;
+    let chunk = crate::session_control::read_output(
+        session_id,
+        crate::session_control::OutputCursor::Tail { max: tail_bytes },
+    )?;
     let text = String::from_utf8_lossy(&chunk.data);
     let text = if strip {
         strip_ansi(&text)
@@ -1866,44 +1909,21 @@ fn tool_read_output(args: &Value) -> Result<String, String> {
 fn tool_read_transcript(args: &Value) -> Result<String, String> {
     let session_id = required_str(args, "session_id")?;
     require_session(session_id, WriteAccess::Read)?;
-    // The app-wide transcript settings are the defaults; explicit tool args win.
-    let mut opts = load_transcript_settings();
-    if let Some(n) = args.get("entries").and_then(Value::as_u64) {
-        opts.max_entries = (n as usize).clamp(1, READ_TRANSCRIPT_MAX_ENTRIES);
-    } else if opts.max_entries == 0 || opts.max_entries > READ_TRANSCRIPT_MAX_ENTRIES {
-        // Whole-conversation (or oversized) defaults are capped for MCP reads,
-        // which are meant to be a compact tail rather than a full export.
-        opts.max_entries = READ_TRANSCRIPT_DEFAULT_ENTRIES;
-    }
-    if let Some(include_tools) = args.get("include_tools").and_then(Value::as_bool) {
-        opts.include_tools = include_tools;
-    }
-    let entries = opts.max_entries;
-    let collect_tools = opts.include_tools
-        || opts.include_reasoning
-        || opts.include_file_changes
-        || opts.include_plan_updates;
-    let manifest = load_manifest(session_id).ok_or_else(|| {
-        format!("Unknown session id '{session_id}'. Use list_sessions to find valid targets.")
-    })?;
-    let snapshot = read_transcript_snapshot(&manifest, entries, collect_tools, None)?;
-    if snapshot.entries.is_empty() {
-        return Err(format!(
-            "Found {} transcript at {}, but no readable user/assistant entries were found.",
-            snapshot.provider, snapshot.path
-        ));
-    }
-
-    let body = format_transcript_markdown(&snapshot, &opts);
-    Ok(format!(
-        "transcript provider={} source={} session={} path={}\n{}\n{}",
-        snapshot.provider,
-        snapshot.source,
-        snapshot.provider_session_id.as_deref().unwrap_or("unknown"),
-        snapshot.path,
-        "-".repeat(40),
-        body.trim_end()
-    ))
+    // The app-wide transcript settings are the defaults; explicit tool args
+    // win. Whole-conversation (or oversized) defaults are capped: a peer
+    // read is a compact tail, not a full export.
+    crate::session_control::read_transcript(
+        session_id,
+        crate::session_control::TranscriptProfile::Compact {
+            entries: args
+                .get("entries")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+            max_entries: READ_TRANSCRIPT_MAX_ENTRIES,
+            default_entries: READ_TRANSCRIPT_DEFAULT_ENTRIES,
+            include_tools: args.get("include_tools").and_then(Value::as_bool),
+        },
+    )
 }
 
 fn hosted_session_state_label(state: HostedSessionState) -> &'static str {
@@ -2101,11 +2121,10 @@ fn tool_wait_for_text(args: &Value) -> Result<String, String> {
 fn tool_wait_for_status(args: &Value) -> Result<String, String> {
     let session_id = required_str(args, "session_id")?;
     let desired = required_str(args, "status")?;
-    if !valid_activity_status(desired) {
-        return Err(format!(
-            "Unsupported status {desired:?}; expected one of starting, working, blocked, done, idle, exited, unknown"
-        ));
-    }
+    let target = crate::session_control::parse_wait_target(
+        desired,
+        crate::session_control::WaitVocabulary::Peer,
+    )?;
     require_session(session_id, WriteAccess::Read)?;
     let timeout_ms = args
         .get("timeout_ms")
@@ -2120,7 +2139,9 @@ fn tool_wait_for_status(args: &Value) -> Result<String, String> {
         })?;
         let activity = load_activity_state();
         let current = activity_status_for_manifest(&activity, &manifest);
-        if status_matches(&current, desired) {
+        if crate::session_control::judge_wait(&target, peer_wait_observation(&current))
+            == crate::session_control::WaitVerdict::Matched
+        {
             let entry = activity_entry_for(&activity, session_id);
             return Ok(format!(
                 "Session {session_id} reached status {current:?} after {}ms (unread={}, completed={}).",
@@ -2180,28 +2201,21 @@ fn tool_send_keys(args: &Value) -> Result<String, String> {
         .get("keys")
         .and_then(Value::as_array)
         .ok_or("send_keys requires a 'keys' array")?;
-    if keys.is_empty() {
-        return Err("send_keys requires at least one key".into());
-    }
-    if keys.len() > MAX_KEYS_PER_CALL {
-        return Err(format!(
-            "send_keys accepts at most {MAX_KEYS_PER_CALL} keys per call"
-        ));
-    }
     let delay_ms = args
         .get("delay_ms")
         .and_then(Value::as_u64)
         .unwrap_or(KEY_DELAY_DEFAULT_MS)
         .min(KEY_DELAY_MAX_MS);
 
-    let mut sequences = Vec::with_capacity(keys.len());
-    for key in keys {
-        let key = key
-            .as_str()
-            .ok_or("send_keys 'keys' entries must be strings")?;
-        let sequence = key_sequence(key).ok_or_else(|| format!("Unsupported key: {key:?}"))?;
-        sequences.push(sequence);
-    }
+    let keys = keys
+        .iter()
+        .map(|key| {
+            key.as_str()
+                .ok_or("send_keys 'keys' entries must be strings")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Shared vocabulary and bounds with the controller; all or nothing.
+    let sequences = crate::session_control::encode_keys(&keys)?;
 
     require_session(session_id, WriteAccess::Write)?;
     for (index, sequence) in sequences.iter().enumerate() {
@@ -2417,7 +2431,7 @@ fn tool_close_session(args: &Value) -> Result<String, String> {
             .into());
     }
     let manifest = load_manifest(session_id).ok_or_else(|| {
-        format!("Unknown session id '{session_id}'. Use list_sessions to find valid targets.")
+        format!("Unknown session id '{session_id}'. Call sessions with action 'list' to find valid targets.")
     })?;
     let security = load_security();
     let caller = caller_manifest();
@@ -2762,7 +2776,7 @@ enum WriteAccess {
 
 fn require_session(session_id: &str, access: WriteAccess) -> Result<(), String> {
     let manifest = load_manifest(session_id).ok_or_else(|| {
-        format!("Unknown session id '{session_id}'. Use list_sessions to find valid targets.")
+        format!("Unknown session id '{session_id}'. Call sessions with action 'list' to find valid targets.")
     })?;
     let security = load_security();
     let caller = caller_manifest();
@@ -2777,10 +2791,8 @@ fn require_session(session_id: &str, access: WriteAccess) -> Result<(), String> 
         }
         // Checked before the approval path so a dead target never shows the
         // user an approval dialog for input that could not be delivered.
-        if manifest.state != HostedSessionState::Running {
-            return Err(format!(
-                "Session '{session_id}' has exited and cannot receive input."
-            ));
+        if let Err(error) = crate::session_control::live_target(session_id) {
+            return Err(error.message(session_id));
         }
         // Sessions in the same effective sidebar group may always coordinate.
         // Anything else consults the app-wide policy: ask the user (remembering
@@ -2840,19 +2852,11 @@ session; ask the user if they want to approve future writes (or change Settings 
 }
 
 fn load_manifest(session_id: &str) -> Option<HostedSessionManifest> {
-    if session_id.is_empty()
-        || session_id.contains('/')
-        || session_id.contains("..")
-        || session_id.contains('\\')
-    {
-        return None;
-    }
-    let raw = std::fs::read(session_host::manifest_path(session_id)).ok()?;
-    serde_json::from_slice(&raw).ok()
+    crate::session_control::read_target(session_id).ok()
 }
 
 fn write_to_session(session_id: &str, data: &str) -> Result<(), String> {
-    crate::session_ops::write_session_input(session_id, data.to_string(), None, None, None)
+    crate::session_control::send_keys(session_id, data, InputAuthority::Peer)
 }
 
 /// Single delivery choke point for typing an inter-session message into a
@@ -2864,7 +2868,7 @@ fn write_to_session(session_id: &str, data: &str) -> Result<(), String> {
 /// to `sanitized` before it reaches the paste. Callers pass already-sanitized
 /// text (`sanitize_paste_text`) and must have passed the write gate.
 fn deliver_text_to_terminal(session_id: &str, sanitized: &str, submit: bool) -> Result<(), String> {
-    crate::session_input::deliver_sanitized_text(session_id, sanitized, submit)
+    crate::session_control::send_text(session_id, sanitized, submit, InputAuthority::Peer)
 }
 
 fn send_initial_text_to_session(session_id: &str, text: &str, submit: bool) -> Result<(), String> {
@@ -2912,106 +2916,6 @@ fn optional_trimmed_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-fn key_sequence(key: &str) -> Option<String> {
-    let normalized = key.trim().to_ascii_lowercase();
-    let sequence = match normalized.as_str() {
-        "enter" | "return" => "\r",
-        "tab" => "\t",
-        "shift+tab" | "backtab" => "\x1b[Z",
-        "space" => " ",
-        "esc" | "escape" => "\x1b",
-        "up" => "\x1b[A",
-        "down" => "\x1b[B",
-        "right" => "\x1b[C",
-        "left" => "\x1b[D",
-        "home" => "\x1b[H",
-        "end" => "\x1b[F",
-        "pageup" | "page_up" => "\x1b[5~",
-        "pagedown" | "page_down" => "\x1b[6~",
-        "backspace" => "\x7f",
-        "delete" | "del" => "\x1b[3~",
-        _ => {
-            if let Some(rest) = normalized.strip_prefix("ctrl+") {
-                let mut chars = rest.chars();
-                if let (Some(c), None) = (chars.next(), chars.next()) {
-                    if c.is_ascii_lowercase() {
-                        return Some(((c as u8 - b'a' + 1) as char).to_string());
-                    }
-                }
-                return None;
-            }
-            let mut chars = key.chars();
-            if let (Some(c), None) = (chars.next(), chars.next()) {
-                if !c.is_control() {
-                    return Some(c.to_string());
-                }
-            }
-            return None;
-        }
-    };
-    Some(sequence.to_string())
-}
-
-pub(crate) fn strip_ansi(text: &str) -> String {
-    enum State {
-        Ground,
-        Escape,
-        Csi,
-        Osc,
-        OscEscape,
-    }
-
-    let mut state = State::Ground;
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match state {
-            State::Ground => match c {
-                '\u{1b}' => state = State::Escape,
-                '\r' => out.push('\n'),
-                c if !c.is_control() || matches!(c, '\n' | '\t') => out.push(c),
-                _ => {}
-            },
-            State::Escape => match c {
-                '[' => state = State::Csi,
-                // DCS, APC, SOS, PM are ST-terminated strings like OSC
-                // (e.g. kitty-graphics probes: `ESC _ G ... ESC \`).
-                ']' | 'P' | '_' | 'X' | '^' => state = State::Osc,
-                _ => state = State::Ground,
-            },
-            State::Csi => {
-                if ('\u{40}'..='\u{7e}').contains(&c) {
-                    state = State::Ground;
-                }
-            }
-            State::Osc => match c {
-                '\u{07}' => state = State::Ground,
-                '\u{1b}' => state = State::OscEscape,
-                _ => {}
-            },
-            State::OscEscape => {
-                state = if c == '\\' { State::Ground } else { State::Osc };
-            }
-        }
-    }
-
-    // TUI repaints leave long runs of blank lines once escapes are stripped.
-    let mut collapsed = String::with_capacity(out.len());
-    let mut blank_run = 0usize;
-    for line in out.lines() {
-        if line.trim().is_empty() {
-            blank_run += 1;
-            if blank_run > 2 {
-                continue;
-            }
-        } else {
-            blank_run = 0;
-        }
-        collapsed.push_str(line);
-        collapsed.push('\n');
-    }
-    collapsed
 }
 
 fn trace(message: &str) {
@@ -3285,7 +3189,7 @@ mod tests {
         // Every advertised action resolves to a handler or help.
         for (action, legacy) in SESSIONS_ACTIONS {
             assert!(
-                legacy_sessions_action(legacy) == Some(*action),
+                sessions_action_for_key(legacy) == Some(*action),
                 "round-trip failed for {action}"
             );
         }
@@ -3352,23 +3256,123 @@ mod tests {
         assert!(missing.contains("No such browser action"));
     }
 
+    /// F5: removed public names are not callable, as tools or as `sessions`
+    /// actions. They fail before any handler (so even a hosted test process
+    /// cannot list, read or deliver anything) and name the canonical call.
     #[test]
-    fn legacy_tool_names_still_dispatch() {
-        // Stale clients (sessions launched before the unified surface) call
-        // the old names; every legacy name must still resolve to a handler.
-        // No tool is invoked here: the test environment may itself be a
-        // hosted Unpeel session, so a live call could really list sessions.
-        for definition in legacy_sessions_tool_definitions() {
-            let legacy = definition["name"].as_str().unwrap();
+    fn removed_aliases_are_rejected_without_side_effects() {
+        let removed = [
+            ("list_children", "list_group"),
+            ("wait_for_children", "wait_for_group"),
+            ("summarize_children", "summarize_group"),
+            ("report_to_parent", "report_to_group"),
+            ("list_sessions", "\"list\""),
+            ("read_transcript", "\"read_transcript\""),
+            ("inspect_session", "\"inspect\""),
+            ("send_text", "\"send_text\""),
+            ("close_session", "\"close\""),
+            ("browser_open", "browser {\"action\":\"open\"}"),
+        ];
+        for (name, canonical) in removed {
+            // A send/report payload that would have delivered text if routed.
+            let arguments = json!({ "session_id": "peer", "text": "x", "summary": "x" });
+            for domains in [
+                McpDomainMask::ALL,
+                McpDomainMask {
+                    browser: false,
+                    computer: false,
+                    sessions: true,
+                },
+            ] {
+                let result = tools_call_with_domains(
+                    &json!({ "name": name, "arguments": arguments }),
+                    domains,
+                )
+                .expect("an MCP tool result");
+                assert_eq!(result["isError"], true, "{name}");
+                let text = result["content"][0]["text"].as_str().unwrap();
+                assert!(
+                    text.contains("was removed") || text.contains("not enabled"),
+                    "{name}: {text}"
+                );
+                if text.contains("was removed") {
+                    assert!(text.contains(canonical), "{name}: {text}");
+                }
+            }
+        }
+        for action in [
+            "list_children",
+            "wait_for_children",
+            "summarize_children",
+            "report_to_parent",
+        ] {
+            let err = run_tool("sessions", &json!({ "action": action, "summary": "x" }))
+                .expect_err("familial action is removed");
             assert!(
-                legacy_sessions_action(legacy).is_some(),
-                "legacy tool {legacy} lost its dispatch mapping"
+                err.contains("Unknown sessions action") && err.contains("was removed"),
+                "{err}"
             );
         }
-
         let err = run_tool("nonsense_tool", &json!({})).expect_err("unknown tool must fail");
         assert!(err.contains("Unknown tool"));
         assert!(err.contains("'sessions'"));
+    }
+
+    /// F1/F3: an embedding that retired the legacy engines (Comet) neither
+    /// advertises nor runs `browser`/`computer` — not even `help` or
+    /// `context` — while standalone keeps both.
+    #[test]
+    fn retired_embedding_has_no_browser_or_computer_surface() {
+        let names = |tools: Vec<Value>| -> Vec<String> {
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Explicit standalone caller: this assertion must not inherit the
+        // Worker manifest of the process running the test binary.
+        crate::embedding::set_retired_for_test(Some(false));
+        let standalone = names(tool_definitions_for_manifest(
+            None,
+            McpDomainMask::ALL.effective(),
+        ));
+        assert!(standalone.contains(&"browser".to_string()));
+
+        crate::embedding::set_retired_for_test(Some(true));
+        assert_eq!(
+            names(tool_definitions_for_manifest(
+                None,
+                McpDomainMask::ALL.effective()
+            )),
+            vec!["sessions".to_string()]
+        );
+        for (tool, action) in [
+            ("browser", "help"),
+            ("browser", "context"),
+            ("browser", "open"),
+            ("computer", "help"),
+            ("computer", "context"),
+            ("computer", "launch"),
+        ] {
+            let call = json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": tool, "arguments": { "action": action, "url": "https://example.test" } }
+            });
+            let result = &handle_message(&call).unwrap()["result"];
+            assert_eq!(result["isError"], true, "{tool}.{action}");
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not enabled"));
+        }
+        let mut manifest = test_manifest("s", "p", Path::new("/tmp/p"), "claude");
+        manifest.browser_mcp_enabled = Some(true);
+        manifest.computer_mcp_enabled = Some(true);
+        assert!(!manifest.browser_mcp_enabled() && !manifest.computer_mcp_enabled());
+        assert!(manifest.sessions_mcp_enabled() || manifest.mcp_enabled.is_none());
+        crate::embedding::set_retired_for_test(Some(false));
+        assert!(manifest.browser_mcp_enabled() && manifest.computer_mcp_enabled());
+        crate::embedding::set_retired_for_test(None);
     }
 
     #[test]
@@ -3452,21 +3456,6 @@ mod tests {
         }))
         .expect("tools/call must produce a response");
         assert_eq!(response["result"]["isError"], true);
-    }
-
-    #[test]
-    fn key_sequences_cover_navigation_and_control_keys() {
-        assert_eq!(key_sequence("enter").as_deref(), Some("\r"));
-        assert_eq!(key_sequence("down").as_deref(), Some("\x1b[B"));
-        assert_eq!(key_sequence("up").as_deref(), Some("\x1b[A"));
-        assert_eq!(key_sequence("shift+tab").as_deref(), Some("\x1b[Z"));
-        assert_eq!(key_sequence("ctrl+c").as_deref(), Some("\x03"));
-        assert_eq!(key_sequence("ctrl+r").as_deref(), Some("\x12"));
-        assert_eq!(key_sequence("esc").as_deref(), Some("\x1b"));
-        assert_eq!(key_sequence("1").as_deref(), Some("1"));
-        assert_eq!(key_sequence("Y").as_deref(), Some("Y"));
-        assert_eq!(key_sequence("ctrl+shift+x"), None);
-        assert_eq!(key_sequence("madeup"), None);
     }
 
     #[test]
@@ -3783,5 +3772,31 @@ mod tests {
             "status": "done",
         }));
         assert!(result.unwrap_err().contains("Unknown session id"));
+    }
+
+    #[test]
+    fn peer_reads_refuse_hostile_targets_before_any_shared_read() {
+        for id in ["../other", "a/b", "a\\b", "definitely-not-a-session"] {
+            let args = json!({ "session_id": id });
+            for result in [
+                tool_read_output(&args),
+                tool_read_transcript(&args),
+                tool_inspect_session(&args),
+            ] {
+                assert!(result.unwrap_err().contains("Unknown session id"), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn peers_cannot_wait_for_task_completion() {
+        // Task completion is controller authority: the peer vocabulary has no
+        // `completed`, and the refusal comes before the target is resolved.
+        let refused = tool_wait_for_status(&json!({
+            "session_id": "definitely-not-a-session",
+            "status": "completed",
+        }))
+        .unwrap_err();
+        assert!(refused.contains("Unsupported status"), "{refused}");
     }
 }

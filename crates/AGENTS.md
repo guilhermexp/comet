@@ -4,7 +4,7 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `preview` é consumida pela engine para HTTP/RTC; `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. A engine também usa `workers-unpeel` para o serviço comum de worktree, a atividade local e a autorização de Source Control de checkouts Worker pelo link com o projeto (Space). `workers-unpeel` fala com a engine só pelo RPC (`zeron-proto`/`zeron-rpc`), para ler e criar projetos no registro único. `voice` (ditado local, modelo Parakeet opcional) é consumida só pela `ui`, sem RPC nem sync. `sessions-mcp` é fronteira lateral de stdio: depende só de `proto` e `rpc`, e o binário `zeron` a lança; a engine não linka essa crate. `computer-use-mcp` é a mesma forma de fronteira, sem dependência de crate do workspace: o binário `zeron` a lança como proxy para o Computer Use do ChatGPT.app. Codex realtime adiciona `audio` (PCM, resampling e AEC nativos opcionais), `voice-media` (helper standalone local, independente da UI), `voice-session` (estado e transporte de cliente sobre RPC), `orb` (geometria/animação pura) e `veil` (fade de texto puro). A engine consome voice-media; desktop e mobile compartilham voice-session/orb/veil. Nada abaixo depende de nada acima.
+As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `preview` é consumida pela engine para HTTP/RTC; `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. A engine também usa `workers-unpeel` para o serviço comum de worktree, a atividade local e a autorização de Source Control de checkouts Worker pelo link com o projeto (Space). `workers-unpeel` fala com a engine só pelo RPC (`zeron-proto`/`zeron-rpc`), para ler e criar projetos no registro único. `voice` (ditado local, modelo Parakeet opcional) é consumida só pela `ui`, sem RPC nem sync. `computer-use-mcp` é a mesma forma de fronteira, sem dependência de crate do workspace: o binário `zeron` a lança como proxy para o Computer Use do ChatGPT.app. Codex realtime adiciona `audio` (PCM, resampling e AEC nativos opcionais), `voice-media` (helper standalone local, independente da UI), `voice-session` (estado e transporte de cliente sobre RPC), `orb` (geometria/animação pura) e `veil` (fade de texto puro). A engine consome voice-media; desktop e mobile compartilham voice-session/orb/veil. Nada abaixo depende de nada acima.
 
 ## Ownership
 
@@ -14,6 +14,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.
 - `edition = "2024"` em todas.
+- `mcp/src/tools.rs`: a consulta existente `list_chats.parent` descobre Chats criados por `parent_chat_id` **ou** `origin_chat_id`; summaries expõem `parentChatId` e `originChatId` separadamente. Isso não muda `Chat::is_top_level`, autoridade nem a linhagem gravada. Regressão de consumidor com RPC em memória: `creator_query_lists_both_lineages_without_reparenting`.
 - `zeron-client` mantém o recibo durável `viewer-delivery` separado do outbox de Chat: descoberta reabre Chats sem viewport, refaz wake com credenciais atuais e só conclui a versão depois do ACK das rows e uma wake final. `hostDevice` é hint de roteamento, nunca grant. Working exige posse do host/output; envio ainda não adotado permanece Sending/Queued.
 - Runtime async é **tokio** em todo lugar; a UI faz a ponte por `gpui_tokio` (`Tokio::spawn` vira `Task` do gpui). A UI nunca bloqueia na engine.
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
@@ -43,6 +44,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
+| `crates/mcp/src/tools.rs` (creator query e summaries) | unit — tool dispatcher + RPC em memória, sem engine/provider | `cargo test -p zeron-mcp --lib creator_query_lists_both_lineages_without_reparenting` |
 | `crates/*/src/**` (lógica pura) | unit (`mod tests` co-located) | `cargo test -p <crate>` |
 | `crates/{engine,harness,rpc,workers-unpeel,doc,sync,visual}/tests/**` | integration | `cargo test -p <crate>` |
 | `crates/ui/src/**` (estado, derivações) | unit | `cargo test -p zeron-ui` |
@@ -61,7 +63,6 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-rpc` | [`rpc/AGENTS.md`](rpc/AGENTS.md) | UiRpc/ControlRpc tipados sobre WS + transporte in-memory |
 | `zeron-syntax` | [`syntax/AGENTS.md`](syntax/AGENTS.md) | Tokenizer tree-sitter paint-only compartilhado pelas surfaces |
 | `zeron-theme` | [`theme/AGENTS.md`](theme/AGENTS.md) | Modelo source-neutral, catálogo e importação de temas |
-| `zeron-sessions-mcp` | [`sessions-mcp/AGENTS.md`](sessions-mcp/AGENTS.md) | MCP `comet-sessions` (`help`, `list_spaces`, `create`) |
 | `zeron-computer-use-mcp` | [`computer-use-mcp/AGENTS.md`](computer-use-mcp/AGENTS.md) | MCP `comet-computer-use` (`computer_use`, `computer_use_reset`), proxy do `cua_repl` |
 | `zeron-workers-unpeel` | [`workers-unpeel/AGENTS.md`](workers-unpeel/AGENTS.md) | Fronteira tipada sobre `third_party/unpeel`: projetos, worktrees, sessões de Worker, controller MCP, notificações ao parent; leitores de Settings → Projects (atividade e tickets por projeto) compartilhados com o controller |
 | `zeron-preview` | [`preview/AGENTS.md`](preview/AGENTS.md) | Catálogo, proxy HTTP/WebSocket e pairing RTC autenticado |

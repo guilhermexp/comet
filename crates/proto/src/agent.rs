@@ -335,7 +335,7 @@ pub struct RunRequest {
     /// engine stamps this field; UI and remote callers do not choose it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workers_parent_chat_id: Option<String>,
-    /// Engine-stamped grant for the `comet-sessions` MCP. Clients cannot
+    /// Engine-stamped grant for the root-only `zeron` chat MCP. Clients cannot
     /// choose it: dispatch overwrites whatever arrived on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<SessionsGrant>,
@@ -469,8 +469,8 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Authority the engine stamps onto an orchestrator run so `comet-sessions`
-/// can open native chats only on that engine, and only for that parent chat.
+/// Authority the engine stamps onto an orchestrator run so its `zeron` chat
+/// MCP can open native chats only on that engine, and only for that parent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionsGrant {

@@ -90,7 +90,7 @@ struct ProviderSpec {
     manual_command: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexStandaloneInstall {
     root: PathBuf,
     target: String,
@@ -123,6 +123,7 @@ impl HomebrewPackage {
     }
 }
 
+#[derive(PartialEq, Eq)]
 enum UpdatePlan {
     Command {
         executable: PathBuf,
@@ -534,6 +535,9 @@ struct ActiveUpdate {
     cancel: CancellationToken,
     automatic: bool,
     previous_phase: HarnessUpdatePhase,
+    /// The CLI changed on disk while this update waited for idle: re-read
+    /// the installed version and release the wait if it is already current.
+    external_change: Arc<tokio::sync::Notify>,
 }
 
 /// The compatibility policy in force: the last published one (fetched or
@@ -559,6 +563,26 @@ impl CompatibilityState {
     }
 }
 
+/// Authority retained from an actual package installation attempt. It is
+/// device-local coordinator state, never inferred from a later Retry alias.
+#[derive(Clone)]
+struct PackageRepairProvenance {
+    binary: BinaryFingerprint,
+    owner: ownership::PackageOwner,
+    package: &'static str,
+    tag: String,
+    latest_version: Option<String>,
+}
+
+impl PackageRepairProvenance {
+    fn matches(&self, plan: &UpdatePlan, binary: &BinaryFingerprint, latest: Option<&str>) -> bool {
+        self.binary == *binary
+            && self.latest_version.as_deref() == latest
+            && matches!(plan, UpdatePlan::Package { owner, package, tag, .. }
+                if owner == &self.owner && package == &self.package && tag == &self.tag)
+    }
+}
+
 struct Inner {
     registry: Arc<HarnessRegistry>,
     order: Vec<HarnessId>,
@@ -576,6 +600,7 @@ struct Inner {
     /// [`BinaryFingerprint`]): a later difference means the CLI changed
     /// outside zeron, so its status is stale.
     checked_binaries: Mutex<HashMap<HarnessId, BinaryFingerprint>>,
+    package_repairs: Mutex<HashMap<HarnessId, PackageRepairProvenance>>,
     compatibility: Mutex<CompatibilityState>,
     /// One policy fetch at a time: concurrent checks share it.
     compatibility_refresh: tokio::sync::Mutex<()>,
@@ -601,11 +626,56 @@ struct UpdateIntentGuard {
     coordinator: HarnessUpdateCoordinator,
     harness: HarnessId,
     complete: bool,
+    recheck_after_cleanup: bool,
 }
 
 impl UpdateIntentGuard {
+    /// Publish the observed installation without lending it another family's
+    /// candidate. `candidate` is the original apply snapshot, never the mutable
+    /// displayed version. Invalidation survives later observations and cancel.
+    fn observe(
+        &mut self,
+        candidate: &HarnessUpdateStatus,
+        installed: &str,
+        probed: BinaryFingerprint,
+    ) -> bool {
+        self.recheck_after_cleanup |=
+            ownership::npm_package(self.harness, candidate.installed_version.as_deref())
+                != ownership::npm_package(self.harness, Some(installed));
+        lock(&self.coordinator.inner.checked_binaries).insert(self.harness, probed);
+        self.coordinator.mutate(self.harness, |status| {
+            status.installed_version = Some(installed.to_owned());
+            if self.recheck_after_cleanup {
+                status.latest_version = None;
+                status.can_apply = false;
+            }
+        });
+        self.recheck_after_cleanup
+    }
+
     fn finish(&mut self) {
         self.complete = true;
+        if !std::mem::take(&mut self.recheck_after_cleanup) {
+            return;
+        }
+        lock(&self.coordinator.inner.package_repairs).remove(&self.harness);
+        let coordinator = self.coordinator.clone();
+        let harness = self.harness;
+        // Every caller has cleared the pending intent before finishing. The
+        // existing check still owns normal operation/execution admission.
+        tokio::spawn(async move {
+            if coordinator.inner.shutdown.is_cancelled()
+                || !coordinator.inner.registry.enabled_set().contains(&harness)
+                || coordinator.policy(harness) == HarnessUpdatePolicy::Off
+            {
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = coordinator.inner.shutdown.cancelled() => {},
+                _ = coordinator.check_one(harness) => {},
+            }
+        });
     }
 }
 
@@ -639,6 +709,7 @@ impl Drop for UpdateIntentGuard {
                 };
             }
         });
+        self.finish();
     }
 }
 
@@ -702,6 +773,7 @@ impl HarnessUpdateCoordinator {
                 operation_gates: Mutex::new(HashMap::new()),
                 owner_gates: Mutex::new(HashMap::new()),
                 checked_binaries: Mutex::new(HashMap::new()),
+                package_repairs: Mutex::new(HashMap::new()),
                 compatibility: Mutex::new(CompatibilityState {
                     published: std::fs::read_to_string(data_dir.join(COMPATIBILITY_CACHE))
                         .ok()
@@ -794,36 +866,55 @@ impl HarnessUpdateCoordinator {
     pub async fn recheck_changed_binaries(&self) {
         let coordinator = self.clone();
         // Resolving an executable can probe candidates' versions (blocking).
-        let changed = tokio::task::spawn_blocking(move || coordinator.changed_binaries())
-            .await
-            .unwrap_or_default();
+        let (changed, waiting) =
+            tokio::task::spawn_blocking(move || coordinator.changed_binaries())
+                .await
+                .unwrap_or_default();
+        // A pending update still waiting for idle owns its row: it re-reads
+        // the installed version itself (and never steals an active run's
+        // lease), instead of a check overwriting WaitingForIdle.
+        for harness in waiting {
+            tracing::info!(?harness, "agent CLI changed on disk while its update waits");
+            if let Some(update) = lock(&self.inner.cancellations).get(&harness) {
+                update.external_change.notify_one();
+            }
+        }
         for harness in changed {
             tracing::info!(?harness, "agent CLI changed on disk; checking for updates");
             let _ = self.check_one(harness).await;
         }
     }
 
-    fn changed_binaries(&self) -> Vec<HarnessId> {
+    /// Changed binaries to check, and changed binaries whose update is still
+    /// waiting for idle (reconciled by that update, not by a check).
+    fn changed_binaries(&self) -> (Vec<HarnessId>, Vec<HarnessId>) {
         let enabled = self.inner.registry.enabled_set();
-        enabled
+        let (waiting, idle): (Vec<_>, Vec<_>) = enabled
             .into_iter()
             .filter(|harness| {
                 self.inner.order.contains(harness)
                     && self.policy(*harness) != HarnessUpdatePolicy::Off
-                    && !self.is_mutating(*harness)
                     && self.status(*harness).phase != HarnessUpdatePhase::Checking
             })
             .filter(|harness| {
-                let Some(last) = lock(&self.inner.checked_binaries).get(harness).cloned() else {
-                    // Never checked: the periodic check owns it.
-                    return false;
-                };
-                self.executable(*harness)
-                    .ok()
-                    .and_then(|executable| BinaryFingerprint::of(&executable))
-                    .is_some_and(|now| now != last)
+                !self.is_mutating(*harness)
+                    || self.status(*harness).phase == HarnessUpdatePhase::WaitingForIdle
             })
-            .collect()
+            .partition(|harness| self.is_mutating(*harness));
+        let changed = |harness: &HarnessId| {
+            let Some(last) = lock(&self.inner.checked_binaries).get(harness).cloned() else {
+                // Never checked: the periodic check owns it.
+                return false;
+            };
+            self.executable(*harness)
+                .ok()
+                .and_then(|executable| BinaryFingerprint::of(&executable))
+                .is_some_and(|now| now != last)
+        };
+        (
+            idle.into_iter().filter(changed).collect(),
+            waiting.into_iter().filter(changed).collect(),
+        )
     }
 
     pub fn watch(&self) -> watch::Receiver<Vec<HarnessUpdateStatus>> {
@@ -1049,6 +1140,7 @@ impl HarnessUpdateCoordinator {
         if self.settle_if_unmonitored(harness) {
             return Ok(());
         }
+        lock(&self.inner.package_repairs).remove(&harness);
         self.mutate(harness, |status| {
             status.phase = HarnessUpdatePhase::Checking;
             status.progress = None;
@@ -1433,34 +1525,24 @@ impl HarnessUpdateCoordinator {
         {
             return Err(held.message);
         }
-        let executable = self.executable(harness)?;
-        // The check judged one install; a different one now (reinstalled
-        // elsewhere, PATH changed) must be checked before anything runs.
-        let checked = lock(&self.inner.checked_binaries)
-            .get(&harness)
-            .map(|fingerprint| fingerprint.path.clone());
-        if let Some(checked) = checked
-            && std::fs::canonicalize(&executable).ok().as_ref() != Some(&checked)
+        // Checked here so a refused install never waits; resolved again once
+        // the update owns the CLI, since it can be replaced while waiting.
+        self.resolve_update_plan(harness, &current)?;
+        // The owner belongs to the failed attempt, not whatever alias Retry
+        // resolves today. Capture that retained record before any waiting.
+        let repair_provenance = if retry
+            && current.error.as_ref().is_some_and(|error| error.retryable)
+            && current.installed_version.is_some()
+            && current.latest_version.is_some()
         {
-            let coordinator = self.clone();
-            tokio::spawn(async move {
-                let _ = coordinator.check_one(harness).await;
-            });
-            return Err(
-                "The CLI's installation changed since it was checked; checking again".into(),
-            );
-        }
-        let plan = update_plan(
-            harness,
-            &executable,
-            PlanContext {
-                installed: current.installed_version.as_deref(),
-                channel: current.channel.as_deref(),
-            },
-        )?;
+            lock(&self.inner.package_repairs).get(&harness).cloned()
+        } else {
+            None
+        };
         // A request queued behind a check must inherit shutdown even if it
         // reaches this point after shutdown's cancellation-map snapshot.
         let cancel = self.inner.shutdown.child_token();
+        let external_change = Arc::new(tokio::sync::Notify::new());
         {
             let mut cancellations = lock(&self.inner.cancellations);
             if cancellations.contains_key(&harness) {
@@ -1475,6 +1557,7 @@ impl HarnessUpdateCoordinator {
                     cancel: cancel.clone(),
                     automatic,
                     previous_phase: current.phase,
+                    external_change: external_change.clone(),
                 },
             );
         }
@@ -1483,19 +1566,101 @@ impl HarnessUpdateCoordinator {
             coordinator: self.clone(),
             harness,
             complete: false,
+            recheck_after_cleanup: false,
         };
         self.mutate(harness, |status| {
             status.phase = HarnessUpdatePhase::WaitingForIdle;
             status.progress = None;
             status.error = None;
         });
-        let lease = tokio::select! {
-            _ = cancel.cancelled() => {
-                self.finish_cancelled(harness);
-                intent.finish();
-                return Err("update cancelled".into());
+        // Waiting never interrupts active work. An installation made outside
+        // zeron meanwhile (the watcher notices the binary change) releases
+        // the wait instead: the queued lease request is simply dropped, so
+        // no run is stopped and exactly one outcome wins the race.
+        let mut queued_lease = std::pin::pin!(self.inner.registry.update_lease(harness));
+        let lease = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.finish_cancelled(harness);
+                    intent.finish();
+                    return Err("update cancelled".into());
+                }
+                lease = &mut queued_lease => break lease,
+                _ = external_change.notified() => {
+                    let Some(latest) = current.latest_version.as_deref() else {
+                        continue;
+                    };
+                    // Probe the installation the registry resolves now, as the
+                    // watcher did: an external update may live at another path
+                    // (versioned install, PATH or symlink retarget) while the
+                    // one captured above is stale or gone. Nothing else is
+                    // repointed; the active runtime keeps its lease.
+                    let Ok(current_executable) = self.executable(harness) else {
+                        continue;
+                    };
+                    // The identity of what is about to be probed. Only this
+                    // binary's result may be recorded, and only if the
+                    // registry still resolves exactly it once the probe ends.
+                    let Some(probed) = BinaryFingerprint::of(&current_executable) else {
+                        continue;
+                    };
+                    // The probe is diagnostic only: cancelling drops it, which
+                    // kills just that process, and releases the intent, the
+                    // pending marker and the queued lease at once.
+                    let installed = match cancellable(
+                        &cancel,
+                        run_version_command(
+                            harness,
+                            &current_executable,
+                            provider(harness).version_args,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(installed) => installed,
+                        Err(_) if cancel.is_cancelled() => {
+                            self.finish_cancelled(harness);
+                            intent.finish();
+                            return Err("update cancelled".into());
+                        }
+                        Err(_) => continue,
+                    };
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+                    // Retargeted or replaced during the probe: the result
+                    // describes a binary that is no longer the one in use.
+                    // Record nothing; the watcher still sees the change
+                    // against the last checked binary and reconciles again.
+                    let still_probed = self
+                        .executable(harness)
+                        .ok()
+                        .and_then(|executable| BinaryFingerprint::of(&executable))
+                        .is_some_and(|now| now == probed);
+                    if !still_probed {
+                        continue;
+                    }
+                    // Compare family before *any* conclusion from A's target,
+                    // including treating a numerically newer B as current.
+                    if intent.observe(&current, &installed, probed.clone()) {
+                        continue;
+                    }
+                    if version_is_newer(latest, &installed) {
+                        // Still older: keep waiting, but this binary is now
+                        // judged, so an unchanged one is not probed again.
+                        continue;
+                    }
+                    tracing::info!(
+                        ?harness,
+                        %installed,
+                        "installed outside zeron while waiting; releasing the pending update"
+                    );
+                    self.finish_already_current(harness, installed.clone(), Some(probed));
+                    intent.finish();
+                    return Ok(installed);
+                }
             }
-            lease = self.inner.registry.update_lease(harness) => lease,
         };
         if cancel.is_cancelled() || !self.inner.registry.enabled_set().contains(&harness) {
             drop(lease);
@@ -1513,6 +1678,112 @@ impl HarnessUpdateCoordinator {
             intent.finish();
             return Err("update cancelled".into());
         }
+        // Resolve and probe the installation now owned, before selecting its
+        // package manager. A's version/release metadata cannot describe B.
+        let observed = async {
+            let executable = self.executable(harness)?;
+            let probed = BinaryFingerprint::of(&executable)
+                .ok_or_else(|| "The CLI's installation disappeared; checking again".to_string())?;
+            let installed = cancellable(
+                &cancel,
+                run_version_command(harness, &executable, provider(harness).version_args),
+            )
+            .await;
+            if cancel.is_cancelled() {
+                return Err("update cancelled".into());
+            }
+            let stable = self
+                .executable(harness)
+                .ok()
+                .and_then(|path| BinaryFingerprint::of(&path))
+                .is_some_and(|now| now == probed);
+            if !stable {
+                return Err(
+                    "The CLI's installation changed during its probe; checking again".into(),
+                );
+            }
+            let installed = match installed {
+                Ok(installed) => {
+                    if intent.observe(&current, &installed, probed.clone()) {
+                        return Err(
+                            "The CLI's release family changed; checking again before updating"
+                                .into(),
+                        );
+                    }
+                    Some(installed)
+                }
+                Err(error) => {
+                    // An unsuccessful probe is NOT an observation. Only an
+                    // independently runnable, unchanged owner may repair this
+                    // already-failed install using its original release plan.
+                    let trusted_repair = !intent.recheck_after_cleanup
+                        && repair_provenance.as_ref().is_some_and(|record| {
+                            update_plan(
+                                harness,
+                                &executable,
+                                PlanContext {
+                                    installed: current.installed_version.as_deref(),
+                                    channel: current.channel.as_deref(),
+                                },
+                            )
+                            .is_ok_and(|plan| {
+                                record.matches(&plan, &probed, current.latest_version.as_deref())
+                            })
+                        });
+                    if !trusted_repair {
+                        return Err(error);
+                    }
+                    None
+                }
+            };
+            Ok((executable, installed, probed))
+        }
+        .await;
+        let (executable, installed, probed) = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                drop(lease);
+                if !cancel.is_cancelled() {
+                    self.mutate(harness, |status| {
+                        status.latest_version = None;
+                        status.can_apply = false;
+                    });
+                    intent.recheck_after_cleanup = true;
+                }
+                self.finish_cancelled(harness);
+                intent.finish();
+                return Err(error);
+            }
+        };
+        if let Some(installed) = installed.as_ref()
+            && let Some(latest) = current.latest_version.as_deref()
+            && !version_is_newer(latest, installed)
+        {
+            drop(lease);
+            self.finish_already_current(harness, installed.clone(), Some(probed));
+            intent.finish();
+            return Ok(installed.clone());
+        }
+        let plan = match update_plan(
+            harness,
+            &executable,
+            PlanContext {
+                // None is exclusively the trusted repair branch above, not
+                // cached data represented as a fresh version observation.
+                installed: installed
+                    .as_deref()
+                    .or(current.installed_version.as_deref()),
+                channel: current.channel.as_deref(),
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                drop(lease);
+                self.finish_cancelled(harness);
+                intent.finish();
+                return Err(error);
+            }
+        };
         let _owner = match plan.owner() {
             Some(owner) => {
                 let gate = self.owner_gate(&owner);
@@ -1528,31 +1799,116 @@ impl HarnessUpdateCoordinator {
             }
             None => None,
         };
-        // CLIs update themselves (and get updated by hand) between checks. One
-        // already at or past the release the check found must not be
-        // "updated" to it: at best a no-op, for an in-place release switch a
-        // silent downgrade. Nothing runs it now: the exclusive lease is held.
-        if let Some(latest) = current.latest_version.as_deref()
-            && let Ok(installed) =
-                run_version_command(harness, &executable, provider(harness).version_args).await
-            && !version_is_newer(latest, &installed)
+        // The owner wait can outlive a healthy probe even when the launcher
+        // itself is unchanged (for example, a supporting version file moves).
+        // Re-resolve the complete plan under the acquired owner, then obtain a
+        // fresh observation. Never borrow authority from a preceding success.
+        let final_observation = async {
+            let executable_now = self.executable(harness)?;
+            let plan_now = update_plan(
+                harness,
+                &executable_now,
+                PlanContext {
+                    installed: installed
+                        .as_deref()
+                        .or(current.installed_version.as_deref()),
+                    channel: current.channel.as_deref(),
+                },
+            )?;
+            if BinaryFingerprint::of(&executable_now).as_ref() != Some(&probed) || plan_now != plan
+            {
+                return Err(
+                    "The CLI's installation owner changed before updating; checking again".into(),
+                );
+            }
+            // With no shared owner there was no second await boundary: the
+            // stable observation under the exclusive CLI lease is still fresh.
+            if _owner.is_none() {
+                return Ok(installed);
+            }
+            let fresh = cancellable(
+                &cancel,
+                run_version_command(harness, &executable_now, provider(harness).version_args),
+            )
+            .await;
+            if cancel.is_cancelled() {
+                return Err("update cancelled".into());
+            }
+            let executable_after = self.executable(harness)?;
+            if BinaryFingerprint::of(&executable_after).as_ref() != Some(&probed) {
+                return Err(
+                    "The CLI's installation changed during its final probe; checking again".into(),
+                );
+            }
+            let fresh = match fresh {
+                Ok(version) => {
+                    // Compare original candidate family before any Current
+                    // conclusion, just as in the exclusive observation above.
+                    if intent.observe(&current, &version, probed.clone()) {
+                        return Err(
+                            "The CLI's release family changed; checking again before updating"
+                                .into(),
+                        );
+                    }
+                    Some(version)
+                }
+                Err(error) => {
+                    if intent.recheck_after_cleanup
+                        || !repair_provenance.as_ref().is_some_and(|record| {
+                            record.matches(&plan, &probed, current.latest_version.as_deref())
+                        })
+                    {
+                        return Err(error);
+                    }
+                    None
+                }
+            };
+            let plan_after = update_plan(
+                harness,
+                &executable_after,
+                PlanContext {
+                    installed: fresh.as_deref().or(current.installed_version.as_deref()),
+                    channel: current.channel.as_deref(),
+                },
+            )?;
+            if plan_after != plan {
+                return Err(
+                    "The CLI's installation owner changed during its final probe; checking again"
+                        .into(),
+                );
+            }
+            Ok(fresh)
+        }
+        .await;
+        let installed = match final_observation {
+            Ok(installed) => installed,
+            Err(error) => {
+                drop(_owner);
+                drop(lease);
+                if !cancel.is_cancelled() {
+                    self.mutate(harness, |status| {
+                        status.latest_version = None;
+                        status.can_apply = false;
+                    });
+                    intent.recheck_after_cleanup = true;
+                }
+                self.finish_cancelled(harness);
+                intent.finish();
+                return Err(error);
+            }
+        };
+        if let Some(installed) = installed.as_ref()
+            && let Some(latest) = current.latest_version.as_deref()
+            && !version_is_newer(latest, installed)
         {
+            drop(_owner);
             drop(lease);
-            lock(&self.inner.cancellations).remove(&harness);
-            self.inner.registry.end_update(harness);
-            self.mutate(harness, |status| {
-                status.installed_version = Some(installed.clone());
-                status.progress = None;
-                status.error = None;
-                status.checked_at = Some(now_ms());
-                status.phase = if status.policy == HarnessUpdatePolicy::Off {
-                    HarnessUpdatePhase::Dormant
-                } else {
-                    HarnessUpdatePhase::Current
-                };
-            });
+            self.finish_already_current(harness, installed.clone(), Some(probed));
             intent.finish();
-            return Ok(installed);
+            return Ok(installed.clone());
+        }
+        if !matches!(plan, UpdatePlan::Package { .. }) {
+            lock(&self.inner.package_repairs).remove(&harness);
         }
         let applied = match plan {
             UpdatePlan::Command { executable, args } => {
@@ -1608,6 +1964,16 @@ impl HarnessUpdateCoordinator {
                 ) {
                     Ok(update) => match self.begin_install(harness, &cancel) {
                         Ok(()) => {
+                            lock(&self.inner.package_repairs).insert(
+                                harness,
+                                PackageRepairProvenance {
+                                    binary: probed.clone(),
+                                    owner: owner.clone(),
+                                    package,
+                                    tag: tag.clone(),
+                                    latest_version: current.latest_version.clone(),
+                                },
+                            );
                             let args: Vec<&str> = update.args.iter().map(String::as_str).collect();
                             run_command_output(&update.program, &args, UPDATE_TIMEOUT)
                                 .await
@@ -1687,6 +2053,7 @@ impl HarnessUpdateCoordinator {
                         }
                     })
                 } else {
+                    lock(&self.inner.package_repairs).remove(&harness);
                     lock(&self.inner.prefs).dismissed_versions.remove(&harness);
                     self.persist_preferences();
                     self.mutate(harness, |status| {
@@ -1975,6 +2342,41 @@ impl HarnessUpdateCoordinator {
             .map_err(|error| error.to_string())?
             .executable_path()
             .ok_or_else(|| "agent CLI executable is unavailable".into())
+    }
+
+    /// The installation the registry resolves now and its update plan. The
+    /// last check judged one install; a different one now (reinstalled
+    /// elsewhere, PATH changed) is checked again before anything runs, and
+    /// an install this updater cannot own is refused by `update_plan`.
+    fn resolve_update_plan(
+        &self,
+        harness: HarnessId,
+        current: &HarnessUpdateStatus,
+    ) -> Result<(PathBuf, UpdatePlan), String> {
+        let executable = self.executable(harness)?;
+        let checked = lock(&self.inner.checked_binaries)
+            .get(&harness)
+            .map(|fingerprint| fingerprint.path.clone());
+        if let Some(checked) = checked
+            && std::fs::canonicalize(&executable).ok().as_ref() != Some(&checked)
+        {
+            let coordinator = self.clone();
+            tokio::spawn(async move {
+                let _ = coordinator.check_one(harness).await;
+            });
+            return Err(
+                "The CLI's installation changed since it was checked; checking again".into(),
+            );
+        }
+        let plan = update_plan(
+            harness,
+            &executable,
+            PlanContext {
+                installed: current.installed_version.as_deref(),
+                channel: current.channel.as_deref(),
+            },
+        )?;
+        Ok((executable, plan))
     }
 
     fn operation_gate(&self, harness: HarnessId) -> Arc<tokio::sync::Mutex<()>> {
@@ -2355,6 +2757,36 @@ impl HarnessUpdateCoordinator {
             status.source = source;
         });
         self.fail_check(harness, error)
+    }
+
+    /// The CLI is already at (or past) the release this update targeted:
+    /// release the pending marker and report it current, running nothing.
+    /// `probed` is the identity of the binary whose version was read, never
+    /// a rediscovered one: recording another installation would bless a
+    /// binary nothing probed.
+    fn finish_already_current(
+        &self,
+        harness: HarnessId,
+        installed: String,
+        probed: Option<BinaryFingerprint>,
+    ) {
+        lock(&self.inner.cancellations).remove(&harness);
+        self.inner.registry.end_update(harness);
+        // This binary is the one now judged; the watcher must not re-flag it.
+        if let Some(fingerprint) = probed {
+            lock(&self.inner.checked_binaries).insert(harness, fingerprint);
+        }
+        self.mutate(harness, |status| {
+            status.installed_version = Some(installed);
+            status.progress = None;
+            status.error = None;
+            status.checked_at = Some(now_ms());
+            status.phase = if status.policy == HarnessUpdatePolicy::Off {
+                HarnessUpdatePhase::Dormant
+            } else {
+                HarnessUpdatePhase::Current
+            };
+        });
     }
 
     fn finish_cancelled(&self, harness: HarnessId) {
@@ -2871,7 +3303,25 @@ async fn run_command_output_env(
             let _ = child.start_kill();
             let _ = child.wait().await;
             return Err(match error {
-                Err(_) => format!("{} timed out", executable.display()),
+                // The timeout drops the readers, not what they already read:
+                // keep the last thing the updater said, bounded and redacted.
+                Err(_) => {
+                    let partial = partial_output(&stdout_bytes, &stderr_bytes);
+                    tracing::warn!(
+                        executable = %executable.display(),
+                        timeout_secs = timeout.as_secs(),
+                        output = %last_chars(&partial, 4000),
+                        "agent CLI command timed out"
+                    );
+                    format!(
+                        "{} timed out after {:?}{}",
+                        executable.display(),
+                        timeout,
+                        failure_summary(&partial)
+                            .map(|line| format!("; last output: {line}"))
+                            .unwrap_or_default()
+                    )
+                }
                 Ok(Err(error)) => format!("could not run {}: {error}", executable.display()),
                 Ok(Ok(_)) => unreachable!(),
             });
@@ -2885,7 +3335,11 @@ async fn run_command_output_env(
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !output.status.success() {
-        let detail = if stderr.is_empty() { &stdout } else { &stderr };
+        // Updater output can echo tokens or signed URLs: redact before it
+        // reaches the log or the Settings row.
+        let detail =
+            zeron_harness::redact::redact_output(if stderr.is_empty() { &stdout } else { &stderr });
+        let detail = &detail;
         tracing::warn!(
             executable = %executable.display(),
             status = %output.status,
@@ -2904,6 +3358,18 @@ async fn run_command_output_env(
         ));
     }
     Ok(if stdout.is_empty() { stderr } else { stdout })
+}
+
+/// What a stopped updater had printed (stderr preferred), redacted.
+fn partial_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    let text = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    zeron_harness::redact::redact_output(text.trim())
 }
 
 /// Updaters can print without bound (npm and Homebrew logs); keep only the
@@ -3146,6 +3612,1343 @@ case "$1" in
   *) exit 2 ;;
 esac
 "#;
+
+    /// U1: an OMP update waiting for an active run is released when OMP is
+    /// updated outside zeron meanwhile — the watcher sees the binary change,
+    /// the update re-reads the version, reports Current and drops its queued
+    /// lease request. The active run's lease is never touched and the
+    /// internal installer never runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn omp_external_update_while_waiting_reconciles_without_touching_active_work() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("omp");
+        let script = |marker: &str| {
+            format!(
+                "#!/bin/sh\n# {marker}\nroot=\"$(dirname \"$0\")\"\ntest \"$1\" != \"--no-extensions\" || shift\ncase \"$1\" in\n  --version) cat \"$root/version\" ;;\n  update) touch \"$root/internal-installer-ran\"; printf '2.0.0\\n' > \"$root/version\" ;;\n  *) exit 2 ;;\nesac\n"
+            )
+        };
+        std::fs::write(&executable, script("1.0.0")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(temp.path().join("version"), "1.0.0\n").unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(
+            executable.clone(),
+            HarnessId::Omp,
+        )));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Omp, |status| {
+            status.phase = HarnessUpdatePhase::Available;
+            status.installed_version = Some("1.0.0".into());
+            status.latest_version = Some("2.0.0".into());
+            status.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries).insert(
+            HarnessId::Omp,
+            super::BinaryFingerprint::of(&executable).unwrap(),
+        );
+        let running = registry.execution_lease(HarnessId::Omp).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Omp).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Omp,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+
+        // An unrelated binary touch that is still the old version keeps
+        // waiting: nothing is released or claimed falsely.
+        std::fs::write(&executable, script("1.0.0-rebuilt")).unwrap();
+        coordinator.recheck_changed_binaries().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            coordinator.status(HarnessId::Omp).phase,
+            HarnessUpdatePhase::WaitingForIdle
+        );
+        assert!(registry.update_pending(HarnessId::Omp));
+
+        // The user updates OMP outside zeron.
+        std::fs::write(temp.path().join("version"), "2.0.0\n").unwrap();
+        std::fs::write(&executable, script("2.0.0-external")).unwrap();
+        coordinator.recheck_changed_binaries().await;
+        let installed = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .expect("the waiting update is released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed, "2.0.0");
+        let status = coordinator.status(HarnessId::Omp);
+        assert_eq!(status.phase, HarnessUpdatePhase::Current);
+        assert_eq!(status.installed_version.as_deref(), Some("2.0.0"));
+        assert!(status.error.is_none());
+        assert!(!registry.update_pending(HarnessId::Omp));
+        assert!(super::lock(&coordinator.inner.cancellations).is_empty());
+        assert!(!temp.path().join("internal-installer-ran").exists());
+        // The active run kept its lease the whole time and keeps working.
+        drop(running);
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.execution_lease(HarnessId::Omp),
+        )
+        .await
+        .expect("no update writer was left queued");
+        drop(next);
+        coordinator.shutdown().await;
+    }
+
+    /// GR1: the external installation that releases a waiting update can
+    /// live at another path (versioned install, retargeted PATH or symlink).
+    /// The reconciliation probes the executable the registry resolves now,
+    /// not the one captured when the update started — whether the old path
+    /// still answers with the old version or is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_update_at_a_new_path_releases_the_waiting_update() {
+        for old_vanishes in [false, true] {
+            external_update_at_new_path(old_vanishes).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn external_update_at_new_path(old_vanishes: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |dir: &str, version: &str| {
+            let root = temp.path().join(dir);
+            std::fs::create_dir_all(&root).unwrap();
+            let executable = root.join("omp");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n# {dir}\nroot=\"$(dirname \"$0\")\"\ntest \"$1\" != \"--no-extensions\" || shift\ncase \"$1\" in\n  --version) cat \"$root/version\" ;;\n  update) touch \"$root/internal-installer-ran\" ;;\n  *) exit 2 ;;\nesac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(root.join("version"), format!("{version}\n")).unwrap();
+            executable
+        };
+        let old = install("v1", "1.0.0");
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(old.clone(), HarnessId::Omp)));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Omp, |status| {
+            status.phase = HarnessUpdatePhase::Available;
+            status.installed_version = Some("1.0.0".into());
+            status.latest_version = Some("2.0.0".into());
+            status.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries)
+            .insert(HarnessId::Omp, super::BinaryFingerprint::of(&old).unwrap());
+        let running = registry.execution_lease(HarnessId::Omp).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Omp).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Omp,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+
+        // OMP 2.0.0 is installed elsewhere and the registry now resolves it.
+        let new = install("v2", "2.0.0");
+        registry.register(Arc::new(ExecutableHarness(new.clone(), HarnessId::Omp)));
+        if old_vanishes {
+            std::fs::remove_dir_all(old.parent().unwrap()).unwrap();
+        }
+        coordinator.recheck_changed_binaries().await;
+        let installed = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the waiting update is released (old path vanished: {old_vanishes})")
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed, "2.0.0");
+        let status = coordinator.status(HarnessId::Omp);
+        assert_eq!(status.phase, HarnessUpdatePhase::Current);
+        assert_eq!(status.installed_version.as_deref(), Some("2.0.0"));
+        assert!(!registry.update_pending(HarnessId::Omp));
+        assert!(super::lock(&coordinator.inner.cancellations).is_empty());
+        assert!(
+            !new.parent()
+                .unwrap()
+                .join("internal-installer-ran")
+                .exists()
+        );
+        assert!(
+            !old.parent()
+                .unwrap()
+                .join("internal-installer-ran")
+                .exists()
+        );
+        // The active run kept its lease; nothing was terminated or queued.
+        drop(running);
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.execution_lease(HarnessId::Omp),
+        )
+        .await
+        .expect("no update writer was left queued");
+        drop(next);
+        coordinator.shutdown().await;
+    }
+
+    /// MR1: a version probe started by an external binary change runs under
+    /// the update's cancellation. When it stalls, Cancel returns at once,
+    /// clears the pending marker and the queued exclusive lease, and stops
+    /// only that probe; the busy runtime keeps its lease and no installer runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_while_an_external_version_probe_stalls_releases_everything() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("omp");
+        let script = |marker: &str| {
+            format!(
+                "#!/bin/sh\n# {marker}\nroot=\"$(dirname \"$0\")\"\ntest \"$1\" != \"--no-extensions\" || shift\ncase \"$1\" in\n  --version)\n    if test -f \"$root/stall-probe\"; then touch \"$root/probe-started\"; sleep 30; fi\n    cat \"$root/version\" ;;\n  update) touch \"$root/internal-installer-ran\" ;;\n  *) exit 2 ;;\nesac\n"
+            )
+        };
+        std::fs::write(&executable, script("1.0.0")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(temp.path().join("version"), "1.0.0\n").unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(
+            executable.clone(),
+            HarnessId::Omp,
+        )));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Omp, |status| {
+            status.phase = HarnessUpdatePhase::Available;
+            status.installed_version = Some("1.0.0".into());
+            status.latest_version = Some("2.0.0".into());
+            status.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries).insert(
+            HarnessId::Omp,
+            super::BinaryFingerprint::of(&executable).unwrap(),
+        );
+        let running = registry.execution_lease(HarnessId::Omp).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Omp).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Omp,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+
+        // The binary changes and its version probe hangs.
+        std::fs::write(temp.path().join("stall-probe"), "").unwrap();
+        std::fs::write(&executable, script("changed")).unwrap();
+        coordinator.recheck_changed_binaries().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !temp.path().join("probe-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the probe started");
+
+        assert!(coordinator.cancel(HarnessId::Omp));
+        let outcome = tokio::time::timeout(Duration::from_secs(2), apply)
+            .await
+            .expect("cancel does not wait for the stalled probe")
+            .unwrap();
+        assert_eq!(outcome.unwrap_err(), "update cancelled");
+        assert!(!registry.update_pending(HarnessId::Omp));
+        assert!(super::lock(&coordinator.inner.cancellations).is_empty());
+        assert_eq!(
+            coordinator.status(HarnessId::Omp).phase,
+            HarnessUpdatePhase::Available
+        );
+        assert!(!temp.path().join("internal-installer-ran").exists());
+        // The runtime kept its lease; releasing it leaves no queued writer.
+        drop(running);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.execution_lease(HarnessId::Omp),
+        )
+        .await
+        .expect("no exclusive writer left queued");
+        coordinator.shutdown().await;
+    }
+
+    /// GF1: the registry is retargeted to an older installation while the
+    /// version probe of a newer binary is still running. The probe's
+    /// "current" answer describes a binary that is no longer in use, so the
+    /// update stays waiting and records nothing for it; the older binary
+    /// stays a change the watcher reconciles, which then probes and records
+    /// it while the update keeps waiting. The active lease survives and no
+    /// installer runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retarget_during_a_current_probe_does_not_bless_an_unprobed_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |dir: &str, version: &str, marker: &str| {
+            let root = temp.path().join(dir);
+            std::fs::create_dir_all(&root).unwrap();
+            let executable = root.join("omp");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n# {marker}\nroot=\"$(dirname \"$0\")\"\ntest \"$1\" != \"--no-extensions\" || shift\ncase \"$1\" in\n  --version)\n    if test -f \"$root/stall-probe\"; then touch \"$root/probe-started\"; while test ! -f \"$root/release-probe\"; do sleep 0.01; done; fi\n    cat \"$root/version\" ;;\n  update) touch \"$root/internal-installer-ran\" ;;\n  *) exit 2 ;;\nesac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(root.join("version"), format!("{version}\n")).unwrap();
+            executable
+        };
+        let current = install("current", "1.0.0", "first");
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(current.clone(), HarnessId::Omp)));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Omp, |status| {
+            status.phase = HarnessUpdatePhase::Available;
+            status.installed_version = Some("1.0.0".into());
+            status.latest_version = Some("2.0.0".into());
+            status.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries).insert(
+            HarnessId::Omp,
+            super::BinaryFingerprint::of(&current).unwrap(),
+        );
+        let running = registry.execution_lease(HarnessId::Omp).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Omp).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Omp,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+
+        // The binary becomes 2.0.0 and its probe is held open.
+        let root = current.parent().unwrap().to_path_buf();
+        std::fs::write(root.join("stall-probe"), "").unwrap();
+        std::fs::write(root.join("version"), "2.0.0\n").unwrap();
+        install("current", "2.0.0", "external-2.0.0");
+        coordinator.recheck_changed_binaries().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("probe-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the probe started");
+
+        // Before it answers, the registry resolves an older installation.
+        let older = install("older", "0.9.0", "older");
+        registry.register(Arc::new(ExecutableHarness(older.clone(), HarnessId::Omp)));
+        std::fs::write(root.join("release-probe"), "").unwrap();
+
+        // The older installation is still a change against the last checked
+        // binary, so the watcher's next pass reconciles it: drive that pass
+        // and wait until the waiting update has actually probed and recorded
+        // the older binary. Wrongly releasing as Current finishes `apply`
+        // instead, which fails at once.
+        let older_fingerprint = super::BinaryFingerprint::of(&older);
+        coordinator.recheck_changed_binaries().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(!apply.is_finished(), "the update was released as current");
+                let checked = super::lock(&coordinator.inner.checked_binaries)
+                    .get(&HarnessId::Omp)
+                    .cloned();
+                if checked == older_fingerprint {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the older replacement was probed and recorded by the waiting update");
+
+        assert!(!apply.is_finished(), "the update was released as current");
+        assert_eq!(
+            coordinator.status(HarnessId::Omp).phase,
+            HarnessUpdatePhase::WaitingForIdle
+        );
+        assert!(registry.update_pending(HarnessId::Omp));
+        for dir in [&root, &older.parent().unwrap().to_path_buf()] {
+            assert!(!dir.join("internal-installer-ran").exists());
+        }
+
+        assert!(coordinator.cancel(HarnessId::Omp));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .expect("cancel releases the update")
+            .unwrap();
+        assert_eq!(outcome.unwrap_err(), "update cancelled");
+        // The active run kept its lease the whole time.
+        drop(running);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.execution_lease(HarnessId::Omp),
+        )
+        .await
+        .expect("no update writer was left queued");
+        coordinator.shutdown().await;
+    }
+
+    /// GF10: a replacement that is still older than the release is probed
+    /// once and recorded; reconciling again without any further change does
+    /// not probe it again. The update keeps waiting and no installer runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_older_replacement_is_probed_once_while_waiting() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("omp");
+        let script = |marker: &str| {
+            format!(
+                "#!/bin/sh\n# {marker}\nroot=\"$(dirname \"$0\")\"\ntest \"$1\" != \"--no-extensions\" || shift\ncase \"$1\" in\n  --version) echo probe >> \"$root/probes\"; cat \"$root/version\" ;;\n  update) touch \"$root/internal-installer-ran\" ;;\n  *) exit 2 ;;\nesac\n"
+            )
+        };
+        std::fs::write(&executable, script("1.0.0")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(temp.path().join("version"), "1.0.0\n").unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(
+            executable.clone(),
+            HarnessId::Omp,
+        )));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Omp, |status| {
+            status.phase = HarnessUpdatePhase::Available;
+            status.installed_version = Some("1.0.0".into());
+            status.latest_version = Some("2.0.0".into());
+            status.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries).insert(
+            HarnessId::Omp,
+            super::BinaryFingerprint::of(&executable).unwrap(),
+        );
+        let running = registry.execution_lease(HarnessId::Omp).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Omp).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Omp,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+        let probes = || {
+            std::fs::read_to_string(temp.path().join("probes"))
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        let before = probes();
+
+        // Replaced by another build that is still older than 2.0.0.
+        std::fs::write(temp.path().join("version"), "1.5.0\n").unwrap();
+        std::fs::write(&executable, script("1.5.0-replacement")).unwrap();
+        let replacement = super::BinaryFingerprint::of(&executable).unwrap();
+        coordinator.recheck_changed_binaries().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while super::lock(&coordinator.inner.checked_binaries).get(&HarnessId::Omp)
+                != Some(&replacement)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the probed older replacement is recorded");
+        assert_eq!(probes(), before + 1);
+
+        // A second reconciliation with nothing changed probes nothing.
+        coordinator.recheck_changed_binaries().await;
+
+        assert_eq!(
+            probes(),
+            before + 1,
+            "an unchanged older binary is not probed again"
+        );
+        assert_eq!(
+            coordinator.status(HarnessId::Omp).phase,
+            HarnessUpdatePhase::WaitingForIdle
+        );
+        assert!(registry.update_pending(HarnessId::Omp));
+        assert!(!apply.is_finished());
+        assert!(!temp.path().join("internal-installer-ran").exists());
+
+        assert!(coordinator.cancel(HarnessId::Omp));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .expect("cancel releases the update")
+            .unwrap();
+        assert_eq!(outcome.unwrap_err(), "update cancelled");
+        assert_eq!(
+            coordinator
+                .status(HarnessId::Omp)
+                .installed_version
+                .as_deref(),
+            Some("1.5.0")
+        );
+        coordinator.recheck_changed_binaries().await;
+        assert_eq!(probes(), before + 1, "cancelled unchanged B remains cached");
+        drop(running);
+        coordinator.shutdown().await;
+    }
+
+    /// GH1: the installation found when the update was queued (A) is
+    /// replaced, while the update waits for an active run, by another one
+    /// (B) that is still older than the release. Once the update owns the
+    /// CLI it rediscovers B and runs B's plan: only B's installer runs, A is
+    /// left untouched (or stays gone), and verification reads B.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_update_queued_on_a_replaced_installation_updates_the_current_one() {
+        for a_vanishes in [false, true] {
+            queued_update_follows_the_replacement(a_vanishes).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn queued_update_follows_the_replacement(a_vanishes: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |dir: &str, version: &str| {
+            let root = temp.path().join(dir);
+            std::fs::create_dir_all(&root).unwrap();
+            let executable = root.join("omp");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n# {dir}\nroot=\"$(dirname \"$0\")\"\ntest \"$1\" != \"--no-extensions\" || shift\ncase \"$1\" in\n  --version) cat \"$root/version\" ;;\n  update) touch \"$root/installer-ran\"; printf '2.0.0\\n' > \"$root/version\" ;;\n  *) exit 2 ;;\nesac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(root.join("version"), format!("{version}\n")).unwrap();
+            executable
+        };
+        let a = install("a", "1.0.0");
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(a.clone(), HarnessId::Omp)));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Omp, |status| {
+            status.phase = HarnessUpdatePhase::Available;
+            status.installed_version = Some("1.0.0".into());
+            status.latest_version = Some("2.0.0".into());
+            status.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries)
+            .insert(HarnessId::Omp, super::BinaryFingerprint::of(&a).unwrap());
+        let running = registry.execution_lease(HarnessId::Omp).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Omp).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Omp,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+
+        // B replaces A while the update waits; it is still older than 2.0.0.
+        let b = install("b", "1.5.0");
+        registry.register(Arc::new(ExecutableHarness(b.clone(), HarnessId::Omp)));
+        if a_vanishes {
+            std::fs::remove_dir_all(a.parent().unwrap()).unwrap();
+        }
+        // The waiting update reconciles B: probed, recorded, still waiting.
+        let b_fingerprint = super::BinaryFingerprint::of(&b);
+        coordinator.recheck_changed_binaries().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(!apply.is_finished(), "B is older: the update keeps waiting");
+                let checked = super::lock(&coordinator.inner.checked_binaries)
+                    .get(&HarnessId::Omp)
+                    .cloned();
+                if checked == b_fingerprint {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the waiting update probed and recorded B");
+
+        // The active run ends; the update now owns the CLI.
+        drop(running);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), apply)
+            .await
+            .expect("the update completes")
+            .unwrap();
+        assert_eq!(
+            outcome.as_deref(),
+            Ok("2.0.0"),
+            "B updated and verified (A vanished: {a_vanishes})"
+        );
+        assert!(
+            b.parent().unwrap().join("installer-ran").exists(),
+            "B's installer ran"
+        );
+        if a_vanishes {
+            assert!(!a.parent().unwrap().exists(), "A was not recreated");
+        } else {
+            assert!(
+                !a.parent().unwrap().join("installer-ran").exists(),
+                "A's installer did not run"
+            );
+            assert_eq!(
+                std::fs::read_to_string(a.parent().unwrap().join("version")).unwrap(),
+                "1.0.0\n",
+                "A is untouched"
+            );
+        }
+        let status = coordinator.status(HarnessId::Omp);
+        assert_eq!(status.phase, HarnessUpdatePhase::Updated);
+        assert_eq!(status.installed_version.as_deref(), Some("2.0.0"));
+        assert!(!registry.update_pending(HarnessId::Omp));
+        coordinator.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_package_update_repairs_only_its_unchanged_launcher() {
+        package_owner_wait_cases(&[
+            "unchanged",
+            "launcher",
+            "owner",
+            "owner-before-retry",
+            "owner-gate",
+            "missing-record",
+            "invalidated",
+        ])
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthy_package_owner_wait_observes_current_support_version() {
+        package_owner_wait_cases(&["healthy-current", "healthy-older", "healthy-failed-probe"])
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthy_package_owner_wait_refuses_another_alias_owner() {
+        package_owner_wait_cases(&["healthy-owner"]).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthy_package_owner_wait_cancels_its_final_probe() {
+        package_owner_wait_cases(&["healthy-cancel"]).await;
+    }
+
+    #[cfg(unix)]
+    async fn package_owner_wait_cases(changes: &[&str]) {
+        use std::os::unix::fs::PermissionsExt;
+        for &change in changes {
+            let healthy = change.starts_with("healthy-");
+            let changed = change != "unchanged";
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = temp.path();
+            let package = prefix.join("lib/node_modules/@openai/codex");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::create_dir_all(prefix.join("bin")).unwrap();
+            let executable = package.join("codex");
+            std::fs::write(
+                &executable,
+                "#!/bin/sh\ncat \"$(dirname \"$0\")/version\"\n",
+            )
+            .unwrap();
+            if healthy {
+                std::fs::write(&executable, format!(
+                    "#!/bin/sh\nroot=\"$(dirname \"$0\")\"\nif test -f \"$root/stall\"; then touch \"$root/probe-started\"; exec sleep 30; fi\necho probe >> \"$root/probes\"\nif test '{change}' = healthy-owner && test ! -f '{}/attempts' && test \"$(wc -l < \"$root/probes\")\" -gt 2; then exit 1; fi\ncat \"$root/version\"\n", prefix.display()
+                )).unwrap();
+            }
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(package.join("version"), "1.0.0\n").unwrap();
+            let npm = prefix.join("bin/npm");
+            std::fs::write(&npm, format!(
+                "#!/bin/sh\necho \"$@\" >> '{0}/attempts'\nif test ! -f '{0}/failed'; then touch '{0}/failed'; rm '{1}/version'; exit 1; fi\necho 2.0.0 > '{1}/version'\n",
+                prefix.display(), package.display())).unwrap();
+            std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let registry = Arc::new(HarnessRegistry::new());
+            registry.register(Arc::new(ExecutableHarness(
+                executable.clone(),
+                HarnessId::Codex,
+            )));
+            let coordinator = super::HarnessUpdateCoordinator::new(prefix, registry.clone());
+            coordinator.mutate(HarnessId::Codex, |s| {
+                s.phase = HarnessUpdatePhase::Available;
+                s.installed_version = Some("1.0.0".into());
+                s.latest_version = Some("2.0.0".into());
+                s.can_apply = true;
+            });
+            super::lock(&coordinator.inner.checked_binaries).insert(
+                HarnessId::Codex,
+                super::BinaryFingerprint::of(&executable).unwrap(),
+            );
+            if healthy {
+                // Reuse the disposable package fixture, but its first apply
+                // is healthy and must wait for the shared npm owner.
+                std::fs::write(prefix.join("failed"), "").unwrap();
+            } else {
+                assert!(coordinator.apply(HarnessId::Codex).await.is_err());
+                let failed = coordinator.status(HarnessId::Codex);
+                assert_eq!(
+                    failed.error.unwrap().kind,
+                    zeron_proto::HarnessUpdateFailureKind::Install
+                );
+                assert!(failed.can_apply);
+            }
+            if change == "launcher" {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&executable)
+                    .unwrap()
+                    .write_all(b"# changed installation\n")
+                    .unwrap();
+            }
+            if change == "missing-record" {
+                super::lock(&coordinator.inner.package_repairs).remove(&HarnessId::Codex);
+            }
+            if change == "owner-before-retry" {
+                let bin = prefix.join(".bun/bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                let alias = bin.join("codex");
+                std::os::unix::fs::symlink(&executable, &alias).unwrap();
+                let bun = bin.join("bun");
+                std::fs::write(
+                    &bun,
+                    format!(
+                        "#!/bin/sh\necho wrong-owner >> '{}/attempts'\n",
+                        prefix.display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(
+                    super::BinaryFingerprint::of(&executable),
+                    super::BinaryFingerprint::of(&alias)
+                );
+                registry.register(Arc::new(ExecutableHarness(alias, HarnessId::Codex)));
+            }
+            let retried = if change == "owner-gate" || healthy {
+                let (_, plan) = coordinator
+                    .resolve_update_plan(HarnessId::Codex, &coordinator.status(HarnessId::Codex))
+                    .unwrap();
+                let gate = coordinator.owner_gate(&plan.owner().unwrap());
+                let held = gate.clone().lock_owned().await;
+                let count = Arc::strong_count(&gate);
+                let retry = tokio::spawn({
+                    let c = coordinator.clone();
+                    async move { c.apply(HarnessId::Codex).await }
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while Arc::strong_count(&gate) == count {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("repair passed the probe and queued for its owner");
+                if change == "healthy-cancel" {
+                    std::fs::write(package.join("stall"), "").unwrap();
+                }
+                if change == "healthy-current" {
+                    std::fs::write(package.join("version"), "2.0.0\n").unwrap();
+                } else if change == "healthy-older" {
+                    std::fs::write(package.join("version"), "1.5.0\n").unwrap();
+                } else if change == "healthy-failed-probe" {
+                    std::fs::remove_file(package.join("version")).unwrap();
+                }
+                if matches!(change, "owner-gate" | "healthy-owner") {
+                    let bin = prefix.join(".bun/bin");
+                    std::fs::create_dir_all(&bin).unwrap();
+                    let alias = bin.join("codex");
+                    std::os::unix::fs::symlink(&executable, &alias).unwrap();
+                    let bun = bin.join("bun");
+                    std::fs::write(
+                        &bun,
+                        format!(
+                            "#!/bin/sh\necho wrong-owner >> '{}/attempts'\n",
+                            prefix.display()
+                        ),
+                    )
+                    .unwrap();
+                    std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    registry.register(Arc::new(ExecutableHarness(alias, HarnessId::Codex)));
+                }
+                drop(held);
+                if change == "healthy-cancel" {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !package.join("probe-started").exists() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("fresh probe reached the controlled stall");
+                    assert_eq!(
+                        coordinator.status(HarnessId::Codex).phase,
+                        HarnessUpdatePhase::Preparing,
+                        "the final probe must precede mutation"
+                    );
+                    assert!(coordinator.cancel(HarnessId::Codex));
+                }
+                tokio::time::timeout(Duration::from_secs(5), retry)
+                    .await
+                    .expect("cancellation releases the final probe promptly")
+                    .unwrap()
+            } else if change == "owner" {
+                // The resolved alias changes owner while the canonical binary
+                // fingerprint remains exactly the successful check's identity.
+                let running = registry.execution_lease(HarnessId::Codex).await;
+                let retry = tokio::spawn({
+                    let coordinator = coordinator.clone();
+                    async move { coordinator.apply(HarnessId::Codex).await }
+                });
+                wait_for_phase(
+                    &coordinator,
+                    HarnessId::Codex,
+                    HarnessUpdatePhase::WaitingForIdle,
+                )
+                .await;
+                let bin = prefix.join(".bun/bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                let alias = bin.join("codex");
+                std::os::unix::fs::symlink(&executable, &alias).unwrap();
+                let bun = bin.join("bun");
+                std::fs::write(
+                    &bun,
+                    format!(
+                        "#!/bin/sh\necho wrong-owner >> '{}/attempts'\n",
+                        prefix.display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(
+                    super::BinaryFingerprint::of(&executable),
+                    super::BinaryFingerprint::of(&alias)
+                );
+                registry.register(Arc::new(ExecutableHarness(alias, HarnessId::Codex)));
+                drop(running);
+                retry.await.unwrap()
+            } else {
+                if change == "invalidated" {
+                    coordinator.mutate(HarnessId::Codex, |s| {
+                        s.latest_version = None;
+                        s.can_apply = false;
+                    });
+                }
+                coordinator.apply(HarnessId::Codex).await
+            };
+            if healthy {
+                if matches!(change, "healthy-current" | "healthy-older") {
+                    assert_eq!(retried.unwrap(), "2.0.0");
+                    assert_eq!(
+                        coordinator.status(HarnessId::Codex).phase,
+                        if change == "healthy-current" {
+                            HarnessUpdatePhase::Current
+                        } else {
+                            HarnessUpdatePhase::Updated
+                        }
+                    );
+                } else {
+                    assert!(
+                        retried.is_err(),
+                        "changed owner or failed fresh probe cannot mutate"
+                    );
+                }
+                let attempts = std::fs::read_to_string(prefix.join("attempts")).unwrap_or_default();
+                assert_eq!(
+                    attempts.lines().count(),
+                    usize::from(change == "healthy-older"),
+                    "{change}: only a fresh older version authorizes mutation"
+                );
+                assert!(!registry.update_pending(HarnessId::Codex));
+            } else {
+                if changed {
+                    assert!(retried.is_err());
+                } else {
+                    assert_eq!(
+                        retried.unwrap(),
+                        "2.0.0",
+                        "existing Retry repairs the supporting file"
+                    );
+                    assert_eq!(
+                        coordinator.status(HarnessId::Codex).phase,
+                        HarnessUpdatePhase::Updated
+                    );
+                }
+                let attempts = std::fs::read_to_string(prefix.join("attempts")).unwrap();
+                assert_eq!(attempts.lines().count(), if changed { 1 } else { 2 });
+                assert!(
+                    attempts
+                        .lines()
+                        .all(|line| line.contains("@openai/codex@latest")
+                            && line.contains("--prefix"))
+                );
+            }
+            coordinator.shutdown().await;
+        }
+    }
+
+    /// GJ2: release metadata from v2 cannot authorize v1's global package.
+    // Each binary is disposable. The second B probe fails before any release
+    // lookup, proving full-check execution admission without registry access.
+    #[cfg(unix)]
+    fn replacement_family_fixture(
+        a_version: &str,
+        b_version: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<HarnessRegistry>,
+        super::HarnessUpdateCoordinator,
+        PathBuf,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |name: &str, package: &str, version: &str| {
+            let prefix = temp.path().join(name);
+            let bin = prefix.join("bin");
+            let package_dir = prefix.join("lib/node_modules").join(package);
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&package_dir).unwrap();
+            let executable = package_dir.join("opencode");
+            std::fs::write(&executable, format!(
+                "#!/bin/sh\nroot='{}'\ncase \"$1\" in\n --version) echo probe >> \"$root/probes\"; n=$(wc -l < \"$root/probes\"); if test \"$n\" -ge 2; then touch \"$root/full-check-reached\"; exit 1; fi; echo '{version}' ;;\n *) touch \"$root/installer-ran\"; exit 3 ;;\nesac\n",
+                prefix.display()
+            )).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let npm = bin.join("npm");
+            std::fs::write(
+                &npm,
+                format!(
+                    "#!/bin/sh\ntouch '{}/installer-ran'\nexit 3\n",
+                    prefix.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+            executable
+        };
+        let a = install("a", opencode_release_package(a_version), a_version);
+        let b = install("b", opencode_release_package(b_version), b_version);
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(a.clone(), HarnessId::Opencode)));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Opencode, |s| {
+            s.phase = HarnessUpdatePhase::Available;
+            s.installed_version = Some(a_version.into());
+            s.latest_version = Some(
+                if a_version == "2.0.0" {
+                    "2.1.0"
+                } else {
+                    "1.9.0"
+                }
+                .into(),
+            );
+            s.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries).insert(
+            HarnessId::Opencode,
+            super::BinaryFingerprint::of(&a).unwrap(),
+        );
+        (temp, registry, coordinator, b)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_family_cancel_and_future_cleanup_cannot_reuse_candidate() {
+        for abort_future in [false, true] {
+            let (temp, registry, coordinator, b) = replacement_family_fixture("2.0.0", "1.5.0");
+            let running = registry.execution_lease(HarnessId::Opencode).await;
+            let update = coordinator.clone();
+            // Drop the owned operation future, not apply's intentionally detached
+            // RPC waiter: this exercises the actual UpdateIntentGuard cleanup.
+            let apply = tokio::spawn(async move { update.apply_inner(HarnessId::Opencode).await });
+            wait_for_phase(
+                &coordinator,
+                HarnessId::Opencode,
+                HarnessUpdatePhase::WaitingForIdle,
+            )
+            .await;
+            registry.register(Arc::new(ExecutableHarness(b, HarnessId::Opencode)));
+            coordinator.recheck_changed_binaries().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while coordinator
+                    .status(HarnessId::Opencode)
+                    .installed_version
+                    .as_deref()
+                    != Some("1.5.0")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let observed = coordinator.status(HarnessId::Opencode);
+            assert!(registry.update_pending(HarnessId::Opencode));
+            if abort_future {
+                apply.abort();
+                assert!(apply.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(coordinator.cancel(HarnessId::Opencode));
+                assert_eq!(apply.await.unwrap().unwrap_err(), "update cancelled");
+            }
+            assert!(!registry.update_pending(HarnessId::Opencode));
+            let reapplier = coordinator.clone();
+            let reapply = tokio::spawn(async move { reapplier.apply(HarnessId::Opencode).await });
+            drop(running);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), reapply)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            // Assert the public observation too: no observer can see B paired
+            // with A's actionable release, even before cancellation wins.
+            assert_eq!(
+                observed.latest_version, None,
+                "A's candidate survived B's publication"
+            );
+            assert!(!observed.can_apply);
+            wait_for_phase(
+                &coordinator,
+                HarnessId::Opencode,
+                HarnessUpdatePhase::Failed,
+            )
+            .await;
+            assert_eq!(
+                coordinator
+                    .status(HarnessId::Opencode)
+                    .installed_version
+                    .as_deref(),
+                Some("1.5.0")
+            );
+            assert!(temp.path().join("b/full-check-reached").exists());
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("b/probes"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2,
+                "one observation and exactly one admitted full check"
+            );
+            for dir in ["a", "b"] {
+                assert!(!temp.path().join(dir).join("installer-ran").exists());
+            }
+            coordinator.shutdown().await;
+        }
+    }
+
+    /// Deterministically cancel at the synchronous publication boundary used
+    /// by the exclusive apply path. No scheduler race or production hook:
+    /// a real version probe and exclusive lease feed the production guard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_family_exclusive_observation_survives_cancel_and_cleanup() {
+        for cleanup in [false, true] {
+            for stop in ["none", "shutdown", "disabled", "off"] {
+                let (temp, registry, coordinator, b) = replacement_family_fixture("2.0.0", "1.5.0");
+                let candidate = coordinator.status(HarnessId::Opencode);
+                let operation = coordinator
+                    .operation_gate(HarnessId::Opencode)
+                    .lock_owned()
+                    .await;
+                let cancel = coordinator.inner.shutdown.child_token();
+                super::lock(&coordinator.inner.cancellations).insert(
+                    HarnessId::Opencode,
+                    super::ActiveUpdate {
+                        cancel: cancel.clone(),
+                        automatic: false,
+                        previous_phase: candidate.phase,
+                        external_change: Default::default(),
+                    },
+                );
+                registry.begin_update(HarnessId::Opencode);
+                let mut intent = super::UpdateIntentGuard {
+                    coordinator: coordinator.clone(),
+                    harness: HarnessId::Opencode,
+                    complete: false,
+                    recheck_after_cleanup: false,
+                };
+                let lease = registry.update_lease(HarnessId::Opencode).await;
+                registry.register(Arc::new(ExecutableHarness(b.clone(), HarnessId::Opencode)));
+                coordinator.mutate(HarnessId::Opencode, |s| {
+                    s.phase = HarnessUpdatePhase::Preparing
+                });
+                let installed = super::run_version_command(HarnessId::Opencode, &b, &["--version"])
+                    .await
+                    .unwrap();
+                assert!(intent.observe(
+                    &candidate,
+                    &installed,
+                    super::BinaryFingerprint::of(&b).unwrap()
+                ));
+                let observed = coordinator.status(HarnessId::Opencode);
+                assert_eq!(observed.installed_version.as_deref(), Some("1.5.0"));
+                assert_eq!(observed.latest_version, None);
+                assert!(!observed.can_apply);
+                assert!(coordinator.cancel(HarnessId::Opencode));
+                assert!(cancel.is_cancelled());
+                match stop {
+                    "shutdown" => coordinator.inner.shutdown.cancel(),
+                    "disabled" => {
+                        registry.register(Arc::new(ExecutableHarness(b, HarnessId::Omp)));
+                        registry.set_enabled(HarnessId::Opencode, false).unwrap();
+                    }
+                    "off" => {
+                        coordinator
+                            .set_policy(HarnessId::Opencode, zeron_proto::HarnessUpdatePolicy::Off);
+                    }
+                    _ => {}
+                }
+                drop(lease);
+                if cleanup {
+                    drop(intent);
+                } else {
+                    coordinator.finish_cancelled(HarnessId::Opencode);
+                    intent.finish();
+                    intent.finish(); // terminal cleanup cannot dispatch twice
+                    drop(intent);
+                }
+                assert!(!registry.update_pending(HarnessId::Opencode));
+                assert!(!coordinator.is_mutating(HarnessId::Opencode));
+                drop(operation);
+                if stop == "none" {
+                    wait_for_phase(
+                        &coordinator,
+                        HarnessId::Opencode,
+                        HarnessUpdatePhase::Failed,
+                    )
+                    .await;
+                }
+                // Let the dispatched task run (or decline); then synchronize
+                // behind any admitted check before counting subprocesses.
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                let _settled = coordinator
+                    .operation_gate(HarnessId::Opencode)
+                    .lock_owned()
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("b/probes"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    if stop == "none" { 2 } else { 1 },
+                    "cleanup={cleanup}, stop={stop}"
+                );
+                assert_eq!(coordinator.status(HarnessId::Opencode).latest_version, None);
+                assert!(!coordinator.status(HarnessId::Opencode).can_apply);
+                for dir in ["a", "b"] {
+                    assert!(!temp.path().join(dir).join("installer-ran").exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_family_cannot_be_current_from_another_familys_target() {
+        let (temp, registry, coordinator, b) = replacement_family_fixture("1.5.0", "2.0.0");
+        let running = registry.execution_lease(HarnessId::Opencode).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Opencode).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Opencode,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+        registry.register(Arc::new(ExecutableHarness(b, HarnessId::Opencode)));
+        coordinator.recheck_changed_binaries().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator
+                .status(HarnessId::Opencode)
+                .installed_version
+                .as_deref()
+                != Some("2.0.0")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed = coordinator.status(HarnessId::Opencode);
+        assert_eq!(
+            observed.phase,
+            HarnessUpdatePhase::WaitingForIdle,
+            "cross-family numeric comparison marked Current"
+        );
+        assert_eq!(observed.latest_version, None);
+        assert!(!observed.can_apply);
+        assert!(coordinator.cancel(HarnessId::Opencode));
+        assert!(apply.await.unwrap().is_err());
+        drop(running);
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Opencode,
+            HarnessUpdatePhase::Failed,
+        )
+        .await;
+        assert!(temp.path().join("b/full-check-reached").exists());
+        coordinator.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_release_family_rechecks_without_mutating_either_installation() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |name: &str, package: &str, version: &str, fail_at: usize| {
+            let prefix = temp.path().join(name);
+            let bin = prefix.join("bin");
+            let package_dir = prefix.join("lib/node_modules").join(package);
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&package_dir).unwrap();
+            let executable = package_dir.join("opencode");
+            std::fs::write(&executable, format!(
+                "#!/bin/sh\nroot='{}'\ncase \"$1\" in\n --version) echo probe >> \"$root/probes\"; n=$(wc -l < \"$root/probes\"); if test \"$n\" -ge {fail_at}; then touch \"$root/full-check-reached\"; exit 1; fi; echo '{version}' ;;\n *) touch \"$root/installer-ran\"; exit 3 ;;\nesac\n",
+                prefix.display()
+            )).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let npm = bin.join("npm");
+            std::fs::write(
+                &npm,
+                format!(
+                    "#!/bin/sh\ntouch '{}/installer-ran'\nexit 3\n",
+                    prefix.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+            executable
+        };
+        let a = install("a", "@opencode/cli", "2.0.0", 99);
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(a.clone(), HarnessId::Opencode)));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry.clone());
+        coordinator.mutate(HarnessId::Opencode, |s| {
+            s.phase = HarnessUpdatePhase::Available;
+            s.installed_version = Some("2.0.0".into());
+            s.latest_version = Some("2.1.0".into());
+            s.can_apply = true;
+        });
+        super::lock(&coordinator.inner.checked_binaries).insert(
+            HarnessId::Opencode,
+            super::BinaryFingerprint::of(&a).unwrap(),
+        );
+        let running = registry.execution_lease(HarnessId::Opencode).await;
+        let update = coordinator.clone();
+        let apply = tokio::spawn(async move { update.apply(HarnessId::Opencode).await });
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Opencode,
+            HarnessUpdatePhase::WaitingForIdle,
+        )
+        .await;
+        // The third probe deliberately fails: observe the existing full-check path
+        // after its execution admission, without any registry/network access.
+        let b = install("b", "opencode-ai", "1.5.0", 3);
+        registry.register(Arc::new(ExecutableHarness(b.clone(), HarnessId::Opencode)));
+        coordinator.recheck_changed_binaries().await;
+        let fingerprint = super::BinaryFingerprint::of(&b);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while super::lock(&coordinator.inner.checked_binaries)
+                .get(&HarnessId::Opencode)
+                .cloned()
+                != fingerprint
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("B is observed while waiting");
+        let plan = super::update_plan(
+            HarnessId::Opencode,
+            &b,
+            super::PlanContext {
+                installed: Some("1.5.0"),
+                channel: Some("stable"),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            super::UpdatePlan::Package {
+                owner: super::ownership::PackageOwner::Npm { .. },
+                package: "opencode-ai",
+                ..
+            }
+        ));
+        drop(running);
+        let error = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.contains("release") && error.contains("checking again"),
+            "{error}"
+        );
+        wait_for_phase(
+            &coordinator,
+            HarnessId::Opencode,
+            HarnessUpdatePhase::Failed,
+        )
+        .await;
+        assert!(
+            temp.path().join("b/full-check-reached").exists(),
+            "check got execution admission after refusal"
+        );
+        assert!(!registry.update_pending(HarnessId::Opencode));
+        for dir in ["a", "b"] {
+            assert!(!temp.path().join(dir).join("installer-ran").exists());
+        }
+        coordinator.shutdown().await;
+    }
+
+    /// U1: a timed-out updater keeps a bounded, redacted tail of what it
+    /// printed, and names the timeout; the policy itself is unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn updater_timeout_reports_bounded_redacted_partial_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("omp");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nfor i in $(seq 1 2000); do echo \"progress line $i\"; done\necho 'Authorization: Bearer sk-live-SECRETSECRETSECRET' >&2\necho 'downloading omp 2.0.0 (step 3/5)' >&2\nsleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = super::run_command_output(&executable, &["update"], Duration::from_millis(800))
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out after 800ms"), "{error}");
+        assert!(
+            error.contains("last output: downloading omp 2.0.0 (step 3/5)"),
+            "{error}"
+        );
+        assert!(!error.contains("SECRET"), "{error}");
+        assert!(error.len() < 1024, "bounded: {} bytes", error.len());
+
+        // A failing updater's reason is redacted the same way.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho 'fetch https://example.test/omp?token=abc123SECRET failed' >&2\nexit 3\n",
+        )
+        .unwrap();
+        let error = super::run_command_output(&executable, &["update"], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(error.contains("exited with"), "{error}");
+        assert!(!error.contains("abc123SECRET"), "{error}");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -3772,6 +5575,7 @@ esac
             super::lock(&coordinator.inner.cancellations).insert(
                 HarnessId::Grok,
                 super::ActiveUpdate {
+                    external_change: Default::default(),
                     cancel: cancel.clone(),
                     automatic: true,
                     previous_phase: HarnessUpdatePhase::Available,
@@ -4159,6 +5963,7 @@ esac
                 super::lock(&coordinator.inner.cancellations).insert(
                     harness,
                     super::ActiveUpdate {
+                        external_change: Default::default(),
                         cancel: token.clone(),
                         automatic: false,
                         previous_phase: HarnessUpdatePhase::Available,
@@ -4216,6 +6021,7 @@ esac
         super::lock(&coordinator.inner.cancellations).insert(
             HarnessId::ClaudeCode,
             super::ActiveUpdate {
+                external_change: Default::default(),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 automatic: false,
                 previous_phase: HarnessUpdatePhase::Available,

@@ -1201,18 +1201,15 @@ mod tests {
         }
     }
 
-    fn delayed_http_endpoint() -> (
-        u16,
-        std::sync::mpsc::Receiver<&'static str>,
-        std::thread::JoinHandle<()>,
-    ) {
+    fn delayed_http_endpoint() -> (u16, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed listener");
         let port = listener
             .local_addr()
             .expect("delayed listener address")
             .port();
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (stop_replied, start_reply_gate) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
+            let mut start_reply_gate = Some(start_reply_gate);
             let mut responses = Vec::new();
             let mut hook_requests = 0;
             while hook_requests < 2 {
@@ -1271,11 +1268,18 @@ mod tests {
                 }
                 let is_start =
                     String::from_utf8_lossy(&request[header_end..]).contains("\"Start\"");
-                let sender = sender.clone();
+                let start_reply_gate = if is_start {
+                    start_reply_gate.take()
+                } else {
+                    None
+                };
+                let stop_replied = stop_replied.clone();
                 responses.push(std::thread::spawn(move || {
-                    let event = if is_start { "Start" } else { "Stop" };
-                    if is_start {
-                        std::thread::sleep(Duration::from_millis(200));
+                    // Invert replies causally, not by assuming Stop starts
+                    // within a fixed sleep while the rest of the suite runs.
+                    if let Some(gate) = start_reply_gate {
+                        gate.recv_timeout(Duration::from_secs(2))
+                            .expect("Stop must reply before Start is released");
                     }
                     let body = r#"{"ok":true}"#;
                     write!(
@@ -1284,14 +1288,16 @@ mod tests {
                         body.len()
                     )
                     .expect("write delayed response");
-                    sender.send(event).expect("send response order");
+                    if !is_start {
+                        stop_replied.send(()).expect("release Start reply");
+                    }
                 }));
             }
             for response in responses {
                 response.join().expect("join delayed response");
             }
         });
-        (port, receiver, thread)
+        (port, thread)
     }
 
     #[test]
@@ -1509,7 +1515,7 @@ mod tests {
         unpeel_core::integrations::install_runtime_support("omp")
             .expect("install current OMP notifier");
         let script = unpeel_core::app_paths::app_hooks_root().join("notify-hook.sh");
-        let (port, response_order, listener_thread) = delayed_http_endpoint();
+        let (port, listener_thread) = delayed_http_endpoint();
 
         for event in ["Start", "Stop"] {
             let status = notify_hook_command(
@@ -1531,14 +1537,6 @@ mod tests {
             assert!(status.success());
         }
 
-        assert_eq!(
-            response_order.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "Stop"
-        );
-        assert_eq!(
-            response_order.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "Start"
-        );
         listener_thread.join().expect("join delayed listener");
         let marker: serde_json::Value = serde_json::from_slice(
             &std::fs::read(session_dir.join("last-hook-event.json")).expect("last marker"),
