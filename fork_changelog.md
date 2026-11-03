@@ -2,6 +2,12 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-03: v1.0.16
+
+- Branch e projetos próximos na sidebar, sem coluna vazia entre os rótulos.
+- Falha na geração automática não grava um título definitivo nem bloqueia uma tentativa normal posterior; títulos existentes são preservados.
+- Título superior com rótulo compacto das menções, sem expor o caminho completo.
+
 ## 2026-11-03 — Metadata e títulos de Chats
 
 - A branch curta fica junto aos projetos trabalhados na sidebar; branches longas preservam espaço para projetos e PR.
