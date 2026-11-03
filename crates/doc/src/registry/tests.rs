@@ -278,6 +278,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         last_seen_at: None,
         room_gen: None,
         origin_chat_id: None,
+        worked_projects: None,
     }
 }
 
@@ -425,6 +426,168 @@ fn rows_round_trip_and_upsert_refreshes() {
     assert_eq!(chats.len(), 1);
     assert_eq!(chats[0].title, None);
     assert_eq!(chats[0].last_message_preview.as_deref(), Some("hello"));
+}
+
+#[test]
+fn worked_projects_survive_registry_round_trip_and_unrelated_edit() {
+    let mut doc = RegistryDoc::new("dev-a");
+    let mut value = serde_json::to_value(chat("chat-1", "dev-a")).unwrap();
+    value["workedProjects"] = json!({
+        "projectIds": ["space-comet", "space-bops"],
+        "complete": false
+    });
+    let row = serde_json::from_value(value).unwrap();
+    doc.upsert_chat(&row).unwrap();
+
+    let mut read = doc.read_chats().unwrap().pop().unwrap();
+    read.title = Some("renamed".into());
+    doc.upsert_chat(&read).unwrap();
+    let read = serde_json::to_value(doc.read_chats().unwrap().pop().unwrap()).unwrap();
+    assert_eq!(read["title"], json!("renamed"));
+    assert_eq!(
+        read["workedProjects"],
+        json!({"projectIds": ["space-comet", "space-bops"], "complete": false})
+    );
+}
+
+#[test]
+fn worked_projects_malformed_metadata_keeps_chat_and_known_ids() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    doc.write(
+        KIND_CHATS,
+        "chat-1",
+        OpKind::Update,
+        fields([(
+            "workedProjects",
+            json!({"projectIds":["known"],"complete":true,"historyVersion":"bad"}),
+        )]),
+    );
+    let row = doc
+        .read_chats()
+        .unwrap()
+        .pop()
+        .expect("Chat must remain visible");
+    let summary = row.worked_projects.unwrap();
+    assert_eq!(summary.project_ids, ["known"]);
+    assert!(!summary.complete);
+    assert!(summary.history_version.is_none());
+    doc.write(
+        KIND_CHATS,
+        "chat-1",
+        OpKind::Update,
+        fields([("workedProjects", json!("bad"))]),
+    );
+    assert!(
+        doc.read_chats()
+            .unwrap()
+            .pop()
+            .expect("Chat must remain visible")
+            .worked_projects
+            .is_none()
+    );
+}
+
+#[test]
+fn worked_projects_field_update_keeps_adjacent_chat_data() {
+    let mut doc = RegistryDoc::new("dev-a");
+    let mut original = chat("chat-1", "dev-a");
+    original.source_context = Some(zeron_proto::ConversationSourceContext {
+        checkout_id: "checkout".into(),
+        repo_root: "/repo".into(),
+        cwd: "/repo/worktree".into(),
+        branch: "feature".into(),
+        head_sha: Some("abc123".into()),
+        observed_at: ts(400_000),
+    });
+    doc.upsert_chat(&original).unwrap();
+    assert!(
+        doc.chat("chat-1")
+            .unwrap()
+            .unwrap()
+            .worked_projects
+            .is_none()
+    );
+    doc.write(
+        KIND_CHATS,
+        "chat-1",
+        OpKind::Update,
+        fields([("updatedAt", json!("2026-01-02T03:04:05Z"))]),
+    );
+    let updated_at = doc
+        .overlay_row(KIND_CHATS, "chat-1")
+        .unwrap()
+        .fields
+        .get("updatedAt")
+        .cloned();
+    let summary = zeron_proto::ChatWorkedProjects {
+        project_ids: vec!["space-comet".into()],
+        complete: false,
+        history_version: Some(vec![1, 2, 3]),
+    };
+    assert!(doc.set_chat_worked_projects("chat-1", &summary).unwrap());
+    assert_eq!(
+        doc.overlay_row(KIND_CHATS, "chat-1")
+            .unwrap()
+            .fields
+            .get("updatedAt")
+            .cloned(),
+        updated_at
+    );
+    let mut expected = original;
+    expected.worked_projects = Some(summary.clone());
+    assert_eq!(doc.read_chats().unwrap(), vec![expected]);
+    let empty_partial = zeron_proto::ChatWorkedProjects {
+        project_ids: vec![],
+        complete: false,
+        history_version: None,
+    };
+    doc.set_chat_worked_projects("chat-1", &empty_partial)
+        .unwrap();
+    let partial = doc
+        .chat("chat-1")
+        .unwrap()
+        .unwrap()
+        .worked_projects
+        .unwrap();
+    let empty_complete = zeron_proto::ChatWorkedProjects {
+        complete: true,
+        ..empty_partial
+    };
+    doc.set_chat_worked_projects("chat-1", &empty_complete)
+        .unwrap();
+    let complete = doc
+        .chat("chat-1")
+        .unwrap()
+        .unwrap()
+        .worked_projects
+        .unwrap();
+    assert!(!partial.complete && complete.complete);
+    assert!(!doc.set_chat_worked_projects("missing", &summary).unwrap());
+}
+
+#[test]
+fn worked_projects_stale_full_chat_upsert_keeps_newer_summary() {
+    let mut doc = RegistryDoc::new("dev-a");
+    let old = zeron_proto::ChatWorkedProjects {
+        project_ids: vec!["old".into()],
+        complete: false,
+        history_version: Some(vec![1]),
+    };
+    let new = zeron_proto::ChatWorkedProjects {
+        project_ids: vec!["new".into()],
+        complete: true,
+        history_version: Some(vec![2]),
+    };
+    let mut stale = chat("chat-1", "dev-a");
+    stale.worked_projects = Some(old);
+    doc.upsert_chat(&stale).unwrap();
+    doc.set_chat_worked_projects("chat-1", &new).unwrap();
+    stale.title = Some("unrelated edit".into());
+    doc.upsert_chat(&stale).unwrap();
+    let current = doc.chat("chat-1").unwrap().unwrap();
+    assert_eq!(current.title.as_deref(), Some("unrelated edit"));
+    assert_eq!(current.worked_projects, Some(new));
 }
 
 #[test]

@@ -528,6 +528,7 @@ mod tests {
                     "now".into(),
                     "Project".into(),
                     None,
+                    Vec::new(),
                     Some(zeron_proto::ChangeRequestSummary {
                         provider: "github".into(),
                         number: 90,

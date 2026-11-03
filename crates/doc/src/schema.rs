@@ -647,6 +647,21 @@ impl SessionDoc {
     /// whole transcript — one bad entry took down every publish for the chat
     /// (2026-07-31, "missing field `id`" during a multi-update import).
     pub fn read_entries(&self) -> Result<Vec<SessionMessageEntry>, DocError> {
+        self.read_entries_inner::<false>()
+            .map(|(entries, _)| entries)
+    }
+
+    /// Read the same tolerant transcript while reporting whether every assistant
+    /// part that could carry a tool call survived decoding.
+    pub fn read_entries_for_attribution(
+        &self,
+    ) -> Result<(Vec<SessionMessageEntry>, bool), DocError> {
+        self.read_entries_inner::<true>()
+    }
+
+    fn read_entries_inner<const TRACK_ATTRIBUTION: bool>(
+        &self,
+    ) -> Result<(Vec<SessionMessageEntry>, bool), DocError> {
         // Materialize only the messages container — a whole-doc deep value
         // here also serialized the commands ledger on every 120ms commit tick.
         let messages = self
@@ -655,20 +670,60 @@ impl SessionDoc {
             .get_deep_value()
             .to_json_value();
         let raw: Vec<serde_json::Value> = serde_json::from_value(messages)?;
-        Ok(raw
+        let mut complete = true;
+        let entries = raw
             .into_iter()
-            .filter_map(|v| match entry_from_json(v) {
-                Ok(entry) => Some(entry),
-                Err(err) => {
-                    tracing::warn!(
-                        chat = %self.chat_id().unwrap_or_default(),
-                        error = %err,
-                        "skipping unsalvageable transcript entry"
-                    );
+            .filter_map(|v| {
+                let raw_parts = if TRACK_ATTRIBUTION {
+                    v.get("parts")
+                        .and_then(|parts| parts.as_array())
+                        .map(|parts| {
+                            let mut tools = 0;
+                            let mut recognized = true;
+                            for part in parts {
+                                match part.get("kind").and_then(|kind| kind.as_str()) {
+                                    Some("tool") => tools += 1,
+                                    Some(
+                                        "text" | "reasoning" | "image" | "visual" | "input"
+                                        | "error" | "workflowTask" | "fork" | "switch",
+                                    ) if part.get("call").is_none() => {}
+                                    _ => recognized = false,
+                                }
+                            }
+                            (recognized, tools, parts.len())
+                        })
+                } else {
                     None
+                };
+                match entry_from_json(v) {
+                    Ok(entry) => {
+                        if TRACK_ATTRIBUTION && entry.role == MessageRole::Assistant {
+                            complete &= raw_parts.is_some_and(|(recognized, tools, count)| {
+                                recognized
+                                    && count == entry.parts.len()
+                                    && tools
+                                        == entry
+                                            .parts
+                                            .iter()
+                                            .filter(|part| matches!(part, MessagePart::Tool { .. }))
+                                            .count()
+                            });
+                        }
+                        Some(entry)
+                    }
+                    Err(err) => {
+                        complete = false;
+                        tracing::warn!(
+                            chat = %self.chat_id().unwrap_or_default(),
+                            error = %err,
+                            "skipping unsalvageable transcript entry"
+                        );
+                        None
+                    }
                 }
             })
-            .collect())
+            .collect();
+        Ok((entries, complete))
     }
 
     /// Read a bounded suffix directly from the containers, without expanding

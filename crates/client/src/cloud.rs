@@ -692,6 +692,7 @@ impl Client {
             space_id: Some(space_id.to_owned()),
             last_seen_at: None,
             origin_chat_id: None,
+            worked_projects: None,
             room_gen: Some(2),
             parent_chat_id: None,
         };

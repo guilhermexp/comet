@@ -187,6 +187,7 @@ rpc_methods! {
     /// the sending thumbnail's percent-ring feed. No params; IPC-only.
     WATCH_TRANSFERS / WatchTransfers = "WatchTransfers" { params: serde_json::Value, reply: serde_json::Value },
     WATCH_CHATS / WatchChats = "WatchChats" { params: serde_json::Value, reply: serde_json::Value },
+    ENSURE_CHAT_WORKED_PROJECTS / EnsureChatWorkedProjects = "EnsureChatWorkedProjects" { params: zeron_proto::EnsureChatWorkedProjectsParams, reply: (), forwardable: true },
     WATCH_DEVICES / WatchDevices = "WatchDevices" { params: serde_json::Value, reply: serde_json::Value },
     WATCH_PROJECT_SKILL_USAGE / WatchProjectSkillUsage = "WatchProjectSkillUsage" { params: zeron_proto::skill_usage::WatchProjectSkillUsageParams, reply: zeron_proto::skill_usage::ProjectSkillUsageSnapshot, forwardable: true, stream: true },
     WATCH_SESSIONS / WatchSessions = "WatchSessions" { params: serde_json::Value, reply: serde_json::Value },

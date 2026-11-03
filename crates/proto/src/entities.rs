@@ -191,6 +191,22 @@ pub struct ConversationSourceContext {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Host-derived project identities and causal evidence for the observed history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatWorkedProjects {
+    pub project_ids: Vec<String>,
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_version: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureChatWorkedProjectsParams {
+    pub chat_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
@@ -208,6 +224,8 @@ pub struct Chat {
     /// chat sharing the same checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<ConversationSourceContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worked_projects: Option<ChatWorkedProjects>,
     pub config: Option<ChatConfig>,
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,

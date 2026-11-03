@@ -1,8 +1,7 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
-use zeron_proto::ToolCall;
 use zeron_workers_unpeel::WorkersProject;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,282 +45,47 @@ pub fn worked_projects_viewport_height_px() -> f32 {
     WORKED_PROJECTS_ROW_HEIGHT * WORKED_PROJECTS_VISIBLE_ROWS as f32
 }
 
-struct CandidateRoot<'a> {
-    project: &'a WorkersProject,
-    root: String,
-}
-
 pub fn worked_projects(
     transcript: &[SessionMessageEntry],
     projects: &[WorkersProject],
     own_checkout: &Path,
     home_dir: Option<&Path>,
 ) -> Vec<WorkedProject> {
-    if transcript.is_empty() || projects.is_empty() {
-        return Vec::new();
-    }
-
-    let own_str = own_checkout.to_string_lossy();
-    let own_trimmed = own_str.trim_end_matches('/');
-
-    let all_registered_roots: Vec<CandidateRoot> = projects
+    let candidates: Vec<_> = projects
         .iter()
-        .filter_map(|project| {
-            if project.is_group {
-                return None;
-            }
-            let p_path = project.path.trim();
-            if p_path.is_empty() {
-                return None;
-            }
-            let trimmed = p_path.trim_end_matches('/');
-            if trimmed.is_empty() {
-                return None;
-            }
-            Some(CandidateRoot {
-                project,
-                root: trimmed.to_string(),
-            })
-        })
+        .filter(|project| !project.is_group)
         .collect();
-
-    // Leaf Root filter: drop any candidate root that is a strict ancestor of another registered project root
-    let roots: Vec<&CandidateRoot> = all_registered_roots
+    let roots: Vec<_> = candidates
         .iter()
-        .filter(|cand| {
-            !all_registered_roots
-                .iter()
-                .any(|other| is_strictly_within(&other.root, &cand.root))
-        })
-        .filter(|cand| cand.root != own_trimmed)
+        .map(|project| project.path.as_str())
         .collect();
-
-    if roots.is_empty() {
-        return Vec::new();
-    }
-
-    let mut first_order_by_project_id: HashMap<String, usize> = HashMap::new();
-    let mut order: usize = 0;
-
-    let home_str = home_dir.map(|h| h.to_string_lossy().trim_end_matches('/').to_string());
-
-    for entry in transcript {
-        if first_order_by_project_id.len() == roots.len() {
-            break;
-        }
-        if entry.role != MessageRole::Assistant {
-            continue;
-        }
-        for part in &entry.parts {
-            let MessagePart::Tool { call, .. } = part else {
-                continue;
-            };
-            match call {
-                ToolCall::ReadFile { path }
-                | ToolCall::WriteFile { path, .. }
-                | ToolCall::EditFile { path, .. } => {
-                    consider_path(
-                        path,
-                        home_str.as_deref(),
-                        &roots,
-                        &mut first_order_by_project_id,
-                        &mut order,
-                        false,
-                    );
-                }
-                ToolCall::ApplyPatch { path: Some(path) } => {
-                    consider_path(
-                        path,
-                        home_str.as_deref(),
-                        &roots,
-                        &mut first_order_by_project_id,
-                        &mut order,
-                        false,
-                    );
-                }
-                ToolCall::Search {
-                    path: Some(path), ..
-                } => {
-                    for_each_structured_path(path, |segment| {
-                        consider_path(
-                            segment,
-                            home_str.as_deref(),
-                            &roots,
-                            &mut first_order_by_project_id,
-                            &mut order,
-                            false,
-                        );
-                    });
-                }
-                ToolCall::Glob { pattern } => {
-                    for_each_structured_path(pattern, |segment| {
-                        consider_path(
-                            segment,
-                            home_str.as_deref(),
-                            &roots,
-                            &mut first_order_by_project_id,
-                            &mut order,
-                            false,
-                        );
-                    });
-                }
-                ToolCall::Exec { command } => {
-                    scan_path_tokens(command, |token| {
-                        consider_path(
-                            token,
-                            home_str.as_deref(),
-                            &roots,
-                            &mut first_order_by_project_id,
-                            &mut order,
-                            true,
-                        );
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut matched: Vec<(&CandidateRoot, usize)> = roots
+    let calls = transcript
+        .iter()
+        .filter(|entry| entry.role == MessageRole::Assistant)
+        .flat_map(|entry| entry.parts.iter())
+        .filter_map(|part| match part {
+            MessagePart::Tool { call, .. } => Some(call),
+            _ => None,
+        });
+    let mut seen = HashSet::new();
+    zeron_proto::worked_projects::worked_root_indices(calls, &roots, own_checkout, home_dir)
         .into_iter()
-        .filter_map(|cand| {
-            first_order_by_project_id
-                .get(&cand.project.id)
-                .map(|&ord| (cand, ord))
-        })
-        .collect();
-
-    matched.sort_by_key(|(_, ord)| *ord);
-
-    matched
-        .into_iter()
-        .map(|(cand, _)| WorkedProject {
-            id: cand.project.id.clone(),
-            name: cand.project.name.clone(),
-            path: cand.project.path.clone(),
-            // Same worktree rule as the Workers sidebar/titlebar
-            // (`workers::presentation::workers_titlebar`).
-            branch: crate::workers::presentation::workers_titlebar(Some(cand.project), None)
+        .map(|index| candidates[index])
+        .filter(|project| seen.insert(project.id.as_str()))
+        .map(|project| WorkedProject {
+            id: project.id.clone(),
+            name: project.name.clone(),
+            path: project.path.clone(),
+            branch: crate::workers::presentation::workers_titlebar(Some(project), None)
                 .branch_is_worktree
                 .then(|| {
-                    cand.project
+                    project
                         .change_request_branch()
-                        .unwrap_or(cand.project.name.as_str())
+                        .unwrap_or(project.name.as_str())
                         .to_owned()
                 }),
         })
         .collect()
-}
-
-fn consider_path(
-    raw_path: &str,
-    home_str: Option<&str>,
-    roots: &[&CandidateRoot],
-    first_order_by_project_id: &mut HashMap<String, usize>,
-    order: &mut usize,
-    strip_trailing_punct: bool,
-) {
-    *order += 1;
-    let trimmed = raw_path.trim();
-    let cleaned = if strip_trailing_punct {
-        trimmed
-            .trim_end_matches([')', '.', ',', ';', ':'])
-            .trim_end_matches('/')
-    } else {
-        trimmed.trim_end_matches('/')
-    };
-    if cleaned.is_empty() {
-        return;
-    }
-    // Relative paths are ignored (S5). Only absolute (starting with '/') or home-relative (starting with '~/') count.
-    let path: String = if cleaned.starts_with('/') {
-        cleaned.to_string()
-    } else if cleaned.starts_with("~/") {
-        if let Some(home) = home_str {
-            format!("{}{}", home, &cleaned[1..])
-        } else {
-            // If home_dir is None, discard home-relative path
-            return;
-        }
-    } else {
-        return;
-    };
-
-    for cand in roots {
-        if first_order_by_project_id.contains_key(&cand.project.id) {
-            continue;
-        }
-        if path == cand.root || is_strictly_within(&path, &cand.root) {
-            first_order_by_project_id.insert(cand.project.id.clone(), *order);
-        }
-    }
-}
-
-/// `true` when `path` sits strictly below `root`, on a component boundary.
-///
-/// Boundary-checked so `/a/kanna` never matches the root `/a/kanwas`, and
-/// allocation-free because this runs per (path token × root) on the render path.
-fn is_strictly_within(path: &str, root: &str) -> bool {
-    path.strip_prefix(root)
-        .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// Splits a STRUCTURED path field on the documented `;` multi-root separator.
-///
-/// `Search { path }` and `Glob { pattern }` carry either one exact path or a
-/// `;`-delimited list of roots ("src; tests"), never free prose — so they must
-/// NOT go through [`scan_path_tokens`], which breaks on whitespace and would
-/// truncate a registered project whose folder name contains a space
-/// ("JK Checklist App" -> ".../JK"). Trailing punctuation is likewise kept:
-/// a directory may legitimately end in `)`, as in "Backup (2)".
-fn for_each_structured_path(field: &str, mut on_path: impl FnMut(&str)) {
-    for segment in field.split(';') {
-        let segment = segment.trim();
-        if !segment.is_empty() {
-            on_path(segment);
-        }
-    }
-}
-
-/// Scans path tokens starting with `/` or `~/` in free text without regex.
-///
-/// Tokens begin at `/` or `~/` and end at the first whitespace, `'`, `"`, `` ` ``, or `)`.
-fn scan_path_tokens<'a>(text: &'a str, mut on_token: impl FnMut(&'a str)) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"~/") {
-            let start = i;
-            let mut end = i + 2;
-            while end < bytes.len() {
-                let b = bytes[end];
-                if b.is_ascii_whitespace() || b == b'\'' || b == b'"' || b == b'`' || b == b')' {
-                    break;
-                }
-                end += 1;
-            }
-            if let Ok(token) = std::str::from_utf8(&bytes[start..end]) {
-                on_token(token);
-            }
-            i = end;
-        } else if bytes[i] == b'/' {
-            let start = i;
-            let mut end = i + 1;
-            while end < bytes.len() {
-                let b = bytes[end];
-                if b.is_ascii_whitespace() || b == b'\'' || b == b'"' || b == b'`' || b == b')' {
-                    break;
-                }
-                end += 1;
-            }
-            if let Ok(token) = std::str::from_utf8(&bytes[start..end]) {
-                on_token(token);
-            }
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
 }
 
 #[cfg(test)]

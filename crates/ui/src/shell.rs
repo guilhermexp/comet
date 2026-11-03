@@ -2576,6 +2576,8 @@ pub struct Shell {
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
+    worked_projects_connection: Option<crate::state::EngineHandle>,
+    worked_projects_requested: std::collections::HashSet<(String, String)>,
     /// The jump-hint overlay is visible while the held modifiers exactly
     /// match a jump shortcut. Window deactivation clears it.
     pub(super) jump_hints: bool,
@@ -3389,6 +3391,8 @@ impl Shell {
             pinned_open: true,
             sessions_open: true,
             archived_shown: 0,
+            worked_projects_connection: None,
+            worked_projects_requested: std::collections::HashSet::new(),
             jump_hints: false,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
@@ -3681,6 +3685,7 @@ impl Shell {
         self.prune_file_explorers(cx);
         self.refresh_harness_update_watch(cx);
         self.sync_search_warm(cx);
+        self.refresh_sidebar_worked_projects(cx);
         if state.read(cx).engine().is_none() {
             self.side_chats.clear();
             self.side_chat_creating = false;
@@ -4411,6 +4416,7 @@ impl Shell {
         }
         self.sidebar_tween = Some(self.panel_tween(from, self.sidebar_target()));
         self.schedule_save(cx);
+        self.refresh_sidebar_worked_projects(cx);
         self.resplit_panels(before, None, cx);
         cx.notify();
     }
@@ -6615,6 +6621,7 @@ impl Shell {
     fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
         self.command_palette = None;
         let was_pull_requests = matches!(self.route, Route::PullRequests);
+        let was_settings = matches!(self.route, Route::Settings(_));
         let will_show_pull_requests = matches!(route, Route::PullRequests);
         if was_pull_requests && !will_show_pull_requests {
             if let Some(page) = self.pull_requests_page.as_ref().cloned() {
@@ -6622,6 +6629,9 @@ impl Shell {
             }
         }
         self.route = route;
+        if was_settings && !matches!(route, Route::Settings(_)) {
+            self.refresh_sidebar_worked_projects(cx);
+        }
         if !was_pull_requests && will_show_pull_requests {
             if let Some(page) = self.pull_requests_page.as_ref().cloned() {
                 page.update(cx, |page, cx| page.on_visible(cx));
@@ -7316,6 +7326,7 @@ impl Shell {
                 }
             }
         }
+        self.refresh_sidebar_worked_projects(cx);
         cx.notify();
     }
 
@@ -11046,6 +11057,7 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
+        worked_projects: Vec<String>,
         change_request: Option<zeron_proto::ChangeRequestSummary>,
         harness: Option<zeron_proto::HarnessId>,
         status: zeron_proto::ChatIndicator,
@@ -11154,7 +11166,9 @@ impl Shell {
                 zeron_proto::ChatIndicator::Idle => None,
             }
         };
-        let shows_metadata = branch.is_some() || change_request.is_some();
+        let shows_metadata =
+            branch.is_some() || !worked_projects.is_empty() || change_request.is_some();
+        let has_worked_projects = !worked_projects.is_empty();
         let queued = queued && !undelivered;
         let working = status == zeron_proto::ChatIndicator::Working && !queued && !undelivered;
         // Subagents running under this chat show as a "● N" pill beside the
@@ -11455,7 +11469,7 @@ impl Shell {
             .h(px(sidebar_row_height(
                 compact,
                 show_label,
-                branch.is_some(),
+                branch.is_some() || has_worked_projects,
                 change_request.is_some(),
             )))
             .flex()
@@ -11856,7 +11870,7 @@ impl Shell {
                             )
                             .child(sidebar_faded_label(
                                 format!("chat-branch-{content_id}").into(),
-                                false,
+                                has_worked_projects,
                                 div()
                                     .text_size(px(11.0))
                                     .line_height(px(14.0))
@@ -11864,9 +11878,56 @@ impl Shell {
                                     .child(popover::search_highlight(branch, search_query, theme)),
                             ))
                         })
-                        // Stable invisible spring keeps the optional PR badge
-                        // pinned right without changing no-PR paint.
-                        .child(div().flex_1().min_w_0())
+                        .when(has_worked_projects, |el| {
+                            let tooltip = worked_projects.join(" · ");
+                            let labels = worked_projects
+                                .into_iter()
+                                .map(|name| {
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(3.0))
+                                        .child(
+                                            icon(icons::FOLDER)
+                                                .size(px(11.0))
+                                                .flex_none()
+                                                .text_color(subline),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .line_height(px(14.0))
+                                                .text_color(subline)
+                                                .child(name),
+                                        )
+                                })
+                                .collect::<Vec<_>>();
+                            el.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "chat-worked-projects-tooltip-{content_id}"
+                                    )))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .tooltip(crate::settings::widgets::text_tooltip(tooltip))
+                                    .child(sidebar_faded_label(
+                                        format!("chat-worked-projects-{content_id}").into(),
+                                        true,
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(5.0))
+                                            .children(labels),
+                                    )),
+                            )
+                        })
+                        // The labels already grow to pin the PR badge right.
+                        // A second spring would waste their available width.
+                        .when(!has_worked_projects, |el| {
+                            el.child(div().flex_1().min_w_0())
+                        })
                         .when_some(change_request, |el, summary| {
                             el.child(if preview {
                                 crate::change_requests::pull_request_badge_preview(
@@ -17017,6 +17078,7 @@ mod tests {
             room_gen: None,
             parent_chat_id: None,
             origin_chat_id: None,
+            worked_projects: None,
         }
     }
 
@@ -20551,6 +20613,7 @@ mod exit_regressions {
                         last_seen_at: None,
                         room_gen: None,
                         origin_chat_id: None,
+                        worked_projects: None,
                     }]);
                     state.select_space(Some("mine".into()), cx);
                 });

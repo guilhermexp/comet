@@ -793,6 +793,7 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     harness_updates: Option<crate::harness_updates::HarnessUpdateCoordinator>,
+    worked_projects: Option<crate::worked_projects::WorkedProjectsSync>,
     local_import: Option<crate::local_import::LocalImporter>,
     run_journal: Option<Arc<RunJournal>>,
     /// Cloud runner only: vault grants (ListGithubRepos, credentialed CloneRepo).
@@ -856,6 +857,7 @@ impl EngineRpc {
             links: None,
             updater: None,
             harness_updates: None,
+            worked_projects: None,
             local_import: None,
             run_journal: None,
             credentials: None,
@@ -923,6 +925,14 @@ impl EngineRpc {
         coordinator: crate::harness_updates::HarnessUpdateCoordinator,
     ) -> Self {
         self.harness_updates = Some(coordinator);
+        self
+    }
+
+    pub fn with_worked_projects(
+        mut self,
+        service: crate::worked_projects::WorkedProjectsSync,
+    ) -> Self {
+        self.worked_projects = Some(service);
         self
     }
 
@@ -3407,6 +3417,18 @@ impl RpcService for EngineRpc {
                         p.catalog,
                     ),
                 ))
+            }
+            methods::ENSURE_CHAT_WORKED_PROJECTS => {
+                let p: zeron_proto::EnsureChatWorkedProjectsParams = parse_params(params)?;
+                let service = self
+                    .worked_projects
+                    .clone()
+                    .ok_or_else(|| RpcError::Failed("worked project service unavailable".into()))?;
+                tokio::task::spawn_blocking(move || service.ensure(&p.chat_ids))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&())
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))

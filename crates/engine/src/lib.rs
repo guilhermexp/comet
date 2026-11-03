@@ -62,6 +62,7 @@ pub mod titles;
 mod transcript_history;
 pub mod uploads;
 pub mod voice;
+pub mod worked_projects;
 pub mod workspace_files;
 pub mod workspace_host;
 pub mod workspace_search;
@@ -168,6 +169,7 @@ pub struct EngineCore {
     pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
+    pub worked_projects: worked_projects::WorkedProjectsSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
@@ -383,6 +385,12 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let worked_projects = worked_projects::WorkedProjectsSync::start(
+            doc_host.clone(),
+            workspace.clone(),
+            &sessions,
+            &device_id,
+        );
         Ok(Self {
             sessions,
             doc_host,
@@ -397,6 +405,7 @@ impl EngineCore {
             change_requests,
             diff_sync,
             spaces_sync,
+            worked_projects,
             uploads,
             agent_accounts,
             harness_updates,
@@ -551,6 +560,7 @@ impl EngineCore {
         .with_previews(self.previews.clone())
         .with_remote_terminals(self.remote_terminals.clone())
         .with_harness_updates(self.harness_updates.clone())
+        .with_worked_projects(self.worked_projects.clone())
         .with_viewport_focus(self.viewport_focus.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
@@ -659,6 +669,7 @@ impl EngineCore {
         self.diff_sync.shutdown().await;
         self.workspace_files.shutdown().await;
         self.spaces_sync.shutdown().await;
+        self.worked_projects.shutdown().await;
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();

@@ -583,6 +583,7 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             origin_chat_id: None,
+            worked_projects: None,
         }
     }
 
