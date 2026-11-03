@@ -10,12 +10,10 @@
 //!    restricted title entry point (isolated cwd, read-only, no tools),
 //!    retrying on zeron's short backoff ladder under one shared wall-clock
 //!    budget ([`crate::recap::with_retry_budget`], so a wedged agent cannot
-//!    hang titling forever); fall back to the prompt's first words when every
-//!    attempt produces nothing;
-//! 4. re-check the title (a user rename during generation wins);
+//!    hang titling forever); leave the chat untitled if no attempt succeeds;
+//! 4. atomically apply only if the chat still exists and remains untitled;
 //! 5. when the chat sits in a zeron worktree (`zeron/<name>` branch), rename the
-//!    branch from the title and update the chat's branch row;
-//! 6. `rename_chat` in the workspace doc.
+//!    branch from the title and update the chat's branch row.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -101,24 +99,21 @@ impl TitleGenerator {
             return Ok(()); // already named
         }
 
-        let generated = self.run_title_model(chat_id, harness_id, prompt, cwd).await;
-        // Fallback so a chat is always named even if the model run produced nothing.
-        let fallback = fallback_title(prompt);
-        let title = generated.unwrap_or(fallback);
-        if title.is_empty() {
+        let Some(title) = self.run_title_model(chat_id, harness_id, prompt, cwd).await else {
             return Ok(());
-        }
-
-        // Re-read after the model call: a user may have named the chat or checked
-        // out another branch while the throwaway generation was live.
-        let latest = self.inner.workspace.chat(chat_id)?.unwrap_or(chat);
-        if latest
-            .title
-            .as_deref()
-            .is_some_and(|t| !t.trim().is_empty())
+        };
+        if !self
+            .inner
+            .workspace
+            .rename_chat_if_untitled(chat_id, &title)?
         {
             return Ok(());
         }
+
+        // Checkout metadata may have changed while generation was in flight.
+        let Some(latest) = self.inner.workspace.chat(chat_id)? else {
+            return Ok(());
+        };
 
         // Rename the worktree branch when the chat still sits on its original
         // zeron/<name> branch (guards live inside rename_worktree_branch).
@@ -143,7 +138,6 @@ impl TitleGenerator {
             }
         }
 
-        self.inner.workspace.rename_chat(chat_id, &title)?;
         tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
         Ok(())
     }
@@ -371,45 +365,6 @@ fn generation_rank(id: &str) -> (Vec<u32>, bool) {
     (version, !dated)
 }
 
-/// The first words of `prompt`, capped near 48 visible chars. A mention link
-/// (`[label](zeron-…)`) is one word whose width is its label, and it is kept
-/// whole or dropped: a cut link shows as raw markdown in the sidebar.
-fn fallback_title(prompt: &str) -> String {
-    const WORDS: usize = 7;
-    const CHARS: usize = 48;
-    let mut words: Vec<&str> = Vec::new();
-    let mut visible = 0usize;
-    let mut rest = prompt.trim_start();
-    while words.len() < WORDS && !rest.is_empty() {
-        let (word, label_len, len) = match mention_link_len(rest) {
-            Some((len, label_len)) => (&rest[..len], label_len, len),
-            None => {
-                let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                (&rest[..len], rest[..len].chars().count(), len)
-            }
-        };
-        let gap = usize::from(!words.is_empty());
-        if visible + gap + label_len > CHARS {
-            if words.is_empty() && mention_link_len(rest).is_none() {
-                // A single overlong word still names the chat.
-                words.push(&rest[..rest.char_indices().nth(CHARS).map_or(len, |(i, _)| i)]);
-            }
-            break;
-        }
-        visible += gap + label_len;
-        words.push(word);
-        rest = rest[len..].trim_start();
-    }
-    words.join(" ")
-}
-
-/// Byte length and label char count of a mention link at the start of `text`.
-fn mention_link_len(text: &str) -> Option<(usize, usize)> {
-    let label_end = text.strip_prefix('[')?.find("](zeron-")? + 1;
-    let close = text[label_end..].find(')')? + label_end;
-    Some((close + 1, text[1..label_end].chars().count()))
-}
-
 /// First line, stripped of quote/heading dressing, capped at 60 chars.
 fn clean_title(raw: &str) -> String {
     let first = raw.trim().lines().next().unwrap_or("");
@@ -484,26 +439,6 @@ async fn collect_text(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn fallback_title_keeps_mention_links_whole() {
-        let prompt = "qual situacao do [infisical-fork](zeron-project:/Users/me/code/infisical-fork) hoje e amanha";
-        assert_eq!(
-            super::fallback_title(prompt),
-            "qual situacao do [infisical-fork](zeron-project:/Users/me/code/infisical-fork) hoje e amanha"
-        );
-        let image = "[Image 1](zeron-image:1) é impressao minha ou o layout quebrou de vez aqui";
-        let title = super::fallback_title(image);
-        assert!(title.starts_with("[Image 1](zeron-image:1) é"));
-        // 41 visible chars of words leave no room for a 12-char label: the
-        // link is dropped whole rather than cut.
-        let tight = "palavra palavra palavra palavra palavra x [long-project](zeron-project:/x)";
-        assert_eq!(
-            super::fallback_title(tight),
-            "palavra palavra palavra palavra palavra x"
-        );
-        assert_eq!(super::fallback_title("a b c d e f g h"), "a b c d e f g");
-        assert_eq!(super::fallback_title(&"x".repeat(60)).chars().count(), 48);
-    }
 
     #[tokio::test]
     async fn tool_use_rejects_the_title_instead_of_accepting_coding_output() {
@@ -548,7 +483,11 @@ mod tests {
         );
     }
 
-    struct RecordingTitleHarness(std::sync::Mutex<Vec<RunRequest>>);
+    struct RecordingTitleHarness(
+        std::sync::Mutex<Vec<RunRequest>>,
+        std::sync::atomic::AtomicBool,
+        Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
+    );
 
     #[async_trait::async_trait]
     impl zeron_harness::Harness for RecordingTitleHarness {
@@ -590,9 +529,17 @@ mod tests {
         > {
             assert!(std::path::Path::new(&request.cwd).is_dir());
             self.0.lock().unwrap().push(request);
+            if let Some((started, release)) = &self.2 {
+                started.add_permits(1);
+                release.acquire().await.unwrap().forget();
+            }
             Ok(futures::stream::iter(vec![
                 Ok(AgentEvent::TextDelta {
-                    text: "Fix Login Flow".into(),
+                    text: if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                        String::new()
+                    } else {
+                        "Fix Login Flow".into()
+                    },
                 }),
                 Ok(AgentEvent::Done {
                     status: DoneStatus::Completed,
@@ -609,7 +556,11 @@ mod tests {
     async fn configured_title_harness_and_model_run_outside_the_project() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(HarnessRegistry::new());
-        let recorder = Arc::new(RecordingTitleHarness(Default::default()));
+        let recorder = Arc::new(RecordingTitleHarness(
+            Default::default(),
+            Default::default(),
+            None,
+        ));
         registry.register(recorder.clone());
         let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
             .unwrap();
@@ -654,6 +605,210 @@ mod tests {
                     .contains(&serde_json::to_string(prompt).unwrap())
             );
         }
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn automatic_title_failure_does_not_block_later_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        let recorder = Arc::new(RecordingTitleHarness(
+            Default::default(),
+            std::sync::atomic::AtomicBool::new(true),
+            None,
+        ));
+        registry.register(recorder.clone());
+        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
+            .unwrap();
+        registry
+            .set_title_settings(crate::registry::TitleSettings {
+                harness: Some(HarnessId::ClaudeCode),
+                model: Some("chosen-title-model".into()),
+            })
+            .unwrap();
+        core.workspace
+            .create_chat("title-test", None, Some(&core.device_id), None, None)
+            .unwrap();
+        let checkout = dir.path().join("fixture-checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&checkout)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "zeron/fixture-checkout"]);
+        core.workspace
+            .set_chat_cwd("title-test", checkout.to_str().unwrap())
+            .unwrap();
+        core.workspace
+            .set_chat_branch("title-test", "zeron/fixture-checkout")
+            .unwrap();
+        let generator = TitleGenerator::new(core.workspace.clone(), registry, core.repos.clone());
+        generator
+            .generate("title-test", HarnessId::Codex, "Repair login", "")
+            .await
+            .unwrap();
+        assert!(
+            core.workspace
+                .chat("title-test")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref()
+                .is_none_or(|title| title.trim().is_empty()),
+            "failed generation must not persist prompt words"
+        );
+        assert_eq!(git(&["branch", "--show-current"]), "zeron/fixture-checkout");
+        recorder.1.store(false, std::sync::atomic::Ordering::SeqCst);
+        generator
+            .generate("title-test", HarnessId::Codex, "Repair login", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            core.workspace
+                .chat("title-test")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Fix Login Flow")
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn automatic_title_preserves_manual_legacy_and_deleted_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let recorder = Arc::new(RecordingTitleHarness(
+            Default::default(),
+            Default::default(),
+            Some((started.clone(), release.clone())),
+        ));
+        registry.register(recorder.clone());
+        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
+            .unwrap();
+        registry
+            .set_title_settings(crate::registry::TitleSettings {
+                harness: Some(HarnessId::ClaudeCode),
+                model: Some("chosen-title-model".into()),
+            })
+            .unwrap();
+        for id in ["manual", "legacy", "pending", "deleted"] {
+            core.workspace
+                .create_chat(id, None, Some(&core.device_id), None, None)
+                .unwrap();
+        }
+        core.workspace.rename_chat("manual", "My title").unwrap();
+        core.workspace
+            .rename_chat("legacy", "Repair login")
+            .unwrap();
+        let generator = TitleGenerator::new(core.workspace.clone(), registry, core.repos.clone());
+        for id in ["manual", "legacy"] {
+            generator
+                .generate(id, HarnessId::Codex, "Repair login", "")
+                .await
+                .unwrap();
+        }
+        assert!(
+            recorder.0.lock().unwrap().is_empty(),
+            "existing names must not invoke the model"
+        );
+        for id in ["pending", "deleted"] {
+            let generator = generator.clone();
+            let task = tokio::spawn(async move {
+                generator
+                    .generate(id, HarnessId::Codex, "Repair login", "")
+                    .await
+            });
+            started.acquire().await.unwrap().forget();
+            if id == "pending" {
+                core.workspace.rename_chat(id, "User wins").unwrap();
+            } else {
+                core.workspace.delete_chat(id).unwrap();
+            }
+            release.add_permits(1);
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            core.workspace
+                .chat("manual")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("My title")
+        );
+        assert_eq!(
+            core.workspace
+                .chat("legacy")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Repair login")
+        );
+        assert_eq!(
+            core.workspace
+                .chat("pending")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("User wins")
+        );
+        assert!(core.workspace.chat("deleted").unwrap().is_none());
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rename_chat_if_untitled_guards_missing_and_named_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        let core =
+            crate::EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None).unwrap();
+        let workspace = &core.workspace;
+        assert!(
+            !workspace
+                .rename_chat_if_untitled("missing", "Generated")
+                .unwrap()
+        );
+        assert!(workspace.chat("missing").unwrap().is_none());
+        workspace
+            .create_chat("chat", None, Some(&core.device_id), None, None)
+            .unwrap();
+        workspace.rename_chat("chat", "  ").unwrap();
+        assert!(
+            workspace
+                .rename_chat_if_untitled("chat", "Generated")
+                .unwrap()
+        );
+        assert!(
+            !workspace
+                .rename_chat_if_untitled("chat", "Replacement")
+                .unwrap()
+        );
+        assert_eq!(
+            workspace.chat("chat").unwrap().unwrap().title.as_deref(),
+            Some("Generated")
+        );
+        workspace.delete_chat("chat").unwrap();
+        assert!(
+            !workspace
+                .rename_chat_if_untitled("chat", "Replacement")
+                .unwrap()
+        );
+        assert!(workspace.chat("chat").unwrap().is_none());
         core.shutdown().await;
     }
 

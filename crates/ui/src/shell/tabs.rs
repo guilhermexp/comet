@@ -294,7 +294,9 @@ impl Shell {
             match state.selected_chat_row() {
                 Some(chat) => (
                     SharedString::from(transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        &crate::composer::title_mention_plain(
+                            chat.title.as_deref().unwrap_or("New session"),
+                        ),
                     )),
                     chat.config.as_ref().map(|c| c.harness),
                     false,
@@ -577,6 +579,7 @@ impl Shell {
                         )
                         .child(
                             div()
+                                .debug_selector(|| "chat-title-bar-text".into())
                                 .min_w_0()
                                 .truncate()
                                 .text_size(px(12.0))

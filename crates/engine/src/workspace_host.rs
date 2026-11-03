@@ -1466,6 +1466,26 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.rename_chat(chat_id, title))?)
     }
 
+    pub(crate) fn rename_chat_if_untitled(
+        &self,
+        chat_id: &str,
+        title: &str,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| {
+            let Some(chat) = doc.chat(chat_id)? else {
+                return Ok(false);
+            };
+            if chat
+                .title
+                .as_deref()
+                .is_some_and(|title| !title.trim().is_empty())
+            {
+                return Ok(false);
+            }
+            doc.rename_chat(chat_id, title)
+        })?)
+    }
+
     /// Backdate a chat's activity timestamps (epoch ms). Returns false when
     /// the chat doesn't exist.
     pub fn set_chat_activity(

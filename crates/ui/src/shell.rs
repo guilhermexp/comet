@@ -11868,15 +11868,24 @@ impl Shell {
                                     .flex_none()
                                     .text_color(subline),
                             )
-                            .child(sidebar_faded_label(
-                                format!("chat-branch-{content_id}").into(),
-                                has_worked_projects,
+                            .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .line_height(px(14.0))
-                                    .text_color(subline)
-                                    .child(popover::search_highlight(branch, search_query, theme)),
-                            ))
+                                    .min_w_0()
+                                    .when(has_worked_projects, |el| el.max_w(gpui::relative(0.5)))
+                                    .child(sidebar_faded_label(
+                                        format!("chat-branch-{content_id}").into(),
+                                        false,
+                                        div()
+                                            .text_size(px(11.0))
+                                            .line_height(px(14.0))
+                                            .text_color(subline)
+                                            .child(popover::search_highlight(
+                                                branch,
+                                                search_query,
+                                                theme,
+                                            )),
+                                    )),
+                            )
                         })
                         .when(has_worked_projects, |el| {
                             let tooltip = worked_projects.join(" · ");
@@ -18864,6 +18873,37 @@ pub fn test_shell(
     let workers = cx.new(|cx| WorkersModel::detached(state.clone(), cx));
     #[cfg(not(test))]
     let workers = cx.new(|cx| WorkersModel::new(state.clone(), cx));
+    if !cx.has_global::<WorkersResourceGlobal>() {
+        let monitor = cx.new(|cx| WorkersResourceMonitor::new(workers.clone(), cx));
+        cx.set_global(WorkersResourceGlobal { monitor });
+    }
+    Shell::new(state, boot, workers, cx)
+}
+
+/// Synthetic native fixture shell; never starts a Workers refresh or engine.
+#[cfg(feature = "appshots-fixture")]
+#[doc(hidden)]
+pub fn detached_fixture_shell(
+    state: Entity<AppState>,
+    boot: EngineBootConfig,
+    cx: &mut Context<Shell>,
+) -> Shell {
+    use crate::workers::resource_monitor::{WorkersResourceGlobal, WorkersResourceMonitor};
+    let workers = cx.new(|cx| {
+        let mut model = WorkersModel::detached(state.clone(), cx);
+        model.settings = Some(zeron_workers_unpeel::WorkersSettingsSnapshot {
+            presets: Vec::new(),
+            runtimes: Vec::new(),
+            transcripts: Default::default(),
+            notifications: Default::default(),
+            appearance: Default::default(),
+            resources: zeron_workers_unpeel::WorkersResourceSettings {
+                monitoring_enabled: false,
+                ..Default::default()
+            },
+        });
+        model
+    });
     if !cx.has_global::<WorkersResourceGlobal>() {
         let monitor = cx.new(|cx| WorkersResourceMonitor::new(workers.clone(), cx));
         cx.set_global(WorkersResourceGlobal { monitor });

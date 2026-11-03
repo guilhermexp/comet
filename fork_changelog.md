@@ -2,6 +2,12 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-03 — Metadata e títulos de Chats
+
+- A branch curta fica junto aos projetos trabalhados na sidebar; branches longas preservam espaço para projetos e PR.
+- Uma geração de título sem saída útil não grava palavras do prompt nem renomeia a branch; nomes manuais e legados permanecem intactos.
+- O título superior apresenta menções por seu rótulo compacto, sem alterar o título armazenado nem o editor de rename.
+
 ## 2026-11-03: v1.0.15
 
 - Todo do composer inicialmente recolhido, com escolha manual preservada durante o progresso.

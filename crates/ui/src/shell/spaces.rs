@@ -399,6 +399,282 @@ pub(super) mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn sidebar_metadata_short_branch_is_adjacent_to_projects(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.sidebar_compact = false;
+            settings.sidebar_show_branch = true;
+            settings.sidebar_show_worked_projects = true;
+            crate::settings::init(settings, dir.path(), cx);
+        });
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.debug_gate = Some(super::super::GatePhase::Ready);
+                shell.reduced_motion = true;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                    state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                    state.spaces = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "project", "deviceId": "local", "path": "/projects/studio",
+                            "createdAt": chrono::Utc::now()
+                        }))
+                        .unwrap(),
+                    ];
+                    let mut chat = pin_test_chat("normal");
+                    chat.branch = Some("main".into());
+                    chat.source_context = Some(zeron_proto::ConversationSourceContext {
+                        checkout_id: "fixture-checkout".into(),
+                        repo_root: "/fixture".into(),
+                        cwd: "/fixture".into(),
+                        branch: "main".into(),
+                        head_sha: None,
+                        observed_at: chrono::Utc::now(),
+                    });
+                    chat.worked_projects = Some(zeron_proto::ChatWorkedProjects {
+                        project_ids: vec!["project".into()],
+                        complete: true,
+                        history_version: None,
+                    });
+                    let mut archived = chat.clone();
+                    archived.id = "archived".into();
+                    archived.archived = true;
+                    state.chats = vec![chat, archived];
+                });
+                cx.notify();
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let sidebar_pane = window
+            .read_with(&cx, |shell, _| shell.sidebar_pane.clone())
+            .unwrap();
+        for width in [242.0, 256.0, 400.0] {
+            window
+                .update(&mut cx, |shell, _, cx| {
+                    shell.settings.sidebar_width = width;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                sidebar_pane.update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear();
+            });
+            for (id, branch_selector, projects_selector) in [
+                (
+                    "normal",
+                    "chat-branch-normal",
+                    "chat-worked-projects-normal",
+                ),
+                (
+                    "archived",
+                    "chat-branch-archived",
+                    "chat-worked-projects-archived",
+                ),
+            ] {
+                let branch = cx.debug_bounds(branch_selector).expect("branch");
+                let projects = cx.debug_bounds(projects_selector).expect("projects");
+                assert!(
+                    branch.size.width < gpui::px(48.0),
+                    "{id} short branch has expanded to {:?} at width {width}",
+                    branch.size.width
+                );
+                assert_eq!(
+                    projects.left() - branch.right(),
+                    gpui::px(4.0),
+                    "{id} branch and projects should be adjacent at width {width}"
+                );
+            }
+        }
+        window
+            .update(&mut cx, |shell, _, cx| {
+                shell.settings.sidebar_show_pull_request = true;
+                shell.active_chat = "normal".into();
+                shell.state.update(cx, |state, _| {
+                    let branch = "feature/a-very-long-branch-name-for-sidebar-layout";
+                    state.chats[0].source_context.as_mut().unwrap().branch = branch.into();
+                    state.spaces.push(
+                        serde_json::from_value(serde_json::json!({
+                            "id":"second", "deviceId":"local", "path":"/projects/second",
+                            "createdAt":chrono::Utc::now()
+                        }))
+                        .unwrap(),
+                    );
+                    state.chats[0]
+                        .worked_projects
+                        .as_mut()
+                        .unwrap()
+                        .project_ids
+                        .push("second".into());
+                    state.selected_chat = Some("normal".into());
+                    state.fixture_sidebar_change_request(
+                        zeron_proto::CheckoutChangeRequestStatus {
+                            checkout_id: "fixture-checkout".into(),
+                            device_id: "local".into(),
+                            cwd: "/fixture".into(),
+                            branch: branch.into(),
+                            updated_at: chrono::Utc::now(),
+                            change_request: Some(zeron_proto::ChangeRequestSummary {
+                                provider: "github".into(),
+                                number: 42,
+                                title: "Fixture".into(),
+                                url: "https://github.com/acme/fixture/pull/42".into(),
+                                state: zeron_proto::ChangeRequestState::Open,
+                                base_ref: "main".into(),
+                                head_ref: branch.into(),
+                            }),
+                        },
+                    );
+                });
+                cx.notify();
+            })
+            .unwrap();
+        for width in [242.0, 256.0, 400.0] {
+            window
+                .update(&mut cx, |shell, _, cx| {
+                    shell.settings.sidebar_width = width;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                sidebar_pane.update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear();
+            });
+            let row = cx.debug_bounds("chat-normal").expect("row");
+            let branch = cx.debug_bounds("chat-branch-normal").expect("long branch");
+            let projects = cx
+                .debug_bounds("chat-worked-projects-normal")
+                .expect("projects");
+            let badge = cx
+                .debug_bounds("pull-request-badge-chat-normal-pr")
+                .expect("PR");
+            assert!(branch.size.width <= row.size.width / 2.0);
+            assert!(projects.size.width > gpui::px(0.0));
+            assert!(projects.right() <= badge.left() && badge.right() <= row.right());
+        }
+        window
+            .read_with(&cx, |shell, cx| assert!(!shell.right_pane_open(cx)))
+            .unwrap();
+        let badge = cx
+            .debug_bounds("pull-request-badge-chat-normal-pr")
+            .unwrap();
+        cx.simulate_click(badge.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        window
+            .read_with(&cx, |shell, cx| {
+                assert!(shell.right_pane_open(cx), "PR click opens the right pane");
+                let crate::shell::RightSurface::PullRequest(id) = shell.resolved_right_active(cx)
+                else {
+                    panic!("PR click activates a pull request view");
+                };
+                assert_eq!(
+                    shell.chat_pull_requests[&id].url,
+                    "https://github.com/acme/fixture/pull/42"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn title_bar_compacts_mentions_without_changing_title(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        let cases = [
+            ("[studio](zeron-project:/fixture/studio/)", "studio"),
+            ("olá [studio](zeron-project:", "olá studio"),
+            ("Título [comum] manual", "Título [comum] manual"),
+            ("Manual title", "Manual title"),
+            (
+                "Review [studio](zeron-project:/fixture/studio/) with a deliberately long title that must leave the controls usable at narrow widths",
+                "Review studio with a deliberately long title that must leave the controls usable at narrow widths",
+            ),
+        ];
+        window
+            .update(cx, |shell, _, cx| {
+                shell.debug_gate = Some(super::super::GatePhase::Ready);
+                shell.reduced_motion = true;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                    state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                    state.spaces = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id":"project", "deviceId":"local", "path":"/fixture",
+                            "createdAt":chrono::Utc::now()
+                        }))
+                        .unwrap(),
+                    ];
+                    state.chats = vec![pin_test_chat("title")];
+                    state.selected_chat = Some("title".into());
+                });
+                cx.notify();
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [650.0, 1400.0] {
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(800.0)));
+            for (raw, expected) in cases {
+                let mut measured = Vec::new();
+                for value in [raw, expected] {
+                    window
+                        .update(&mut cx, |shell, _, cx| {
+                            shell
+                                .state
+                                .update(cx, |state, _| state.chats[0].title = Some(value.into()));
+                            cx.notify();
+                        })
+                        .unwrap();
+                    cx.run_until_parked();
+                    cx.update(|window, cx| {
+                        window.refresh();
+                        window.draw(cx).clear();
+                    });
+                    let title_bounds = cx.debug_bounds("chat-title-bar-text").expect("title bar");
+                    let terminal = cx
+                        .debug_bounds("toggle-terminal")
+                        .expect("titlebar terminal control");
+                    assert!(
+                        title_bounds.right() <= terminal.left(),
+                        "title must not overlap controls"
+                    );
+                    measured.push(
+                        cx.debug_bounds("chat-title-bar-text")
+                            .expect("title bar")
+                            .size
+                            .width,
+                    );
+                }
+                assert_eq!(
+                    measured[0], measured[1],
+                    "rendered title for {raw:?} at {width}"
+                );
+                window
+                    .update(&mut cx, |shell, _, cx| {
+                        shell
+                            .state
+                            .update(cx, |state, _| state.chats[0].title = Some(raw.into()));
+                        cx.notify();
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                window
+                    .update(&mut cx, |shell, _, cx| {
+                        assert_eq!(shell.state.read(cx).chats[0].title.as_deref(), Some(raw));
+                        shell.open_rename_chat("title".into(), cx);
+                        assert_eq!(
+                            shell.chat_rename.as_ref().unwrap().input.read(cx).text(),
+                            raw
+                        );
+                        shell.finish_rename_chat(false, cx);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[gpui::test]
     fn sidebar_worked_projects_geometry_normal_compact_and_archived(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {

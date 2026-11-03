@@ -59,6 +59,10 @@ name = "appshots-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "sidebar-title-fixture"
+required-features = ["appshots-fixture", "project-palette-fixture"]
+
+[[example]]
 name = "accounts-a11y-fixture"
 required-features = ["appshots-fixture"]
 
