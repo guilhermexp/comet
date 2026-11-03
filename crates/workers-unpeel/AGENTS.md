@@ -164,6 +164,7 @@ apps/zeron (host-mode dispatch at startup).
   inspect and output reach the Host's shared `hosted_sessions`/`read_output`
   through the client tunnel. Do not re-copy key tables, ANSI parsers, wait
   vocabularies or pagers here.
+- `restart_worker` retorna o `sessionID` produzido pelo efeito headless e transfere o parent binding para exatamente esse ID; resume in-place devolve o ID original. Ausência de ID é erro de protocolo, nunca descoberta por diferença de bootstrap. `tests/worker_restart_identity.rs` exercita hosts descartáveis, requisições simultâneas, resume in-place e envio/notificação por Chat; seu hook de conclusão usa o snapshot reconciliado pelo journal real do host.
 - **Worker worktree root = device preference.** `worktree_ownership::common_worktrees_root`
   applies `ZERON_WORKTREES_DIR`, else the saved enabled absolute folder in
   `{data_dir}/worktree-settings.json` (the engine's Settings → General file),

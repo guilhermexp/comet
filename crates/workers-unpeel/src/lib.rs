@@ -658,14 +658,6 @@ pub fn controller_mcp_live_worker_guard(session: &WorkersSession) -> Result<(), 
     controller_mcp::live_worker_guard(session)
 }
 
-#[doc(hidden)]
-pub fn controller_mcp_replacement_session_id(
-    before: &[String],
-    after: &[String],
-) -> Option<String> {
-    controller_mcp::replacement_session_id(before, after)
-}
-
 /// Make the current Comet executable the Unpeel launcher when no explicit
 /// host override was supplied. This keeps packaged and development builds
 /// self-contained: the launcher-file mode above re-execs the same binary in
@@ -3395,7 +3387,7 @@ impl LocalWorkersClient {
         &self,
         session_id: &str,
         action: SessionAction,
-    ) -> Result<(), WorkersError> {
+    ) -> Result<Option<String>, WorkersError> {
         let _checkout_action = if matches!(
             action,
             SessionAction::Restart | SessionAction::RestartAgent | SessionAction::ResumeAgent
@@ -3406,10 +3398,33 @@ impl LocalWorkersClient {
         } else {
             None
         };
-        self.mutate(
+        let response = self.request(
+            "POST",
             "/mobile/session-action",
+            Vec::new(),
             json!({ "sessionID": session_id, "action": action.wire_name() }),
-        )
+        )?;
+        let id = response
+            .get("sessionID")
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    WorkersError::Protocol(
+                        "session action response has an invalid sessionID".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        if id.is_none()
+            && matches!(
+                action,
+                SessionAction::Restart | SessionAction::RestartAgent | SessionAction::ResumeAgent
+            )
+        {
+            return Err(WorkersError::Protocol(
+                "session action response missing sessionID".into(),
+            ));
+        }
+        Ok(id)
     }
 
     pub fn session_command(
@@ -3420,20 +3435,17 @@ impl LocalWorkersClient {
         let session_id = session.id.as_str();
         match command {
             WorkersSessionCommand::Stop => {
-                self.session_action(session_id, SessionAction::Stop)?;
+                let _ = self.session_action(session_id, SessionAction::Stop)?;
                 Ok(None)
             }
             WorkersSessionCommand::RestartSession => {
-                self.session_action(session_id, SessionAction::Restart)?;
-                Ok(None)
+                self.session_action(session_id, SessionAction::Restart)
             }
             WorkersSessionCommand::RestartAgent => {
-                self.session_action(session_id, SessionAction::RestartAgent)?;
-                Ok(None)
+                self.session_action(session_id, SessionAction::RestartAgent)
             }
             WorkersSessionCommand::ResumeAgent => {
-                self.session_action(session_id, SessionAction::ResumeAgent)?;
-                Ok(None)
+                self.session_action(session_id, SessionAction::ResumeAgent)
             }
             WorkersSessionCommand::Fork => self.fork_session(session).map(Some),
             WorkersSessionCommand::ClearAttention => {
@@ -3462,7 +3474,7 @@ impl LocalWorkersClient {
             }
             WorkersSessionCommand::Archive => {
                 if session.is_live() {
-                    self.session_action(session_id, SessionAction::Stop)?;
+                    let _ = self.session_action(session_id, SessionAction::Stop)?;
                 }
                 self.set_session_organization(
                     session_id,
@@ -3506,20 +3518,22 @@ impl LocalWorkersClient {
                 } else {
                     SessionAction::Restart
                 };
-                if let Err(error) = self.session_action(session_id, resume) {
-                    let _ = self.set_session_organization(
-                        session_id,
-                        SessionOrganizationPatch {
-                            archived: Some(true),
-                            ..Default::default()
-                        },
-                    );
-                    return Err(error);
+                match self.session_action(session_id, resume) {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        let _ = self.set_session_organization(
+                            session_id,
+                            SessionOrganizationPatch {
+                                archived: Some(true),
+                                ..Default::default()
+                            },
+                        );
+                        Err(error)
+                    }
                 }
-                Ok(None)
             }
             WorkersSessionCommand::Remove => {
-                self.session_action(session_id, SessionAction::Remove)?;
+                let _ = self.session_action(session_id, SessionAction::Remove)?;
                 Ok(None)
             }
         }

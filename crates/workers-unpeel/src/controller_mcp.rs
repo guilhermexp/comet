@@ -1097,14 +1097,15 @@ fn dispatch_action(
                     session.id
                 ));
             }
-            let before = worker_ids(client)?;
-            client
+            let session_id = client
                 .session_command(&session, WorkersSessionCommand::RestoreAndResume)
-                .map_err(|error| error.to_string())?;
-            // Relaunching replaces the Session, so the id the caller asked
-            // with is gone: report the one it must address from now on.
-            let session_id = replacement_session_id(&before, &worker_ids(client)?)
-                .unwrap_or_else(|| session.id.clone());
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "Worker {} was restarted, but the host did not return its session ID",
+                        session.id
+                    )
+                })?;
             // Without the parent binding the replacement refuses tracked
             // send_text and can never report completion or notify its parent.
             crate::carry_worker_parent_binding(&session.id, &session_id, unix_time_ms())
@@ -1474,25 +1475,6 @@ pub fn live_worker_guard(session: &WorkersSession) -> Result<(), String> {
         "Worker '{}' is not running (state={}, archived={}). Call restart_worker to bring it back with its conversation, then send input.",
         session.id, session.state, session.archived
     ))
-}
-
-fn worker_ids(client: &LocalWorkersClient) -> Result<Vec<String>, String> {
-    Ok(client
-        .bootstrap()
-        .map_err(|error| error.to_string())?
-        .sessions
-        .into_iter()
-        .map(|session| session.id)
-        .collect())
-}
-
-/// The single id that appeared while restarting. Anything else — no new id,
-/// or more than one because another Worker launched concurrently — is
-/// reported as unknown rather than guessed.
-pub fn replacement_session_id(before: &[String], after: &[String]) -> Option<String> {
-    let mut new_ids = after.iter().filter(|id| !before.contains(id));
-    let replacement = new_ids.next()?;
-    new_ids.next().is_none().then(|| replacement.clone())
 }
 
 /// The registry this controller lists and creates projects in: the engine

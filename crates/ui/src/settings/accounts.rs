@@ -2324,6 +2324,7 @@ impl Render for AccountsPage {
                             card.children(rows)
                         };
                         div()
+                            .id(name)
                             .mt(px(16.0))
                             .p(px(16.0))
                             .rounded(px(12.0))
@@ -2472,6 +2473,48 @@ impl Render for AccountsPage {
             .when_some(dialog, |el, dialog| el.child(dialog))
             .into_any_element()
     }
+}
+
+/// Isolated native accessibility fixture; never loads a real provider.
+#[cfg(feature = "appshots-fixture")]
+pub fn accessibility_fixture(embedded: bool, cx: &mut Context<AccountsPage>) -> AccountsPage {
+    let state = cx.new(|_| AppState::new());
+    let mut page = if embedded {
+        AccountsPage::new_embedded(state, None, HarnessId::Opencode, cx)
+    } else {
+        AccountsPage::new(state, cx)
+    };
+    let account = |id: &str, harness, provider: Option<&str>| AgentAccount {
+        id: id.into(),
+        harness,
+        email: Some(format!("{id}@example.invalid")),
+        plan_label: None,
+        active: false,
+        usage_windows: vec![zeron_proto::AgentUsageWindow {
+            label: "Session".into(),
+            used_fraction: 0.4,
+            resets_at: None,
+        }],
+        usage_lines: vec![],
+        usage_fetched_at: None,
+        usage_error: None,
+        display_name: None,
+        organization: None,
+        auth_kind: None,
+        switchable: true,
+        saved_at: None,
+        provider: provider.map(str::to_string),
+    };
+    page.snapshot = Loadable::Ready(AgentAccountsSnapshot {
+        accounts: vec![
+            account("claude", HarnessId::ClaudeCode, None),
+            account("codex", HarnessId::Codex, None),
+            account("openai", HarnessId::Opencode, Some("openai")),
+            account("copilot", HarnessId::Opencode, Some("github-copilot")),
+        ],
+        warnings: vec![],
+    });
+    page
 }
 
 #[cfg(test)]

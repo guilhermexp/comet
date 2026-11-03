@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "f1449525c8007824c905d2c7b3bb01ed75261e0a"
+vendored_tree = "525110c5b873a71c1e39ba64e7a748dfaf1c2c80"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -255,3 +255,7 @@ base_revision_resolves_upstream = false
 # intermediates, isolate embedding advertisement assertions from ambient
 # caller manifests, and name canonical browser/action screenshot in guidance.
 # Raw replay, call authority and standalone dispatcher keys are unchanged.
+
+# 2026-11-02 — headless controller session actions preserve the actual restart
+# or in-place resume ID in the optional sessionID response. Native Swift keeps
+# its separate asynchronous fallback. Consumer proof: worker_restart_identity.

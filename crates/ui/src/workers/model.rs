@@ -273,12 +273,7 @@ fn expand_project_chain(
 #[derive(Debug, Clone)]
 struct PendingReplacement {
     source_id: String,
-    project_id: String,
-    command: String,
-    provider_id: Option<String>,
-    worktree_branch: Option<String>,
-    source_created_at_unix_ms: u64,
-    baseline_ids: HashSet<String>,
+    result_id: Option<String>,
     remaining_refreshes: u8,
 }
 
@@ -366,30 +361,6 @@ struct PendingLaunchSelection {
     session_id: String,
     remaining_refreshes: u8,
     visible_refreshes: u8,
-}
-
-fn replacement_selection(
-    pending: &PendingReplacement,
-    sessions: &[WorkersSession],
-) -> Option<Option<String>> {
-    let candidates = sessions
-        .iter()
-        .filter(|session| {
-            session.project_id == pending.project_id
-                && !pending.baseline_ids.contains(&session.id)
-                && session.is_live()
-                && session.command == pending.command
-                && session.provider_id == pending.provider_id
-                && session.worktree_branch == pending.worktree_branch
-                && session.created_at_unix_ms >= pending.source_created_at_unix_ms
-        })
-        .map(|session| session.id.clone())
-        .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [only] => Some(Some(only.clone())),
-        [] => None,
-        _ => Some(None),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1808,22 +1779,40 @@ impl WorkersModel {
 
     pub fn stop(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.run_unit_action(
-            move |client| client.session_action(&session_id, SessionAction::Stop),
+            move |client| {
+                client
+                    .session_action(&session_id, SessionAction::Stop)
+                    .map(|_| ())
+            },
             cx,
         );
     }
 
     pub fn restart(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.prepare_replacement(&session_id);
-        self.run_unit_action(
+        let source_id = session_id.clone();
+        self.run_action(
             move |client| client.session_action(&session_id, SessionAction::Restart),
+            move |model, result| {
+                if let Some(pending) = model
+                    .pending_replacement
+                    .as_mut()
+                    .filter(|p| p.source_id == source_id)
+                {
+                    pending.result_id = result;
+                }
+            },
             cx,
         );
     }
 
     pub fn resume_agent(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.run_unit_action(
-            move |client| client.session_action(&session_id, SessionAction::ResumeAgent),
+            move |client| {
+                client
+                    .session_action(&session_id, SessionAction::ResumeAgent)
+                    .map(|_| ())
+            },
             cx,
         );
     }
@@ -1894,7 +1883,11 @@ impl WorkersModel {
 
     pub fn remove(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.run_unit_action(
-            move |client| client.session_action(&session_id, SessionAction::Remove),
+            move |client| {
+                client
+                    .session_action(&session_id, SessionAction::Remove)
+                    .map(|_| ())
+            },
             cx,
         );
     }
@@ -2082,22 +2075,33 @@ impl WorkersModel {
                         ..Default::default()
                     },
                 )?;
-                if resume {
-                    if let Err(error) = client.session_action(&session_id, restore_action(&session))
-                    {
-                        let _ = client.set_session_organization(
-                            &session_id,
-                            SessionOrganizationPatch {
-                                archived: Some(true),
-                                ..Default::default()
-                            },
-                        );
-                        return Err(error);
+                let result = if resume {
+                    match client.session_action(&session_id, restore_action(&session)) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let _ = client.set_session_organization(
+                                &session_id,
+                                SessionOrganizationPatch {
+                                    archived: Some(true),
+                                    ..Default::default()
+                                },
+                            );
+                            return Err(error);
+                        }
                     }
-                }
-                Ok(())
+                } else {
+                    None
+                };
+                Ok(result)
             },
-            move |model, ()| {
+            move |model, result| {
+                if let Some(pending) = model
+                    .pending_replacement
+                    .as_mut()
+                    .filter(|p| p.source_id == completed_id)
+                {
+                    pending.result_id = result;
+                }
                 model
                     .archived_sessions
                     .retain(|session| session.id != completed_id);
@@ -2109,7 +2113,11 @@ impl WorkersModel {
     pub fn remove_archived(&mut self, session_id: String, cx: &mut Context<Self>) {
         let completed_id = session_id.clone();
         self.run_action(
-            move |client| client.session_action(&session_id, SessionAction::Remove),
+            move |client| {
+                client
+                    .session_action(&session_id, SessionAction::Remove)
+                    .map(|_| ())
+            },
             move |model, ()| {
                 model
                     .archived_sessions
@@ -2145,16 +2153,7 @@ impl WorkersModel {
     fn prepare_replacement_for(&mut self, source: &WorkersSession) {
         self.pending_replacement = Some(PendingReplacement {
             source_id: source.id.clone(),
-            project_id: source.project_id.clone(),
-            command: source.command.clone(),
-            provider_id: source.provider_id.clone(),
-            worktree_branch: source.worktree_branch.clone(),
-            source_created_at_unix_ms: source.created_at_unix_ms,
-            baseline_ids: self
-                .sessions()
-                .iter()
-                .map(|session| session.id.clone())
-                .collect(),
+            result_id: None,
             remaining_refreshes: 8,
         });
     }
@@ -2276,23 +2275,24 @@ impl WorkersModel {
         self.notification_state
             .retain(|session_id, _| live_session_ids.contains(session_id.as_str()));
         if let Some(mut pending) = self.pending_replacement.take() {
-            if snapshot
-                .sessions
-                .iter()
-                .any(|session| session.id == pending.source_id)
-            {
-                self.selected_session_id = Some(pending.source_id.clone());
-                self.pending_replacement = Some(pending);
-            } else {
-                match replacement_selection(&pending, &snapshot.sessions) {
-                    Some(selection) => self.selected_session_id = selection,
-                    None if pending.remaining_refreshes > 0 => {
-                        pending.remaining_refreshes -= 1;
-                        self.selected_session_id = None;
-                        self.pending_replacement = Some(pending);
-                    }
-                    None => self.selected_session_id = None,
+            if let Some(id) = pending.result_id.as_ref() {
+                self.selected_session_id = Some(id.clone());
+                if pending.remaining_refreshes > 0
+                    && !snapshot
+                        .sessions
+                        .iter()
+                        .any(|session| session.id == *id && !session.archived)
+                {
+                    pending.remaining_refreshes -= 1;
+                    self.pending_replacement = Some(pending);
                 }
+            } else {
+                self.selected_session_id = snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == pending.source_id && !session.archived)
+                    .then(|| pending.source_id.clone());
+                self.pending_replacement = Some(pending);
             }
         } else if let Some(mut pending) = self.pending_launch_selection.take() {
             let visible = snapshot
@@ -2321,7 +2321,8 @@ impl WorkersModel {
             self.selected_project_id.as_deref(),
             self.selected_session_id.as_deref(),
             (!had_selected_session && !selected_project_had_sessions)
-                || self.pending_launch_selection.is_some(),
+                || self.pending_launch_selection.is_some()
+                || self.pending_replacement.is_some(),
             &snapshot.projects,
             &snapshot.sessions,
         );
@@ -2498,6 +2499,8 @@ fn updates_for_preset_clis<'a>(
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use gpui::AppContext;
+
     use zeron_workers_unpeel::{
         WorkerParentLink, WorkerParentNotification, WorkerParentNotificationKind,
         WorkersNotificationSettings, WorkersSession, WorkersSessionCapabilities,
@@ -2505,13 +2508,13 @@ mod tests {
     };
 
     use super::{
-        ActionDrain, ActionQueue, PendingReplacement, QueuedActionKind, WorkersSessionTarget,
-        WorkersSettingsTab, claim_parent_notification_delivery, note_parent_notification_failure,
+        ActionDrain, ActionQueue, QueuedActionKind, WorkersSessionTarget, WorkersSettingsTab,
+        claim_parent_notification_delivery, note_parent_notification_failure,
         notification_settings_for_snapshot, parent_notification_retry_allowed,
         parent_notification_rpc_params, reconcile_selection, reconcile_selection_with_pending,
-        replacement_selection, resolve_session_target, selection_after_filter,
-        selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
-        toggle_expanded, worktree_hook_warning_message, worktree_setup_failure_message,
+        resolve_session_target, selection_after_filter, selection_after_remove,
+        sessions_for_parent_chat_from_links, sessions_for_project, toggle_expanded,
+        worktree_hook_warning_message, worktree_setup_failure_message,
     };
 
     #[test]
@@ -2852,6 +2855,84 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn replacement_identity_survives_stale_snapshots_and_manual_selection_wins(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Even a detached model constructs the shared activity bridge. Run
+        // this test in a child with disposable homes so a normal suite cannot
+        // register its bridge in the user's live Workers profile.
+        const ISOLATED: &str = "ZERON_WORKER_REPLACEMENT_MODEL_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workers::model::tests::replacement_identity_survives_stale_snapshots_and_manual_selection_wins",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .env("HOME", home.path())
+                .env("UNPEEL_HOME", home.path().join("unpeel"))
+                .env("ZERON_DATA_DIR", home.path().join("zeron"))
+                .env("XDG_CONFIG_HOME", home.path().join("config"))
+                .env("COMET_WORKERS_HOOKS_DIR", home.path().join("hooks"))
+                .env_remove("PI_CODING_AGENT_DIR")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "isolated model test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let state = cx.new(|_| crate::state::AppState::new());
+        let model = cx.new(|cx| super::WorkersModel::detached(state, cx));
+        let snapshot = |sessions| zeron_workers_unpeel::WorkersBootstrap {
+            mac_name: String::new(),
+            protocol: zeron_workers_unpeel::WorkersProtocol {
+                major_version: 1,
+                minor_version: 0,
+                capabilities: Vec::new(),
+            },
+            projects: Vec::new(),
+            presets: Vec::new(),
+            sessions,
+            activity_log: Vec::new(),
+        };
+        let old = session("old", "project", false);
+        let noise = session("noise", "project", true);
+        let replacement = session("actual", "project", true);
+        model.update(cx, |model, cx| {
+            model.apply_snapshot(snapshot(vec![old.clone(), noise.clone()]), false);
+            model.select_session("old".into(), cx);
+            model.prepare_replacement_for(&old);
+            model.pending_replacement.as_mut().unwrap().result_id = Some("actual".into());
+            model.apply_snapshot(snapshot(vec![old.clone(), noise.clone()]), false);
+            assert_eq!(model.selected_session_id.as_deref(), Some("actual"));
+            model.apply_snapshot(snapshot(vec![noise.clone(), replacement.clone()]), false);
+            assert_eq!(model.selected_session_id.as_deref(), Some("actual"));
+            assert!(model.pending_replacement.is_none());
+
+            model.select_session("actual".into(), cx);
+            model.prepare_replacement_for(&replacement);
+            model.pending_replacement.as_mut().unwrap().result_id = Some("actual".into());
+            model.apply_snapshot(snapshot(vec![replacement.clone(), noise.clone()]), false);
+            assert_eq!(model.selected_session_id.as_deref(), Some("actual"));
+            assert!(model.pending_replacement.is_none());
+
+            model.prepare_replacement_for(&replacement);
+            model.pending_replacement.as_mut().unwrap().result_id = Some("later".into());
+            model.select_session("noise".into(), cx);
+            model.apply_snapshot(snapshot(vec![replacement, noise]), false);
+            assert_eq!(model.selected_session_id.as_deref(), Some("noise"));
+            assert!(model.pending_replacement.is_none());
+        });
+    }
+
     #[test]
     fn worker_parent_filter_is_exact_and_ignores_stale_session_ids() {
         let sessions = vec![
@@ -3169,36 +3250,5 @@ mod tests {
             expanded,
             HashSet::from(["two".to_owned(), "three".to_owned()])
         );
-    }
-
-    #[test]
-    fn replacement_adopts_only_one_new_live_session_in_the_same_project() {
-        let pending = PendingReplacement {
-            source_id: "old".to_owned(),
-            project_id: "one".to_owned(),
-            command: "zsh".to_owned(),
-            provider_id: None,
-            worktree_branch: None,
-            source_created_at_unix_ms: 1,
-            baseline_ids: HashSet::from(["other".to_owned()]),
-            remaining_refreshes: 8,
-        };
-        assert_eq!(
-            replacement_selection(
-                &pending,
-                &[session("other", "two", true), session("new", "one", true)]
-            ),
-            Some(Some("new".to_owned()))
-        );
-        assert_eq!(
-            replacement_selection(
-                &pending,
-                &[session("new-a", "one", true), session("new-b", "one", true)]
-            ),
-            Some(None)
-        );
-        let mut decoy = session("decoy", "one", true);
-        decoy.command = "claude".to_owned();
-        assert_eq!(replacement_selection(&pending, &[decoy]), None);
     }
 }

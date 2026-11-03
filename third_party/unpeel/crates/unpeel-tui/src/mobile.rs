@@ -1982,7 +1982,7 @@ mod tests {
                 | ("conformance-action-restart", ControllerSessionAction::Restart)
                 | ("conformance-action-restart-agent", ControllerSessionAction::RestartAgent)
                 | ("conformance-action-resume-agent", ControllerSessionAction::ResumeAgent)
-                | ("conformance-remove", ControllerSessionAction::Remove) => Ok(()),
+                | ("conformance-remove", ControllerSessionAction::Remove) => Ok(None),
                 ("conformance-stop-exited", ControllerSessionAction::Stop)
                 | ("conformance-restart-agent-exited", ControllerSessionAction::RestartAgent)
                 | ("conformance-resume-agent-exited", ControllerSessionAction::ResumeAgent) => {

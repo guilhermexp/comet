@@ -263,7 +263,7 @@ pub enum ControllerEffectError {
 }
 
 pub type ControllerSessionActionExecutor = Arc<
-    dyn Fn(ControllerSessionActionRequest) -> Result<(), ControllerEffectError>
+    dyn Fn(ControllerSessionActionRequest) -> Result<Option<String>, ControllerEffectError>
         + Send
         + Sync
         + 'static,
@@ -288,7 +288,7 @@ impl ControllerEffects {
     fn execute_session_action(
         &self,
         request: ControllerSessionActionRequest,
-    ) -> Result<(), ControllerEffectError> {
+    ) -> Result<Option<String>, ControllerEffectError> {
         (self.session_action_executor)(request)
     }
 }
@@ -897,7 +897,7 @@ fn ensure_checkout_restart_eligible(
 pub fn execute_headless_session_action(
     request: ControllerSessionActionRequest,
     hook_port: Option<u16>,
-) -> Result<(), ControllerEffectError> {
+) -> Result<Option<String>, ControllerEffectError> {
     let Some(manifest) = session_host::refresh_manifest_health(&request.session_id) else {
         return Err(ControllerEffectError::UnknownSession);
     };
@@ -944,17 +944,23 @@ pub fn execute_headless_session_action(
     }
 
     let result = match request.action {
-        ControllerSessionAction::Stop => session_ops::stop_session(&request.session_id),
+        ControllerSessionAction::Stop => {
+            session_ops::stop_session(&request.session_id).map(|()| None)
+        }
         ControllerSessionAction::Restart => session_ops::resume_session(
             &request.session_id,
             hook_port,
             SESSION_CREATE_INITIAL_COLUMNS,
             SESSION_CREATE_INITIAL_ROWS,
         )
-        .map(|_| ()),
-        ControllerSessionAction::RestartAgent => session_ops::restart_agent(&request.session_id),
-        ControllerSessionAction::ResumeAgent => session_ops::resume_agent(&request.session_id),
-        ControllerSessionAction::Remove => session_ops::remove_session(&request.session_id),
+        .map(Some),
+        ControllerSessionAction::RestartAgent => session_ops::restart_agent(&request.session_id)
+            .map(|()| Some(request.session_id.clone())),
+        ControllerSessionAction::ResumeAgent => session_ops::resume_agent(&request.session_id)
+            .map(|()| Some(request.session_id.clone())),
+        ControllerSessionAction::Remove => {
+            session_ops::remove_session(&request.session_id).map(|()| None)
+        }
     };
     result.map_err(|message| match request.action {
         ControllerSessionAction::RestartAgent | ControllerSessionAction::ResumeAgent => {
@@ -1208,7 +1214,7 @@ fn run_session_action(
         session_id: session_id.clone(),
         action,
     };
-    effects
+    let result_id = effects
         .execute_session_action(request)
         .map_err(|error| match error {
             ControllerEffectError::UnknownSession => {
@@ -1249,7 +1255,10 @@ fn run_session_action(
                 ControllerApiError::new(500, format!("Could not {verb} session: {session_id}"))
             }
         })?;
-    Ok(json!({ "ok": true }))
+    Ok(match result_id {
+        Some(id) => json!({ "ok": true, "sessionID": id }),
+        None => json!({ "ok": true }),
+    })
 }
 
 pub fn read_session_metrics(session_id: &str) -> Result<SessionMetrics, ControllerApiError> {
@@ -2162,7 +2171,7 @@ mod tests {
     }
 
     fn controller_effects(
-        executor: impl Fn(ControllerSessionActionRequest) -> Result<(), ControllerEffectError>
+        executor: impl Fn(ControllerSessionActionRequest) -> Result<Option<String>, ControllerEffectError>
             + Send
             + Sync
             + 'static,
@@ -2217,7 +2226,7 @@ mod tests {
         let execution_count = Arc::clone(&executions);
         let effects = controller_effects(move |_| {
             execution_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(None)
         });
 
         let mut missing = request("POST", "/mobile/restart-session");
@@ -2250,7 +2259,7 @@ mod tests {
                 "missing" => Err(ControllerEffectError::UnknownSession),
                 "exited" => Err(ControllerEffectError::SessionNotRunning),
                 "broken" => Err(ControllerEffectError::Failed("adapter detail".into())),
-                _ => Ok(()),
+                _ => Ok(Some("replacement".into())),
             }
         });
 
@@ -2258,7 +2267,10 @@ mod tests {
         restart.body = json!({ "sessionID": "known" });
         let response = route_with_effects(&restart, None, None, Some(&effects)).unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, json!({ "ok": true }));
+        assert_eq!(
+            response.body,
+            json!({ "ok": true, "sessionID": "replacement" })
+        );
 
         let mut remove = request("POST", "/mobile/session-action");
         remove.body = json!({ "sessionID": "known", "action": "remove" });
@@ -2395,7 +2407,7 @@ mod tests {
             while !*released {
                 released = ready.wait(released).expect("lifecycle gate wait");
             }
-            Ok(())
+            Ok(Some("replacement".into()))
         });
         let mut request = request("POST", "/mobile/session-action");
         request.id = Some(format!("lifecycle-replay-{}", uuid::Uuid::new_v4()));
@@ -2438,7 +2450,10 @@ mod tests {
 
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert_eq!(follower_response, leader_response);
-        assert_eq!(leader_response.body, json!({ "ok": true }));
+        assert_eq!(
+            leader_response.body,
+            json!({ "ok": true, "sessionID": "replacement" })
+        );
         assert_eq!(
             route_with_effects(&request, None, None, Some(&effects)).unwrap(),
             leader_response

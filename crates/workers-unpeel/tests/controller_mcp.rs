@@ -13,11 +13,10 @@ use zeron_workers_unpeel::{
     controller_mcp_encode_keys, controller_mcp_handle_request, controller_mcp_is_booting_screen,
     controller_mcp_is_briefing_screen_ready, controller_mcp_live_worker_guard,
     controller_mcp_parse_launch, controller_mcp_parse_launch_briefing,
-    controller_mcp_replacement_session_id, controller_mcp_sanitize_text,
-    controller_mcp_startup_prompt_response, controller_mcp_take_parent_chat_id,
-    controller_mcp_tracks_task_episode, current_episode_completed_with_evidence_at,
-    ensure_controller_mcp_host_launcher, is_session_host_mode, register_worker_parent_at,
-    worker_parent_links_at,
+    controller_mcp_sanitize_text, controller_mcp_startup_prompt_response,
+    controller_mcp_take_parent_chat_id, controller_mcp_tracks_task_episode,
+    current_episode_completed_with_evidence_at, ensure_controller_mcp_host_launcher,
+    is_session_host_mode, register_worker_parent_at, worker_parent_links_at,
 };
 
 #[test]
@@ -2171,30 +2170,6 @@ fn writing_to_a_hibernated_worker_names_restart_worker() {
 
     let live = worker_with_state("running");
     assert!(controller_mcp_live_worker_guard(&live).is_ok());
-}
-
-/// Restarting replaces the Session, so the orchestrator needs the id it got
-/// back, not the one it asked with.
-#[test]
-fn restart_reports_the_replacement_session_id() {
-    let before = ["worker-1".to_owned(), "worker-2".to_owned()];
-    let after = ["worker-2".to_owned(), "worker-3".to_owned()];
-    assert_eq!(
-        controller_mcp_replacement_session_id(&before, &after),
-        Some("worker-3".to_owned())
-    );
-    // An ambiguous or unchanged listing must not invent an id.
-    assert_eq!(
-        controller_mcp_replacement_session_id(&before, &before),
-        None
-    );
-    assert_eq!(
-        controller_mcp_replacement_session_id(
-            &before,
-            &["worker-3".to_owned(), "worker-4".to_owned()]
-        ),
-        None
-    );
 }
 
 #[test]
