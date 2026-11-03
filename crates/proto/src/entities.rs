@@ -1655,7 +1655,9 @@ pub enum AgentAuthKind {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccountsSnapshot {
+    #[serde(deserialize_with = "crate::agent::deserialize_harness_rows")]
     pub accounts: Vec<AgentAccount>,
+    #[serde(deserialize_with = "crate::agent::deserialize_harness_rows")]
     pub warnings: Vec<AgentAccountWarning>,
 }
 
@@ -1998,6 +2000,83 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AgentAccountsSnapshot>(value).unwrap(),
             snapshot
+        );
+    }
+
+    #[test]
+    fn account_snapshots_ignore_unknown_harnesses_but_reject_malformed_known_rows() {
+        use serde_json::json;
+        let snapshot: AgentAccountsSnapshot = serde_json::from_value(json!({
+            "accounts": [
+                {"id":"new", "harness":"fx"},
+                {"id":"codex", "harness":"codex", "active":true, "email":null, "planLabel":null}
+            ],
+            "warnings": [
+                {"harness":"fx", "message":"unknown"},
+                {"harness":"codex", "message":"known"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(snapshot.accounts.len(), 1);
+        assert_eq!(snapshot.accounts[0].id, "codex");
+        assert!(snapshot.accounts[0].active);
+        assert!(snapshot.accounts[0].usage_windows.is_empty());
+        assert_eq!(snapshot.warnings.len(), 1);
+        assert_eq!(snapshot.warnings[0].message, "known");
+
+        let only_unknown: AgentAccountsSnapshot = serde_json::from_value(json!({
+            "accounts":[{"harness":"fx"}], "warnings":[{"harness":"fx"}]
+        }))
+        .unwrap();
+        assert!(only_unknown.accounts.is_empty());
+        assert!(only_unknown.warnings.is_empty());
+
+        let account = json!({
+            "id":"codex", "harness":"codex", "active":true,
+            "email":null, "planLabel":null
+        });
+        let warning = json!({"harness":"codex", "message":"known"});
+        for discriminator in [None, Some(json!(null)), Some(json!(3))] {
+            for (field, mut row) in [("accounts", account.clone()), ("warnings", warning.clone())] {
+                match &discriminator {
+                    Some(value) => row["harness"] = value.clone(),
+                    None => {
+                        row.as_object_mut().unwrap().remove("harness");
+                    }
+                }
+                let mut snapshot = json!({"accounts":[], "warnings":[]});
+                snapshot[field] = json!([row]);
+                assert!(serde_json::from_value::<AgentAccountsSnapshot>(snapshot).is_err());
+            }
+        }
+        for invalid in [
+            json!({"id":"codex", "harness":"codex", "active":"bad", "email":null, "planLabel":null}),
+            json!({"id":"codex", "harness":"codex", "active":true, "email":null, "planLabel":null, "authKind":"unknown"}),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentAccountsSnapshot>(json!({
+                    "accounts":[invalid], "warnings":[]
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<AgentAccountsSnapshot>(json!({
+                "accounts":[], "warnings":[{"harness":"codex"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AgentAccountsSnapshot>(json!({
+                "accounts":{}, "warnings":[]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AgentAccount>(json!({
+                "id":"new", "harness":"fx", "active":true
+            }))
+            .is_err()
         );
     }
 

@@ -733,10 +733,12 @@ impl HarnessesPage {
             this.update(cx, |page, cx| {
                 page.switching = false;
                 page.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                        Ok(list) => Loadable::Ready(list),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
+                    Ok(value) => {
+                        match zeron_proto::decode_harness_catalog::<HarnessDescriptor>(value) {
+                            Ok(list) => Loadable::Ready(list),
+                            Err(err) => Loadable::Error(err.to_string()),
+                        }
+                    }
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 page.run_pending_sign_in(cx);
@@ -794,7 +796,7 @@ impl HarnessesPage {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|value| {
-                    serde_json::from_value::<Vec<HarnessDescriptor>>(value)
+                    zeron_proto::decode_harness_catalog::<HarnessDescriptor>(value)
                         .map_err(|error| error.to_string())
                 });
             this.update(cx, |page, cx| {
@@ -831,16 +833,19 @@ impl HarnessesPage {
             let result = engine
                 .client()
                 .call(methods::SET_HARNESS_ENABLED, params)
-                .await;
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    zeron_proto::decode_harness_catalog::<HarnessDescriptor>(value)
+                        .map_err(|error| error.to_string())
+                });
             this.update(cx, |page, cx| {
                 if page.pending_toggle == Some((harness, enabled)) {
                     page.pending_toggle = None;
                 }
                 match result {
-                    Ok(value) => {
-                        if let Ok(list) = serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                            page.harnesses = Loadable::Ready(list);
-                        }
+                    Ok(list) => {
+                        page.harnesses = Loadable::Ready(list);
                         if !enabled && page.expanded_harness == Some(harness) {
                             page.expanded_harness = None;
                         }

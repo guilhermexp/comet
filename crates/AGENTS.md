@@ -16,6 +16,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 - `edition = "2024"` em todas.
 - `mcp/src/tools.rs`: a consulta existente `list_chats.parent` descobre Chats criados por `parent_chat_id` **ou** `origin_chat_id`; summaries expõem `parentChatId` e `originChatId` separadamente. Isso não muda `Chat::is_top_level`, autoridade nem a linhagem gravada. Regressão de consumidor com RPC em memória: `creator_query_lists_both_lineages_without_reparenting`.
 - `zeron-client` mantém o recibo durável `viewer-delivery` separado do outbox de Chat: descoberta reabre Chats sem viewport, refaz wake com credenciais atuais e só conclui a versão depois do ACK das rows e uma wake final. `hostDevice` é hint de roteamento, nunca grant. Working exige posse do host/output; envio ainda não adotado permanece Sending/Queued.
+- Descoberta tipada de harness entre versões usa a política de `zeron-proto` em desktop e `zeron-mcp`; identidades desconhecidas não viram runtimes executáveis. O catálogo string de `zeron-client` continua aberto.
 - Runtime async é **tokio** em todo lugar; a UI faz a ponte por `gpui_tokio` (`Tokio::spawn` vira `Task` do gpui). A UI nunca bloqueia na engine.
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
 - **Configured worker presets receive `launch_worker` briefing at native
@@ -63,6 +64,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `zeron-rpc` | [`rpc/AGENTS.md`](rpc/AGENTS.md) | UiRpc/ControlRpc tipados sobre WS + transporte in-memory |
 | `zeron-syntax` | [`syntax/AGENTS.md`](syntax/AGENTS.md) | Tokenizer tree-sitter paint-only compartilhado pelas surfaces |
 | `zeron-theme` | [`theme/AGENTS.md`](theme/AGENTS.md) | Modelo source-neutral, catálogo e importação de temas |
+| `zeron-mcp` | — (`mcp/src/lib.rs`) | Ferramentas de Chat via IPC, incluindo descoberta de harness por device |
 | `zeron-computer-use-mcp` | [`computer-use-mcp/AGENTS.md`](computer-use-mcp/AGENTS.md) | MCP `comet-computer-use` (`computer_use`, `computer_use_reset`), proxy do `cua_repl` |
 | `zeron-workers-unpeel` | [`workers-unpeel/AGENTS.md`](workers-unpeel/AGENTS.md) | Fronteira tipada sobre `third_party/unpeel`: projetos, worktrees, sessões de Worker, controller MCP, notificações ao parent; leitores de Settings → Projects (atividade e tickets por projeto) compartilhados com o controller |
 | `zeron-preview` | [`preview/AGENTS.md`](preview/AGENTS.md) | Catálogo, proxy HTTP/WebSocket e pairing RTC autenticado |

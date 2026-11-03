@@ -2,6 +2,18 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-03 — Identidade de Workers reiniciados e acessibilidade de Accounts
+
+- O reinício de Worker propaga o ID real devolvido pelo host até o controller e transfere o vínculo com o Chat pai usando esse ID, sem inferir a substituição por diferenças de listas. A retomada no mesmo host preserva o ID original.
+- Accounts dá identidade de acessibilidade própria a cada seção de provedor, evitando o fechamento da build dev quando várias contas usam o mesmo índice de linha.
+- Verificação: quatro cenários isolados com hosts reais cobrem reinício normal, requisições simultâneas, retomada sem troca de ID e envio com notificação pendente para o Chat correto. A fixture nativa de Accounts passou com AccessKit ativo; o dev normal carregou dez contas sem repetir o panic. Não foi exercitado transporte real de notificação ao Chat nem conclusão por provider real.
+
+## 2026-11-02 — v1.0.14: Compatibilidade da descoberta remota de harnesses
+
+- Catálogos de harnesses e snapshots de contas agora preservam rows suportadas quando um device anuncia uma identidade mais nova desconhecida. Dados malformados de identidades conhecidas continuam erros; a mudança não adiciona Fx nem altera requests de execução ou IDs de modelo.
+- O MCP distingue endpoint de contas indisponível de resposta inválida; Settings exibe falhas de decode do toggle. O app já em execução não é substituído nem reiniciado por esta alteração.
+- Verificação: 126 testes `zeron-proto`, 39 `zeron-mcp` e dois testes focados de retarget na UI passaram. Um cliente MCP compilado nesta revisão descobriu Codex e oito modelos na VPS, criou um Chat temporário somente-leitura e recebeu `CODEX_REMOTE_OK`; o Chat foi arquivado. A interface do app instalado ainda não foi validada com esta versão.
+
 ## 2026-11-01 — Correções desktop V1–V3, W1, W2, C1, B1, B2, U1, F1/F3/F4/F5/F7 (branch de tarefa, sem release)
 
 - Voz: o stage não mostra Details (corpo, header, resize) nem na saída, sem salvar preferência; Settings → Voice "Show voice orb" (`voiceOrbEnabled`) remove todas as orbs e seus ticks sem afetar chamada, ditado ou Reduce motion; widget compacto global (mudo, voltar, encerrar no hover/foco) substitui a orb do composer.
