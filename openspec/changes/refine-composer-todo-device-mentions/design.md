@@ -10,7 +10,7 @@ Ver `proposal.md` para motivação. Pesquisa somente leitura encontrou:
 - `proto/src/chat_mentions.rs`: precedente de URI canônica, parser estrito, label escapado e expansão para prompt legível. `invocation::harness_prompt` centraliza transformações usadas por envio e steer; Cursor/OpenCode têm consumidores próprios já existentes.
 - Devices vêm de `AppState.listed_devices`; Project/Space tem `device_id` e path no host dono. As ferramentas existentes resolvem device por ID e projeto dentro do destino. A menção de projeto atual contém path, não seleciona host.
 
-O trabalho Projects worked está em outro Chat com WIP e target próprios no checkout principal. Nada desta change autoriza sobrescrevê-los ou interromper suas provas.
+Projects worked foi integrado na main local `58d36b546f57b361535ce53959281371e5fbf059`, sobre a base inicial `122c3090f` desta change. A integração deve preservar `Chat.worked_projects`, seu witness causal, `EnsureChatWorkedProjects` e os metadados de UiSettings/sidebar ao reconciliar literals e merges. Nada desta change autoriza sobrescrever trabalho ou interromper targets/provas alheios.
 
 ## Goals / Non-Goals
 
@@ -52,7 +52,7 @@ Compatibilidade escolhida: em host antigo sem a expansão, a URI bruta ainda lev
 
 Um único dono de integração no composer; implementação em Worker isolado por cruzar UI/proto, a partir da base atual do fork, depois de coordenar com o Chat Projects worked. Preservar trabalho/targets alheios. Antes de editar exports ou consumidores, levantar referências com LSP quando disponível. Ler cadeia DOX do target e Impeccable; o contexto visual foi carregado e DESIGN.md examinado integralmente pelo scout. Reutilizar Theme, popover, rows, foco e animações existentes; nenhuma tarefa de init/rebranding.
 
-Agrupar verificações Cargo locais necessárias em uma única rodada de `scripts/cargo-verify.py`, mantendo jobs=2 e sccache; sem heavy-run e sem baterias repetidas apenas por ritual. Provar estado/UI por fixture GPUI e o caminho até o harness por consumidor real isolado, sem conta/provider externo. Observação visual nativa deve usar fixture que não inicialize integrações reais; não abrir cópia completa do app sem isolamento demonstrado dos providers, conforme DOX. Se a surface não puder ser exercitada com segurança, registrar `notProven`, sem fingir prova visual nem substituir o app do usuário.
+Agrupar verificações Cargo locais necessárias com comandos nativos diretos, mantendo jobs=2 e sccache, `CARGO_TARGET_DIR` exclusivo da tarefa e do checkout e avaliação do espaço livre antes de compilar. Reutilizar esse target nas provas da mesma fonte; não usar `scripts/cargo-verify.py`, seu mínimo de 60 GiB, heavy-run ou wrappers de serialização, nem repetir baterias apenas por ritual. Provar estado/UI por fixture GPUI e o caminho até o harness por consumidor real isolado, sem conta/provider externo. Observação visual nativa deve usar fixture que não inicialize integrações reais; não abrir cópia completa do app sem isolamento demonstrado dos providers, conforme DOX. Se a surface não puder ser exercitada com segurança, registrar `notProven`, sem fingir prova visual nem substituir o app do usuário.
 
 ## Risks / Trade-offs
 

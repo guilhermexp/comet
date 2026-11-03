@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
                                 .save(output.join(format!("frame-{frame:02}.png")))?;
                             Ok(())
                         })??;
-                        let raw = input.read_with(cx, |input, _| input.text().to_owned())?;
+                        let raw = input.read_with(cx, |input, _| input.text().to_owned());
                         if !raw.is_empty() {
                             println!(
                                 "FRAME {frame} DRAFT {raw:?} AGENT {:?}",
