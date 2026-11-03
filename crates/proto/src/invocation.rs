@@ -213,7 +213,7 @@ pub fn harness_prompt(text: &str, harness: crate::HarnessId) -> String {
         ),
     );
     if harness == crate::HarnessId::Codex {
-        return text;
+        return crate::device_mentions::device_mention_prompt(&text);
     }
     let mut result = String::new();
     let mut at = 0;
@@ -250,7 +250,7 @@ pub fn harness_prompt(text: &str, harness: crate::HarnessId) -> String {
         at = range.end;
     }
     result.push_str(&text[at..]);
-    result
+    crate::device_mentions::device_mention_prompt(&result)
 }
 
 pub fn invocation_prompt(text: &str) -> String {

@@ -178,8 +178,7 @@ fn signature(items: &[TodoItem]) -> u64 {
 /// `shell::SessionPanels` it lasts for the app run, not across restarts.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TodoPanelState {
-    /// The user's explicit choice; `None` follows the automatic rule: open
-    /// while work remains, compact once everything is done.
+    /// The user's explicit choice; absent a choice the panel is collapsed.
     expanded: Option<bool>,
     show_earlier: bool,
     show_later: bool,
@@ -202,14 +201,12 @@ impl TodoPanelState {
         self.was_settled = settled;
     }
 
-    /// A finished list is compact by default even while a new turn runs, so
-    /// last turn's checklist does not pop open again each time you send.
-    pub fn is_expanded(&self, finished: bool) -> bool {
-        self.expanded.unwrap_or(!finished)
+    pub fn is_expanded(&self) -> bool {
+        self.expanded.unwrap_or(false)
     }
 
-    pub fn toggle(&mut self, finished: bool) {
-        self.expanded = Some(!self.is_expanded(finished));
+    pub fn toggle(&mut self) {
+        self.expanded = Some(!self.is_expanded());
         self.epoch = self.epoch.wrapping_add(1);
     }
 
@@ -300,7 +297,7 @@ impl Composer {
         if panel.is_dismissed(&items) {
             return None;
         }
-        let expanded = panel.is_expanded(summary.finished());
+        let expanded = panel.is_expanded();
         let (show_earlier, show_later, epoch) = (panel.show_earlier, panel.show_later, panel.epoch);
 
         let theme = Theme::of(cx).clone();
@@ -328,6 +325,7 @@ impl Composer {
                 true,
                 div()
                     .id("todo-panel-rows")
+                    .debug_selector(|| "todo-panel-rows".into())
                     .max_h(window.viewport_size().height * 0.3)
                     .overflow_y_scroll()
                     .track_scroll(&self.todo_scroll)
@@ -399,11 +397,11 @@ impl Composer {
                 .map(|ix| (items[ix].text.clone().into(), theme.text_muted))
         };
 
-        let finished = summary.finished();
         let toggle_chat = chat_id.to_owned();
         let toggle =
             div()
                 .id("todo-panel-toggle")
+                .debug_selector(|| "todo-panel-toggle".into())
                 .role(gpui::Role::Button)
                 .aria_label(label)
                 .flex_1()
@@ -422,7 +420,7 @@ impl Composer {
                     this.todo_panels
                         .entry(toggle_chat.clone())
                         .or_default()
-                        .toggle(finished);
+                        .toggle();
                     cx.notify();
                 }))
                 .tooltip(crate::settings::widgets::text_tooltip(label))
@@ -888,40 +886,47 @@ mod tests {
     }
 
     #[test]
-    fn panel_follows_the_work_then_tidies_itself_once() {
+    fn new_work_and_progress_leave_the_panel_collapsed() {
+        let mut panel = TodoPanelState::default();
+        for progress in ["...", "x>."] {
+            let list = items(progress);
+            panel.observe(false);
+            let summary = TodoSummary::of(&list);
+            assert!(!panel.is_expanded(), "{progress}");
+            assert_eq!(
+                summary.headline(),
+                Some(usize::from(progress.starts_with('x')))
+            );
+        }
+    }
+
+    #[test]
+    fn panel_follows_manual_choice_and_tidies_once_when_settled() {
         let mut state = TodoPanelState::default();
-        // Working: open by default.
         state.observe(false);
-        assert!(state.is_expanded(false));
-        // A finished list stays compact when a new turn starts (not settled,
-        // since the turn is live) instead of popping open again.
-        assert!(!state.is_expanded(true));
-        // User collapses mid-run: respected.
-        state.toggle(false);
+        state.toggle();
         state.observe(false);
-        assert!(!state.is_expanded(false));
-        // Everything done and idle: compact, and the explicit choice resets.
-        state.toggle(false); // user had re-expanded
-        assert!(state.is_expanded(false));
-        state.observe(true);
-        assert!(!state.is_expanded(true));
-        // Opening the finished list by hand sticks (no re-collapse each frame).
-        state.toggle(true);
-        state.observe(true);
-        assert!(state.is_expanded(true));
-        // New work arrives: back to the automatic open state...
+        assert!(state.is_expanded());
+        state.toggle();
         state.observe(false);
-        assert!(state.is_expanded(false));
-        // ...and finishing again tidies again.
+        assert!(!state.is_expanded());
+        state.toggle();
         state.observe(true);
-        assert!(!state.is_expanded(true));
+        assert!(!state.is_expanded());
+        state.toggle();
+        state.observe(true);
+        assert!(state.is_expanded());
+        state.observe(false);
+        assert!(state.is_expanded());
+        state.observe(true);
+        assert!(!state.is_expanded());
     }
 
     #[test]
     fn toggle_replays_the_fade_and_folds_toggle_independently() {
         let mut state = TodoPanelState::default();
         let before = state.epoch;
-        state.toggle(false);
+        state.toggle();
         assert_ne!(state.epoch, before);
         state.toggle_fold(FoldSide::Later);
         assert!(state.show_later && !state.show_earlier);
@@ -1053,13 +1058,17 @@ mod composer_tests {
         entries: Vec<SessionMessageEntry>,
         cx: &mut gpui::TestAppContext,
     ) {
-        state.update(cx, |state, _| {
+        state.update(cx, |state, cx| {
             state.selected_chat = Some(chat.into());
             state.transcript = entries;
             state.transcript_revision += 1;
+            cx.notify();
         });
         handle
-            .update(cx, |composer, _, _| composer.current_key = chat.into())
+            .update(cx, |composer, _, cx| {
+                composer.current_key = chat.into();
+                cx.notify();
+            })
             .unwrap();
     }
 
@@ -1181,27 +1190,85 @@ mod composer_tests {
     }
 
     #[gpui::test]
-    fn open_state_is_remembered_per_chat(cx: &mut gpui::TestAppContext) {
+    fn header_click_and_progress_preserve_independent_chat_choices(cx: &mut gpui::TestAppContext) {
         let (_dir, state, handle) = window(cx);
-        let entries = || vec![assistant_with_todo(items(1, 3))];
-        show_todo(&state, &handle, "a", entries(), cx);
-        assert!(rendered(&handle, cx));
-        handle
-            .update(cx, |composer, _, _| {
-                composer.todo_panels.get_mut("a").unwrap().toggle(false);
-            })
-            .unwrap();
-        // Another chat starts from the automatic state, and A keeps its choice.
-        show_todo(&state, &handle, "b", entries(), cx);
-        assert!(rendered(&handle, cx));
-        show_todo(&state, &handle, "a", entries(), cx);
-        assert!(rendered(&handle, cx));
-        handle
-            .read_with(cx, |composer, _| {
-                assert!(!composer.todo_panels["a"].is_expanded(false));
-                assert!(composer.todo_panels["b"].is_expanded(false));
-            })
-            .unwrap();
+        let draw = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+        };
+        show_todo(
+            &state,
+            &handle,
+            "a",
+            vec![assistant_with_todo(items(0, 3))],
+            cx,
+        );
+        draw(cx);
+        {
+            let mut visual = gpui::VisualTestContext::from_window(handle.into(), cx);
+            let header = visual.debug_bounds("todo-panel-toggle").expect("header");
+            assert!(visual.debug_bounds("todo-panel-rows").is_none());
+            visual.simulate_click(header.center(), gpui::Modifiers::default());
+        }
+        draw(cx);
+        assert!(
+            gpui::VisualTestContext::from_window(handle.into(), cx)
+                .debug_bounds("todo-panel-rows")
+                .is_some()
+        );
+        show_todo(
+            &state,
+            &handle,
+            "a",
+            vec![assistant_with_todo(items(1, 3))],
+            cx,
+        );
+        draw(cx);
+        assert!(
+            gpui::VisualTestContext::from_window(handle.into(), cx)
+                .debug_bounds("todo-panel-rows")
+                .is_some()
+        );
+        show_todo(
+            &state,
+            &handle,
+            "b",
+            vec![assistant_with_todo(items(1, 3))],
+            cx,
+        );
+        draw(cx);
+        assert!(
+            gpui::VisualTestContext::from_window(handle.into(), cx)
+                .debug_bounds("todo-panel-rows")
+                .is_none()
+        );
+        show_todo(
+            &state,
+            &handle,
+            "a",
+            vec![assistant_with_todo(items(1, 3))],
+            cx,
+        );
+        draw(cx);
+        {
+            let mut visual = gpui::VisualTestContext::from_window(handle.into(), cx);
+            assert!(visual.debug_bounds("todo-panel-rows").is_some());
+            let header = visual.debug_bounds("todo-panel-toggle").unwrap();
+            visual.simulate_click(header.center(), gpui::Modifiers::default());
+        }
+        show_todo(
+            &state,
+            &handle,
+            "a",
+            vec![assistant_with_todo(items(2, 3))],
+            cx,
+        );
+        draw(cx);
+        assert!(
+            gpui::VisualTestContext::from_window(handle.into(), cx)
+                .debug_bounds("todo-panel-rows")
+                .is_none()
+        );
     }
 
     #[gpui::test]

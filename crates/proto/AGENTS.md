@@ -29,6 +29,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 - `attachment_mentions::pair_attachment_mentions` associa chips distintos a paths em ordem estável, um-para-um, compartilhado entre desktop e iOS. Nome visível exato desempata colisões do nome sanitizado pelo upload; nomes duplicados preservam a ordem de staging. É uma derivação local pura e não altera o schema de mensagens.
 
+- `device_mentions` codifica referências textuais `[nome](zeron-device:<id>)` com ID opaco, distinto de path; o parser estrito ignora código, imagens, escapes e links inválidos. `invocation::harness_prompt` expande somente a cópia entregue ao agente; fila e transcript conservam a URI canônica, sem alterar wire ou grants.
+
 - GitHistoryPage inclui branchTips com default vazio e comparison opcional. SearchGitHistoryParams e ResolveGitAvatarsParams definem as novas requests aditivas; versões antigas podem continuar lendo páginas sem esses campos.
 
 - `preview.rs` define catálogo de serviços, porta estável e snapshot do browser. Metadados de descoberta não entram no documento Loro; pertencem ao catálogo de previews do device.

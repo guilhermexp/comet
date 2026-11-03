@@ -2,6 +2,11 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-03 — Todo e referências de Devices no composer
+
+- A bandeja Todo começa recolhida e conserva a escolha manual por Chat durante o progresso; a conclusão ociosa mantém o reset existente.
+- O menu `@` oferece dispositivos físicos online do registro, identificados por nome e ID estável. A referência permanece textual na fila e no transcript e é expandida somente para o prompt do agente, sem mover o Chat ou conceder acesso.
+
 ## 2026-11-03 — Projeto de origem em Projects worked
 
 - Linhas de worktree mostram `projeto/branch`, usando a identidade do projeto registrado; nomes de pasta de worktree não são tratados como projetos. Prefixos já qualificados não se repetem, e projetos normais mantêm o nome simples.

@@ -12433,6 +12433,12 @@ fn user_bubble_text(
         .child(underlay)
         .child(text_element)
         .into_any_element();
+    let selectable = crate::composer::device_identity_overlays(
+        format!("{row_id}-device-identities").into(),
+        selectable,
+        chip_layout.clone(),
+        crate::composer::device_identities(&mentions),
+    );
     if overlays.is_empty() {
         return selectable;
     }

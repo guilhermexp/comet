@@ -55,11 +55,11 @@ step narrower than it, which is itself narrower than the composer).
   last three). `N earlier` / `N later` rows at the edges reveal the hidden items in
   place and hide them again. Items are never reordered (`todo_panel::rows`).
 - **Open state.** Per chat, in memory for the app run (like the right-pane flags in
-  `shell::SessionPanels`; the repo keeps no per-chat UI state on disk). Default:
-  open while work remains, compact once everything is done, including when a new
-  turn starts on an old finished list. When the last item completes and the turn
-  is idle, an explicit choice is reset once so the panel tidies itself to the
-  compact done state; opening it by hand afterwards sticks.
+  `shell::SessionPanels`; the repo keeps no per-chat UI state on disk). A new
+  list starts collapsed, and progress updates do not open it. The header toggles
+  the list; the manual choice survives ordinary updates. When the last item
+  completes and the turn is idle, the choice resets once so the panel tidies
+  itself; opening it by hand afterwards sticks.
 - **Done state.** Offers a dismiss button; a dismissal holds until the agent writes
   a different list.
 - **No focus stealing.** Nothing here takes focus; updates only re-render.

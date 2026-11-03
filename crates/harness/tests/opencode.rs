@@ -566,7 +566,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
     let fake = FakeOpencode::start().await;
     let (controls, steer, _token) = controls();
     let mut stream = harness(&fake)
-        .run(request("hi"), controls)
+        .run(request("hi [Desk](zeron-device:host-a)"), controls)
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await;
@@ -584,7 +584,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
 
     steer
         .send(SteerMessage {
-            prompt: "also do this".into(),
+            prompt: "also do this [Desk](zeron-device:host-b)".into(),
             message_id: None,
             attachments: Vec::new(),
             config: None,
@@ -602,7 +602,18 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
     );
     // The steer went out as a second prompt on the SAME session.
     let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 2).await;
-    assert_eq!(prompts[1]["parts"][0]["text"], "also do this");
+    assert!(
+        prompts[0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("device id host-a")
+    );
+    assert!(
+        prompts[1]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("device id host-b")
+    );
 
     // Turn 2 settles normally.
     assistant_message(&fake, "ses_test", "msg_2");

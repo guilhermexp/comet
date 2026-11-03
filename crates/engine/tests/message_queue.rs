@@ -799,6 +799,55 @@ async fn a_steer_command_for_a_turn_boundary_agent_waits_in_the_queue_for_the_tu
     core.shutdown().await;
 }
 
+#[tokio::test]
+async fn device_references_survive_initial_and_steered_delivery() {
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    let initial = "Start on [Desk](zeron-device:host-a)";
+    let steer = "Continue on [Desk](zeron-device:host-b)";
+    core.doc_host
+        .queue_message(CHAT, initial, Vec::new())
+        .unwrap();
+    wait_for(
+        || {
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("device id host-a"))
+        },
+        "initial device identity at harness",
+    )
+    .await;
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Steer {
+                prompt: steer.into(),
+                message_id: Some("device-steer".into()),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("device id host-b"))
+        },
+        "steered device identity at harness",
+    )
+    .await;
+    wait_for(
+        || user_messages(&core).iter().any(|text| text == steer),
+        "canonical steer in transcript",
+    )
+    .await;
+    assert!(user_messages(&core).iter().any(|text| text == initial));
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 /// A full mailbox must apply backpressure, never kill the healthy runtime.
 #[tokio::test]
 async fn saturated_steering_mailbox_waits_without_restarting_or_losing_messages() {
@@ -1785,7 +1834,7 @@ async fn an_acquired_edit_blocks_turn_end_and_commit_sends_the_new_text() {
                 &id,
                 &lease_id,
                 FinishQueueEditAction::Commit,
-                Some("new text"),
+                Some("new text [Desk](zeron-device:host-edit)"),
                 Some(&base_text_hash),
             )
             .await
@@ -1793,8 +1842,23 @@ async fn an_acquired_edit_blocks_turn_end_and_commit_sends_the_new_text() {
         FinishQueueEditOutcome::Committed
     ));
     wait_for(
-        || prompts.lock().unwrap().iter().any(|p| p == "new text"),
+        || {
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("device id host-edit"))
+        },
         "edited row to dispatch",
+    )
+    .await;
+    wait_for(
+        || {
+            user_messages(&core)
+                .iter()
+                .any(|m| m == "new text [Desk](zeron-device:host-edit)")
+        },
+        "canonical edited text in transcript",
     )
     .await;
     assert!(!prompts.lock().unwrap().iter().any(|p| p == "old text"));

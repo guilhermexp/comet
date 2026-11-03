@@ -51,6 +51,10 @@ name = "provider-limit-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "composer-mentions-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "appshots-fixture"
 required-features = ["appshots-fixture"]
 

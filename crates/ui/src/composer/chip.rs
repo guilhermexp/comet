@@ -32,6 +32,8 @@ pub enum ChipKind {
     Directory,
     /// Another chat, dropped from the sidebar.
     Chat,
+    /// A registered device identity, not a filesystem path.
+    Device,
 }
 
 /// What a chip's icon is painted from: a monochrome glyph tinted like the
@@ -173,6 +175,7 @@ pub(crate) fn chip_icon(
         ChipKind::Skill => ChipIcon::Glyph(crate::icons::MAGIC_STICK_3),
         ChipKind::Command => ChipIcon::Glyph(crate::icons::COMMAND),
         ChipKind::Chat => ChipIcon::Glyph(crate::icons::CHAT_ROUND_LINE),
+        ChipKind::Device => ChipIcon::Glyph(crate::icons::MONITOR),
         ChipKind::File => ChipIcon::FileTheme(asset_path(FileIconIdentity::file(path), appearance)),
         ChipKind::Directory => ChipIcon::FileTheme(asset_path(
             FileIconIdentity::directory(path.trim_end_matches('/'), false),
@@ -239,6 +242,123 @@ pub(crate) fn paint_chip(
     }
 }
 
+/// Place a non-layout tooltip target on each device chip, not on the whole
+/// message: identical names can then be inspected independently.
+pub(crate) fn device_identities(spans: &[SentMentionSpan]) -> Vec<(Range<usize>, SharedString)> {
+    spans
+        .iter()
+        .filter_map(|span| {
+            span.device_name.as_ref().map(|name| {
+                (
+                    span.range.clone(),
+                    SharedString::from(format!("{name} · {}", span.path)),
+                )
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn device_identity_overlays(
+    id: SharedString,
+    child: gpui::AnyElement,
+    layout: gpui::TextLayout,
+    identities: Vec<(Range<usize>, SharedString)>,
+) -> gpui::AnyElement {
+    if identities.is_empty() {
+        return child;
+    }
+    DeviceIdentityOverlays {
+        id,
+        child,
+        layout,
+        identities,
+    }
+    .into_any_element()
+}
+
+struct DeviceIdentityOverlays {
+    id: SharedString,
+    child: gpui::AnyElement,
+    layout: gpui::TextLayout,
+    identities: Vec<(Range<usize>, SharedString)>,
+}
+
+impl IntoElement for DeviceIdentityOverlays {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for DeviceIdentityOverlays {
+    type RequestLayoutState = ();
+    type PrepaintState = Vec<gpui::AnyElement>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        Some(self.id.clone().into())
+    }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<gpui::AnyElement> {
+        self.child.prepaint(window, cx);
+        let mut targets = Vec::new();
+        for (index, (range, identity)) in self.identities.iter().enumerate() {
+            for (part, rect) in crate::markdown::render::range_rects(&self.layout, range, 0.0, 2.0)
+                .into_iter()
+                .enumerate()
+            {
+                let mut target = div()
+                    .id(SharedString::from(format!("{}-{index}-{part}", self.id)))
+                    .w(rect.size.width)
+                    .h(rect.size.height)
+                    .tooltip(crate::settings::widgets::text_tooltip(identity.clone()))
+                    .into_any_element();
+                target.prepaint_as_root(
+                    rect.origin,
+                    rect.size.map(gpui::AvailableSpace::Definite),
+                    window,
+                    cx,
+                );
+                targets.push(target);
+            }
+        }
+        targets
+    }
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        targets: &mut Vec<gpui::AnyElement>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+        for target in targets {
+            target.paint(window, cx);
+        }
+    }
+}
+
 /// A sent message's text with its chips painted over their spans, for rows
 /// that show one line of it (the queue). `text` is the projected display text
 /// and `spans` its chips, as [`sent_mention_display`] returns them.
@@ -263,6 +383,8 @@ pub(crate) fn chip_text(
                 .map(|range| (range, SharedString::from(CHIP_PAD_FAMILY))),
         );
     let layout = styled.layout().clone();
+    let identity_layout = layout.clone();
+    let identities = device_identities(&spans);
     let icons: Vec<ChipIcon> = spans
         .iter()
         .map(|span| chip_icon(span.kind, &span.path, theme.appearance))
@@ -288,9 +410,15 @@ pub(crate) fn chip_text(
     )
     .absolute()
     .size_full();
-    div()
+    let child = div()
         .relative()
         .child(underlay)
         .child(styled)
-        .into_any_element()
+        .into_any_element();
+    device_identity_overlays(
+        "queued-device-identities".into(),
+        child,
+        identity_layout,
+        identities,
+    )
 }

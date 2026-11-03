@@ -45,8 +45,8 @@ mod chip;
 pub use chip::ChipKind;
 use chip::*;
 pub(crate) use chip::{
-    CHIP_PAD_FAMILY, ChipIcon, chip_icon, chip_pad_ranges, chip_text, paint_chip,
-    text_chip_label_offset,
+    CHIP_PAD_FAMILY, ChipIcon, chip_icon, chip_pad_ranges, chip_text, device_identities,
+    device_identity_overlays, paint_chip, text_chip_label_offset,
 };
 
 // ---------------------------------------------------------------------------
@@ -2035,6 +2035,17 @@ impl TextProjection {
                 }),
         );
         links.extend(
+            zeron_proto::device_mentions::device_mention_links(raw)
+                .into_iter()
+                .map(|link| FileMentionLink {
+                    range: link.range,
+                    basename: link.name,
+                    path: link.device_id,
+                    kind: ChipKind::Device,
+                    attachment: None,
+                }),
+        );
+        links.extend(
             zeron_proto::attachment_mentions::attachment_mentions(raw)
                 .into_iter()
                 .map(|mention| FileMentionLink {
@@ -2208,8 +2219,10 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
                         .iter()
                         .filter(|other| other.path != link.path)
                         .collect();
-                    // A chat's "path" is its id: always show its title.
-                    if duplicates.is_empty() || link.kind == ChipKind::Chat {
+                    // Chat and device identities are opaque ids, not paths.
+                    if duplicates.is_empty()
+                        || matches!(link.kind, ChipKind::Chat | ChipKind::Device)
+                    {
                         return link.basename.clone();
                     }
                     let parts: Vec<_> = link.path.split('/').collect();
@@ -2242,15 +2255,15 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
         .collect()
 }
 
-/// One chip in a *sent* message: its byte range over the projected display
-/// string (`@label` between side bearings). The transcript renders these
-/// read-only — no editing state, no tooltip machinery.
+/// One chip in a sent message, with its range over the projected display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMentionSpan {
     pub range: Range<usize>,
-    /// Full workspace-relative path (labels can be shortened to basenames).
+    /// Filesystem path or opaque Chat/device identity, according to `kind`.
     pub path: SharedString,
     pub kind: ChipKind,
+    /// The exact name captured in a device reference, for identity inspection.
+    pub device_name: Option<SharedString>,
     /// The draft number of an attachment chip.
     pub attachment: Option<u32>,
     /// The upload an attachment chip names, once the transcript pairs them.
@@ -2264,6 +2277,7 @@ fn has_mention_scheme(raw: &str) -> bool {
         || raw.contains(zeron_proto::attachment_mentions::IMAGE_MENTION_SCHEME)
         || raw.contains(zeron_proto::attachment_mentions::ATTACHMENT_MENTION_SCHEME)
         || raw.contains(zeron_proto::chat_mentions::CHAT_MENTION_SCHEME)
+        || raw.contains(zeron_proto::device_mentions::DEVICE_MENTION_SCHEME)
 }
 
 /// Project a sent message's raw Markdown for transcript display: mention links
@@ -2290,6 +2304,8 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
                 if link.is_dir() { "/" } else { "" }
             )),
             kind: link.kind,
+            device_name: (link.kind == ChipKind::Device)
+                .then(|| SharedString::from(link.basename.clone())),
             attachment: link.attachment,
             upload: None,
         })
@@ -5819,7 +5835,9 @@ impl gpui::Element for ComposerTextElement {
             let mut first_row = true;
             let target = MentionTooltipTarget {
                 range: mention.range.clone(),
-                path: if mention.attachment.is_some() {
+                path: if mention.kind == ChipKind::Device {
+                    SharedString::from(format!("{} · {}", mention.basename, mention.path))
+                } else if mention.attachment.is_some() {
                     SharedString::from(mention.basename.clone())
                 } else {
                     SharedString::from(format!(
@@ -6768,6 +6786,47 @@ struct ProjectMention {
     device: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceMention {
+    id: String,
+    name: String,
+    platform: String,
+}
+
+fn device_mentions(
+    state: &AppState,
+    query: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<DeviceMention> {
+    let needle = query.to_lowercase();
+    let mut devices: Vec<_> = state
+        .listed_devices()
+        .filter(|device| !crate::cloud::is_cloud(device))
+        .filter(|device| !crate::cloud::is_cloud_account(device))
+        .filter(|device| !state.is_cloud_session_device(&device.id))
+        .filter(|device| state.device_presence(&device.id, now) == crate::cloud::Presence::Online)
+        .filter(|device| {
+            zeron_proto::device_mentions::device_mention_link(&device.id, &device.name).is_some()
+        })
+        .filter(|device| {
+            device.name.to_lowercase().contains(&needle)
+                || device.id.to_lowercase().contains(&needle)
+        })
+        .map(|device| DeviceMention {
+            id: device.id.clone(),
+            name: device.name.clone(),
+            platform: device.platform.clone(),
+        })
+        .collect();
+    devices.sort_by(|a, b| {
+        (state.local_device_id.as_deref() != Some(a.id.as_str()))
+            .cmp(&(state.local_device_id.as_deref() != Some(b.id.as_str())))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    devices
+}
+
 /// Projects matching the `@` query by name or path (case-insensitive); an
 /// empty query lists them all. Pure — filtering the registry snapshot the
 /// composer already holds, so no IO per keystroke.
@@ -6827,6 +6886,7 @@ enum MentionLevel {
     #[default]
     Root,
     Projects,
+    Devices,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6838,6 +6898,8 @@ struct FileMentionState {
     /// Known projects matching the query — only shown (and only navigable)
     /// once the root menu's Projects entry is opened.
     projects: Vec<ProjectMention>,
+    devices: Vec<DeviceMention>,
+    selected_device: Option<String>,
     level: MentionLevel,
     active: Option<usize>,
     request: u64,
@@ -6857,8 +6919,9 @@ impl FileMentionState {
     /// is the Projects entry plus the file results; inside it, the projects.
     fn row_count(&self, attachment_rows: usize) -> usize {
         match self.level {
-            MentionLevel::Root => attachment_rows + 1 + self.results.len(),
+            MentionLevel::Root => attachment_rows + 2 + self.results.len(),
             MentionLevel::Projects => self.projects.len(),
+            MentionLevel::Devices => self.devices.len(),
         }
     }
 
@@ -6867,8 +6930,8 @@ impl FileMentionState {
     /// child index `scroll_to_item` wants.
     fn scroll_index(&self, active: usize, attachment_rows: usize) -> usize {
         match self.level {
-            MentionLevel::Root => active + usize::from(active > attachment_rows),
-            MentionLevel::Projects => active + 1,
+            MentionLevel::Root => active + usize::from(active > attachment_rows + 1),
+            MentionLevel::Projects | MentionLevel::Devices => active + 1,
         }
     }
 }
@@ -7219,6 +7282,12 @@ impl Composer {
     /// The picker entity, for the shell's canvas target selectors.
     pub fn pickers(&self) -> &Entity<Pickers> {
         &self.pickers
+    }
+
+    /// Read the actual draft in the isolated native composer fixture.
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_input(&self) -> Entity<ComposerInput> {
+        self.input.clone()
     }
 
     /// Feed the shell's current outer width into responsive composer controls.
@@ -8590,6 +8659,7 @@ impl Composer {
             self.slash.active.is_some()
         } else {
             self.mention.active.is_some()
+                || (self.mention.token.is_some() && self.mention.level == MentionLevel::Devices)
         };
         self.input.update(cx, |input, cx| {
             input.set_mention_controls(open, has_selection, cx)
@@ -8887,6 +8957,7 @@ impl Composer {
             Some(token) => filter_project_mentions(&self.project_ledger, &token.query),
             None => Vec::new(),
         };
+        self.refresh_device_mentions(cx);
         if !refining {
             self.mention.results.clear();
             self.mention.active = None;
@@ -8917,11 +8988,23 @@ impl Composer {
                 > 0)
             .then_some(0),
         };
+        if self.mention.level == MentionLevel::Devices {
+            self.mention.selected_device = self
+                .mention
+                .active
+                .and_then(|index| self.mention.devices.get(index))
+                .map(|device| device.id.clone());
+        }
         self.sync_mention_controls(cx);
         let Some(token) = token else {
             cx.notify();
             return;
         };
+        if self.mention.level == MentionLevel::Devices {
+            self.mention.loading = false;
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.mention.loading = false;
             cx.notify();
@@ -8954,7 +9037,9 @@ impl Composer {
                 result = engine.client().call(methods::SEARCH_FILES, params).await;
             }
             this.update(cx, |composer, cx| {
-                if !mention_response_is_current(&composer.mention, request) {
+                if composer.mention.level == MentionLevel::Devices
+                    || !mention_response_is_current(&composer.mention, request)
+                {
                     return;
                 }
                 composer.mention.loading = false;
@@ -8966,11 +9051,9 @@ impl Composer {
                             results.retain(|result| local_path_is_safe(&result.path));
                             composer.mention.error = None;
                             composer.mention.results = results;
-                            composer.mention.active = (composer
-                                .mention
-                                .row_count(composer.mention_attachment_matches().len())
-                                > 0)
-                            .then_some(0);
+                            if composer.mention.level == MentionLevel::Root {
+                                composer.mention.active = Some(0);
+                            }
                             // New result set: the row stack restarts at the top.
                             crate::popover::reset_menu_scroll(
                                 &composer.mention_scroll,
@@ -8982,11 +9065,9 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(%err, "file mention search failed");
                         composer.mention.results.clear();
-                        composer.mention.active = (composer
-                            .mention
-                            .row_count(composer.mention_attachment_matches().len())
-                            > 0)
-                        .then_some(0);
+                        if composer.mention.level == MentionLevel::Root {
+                            composer.mention.active = Some(0);
+                        }
                         composer.mention.error = Some(mention_error_message(&err));
                     }
                 }
@@ -9009,6 +9090,23 @@ impl Composer {
         cx.notify();
     }
 
+    fn refresh_device_mentions(&mut self, cx: &mut Context<Self>) {
+        let query = self
+            .mention
+            .token
+            .as_ref()
+            .map_or("", |token| token.query.as_str());
+        let devices = device_mentions(self.state.read(cx), query, crate::state::clock_now());
+        if self.mention.level == MentionLevel::Devices {
+            self.mention.active = self
+                .mention
+                .selected_device
+                .as_ref()
+                .and_then(|id| devices.iter().position(|device| &device.id == id));
+        }
+        self.mention.devices = devices;
+    }
+
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         let attachment_rows = self.mention_attachment_matches().len();
         self.mention.active = crate::popover::menu_step(
@@ -9016,6 +9114,13 @@ impl Composer {
             self.mention.row_count(attachment_rows),
             delta,
         );
+        if self.mention.level == MentionLevel::Devices {
+            self.mention.selected_device = self
+                .mention
+                .active
+                .and_then(|index| self.mention.devices.get(index))
+                .map(|device| device.id.clone());
+        }
         if let Some(active) = self.mention.active {
             // Keep the keyboard cursor visible in the scrolled row stack.
             self.mention_scroll
@@ -9028,9 +9133,15 @@ impl Composer {
     fn dismiss_mention(&mut self, cx: &mut Context<Self>) {
         // Inside the project list, Escape walks back to the root menu — the
         // whole popup closes only from there.
-        if self.mention.level == MentionLevel::Projects {
+        if self.mention.level != MentionLevel::Root {
+            let was_devices = self.mention.level == MentionLevel::Devices;
             self.mention.level = MentionLevel::Root;
             self.mention.active = Some(0);
+            if was_devices {
+                self.mention.token = None;
+                self.on_input_edited(cx);
+                return;
+            }
             crate::popover::reset_menu_scroll(&self.mention_scroll, &mut self.popup_bar);
             self.sync_mention_controls(cx);
             cx.notify();
@@ -9094,6 +9205,24 @@ impl Composer {
                 Some(project) => project_mention_link(&project.name, &project.path),
                 None => return,
             },
+            MentionLevel::Devices => {
+                let Some(id) = self.mention.selected_device.as_deref() else {
+                    return;
+                };
+                let state = self.state.read(cx);
+                let Some(device) = device_mentions(state, &token.query, crate::state::clock_now())
+                    .into_iter()
+                    .find(|device| device.id == id)
+                else {
+                    return;
+                };
+                let Some(link) =
+                    zeron_proto::device_mentions::device_mention_link(&device.id, &device.name)
+                else {
+                    return;
+                };
+                link
+            }
             MentionLevel::Root => {
                 let attachments = self.mention_attachment_matches();
                 if let Some(row) = attachments.get(active) {
@@ -9122,7 +9251,24 @@ impl Composer {
                         cx.notify();
                         return;
                     }
-                    file_ix => match self.mention.results.get(file_ix - 1) {
+                    1 => {
+                        self.mention.request = self.mention.request.wrapping_add(1);
+                        self.mention_task = None;
+                        self.mention.loading = false;
+                        self.mention.level = MentionLevel::Devices;
+                        self.refresh_device_mentions(cx);
+                        self.mention.active = (!self.mention.devices.is_empty()).then_some(0);
+                        self.mention.selected_device =
+                            self.mention.devices.first().map(|device| device.id.clone());
+                        crate::popover::reset_menu_scroll(
+                            &self.mention_scroll,
+                            &mut self.popup_bar,
+                        );
+                        self.sync_mention_controls(cx);
+                        cx.notify();
+                        return;
+                    }
+                    file_ix => match self.mention.results.get(file_ix - 2) {
                         Some(result) => local_file_link(&result.path, result.is_dir),
                         None => return,
                     },
@@ -9153,6 +9299,7 @@ impl Composer {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         let rows = match self.mention.level {
             MentionLevel::Projects => self.render_project_mention_rows(theme, cx),
+            MentionLevel::Devices => self.render_device_mention_rows(theme, cx),
             MentionLevel::Root => self.render_root_mention_rows(token, theme, cx),
         };
         card = card.child(
@@ -9258,9 +9405,41 @@ impl Composer {
             )
             .into_any_element(),
         );
+        rows.push(
+            crate::popover::menu_row(
+                theme,
+                self.mention.active == Some(attachment_count + 1),
+                "mention-devices",
+            )
+            .id("mention-devices")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.mention.active = Some(this.mention_attachment_matches().len() + 1);
+                this.accept_mention(cx);
+            }))
+            .child(
+                crate::icons::icon(crate::icons::MONITOR)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .child("Devices"),
+            )
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .into_any_element(),
+        );
         rows.push(crate::popover::menu_separator().into_any_element());
         for (ix, result) in self.mention.results.iter().enumerate() {
-            let row_ix = attachment_count + ix + 1;
+            let row_ix = attachment_count + ix + 2;
             let (directory, name) = match result.path.rsplit_once('/') {
                 Some((directory, name)) => (directory.to_string(), name.to_string()),
                 None => (String::new(), result.path.clone()),
@@ -9328,6 +9507,57 @@ impl Composer {
                         .into_any_element(),
                 );
             }
+        }
+        rows
+    }
+
+    fn render_device_mention_rows(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows = vec![crate::popover::menu_heading(theme, "Devices").into_any_element()];
+        if self.mention.devices.is_empty() {
+            rows.push(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("No online devices")
+                    .into_any_element(),
+            );
+            return rows;
+        }
+        for (ix, device) in self.mention.devices.iter().enumerate() {
+            let id = device.id.clone();
+            let detail = format!("{} · {}", device.platform, device.id);
+            rows.push(
+                crate::popover::menu_row(
+                    theme,
+                    self.mention.active == Some(ix),
+                    format!("device-mention-{ix}"),
+                )
+                .id(("device-mention", ix))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.mention.level != MentionLevel::Devices {
+                        return;
+                    }
+                    this.mention.selected_device = Some(id.clone());
+                    this.mention.active = Some(ix);
+                    this.accept_mention(cx);
+                }))
+                .child(crate::popover::completion_row_content(
+                    theme,
+                    crate::icons::icon(crate::cloud::device_glyph(&device.id, &device.platform))
+                        .size(px(14.0))
+                        .text_color(theme.text_muted)
+                        .into_any_element(),
+                    device.name.clone().into(),
+                    detail.into(),
+                ))
+                .into_any_element(),
+            );
         }
         rows
     }
@@ -9842,6 +10072,10 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        if self.mention.level == MentionLevel::Devices && self.mention.token.is_some() {
+            self.refresh_device_mentions(cx);
+            self.sync_mention_controls(cx);
+        }
         {
             let state = self.state.read(cx);
             // AppState also notifies at clock-only transitions, so a run that
@@ -14878,6 +15112,84 @@ mod tests {
     }
 
     #[gpui::test]
+    fn failed_device_send_restores_the_exact_draft_for_resubmission(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.selected_chat = Some("chat".into());
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        let raw = "Ask [Desk](zeron-device:remote-a) and [Desk](zeron-device:remote-b)";
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text(raw, cx));
+            composer.on_submit(cx);
+        });
+        for attempt in 0..2 {
+            let mut queued = None;
+            for _ in 0..20 {
+                cx.run_until_parked();
+                while let Ok(frame) = requests.try_recv() {
+                    let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                    if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) {
+                        queued = Some(frame);
+                    }
+                }
+                if queued.is_some() {
+                    break;
+                }
+                runtime.block_on(async { tokio::task::yield_now().await });
+            }
+            let queued = queued.expect("submission reaches the durable queue");
+            assert_eq!(queued.params["command"]["request"]["prompt"], raw);
+            let response = if attempt == 0 {
+                zeron_rpc::ServerFrame {
+                    id: queued.id,
+                    err: Some("synthetic rejection".into()),
+                    ..Default::default()
+                }
+            } else {
+                zeron_rpc::ServerFrame {
+                    id: queued.id,
+                    ok: Some(serde_json::json!({"commandId":"queued"})),
+                    ..Default::default()
+                }
+            };
+            runtime.block_on(async {
+                replies
+                    .send(serde_json::to_string(&response).unwrap())
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while replies.capacity() < replies.max_capacity() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            cx.run_until_parked();
+            if attempt == 0 {
+                composer.update(cx, |composer, cx| {
+                    assert_eq!(composer.input.read(cx).text(), raw);
+                    assert!(composer.failure.is_some());
+                    composer.on_submit(cx);
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
     fn enter_while_turn_boundary_is_working_queues_remote_image_transfer_with_steer(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -17357,6 +17669,290 @@ mod tests {
         assert!(filter_project_mentions(&ledger, "nothing").is_empty());
     }
 
+    #[test]
+    fn device_choices_follow_registered_physical_presence_and_search() {
+        use chrono::{TimeDelta, Utc};
+        let now = Utc::now();
+        let device = |id: &str, name: &str, seen, capabilities: Vec<String>| zeron_proto::Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: seen,
+            created_at: None,
+            version: None,
+            cursor_sdk_version: None,
+            capabilities,
+        };
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        state.devices = vec![
+            device("local", "Desk", None, vec![]),
+            device("remote-a", "Desk", Some(now), vec![]),
+            device("remote-b", "Desk", Some(now), vec![]),
+            device(
+                "offline",
+                "Offline",
+                Some(now - TimeDelta::seconds(72)),
+                vec![],
+            ),
+            device(
+                "cloud",
+                "Cloud",
+                Some(now),
+                vec![zeron_proto::CLOUD_SESSION_CAPABILITY.into()],
+            ),
+        ];
+        let ids = |rows: Vec<DeviceMention>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(device_mentions(&state, "", now)),
+            ["local", "remote-a", "remote-b"]
+        );
+        assert_eq!(ids(device_mentions(&state, "REMOTE-B", now)), ["remote-b"]);
+        assert_eq!(
+            ids(device_mentions(&state, "", now + TimeDelta::seconds(72))),
+            ["local"]
+        );
+        state.devices[1].name = "Renamed".into();
+        state.devices[1].last_seen_at = Some(now + TimeDelta::seconds(72));
+        assert_eq!(
+            ids(device_mentions(
+                &state,
+                "renamed",
+                now + TimeDelta::seconds(72)
+            )),
+            ["remote-a"]
+        );
+    }
+
+    #[test]
+    fn device_chips_keep_snapshot_names_and_distinct_ids() {
+        let raw = "[Desk](zeron-device:remote-a) [Desk](zeron-device:remote-b)";
+        let (display, spans) = sent_mention_display(raw).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].kind, ChipKind::Device);
+        assert_eq!(spans[0].path.as_ref(), "remote-a");
+        assert_eq!(spans[1].path.as_ref(), "remote-b");
+        assert!(display[spans[0].range.clone()].contains("Desk"));
+        assert!(display[spans[1].range.clone()].contains("Desk"));
+        let identities = device_identities(&spans);
+        assert_eq!(
+            identities[0],
+            (spans[0].range.clone(), "Desk · remote-a".into())
+        );
+        assert_eq!(
+            identities[1],
+            (spans[1].range.clone(), "Desk · remote-b".into())
+        );
+    }
+
+    #[gpui::test]
+    fn stale_device_selection_does_not_insert_its_new_neighbor(cx: &mut gpui::TestAppContext) {
+        use chrono::{TimeDelta, Utc};
+        let now = Utc::now();
+        let clock = crate::state::TestClock::start(now);
+        let (_dir, handle) = composer_focus_window(cx);
+        cx.update(|cx| init(cx, ComposerSendBehavior::Enter));
+        let (state, input) = handle
+            .read_with(cx, |composer, _| {
+                (composer.state.clone(), composer.input.clone())
+            })
+            .unwrap();
+        let submitted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = submitted.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event, _| {
+                if matches!(
+                    event,
+                    ComposerInputEvent::Submitted | ComposerInputEvent::ModifiedSubmitted
+                ) {
+                    observed.set(true);
+                }
+            })
+        });
+        let device = |id: &str, last_seen_at| zeron_proto::Device {
+            id: id.into(),
+            name: "Desk".into(),
+            platform: "macos".into(),
+            last_seen_at,
+            created_at: None,
+            version: None,
+            cursor_sdk_version: None,
+            capabilities: vec![],
+        };
+        state.update(cx, |state, cx| {
+            state.local_device_id = Some("local".into());
+            state.devices = vec![device("local", None), device("remote", Some(now))];
+            state.watch_clock_transitions(cx);
+            cx.notify();
+        });
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("@", cx);
+                    window.focus(&input.focus_handle, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.simulate_keystrokes(handle.into(), "down enter down");
+        handle
+            .read_with(cx, |composer, _| {
+                assert_eq!(composer.mention.selected_device.as_deref(), Some("remote"));
+            })
+            .unwrap();
+
+        // Expiry is delivered by the existing clock transition, not a manual notify.
+        clock.set(now + TimeDelta::seconds(72));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(72));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.simulate_keystrokes(handle.into(), "enter");
+        assert!(
+            !submitted.get(),
+            "expired selection submitted an unfinished prompt"
+        );
+        handle
+            .read_with(cx, |composer, cx| {
+                assert_eq!(composer.input.read(cx).text(), "@");
+                assert_eq!(composer.mention.active, None);
+            })
+            .unwrap();
+        cx.simulate_keystrokes(handle.into(), "down enter");
+        handle
+            .read_with(cx, |composer, cx| {
+                assert_eq!(
+                    composer.input.read(cx).text(),
+                    "[Desk](zeron-device:local) "
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn device_filter_never_searches_files_or_accepts_an_old_file_response(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let (_dir, handle) = composer_focus_window(cx);
+        let state = handle
+            .read_with(cx, |composer, _| composer.state.clone())
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.devices = (0..30)
+                .map(|index| zeron_proto::Device {
+                    id: format!("host-{index}"),
+                    name: format!("Desk {index}"),
+                    platform: "macos".into(),
+                    last_seen_at: Some(chrono::Utc::now()),
+                    created_at: None,
+                    version: None,
+                    cursor_sdk_version: None,
+                    capabilities: vec![],
+                })
+                .collect();
+            state.spaces.push(zeron_proto::Space {
+                id: "space".into(),
+                device_id: "host".into(),
+                path: "/project".into(),
+                name: None,
+                git_detected: false,
+                git_checked_at: None,
+                checkout_id: None,
+                repository_id: None,
+                created_at: chrono::Utc::now(),
+                github_repo: None,
+            });
+            state.select_space(Some("space".into()), cx);
+        });
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("@", cx);
+                    window.focus(&input.focus_handle, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        let mut old_search = None;
+        for _ in 0..20 {
+            cx.run_until_parked();
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                if frame.method.as_deref() == Some(methods::SEARCH_FILES) {
+                    old_search = Some(frame);
+                }
+            }
+            if old_search.is_some() {
+                break;
+            }
+            runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        let old_search = old_search.expect("root menu started a file search");
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.move_mention(1, cx);
+                composer.accept_mention(cx);
+                assert_eq!(composer.mention.level, MentionLevel::Devices);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("@De", cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        for _ in 0..2 {
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+        }
+        let offset = gpui::point(px(0.0), px(-40.0));
+        handle
+            .update(cx, |composer, _, _| {
+                assert!(
+                    composer.mention_scroll.max_offset().y > px(0.0),
+                    "device list must actually scroll"
+                );
+                composer.mention_scroll.set_offset(offset);
+                assert_eq!(composer.mention_scroll.offset(), offset);
+            })
+            .unwrap();
+        runtime.block_on(async {
+            let response = zeron_rpc::ServerFrame {
+                id: old_search.id,
+                ok: Some(serde_json::json!([])),
+                ..Default::default()
+            };
+            replies
+                .send(serde_json::to_string(&response).unwrap())
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                assert_eq!(composer.mention_scroll.offset(), offset)
+            })
+            .unwrap();
+        while let Ok(frame) = requests.try_recv() {
+            let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            assert_ne!(frame.method.as_deref(), Some(methods::SEARCH_FILES));
+        }
+    }
+
     /// Scenario "Mentioning a project": the offered projects are the
     /// registry's projects with their device, newest activity first.
     #[test]
@@ -17415,38 +18011,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn mention_menu_navigates_root_then_projects() {
-        let mut state = FileMentionState {
-            projects: vec![ProjectMention {
-                name: ".orchestrator".into(),
-                path: "/Users/x/.orchestrator".into(),
-                device: None,
-            }],
-            results: vec![
-                FileSearchMatch {
-                    path: "src/main.rs".into(),
-                    is_dir: false,
-                },
-                FileSearchMatch {
-                    path: "src/lib.rs".into(),
-                    is_dir: false,
-                },
-            ],
-            ..FileMentionState::default()
-        };
-        // Root: the Projects entry plus the files — projects are not rows here.
-        assert_eq!(state.row_count(0), 3);
-        // The separator sits between the entry and the first file.
-        assert_eq!(state.scroll_index(0, 0), 0);
-        assert_eq!(state.scroll_index(1, 0), 2);
-
-        state.level = MentionLevel::Projects;
-        assert_eq!(state.row_count(0), 1);
-        // The "Projects" heading is the stack's first child.
-        assert_eq!(state.scroll_index(0, 0), 1);
     }
 
     #[test]

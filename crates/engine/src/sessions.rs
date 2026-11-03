@@ -6616,7 +6616,9 @@ mod tests {
             command: None,
         }
         .link();
-        let previous = format!("Previous {skill}\nSecond line with \\ and \"quotes\"");
+        let previous = format!(
+            "Previous {skill} [Desk](zeron-device:host-a)\nSecond line with \\ and \"quotes\""
+        );
         doc.push_message(&zeron_doc::SessionMessageEntry {
             id: "u1".into(),
             role: zeron_doc::MessageRole::User,
@@ -6631,10 +6633,22 @@ mod tests {
             duration_ms: None,
         })
         .unwrap();
-        let current = format!("Current {skill}\nKeep **Markdown**");
+        let current = format!("Current {skill} [Desk](zeron-device:host-b)\nKeep **Markdown**");
         let delivered = super::cursor_unstarted_history(&doc, "u2", &current, false).unwrap();
         let (_, json) = delivered.split_once('\n').unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(
+            parsed["currentUserMessage"]
+                .as_str()
+                .unwrap()
+                .contains("device id host-b")
+        );
+        assert!(
+            parsed["previousUserMessages"][0]
+                .as_str()
+                .unwrap()
+                .contains("device id host-a")
+        );
         assert_eq!(
             parsed["currentUserMessage"],
             zeron_proto::invocation::harness_prompt(&current, zeron_proto::HarnessId::Cursor)
