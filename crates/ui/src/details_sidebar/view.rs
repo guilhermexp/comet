@@ -3233,6 +3233,11 @@ impl DetailsSidebar {
                         .flex_col()
                         .children(worked.iter().enumerate().map(|(index, project)| {
                             let path = project.path.clone();
+                            let workers = self.workers_model.read(cx);
+                            let (project_name, branch_or_name) =
+                                super::worked_projects::worked_project_label(
+                                    project, workers.projects(), workers.spaces(),
+                                );
                             div()
                                 .id(("worked-project", index))
                                 .debug_selector(move || format!("worked-project-row-{index}"))
@@ -3264,10 +3269,17 @@ impl DetailsSidebar {
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .truncate()
+                                        .flex()
+                                        .overflow_hidden()
                                         .text_size(px(12.0))
                                         .text_color(theme.text)
-                                        .child(zeron_proto::view::single_line(&project.name)),
+                                        .children(project_name.map(|name| {
+                                            div().flex_none().flex()
+                                                .child(zeron_proto::view::single_line(name))
+                                                .child("/")
+                                        }))
+                                        .child(div().flex_1().min_w_0().truncate()
+                                            .child(zeron_proto::view::single_line(branch_or_name))),
                                 )
                                 .children(self.worked_diffs.get(&project.path).filter(|diff| diff.files > 0).map(|diff| {
                                     let additions = diff.additions;

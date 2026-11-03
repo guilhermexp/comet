@@ -2,6 +2,12 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-03 — Projeto de origem em Projects worked
+
+- Linhas de worktree mostram `projeto/branch`, usando a identidade do projeto registrado; nomes de pasta de worktree não são tratados como projetos. Prefixos já qualificados não se repetem, e projetos normais mantêm o nome simples.
+- O nome do projeto permanece visível quando a branch trunca, sem mudar ícones, contadores ou a ação da linha.
+- Verificação: regressão comportamental de identidade com dois projetos e branches iguais, prefixo qualificado e projeto normal; smoke GPUI nativo isolado em 300 px e 500 px. Sem release ou substituição do app instalado.
+
 ## 2026-11-03 — Identidade de Workers reiniciados e acessibilidade de Accounts
 
 - O reinício de Worker propaga o ID real devolvido pelo host até o controller e transfere o vínculo com o Chat pai usando esse ID, sem inferir a substituição por diferenças de listas. A retomada no mesmo host preserva o ID original.

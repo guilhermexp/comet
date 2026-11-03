@@ -14,6 +14,31 @@ pub struct WorkedProject {
     /// row then wears the branch mark instead of the folder.
     pub branch: Option<String>,
 }
+
+/// Keep project identity separate so only the branch needs to truncate.
+pub(super) fn worked_project_label<'a>(
+    project: &'a WorkedProject,
+    projects: &'a [WorkersProject],
+    spaces: &'a [zeron_workers_unpeel::space_registry::SpaceRef],
+) -> (Option<&'a str>, &'a str) {
+    let Some(branch) = project.branch.as_deref() else {
+        return (None, &project.name);
+    };
+    let checkout = projects.iter().find(|checkout| checkout.id == project.id);
+    let name = checkout.and_then(|checkout| {
+        let space_id = checkout.space_id.as_deref()?;
+        spaces
+            .iter()
+            .find(|space| space.local && space.id == space_id)
+            .map(|space| space.name.as_str())
+            .or(checkout.repository_name.as_deref())
+            .filter(|name| !name.is_empty())
+    });
+    let branch = name
+        .and_then(|name| branch.strip_prefix(name)?.strip_prefix('/'))
+        .unwrap_or(branch);
+    (name, branch)
+}
 pub const WORKED_PROJECTS_ROW_HEIGHT: f32 = 28.0;
 pub const WORKED_PROJECTS_VISIBLE_ROWS: usize = 5;
 
@@ -330,6 +355,53 @@ mod tests {
             checkout_archived: false,
             checkout_detached: false,
             space_id: None,
+        }
+    }
+
+    #[test]
+    fn worktree_labels_use_registered_identity_not_checkout_names() {
+        use zeron_workers_unpeel::space_registry::SpaceRef;
+        let branch = "fix-desktop-corrections-20261101";
+        let mut projects = Vec::new();
+        let mut spaces = Vec::new();
+        for (id, name) in [("one", "bops"), ("two", "clovy-os")] {
+            let mut checkout =
+                make_project(id, "misleading-worktree-folder", "/worktrees/irrelevant");
+            checkout.space_id = Some(id.into());
+            checkout.repository_name = Some("stale-name".into());
+            projects.push(checkout);
+            spaces.push(SpaceRef {
+                id: id.into(),
+                name: name.into(),
+                path: format!("/repos/{name}"),
+                device_id: "local".into(),
+                device_name: None,
+                git: true,
+                local: true,
+            });
+        }
+        for (id, name) in [("one", "bops"), ("two", "clovy-os")] {
+            let mut row = WorkedProject {
+                id: id.into(),
+                name: "misleading-worktree-folder".into(),
+                path: "/worktrees/irrelevant".into(),
+                branch: Some(branch.into()),
+            };
+            assert_eq!(
+                super::worked_project_label(&row, &projects, &spaces),
+                (Some(name), branch)
+            );
+            row.branch = Some(format!("{name}/{branch}"));
+            assert_eq!(
+                super::worked_project_label(&row, &projects, &spaces),
+                (Some(name), branch)
+            );
+            row.branch = None;
+            row.name = name.into();
+            assert_eq!(
+                super::worked_project_label(&row, &projects, &spaces),
+                (None, name)
+            );
         }
     }
 
