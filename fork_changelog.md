@@ -2,6 +2,12 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-03: v1.0.15
+
+- Todo do composer inicialmente recolhido, com escolha manual preservada durante o progresso.
+- Menções de dispositivos online alinhadas a Settings, mantendo nome e ID até o prompt do agente.
+- Identificação de projeto/branch em Projects worked e projetos trabalhados na sidebar.
+
 ## 2026-11-03 — Todo e referências de Devices no composer
 
 - A bandeja Todo começa recolhida e conserva a escolha manual por Chat durante o progresso; a conclusão ociosa mantém o reset existente.
