@@ -2,6 +2,12 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-03 — Projetos trabalhados na sidebar
+
+- A linha normal de cada Chat mostra os projetos raiz realmente trabalhados, deduplicados por identidade registrada; `… > Show > Projects worked` controla essa informação independentemente de Branch e permanece ligado por padrão. Compact não recebe linha de metadata.
+- A engine mantém o resumo por host fora do render e preserva IDs conhecidos até uma leitura estável cuja versão causal cubra a evidência anterior; Chats arquivados legados são calculados sob demanda batched.
+- Verificação nativa isolada: layouts 280, 310 e 420 px, Show/reload, Branch off, Compact, Archived e tooltip completo. O app instalado não foi substituído.
+
 ## 2026-11-03 — Projeto de origem em Projects worked
 
 - Linhas de worktree mostram `projeto/branch`, usando a identidade do projeto registrado; nomes de pasta de worktree não são tratados como projetos. Prefixos já qualificados não se repetem, e projetos normais mantêm o nome simples.

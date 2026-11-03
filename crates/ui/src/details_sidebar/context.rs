@@ -163,6 +163,7 @@ mod tests {
             room_gen: None,
             parent_chat_id: None,
             origin_chat_id: None,
+            worked_projects: None,
             harness_session_harness: None,
         }
     }

@@ -1120,6 +1120,7 @@ impl Shell {
                         .into(),
                     folder.into(),
                     branch,
+                    Vec::new(),
                     pr,
                     harness,
                     state.display_status_for(chat, Utc::now()),

@@ -1168,6 +1168,7 @@ impl WorkspaceHost {
                 last_seen_at: None,
                 parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
                 origin_chat_id: origin_chat_id.map(str::to_owned),
+                worked_projects: None,
             })
         })?;
         Ok(())
@@ -1545,6 +1546,35 @@ impl WorkspaceHost {
     /// HEAD-watcher reconciliation: the branch checked out at the chat's cwd.
     pub fn set_chat_branch(&self, chat_id: &str, branch: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_branch(chat_id, branch))?)
+    }
+
+    pub fn set_chat_worked_projects(
+        &self,
+        chat_id: &str,
+        summary: &zeron_proto::ChatWorkedProjects,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_worked_projects(chat_id, summary))?)
+    }
+
+    pub(crate) fn publish_worked_projects_if_current(
+        &self,
+        expected: &Chat,
+        summary: &zeron_proto::ChatWorkedProjects,
+    ) -> Result<bool, EngineError> {
+        let wrote = {
+            let mut doc = lock(&self.inner.reg);
+            if doc.chat(&expected.id)?.as_ref() != Some(expected) {
+                return Ok(false);
+            }
+            doc.set_chat_worked_projects(&expected.id, summary)?
+        };
+        if wrote {
+            self.inner.bump_changed();
+            if let Some(room) = lock(&self.inner.room).as_ref() {
+                room.nudge();
+            }
+        }
+        Ok(wrote)
     }
 
     pub fn set_chat_source_context(

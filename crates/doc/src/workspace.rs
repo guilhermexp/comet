@@ -269,6 +269,14 @@ impl WorkspaceDoc {
             )?,
             None => row.delete("sourceContext")?,
         }
+        if let Some(summary) = &chat.worked_projects
+            && row.get("workedProjects").is_none()
+        {
+            row.insert(
+                "workedProjects",
+                LoroValue::from(serde_json::to_value(summary)?),
+            )?;
+        }
         match &chat.config {
             Some(config) => row.insert("config", LoroValue::from(serde_json::to_value(config)?))?,
             None => row.delete("config")?,
@@ -300,6 +308,22 @@ impl WorkspaceDoc {
         set_opt_str(&row, "originChatId", chat.origin_chat_id.as_deref())?;
         self.doc.commit();
         Ok(())
+    }
+
+    pub fn set_chat_worked_projects(
+        &self,
+        chat_id: &str,
+        summary: &zeron_proto::ChatWorkedProjects,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert(
+            "workedProjects",
+            LoroValue::from(serde_json::to_value(summary)?),
+        )?;
+        self.doc.commit();
+        Ok(true)
     }
 
     /// Synced seen marker (LWW) with a monotonic guard: no oplog write when the
@@ -744,6 +768,8 @@ pub(crate) struct RawChat {
     checkout_id: Option<String>,
     #[serde(default)]
     source_context: Option<zeron_proto::ConversationSourceContext>,
+    #[serde(default, deserialize_with = "lenient_worked_projects")]
+    worked_projects: Option<zeron_proto::ChatWorkedProjects>,
     /// LENIENT: a config this build can't decode (a harness/reasoning/sandbox
     /// id from a NEWER peer — field incident: pre-v0.2.10 laptops dropped
     /// every `"opencode"` chat row wholesale, so new sessions silently never
@@ -775,6 +801,51 @@ pub(crate) struct RawChat {
     origin_chat_id: Option<String>,
 }
 
+// Optional derived metadata must not hide the Chat, and malformed evidence
+// must not discard project IDs that can still be recovered.
+fn lenient_worked_projects<'de, D>(
+    deserializer: D,
+) -> Result<Option<zeron_proto::ChatWorkedProjects>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(serde_json::Value::Object(mut value)) =
+        Option::<serde_json::Value>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let Some(serde_json::Value::Array(ids)) = value.remove("projectIds") else {
+        return Ok(None);
+    };
+    let mut complete = value
+        .remove("complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut project_ids = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let serde_json::Value::String(id) = id {
+            project_ids.push(id);
+        } else {
+            complete = false;
+        }
+    }
+    let history_version = match value.remove("historyVersion") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match serde_json::from_value(value) {
+            Ok(version) => Some(version),
+            Err(_) => {
+                complete = false;
+                None
+            }
+        },
+    };
+    Ok(Some(zeron_proto::ChatWorkedProjects {
+        project_ids,
+        complete,
+        history_version,
+    }))
+}
+
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
 /// peer's harness id, reasoning level or sandbox mode) cost the CONFIG, not
 /// the row. Mirrors the transcript salvage rule: a missing field must cost
@@ -804,6 +875,7 @@ impl From<RawChat> for Chat {
             branch: raw.branch,
             checkout_id: raw.checkout_id,
             source_context: raw.source_context,
+            worked_projects: raw.worked_projects,
             config: raw.config,
             last_message_preview: raw.last_message_preview,
             last_message_at: raw.last_message_at.map(dt),
@@ -954,7 +1026,84 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             origin_chat_id: None,
+            worked_projects: None,
         }
+    }
+
+    #[test]
+    fn worked_projects_round_trip_and_field_only_update() {
+        let doc = WorkspaceDoc::new();
+        let original = chat("worked", "dev-a");
+        doc.upsert_chat(&original).unwrap();
+        assert!(doc.read_chats().unwrap()[0].worked_projects.is_none());
+        let summary = zeron_proto::ChatWorkedProjects {
+            project_ids: vec!["space-comet".into()],
+            complete: false,
+            history_version: Some(vec![1, 2, 3]),
+        };
+        assert!(doc.set_chat_worked_projects("worked", &summary).unwrap());
+        let mut expected = original;
+        expected.worked_projects = Some(summary);
+        assert_eq!(doc.read_chats().unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn worked_projects_malformed_metadata_keeps_chat_and_known_ids() {
+        let doc = WorkspaceDoc::new();
+        doc.upsert_chat(&chat("worked", "dev-a")).unwrap();
+        let row = doc.row("chats", "worked").unwrap();
+        row.insert(
+            "workedProjects",
+            LoroValue::from(serde_json::json!({
+                "projectIds":["known"],"complete":true,"historyVersion":"bad"
+            })),
+        )
+        .unwrap();
+        doc.doc.commit();
+        let chat = doc
+            .read_chats()
+            .unwrap()
+            .pop()
+            .expect("Chat must remain visible");
+        let summary = chat.worked_projects.unwrap();
+        assert_eq!(summary.project_ids, ["known"]);
+        assert!(!summary.complete);
+        assert!(summary.history_version.is_none());
+        row.insert("workedProjects", LoroValue::from(serde_json::json!("bad")))
+            .unwrap();
+        doc.doc.commit();
+        assert!(
+            doc.read_chats()
+                .unwrap()
+                .pop()
+                .expect("Chat must remain visible")
+                .worked_projects
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn worked_projects_stale_full_chat_upsert_keeps_newer_summary() {
+        let doc = WorkspaceDoc::new();
+        let old = zeron_proto::ChatWorkedProjects {
+            project_ids: vec!["old".into()],
+            complete: false,
+            history_version: Some(vec![1]),
+        };
+        let new = zeron_proto::ChatWorkedProjects {
+            project_ids: vec!["new".into()],
+            complete: true,
+            history_version: Some(vec![2]),
+        };
+        let mut stale = chat("worked", "dev-a");
+        stale.worked_projects = Some(old);
+        doc.upsert_chat(&stale).unwrap();
+        doc.set_chat_worked_projects("worked", &new).unwrap();
+        stale.title = Some("unrelated edit".into());
+        doc.upsert_chat(&stale).unwrap();
+        let current = doc.read_chats().unwrap().pop().unwrap();
+        assert_eq!(current.title.as_deref(), Some("unrelated edit"));
+        assert_eq!(current.worked_projects, Some(new));
     }
 
     fn space(id: &str, device_id: &str, path: &str) -> Space {

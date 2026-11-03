@@ -25,6 +25,7 @@ pub mod sidebar_pins;
 pub mod skill_usage;
 pub mod view;
 pub mod voice;
+pub mod worked_projects;
 pub mod workspace;
 
 pub use agent::*;

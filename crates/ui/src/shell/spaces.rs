@@ -274,6 +274,438 @@ pub(super) mod pinned_session_tests {
         .unwrap()
     }
 
+    #[gpui::test]
+    fn sidebar_worked_projects_follow_each_chat_not_selection(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window.update(cx, |shell, _, cx| {
+            shell.settings.sidebar_show_worked_projects = true;
+            shell.settings.sidebar_show_branch = false;
+            shell.state.update(cx, |state, _| {
+                state.spaces = vec![
+                    serde_json::from_value(serde_json::json!({"id":"comet","deviceId":"local","path":"/projects/comet","createdAt":chrono::Utc::now()})).unwrap(),
+                    serde_json::from_value(serde_json::json!({"id":"bops","deviceId":"local","path":"/projects/bops","createdAt":chrono::Utc::now()})).unwrap(),
+                    serde_json::from_value(serde_json::json!({"id":"foreign","deviceId":"other","path":"/projects/foreign","createdAt":chrono::Utc::now()})).unwrap(),
+                ];
+            });
+            let mut first = pin_test_chat("first");
+            first.branch = Some("same-branch".into());
+            first.worked_projects = Some(zeron_proto::ChatWorkedProjects {
+                project_ids: vec!["comet".into(), "comet".into(), "bops".into(), "foreign".into()],
+                complete: true,
+                history_version: None,
+            });
+            let mut second = pin_test_chat("second");
+            second.branch = Some("same-branch".into());
+            second.worked_projects = Some(zeron_proto::ChatWorkedProjects {
+                project_ids: vec!["bops".into()], complete: true, history_version: None,
+            });
+            for selected in ["first", "second"] {
+                shell.state.update(cx, |state, _| state.selected_chat = Some(selected.into()));
+                let state = shell.state.read(cx);
+                let a = shell.sidebar_chat_data(ChatIndicator::Idle, first.clone(), state);
+                let b = shell.sidebar_chat_data(ChatIndicator::Idle, second.clone(), state);
+                assert_eq!(a.worked_projects, ["comet", "bops"]);
+                assert_eq!(b.worked_projects, ["bops"]);
+                assert!(a.branch.is_none(), "Branch off must not hide projects");
+            }
+            shell.state.update(cx, |state, _| state.spaces[0].name = Some("Renamed root".into()));
+            let renamed = shell.sidebar_chat_data(ChatIndicator::Idle, first.clone(), shell.state.read(cx));
+            assert_eq!(renamed.worked_projects, ["Renamed root", "bops"]);
+            let mut unworked = pin_test_chat("comet");
+            unworked.space_id = Some("comet".into());
+            assert!(shell.sidebar_chat_data(ChatIndicator::Idle, unworked, shell.state.read(cx)).worked_projects.is_empty());
+            shell.settings.sidebar_show_worked_projects = false;
+            let a = shell.sidebar_chat_data(ChatIndicator::Idle, first, shell.state.read(cx));
+            assert!(a.worked_projects.is_empty());
+        }).unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_worked_projects_real_show_click_and_reload(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.sidebar_compact = false;
+            settings.sidebar_show_branch = false;
+            settings.sidebar_show_project_label = false;
+            crate::settings::init(settings, dir.path(), cx);
+        });
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, window, cx| {
+                shell.debug_gate = Some(super::super::GatePhase::Ready);
+                shell.reduced_motion = true;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                    state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                    state.spaces = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id":"comet", "deviceId":"local", "path":"/projects/comet",
+                            "createdAt":chrono::Utc::now()
+                        }))
+                        .unwrap(),
+                    ];
+                    let mut chat = pin_test_chat("row");
+                    chat.worked_projects = Some(zeron_proto::ChatWorkedProjects {
+                        project_ids: vec!["comet".into()],
+                        complete: true,
+                        history_version: None,
+                    });
+                    state.chats = vec![chat];
+                });
+                shell.open_sidebar_view_menu(window, cx);
+                shell.open_sidebar_view_submenu(2, false, cx);
+                cx.notify();
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let sidebar_pane = window
+            .read_with(&cx, |shell, _| shell.sidebar_pane.clone())
+            .unwrap();
+        cx.update(|window, cx| {
+            sidebar_pane.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear();
+        });
+        assert!(cx.debug_bounds("chat-worked-projects-row").is_some());
+        let item = cx
+            .debug_bounds("sidebar-view-row-6")
+            .expect("Projects worked in Show");
+        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            sidebar_pane.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear();
+        });
+        assert!(cx.debug_bounds("chat-worked-projects-row").is_none());
+        assert!(
+            cx.debug_bounds("sidebar-view-row-6").is_some(),
+            "Show stays open"
+        );
+        window
+            .read_with(&cx, |shell, _| {
+                assert!(!shell.settings.sidebar_show_worked_projects);
+                assert!(!shell.settings.sidebar_show_branch);
+                assert!(!shell.settings.sidebar_show_project_label);
+            })
+            .unwrap();
+        cx.update(|_, cx| crate::settings::flush(cx));
+        let reloaded = crate::settings::UiSettings::load(dir.path());
+        assert!(!reloaded.sidebar_show_worked_projects);
+        assert!(!reloaded.sidebar_show_branch);
+        assert!(!reloaded.sidebar_show_project_label);
+    }
+
+    #[gpui::test]
+    fn sidebar_worked_projects_geometry_normal_compact_and_archived(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.sidebar_compact = false;
+            settings.sidebar_show_branch = false;
+            settings.sidebar_show_project_label = false;
+            settings.sidebar_width = 280.0;
+            crate::settings::init(settings, dir.path(), cx);
+        });
+        let window = pin_test_shell(cx, dir.path());
+        window.update(cx, |shell, _, cx| {
+            shell.debug_gate = Some(super::super::GatePhase::Ready);
+            shell.reduced_motion = true;
+            shell.state.update(cx, |state, _| {
+                state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                state.spaces = vec![
+                    serde_json::from_value(serde_json::json!({"id":"long","deviceId":"local","path":"/projects/a-very-long-project-folder-name-that-must-fade","createdAt":chrono::Utc::now()})).unwrap(),
+                    serde_json::from_value(serde_json::json!({"id":"second","deviceId":"local","path":"/projects/second","createdAt":chrono::Utc::now()})).unwrap(),
+                ];
+                let mut normal = pin_test_chat("normal");
+                normal.worked_projects = Some(zeron_proto::ChatWorkedProjects {
+                    project_ids: vec!["long".into(), "second".into()], complete: true, history_version: None,
+                });
+                let mut archived = normal.clone();
+                archived.id = "archived".into();
+                archived.archived = true;
+                state.chats = vec![normal, pin_test_chat("empty"), archived];
+            });
+            cx.notify();
+        }).unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let sidebar_pane = window
+            .read_with(&cx, |shell, _| shell.sidebar_pane.clone())
+            .unwrap();
+        cx.update(|window, cx| {
+            sidebar_pane.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear();
+        });
+        let normal = cx.debug_bounds("chat-normal").expect("active row");
+        let empty = cx.debug_bounds("chat-empty").expect("row without metadata");
+        let archived = cx.debug_bounds("chat-archived").expect("archived row");
+        let labels = cx
+            .debug_bounds("chat-worked-projects-normal")
+            .expect("labels without Branch");
+        let archived_labels = cx
+            .debug_bounds("chat-worked-projects-archived")
+            .expect("archived labels");
+        assert!(normal.size.height > empty.size.height);
+        assert_eq!(normal.size.height, archived.size.height);
+        assert!(labels.left() >= normal.left() && labels.right() <= normal.right());
+        assert!(
+            labels.size.width >= normal.size.width - gpui::px(24.0),
+            "without Branch or PR, labels should use the available metadata width"
+        );
+        assert!(
+            archived_labels.left() >= archived.left()
+                && archived_labels.right() <= archived.right()
+        );
+        assert!(cx.debug_bounds("chat-branch-normal").is_none());
+        window
+            .update(&mut cx, |shell, _, cx| {
+                shell.settings.sidebar_compact = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            sidebar_pane.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear();
+        });
+        assert!(cx.debug_bounds("chat-worked-projects-normal").is_none());
+        assert!(cx.debug_bounds("chat-worked-projects-archived").is_none());
+        assert_eq!(
+            cx.debug_bounds("chat-normal").unwrap().size.height,
+            cx.debug_bounds("chat-empty").unwrap().size.height
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_worked_projects_hydrates_only_visible_legacy_archive_once_per_connection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::ARCHIVED_INITIAL_ROWS;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        let (engine, mut requests, _replies) = pin_test_engine();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_compact = false;
+                shell.settings.sidebar_show_archived = true;
+                shell.settings.sidebar_show_worked_projects = false;
+                shell.settings.sidebar_collapsed = false;
+                shell.archived_open = true;
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("local".into());
+                    state.set_test_engine(engine);
+                    state.chats = (0..ARCHIVED_INITIAL_ROWS + 3)
+                        .map(|i| {
+                            let mut chat = pin_test_chat(&format!("arch-{i:02}"));
+                            chat.archived = true;
+                            chat.created_at -= chrono::Duration::minutes(i as i64);
+                            if i == 0 {
+                                chat.worked_projects = Some(zeron_proto::ChatWorkedProjects {
+                                    project_ids: vec![],
+                                    complete: true,
+                                    history_version: None,
+                                });
+                            }
+                            chat
+                        })
+                        .collect();
+                });
+                shell.refresh_sidebar_worked_projects(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            requests.0.try_recv().is_err(),
+            "hidden labels must not request history"
+        );
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_show_worked_projects = true;
+                shell.refresh_sidebar_worked_projects(cx);
+                shell.refresh_sidebar_worked_projects(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request: serde_json::Value =
+            serde_json::from_str(&requests.0.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            request["method"],
+            zeron_rpc::methods::ENSURE_CHAT_WORKED_PROJECTS
+        );
+        let ids = request["params"]["chatIds"].as_array().unwrap();
+        assert_eq!(ids.len(), ARCHIVED_INITIAL_ROWS - 1);
+        assert!(!ids.contains(&serde_json::json!("arch-00")));
+        assert!(!ids.contains(&serde_json::json!(format!(
+            "arch-{:02}",
+            ARCHIVED_INITIAL_ROWS
+        ))));
+        assert!(
+            requests.0.try_recv().is_err(),
+            "redraws must not retry an in-flight request"
+        );
+        let (replacement, mut next_requests, _next_replies) = pin_test_engine();
+        window
+            .update(cx, |shell, _, cx| {
+                shell
+                    .state
+                    .update(cx, |state, _| state.set_test_engine(replacement));
+                shell.refresh_sidebar_worked_projects(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request: serde_json::Value =
+            serde_json::from_str(&next_requests.0.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            request["method"],
+            zeron_rpc::methods::ENSURE_CHAT_WORKED_PROJECTS
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_worked_projects_waits_until_sessions_are_visible(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        let (engine, mut requests, _replies) = pin_test_engine();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_compact = false;
+                shell.settings.sidebar_show_archived = true;
+                shell.settings.sidebar_show_worked_projects = true;
+                shell.settings.sidebar_collapsed = false;
+                shell.archived_open = true;
+                shell.sidebar_mode = super::super::SidebarMode::Workers;
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("local".into());
+                    state.set_test_engine(engine);
+                    let mut archived = pin_test_chat("archived");
+                    archived.archived = true;
+                    state.chats = vec![archived];
+                });
+                shell.refresh_sidebar_worked_projects(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            requests.0.try_recv().is_err(),
+            "Workers sidebar must not hydrate hidden archived rows"
+        );
+        window
+            .update(cx, |shell, _, cx| {
+                shell.select_sidebar_mode(super::super::SidebarMode::Orchestrator, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request: serde_json::Value =
+            serde_json::from_str(&requests.0.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            request["params"]["chatIds"],
+            serde_json::json!(["archived"])
+        );
+        window
+            .update(cx, |shell, _, cx| {
+                shell.set_route(
+                    super::super::Route::Settings(super::super::SettingsSection::General),
+                    cx,
+                );
+                shell.state.update(cx, |state, _| {
+                    let mut archived = pin_test_chat("settings-hidden");
+                    archived.archived = true;
+                    state.chats.push(archived);
+                });
+                shell.refresh_sidebar_worked_projects(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            requests.0.try_recv().is_err(),
+            "Settings must not hydrate hidden archived rows"
+        );
+        window
+            .update(cx, |shell, _, cx| {
+                shell.set_route(super::super::Route::Chat, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request: serde_json::Value =
+            serde_json::from_str(&requests.0.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            request["params"]["chatIds"],
+            serde_json::json!(["settings-hidden"])
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_worked_projects_hydrates_newly_filtered_archived_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        let (engine, mut requests, _replies) = pin_test_engine();
+        window.update(cx, |shell, _, cx| {
+            shell.settings.sidebar_compact = false;
+            shell.settings.sidebar_show_archived = true;
+            shell.settings.sidebar_show_worked_projects = true;
+            shell.settings.sidebar_collapsed = false;
+            shell.settings.space_filter = Some("space-a".into());
+            shell.archived_open = true;
+            shell.state.update(cx, |state, _| {
+                state.local_device_id = Some("local".into());
+                state.set_test_engine(engine);
+                state.selected_chat = Some("active".into());
+                state.spaces = ["space-a", "space-b"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                    "id":id,"deviceId":"local","path":format!("/{id}"),"createdAt":chrono::Utc::now()
+                })).unwrap()).collect();
+                state.chats = [("archived-a", "space-a"), ("archived-b", "space-b")].into_iter().map(|(id, space)| {
+                    let mut chat = pin_test_chat(id);
+                    chat.archived = true;
+                    chat.space_id = Some(space.into());
+                    chat
+                }).collect();
+            });
+            shell.refresh_sidebar_worked_projects(cx);
+        }).unwrap();
+        cx.run_until_parked();
+        let first: serde_json::Value =
+            serde_json::from_str(&requests.0.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            first["params"]["chatIds"],
+            serde_json::json!(["archived-a"])
+        );
+        window
+            .update(cx, |shell, _, cx| {
+                shell.set_space_filter(Some("space-b".into()), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let next: serde_json::Value = serde_json::from_str(
+            &requests
+                .0
+                .try_recv()
+                .expect("newly visible archive was not requested"),
+        )
+        .unwrap();
+        assert_eq!(next["params"]["chatIds"], serde_json::json!(["archived-b"]));
+    }
+
     /// The engine's `Mutate` requests only. The fork shell also talks to an
     /// attached engine on its own (details-sidebar usage `ListAgentAccounts`,
     /// Workers-driven checkout watches, boot transcript watches); those are
@@ -2222,6 +2654,7 @@ struct ActiveChatRow {
     chat: zeron_proto::Chat,
     folder: String,
     branch: Option<String>,
+    worked_projects: Vec<String>,
     change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
 }
@@ -2300,6 +2733,7 @@ enum SidebarViewRow {
     LastUpdated,
     Created,
     ShowBranch,
+    ShowWorkedProjects,
     ShowPullRequest,
     ShowHarness,
     ShowProjectFilter,
@@ -2318,15 +2752,16 @@ impl SidebarViewRow {
 }
 
 const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..12)];
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..13)];
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 12] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 13] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
     SidebarViewRow::LastUpdated,
     SidebarViewRow::Created,
     SidebarViewRow::ShowBranch,
+    SidebarViewRow::ShowWorkedProjects,
     SidebarViewRow::ShowPullRequest,
     SidebarViewRow::ShowHarness,
     SidebarViewRow::ShowProjectIcon,
@@ -3257,6 +3692,7 @@ impl Shell {
         if let Some(page) = self.pull_requests_page.as_ref() {
             page.update(cx, |page, cx| page.on_project_scope_changed(cx));
         }
+        self.refresh_sidebar_worked_projects(cx);
         cx.notify();
     }
 
@@ -4315,6 +4751,10 @@ impl Shell {
             SidebarViewRow::ShowBranch => {
                 self.settings.sidebar_show_branch = !self.settings.sidebar_show_branch
             }
+            SidebarViewRow::ShowWorkedProjects => {
+                self.settings.sidebar_show_worked_projects =
+                    !self.settings.sidebar_show_worked_projects
+            }
             SidebarViewRow::ShowPullRequest => {
                 self.settings.sidebar_show_pull_request = !self.settings.sidebar_show_pull_request;
                 let visible = self.settings.sidebar_show_pull_request;
@@ -4338,6 +4778,7 @@ impl Shell {
             }
         }
         self.schedule_save(cx);
+        self.refresh_sidebar_worked_projects(cx);
         if row.closes_submenu() {
             if let Some(menu) = self.sidebar_view_menu.open_mut() {
                 menu.submenu = None;
@@ -4501,6 +4942,7 @@ impl Shell {
             "Last updated",
             "Created",
             "Branch",
+            "Projects worked",
             "Pull request",
             "Harness",
             "Project icon",
@@ -4515,6 +4957,7 @@ impl Shell {
             icons::CLOCK_CIRCLE,
             icons::CALENDAR,
             icons::GIT_BRANCH,
+            icons::FOLDER,
             icons::PULL_REQUEST,
             icons::BOT,
             icons::PROJECT_DEFAULT,
@@ -4530,6 +4973,7 @@ impl Shell {
             sort == SidebarSort::LastUpdated,
             sort == SidebarSort::Created,
             show_branch,
+            self.settings.sidebar_show_worked_projects,
             show_pr,
             show_harness,
             self.settings.sidebar_show_project_icon,
@@ -4556,6 +5000,7 @@ impl Shell {
                 format!("sidebar-view-group-{group}"),
             )
             .id(("sidebar-view-group", group))
+            .debug_selector(move || format!("sidebar-view-group-{group}"))
             .relative()
             .h(px(30.0))
             .py(px(0.0))
@@ -4645,6 +5090,7 @@ impl Shell {
                             format!("sidebar-view-row-{ix}"),
                         )
                         .id(("sidebar-view-row", ix))
+                        .debug_selector(move || format!("sidebar-view-row-{ix}"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.activate_sidebar_view_row(row, cx);
                             cx.stop_propagation();
@@ -5536,6 +5982,7 @@ impl Shell {
         if self.settings.sidebar_collapsed {
             self.toggle_sidebar(cx);
         }
+        self.refresh_sidebar_worked_projects(cx);
         cx.notify();
         true
     }
@@ -5555,6 +6002,69 @@ impl Shell {
     pub(super) fn begin_queued_sidebar_reveal(&mut self, key: &str, open: bool, body_height: f32) {
         if open && self.sidebar_reveal_motions.remove(key) {
             self.begin_sidebar_disclosure_motion(key, 0.0, body_height);
+        }
+    }
+
+    /// Request legacy summaries only for visible archived rows, once per connection.
+    pub(super) fn refresh_sidebar_worked_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.worked_projects_connection = None;
+            self.worked_projects_requested.clear();
+            return;
+        };
+        if self
+            .worked_projects_connection
+            .as_ref()
+            .is_none_or(|previous| !previous.same_connection(&engine))
+        {
+            self.worked_projects_requested.clear();
+            self.worked_projects_connection = Some(engine.clone());
+        }
+        if !self.sidebar_mode.shows_orchestrator_content()
+            || matches!(self.route, super::Route::Settings(_))
+            || !self.archived_open
+            || !self.settings.sidebar_show_archived
+            || !self.settings.sidebar_show_worked_projects
+            || self.settings.sidebar_compact
+            || self.settings.sidebar_collapsed
+        {
+            return;
+        }
+
+        let mut batches = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for chat in self
+            .archived_sidebar_chats(cx)
+            .into_iter()
+            .take(self.archived_shown.max(ARCHIVED_INITIAL_ROWS))
+        {
+            if chat.worked_projects.is_some()
+                || !self
+                    .state
+                    .read(cx)
+                    .device_online(&chat.device_id, Utc::now())
+                || !self
+                    .worked_projects_requested
+                    .insert((chat.device_id.clone(), chat.id.clone()))
+            {
+                continue;
+            }
+            batches.entry(chat.device_id).or_default().push(chat.id);
+        }
+        for (device_id, chat_ids) in batches {
+            let engine = engine.clone();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = engine
+                    .client()
+                    .call(
+                        zeron_rpc::methods::ENSURE_CHAT_WORKED_PROJECTS,
+                        serde_json::json!({ "chatIds": chat_ids, "targetDeviceId": device_id }),
+                    )
+                    .await
+                {
+                    tracing::debug!(%error, "Archived worked-project hydration unavailable");
+                }
+            })
+            .detach();
         }
     }
 
@@ -5594,6 +6104,28 @@ impl Shell {
             .filter(|b| !b.is_empty())
             .map(str::to_string)
             .filter(|_| self.settings.sidebar_show_branch);
+        let worked_projects = if self.settings.sidebar_show_worked_projects {
+            chat.worked_projects
+                .as_ref()
+                .map(|summary| {
+                    let mut seen = HashSet::new();
+                    summary
+                        .project_ids
+                        .iter()
+                        .filter(|id| seen.insert(id.as_str()))
+                        .filter_map(|id| {
+                            state
+                                .spaces
+                                .iter()
+                                .find(|space| space.id == *id && space.device_id == chat.device_id)
+                        })
+                        .map(|space| space.display_name().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let change_request = state
             .change_request_for_chat(&chat)
             .cloned()
@@ -5608,6 +6140,7 @@ impl Shell {
             chat: chat.clone(),
             folder,
             branch,
+            worked_projects,
             change_request,
             group,
         }
@@ -5673,7 +6206,7 @@ impl Shell {
                 sidebar_row_height(
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
-                    row.branch.is_some(),
+                    row.branch.is_some() || !row.worked_projects.is_empty(),
                     row.change_request.is_some(),
                 )
             })
@@ -5767,7 +6300,7 @@ impl Shell {
                 drag.row_height = sidebar_row_height(
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
-                    rows[index].branch.is_some(),
+                    rows[index].branch.is_some() || !rows[index].worked_projects.is_empty(),
                     rows[index].change_request.is_some(),
                 );
                 // Move the vacant slot to the destination instead of keeping two
@@ -5882,6 +6415,7 @@ impl Shell {
                     chat,
                     folder,
                     branch,
+                    worked_projects,
                     change_request,
                     group: _,
                 } = row;
@@ -5896,7 +6430,7 @@ impl Shell {
                 let height = sidebar_row_height(
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
-                    branch.is_some(),
+                    branch.is_some() || !worked_projects.is_empty(),
                     change_request.is_some(),
                 );
                 // Only rows a jump slot can reach wear a chip; row 10 onward
@@ -5951,6 +6485,7 @@ impl Shell {
                     time_ago,
                     folder.into(),
                     branch.map(SharedString::from),
+                    worked_projects,
                     change_request,
                     harness,
                     status,
@@ -6445,7 +6980,7 @@ impl Shell {
                     sidebar_row_height(
                         self.settings.sidebar_compact,
                         self.settings.sidebar_show_project_label,
-                        row.branch.is_some(),
+                        row.branch.is_some() || !row.worked_projects.is_empty(),
                         row.change_request.is_some(),
                     )
                 })
@@ -6479,6 +7014,7 @@ impl Shell {
             );
             this.archived_open = !was_open;
             this.archived_shown = INITIAL;
+            this.refresh_sidebar_worked_projects(cx);
             cx.notify();
         }));
         let section = div().flex().flex_col().child(header);
@@ -6508,6 +7044,7 @@ impl Shell {
                             .into(),
                         row.folder.into(),
                         row.branch.map(SharedString::from),
+                        row.worked_projects,
                         row.change_request,
                         harness,
                         row.status,
@@ -6545,6 +7082,7 @@ impl Shell {
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.archived_shown = this.archived_shown.max(INITIAL) + PAGE;
+                            this.refresh_sidebar_worked_projects(cx);
                             cx.notify();
                         }))
                         .child(
@@ -9448,6 +9986,7 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             origin_chat_id: None,
+            worked_projects: None,
         }
     }
 

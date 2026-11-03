@@ -26,7 +26,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Monitor de nitidez nativa (macOS, app já aberto) | `python3 scripts/ui-sharpness-monitor.py` · [guia](docs/ui-sharpness-monitor.md) |
 | Suite completa | `cargo test --workspace` |
 | Testes de uma crate | `cargo test -p zeron-ui` |
-| Verificação Cargo local no macOS/Linux | `scripts/cargo-verify.py -- cargo test -p zeron-ui` |
+| Verificação Cargo local no macOS/Linux | `cargo test -p zeron-ui` |
 | Formatação (obrigatória antes de merge do upstream) | `cargo fmt --all` |
 | Demo local offline (harness mock, seeded) | `scripts/dev-demo.sh` (`--slow` pra ver streaming) |
 | Smoke e2e | `scripts/e2e-smoke.sh` |
@@ -52,8 +52,7 @@ CI de testes cancela PRs e pushes ultrapassados na mesma ref. Para não perder a
 
 ## Gotchas duráveis
 
-- **Verificações Cargo locais no macOS/Linux usam `scripts/cargo-verify.py -- <comando>`.** O wrapper impede verificações simultâneas entre checkouts, usa um `CARGO_TARGET_DIR` isolado de caminho fixo (para o sccache reaproveitar as dependências), compila incremental, roda com QoS de background no macOS (só E-cores; `COMET_CARGO_VERIFY_FOREGROUND=1` desliga), limita os jobs a 4 por padrão, recusa começar com menos de 60 GiB livres, interrompe se cair abaixo de 20 GiB e remove o target ao terminar ou receber SIGINT/SIGTERM/SIGHUP. Se o wrapper levar SIGKILL, um watchdog derruba o grupo do Cargo e a próxima execução remove o target órfão. Agrupar testes da mesma rodada em uma invocação (`scripts/cargo-verify.py -- bash -c 'cargo test -p zeron-engine && cargo test -p zeron-ui'`) para reutilizar a compilação dentro dela. Vale também para testes locais durante o no-mistakes; CI remoto e Windows seguem os comandos Cargo da tabela. `cargo run` do app de desenvolvimento continua usando o target incremental normal. Não compartilhar um target persistente entre checkouts com fontes diferentes: isso pode reutilizar artefatos stale.
-- **No macOS, rode um único gate `no-mistakes` com testes Rust por vez.** Cada run tem um checkout/target próprio, e dois runs simultâneos podem somar dezenas de gigabytes mesmo quando cada um limpa no fim. Antes de abrir outro gate, aguarde o primeiro terminar e confira o espaço livre. Não rode testes Cargo manuais em paralelo com o gate.
+- **Builds e verificações Cargo locais usam ferramentas nativas diretamente, sem `scripts/cargo-verify.py`, fila global ou wrappers de serialização.** Projetos independentes podem compilar, testar e revisar em paralelo. Preserve `[build] jobs = 2` e o sccache. Use `CARGO_TARGET_DIR` exclusivo da tarefa e do checkout; não compartilhe targets entre fontes diferentes, para evitar artefatos stale. Confira o espaço livre antes de compilar e limpe apenas os artefatos regeneráveis próprios ao fechar a tarefa.
 
 - **`cargo run` usa o checkout atual do Comet e o OMP instalado.** Não impor OMP de fonte em `.cargo/config.toml`: desenvolvimento com o checkout irmão é opt-in via `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` (contrato em `scripts/AGENTS.md`). Outro worktree tem código e binário próprios; executar ali não inclui mudanças locais deste checkout.
 
@@ -104,7 +103,7 @@ Suítes canônicas por superfície (detalhe e matriz `Test:` ficam no `AGENTS.md
 
 | Superfície | Comando |
 |---|---|
-| Workspace Rust | `cargo test --workspace` (no macOS/Linux local: `scripts/cargo-verify.py -- cargo test --workspace`) |
+| Workspace Rust | `cargo test --workspace` |
 | Edge Cloudflare | `npm -C edge run test` (unit + workerd) |
 | Cliente iOS | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=<device do runtime instalado>'` |
 | Fluxo headed/headless | `scripts/e2e-smoke.sh` |

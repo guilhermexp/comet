@@ -191,6 +191,48 @@ fn sidebar_badges_open_pull_requests_where_settings_send_them(cx: &mut TestAppCo
     });
 }
 
+#[gpui::test]
+fn sidebar_worked_projects_keep_pr_badge_bounded_and_clickable(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    shell.update(cx, |shell, cx| {
+        shell.settings.sidebar_compact = false;
+        shell.settings.sidebar_width = 280.0;
+        shell.settings.sidebar_show_worked_projects = true;
+        shell.state.update(cx, |state, _| {
+            state.spaces = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id":"long", "deviceId":"local", "path":"/projects/an-extremely-long-project-folder-name",
+                    "createdAt":Utc::now()
+                })).unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "id":"another", "deviceId":"local", "path":"/projects/another",
+                    "createdAt":Utc::now()
+                })).unwrap(),
+            ];
+            state.chats[0].worked_projects = Some(zeron_proto::ChatWorkedProjects {
+                project_ids: vec!["long".into(), "another".into()],
+                complete: true,
+                history_version: None,
+            });
+        });
+        cx.notify();
+    });
+    redraw(cx);
+    let row = cx.debug_bounds("chat-a").unwrap();
+    let labels = cx.debug_bounds("chat-worked-projects-a").unwrap();
+    let badge = cx.debug_bounds("pull-request-badge-chat-a-pr").unwrap();
+    assert!(labels.right() <= badge.left());
+    assert!(badge.right() <= row.right());
+    click(cx, "pull-request-badge-chat-a-pr");
+    assert_eq!(pane(&shell, cx), (1, Some(("view", pull_request(90)))));
+    assert_eq!(
+        shell
+            .read_with(cx, |shell, cx| shell.state.read(cx).selected_chat.clone())
+            .as_deref(),
+        Some("a")
+    );
+}
+
 /// A board row opens its pull request where Settings says. The board has no
 /// session pane, so "In-app browser" opens the default browser there.
 #[gpui::test]

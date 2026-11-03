@@ -1338,7 +1338,7 @@ impl RegistryDoc {
             Some(config) => serde_json::to_value(config)?,
             None => Value::Null,
         };
-        let set = fields([
+        let mut set = fields([
             ("id", json!(chat.id)),
             ("deviceId", json!(chat.device_id)),
             ("title", opt_str(chat.title.as_deref())),
@@ -1383,6 +1383,15 @@ impl RegistryDoc {
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
             ("originChatId", opt_str(chat.origin_chat_id.as_deref())),
         ]);
+        // Full-row callers can hold an older summary across a concurrent host
+        // publication. Only seed an absent field; later writes use its setter.
+        if let Some(summary) = &chat.worked_projects
+            && self
+                .overlay_row(KIND_CHATS, &chat.id)
+                .is_none_or(|row| !row.fields.contains_key("workedProjects"))
+        {
+            set.insert("workedProjects".into(), serde_json::to_value(summary)?);
+        }
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
     }
@@ -1509,6 +1518,23 @@ impl RegistryDoc {
             chat_id,
             OpKind::Update,
             fields([("branch", json!(branch))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_worked_projects(
+        &mut self,
+        chat_id: &str,
+        summary: &zeron_proto::ChatWorkedProjects,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("workedProjects", serde_json::to_value(summary)?)]),
         );
         Ok(true)
     }
@@ -1821,6 +1847,7 @@ impl RegistryDoc {
                     ("cwd", opt_str(chat.cwd.as_deref())),
                     ("branch", opt_str(chat.branch.as_deref())),
                     ("checkoutId", opt_str(chat.checkout_id.as_deref())),
+                    ("workedProjects", json!(chat.worked_projects)),
                     ("config", config),
                     (
                         "lastMessagePreview",

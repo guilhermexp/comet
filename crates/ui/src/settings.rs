@@ -943,6 +943,7 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.sidebar_show_project_icon = shell.sidebar_show_project_icon;
     current.sidebar_show_harness = shell.sidebar_show_harness;
     current.sidebar_show_branch = shell.sidebar_show_branch;
+    current.sidebar_show_worked_projects = shell.sidebar_show_worked_projects;
     current.sidebar_show_pull_request = shell.sidebar_show_pull_request;
     current.sidebar_show_archived = shell.sidebar_show_archived;
     current.last_space_id = shell.last_space_id.clone();
@@ -1211,6 +1212,7 @@ pub struct UiSettings {
     pub sidebar_show_project_icon: bool,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
+    pub sidebar_show_worked_projects: bool,
     pub sidebar_show_pull_request: bool,
     /// The project filter row at the top of the sidebar.
     pub sidebar_show_project_filter: bool,
@@ -1444,6 +1446,7 @@ impl Default for UiSettings {
             sidebar_show_project_icon: true,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
+            sidebar_show_worked_projects: true,
             sidebar_show_pull_request: true,
             sidebar_show_project_filter: true,
             sidebar_show_archived: true,
@@ -2111,6 +2114,7 @@ impl UiSettings {
             sidebar_show_project_icon,
             sidebar_show_harness,
             sidebar_show_branch,
+            sidebar_show_worked_projects,
             sidebar_show_pull_request,
             sidebar_show_project_filter,
             sidebar_show_archived,
@@ -3372,6 +3376,7 @@ mod tests {
             sidebar_show_project_label: false,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
+            sidebar_show_worked_projects: false,
             sidebar_show_pull_request: false,
             sidebar_show_project_filter: false,
             sidebar_show_archived: false,
@@ -3562,6 +3567,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         current.save(dir.path()).unwrap();
         assert!(!UiSettings::load(dir.path()).sidebar_show_archived);
+    }
+
+    #[test]
+    fn sidebar_worked_projects_preference_survives_reload_and_stale_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarShowBranch":false,"sidebarShowHarness":false}"#,
+        )
+        .unwrap();
+        let base = UiSettings::load(dir.path());
+        let base_json = serde_json::to_value(&base).unwrap();
+        assert_eq!(base_json["sidebarShowWorkedProjects"], true);
+        assert!(!base.sidebar_show_branch);
+        assert!(!base.sidebar_show_harness);
+
+        let mut toggled = base_json;
+        toggled["sidebarShowWorkedProjects"] = false.into();
+        let toggled: UiSettings = serde_json::from_value(toggled).unwrap();
+        let mut current = base.clone();
+        apply_shell_settings(&mut current, &toggled);
+        current.save(dir.path()).unwrap();
+
+        let mut stale_edit = base.clone();
+        stale_edit.sidebar_width = 310.0;
+        let merged = UiSettings::merge_changes(&base, &stale_edit, UiSettings::load(dir.path()));
+        merged.save(dir.path()).unwrap();
+        let reloaded = UiSettings::load(dir.path());
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap()["sidebarShowWorkedProjects"],
+            false
+        );
+        assert!(!reloaded.sidebar_show_branch);
+        assert!(!reloaded.sidebar_show_harness);
+        assert_eq!(reloaded.sidebar_width, 310.0);
     }
 
     #[test]
