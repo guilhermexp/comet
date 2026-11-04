@@ -56,7 +56,7 @@ Bibliotecas da rodada de core (`rust-core-libs-second.log`): doc 218/0, harness 
 
 ## Limitações e riscos
 
-- `cargo test --workspace` completo pertence ao CI da PR; não foi executado localmente. Os runs do CI serão consultados após o push; este documento não os declara verdes.
+- `cargo test --workspace` completo pertence ao CI da PR; não foi executado localmente. Runs do CI são consultados por SHA e jobs/etapas realmente executados; este documento registra a prova local, sem declarar CI verde.
 - Linux não prova AppKit, macOS headed/browser focus, packaging/update instalado nem Xcode/Simulator/UIKit. Nenhum app real, dev-demo, provider autenticado ou sessão paga foi lançado como prova.
 - WPE WebKit 2.50+ não está instalado nesta box; o build Linux usa fallback WebKitGTK. Não há prova nativa de apresentação dma-buf/WPE.
 - zgx/cli/launch e serviços edge adicionais são dormentes/excluídos; a compilação do fork não prova esses produtos alternativos. Plugins retidos são exercitados por fixtures explícitas, sem ativação de produção.

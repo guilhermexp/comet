@@ -24,8 +24,8 @@
 ## 4. Entrega
 
 - [x] 4.1 Commit só de docs após código: YAML de histórico, receita/tabelas upstream, DOX e tarefas; verificar git show --stat.
-- [ ] 4.2 Push sem force apenas origin sync/upstream-20261104 e PR draft para main; conferir head/base/draft na API.
-- [ ] 4.3 Relatório absoluto .tmp/reports/sync-upstream-20261104.md com todos os SHAs, decisões abertas, checks e URL; conferir existência e head final.
+- [x] 4.2 Push sem force apenas origin sync/upstream-20261104 e PR draft para main; conferir head/base/draft na API.
+- [x] 4.3 Relatório absoluto .tmp/reports/sync-upstream-20261104.md com todos os SHAs, decisões abertas, checks e URL; conferir existência e head final.
 
 ## Workflow follow-up
 

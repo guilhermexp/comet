@@ -3,7 +3,7 @@ id: 20261104T202458Z-35561ead
 skill_version: brief-20261104
 started_at: '2026-11-04T20:24:58Z'
 started_at_note: Primeira medição preservada em merge-tree.txt; preparação começou antes desse checkpoint.
-finished_at: '2026-11-04T22:09:35Z'
+finished_at: '2026-11-04T22:10:52Z'
 request: Executar integralmente o brief sync-upstream-20261104, sozinho; alvo fixo, customizações do fork sempre
   prevalecem; branch sync/upstream-20261104 e PR draft para main, sem merge.
 workflow_source: .tmp/briefs/sync-upstream-20261104.md; ajustes não existiam nas releituras de fase; Cargo nativo,
@@ -952,7 +952,7 @@ references:
 - .tmp/reports/sync-upstream-20261104.md
 - openspec/changes/sync-upstream-20261104/
 - docs/upstream-sync.md
-outcome: integrated_awaiting_draft
+outcome: integrated_draft
 pending:
 - Aceite/revisão macOS/iOS/visual pelo orquestrador
 - Decisões futuras do dono D1/D2/D8; nada ativado nesta PR
@@ -961,9 +961,21 @@ delivery:
   integration: draft_pr
   target_branch: sync/upstream-20261104
   base: main
-  pr: null
-  draft: null
-  publication: aguardando push autorizado somente da branch
-  record_pushed: false
+  pr: https://github.com/guilhermexp/comet/pull/26
+  draft: true
+  publication_note: Snapshot do primeiro push e da PR conferidos; o próprio fechamento documental segue em push
+    normal. Head final e refs atualizados no relatório absoluto e publication.json locais.
+  publication:
+    verified_at: '2026-11-04T22:10:28+00:00'
+    command: git push origin sync/upstream-20261104
+    exit: 0
+    head: c67646bbd96b14f0f123d2d9cfc2124d733880d3
+    remote_refs:
+      refs/heads/main: 0f5c6a34b0b80bec083c4f9b5fb5d1aa143895d8
+      refs/heads/sync/upstream-20261104: c67646bbd96b14f0f123d2d9cfc2124d733880d3
+    upstream_push: DISABLED-never-push-upstream
+    pr: https://github.com/guilhermexp/comet/pull/26
+    is_draft: true
+  record_pushed: true
   merge: proibido; não executado
   release_deploy_workflow_dispatch: não executados
