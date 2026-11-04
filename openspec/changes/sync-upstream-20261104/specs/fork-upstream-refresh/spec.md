@@ -1,0 +1,47 @@
+## ADDED Requirements
+
+### Requirement: Alternative upstream interfaces require explicit activation
+
+The fork SHALL retain its gpui interface, Workers, Details, managed Usage and right-panel terminal while integrating shared upstream changes. Alternative interfaces, plugins/templates and beta launch paths SHALL remain dormant until separately authorized.
+
+#### Scenario: Normal fork startup after integration
+- **Test:** unit
+- **WHEN** the fork starts with its existing settings
+- **THEN** its gpui shell and Workers remain available and no alternative interface or plugin service starts automatically
+
+### Requirement: Upstream IPC hardening preserves fork grants
+
+The integration SHALL preserve root-only Chat tools, authenticated Workers clients and empty per-run MCP injection. Added IPC scopes SHALL NOT grant child Chats root authority or leak engine credentials into Workers.
+
+#### Scenario: Child Chat requests tools
+- **Test:** integration
+- **WHEN** a Chat with either lineage field starts a run
+- **THEN** it retains Workers tools but receives no root Chat creation grant or globally injected MCP
+
+#### Scenario: Fork controller uses authenticated IPC
+- **Test:** integration
+- **WHEN** the Workers controller queries or creates a registered Project
+- **THEN** it authenticates to the same engine and its spawned Worker does not inherit that credential
+
+### Requirement: Shared improvements preserve transcript privacy and lineage
+
+Accepted access modes, process inspection and tool output SHALL preserve host ownership, sanitized transcript inputs, independent child lineage and fork steering behavior.
+
+#### Scenario: Tool output is read on its host
+- **Test:** integration
+- **WHEN** an authorized caller requests a command output for its Chat
+- **THEN** only that command output is returned, without exposing private tool inputs or another Chat's journal
+
+#### Scenario: Inherited Chat remains a child
+- **Test:** integration
+- **WHEN** a Chat is created with inherited configuration
+- **THEN** its origin lineage remains recorded and it cannot create grandchildren
+
+### Requirement: Additional edge services remain dormant
+
+Directory/profile/badge, Cloud/vault/runner and plugin directory services SHALL remain outside the fork's published edge graph until their bindings and activation are separately authorized.
+
+#### Scenario: Existing edge configuration is used
+- **Test:** integration
+- **WHEN** the Worker runs with the fork's current bindings
+- **THEN** existing sync and authenticated previews work without requiring additional upstream storage or exposing those dormant routes
