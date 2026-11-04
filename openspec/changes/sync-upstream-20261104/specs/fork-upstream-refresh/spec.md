@@ -45,3 +45,12 @@ Directory/profile/badge, Cloud/vault/runner and plugin directory services SHALL 
 - **Test:** integration
 - **WHEN** the Worker runs with the fork's current bindings
 - **THEN** existing sync and authenticated previews work without requiring additional upstream storage or exposing those dormant routes
+
+### Requirement: Workspace creation preserves both clients
+
+The integration SHALL preserve the fork's parentPath/name creation contract while accepting upstream guarded creation with operationId/path/expectedCheckoutId on the same RPC.
+
+#### Scenario: Legacy and guarded clients create entries
+- **Test:** integration
+- **WHEN** both client formats create files in an owned workspace
+- **THEN** both receive their corresponding reply shape, existing entries remain untouched, and guarded creation with stale checkout identity writes nothing

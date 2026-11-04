@@ -12,6 +12,8 @@ This crate owns `Cargo.toml` and `src/`. The Swift app and generated binding lif
 
 ## Local Contracts
 
+- Sync `35561ead` retains fork visual/voice/transcript projections while adding Fx/access modes, background process metadata and childKind from the shared core. Swift bindings/header/modulemap must be generated together from the integrated library. A Linux host generation proves binding consistency only; iOS linking and UIKit behavior still require the native lane.
+
 - `layout` emits platform-neutral row text, links, and widgets. The iOS transcript renderer consumes these values; keep labels, colors, preview references, and row geometry consistent with that contract.
 - Canonical attachment links are parsed and paired through `zeron-proto`. Use `pair_attachment_mentions` so each attachment path is consumed at most once; image chips retain their full upload path for preview activation, and unmatched uploads remain in the image or file strip.
 - Copy text uses the canonical attachment prompt projection, while display text may replace the links with chips.
@@ -27,12 +29,12 @@ This crate owns `Cargo.toml` and `src/`. The Swift app and generated binding lif
 
 ## Verification
 
-Run focused Rust checks through the repository Cargo wrapper on macOS/Linux, for example `scripts/cargo-verify.py -- cargo test -p zeron-mobile layout::tests::sanitized_attachment_name_collision_keeps_only_the_unpaired_upload_pill`.
+Run focused Rust checks with native Cargo and a task-exclusive target, jobs=2 and sccache, as required by the root AGENTS.md.
 
 | Layer / path | Tier | How to run |
 |---|---|---|
-| `src/layout/**` | unit | `scripts/cargo-verify.py -- cargo test -p zeron-mobile layout::tests` |
-| `src/client_ffi/voice.rs` | unit | `scripts/cargo-verify.py -- cargo test -p zeron-mobile client_ffi::voice` |
+| `src/layout/**` | unit | `cargo test -p zeron-mobile layout::tests` |
+| `src/client_ffi/voice.rs` | unit | `cargo test -p zeron-mobile client_ffi::voice` |
 
 Additional integration coverage:
 

@@ -19,6 +19,8 @@ preference stream. `Shell` owns destination selection at shortcut time and
 
 ## Local Contracts
 
+- Atalhos persistidos usam teclas US para validação; `shortcut::registered` aplica os equivalentes do layout ao registrar a hotkey nativa (por exemplo AZERTY ⌘1 → &). Combo inválido conserva o fallback padrão. Isso não muda consentimento, destino nem transporte da captura.
+
 - A capture is user-triggered and remains on the headed/viewer device. The
   screenshot is transported through the ordinary attachment upload path.
 - Destination is captured before the native async operation begins. Delivery
@@ -53,6 +55,7 @@ identity of the screenshot id when changing upload or queued-send handling.
 
 | Layer / path | Tier | How to run |
 |---|---|---|
+| `src/appshots/shortcut.rs` (validação e registro por layout) | unit | `cargo test -p zeron-ui --lib appshots::shortcut::tests` |
 | `src/appshots.rs` (limits, XML transport, presentation metadata) | unit | `cargo test -p zeron-ui appshots` |
 | `src/appshots/{macos,linux}` (native permission/capture) | none locally; native QA | `scripts/dev-demo.sh`, with platform permissions enabled |
 | `src/{shell,composer,lib}.rs` (destination, staging, failure recovery) | unit + compile | `cargo test -p zeron-ui composer` and `cargo check -p zeron-ui` |

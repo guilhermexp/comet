@@ -12,6 +12,11 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 ## Local Contracts
 
+- Chamadas diretas aos drivers ACP/Claude/Codex/Pi conservam o suporte aditivo a `extra_mcp` do upstream junto aos grants; isso não ativa plugins no fork: `drive_run` limpa esse campo antes de chamar qualquer driver. A fixture `acp_tool_fixture` prova a seleção do servidor que anuncia a tool.
+
+- Sync `35561ead`: Fx e ACP registry entram no catálogo junto de OMP/Kimi; modos de acesso/plano só são anunciados quando suportados (OMP anuncia FullAccess). Launches preservam leases, grants `workers_mcp` e `run_isolated`. Os campos `mcp`/`extra_mcp` continuam dados de compatibilidade, limpos pela engine antes do run normal; plugins não são ativados por essa integração.
+- Normalizers conservam a metadata de execução do fork junto de exit code opcional e output de comandos. Ausência de exit code não fabrica falha. Pi mantém uma extensão MCP por servidor concedido, incluindo Workers/sessions/computer-use, com config isolada por variável.
+
 - Contexto Claude vem do input + cache da mensagem assistant principal; frames de filhos e totais agregados do result não medem ocupação. Capacidade vem de `modelUsage`, casando o modelo principal/canonicalModel ou a única entrada disponível, sem fallback fixo 200k/1m. Codex publica contexto ao receber tokenUsage (incluindo zero/campos parciais), mantendo accounting do turno separado e emitido antes de Done.
 
 - **O gate de preview parcial É a janela de commit do doc** (`partial_tool_input::PREVIEW_GATE` = `zeron_doc::STREAM_COMMIT_MS`), importado e nunca reescrito. Era literal `100ms` enquanto o host commitava a cada `120ms`: dois throttles em série com períodos que não se dividem fazem *aliasing* — preview emitido logo após a janela fechar espera a janela inteira, dois dentro da mesma janela colapsam em um, e a cadência visível pulsa no MMC (600ms) em vez de ficar firme. Era isso que fazia o texto do card de Write/Edit parecer travado. **Não remover o gate**: ele limita o fluxo de EVENTOS, não só o doc — sem ele um corpo de 1 MiB emite um evento por delta, e as suítes de linearidade cravam teto de 70 refreshes por megabyte. O sleep do teste de tempo também deriva de `PREVIEW_GATE`, não de literal.

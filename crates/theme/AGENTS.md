@@ -12,6 +12,8 @@ Modelo source-neutral de temas, registro built-in, biblioteca device-local de te
 
 ## Local Contracts
 
+- Sync `35561ead`: `catalog` oferece listar/ler/criar/editar/remover/usar temas sobre a biblioteca e registro já existentes; não criar modelo paralelo para ferramentas MCP. Variantes geradas inicializam também os papéis/frost opcionais do fork. Leitura de temas de templates permanece fonte disponível, sem ativar runtime de plugins/templates.
+
 - `ThemeVariant` entregue ao runtime é completo e independente do formato-fonte.
 - A preferência de superfície é política device-local separada do tema e do accent.
 - Importação linked preserva a origem e pode ser recarregada; copy instala snapshot independente.
@@ -36,6 +38,7 @@ Modelo source-neutral de temas, registro built-in, biblioteca device-local de te
 | `src/builtins.rs` (`terminal_background` com alpha) | unit | `cargo test -p zeron-theme --lib monocode_fidelity_terminal_background_keeps_alpha` |
 | `src/lib.rs` (faixa de frost) | unit | `cargo test -p zeron-theme --lib frost_bounds_rejects_out_of_range` |
 | `src/lib.rs` (contraste do terminal no canvas achatado) | unit | `cargo test -p zeron-theme --lib frost_bounds_terminal_contrast_uses_flattened_canvas` |
+| `src/catalog.rs` (MCP theme catalog sobre a biblioteca) | unit | `cargo test -p zeron-theme --lib catalog` |
 | `src/library.rs` | unit + filesystem temporário | `cargo test -p zeron-theme library` |
 | `src/vscode.rs` | unit | `cargo test -p zeron-theme vscode` |
 

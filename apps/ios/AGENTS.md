@@ -17,6 +17,8 @@ WebRTC e o lifecycle remoto ficam em `Zeron/Voice/`.
 
 ## Local Contracts
 
+- Sync `35561ead` imports shared Fx/access/process/child metadata and native client updates while preserving the fork visual/voice surfaces. `Core/Generated/zeron_core.swift` and `CoreFFI` headers/modulemap must describe the same integrated Rust library. Host generation on Linux does not prove iOS build/link or UIKit interaction; keep that acceptance pending for macOS.
+
 - Uma falha ao abrir um Chat real registra o erro, mantém o usuário na
   navegação real de Sessions e mostra uma falha visível. Nunca substitua o Chat
   solicitado por `FixtureSessionSource`; fixtures pertencem ao lab e aos

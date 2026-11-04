@@ -12,6 +12,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 ## Local Contracts
 
+- Sync `35561ead`: `plugin-guard` e `preview-label` são membros compartilhados; `cli`, `launch` e `apps/zgx` permanecem excluídos. Plugins/templates existem como fonte testável, mas o startup do fork não os ativa. O MCP preserva o default side chat e os modos configured/inherit, aceitando subagent explícito e recusando netos/overrides de access/plan no inherit.
+
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.
 - `edition = "2024"` em todas.
 - `mcp/src/tools.rs`: a consulta existente `list_chats.parent` descobre Chats criados por `parent_chat_id` **ou** `origin_chat_id`; summaries expõem `parentChatId` e `originChatId` separadamente. Isso não muda `Chat::is_top_level`, autoridade nem a linhagem gravada. Regressão de consumidor com RPC em memória: `creator_query_lists_both_lineages_without_reparenting`.
@@ -56,6 +58,10 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 | Crate | Doc | Papel |
 |---|---|---|
+| `zeron-cli` (excluída) | [`cli/AGENTS.md`](cli/AGENTS.md) | CLI upstream dormente |
+| `zeron-launch` (excluída) | [`launch/AGENTS.md`](launch/AGENTS.md) | Launch/engine managed dormentes |
+| `zeron-plugin-guard` | [`plugin-guard/AGENTS.md`](plugin-guard/AGENTS.md) | Validação pura de permissões de plugins dormentes |
+| `zeron-preview-label` | [`preview-label/AGENTS.md`](preview-label/AGENTS.md) | Nomes e labels puros para processos/previews |
 | `zeron-proto` | [`proto/AGENTS.md`](proto/AGENTS.md) | Tipos de fio + derivações puras compartilhadas |
 | `zeron-doc` | [`doc/AGENTS.md`](doc/AGENTS.md) | Schemas Loro (session/workspace) + mirror layer |
 | `zeron-sync` | [`sync/AGENTS.md`](sync/AGENTS.md) | Cliente de room Loro + DocsStore (snapshot de nascimento e sinais efêmeros de histórico local) |

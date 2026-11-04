@@ -12,6 +12,8 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 ## Local Contracts
 
+- Sync `35561ead`: `childKind`, access/plan, `backgroundTasks` e `exitCode/outputLines/outputTruncated` são campos aditivos. Tail de comandos segue os limites comuns de `command_output`; os demais outputs mantêm o resumo limitado do fork e Write/Edit seguem sanitizados. `execution`, `file_preview` e `subagent_end` coexistem com os campos novos, inclusive no rebuild/replay. Loro passa a 1.17 junto do materializador edge.
+
 - `commit_voice_transcript` só aceita texto final canônico e idempotente, com identidade por sessão/item; partial, áudio, SDP e lease não são conteúdo do doc. Transcript promovido pelo roteamento nativo não duplica a mensagem já persistida, e precisa referenciar uma mensagem que já existe.
 - `workedProjects` é metadata opcional da row de Chat em `RegistryDoc` e no `WorkspaceDoc` legado; o setter dedicado escreve só esse campo, sem tocar `updatedAt` nem demais atributos. Upsert completo só semeia o campo ausente: uma cópia de Chat stale não sobrescreve o resumo mais novo. O registry/edge trata o objeto aditivo pelo merge genérico de campos, sem alterar o session doc.
 - Ao decodificar a row, `workedProjects` malformado nunca derruba o Chat: IDs string recuperáveis permanecem, evidência inválida vira desconhecida e o resumo fica incompleto; valor inteiramente ilegível vira metadata ausente.

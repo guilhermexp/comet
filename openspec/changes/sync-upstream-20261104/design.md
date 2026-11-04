@@ -12,7 +12,7 @@ Incorporar o alvo como segundo pai de um merge, após commit próprio de planeja
 
 ### D1 — zgx, plugins e templates dormentes
 
-Conservar apps/zgx como fonte fora do workspace padrão, sem trocar launch, shell gpui, Workers, Details, Usage ou terminal direito. Plugins/templates e serviços novos ficam sem ativação automática na engine do fork; autorização de plugin nunca substitui grant raiz. Alternativa rejeitada: migrar a interface e iniciar código de plugin sem aceite. Decisão aberta ao dono: se e quando iniciar migração separada para zgx/plugins/templates.
+Conservar apps/zgx como fonte fora do workspace padrão, sem trocar launch, shell gpui, Workers, Details, Usage ou terminal direito. A capability zgx-interface-v1 não é anunciada. Plugins/templates e serviços novos ficam sem ativação automática na engine do fork; autorização de plugin nunca substitui grant raiz. Alternativa rejeitada: migrar a interface e iniciar código de plugin sem aceite. Decisão aberta ao dono: se e quando iniciar migração separada para zgx/plugins/templates.
 
 ### D2 — edge mantém o grafo publicado do fork
 
@@ -20,11 +20,11 @@ Preview/login e materialização do transcript entram vivos; directory/profile/b
 
 ### D3 — Settings/Usage e apresentação do fork
 
-Aceitar busca/scroll/atalhos/anotações/imagens e percentuais Cursor sobre Projects/Accounts, persistência apply_shell_settings, medidores Grok/Kimi/Antigravity e transcript compacto. Recusar a restauração do anel Usage/context do upstream e do terminal de rodapé. Theme tools devem compartilhar o catálogo do fork, não instalar um segundo modelo.
+Aceitar busca/scroll/atalhos/anotações/imagens e percentuais Cursor sobre Projects/Accounts, persistência apply_shell_settings, medidores Grok/Kimi/Antigravity e transcript compacto. Recusar a restauração do anel Usage/context do upstream e do terminal de rodapé. Theme tools devem compartilhar o catálogo do fork, não instalar um segundo modelo. Sinais de PR mantêm o runner limitado/cwd e obtêm viewer pela metadata autenticada do fork; seu cache account identifica credencial, não username.
 
 ### D4 — AccessMode, Fx e ACP registry com grants do fork
 
-Adicionar opções aditivas de acesso/plano e Fx/registry; OMP/Kimi preservados e não prometem modos que não suportam. RunRequest.mcp continua vazio, configuração de processo continua comparando grants, execution/update leases continuam vinculantes. MCP de plugins não é injetado globalmente. Native subagents continua derivado apenas do sessions grant.
+Adicionar opções aditivas de acesso/plano e Fx/registry; OMP/Kimi preservados e não prometem modos que não suportam. A engine limpa RunRequest.mcp e extra_mcp antes de capturar o retry e invocar o driver; chamadas diretas aos drivers conservam extra_mcp. A configuração de processo continua comparando grants e acesso efetivo, execution/update leases continuam vinculantes. MCP de plugins não é injetado globalmente. Native subagents continua derivado apenas do sessions grant.
 
 ### D5 — escopos IPC preservam os clientes autorizados
 
@@ -46,6 +46,10 @@ Aceitar lista/leitura/parada de processos em background e tails/exit code de too
 
 API nova de WPE/dma-buf exige portar commits necessários em fonte separada dentro do worktree e copiar ao vendor com registro third_party/zui-upstream.toml, preservando patches locais. Verificar tanto line_wrapper quanto line_layout de closing punctuation. Nunca trocar para dependência git do zui.
 
+### D10 — dois formatos de CreateWorkspaceEntry
+
+O fork já usa parentPath/name e reply WorkspaceEntryMutation. O upstream adicionou um homônimo incompatível com operationId/path/expectedCheckoutId e reply WorkspaceMutationOutcome. Preservar o tipo legado e nomear o novo CreateWorkspaceEntryMutationRequest; dispatch por operationId no mesmo RPC. Ambos mantêm ownership/path gates, e o novo mantém checkout identity/no-replace. Teste integrado cobre ambos, destino existente e checkout stale. Alternativa rejeitada: quebrar o cliente Files já instalado.
+
 ## Risks / Trade-offs
 
 - Grande delta de plugins/registry → runtime dormente, gates e regressões focadas.
@@ -60,4 +64,4 @@ Planejamento → fmt → merge real → resolução por arquivo → check all ta
 
 ## Open Questions
 
-Dono decide em trabalhos futuros se ativa zgx/plugins/templates (D1), directory/profile/badges/card-web (D2) ou canal beta (D8). Nesta PR a escolha já está fixada: permanecer dormente. Aceite macOS/iOS e visual precede sair de draft.
+Dono decide em trabalhos futuros se ativa zgx/plugins/templates (D1), directory/profile/badges/card-web (D2) ou canal beta/CLI/managed engine (D8). Nesta PR a escolha já está fixada: permanecer dormente. Aceite macOS/iOS e visual precede sair de draft.

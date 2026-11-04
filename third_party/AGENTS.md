@@ -23,6 +23,8 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 
 ## Local Contracts
 
+- Sync `35561ead` porta zui `361ff20..b564a34` em `.tmp/zui-source` e importa o snapshot com proveniência em `zui-upstream.toml`. As APIs de dma-buf/pixel atlas e frame callbacks entram sem perder vidro macOS, headless ou as duas regras de pontuação. Formatar na fonte separada e preservar symlinks de licença; `vendored_tree` deve coincidir com a árvore Git final, incluindo modos.
+
 - **`unpeel/` não é submódulo.** `.gitmodules` e o gitlink foram removidos no
   commit `216b61e8`; clone, worktree e CI recebem os arquivos diretamente. Não
   executar `git submodule` para este path.
@@ -135,11 +137,11 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   projeção de descriptors/ícones para o catálogo Swift gerado; não roda Cargo.
   `bun run validate:runtimes` acrescenta
   `cargo test --manifest-path crates/Cargo.toml -p unpeel-core runtime_catalog`,
-  então a validação combinada local roda dentro de
-  `scripts/cargo-verify.py -- bun run --cwd third_party/unpeel validate:runtimes`.
+  então a validação combinada local usa
+  `bun run --cwd third_party/unpeel validate:runtimes`, com target exclusivo, jobs=2
+  e sccache conforme o AGENTS.md raiz.
   Mudanças Rust-only em adapters não alteram o catálogo Swift nem exigem
-  geração: rode apenas filtros Rust focados através de uma única invocação do
-  wrapper. Se `check:runtimes` encontrar drift, compare a projeção esperada com
+  geração: rode apenas filtros Rust focados com Cargo nativo. Se `check:runtimes` encontrar drift, compare a projeção esperada com
   os descriptors/ícones canônicos; atualize o Swift rastreado somente quando
   ele estiver realmente desatualizado. Em 2026-10-08, foi corrigido um drift
   preexistente no catálogo Swift (reliability de atenção de Pi/OMP/Prime e
@@ -205,8 +207,8 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `third_party/unpeel/scripts/generate-runtime-client-catalog.mjs` + `third_party/unpeel/apps/shared/UnpeelShared/Sources/UnpeelShared/GeneratedRuntimeCatalog.swift` | unit — projeção determinística de descriptors/ícones; sem Cargo | `bun run --cwd "$PWD/third_party/unpeel" check:runtimes` |
-| `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `scripts/cargo-verify.py -- bash -c 'cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core && cargo test -p zeron-workers-unpeel'` |
-| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `scripts/cargo-verify.py -- cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
+| `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · `cargo test -p zeron-workers-unpeel` |
+| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
 | `third_party/zui` | unit no vendor (API de blur e ambas as regras de pontuação) + compile downstream da API de glifo transformado | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --lib window_blur_` · `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui --features gpui_platform/runtime_shaders --lib closing_punctuation_attached` · `cargo build -p zeron` |
