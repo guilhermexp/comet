@@ -413,7 +413,7 @@ struct Inner {
     local_ipc: Mutex<Option<String>>,
     #[cfg(test)]
     admission_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// Plugins whose native MCP servers local runs get (absent in bare tests).
+    /// Retained upstream service seam; fork runs never inject plugin MCP servers.
     plugins: OnceLock<crate::plugins::Plugins>,
 }
 
@@ -609,7 +609,8 @@ impl SessionsEngine {
         lock(&self.inner.ipc_token_file).clone()
     }
 
-    /// Wire the plugins service: local runs get its native MCP servers.
+    /// Retained upstream seam for separate plugin activation; the fork grant
+    /// model still strips native per-run MCP injection in `drive_run`.
     pub fn set_plugins(&self, plugins: crate::plugins::Plugins) {
         let _ = self.inner.plugins.set(plugins);
     }
@@ -1929,10 +1930,6 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
-    }
-
-    pub fn has_run(&self, chat_id: &str) -> bool {
-        lock(&self.inner.runs).contains_key(chat_id)
     }
 
     pub fn inject_event(&self, chat_id: &str, event: AgentEvent) -> bool {
@@ -4485,6 +4482,7 @@ async fn drive_run(
     // upstream's always-on `zeron mcp` injection. Strip anything a client put
     // on the wire so `RunRequest.mcp` stays empty on every run.
     request.mcp = None;
+    request.extra_mcp.clear();
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership. The retry's own dispatch restamps
@@ -4494,9 +4492,7 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    // D1/D4: no host/plugin MCP injection; the fork grants are stamped separately.
-    request.mcp = None;
-    request.extra_mcp.clear();
+    // D1/D4: the fork grants are stamped separately; no plugin injection.
     // A revived turn the resumed session already holds: the provider gets
     // the continuation, while the transcript, preview and title keep the
     // user's own message (and the retries carry the revival on).
@@ -4885,7 +4881,7 @@ async fn drive_run(
     let mut live_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     live_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The runtime's background processes, published on the session row.
-    let mut background_processes = turn.watch_background_processes();
+    let mut background_processes = turn_control.watch_background_processes();
     // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
     // steerable harness parks here instead of ending the run — the child and
     // its steering mailbox stay warm, and the next user message (dispatch
@@ -6342,6 +6338,10 @@ mod tests {
             continuation_of: None,
         };
         let spawn = |id: &str, child: &str| MessagePart::Tool {
+            exit_code: Default::default(),
+            output_lines: Default::default(),
+            output_truncated: Default::default(),
+
             id: id.into(),
             call: ToolCall::Unknown {
                 name: format!("Agent: {id}"),
@@ -6570,6 +6570,8 @@ mod tests {
         at += 4_000;
         turn.observe_at(
             &AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "a".into(),
                 is_error: false,
                 output: None,
@@ -6584,6 +6586,8 @@ mod tests {
         // "b" overlaps "a": the union (2s..6s) counts once.
         turn.observe_at(
             &AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "b".into(),
                 is_error: false,
                 output: None,
@@ -6779,6 +6783,8 @@ mod tests {
     #[test]
     fn context_snapshot_updates_deduplicate_and_only_a_measurement_replaces() {
         let mut session = Session {
+            background_tasks: Default::default(),
+
             last_completed_turn: None,
             chat_id: "chat-1".into(),
             device_id: "device-1".into(),
@@ -6829,6 +6835,8 @@ mod tests {
     #[test]
     fn only_an_errored_row_carries_a_reason_and_the_next_turn_clears_it() {
         let mut session = Session {
+            background_tasks: Default::default(),
+
             last_completed_turn: None,
             chat_id: "chat-1".into(),
             device_id: "device-1".into(),

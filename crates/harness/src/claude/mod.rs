@@ -525,12 +525,10 @@ impl ClaudeHarness {
                 cmd.arg("--strict-mcp-config");
             }
         } else {
-            if let Some(mcp) = &request.mcp {
-                // Zeron's own server rides beside the user's configured servers
-                // (no `--strict-mcp-config`): the CLI merges an inline JSON
-                // config with settings-sourced ones. Always unset in the fork:
-                // its servers ride the Workers/sessions grant in `launch_args`.
-                cmd.args(["--mcp-config", &mcp_config_arg(mcp)]);
+            if let Some(config) = mcp_servers_config_arg(request.mcp.as_ref(), &request.extra_mcp) {
+                // Direct harness callers retain upstream's optional servers;
+                // normal fork runs clear these and use stamped grants.
+                cmd.args(["--mcp-config", &config]);
             }
             // Delegation goes through the side chats of the fork's root
             // orchestrator grant only. A bare tool name "removes the matching
@@ -2211,6 +2209,10 @@ mod tests {
 
     fn workers_request(enabled: bool) -> RunRequest {
         RunRequest {
+            access: Default::default(),
+            extra_mcp: Default::default(),
+            plan: Default::default(),
+
             prompt: "test".into(),
             harness: None,
             model: None,
@@ -2453,6 +2455,10 @@ mod access_tests {
 
     fn request(access: AccessMode, auto_approve: bool, plan: bool) -> RunRequest {
         RunRequest {
+            enable_workers_mcp: Default::default(),
+            sessions: Default::default(),
+            workers_parent_chat_id: Default::default(),
+
             mcp: None,
             prompt: "hi".into(),
             harness: None,

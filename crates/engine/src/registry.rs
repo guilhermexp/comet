@@ -1029,6 +1029,10 @@ fn full_registry() -> HarnessRegistry {
     // step-boundary steering plus its live provider/model catalog.
     registry.register_lazy(
         HarnessDescriptor {
+            access_modes: Default::default(),
+            icon: Default::default(),
+            supports_plan: Default::default(),
+
             id: HarnessId::Omp,
             name: "OMP".into(),
             supports_steering: true,

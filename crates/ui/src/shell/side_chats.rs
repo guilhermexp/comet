@@ -556,7 +556,7 @@ mod tests {
             )
         });
         window
-            .update(cx, |shell, _, cx| {
+            .update(cx, |shell, window, cx| {
                 shell.active_chat = "main".into();
                 shell.set_surfaces_open(true, cx);
                 let chat = serde_json::from_value(serde_json::json!({
@@ -736,7 +736,7 @@ mod tests {
         }))
         .unwrap();
         window
-            .update(cx, |shell, _, cx| {
+            .update(cx, |shell, window, cx| {
                 shell.active_chat = "main".into();
                 let main: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
                     "id": "main", "deviceId": "local", "cwd": "/tmp/main",
@@ -893,7 +893,7 @@ mod tests {
         };
         let window = shell_window(dir, cx);
         window
-            .update(cx, |shell, _, cx| {
+            .update(cx, |shell, window, cx| {
                 shell.active_chat = "main".into();
                 let main: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
                     "id": "main", "deviceId": "omarchy", "cwd": "/srv/main",
@@ -916,7 +916,7 @@ mod tests {
                     state.selected_chat = Some("main".into());
                     state.set_test_engine(engine);
                 });
-                shell.toggle_right_pane(cx);
+                shell.toggle_right_pane(window, cx);
             })
             .unwrap();
         (window, runtime, ForkEngine { requests, replies })
@@ -1138,7 +1138,16 @@ mod tests {
                 }))
                 .unwrap();
                 shell.state.update(cx, |state, _| state.chats.push(row));
-                shell.open_child_chat_tab(&fork_id, cx);
+                let chat = shell
+                    .state
+                    .read(cx)
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == fork_id)
+                    .unwrap()
+                    .clone();
+                let key = shell.panel_key(cx);
+                shell.open_side_chat(chat, key, cx);
                 assert_eq!(shell.side_chats.len(), 1);
                 let side = &shell.side_chats[&tab];
                 assert!(side.fork.is_none(), "the row opens the chat, not the wait");

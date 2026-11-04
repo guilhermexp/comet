@@ -2382,6 +2382,10 @@ mod tests {
 
     fn tool_part(id: &str, resolved: bool, subagent_status: Option<&str>) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_lines: Default::default(),
+            output_truncated: Default::default(),
+
             id: id.into(),
             call: ToolCall::Exec {
                 command: "ls".into(),
@@ -2846,6 +2850,10 @@ mod tests {
         let doc = SessionDoc::init("file-preview").unwrap();
         let mut writer = SegmentWriter::begin(&doc, "entry-1", "dev", 1).unwrap();
         let mut part = MessagePart::Tool {
+            exit_code: Default::default(),
+            output_lines: Default::default(),
+            output_truncated: Default::default(),
+
             id: "write-1".into(),
             call: ToolCall::WriteFile {
                 path: "notes/new.txt".into(),
@@ -2945,6 +2953,10 @@ mod tests {
             id: "entry".into(),
             role: MessageRole::Assistant,
             parts: vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_lines: Default::default(),
+                output_truncated: Default::default(),
+
                 id: "write-1".into(),
                 call: ToolCall::WriteFile {
                     path: "notes.txt".into(),
@@ -3317,6 +3329,8 @@ mod tests {
         fold_event_into_parts(
             &mut folded,
             &AgentEvent::ToolResult {
+                execution: Default::default(),
+
                 id: "c1".into(),
                 is_error: true,
                 output: Some(full.clone()),
@@ -3325,7 +3339,9 @@ mod tests {
             },
         );
         writer.sync(&folded).unwrap();
-        writer.finish(&folded, MessageStatus::Complete).unwrap();
+        writer
+            .finish(&folded, MessageStatus::Complete, None)
+            .unwrap();
         let entries = doc.read_entries().unwrap();
         match &entries[0].parts[0] {
             MessagePart::Tool {
@@ -3426,6 +3442,10 @@ mod tests {
             id: "m-execution".into(),
             role: MessageRole::Assistant,
             parts: vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_lines: Default::default(),
+                output_truncated: Default::default(),
+
                 id: "exec".into(),
                 call: ToolCall::Exec {
                     command: "cargo test".into(),

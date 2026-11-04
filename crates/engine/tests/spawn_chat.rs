@@ -78,6 +78,9 @@ impl Harness for RecordingHarness {
 
 fn parent_config() -> ChatConfig {
     ChatConfig {
+        access: zeron_proto::AccessMode::Supervised,
+        plan: true,
+
         harness: HarnessId::Mock,
         model: Some("switched-model".into()),
         reasoning: Some(ReasoningLevel::High),
@@ -91,6 +94,10 @@ fn parent_config() -> ChatConfig {
 
 fn run_request(prompt: &str, cwd: &str) -> RunRequest {
     RunRequest {
+        access: zeron_proto::AccessMode::Supervised,
+        plan: true,
+        extra_mcp: Default::default(),
+
         prompt: prompt.into(),
         harness: Some(HarnessId::Mock),
         model: Some("switched-model".into()),
@@ -228,6 +235,9 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
             Some(&core.device_id),
             Some(&core.device_id),
             Some(ChatConfig {
+                access: Default::default(),
+                plan: Default::default(),
+
                 harness: HarnessId::Mock,
                 model: Some("original-model".into()),
                 reasoning: Some(ReasoningLevel::Low),
@@ -235,6 +245,7 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
                 sandbox: SandboxLevel::WorkspaceWrite,
             }),
             Some("/tmp/worktrees/feature".into()),
+            None,
             None,
         )
         .unwrap();
@@ -327,6 +338,9 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
     assert_eq!(first.model.as_deref(), Some("switched-model"));
     assert_eq!(first.reasoning, Some(ReasoningLevel::High));
     assert_eq!(first.sandbox, SandboxLevel::ReadOnly);
+    assert_eq!(first.access, parent_config().access);
+    assert!(first.plan);
+    assert!(first.mcp.is_none() && first.extra_mcp.is_empty());
     assert_eq!(first.harness, Some(HarnessId::Mock));
 
     core.doc_host
@@ -334,6 +348,18 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
             &child_id,
             SessionCommandPayload::Run {
                 request: RunRequest {
+                    mcp: Some(zeron_proto::McpServer {
+                        name: "forged".into(),
+                        command: "/never-run".into(),
+                        args: vec![],
+                        env: Default::default(),
+                    }),
+                    extra_mcp: vec![zeron_proto::McpServer {
+                        name: "forged-plugin".into(),
+                        command: "/never-run".into(),
+                        args: vec![],
+                        env: Default::default(),
+                    }],
                     sessions: Some(SessionsGrant {
                         parent_chat_id: "forged".into(),
                         endpoint: "ws://127.0.0.1:1".into(),
@@ -352,6 +378,10 @@ async fn spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent() {
     )
     .await;
     let later = &requests_for(&log, &child_id)[1];
+    assert!(
+        later.mcp.is_none() && later.extra_mcp.is_empty(),
+        "client MCP injection is stripped"
+    );
     assert!(
         later.sessions.is_none(),
         "forged sessions grant is overwritten"

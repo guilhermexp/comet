@@ -34,25 +34,11 @@ pub(super) fn configure_all(
     mcp: Option<&zeron_proto::McpServer>,
     extras: &[zeron_proto::McpServer],
 ) -> Result<Option<ScratchDir>, HarnessError> {
-    let mut servers = mcp.into_iter().chain(extras);
-    let Some(first) = servers.next() else {
+    let servers: Vec<_> = mcp.into_iter().chain(extras).cloned().collect();
+    if servers.is_empty() {
         return Ok(None);
-    };
-    let scratch = configure(cmd, first)?;
-    for (index, config) in servers.enumerate().map(|(i, c)| (i + 1, c)) {
-        let var = format!("{CONFIG_ENV}_{index}");
-        let source = include_str!("mcp.mjs").replace(
-            &format!("process.env.{CONFIG_ENV}"),
-            &format!("process.env.{var}"),
-        );
-        let extension = scratch.path().join(format!("zeron-mcp-{index}.mjs"));
-        std::fs::write(&extension, source)?;
-        cmd.arg("--extension").arg(extension).env(
-            var,
-            serde_json::to_string(config).expect("serializable MCP config"),
-        );
     }
-    Ok(Some(scratch))
+    configure(cmd, &servers).map(Some)
 }
 
 #[cfg(all(test, unix))]

@@ -1218,6 +1218,13 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
     .await;
     assert_eq!(queue_texts(&core), vec!["second queued"]);
     assert!(!user_messages(&core).iter().any(|m| m == "second queued"));
+    // A durable user row precedes harness startup. Observe the prompt whose
+    // receiver the fixture subscribed before broadcasting its completion.
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "first queued"),
+        "first queued harness",
+    )
+    .await;
     harness.finish.send(()).unwrap();
     wait_for(
         || user_messages(&core).iter().any(|m| m == "second queued"),
@@ -1225,6 +1232,11 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
     )
     .await;
     assert!(queue_texts(&core).is_empty());
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "second queued"),
+        "second queued harness",
+    )
+    .await;
     let _ = harness.finish.send(());
     core.shutdown().await;
 }

@@ -221,6 +221,10 @@ impl TitleGenerator {
             std::time::Duration::from_secs(crate::recap::RUN_ATTEMPT_SECS),
             move |attempt| async move {
                 let mut request = RunRequest {
+                    access: Default::default(),
+                    extra_mcp: Default::default(),
+                    plan: Default::default(),
+
                     prompt: title_prompt.clone(),
                     harness: Some(harness_id),
                     model: cheap.clone(),

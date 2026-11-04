@@ -157,6 +157,10 @@ impl World {
                 chat_id,
                 SessionCommandPayload::Run {
                     request: RunRequest {
+                        access: Default::default(),
+                        plan: Default::default(),
+                        extra_mcp: Default::default(),
+
                         mcp: None,
                         prompt: prompt.into(),
                         harness: None,

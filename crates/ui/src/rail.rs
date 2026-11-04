@@ -31,6 +31,8 @@ pub fn rail_visible(container_width: f32) -> bool {
 }
 
 /// Preview line caps: the prompt and the reply's opening clamp to these.
+pub const PREVIEW_PROMPT_CHARS: usize = 160;
+pub const PREVIEW_REPLY_CHARS: usize = 200;
 pub const PREVIEW_PROMPT_LINES: usize = 3;
 pub const PREVIEW_REPLY_LINES: usize = 4;
 /// Source a preview parses at most; the clamp shows far less of it.
@@ -138,7 +140,8 @@ pub fn rail_ticks(
     for (ix, entry) in entries.iter().enumerate() {
         // Worker completion notices ride user-role entries but are not the
         // user's prompts: no navigation tick.
-        if entry.role != MessageRole::User || crate::transcript::is_worker_notice(&user_text(entry))
+        if entry.role != MessageRole::User
+            || crate::transcript::is_worker_notice(&user_text(entry).0)
         {
             continue;
         }
@@ -413,10 +416,19 @@ fn preview_text(source: &str, color: gpui::Hsla, theme: &Theme) -> Option<AnyEle
     let mut theme = theme.clone();
     theme.text = color;
     let flat = render::flatten_runs(&runs, &theme, false);
+    let mut offset = 0;
+    let code_ranges: Vec<_> = flat
+        .runs
+        .iter()
+        .filter_map(|run| {
+            let start = offset;
+            offset += run.len;
+            (run.font.family == theme.font_mono).then_some(start..offset)
+        })
+        .collect();
     let styled = StyledText::new(flat.text).with_runs(flat.runs);
     let layout = styled.layout().clone();
-    let wash = render::inline_code_wash(&theme);
-    let code_ranges = flat.code_ranges;
+    let wash = theme.code_wash;
     div()
         .relative()
         .child(
@@ -427,7 +439,7 @@ fn preview_text(source: &str, color: gpui::Hsla, theme: &Theme) -> Option<AnyEle
                         for rect in render::range_rects(
                             &layout,
                             range,
-                            render::INLINE_CODE_PAD_X,
+                            3.0,
                             render::INLINE_CODE_INSET_Y / 2.0,
                         ) {
                             window.paint_quad(gpui::fill(rect, wash).corner_radii(px(3.5)));
@@ -870,8 +882,6 @@ impl Transcript {
             }
         };
         let move_under = tick_under.clone();
-        // Only the hovered prompt's preview is materialized per frame.
-        let hovered_tick = hover.and_then(|ix| self.rail_snapshot.ticks.get(ix).cloned());
 
         // A scrolling rail only builds the ticks its window shows (and a
         // slot either side): a long chat's hundreds of others would be laid
@@ -1384,4 +1394,13 @@ mod tests {
         assert_eq!(ticks[0].prompt, "You own the **soak**.");
         assert!(ticks[1].sender.is_none());
     }
+}
+
+pub fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let flat = crate::transcript::single_line(text);
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
 }

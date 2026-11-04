@@ -1030,9 +1030,9 @@ mod tests {
         assert!(tail.contains("[redacted]"));
     }
 
-    /// Codex's other tools (an MCP call here) still leave no output in the doc.
+    /// Non-command tools keep the fork's bounded summary, without command metadata.
     #[test]
-    fn a_non_command_tool_keeps_no_output() {
+    fn a_non_command_tool_keeps_fork_summary() {
         let mut parts = Vec::new();
         for event in [
             AgentEvent::ToolCall {
@@ -1044,6 +1044,8 @@ mod tests {
                 },
             },
             AgentEvent::ToolResult {
+                execution: Default::default(),
+
                 id: "m1".into(),
                 is_error: false,
                 output: Some("secret file contents\n".repeat(10)),
@@ -1056,13 +1058,13 @@ mod tests {
         assert!(matches!(
             &parts[0],
             zeron_doc::MessagePart::Tool {
-                output: None,
+                output: Some(summary),
                 output_bytes: None,
                 exit_code: None,
                 output_truncated: false,
                 resolved: true,
                 ..
-            }
+            } if summary == "secret file contents…"
         ));
     }
 

@@ -1592,6 +1592,8 @@ mod partial_context_tests {
         ] {
             let doc = WorkspaceDoc::new();
             let mut row = Session {
+                background_tasks: Default::default(),
+
                 chat_id: "chat".into(),
                 device_id: "device".into(),
                 status: SessionStatus::Idle,

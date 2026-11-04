@@ -1900,6 +1900,35 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn fork_startup_keeps_plugin_rpc_dormant() {
+        let temp = TempDir::new().unwrap();
+        let core = EngineCore::assemble(
+            temp.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        let info = client
+            .call(zeron_rpc::methods::ENGINE_INFO, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let info: zeron_proto::EngineInfo = serde_json::from_value(info).unwrap();
+        assert!(!info.supports(zeron_proto::capabilities::ZGX_INTERFACE_V1));
+        assert!(info.supports(zeron_proto::capabilities::BACKGROUND_TASKS_V1));
+        let error = client
+            .call(zeron_rpc::methods::LIST_PLUGINS, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Plugins aren't available here"),
+            "{error}"
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_boot_cleanup_removes_trajectory_store_leftovers() {
         let temp = TempDir::new().unwrap();
         let profile = EngineProfile::development(temp.path(), "dev_org", "dev_user");

@@ -79,8 +79,6 @@ settings_index! {
         "titles rename sessions model"),
     (WorktreeLocation, General, Some("Git"), "Custom worktree location",
         "folder directory path checkout branches"),
-    (CommitCredit, General, Some("Git"), "Credit Zeron in commits",
-        "co-author coauthor attribution bot commit message"),
     (ColorScheme, Appearance, None, "Color scheme",
         "system light dark mode"),
     (LightTheme, Appearance, None, "Light theme",
@@ -362,6 +360,8 @@ fn shortcut_entries(section: SettingsSection) -> Vec<Entry> {
 /// What a page is also called, and what it holds that has no row of its own.
 fn page_terms(section: SettingsSection) -> &'static str {
     match section {
+        SettingsSection::Projects => "projects folders checkouts worktrees tickets",
+
         SettingsSection::General => "preferences composer conversations behavior",
         SettingsSection::Appearance => "theme look colors fonts",
         SettingsSection::Notifications => "alerts sounds banners",
@@ -369,7 +369,7 @@ fn page_terms(section: SettingsSection) -> &'static str {
         SettingsSection::Shortcuts => "keyboard keybindings hotkeys keys",
         SettingsSection::Harnesses | SettingsSection::Agents => {
             "harnesses agents cli claude code codex cursor devin grok hermes pi opencode \
-             antigravity muse install enable disable update policy accounts sign in login"
+             antigravity muse kimi install enable disable update policy accounts usage quota sign in login"
         }
         SettingsSection::Devices => "machines computers remote this device other devices rename",
         SettingsSection::Cloud => "machine remote github repositories usage",
@@ -794,13 +794,13 @@ mod tests {
             !matches!(section, SettingsSection::Cloud | SettingsSection::Billing)
         };
         assert_eq!(top("credits"), Target::Setting(SettingId::Credits));
-        // Signed out, Billing's credits are gone: only General's near
-        // spelling ("Credit Zeron in commits") is left.
+        // The fork does not offer upstream commit credit in search.
         let hits = search("credits", signed_out);
-        assert!(!hits.is_empty() && hits.iter().all(|hit| signed_out(hit.entry.section)));
-        assert_eq!(
-            hits[0].entry.target,
-            Target::Setting(SettingId::CommitCredit)
+        assert!(hits.iter().all(|hit| signed_out(hit.entry.section)));
+        assert!(
+            !search("credit zeron commits", |_| true)
+                .iter()
+                .any(|hit| hit.entry.title.contains("Credit Zeron"))
         );
     }
 

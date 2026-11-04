@@ -60,6 +60,10 @@ fn fake_harness(scenario: &str) -> OmpHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        access: Default::default(),
+        extra_mcp: Default::default(),
+        plan: Default::default(),
+
         prompt: prompt.to_owned(),
         harness: Some(HarnessId::Omp),
         model: None,
@@ -532,6 +536,8 @@ fn normalizer_maps_text_reasoning_and_tools() {
             "isError": false
         })),
         vec![AgentEvent::ToolResult {
+            exit_code: Some(0),
+
             id: "tool-1".into(),
             is_error: false,
             output: Some("ok".into()),
@@ -560,6 +566,7 @@ fn normalizer_maps_text_reasoning_and_tools() {
             output,
             diff,
             execution,
+            ..
         },
     ] = &edited[..]
     else {

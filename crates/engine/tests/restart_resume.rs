@@ -367,6 +367,10 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
                 // it, its card keeps spinning under a transcript that already
                 // says the run was interrupted.
                 MessagePart::Tool {
+                    exit_code: Default::default(),
+                    output_truncated: Default::default(),
+                    output_lines: Default::default(),
+
                     id: "tool-0".into(),
                     call: ToolCall::Exec {
                         command: "sleep 600".into(),
@@ -1539,6 +1543,10 @@ async fn recovery_settles_subagent_docs_in_step_with_their_chips() {
     std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
     let sub_doc = |id: &str| format!("{CHAT}--sub--{id}");
     let chip = |id: &str| MessagePart::Tool {
+        exit_code: Default::default(),
+        output_truncated: Default::default(),
+        output_lines: Default::default(),
+
         id: id.into(),
         call: ToolCall::Unknown {
             name: "Agent: scan".into(),

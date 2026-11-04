@@ -54,7 +54,7 @@ pub mod capabilities {
         SIDEBAR_SECTION_ORDER_V1,
         PROVIDER_SWITCH_V1,
         BACKGROUND_TASKS_V1,
-        ZGX_INTERFACE_V1,
+        // D1: the fork does not activate the zgx/plugin interface.
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -182,6 +182,7 @@ mod tests {
             capabilities: capabilities::current(),
             build: None,
         };
+        assert!(!info.supports(capabilities::ZGX_INTERFACE_V1));
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
             serde_json::json!({
@@ -200,7 +201,6 @@ mod tests {
                     "sidebar-section-order-v1",
                     "provider-switch-v1",
                     "background-tasks-v1",
-                    "zgx-interface-v1",
                     "voice-client-media-v1"
                 ],
             })

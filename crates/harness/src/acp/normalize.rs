@@ -935,6 +935,8 @@ mod tests {
                     },
                 },
                 AgentEvent::ToolResult {
+                    exit_code: Default::default(),
+
                     id: "write-growing".into(),
                     is_error: false,
                     output: None,
@@ -994,6 +996,8 @@ mod tests {
                     },
                 },
                 AgentEvent::ToolResult {
+                    exit_code: Default::default(),
+
                     id: "edit-growing".into(),
                     is_error: true,
                     output: None,
@@ -1031,6 +1035,8 @@ mod tests {
                 "status": "completed"
             })),
             vec![AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "turn-local-write".into(),
                 is_error: false,
                 output: None,

@@ -359,6 +359,9 @@ impl Palette {
         ]);
         let encoded = self.to_json(None).to_string();
         ThemeVariant {
+            flat_shell: false,
+            frost_alpha: None,
+            frost_blur_radius: None,
             id: id.into(),
             family_id: family_id.into(),
             name: name.into(),

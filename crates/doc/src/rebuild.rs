@@ -310,6 +310,10 @@ mod tests {
         let source = SessionDoc::init("chat-file").unwrap();
         let mut entry = fat_entry("m-file");
         entry.parts = vec![MessagePart::Tool {
+            exit_code: Default::default(),
+            output_lines: Default::default(),
+            output_truncated: Default::default(),
+
             id: "edit-1".into(),
             call: ToolCall::EditFile {
                 path: "src/main.rs".into(),

@@ -1229,27 +1229,28 @@ impl GitHubCli {
         source: &CheckoutSourceContext,
         url: &str,
     ) -> Option<zeron_proto::ChangeRequestSignals> {
+        let url = validated_pull_request_url(url).ok()?;
         let request = ProcessRequest {
-            program: "gh".into(),
+            cwd: Some(source.checkout_root.clone()),
             args: vec![
                 "pr".into(),
                 "view".into(),
-                url.into(),
+                url.clone(),
                 "--json".into(),
                 "reviewDecision,reviewRequests,statusCheckRollup".into(),
             ],
-            stdin: None,
-            cwd: Some(source.checkout_root.clone()),
-            env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
-            timeout: GITHUB_TIMEOUT,
-            output_limit: GITHUB_OUTPUT_LIMIT,
+            ..self.request()
         };
         let output = self.runner.run(request).await.ok()?;
         if !output.success || output.stdout_truncated {
             return None;
         }
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        let viewer = self.store_account().await;
+        let viewer = self
+            .fetch_pr_metadata(&url, &url)
+            .await
+            .ok()
+            .and_then(|metadata| metadata.viewer_login);
         Some(signals_from(&value, viewer.as_deref()))
     }
 
@@ -5137,7 +5138,9 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         let runner = FakeProcessRunner::with_responses([
             command_success(list),
             command_success(view.to_vec()),
-            command_success("ada\n"),
+            command_success(
+                br#"{"data":{"viewer":{"login":"ada"},"repository":{"pullRequest":{}}}}"#.to_vec(),
+            ),
         ]);
         let github = GitHubCli::with_runner(runner.clone());
         let summary = github.find_for_branch(&source).await.unwrap().unwrap();
@@ -5150,13 +5153,11 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             signals.ci,
             zeron_proto::change_request_assessment::CiState::Failed
         );
-        if std::env::var_os("GH_TOKEN").is_none() && std::env::var_os("GITHUB_TOKEN").is_none() {
-            assert_eq!(
-                signals.review_requested_of_viewer,
-                Some(true),
-                "requested of the signed-in account"
-            );
-        }
+        assert_eq!(
+            signals.review_requested_of_viewer,
+            Some(true),
+            "requested of the authenticated GraphQL viewer"
+        );
     }
 
     #[tokio::test]

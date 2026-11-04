@@ -517,6 +517,8 @@ pub(super) mod pinned_session_tests {
                             branch: branch.into(),
                             updated_at: chrono::Utc::now(),
                             change_request: Some(zeron_proto::ChangeRequestSummary {
+                                signals: Default::default(),
+
                                 provider: "github".into(),
                                 number: 42,
                                 title: "Fixture".into(),

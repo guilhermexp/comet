@@ -34,12 +34,13 @@ use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use crate::markdown::parser::{InlineRun, InlineStyle};
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Entity, ListAlignment,
-    ListOffset, ListScrollEvent, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, PathBuilder, Pixels, Point, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, StyledImage as _, StyledText, Subscription, Task, TextAlign,
-    TextRun, Window, canvas, div, img, list, point, prelude::*, px, quad, size,
+    AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
+    ListScrollEvent, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    StyledImage as _, StyledText, Subscription, Task, TextRun, Window, canvas, div, img, list,
+    point, prelude::*, px, quad, size,
 };
 
 use zeron_doc::{
@@ -2022,7 +2023,6 @@ fn rows_for_entry_with_todo_history(
                     .map(Arc::new),
                 full: Arc::new(tree),
             });
-        let copy_text = (!text.trim().is_empty()).then(|| SharedString::from(text.clone()));
         return vec![Row {
             id: entry.id.clone().into(),
             version: (raw.len() as u64) << 1 | pending as u64,
@@ -3993,11 +3993,7 @@ fn tool_payload_height(invocation: Option<&ToolDetail>, result: Option<&ToolDeta
 }
 
 /// Tool image preview frame height; widths follow each image's aspect.
-const TOOL_IMAGE_HEIGHT: f32 = 220.0;
-const TOOL_IMAGE_MAX_WIDTH: f32 = 560.0;
-const TOOL_IMAGE_PAD: f32 = 8.0;
 /// Analytic height an open chip's image strip adds (separator + frames).
-const TOOL_IMAGE_STRIP_HEIGHT: f32 = DETAIL_SEPARATOR + TOOL_IMAGE_HEIGHT + 2.0 * TOOL_IMAGE_PAD;
 
 /// The open image context menu: what to copy and where it lives.
 struct ImageMenu {
@@ -4008,11 +4004,6 @@ struct ImageMenu {
     chat_image: Option<(String, &'static str)>,
     position: Point<Pixels>,
     active: Option<usize>,
-}
-
-/// Spawn chips never expand, so they never preview images either.
-fn chip_has_images(tool: &ToolItem) -> bool {
-    !tool.images.is_empty() && !is_spawn_link(tool)
 }
 
 /// Height of the "Show full output/diff" affordance row appended below an
@@ -5306,8 +5297,6 @@ impl Transcript {
             this.sync_loader(cx);
         });
         cx.on_release(|this: &mut Self, cx| {
-            this.close_diagram_zoom(cx);
-            crate::image_media::release_media(this.diagrams.borrow_mut().drain(), cx);
             this.tool_images.clear(cx);
         })
         .detach();
@@ -5593,6 +5582,10 @@ impl Transcript {
             }
             cx.notify();
         }
+    }
+
+    pub(crate) fn state_entity(&self) -> &Entity<AppState> {
+        &self.state
     }
 
     pub(crate) fn rail_hover(&self) -> Option<usize> {
@@ -11039,17 +11032,6 @@ impl Transcript {
             .into_any_element()
     }
 
-    /// The chat's checkout, which tells a workspace-file link from a web one.
-    fn workspace_root(&self, cx: &gpui::App) -> Option<SharedString> {
-        let state = self.state.read(cx);
-        self.chat_id
-            .as_deref()
-            .and_then(|chat_id| state.chats.iter().find(|chat| chat.id == chat_id))
-            .or_else(|| state.selected_chat_row())
-            .and_then(|chat| chat.cwd.as_deref())
-            .map(SharedString::from)
-    }
-
     /// A prompt's Markdown, rendered like a reply's at the bubble's size: its
     /// own selection keys, links and fences. The canvas behind it records the
     /// full height for the fold, as [`user_bubble_text`] does for plain text.
@@ -11067,13 +11049,6 @@ impl Transcript {
         self.rendered_rows.insert(row_key.clone());
         let link = self.link_ui(cx);
         let tree = self.inline_code_tree(tree, link.as_ref(), cx);
-        let code = tree
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(ix, top)| self.code_uis_for(&row_key, &top.block, ix, cx))
-            .flatten()
-            .collect::<HashMap<_, _>>();
         let opts = RenderOptions {
             tasks: None,
             media: None,
@@ -11084,7 +11059,12 @@ impl Transcript {
             copy: Some(self.copy_ui_for(&row_key, cx)),
             link,
             workspace_root: self.workspace_root(cx),
-            code: (!code.is_empty()).then_some(code),
+            code: None,
+            open_file: self.open_file_link(cx),
+            file_root: self.workspace_root(cx).map(|root| root.to_string()),
+            selection_group: None,
+            block_width: self.content_width * 0.8 - 32.0,
+            table_bleed_budget: 0.0,
             math: crate::settings::math_style(cx),
         };
         let highlight = self.code_highlight_for(&row_key, &tree, None, cx);
@@ -11207,14 +11187,12 @@ impl Transcript {
         })
     }
 
-    /// Media wiring for settled Markdown: Mermaid fences become diagrams
-    /// once rendered and keep their source until then (or on failure), and
-    /// local images the chat's folder holds are drawn (`reply_images`).
+    /// Local images held by the Chat's folder; Mermaid keeps the fork renderer.
     fn reply_media(&mut self, cx: &Context<Self>) -> render::MediaUi {
         self.reply_images.borrow_mut().show(self.reply_chat(cx));
         let images = self.reply_images.clone();
         let viewer = cx.weak_entity();
-        let media = self.diagram_media.get_or_insert_with(|| render::MediaUi {
+        let media = render::MediaUi {
             image: Some(Rc::new(move |image, id, theme| {
                 use crate::reply_images::{ReplyImage, frame, sized};
                 // `{row}-image-{block}-{run}`: the row to remeasure on landing.
@@ -11257,51 +11235,8 @@ impl Transcript {
                 Some(element)
             })),
             diagram: None,
-        });
-        media.clone()
-    }
-
-    /// Render requested diagrams one at a time off the UI thread. The loop
-    /// picks its next source between renders, so rows that scrolled away in
-    /// the meantime are skipped rather than queued.
-    fn ensure_diagram_worker(&mut self, cx: &mut Context<Self>) {
-        if self.diagram_worker.is_some() || !self.diagrams.borrow_mut().take_new_requests() {
-            return;
-        }
-        self.diagram_worker = Some(cx.spawn(async move |this, cx| {
-            loop {
-                let job = this.update(cx, |this, cx| {
-                    let job = this.diagrams.borrow_mut().next_job();
-                    if job.is_none() {
-                        this.diagram_worker = None;
-                    }
-                    job.map(|code| {
-                        (
-                            code,
-                            crate::markdown::mermaid::Palette::from_theme(Theme::of(cx)),
-                            crate::theme::style_generation(),
-                        )
-                    })
-                });
-                let Ok(Some((code, palette, style))) = job else {
-                    return;
-                };
-                let source = code.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let svg = crate::markdown::mermaid::render(&source, &palette)?;
-                        crate::image_media::decode_image("image/svg+xml", svg.into_bytes())
-                    })
-                    .await;
-                if this
-                    .update(cx, |this, cx| this.finish_diagram(code, style, result, cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        }));
+        };
+        media
     }
 
     /// Start the image reads this paint asked for, a few at a time: a landed
@@ -11364,20 +11299,6 @@ impl Transcript {
         self.reply_image_loads.insert(key, task);
     }
 
-    fn finish_diagram(
-        &mut self,
-        code: String,
-        style: u32,
-        result: Result<crate::image_media::MediaImage, String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((rows, released)) = self.diagrams.borrow_mut().finish(code, style, result) else {
-            return;
-        };
-        crate::image_media::release_media(released, cx);
-        self.diagram_layout_changed(&rows, cx);
-    }
-
     /// A diagram replaced its source (or the reverse): remeasure the rows
     /// painting it and let the bottom pin and the own-turn runway absorb the
     /// height change, exactly like any other layout-affecting row update.
@@ -11402,50 +11323,6 @@ impl Transcript {
         cx.notify();
     }
 
-    /// Open a diagram in the shared lightbox, rasterized for the window
-    /// within the memory the retained diagrams leave available.
-    fn open_diagram_preview(
-        &mut self,
-        source: crate::image_media::MediaImage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_diagram_zoom(cx);
-        let viewport = window.viewport_size();
-        let available = mermaid_cache::MAX_RETAINED_BYTES
-            .saturating_sub(self.diagrams.borrow().retained_bytes());
-        let enlarged = source.enlarged(
-            (
-                f32::from(viewport.width) * 0.9,
-                f32::from(viewport.height) * 0.85,
-            ),
-            window.scale_factor(),
-            available,
-            None,
-        );
-        self.attachment_preview_return_focus = window.focused(cx);
-        self.attachment_preview = Some(
-            crate::attachments::PreviewImage::new("Mermaid diagram", enlarged.image)
-                .with_plate(crate::markdown::mermaid::Palette::plate(Theme::of(cx))),
-        );
-        self.diagram_zoom = Some(source);
-        window.focus(&self.attachment_preview_focus, cx);
-        cx.notify();
-    }
-
-    /// Release a diagram lightbox's dedicated raster. The row's own preview
-    /// stays with the diagram cache.
-    fn close_diagram_zoom(&mut self, cx: &mut gpui::App) {
-        let Some(source) = self.diagram_zoom.take() else {
-            return;
-        };
-        if let Some(preview) = self.attachment_preview.take()
-            && !Arc::ptr_eq(&preview.image, &source.image)
-        {
-            cx.defer(move |cx| gpui::ImageSource::Image(preview.image).evict(None, cx));
-        }
-    }
-
     /// Open an image in the shared lightbox; Escape returns focus here.
     fn open_image_preview(
         &mut self,
@@ -11458,55 +11335,6 @@ impl Transcript {
         self.attachment_preview = Some(preview);
         window.focus(&self.attachment_preview_focus, cx);
         cx.notify();
-    }
-
-    fn render_generated_image(
-        &mut self,
-        row_id: &SharedString,
-        owner: &str,
-        path: &str,
-        name: &str,
-        mime_type: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        use crate::attachments::AttachmentSnapshot;
-        let devices = self.generated_attachment_device_ids(owner, cx);
-        let state = self.attachment_state(&devices, path, Some(mime_type), cx);
-        let theme = Theme::of(cx).clone();
-        let frame = crate::reply_images::frame(SharedString::from(format!("{row_id}-generated")));
-        match state {
-            AttachmentSnapshot::Loaded(loaded) => {
-                let preview =
-                    crate::attachments::PreviewImage::new(name.to_owned(), loaded.image.clone());
-                let menu_path = path.to_owned();
-                crate::reply_images::sized(frame, &loaded.image, &theme)
-                    .on_mouse_down(
-                        gpui::MouseButton::Right,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.open_image_menu(
-                                menu_path.clone(),
-                                devices.clone(),
-                                event.position,
-                                window,
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_image_preview(preview.clone(), window, cx)
-                    }))
-                    .into_any_element()
-            }
-            AttachmentSnapshot::Loading => frame
-                .text_color(theme.text_muted)
-                .child("Loading image…")
-                .into_any_element(),
-            AttachmentSnapshot::Error { .. } => frame
-                .text_color(theme.text_muted)
-                .child("Image unavailable")
-                .into_any_element(),
-        }
     }
 
     fn render_visual(
@@ -12899,7 +12727,7 @@ pub struct AgentSender {
 /// agent sent: the agent keeps reading it in the stored prompt, while the
 /// transcript shows the sender above the bubble and only the body inside it.
 /// Replaces the fork's former in-bubble bold "Message from" attribution.
-fn agent_message_sender(text: &str) -> Option<(AgentSender, &str)> {
+pub(crate) fn agent_message_sender(text: &str) -> Option<(AgentSender, &str)> {
     let (sender, body) = zeron_proto::agent_messages::agent_message_sender(text)?;
     Some((
         AgentSender {
@@ -14027,14 +13855,6 @@ fn file_badge_name(path: &str) -> &str {
     path.rsplit(['/', '\\'])
         .find(|component| !component.is_empty())
         .unwrap_or(path)
-}
-
-/// The open image context menu and the device candidates for copying its file.
-struct ImageMenu {
-    path: String,
-    devices: Vec<String>,
-    position: Point<Pixels>,
-    active: Option<usize>,
 }
 
 /// The chip's content row: icon tile + label + detail line (+ trailing tile
@@ -16691,6 +16511,10 @@ mod tests {
     #[test]
     fn assistant_turn_projects_completed_work_before_the_final_answer() {
         let read = MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: "read-1".into(),
             call: ToolCall::ReadFile {
                 path: "src/lib.rs".into(),
@@ -16748,6 +16572,9 @@ mod tests {
             crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
         });
         let chat = |id: &str| zeron_proto::Chat {
+            origin_chat_id: Default::default(),
+            worked_projects: Default::default(),
+
             id: id.into(),
             device_id: "reply-host".into(),
             title: None,
@@ -16792,7 +16619,7 @@ mod tests {
         let entry = assistant("a", MessageStatus::Complete, vec![text_part("t", text)]);
         transcript.update(cx, |this, _| {
             this.chat_id = Some("reply-chat".into());
-            this.rows = rows_for_entry(&entry, false, false, &mut parse);
+            this.rows = rows_for_entry(&entry, false, &mut parse);
         });
         struct RowsFixture(Entity<Transcript>);
         impl Render for RowsFixture {
@@ -16866,6 +16693,127 @@ mod tests {
             this.doc_override = Some("reply-doc".into());
             assert!(this.reply_chat(cx).is_none());
         });
+    }
+
+    #[test]
+    fn prompts_written_in_markdown_render_it() {
+        let markdown = |text: &str| {
+            let mut entry = user_entry("u1");
+            entry.parts = vec![text_part("u1-text", text)];
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::User { markdown, .. } = &rows[0].kind else {
+                panic!("expected a user row");
+            };
+            markdown.clone()
+        };
+        let tree = markdown("Keep **this**\nand `that`\n\n- one\n- two")
+            .unwrap()
+            .full;
+        assert_eq!(tree.blocks.len(), 2);
+        // Typed newlines stay line breaks.
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected a paragraph");
+        };
+        assert!(runs.iter().any(|run| run.text.contains('\n')));
+        // Prose reads the same as typed, so it keeps the plain bubble.
+        assert!(markdown("just a question\n\nand another").is_none());
+        // Chips paint over the plain text's layout, so a prompt with one
+        // stays plain.
+        let link = zeron_proto::attachment_mentions::attachment_mention_link(1, Some("notes.md"));
+        assert!(markdown(&format!("**read** {link}")).is_none());
+        // An agent's message renders its body, under the sender caption.
+        let routed = "[Message from Zeron chat cd27c5c2. Reply to it with the Zeron `send_message` tool, chat cd27c5c2-0000-4000-8000-000000000000.]\n\nRun `cargo test`.";
+        assert!(markdown(routed).is_some());
+    }
+
+    #[test]
+    fn long_prompts_fold_to_their_leading_markdown() {
+        let markdown = |text: &str| {
+            let mut entry = user_entry("u1");
+            entry.parts = vec![text_part("u1-text", text)];
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::User { markdown, .. } = &rows[0].kind else {
+                panic!("expected a user row");
+            };
+            markdown.clone().unwrap()
+        };
+        let lines = USER_COLLAPSED_LINES + USER_FOLD_OVERDRAW_LINES;
+        // A prompt that fits whole folds to itself.
+        assert!(markdown("**short**\n\n- one\n- two").folded.is_none());
+        // A long report keeps its heading and the items that fill the fold.
+        let report: String = (1..=240).map(|i| format!("{i}. **case {i}**\n")).collect();
+        let report = markdown(&format!("## Sweep\n\n{report}"));
+        let folded = report.folded.unwrap();
+        assert_eq!(folded.blocks.len(), 2);
+        let Block::List { items, .. } = &folded.blocks[1].block else {
+            panic!("expected the list");
+        };
+        assert_eq!(items.len(), lines - 1);
+        let Block::List { items: all, .. } = &report.full.blocks[1].block else {
+            panic!("expected the list");
+        };
+        // A prefix: each kept item is the item it was.
+        assert_eq!(items[..], all[..items.len()]);
+        // A long fence keeps its first lines; blocks after the fold go.
+        let fence: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        let fenced = markdown(&format!("Run:\n\n```\n{fence}```\n\nthen **this**"));
+        let folded = fenced.folded.unwrap();
+        assert_eq!(folded.blocks.len(), 2);
+        let Block::CodeBlock { code, .. } = &folded.blocks[1].block else {
+            panic!("expected the fence");
+        };
+        assert_eq!(code.lines().count(), lines - 2);
+        assert!(code.starts_with("line 1\nline 2"));
+    }
+
+    #[test]
+    fn generated_image_owner_candidates_and_same_length_corrections() {
+        assert_eq!(
+            generated_image_devices("owner", &["host".into(), "local".into(), "owner".into()]),
+            vec!["owner", "host", "local"]
+        );
+        assert_eq!(
+            generated_image_devices("", &["host".into(), "host".into(), "".into()]),
+            vec!["host"]
+        );
+        let entries: Vec<SessionMessageEntry> =
+            serde_json::from_str(include_str!("../tests/fixtures/generated-images.json")).unwrap();
+        let entry = &entries[0];
+        let original = entry_fingerprint(entry, false);
+        let row_version = rows_for_entry(entry, false, &mut parse)[0].version;
+        for field in 0..4 {
+            let mut changed = entry.clone();
+            if field == 0 {
+                changed.device_id = "another-owner".into();
+            } else if let MessagePart::Image {
+                path,
+                name,
+                mime_type,
+                ..
+            } = &mut changed.parts[0]
+            {
+                match field {
+                    1 => *path = path.replace("loaded", "edited"),
+                    2 => *name = "corrected.png".into(),
+                    _ => *mime_type = "image/gif".into(),
+                }
+            }
+            assert_ne!(entry_fingerprint(&changed, false), original);
+            assert_ne!(
+                rows_for_entry(&changed, false, &mut parse)[0].version,
+                row_version
+            );
+        }
+        for entry in entries {
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].turn_start);
+            assert_eq!(
+                rows[0].timestamp.is_some(),
+                entry.status == Some(MessageStatus::Complete)
+            );
+            assert!(rows[0].copy_text.is_none());
+        }
     }
 
     #[test]
@@ -17100,6 +17048,10 @@ mod tests {
     #[test]
     fn assistant_turn_preserves_specialized_children_and_stable_identity() {
         let todo = MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: "todo".into(),
             call: ToolCall::Todo {
                 items: vec![TodoItem {
@@ -17178,6 +17130,10 @@ mod tests {
         preview: Option<zeron_doc::FileChangePreview>,
     ) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::WriteFile {
                 path: "notes/new.txt".into(),
@@ -17202,6 +17158,10 @@ mod tests {
 
     fn exec_part(id: &str, resolved: bool) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::Exec {
                 command: "ls".into(),
@@ -17975,6 +17935,10 @@ mod tests {
 
     fn tool_part(id: &str, command: &str) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::Exec {
                 command: command.into(),
@@ -18548,6 +18512,10 @@ mod tests {
             "todo-entry",
             MessageStatus::Complete,
             vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "todo-1".into(),
                 call: ToolCall::Todo {
                     items: vec![
@@ -18659,6 +18627,10 @@ mod tests {
             "todo-append-entry",
             MessageStatus::Complete,
             vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "todo-append".into(),
                 call: ToolCall::Todo {
                     items: vec![
@@ -18716,6 +18688,10 @@ mod tests {
             "todo-progress-entry",
             MessageStatus::Complete,
             vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "todo-progress".into(),
                 call: ToolCall::Todo {
                     items: make_items(3),
@@ -18886,6 +18862,10 @@ mod tests {
     #[test]
     fn assistant_image_read_tool_adds_a_gallery_without_output_text() {
         let read = |id: &str, path: &str| MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::ReadFile { path: path.into() },
             is_error: false,
@@ -19628,14 +19608,18 @@ mod tests {
                 assert!(this.list.logical_scroll_top().offset_in_item.abs() <= px(1.0));
                 let bounds = render::selection_test_bounds("reply#body.0:0");
                 assert!(
-                    bounds.size.width <= px(904.0),
-                    "content must fit a 1000px viewport with 48px gutters"
+                    bounds.size.width <= px(1000.0 - 2.0 * COLUMN_GUTTER),
+                    "content must fit the fork's viewport gutters: {bounds:?}"
                 );
                 entries[0].parts.push(tool_part("live-tool", "pwd"));
                 transcript.update(cx, |this, cx| {
                     feed(this, entries, cx);
                     assert!(
-                        this.tool_group_reveals[&SharedString::from("reply#g0")].starts[0]
+                        this.tool_reveals
+                            .values()
+                            .find_map(|starts| starts.get(&SharedString::from("live-tool")))
+                            .copied()
+                            .flatten()
                             .is_some()
                     );
                     this.pinned = true;
@@ -20159,6 +20143,10 @@ mod tests {
                     this.rail_enabled = false;
                     this.state.update(cx, |state, _| {
                         state.sessions.push(zeron_proto::Session {
+                            context_usage: Default::default(),
+                            error: Default::default(),
+                            turn_stats: Default::default(),
+
                             last_completed_turn: None,
                             last_turn_outcome: None,
                             terminal_activity: None,
@@ -20606,7 +20594,7 @@ mod tests {
                         .child(self.transcript.clone())
                 }
             }
-            with_window(|transcript, _, cx| {
+            with_window(|transcript, original, cx| {
                 transcript.update(cx, |this, cx| {
                     this.rows = vec![viewport_row("prompt", "prompt")];
                     this.list.reset(1);
@@ -20614,6 +20602,11 @@ mod tests {
                     this.on_own_send("chat".into(), "prompt".into(), cx);
                     this.list.scroll_to(ListOffset::default());
                 });
+                // A ListState has one viewport. Detach the helper window before
+                // mounting this same Transcript in the resizable host.
+                original
+                    .update(cx, |_, window, _| window.remove_window())
+                    .unwrap();
                 let window = cx
                     .open_window(gpui::WindowOptions::default(), |_, cx| {
                         cx.new(|_| SizedTranscript {
@@ -20890,274 +20883,8 @@ mod tests {
             });
         }
 
-        /// Run the next queued diagram synchronously, as the worker would.
-        fn render_next_diagram(transcript: &Entity<Transcript>, cx: &mut gpui::App) -> bool {
-            transcript.update(cx, |this, cx| {
-                let Some(code) = this.diagrams.borrow_mut().next_job() else {
-                    return false;
-                };
-                let palette = crate::markdown::mermaid::Palette::from_theme(Theme::of(cx));
-                let result = crate::markdown::mermaid::render(&code, &palette).and_then(|svg| {
-                    crate::image_media::decode_image("image/svg+xml", svg.into_bytes())
-                });
-                assert!(result.is_ok(), "fixture diagram must render");
-                this.finish_diagram(code, crate::theme::style_generation(), result, cx);
-                true
-            })
-        }
-
         const MERMAID_FENCE: &str =
             "```mermaid\nflowchart TD\n    A[Request] --> B[Plan]\n    B --> C[Done]\n```\n";
-
-        #[test]
-        fn mermaid_streaming_tail_keeps_source_until_the_reply_moves_past_it() {
-            with_window(|transcript, window, cx| {
-                let reply = |status, text: String| {
-                    vec![
-                        prompt("prompt"),
-                        assistant("reply", status, vec![text_part("text", &text)]),
-                    ]
-                };
-                let mut text = String::from("Intro.\n\n");
-                // Token-sized commits through the open fence, then the closed
-                // fence while it is still the reply's tail.
-                for token in MERMAID_FENCE.split_inclusive([' ', '\n']) {
-                    text.push_str(token);
-                    transcript.update(cx, |this, cx| {
-                        this.rail_enabled = false;
-                        feed(this, reply(MessageStatus::Streaming, text.clone()), cx)
-                    });
-                    tick(&transcript, window, cx);
-                    let this = transcript.read(cx);
-                    assert!(
-                        this.diagram_worker.is_none(),
-                        "a streaming tail fence must not start a render"
-                    );
-                    assert!(this.diagrams.borrow_mut().next_job().is_none());
-                }
-                // Enough reply after the fence that the viewport can anchor on
-                // it without clamping back to the end.
-                text.push_str(&format!(
-                    "\nAfter the diagram. {}",
-                    "More detail. ".repeat(300)
-                ));
-                transcript.update(cx, |this, cx| {
-                    feed(this, reply(MessageStatus::Streaming, text.clone()), cx)
-                });
-                draw(window, cx);
-                assert!(
-                    transcript.read(cx).diagram_worker.is_some(),
-                    "a fence followed by more reply renders"
-                );
-                // A pinned end is glued, where rows report no bounds; read
-                // them with the viewport anchored at the diagram row instead.
-                transcript.update(cx, |this, cx| {
-                    this.pinned = false;
-                    let ix = this
-                        .rows
-                        .iter()
-                        .position(|row| row.id.as_ref() == "reply#text.1")
-                        .unwrap();
-                    this.list.scroll_to(ListOffset {
-                        item_ix: ix,
-                        offset_in_item: px(0.0),
-                    });
-                    cx.notify();
-                });
-                draw(window, cx);
-                let fence_height = |cx: &gpui::App| {
-                    let this = transcript.read(cx);
-                    let ix = this
-                        .rows
-                        .iter()
-                        .position(|row| row.id.as_ref() == "reply#text.1")
-                        .unwrap();
-                    this.list.bounds_for_item(ix).unwrap().size.height
-                };
-                let source_height = fence_height(cx);
-                assert!(render_next_diagram(&transcript, cx));
-                assert!(
-                    !render_next_diagram(&transcript, cx),
-                    "one request per source"
-                );
-                draw(window, cx);
-                assert_ne!(
-                    fence_height(cx),
-                    source_height,
-                    "the diagram replaced its source"
-                );
-                let frame: SharedString = "reply#text.1-mermaid-1".into();
-                transcript.update(cx, |this, cx| {
-                    assert_eq!(this.diagrams.borrow().ready_count(), 1);
-                    this.diagrams.borrow_mut().toggle_source(&frame);
-                    this.diagram_layout_changed(&["reply#text.1".into()], cx);
-                });
-                draw(window, cx);
-                assert_eq!(
-                    fence_height(cx),
-                    source_height,
-                    "the toggle restores the source"
-                );
-                // Completion keeps row identity, the rendered diagram and
-                // the reader's source toggle; nothing renders again.
-                transcript.update(cx, |this, cx| {
-                    feed(this, reply(MessageStatus::Complete, text.clone()), cx)
-                });
-                draw(window, cx);
-                let this = transcript.read(cx);
-                assert!(this.diagrams.borrow().source_visible(&frame));
-                assert!(this.diagrams.borrow_mut().next_job().is_none());
-            });
-        }
-
-        #[test]
-        fn mermaid_diagram_swap_keeps_a_pinned_stream_at_the_bottom() {
-            with_window(|transcript, window, cx| {
-                let intro = "A paragraph that explains the result in detail. ".repeat(12);
-                let reply = |status, tail: &str| {
-                    let mut text = String::new();
-                    for section in 0..8 {
-                        text.push_str(&format!("Section {section}. {intro}\n\n"));
-                    }
-                    text.push_str(MERMAID_FENCE);
-                    text.push_str(tail);
-                    vec![
-                        prompt("prompt"),
-                        assistant("reply", status, vec![text_part("text", &text)]),
-                    ]
-                };
-                transcript.update(cx, |this, cx| {
-                    this.rail_enabled = false;
-                    feed(
-                        this,
-                        reply(MessageStatus::Streaming, "\nAfter the diagram."),
-                        cx,
-                    )
-                });
-                for _ in 0..50 {
-                    tick(&transcript, window, cx);
-                }
-                let this = transcript.read(cx);
-                assert!(this.pinned);
-                assert!(
-                    this.list.max_offset_for_scrollbar().y > px(100.0),
-                    "must overflow"
-                );
-                assert!(this.distance_from_bottom() <= 1.0);
-                assert!(render_next_diagram(&transcript, cx));
-                for _ in 0..50 {
-                    tick(&transcript, window, cx);
-                }
-                let this = transcript.read(cx);
-                assert!(this.pinned, "a diagram swap is not user input");
-                assert!(this.distance_from_bottom() <= 1.0, "pin follows the swap");
-                // More streaming after the swap keeps following.
-                transcript.update(cx, |this, cx| {
-                    feed(
-                        this,
-                        reply(
-                            MessageStatus::Streaming,
-                            &format!("\nAfter the diagram.\n\n{intro}\n\n{intro}"),
-                        ),
-                        cx,
-                    )
-                });
-                for _ in 0..50 {
-                    tick(&transcript, window, cx);
-                }
-                let this = transcript.read(cx);
-                assert!(this.pinned);
-                assert!(this.distance_from_bottom() <= 1.0);
-                assert!(this.diagrams.borrow_mut().next_job().is_none());
-            });
-        }
-
-        #[test]
-        fn mermaid_completion_renders_the_tail_without_moving_the_runway_prompt() {
-            with_window(|transcript, window, cx| {
-                transcript.update(cx, |this, cx| {
-                    feed(this, vec![prompt("prompt")], cx);
-                    this.rail_enabled = false;
-                });
-                draw(window, cx);
-                transcript.update(cx, |this, cx| {
-                    this.on_own_send("chat".into(), "prompt".into(), cx)
-                });
-                draw(window, cx);
-                for _ in 0..80 {
-                    tick(&transcript, window, cx);
-                }
-                let reply = |status| {
-                    vec![
-                        prompt("prompt"),
-                        assistant(
-                            "reply",
-                            status,
-                            vec![text_part(
-                                "text",
-                                &format!("Here it is:\n\n{MERMAID_FENCE}"),
-                            )],
-                        ),
-                    ]
-                };
-                transcript.update(cx, |this, cx| {
-                    feed(this, reply(MessageStatus::Streaming), cx)
-                });
-                for _ in 0..50 {
-                    tick(&transcript, window, cx);
-                }
-                assert!(transcript.read(cx).diagram_worker.is_none());
-                transcript.update(cx, |this, cx| {
-                    feed(this, reply(MessageStatus::Complete), cx)
-                });
-                for _ in 0..50 {
-                    tick(&transcript, window, cx);
-                }
-                let prompt_top = |cx: &gpui::App| {
-                    let this = transcript.read(cx);
-                    assert!(this.own_turn.is_some(), "a short reply keeps its runway");
-                    this.list.bounds_for_item(0).unwrap().top()
-                };
-                let before = prompt_top(cx);
-                assert!(render_next_diagram(&transcript, cx));
-                // No controller tick between the swap and this paint.
-                draw(window, cx);
-                assert_eq!(prompt_top(cx), before, "the diagram swap moved the prompt");
-                let this = transcript.read(cx);
-                assert!(
-                    this.list.max_offset_for_scrollbar().y <= px(2.5),
-                    "the swap opened blank space below the runway"
-                );
-                for _ in 0..50 {
-                    tick(&transcript, window, cx);
-                }
-                assert_eq!(prompt_top(cx), before);
-
-                // The lightbox frames an enlarged raster by the diagram's
-                // natural size and releases it on close.
-                let media = transcript
-                    .read(cx)
-                    .diagrams
-                    .borrow()
-                    .ready_media()
-                    .expect("rendered diagram");
-                cx.update_window(window.into(), |_, window, cx| {
-                    transcript.update(cx, |this, cx| {
-                        this.open_diagram_preview(media.clone(), window, cx)
-                    });
-                })
-                .unwrap();
-                draw(window, cx);
-                transcript.update(cx, |this, cx| {
-                    assert!(this.attachment_preview.is_some());
-                    assert!(this.diagram_zoom.is_some());
-                    this.close_diagram_zoom(cx);
-                    assert!(this.attachment_preview.is_none());
-                    assert!(this.diagram_zoom.is_none());
-                });
-                draw(window, cx);
-            });
-        }
 
         #[test]
         fn send_glide_never_crosses_the_prompt_during_remeasurement() {
@@ -21500,26 +21227,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn user_resize_duration_scales_with_distance_and_stays_bounded() {
-        let short = user_resize_duration_ms(100.0);
-        let medium = user_resize_duration_ms(600.0);
-        let long = user_resize_duration_ms(2_000.0);
-        assert!((220..=260).contains(&short));
-        assert!(medium > short);
-        assert_eq!(long, 850);
-        assert_eq!(
-            user_resize_spec(100.0).curve,
-            motion::EASE_OUT,
-            "short folds keep the decisive sidebar-like ease-out"
-        );
-        assert_eq!(
-            user_resize_spec(2_000.0).curve,
-            motion::EASE_IN_OUT,
-            "large folds avoid front-loading the whole travel"
-        );
-    }
-
     /// The toggle is render-local: expanding a prompt must not change the
     /// row's identity or version, or the list would splice (and the
     /// virtualizer would drop the scroll anchor) on every click.
@@ -21529,8 +21236,8 @@ mod tests {
         entry.role = MessageRole::User;
         entry.status = None;
         entry.parts = vec![text_part("t0", &"a line\n".repeat(40))];
-        let before = rows_for_entry(&entry, false, false, &mut parse);
-        let after = rows_for_entry(&entry, false, false, &mut parse);
+        let before = rows_for_entry(&entry, false, &mut parse);
+        let after = rows_for_entry(&entry, false, &mut parse);
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].id, after[0].id);
         assert_eq!(before[0].version, after[0].version);
@@ -21628,20 +21335,6 @@ mod tests {
         assert_eq!(user_fold_target_top(300.0, 100.0, 700.0, 500.0), 188.0);
         assert_eq!(user_fold_target_top(300.0, 100.0, 700.0, 200.0), 300.0);
         assert_eq!(user_fold_target_top(50.0, 100.0, 700.0, 200.0), 100.0);
-    }
-
-    #[test]
-    fn long_prompts_collapse_and_short_ones_do_not() {
-        assert!(!user_message_needs_collapse("short message"));
-        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5"));
-        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
-        assert!(!user_message_needs_collapse(&"x".repeat(240)));
-        assert!(!user_message_needs_collapse(
-            &"x".repeat(USER_COLLAPSE_CHARS)
-        ));
-        assert!(user_message_needs_collapse(
-            &"x".repeat(USER_COLLAPSE_CHARS + 1)
-        ));
     }
 
     fn att(path: &str) -> crate::attachments::UserImageAttachment {
@@ -23978,8 +23671,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, _engine) = remote_chats_state(cx, dir.path());
         state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
-        let subagent =
-            cx.new(|cx| Transcript::for_doc(state.clone(), "subagent-doc".into(), true, cx));
+        let subagent = cx.new(|cx| {
+            Transcript::for_doc(
+                state.clone(),
+                "a".into(),
+                "subagent-tool".into(),
+                "subagent-doc".into(),
+                true,
+                cx,
+            )
+        });
         let primary = cx.new(|cx| Transcript::new(state.clone(), cx));
         cx.run_until_parked();
         advance(cx, Duration::from_secs(1));

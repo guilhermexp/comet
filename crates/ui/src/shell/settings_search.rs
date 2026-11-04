@@ -415,7 +415,7 @@ mod tests {
         let data_dir = dir.path().to_path_buf();
         let (shell, cx) = cx.add_window_view(move |_, cx| {
             let state = cx.new(|_| AppState::new());
-            Shell::new(
+            crate::shell::test_shell(
                 state,
                 EngineBootConfig {
                     data_dir,

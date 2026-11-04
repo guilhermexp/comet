@@ -2420,7 +2420,7 @@ impl AcpHarness {
                 } else if exe.file_name().is_some_and(|n| n == path.as_os_str()) {
                     exe.to_path_buf()
                 } else {
-                    find_on_paths(&program, Vec::new()).unwrap_or(path)
+                    crate::find_on_paths(&program, Vec::new()).unwrap_or(path)
                 };
                 let mut cmd = command(&[], &extra_env);
                 let mut replaced = Command::new(&resolved);
@@ -4574,7 +4574,10 @@ async fn open_session(
     // server on `request.mcp` (the engine leaves it unset: D3). Every
     // restore/new attempt carries the same grant.
     let mut mcp_servers = workers_mcp_servers(request);
-    mcp_servers.extend(acp_mcp_servers(request.mcp.as_ref()));
+    mcp_servers.extend(acp_session_mcp_servers(
+        request.mcp.as_ref(),
+        &request.extra_mcp,
+    ));
     let params = json!({ "cwd": request.cwd, "mcpServers": mcp_servers });
     if let Some(resume) = &request.resume {
         let method = restore_method(init, harness);
@@ -6779,6 +6782,8 @@ mod tests {
 
         track_open_tools(
             &AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "write-live".into(),
                 is_error: false,
                 output: None,

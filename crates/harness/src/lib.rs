@@ -181,7 +181,7 @@ pub fn same_model_options(
 /// Whether the process-bound MCP servers and grants match. These values are
 /// consumed when adapters start and cannot be safely adopted by a live process.
 pub(crate) fn same_mcp_runtime_config(live: &RunRequest, next: &RunRequest) -> bool {
-    same_worker_mcp_config(live, next) && live.mcp == next.mcp
+    same_worker_mcp_config(live, next) && live.mcp == next.mcp && live.extra_mcp == next.extra_mcp
 }
 
 /// OMP has its own host-tool bridge and does not consume `RunRequest::mcp`.
@@ -1003,6 +1003,10 @@ mod tests {
         let mut events = harness
             .run(
                 RunRequest {
+                    access: Default::default(),
+                    extra_mcp: Default::default(),
+                    plan: Default::default(),
+
                     prompt: "test".into(),
                     harness: None,
                     model: None,

@@ -613,7 +613,7 @@ struct CreateChatArgs {
     sandbox: Option<String>,
     access: Option<String>,
     #[serde(default)]
-    plan: bool,
+    plan: Option<bool>,
     title: Option<String>,
     branch: Option<String>,
     cwd: Option<String>,
@@ -1200,7 +1200,7 @@ impl Tools {
                     .join(", ")
             );
             anyhow::ensure!(
-                !args.plan || info.supports_plan,
+                !args.plan.unwrap_or(false) || info.supports_plan,
                 "{harness:?} on device {device_id} has no plan mode"
             );
         }
@@ -1211,7 +1211,7 @@ impl Tools {
             model_options: Default::default(),
             sandbox,
             access,
-            plan: args.plan,
+            plan: args.plan.unwrap_or(false),
         };
 
         let chat_id = uuid::Uuid::new_v4().to_string();
@@ -1382,6 +1382,8 @@ impl Tools {
             ("model", args.model.is_some()),
             ("reasoning", args.reasoning.is_some()),
             ("sandbox", args.sandbox.is_some()),
+            ("access", args.access.is_some()),
+            ("plan", args.plan.is_some()),
             ("branch", args.branch.is_some()),
             ("cwd", args.cwd.is_some()),
             ("cloud", args.cloud),
@@ -1473,6 +1475,8 @@ impl Tools {
         });
         // The engine queued the first run; track it like any sent turn.
         let chat = Chat {
+            child_kind: Default::default(),
+
             id: spawned.chat_id.clone(),
             device_id: spawned.device_id.clone(),
             title: args.title.clone(),
@@ -2102,7 +2106,7 @@ mod tests {
                     RpcReply::Value(self.remote_catalog.clone().unwrap())
                 }
                 methods::LIST_HARNESSES if remote => RpcReply::Value(json!([
-                    {"id":"fx", "name":"Newer harness", "installed":true},
+                    {"id":"future-provider", "name":"Newer harness", "installed":true},
                     {"id":"codex", "name":"Remote Codex", "installed":true},
                     {"id":"cursor", "name":"Disabled Cursor", "installed":true, "enabled":false}
                 ])),
@@ -2740,6 +2744,8 @@ mod tests {
             json!({ "mode": "inherit", "prompt": "p", "branch": "x" }),
             json!({ "mode": "inherit", "prompt": "p", "cloud": true }),
             json!({ "mode": "inherit", "prompt": "p", "sandbox": "read-only" }),
+            json!({ "mode": "inherit", "prompt": "p", "access": "supervised" }),
+            json!({ "mode": "inherit", "prompt": "p", "plan": false }),
             json!({ "mode": "inherit", "prompt": "p", "kind": "side" }),
             json!({ "mode": "inherit" }),
             json!({ "mode": "inherit", "prompt": "  " }),
@@ -3129,12 +3135,12 @@ mod tests {
             deep: true,
             accounts: Some(json!({"accounts": [], "warnings": []})),
             remote_accounts: Some(json!({"accounts": [{
-                "id": "fx-account", "harness": "fx", "active": true,
+                "id": "fx-account", "harness": "future-provider", "active": true,
                 "email": null, "planLabel": null
             }, {
                 "id": "remote-account", "harness": "codex", "active": true,
                 "email": null, "planLabel": null
-            }], "warnings": [{"harness":"fx", "message":"unavailable"}]})),
+            }], "warnings": [{"harness":"future-provider", "message":"unavailable"}]})),
             ..Default::default()
         });
         let top = tools(world.clone(), origin("chat-alpha-1"));
@@ -3198,7 +3204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kinds_default_children_to_subagents_and_reject_invalid_arguments_before_writing() {
+    async fn kinds_preserve_side_default_and_reject_invalid_arguments_before_writing() {
         let world = Arc::new(World::default());
         let root = tools(world.clone(), Origin::default());
         for args in [
@@ -3227,9 +3233,9 @@ mod tests {
                 "subagent",
                 json!("chat-alpha-1"),
             ),
-            // A child of your own chat, kind omitted: a subagent.
-            (json!({}), "subagent", json!("chat-alpha-1")),
-            (json!({"parent":"Beta"}), "subagent", json!("chat-beta-2")),
+            // The fork preserves side as the default when kind is omitted.
+            (json!({}), "side", json!("chat-alpha-1")),
+            (json!({"parent":"Beta"}), "side", json!("chat-beta-2")),
             (
                 json!({"kind":"side", "parent":"Beta"}),
                 "side",
@@ -3260,12 +3266,12 @@ mod tests {
                 .unwrap()["kind"],
             "side"
         );
-        // An explicit parent from outside any chat: a subagent of it.
+        // An explicit parent also keeps the fork default of a side chat.
         assert_eq!(
             root.call("create_chat", json!({"parent":"Alpha"}))
                 .await
                 .unwrap()["kind"],
-            "subagent"
+            "side"
         );
     }
 
@@ -3406,7 +3412,7 @@ mod tests {
     async fn remote_catalog_filters_only_unknown_harness_rows() {
         let world = Arc::new(World {
             remote_catalog: Some(json!([
-                {"id":"fx", "name":"Unknown"},
+                {"id":"future-provider", "name":"Unknown"},
                 {"id":"codex", "name":"Codex"},
                 {"id":"cursor", "name":"Cursor", "installed":false, "enabled":false}
             ])),
@@ -3425,7 +3431,7 @@ mod tests {
         assert_eq!(listed["harnesses"][1]["installed"], false);
         assert_eq!(listed["harnesses"][1]["available"], false);
         let world = Arc::new(World {
-            remote_catalog: Some(json!([{"id":"fx"}])),
+            remote_catalog: Some(json!([{"id":"future-provider"}])),
             ..Default::default()
         });
         let only_unknown = self::tools(world, Origin::default())
@@ -3498,13 +3504,19 @@ mod tests {
         let tools = tools(Arc::new(World::default()), Origin::default());
         assert!(
             tools
-                .call("list_models", json!({"device":"Worker", "harness":"fx"}))
+                .call(
+                    "list_models",
+                    json!({"device":"Worker", "harness":"future-provider"})
+                )
                 .await
                 .is_err()
         );
         assert!(
             tools
-                .call("create_chat", json!({"device":"Worker", "harness":"fx"}))
+                .call(
+                    "create_chat",
+                    json!({"device":"Worker", "harness":"future-provider"})
+                )
                 .await
                 .is_err()
         );

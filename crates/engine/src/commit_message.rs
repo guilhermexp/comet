@@ -124,6 +124,10 @@ pub(crate) async fn generate(
         .await;
         let scratch = tempfile::tempdir().map_err(|e| EngineError::Other(e.to_string()))?;
         let request = RunRequest {
+            access: Default::default(),
+            extra_mcp: Default::default(),
+            plan: Default::default(),
+
             prompt,
             harness: Some(id),
             model,

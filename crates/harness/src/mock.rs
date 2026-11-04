@@ -323,6 +323,8 @@ impl Harness for MockHarness {
                         });
                         tokio::time::sleep(pause).await;
                         let _ = tx.send(AgentEvent::ToolResult {
+                            execution: Default::default(),
+
                             id: "mock-approved-tool".into(),
                             is_error: false,
                             output: Some("test result: ok. 128 passed; 0 failed".into()),
@@ -1025,6 +1027,8 @@ fn background_run(
                 },
             });
             let _ = tx.send(AgentEvent::ToolResult {
+                execution: Default::default(),
+
                 id: format!("{id}-call"),
                 is_error: false,
                 output: Some(format!("Command running in background with ID: {id}")),

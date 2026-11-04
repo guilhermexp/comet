@@ -2232,6 +2232,8 @@ mod tests {
     fn kimi_account_snapshot_serializes_only_normalized_device_local_fields() {
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![AgentAccount {
+                codex_reset_credits: Default::default(),
+
                 id: "kimi-code-managed".into(),
                 harness: HarnessId::Kimi,
                 email: None,
@@ -2272,11 +2274,11 @@ mod tests {
         use serde_json::json;
         let snapshot: AgentAccountsSnapshot = serde_json::from_value(json!({
             "accounts": [
-                {"id":"new", "harness":"fx"},
+                {"id":"new", "harness":"future-provider"},
                 {"id":"codex", "harness":"codex", "active":true, "email":null, "planLabel":null}
             ],
             "warnings": [
-                {"harness":"fx", "message":"unknown"},
+                {"harness":"future-provider", "message":"unknown"},
                 {"harness":"codex", "message":"known"}
             ]
         }))
@@ -2289,7 +2291,7 @@ mod tests {
         assert_eq!(snapshot.warnings[0].message, "known");
 
         let only_unknown: AgentAccountsSnapshot = serde_json::from_value(json!({
-            "accounts":[{"harness":"fx"}], "warnings":[{"harness":"fx"}]
+            "accounts":[{"harness":"future-provider"}], "warnings":[{"harness":"future-provider"}]
         }))
         .unwrap();
         assert!(only_unknown.accounts.is_empty());
@@ -2338,7 +2340,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<AgentAccount>(json!({
-                "id":"new", "harness":"fx", "active":true
+                "id":"new", "harness":"future-provider", "active":true
             }))
             .is_err()
         );

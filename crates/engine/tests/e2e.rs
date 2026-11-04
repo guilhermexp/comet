@@ -4129,6 +4129,9 @@ async fn spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt() {
             Some("space-e2e"),
             Some(&core.device_id),
             Some(ChatConfig {
+                access: Default::default(),
+                plan: Default::default(),
+
                 harness: HarnessId::Mock,
                 model: Some("parent-model".into()),
                 reasoning: Some(ReasoningLevel::High),
@@ -4886,6 +4889,8 @@ async fn a_commands_whole_output_is_read_from_its_hosts_journal() {
                     },
                 },
                 AgentEvent::ToolResult {
+                    execution: Default::default(),
+
                     id: "t1".into(),
                     is_error: false,
                     output: Some(output.clone()),
@@ -4899,6 +4904,8 @@ async fn a_commands_whole_output_is_read_from_its_hosts_journal() {
                     },
                 },
                 AgentEvent::ToolResult {
+                    execution: Default::default(),
+
                     id: "r1".into(),
                     is_error: false,
                     output: Some("fn main() {}".into()),

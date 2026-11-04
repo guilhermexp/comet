@@ -943,17 +943,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     // stats only, never text. `is_error` still folds so
                     // failed chips read as failed.
                     //
-                    // The one exception (2026-11-03, user decision): a
-                    // COMMAND's output keeps a short, redacted tail — its
-                    // last 10 lines or 1 KB, whichever is less — with its
-                    // exit code, so an opened Run row shows how it ended (a
-                    // build's error, a test run's summary) the way a
-                    // terminal would. Bounded per part, so a long session
-                    // grows by at most ~1 KB per command; file reads,
-                    // searches, fetches and MCP results stay out. The whole
-                    // output stays in the host's run journal, never synced;
-                    // a reader who expands it asks the host for it
-                    // (`ReadToolOutput`, redacted the same way).
+                    // Commands keep a bounded, redacted tail and optional exit
+                    // code. Other tools retain the fork's bounded summary;
+                    // private Write/Edit inputs remain sanitized separately.
+                    // Full command output is host-local (`ReadToolOutput`).
                     let tail = match (&*call, output.as_deref()) {
                         (ToolCall::Exec { command }, Some(output)) => {
                             command_output_tail(command, output)
@@ -1790,6 +1783,8 @@ mod tests {
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "c1".into(),
                 is_error: false,
                 output: None,
@@ -1941,6 +1936,8 @@ mod tests {
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "exec".into(),
                 is_error: false,
                 output: Some("ok".into()),
@@ -1974,6 +1971,8 @@ mod tests {
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "worker-call".into(),
                 is_error: false,
                 output: Some(
@@ -2345,6 +2344,8 @@ mod tests {
                 },
             },
             AgentEvent::ToolResult {
+                execution: Default::default(),
+
                 id: "c".into(),
                 is_error: exit_code.is_some_and(|c| c != 0),
                 output: Some(output.into()),
@@ -2466,6 +2467,8 @@ mod tests {
                     },
                 },
                 AgentEvent::ToolResult {
+                    execution: Default::default(),
+
                     id: "c".into(),
                     is_error: false,
                     output: Some("hunter2-but-unlabelled\n".into()),
@@ -2531,7 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_command_keeps_no_output_or_exit_code() {
+    fn a_non_command_keeps_fork_summary_without_command_exit_metadata() {
         let mut parts = Vec::new();
         for event in [
             AgentEvent::ToolCall {
@@ -2541,9 +2544,11 @@ mod tests {
                 },
             },
             AgentEvent::ToolResult {
+                execution: Default::default(),
+
                 id: "r".into(),
                 is_error: false,
-                output: Some("API_KEY=hunter2".into()),
+                output: Some("a".repeat(200)),
                 diff: None,
                 exit_code: Some(0),
             },
@@ -2553,13 +2558,13 @@ mod tests {
         assert!(matches!(
             &parts[0],
             MessagePart::Tool {
-                output: None,
+                output: Some(summary),
                 output_bytes: None,
                 exit_code: None,
                 output_truncated: false,
                 resolved: true,
                 ..
-            }
+            } if summary == &format!("{}…", "a".repeat(TOOL_OUTPUT_SUMMARY_MAX))
         ));
     }
 
@@ -2854,6 +2859,8 @@ mod tests {
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "edit-1".into(),
                 is_error: false,
                 output: None,

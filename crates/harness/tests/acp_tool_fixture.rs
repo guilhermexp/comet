@@ -77,6 +77,10 @@ fn server(name: &str, command: &Path, tool: &str) -> McpServer {
 
 fn request(prompt: &str, cwd: &Path, env: &[(&str, &str)]) -> RunRequest {
     RunRequest {
+        enable_workers_mcp: Default::default(),
+        sessions: Default::default(),
+        workers_parent_chat_id: Default::default(),
+
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -103,6 +107,8 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        chat_id: Default::default(),
+
         realtime: None,
         execution_lease: None,
         request_input: Box::new(move |_questions| {

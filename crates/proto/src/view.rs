@@ -116,6 +116,8 @@ mod failure_text_tests {
 
     fn errored(reason: Option<&str>) -> Session {
         Session {
+            background_tasks: Default::default(),
+
             last_completed_turn: None,
             chat_id: "chat-1".into(),
             device_id: "dev-1".into(),

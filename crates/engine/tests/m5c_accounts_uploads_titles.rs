@@ -1189,6 +1189,10 @@ async fn titling_picks_the_live_haiku_out_of_a_raw_omp_inventory() {
             chat_id,
             HarnessId::Mock,
             zeron_proto::RunRequest {
+                access: Default::default(),
+                plan: Default::default(),
+                extra_mcp: Default::default(),
+
                 prompt: "please fix the login flow".into(),
                 harness: None,
                 model: None,

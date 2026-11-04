@@ -466,7 +466,7 @@ fn note_commands(f: &MessageFrame, commands: &mut std::collections::HashMap<Stri
 /// end of it, [`zeron_proto::command_output_cap`]) and exit code: Claude Code
 /// leads a failed command's text with `Exit code N`; one that succeeded says
 /// nothing, so it exited 0 — unless it went to the background, which says
-/// only that it started. Every other tool's output stays off the event.
+/// only that it started. Other tools retain the fork's bounded text result.
 fn tool_result(
     b: &ContentBlock,
     commands: &mut std::collections::HashMap<String, bool>,
@@ -488,9 +488,11 @@ fn tool_result(
             let exit = code.or((!is_error && !background).then_some(0));
             (zeron_proto::command_output_cap(rest), exit)
         }
-        None => (None, None),
+        None => (tool_result_output(b), None),
     };
     AgentEvent::ToolResult {
+        execution: Default::default(),
+
         id: b.tool_use_id.clone(),
         is_error,
         output,
@@ -1837,9 +1839,9 @@ mod tests {
         ));
     }
 
-    /// A file read's result never reaches the event, let alone the doc.
+    /// File reads retain the fork's bounded result without command metadata.
     #[test]
-    fn a_read_result_keeps_no_output() {
+    fn a_read_result_keeps_fork_summary_without_exit_metadata() {
         let mut n = Normalizer::new();
         let mut events = Vec::new();
         for raw in [
@@ -1851,10 +1853,10 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             AgentEvent::ToolResult {
-                output: None,
+                output: Some(text),
                 exit_code: None,
                 ..
-            }
+            } if text == "API_KEY=hunter2"
         )));
         let part = folded_tool(
             "Read",
@@ -1865,10 +1867,10 @@ mod tests {
         assert!(matches!(
             &part,
             zeron_doc::MessagePart::Tool {
-                output: None,
+                output: Some(text),
                 exit_code: None,
                 ..
-            }
+            } if text == "API_KEY=hunter2"
         ));
     }
 
@@ -2238,6 +2240,8 @@ mod tests {
         assert_eq!(
             events,
             vec![AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "t-output".into(),
                 is_error: false,
                 output: Some("11 alpha.txt\n".into()),

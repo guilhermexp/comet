@@ -131,7 +131,6 @@ fn engine(dir: &Path, device: &str, rooms: &str) -> Engine {
     std::fs::write(dir.join("device-id"), device).unwrap();
     let core = EngineCore::assemble(dir, Arc::new(HarnessRegistry::new()), HarnessId::Mock, None)
         .expect("engine assembles");
-    let host = core.start_host_relay(rooms);
     let mut links =
         LinkCacheConfig::new(rooms.to_string(), Arc::new(StaticToken("test-user".into())));
     links.probe_timeout = Duration::from_secs(5);
@@ -144,8 +143,23 @@ fn engine(dir: &Path, device: &str, rooms: &str) -> Engine {
             signature: "test-sig".into(),
         })
     }));
-    core.set_links(LinkCache::new(links));
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let links = LinkCache::new(links);
+    core.set_links(links.clone());
+    // D1: production startup leaves plugins dormant. This fixture explicitly
+    // starts and attaches the service to test its retained implementation.
+    core.plugins.set_links(links);
+    core.plugins.start();
+    let rpc = Arc::try_unwrap(core.rpc_service())
+        .ok()
+        .expect("unique fixture service")
+        .with_plugins(core.plugins.clone());
+    let service = Arc::new(rpc);
+    let host = zeron_rpc::HostRelay::spawn(
+        zeron_rpc::HostRelayConfig::new(rooms, device, Arc::new(StaticToken("test-user".into()))),
+        service.clone(),
+        Arc::new(|_| true),
+    );
+    let client = zeron_rpc::memory_client(service);
     Engine {
         core,
         client,

@@ -1648,6 +1648,7 @@ fn project_mention_links(text: &str) -> Vec<FileMentionLink> {
                 path,
                 kind: ChipKind::Directory,
                 attachment: None,
+                annotation: None,
             });
         }
         search = end;
@@ -2131,6 +2132,7 @@ impl TextProjection {
                     path: link.device_id,
                     kind: ChipKind::Device,
                     attachment: None,
+                    annotation: None,
                 }),
         );
         links.extend(
@@ -7884,7 +7886,10 @@ impl Composer {
     /// Anything a close would lose: typed text, staged files or appshots.
     /// A side chat tab closed with content stays resident for its reopen.
     pub(crate) fn has_content(&self, cx: &App) -> bool {
-        self.has_draft(cx) || !self.staged().is_empty() || !self.staged_appshots().is_empty()
+        self.has_draft(cx)
+            || !self.staged().is_empty()
+            || !self.staged_appshots().is_empty()
+            || !self.staged_comments(cx).is_empty()
     }
 
     pub(crate) fn can_edit_queue_in_composer(&self) -> bool {
@@ -8071,16 +8076,6 @@ impl Composer {
                 .as_deref()
                 .is_some_and(|id| state.send_pending(id, now));
         link_notice(link, host, intent, state.transcript_loading(now).is_some())
-    }
-
-    /// Whether the draft holds anything a close would lose: text, staged
-    /// attachments or appshots, or staged review comments.
-    pub(crate) fn has_draft(&self, cx: &App) -> bool {
-        composer_has_content(
-            self.input.read(cx).text(),
-            self.staged().len() + self.staged_appshots().len(),
-            self.staged_comments(cx).len(),
-        )
     }
 
     #[cfg(test)]
@@ -11540,6 +11535,9 @@ impl Composer {
                 } else {
                     SessionCommandPayload::Run {
                         request: RunRequest {
+                            access: resolved.access,
+                            plan: resolved.plan,
+                            extra_mcp: Vec::new(),
                             prompt: content.clone(),
                             harness: resolved.harness,
                             model: resolved.model.clone(),
@@ -14797,6 +14795,8 @@ mod tests {
                 state.update(cx, |state, cx| {
                     state.selected_chat = Some("context-chat".into());
                     state.sessions = vec![zeron_proto::Session {
+                        background_tasks: Default::default(),
+
                         chat_id: "context-chat".into(),
                         device_id: "device".into(),
                         status: zeron_proto::SessionStatus::Idle,
@@ -15594,6 +15594,8 @@ mod tests {
                 })
                 .collect();
             state.sessions = vec![zeron_proto::Session {
+                background_tasks: Default::default(),
+
                 last_completed_turn: None,
                 chat_id: "remote-chat".into(),
                 device_id: "remote-device".into(),
@@ -15615,6 +15617,10 @@ mod tests {
         let pickers = composer.read_with(cx, |composer, _| composer.pickers().clone());
         pickers.update(cx, |pickers, _| {
             pickers.set_test_harness_catalog(vec![zeron_engine::registry::HarnessDescriptor {
+                access_modes: Default::default(),
+                supports_plan: Default::default(),
+                icon: Default::default(),
+
                 id: HarnessId::Omp,
                 name: "OMP".into(),
                 installed: true,
@@ -18283,6 +18289,8 @@ mod tests {
                 })
                 .collect();
             state.spaces.push(zeron_proto::Space {
+                icon: Default::default(),
+
                 id: "space".into(),
                 device_id: "host".into(),
                 path: "/project".into(),
@@ -18379,6 +18387,8 @@ mod tests {
         use chrono::TimeZone;
         let at = |ms: i64| chrono::Utc.timestamp_millis_opt(ms).unwrap();
         let space = |id: &str, device: &str, path: &str, created: i64| zeron_proto::Space {
+            icon: Default::default(),
+
             id: id.into(),
             device_id: device.into(),
             path: path.into(),

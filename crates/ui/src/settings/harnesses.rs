@@ -2014,6 +2014,10 @@ mod tests {
         state.update(cx, |state, _| state.set_test_engine(engine));
 
         let descriptor = |enabled| super::HarnessDescriptor {
+            access_modes: Default::default(),
+            supports_plan: Default::default(),
+            icon: Default::default(),
+
             id: zeron_proto::HarnessId::Codex,
             name: "Codex".into(),
             supports_steering: false,

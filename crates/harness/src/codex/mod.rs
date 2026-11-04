@@ -752,7 +752,6 @@ impl Harness for CodexHarness {
             && live.model == next.model
             && to_effort(live.reasoning) == to_effort(next.reasoning)
             && service_tier(live) == service_tier(next)
-            && live.auto_approve == next.auto_approve
             && crate::same_mcp_runtime_config(live, next)
             && run_access(live) == run_access(next)
             && live.plan == next.plan
@@ -764,7 +763,6 @@ impl Harness for CodexHarness {
     /// expressed that way (an omitted parameter keeps the previous value).
     fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
         live.cwd == next.cwd
-            && live.auto_approve == next.auto_approve
             && crate::same_mcp_runtime_config(live, next)
             && (next.model.is_some() || live.model.is_none())
             && (to_effort(next.reasoning).is_some() || to_effort(live.reasoning).is_none())
@@ -3148,6 +3146,10 @@ mod tests {
 
     fn workers_request(enabled: bool) -> RunRequest {
         RunRequest {
+            access: Default::default(),
+            extra_mcp: Default::default(),
+            plan: Default::default(),
+
             prompt: "test".into(),
             harness: None,
             model: Some("gpt-5.6-sol".into()),
@@ -3268,6 +3270,10 @@ mod tests {
 
     fn run_request(access: AccessMode, plan: bool) -> RunRequest {
         RunRequest {
+            enable_workers_mcp: Default::default(),
+            sessions: Default::default(),
+            workers_parent_chat_id: Default::default(),
+
             mcp: None,
             prompt: String::new(),
             harness: None,

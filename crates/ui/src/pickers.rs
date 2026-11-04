@@ -7939,6 +7939,10 @@ mod tests {
     #[test]
     fn offered_catalog_keeps_pi_and_omp_as_separate_rails() {
         let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
+            access_modes: Default::default(),
+            supports_plan: Default::default(),
+            icon: Default::default(),
+
             id,
             name: name.into(),
             supports_steering: true,
@@ -8028,7 +8032,10 @@ mod tests {
         let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
             "id": "existing", "deviceId": "dev", "archived": false,
             "createdAt": "2026-09-05T00:00:00Z",
-            "config": ChatConfig { harness: HarnessId::Omp, model: Some(old.into()),
+            "config": ChatConfig {
+                access: Default::default(),
+                plan: Default::default(),
+ harness: HarnessId::Omp, model: Some(old.into()),
                 reasoning: None, model_options: Default::default(), sandbox: SandboxLevel::WorkspaceWrite }
         })).unwrap();
         let state = cx.new(|_| {

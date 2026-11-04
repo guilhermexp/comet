@@ -909,7 +909,7 @@ pub struct EngineRpc {
     credentials: Option<crate::credentials::CredentialBroker>,
     /// Viewports' window focus, for desktop banners.
     viewport_focus: crate::desktop_notify::ViewportFocus,
-    /// The plugins service (absent in bare test assemblies).
+    /// The plugins service (absent in normal fork startup; fixtures opt in).
     plugins: Option<crate::plugins::Plugins>,
     engine_info: EngineInfo,
 }
@@ -1955,6 +1955,10 @@ impl EngineRpc {
             .map_err(|error| RpcError::Failed(error.to_string()))?;
         let config = parent.config.as_ref();
         let request = zeron_proto::RunRequest {
+            access: config.map(|config| config.access).unwrap_or_default(),
+            extra_mcp: Default::default(),
+            plan: config.is_some_and(|config| config.plan),
+
             prompt,
             harness: config.map(|config| config.harness),
             model: config.and_then(|config| config.model.clone()),

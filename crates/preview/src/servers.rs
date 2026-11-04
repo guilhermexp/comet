@@ -459,6 +459,8 @@ mod tests {
 
     fn listener(pid: u32, cwd: &str, port: u16, args: &[&str], v6: bool) -> Listener {
         Listener {
+            signing_in: Default::default(),
+
             pid,
             parent: 1,
             cwd: PathBuf::from(cwd),

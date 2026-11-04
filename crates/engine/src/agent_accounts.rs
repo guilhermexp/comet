@@ -1379,6 +1379,8 @@ impl AgentAccounts {
                 let entry = usage.get(&usage_key(harness, &slot.account_key));
                 let snapshot = entry.and_then(|entry| entry.usage.as_ref());
                 accounts.push(AgentAccount {
+                    usage_lines: lines_for(harness),
+
                     id: slot.id.clone(),
                     harness,
                     email: Some(slot.profile.email.clone()),
@@ -4174,6 +4176,8 @@ impl AntigravityLogin {
             other => (other, None, AgentAuthKind::Oauth),
         };
         AgentAccount {
+            usage_lines: Default::default(),
+
             id: slot_id_for(HarnessId::Antigravity, &self.method),
             harness: HarnessId::Antigravity,
             email: None,
@@ -4239,6 +4243,8 @@ fn managed_account(
     usage_windows: Vec<AgentUsageWindow>,
 ) -> AgentAccount {
     AgentAccount {
+        codex_reset_credits: Default::default(),
+
         id,
         harness,
         email,
@@ -4609,6 +4615,8 @@ fn parse_grok_login(auth: serde_json::Value) -> Option<AgentAccount> {
         let last = str_field(entry, "last_name").unwrap_or_default();
         let display_name = format!("{first} {last}").trim().to_string();
         return Some(AgentAccount {
+            codex_reset_credits: Default::default(),
+
             id: "grok-cli-managed".into(),
             harness: HarnessId::Grok,
             email: Some(email),

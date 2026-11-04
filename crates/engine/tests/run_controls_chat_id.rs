@@ -128,6 +128,10 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
             CHAT,
             HarnessId::Mock,
             RunRequest {
+                access: Default::default(),
+                plan: Default::default(),
+                extra_mcp: Default::default(),
+
                 prompt: "hello".into(),
                 harness: None,
                 model: None,

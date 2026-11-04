@@ -1090,6 +1090,8 @@ mod tests {
             .append(
                 "chat",
                 &AgentEvent::ToolResult {
+                    exit_code: Default::default(),
+
                     id: "edit-1".into(),
                     is_error: false,
                     output: None,

@@ -1014,7 +1014,9 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
     ) -> Result<(), EngineError> {
-        self.insert_chat(chat_id, space_id, device_id, None, config, cwd, None, None)
+        self.insert_chat(
+            chat_id, space_id, device_id, None, config, cwd, None, None, None,
+        )
     }
 
     /// [`create_chat`](Self::create_chat) recording the creating chat
@@ -1066,6 +1068,7 @@ impl WorkspaceHost {
             cwd,
             parent_chat_id,
             None,
+            child_kind,
         )
     }
 
@@ -1090,6 +1093,7 @@ impl WorkspaceHost {
             cwd,
             None,
             Some(origin_chat_id),
+            None,
         )
     }
 
@@ -1104,6 +1108,7 @@ impl WorkspaceHost {
         cwd: Option<String>,
         parent_chat_id: Option<String>,
         origin_chat_id: Option<&str>,
+        child_kind: Option<zeron_proto::ChildKind>,
     ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
@@ -1149,6 +1154,7 @@ impl WorkspaceHost {
                 .initialize_chat_snapshot(chat_id, &doc.export_snapshot()?)?;
         }
         let parent = parent_chat_id.filter(|p| !p.trim().is_empty());
+        let child_kind = child_kind.filter(|_| parent.is_some());
         self.mutate(|doc| {
             doc.upsert_chat(&Chat {
                 id: chat_id.to_string(),
@@ -1175,7 +1181,7 @@ impl WorkspaceHost {
                 parent_chat_id: parent,
                 origin_chat_id: origin_chat_id.map(str::to_owned),
                 worked_projects: None,
-                child_kind: child_kind.filter(|_| parent.is_some()),
+                child_kind,
             })
         })?;
         Ok(())

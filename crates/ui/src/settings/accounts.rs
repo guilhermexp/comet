@@ -2489,6 +2489,8 @@ pub fn accessibility_fixture(embedded: bool, cx: &mut Context<AccountsPage>) -> 
         AccountsPage::new(state, cx)
     };
     let account = |id: &str, harness, provider: Option<&str>| AgentAccount {
+        codex_reset_credits: Default::default(),
+
         id: id.into(),
         harness,
         email: Some(format!("{id}@example.invalid")),

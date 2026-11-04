@@ -205,6 +205,8 @@ pub(super) fn script() -> Vec<AgentEvent> {
             call,
         });
         events.push(AgentEvent::ToolResult {
+            exit_code: Default::default(),
+
             id,
             is_error,
             output: Some(output.into()),

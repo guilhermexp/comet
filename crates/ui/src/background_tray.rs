@@ -810,6 +810,9 @@ mod tests {
 
     fn chat(id: &str) -> zeron_proto::Chat {
         zeron_proto::Chat {
+            origin_chat_id: Default::default(),
+            worked_projects: Default::default(),
+
             id: id.into(),
             device_id: "host".into(),
             title: None,
@@ -860,6 +863,10 @@ mod tests {
                 },
             }];
             state.sessions = vec![zeron_proto::Session {
+                context_usage: Default::default(),
+                error: Default::default(),
+                turn_stats: Default::default(),
+
                 last_completed_turn: None,
                 chat_id: chat_id.into(),
                 device_id: "host".into(),

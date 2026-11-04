@@ -1541,6 +1541,8 @@ mod tests {
         assert_eq!(execution, None);
 
         let event = AgentEvent::ToolResult {
+            exit_code: Default::default(),
+
             id: "c1".into(),
             is_error: false,
             output: Some("ok".into()),

@@ -200,6 +200,8 @@ mod tests {
 
     fn space(id: &str, device: &str, path: &str, created_ms: i64) -> Space {
         Space {
+            icon: Default::default(),
+
             id: id.into(),
             device_id: device.into(),
             path: path.into(),
@@ -228,6 +230,8 @@ mod tests {
 
     fn chat(id: &str, space_id: &str, at_ms: i64, archived: bool) -> Chat {
         Chat {
+            child_kind: Default::default(),
+
             id: id.into(),
             device_id: "dev-local".into(),
             title: Some(format!("chat {id}")),

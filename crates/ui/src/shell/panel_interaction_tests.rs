@@ -734,6 +734,10 @@ fn worked_project_diff_watch_tracks_effective_details_visibility(cx: &mut TestAp
                 .into_iter()
                 .enumerate()
                 .map(|(index, path)| MessagePart::Tool {
+                    exit_code: Default::default(),
+                    output_truncated: Default::default(),
+                    output_lines: Default::default(),
+
                     id: format!("tool-{index}"),
                     call: ToolCall::ReadFile { path: path.into() },
                     diff: None,
@@ -1737,6 +1741,8 @@ fn details_server_rows_open_in_the_internal_browser(cx: &mut TestAppContext) {
     browser.update(cx, |browser, cx| {
         browser.set_test_previews(zeron_proto::PreviewSnapshot {
             services: vec![zeron_proto::PreviewService {
+                process: Default::default(),
+
                 id: "svc".into(),
                 project_id: "p".into(),
                 project_name: "p".into(),
@@ -1766,6 +1772,8 @@ fn details_server_rows_open_in_the_internal_browser(cx: &mut TestAppContext) {
     browser.update(cx, |browser, cx| {
         browser.set_test_previews(zeron_proto::PreviewSnapshot {
             services: vec![zeron_proto::PreviewService {
+                process: Default::default(),
+
                 id: "svc".into(),
                 project_id: "p".into(),
                 project_name: "p".into(),
@@ -1915,6 +1923,8 @@ fn manual_navigation_cancels_a_pending_remote_server(cx: &mut TestAppContext) {
     paint_twice(cx);
     let snapshot = |port: u16| zeron_proto::PreviewSnapshot {
         services: vec![zeron_proto::PreviewService {
+            process: Default::default(),
+
             id: format!("svc-{port}"),
             project_id: "p".into(),
             project_name: "p".into(),
@@ -1990,6 +2000,8 @@ fn late_server_discovery_keeps_the_exact_editing_focus(cx: &mut TestAppContext) 
     paint_twice(cx);
     let snapshot = |port: u16| zeron_proto::PreviewSnapshot {
         services: vec![zeron_proto::PreviewService {
+            process: Default::default(),
+
             id: format!("svc-{port}"),
             project_id: "p".into(),
             project_name: "p".into(),
