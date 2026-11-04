@@ -75,12 +75,24 @@ name = "tool-images-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "remote-sync-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "reply-images-fixture"
+required-features = ["appshots-fixture", "resource-profile"]
+
+[[example]]
 name = "pull-request-fixture"
 required-features = ["pull-request-fixture"]
 
 [[example]]
 name = "pull-request-destination-fixture"
 required-features = ["pull-request-fixture", "browser-fixture"]
+
+[[example]]
+name = "browser-annotation-fixture"
+required-features = ["appshots-fixture"]
 
 [[example]]
 name = "new-project-fixture"
@@ -107,6 +119,10 @@ name = "message-captions-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "message-markdown-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "sidebar-fixture"
 required-features = ["project-palette-fixture"]
 
@@ -116,6 +132,18 @@ required-features = ["compact-picker-fixture"]
 
 [[example]]
 name = "question-answers-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "settings-search-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "right-panel-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "session-card-fixture"
 required-features = ["appshots-fixture"]
 
 [dependencies]
@@ -184,7 +212,8 @@ objc = "0.2"
 wry.workspace = true
 raw-window-handle.workspace = true
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSApplication", "NSHapticFeedback", "NSResponder"] }
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSHapticFeedback", "NSResponder", "NSBitmapImageRep", "NSImage", "NSEvent", "NSView", "NSWindow"] }
+objc2-core-graphics = { workspace = true, features = ["CGDirectDisplay", "CGEvent", "CGEventTypes"] }
 objc2-foundation.workspace = true
 objc2-web-kit.workspace = true
 image.workspace = true
@@ -197,11 +226,13 @@ dispatch2 = "0.3.1"
 block2 = "0.6.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 ashpd = { workspace = true, features = ["settings"] }
 atspi.workspace = true
 async-io.workspace = true
 x11rb.workspace = true
 image = { workspace = true, features = ["png"] }
+
 
 [target.'cfg(windows)'.dependencies]
 # Embedded browser: WebView2 in visual-hosting mode, composited by the zui

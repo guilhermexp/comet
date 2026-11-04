@@ -256,10 +256,13 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
             sessions: None,
+            access: Default::default(),
+            plan: false,
             attachments: Vec::new(),
             worktree: None,
             resume: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         },
         message_id: "msg-relay-1".into(),
     })

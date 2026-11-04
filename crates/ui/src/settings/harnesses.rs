@@ -36,7 +36,9 @@ use crate::motion;
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
 use crate::settings::accounts::{self, AccountsPage};
+use crate::settings::search::{SearchAnchor, SettingId, Target};
 use crate::settings::widgets;
+use crate::shell::SettingsSection;
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -124,12 +126,14 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Devin => "devin",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
+        HarnessId::Fx => "fx",
         HarnessId::Pi => "pi",
         HarnessId::Omp => "omp",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
+        HarnessId::Registry(agent) => agent.registry_id(),
     }
 }
 
@@ -535,7 +539,7 @@ impl HarnessesPage {
                 .flex()
                 .flex_col()
                 .child(widgets::details_label(theme, "Updates"))
-                .child(row)
+                .child(row.search_anchor(SettingId::UpdatePolicy))
                 .into_any_element(),
         )
     }
@@ -546,6 +550,44 @@ impl HarnessesPage {
             object.insert("targetDeviceId".into(), serde_json::json!(target));
         }
         value
+    }
+
+    /// Whether a dialog [`Self::dismiss_on_escape`] would close is open.
+    pub(crate) fn has_escape_surface(&self, cx: &gpui::App) -> bool {
+        self.expanded_harness.is_some()
+            && self
+                .accounts_page
+                .as_ref()
+                .is_some_and(|accounts| accounts.read(cx).has_escape_surface())
+    }
+
+    /// `harness` as the only provider, expanded, with every section its
+    /// details can show loaded: what the settings search must find there.
+    #[cfg(test)]
+    pub(crate) fn show_provider_details(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        self.harnesses = Loadable::Ready(vec![HarnessDescriptor {
+            icon: None,
+            id: harness,
+            name: format!("{harness:?}"),
+            supports_steering: false,
+            steering_mode: zeron_proto::SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: Some(true),
+            access_modes: Vec::new(),
+            supports_plan: false,
+        }]);
+        self.updates = Loadable::Ready(vec![
+            serde_json::from_value(serde_json::json!({ "harness": harness, "phase": "current" }))
+                .unwrap(),
+        ]);
+        self.native_subagents = Loadable::Ready(zeron_engine::registry::NativeSubagentSettings {
+            switchable: vec![harness],
+            off: Vec::new(),
+        });
+        self.expanded_harness = None;
+        self.toggle_agent_details(harness, cx);
     }
 
     /// Escape that reached Settings unclaimed goes to the expanded provider's
@@ -1254,6 +1296,14 @@ impl HarnessesPage {
                             .into_any_element(),
                     );
                 }
+                if installed && harness == HarnessId::Fx {
+                    meta.push(
+                        div()
+                            .text_color(theme.text_muted)
+                            .child("Configure your model provider with fx login or fx setup.")
+                            .into_any_element(),
+                    );
+                }
                 // Not installed: the hint above says all there is.
                 if let Some(status) = update.filter(|_| installed) {
                     let (text, color) = harness_update_label(status, &theme);
@@ -1612,6 +1662,11 @@ impl Render for HarnessesPage {
                     .into_any_element()
             }
         };
+        // A provider's own rows show once it is expanded: until then, a hit
+        // on one lands on the list, to pick the provider.
+        let body = body
+            .search_anchor(Target::Page(SettingsSection::Harnesses))
+            .block();
         crate::toast::take_error(&mut self.error, cx);
         if embedded {
             let scrollbar = popover::rail(self, "harnesses-embedded-scrollbar", &theme, cx);
@@ -1699,6 +1754,7 @@ impl Render for HarnessesPage {
                 )
                 .fade_overflow_y(&self.scroll.scroll),
             )
+            .child(widgets::page_reveal(&self.scroll.scroll))
             .children(scrollbar)
             .into_any_element()
     }
@@ -1729,6 +1785,7 @@ mod tests {
                 assert_eq!(page.expanded_harness, None, "nothing to open yet");
                 page.harnesses =
                     super::Loadable::Ready(vec![zeron_engine::registry::HarnessDescriptor {
+                        icon: None,
                         id: zeron_proto::HarnessId::Codex,
                         name: "Codex".into(),
                         supports_steering: false,
@@ -1737,6 +1794,8 @@ mod tests {
                         installed: true,
                         can_install: false,
                         enabled: Some(true),
+                        access_modes: Vec::new(),
+                        supports_plan: false,
                     }]);
                 page.run_pending_sign_in(cx);
                 assert_eq!(page.expanded_harness, Some(zeron_proto::HarnessId::Codex));
@@ -1766,6 +1825,7 @@ mod tests {
             super::HarnessesPage::new(state, cx)
         });
         let descriptor = |id, name: &str| zeron_engine::registry::HarnessDescriptor {
+            icon: None,
             id,
             name: name.into(),
             supports_steering: false,
@@ -1774,6 +1834,8 @@ mod tests {
             installed: true,
             can_install: false,
             enabled: Some(true),
+            access_modes: Vec::new(),
+            supports_plan: false,
         };
         window
             .update(cx, |page, _, cx| {
@@ -2040,6 +2102,7 @@ mod tests {
             page
         });
         let descriptor = |id, name: &str| zeron_engine::registry::HarnessDescriptor {
+            icon: None,
             id,
             name: name.into(),
             supports_steering: false,
@@ -2048,6 +2111,8 @@ mod tests {
             installed: true,
             can_install: true,
             enabled: Some(true),
+            access_modes: Vec::new(),
+            supports_plan: false,
         };
         window
             .update(cx, |page, _, cx| {

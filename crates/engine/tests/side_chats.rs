@@ -173,6 +173,8 @@ async fn fork_is_frozen_durable_idempotent_and_has_an_independent_provider_sessi
                 cwd: "/tmp".into(),
                 sandbox: SandboxLevel::WorkspaceWrite,
                 auto_approve: true,
+                access: Default::default(),
+                plan: false,
                 resume: None,
                 attachments: vec![],
                 worktree: None,
@@ -180,6 +182,7 @@ async fn fork_is_frozen_durable_idempotent_and_has_an_independent_provider_sessi
                 workers_parent_chat_id: None,
                 sessions: None,
                 env: Default::default(),
+                extra_mcp: Vec::new(),
             },
             Some("side-user".into()),
         )
@@ -425,6 +428,9 @@ async fn a_fork_settles_the_running_subagent_chips_it_copies() {
         subagent_status: Some(status),
         subagent_tail: None,
         subagent_end: None,
+        exit_code: None,
+        output_truncated: false,
+        output_lines: None,
     };
     core.doc_host
         .open("main")
@@ -547,6 +553,8 @@ async fn side_turn(
                 cwd: "/tmp".into(),
                 sandbox: SandboxLevel::WorkspaceWrite,
                 auto_approve: true,
+                access: Default::default(),
+                plan: false,
                 resume,
                 attachments: vec![],
                 worktree: None,
@@ -554,6 +562,7 @@ async fn side_turn(
                 workers_parent_chat_id: None,
                 sessions: None,
                 env: Default::default(),
+                extra_mcp: Vec::new(),
             },
             Some(message_id.into()),
         )
@@ -759,6 +768,8 @@ async fn warm_side_chat_sends_owed_fork_history_once() {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         resume: None,
         attachments: vec![],
         worktree: None,
@@ -766,6 +777,7 @@ async fn warm_side_chat_sends_owed_fork_history_once() {
         workers_parent_chat_id: None,
         sessions: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     let settle = |count: usize| {
         let seen = seen.clone();
@@ -948,6 +960,8 @@ async fn orphaned_history_steer_still_owes_the_history() {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         resume: None,
         attachments: vec![],
         worktree: None,
@@ -955,6 +969,7 @@ async fn orphaned_history_steer_still_owes_the_history() {
         workers_parent_chat_id: None,
         sessions: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     core.sessions
         .dispatch(
@@ -1077,6 +1092,8 @@ async fn a_side_chat_keeps_its_subagent_tools_when_native_subagents_are_off() {
                     cwd: "/tmp".into(),
                     sandbox: SandboxLevel::WorkspaceWrite,
                     auto_approve: true,
+                    access: Default::default(),
+                    plan: false,
                     resume: None,
                     attachments: vec![],
                     worktree: None,
@@ -1084,6 +1101,7 @@ async fn a_side_chat_keeps_its_subagent_tools_when_native_subagents_are_off() {
                     workers_parent_chat_id: None,
                     sessions: None,
                     env: Default::default(),
+                    extra_mcp: Vec::new(),
                 },
                 Some(format!("{chat}-u1")),
             )

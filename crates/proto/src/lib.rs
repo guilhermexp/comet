@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod agent_messages;
+pub mod annotation;
 pub mod attachment_mentions;
 pub mod change_request_assessment;
 pub mod chat_mentions;
@@ -21,6 +22,7 @@ pub mod preview;
 pub mod program_status;
 pub mod projectless;
 pub mod providers;
+pub mod redact;
 pub mod run_errors;
 pub mod sidebar_pins;
 pub mod skill_usage;

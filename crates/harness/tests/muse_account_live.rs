@@ -80,6 +80,8 @@ async fn an_approved_device_login_runs_real_turns_and_signs_out() {
         cwd: work.path().display().to_string(),
         sandbox: SandboxLevel::ReadOnly,
         auto_approve: false,
+        access: Default::default(),
+        plan: false,
         resume: None,
         attachments: vec![],
         worktree: None,
@@ -88,6 +90,7 @@ async fn an_approved_device_login_runs_real_turns_and_signs_out() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        extra_mcp: Vec::new(),
     };
     let (steer, steering) = tokio::sync::mpsc::channel(8);
     let controls = RunControls {
@@ -200,6 +203,8 @@ async fn a_real_turn_reports_the_subscriptions_usage() {
         cwd: work.path().display().to_string(),
         sandbox: SandboxLevel::ReadOnly,
         auto_approve: false,
+        access: Default::default(),
+        plan: false,
         resume: None,
         attachments: vec![],
         worktree: None,
@@ -208,6 +213,7 @@ async fn a_real_turn_reports_the_subscriptions_usage() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        extra_mcp: Vec::new(),
     };
     let mut stream = MuseHarness::new()
         .with_executable(std::path::PathBuf::from(bin))

@@ -930,6 +930,9 @@ fn refresh_setup_placeholder(st: &mut CoreState, cloud_booting: bool) -> bool {
                     subagent_end: None,
                     execution: None,
                     file_preview: None,
+                    exit_code: None,
+                    output_truncated: false,
+                    output_lines: None,
                 }],
                 created_at: created_at + 1,
                 device_id: String::new(),
@@ -1178,7 +1181,9 @@ impl SessionHandle {
                     model_options: config.map(|c| c.model_options.clone()).unwrap_or_default(),
                     cwd: chat.cwd.clone().unwrap_or_else(|| "~".into()),
                     sandbox: config.map_or(SandboxLevel::WorkspaceWrite, |c| c.sandbox),
-                    auto_approve: true,
+                    auto_approve: false,
+                    access: config.map(|c| c.access).unwrap_or_default(),
+                    plan: config.is_some_and(|c| c.plan),
                     resume: None,
                     attachments: refs.clone(),
                     worktree: request.worktree.clone(),
@@ -1187,6 +1192,7 @@ impl SessionHandle {
                     sessions: None,
                     mcp: None,
                     env: Default::default(),
+                    extra_mcp: Vec::new(),
                 };
                 self.core.queue_command(
                     &device_id,

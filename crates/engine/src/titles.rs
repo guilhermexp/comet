@@ -469,10 +469,13 @@ mod tests {
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
             sessions: None,
+            access: Default::default(),
+            plan: false,
             resume: None,
             attachments: vec![],
             worktree: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         };
         let result = collect_text(&harness, "title-test", request, None).await;
         assert!(

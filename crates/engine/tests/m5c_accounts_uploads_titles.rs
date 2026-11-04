@@ -956,10 +956,13 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     core.sessions
         .dispatch(chat_id, HarnessId::Mock, request, None)
@@ -1005,10 +1008,13 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     core.sessions
         .dispatch(chat_id, HarnessId::Mock, request, None)

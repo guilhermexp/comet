@@ -6305,6 +6305,8 @@ impl DocHost {
                         reasoning: request.reasoning,
                         model_options: request.model_options.clone(),
                         sandbox: request.sandbox,
+                        access: request.access,
+                        plan: request.plan,
                     };
                     if let Err(err) = ws.set_chat_config(chat_id, &config) {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
@@ -6939,10 +6941,13 @@ impl DocHost {
             enable_workers_mcp: true,
             workers_parent_chat_id: Some(chat_id.to_owned()),
             sessions: None,
+            access: config.as_ref().map(|c| c.access).unwrap_or_default(),
+            plan: config.as_ref().is_some_and(|c| c.plan),
             attachments: Vec::new(),
             resume: None,
             worktree: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         };
         if let Some(sessions) = self.sessions() {
             sessions.stamp_sessions_grant(chat_id, &mut request);

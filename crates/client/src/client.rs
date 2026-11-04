@@ -804,6 +804,7 @@ impl Client {
             parent_chat_id: None,
             origin_chat_id: None,
             worked_projects: None,
+            child_kind: None,
         };
         let id = chat.id.clone();
         self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
@@ -1156,6 +1157,7 @@ impl Client {
             checkout_id: None,
             repository_id: None,
             github_repo: None,
+            icon: None,
             created_at: Utc::now(),
         };
         let id = space.id.clone();

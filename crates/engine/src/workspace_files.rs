@@ -448,6 +448,7 @@ impl WorkspaceFiles {
             page.mutation_capabilities = Some(zeron_proto::WorkspaceMutationCapabilities {
                 move_entry: cfg!(any(target_os = "linux", target_os = "macos", windows)),
                 delete_entry: true,
+                create_entry: cfg!(any(target_os = "linux", target_os = "macos", windows)),
             });
             page
         })
@@ -4157,6 +4158,7 @@ mod image_tests {
             Some("cloud-session"),
             None,
             Some(checkout.to_string_lossy().into_owned()),
+            None,
             None,
         )
         .unwrap();

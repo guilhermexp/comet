@@ -1,6 +1,6 @@
 repository = "https://github.com/zeronsh/zui"
-base_revision = "361ff20b919fdfb80199ee6d9aed725300cb7d54"
-vendored_tree = "1bb62f8c1c84db914c44e106f17e031f80475911"
+base_revision = "b564a34413bb7ef1da04121c4a287758f94993d9"
+vendored_tree = "03599671d08bcf1ac901a1004aa04db68b492ac3"
 vendored_from = "working-tree"
 license = "Apache-2.0"
 
@@ -77,3 +77,10 @@ license = "Apache-2.0"
 # layout assertions while retaining Rust ABI checks. Source patch commit:
 # 55ccec6c9cc913665f67035cd57d358a4aa66623.
 # Fork-toolchain formatting in the separate source checkout: bb83f55a94c13794686019b322253b1988543c77.
+
+# Sync 2026-11-04: reconstructed exact prior snapshot in .tmp/zui-source,
+# merged 361ff20..b564a34 (0dc69aa, 5526f55, 5392ee1, b564a34).
+# Source merge: 20dcce769a682f3e6f0bd6acd1f2541ea2582a22. No conflicts.
+# In-place pixel/dma-buf atlas updates, inactive-window frame callbacks,
+# Wayland frame recovery and consistent drag threshold. Fork macOS glass,
+# headless keyboard guard and both closing-punctuation rules preserved.

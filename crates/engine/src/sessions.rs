@@ -413,6 +413,8 @@ struct Inner {
     local_ipc: Mutex<Option<String>>,
     #[cfg(test)]
     admission_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Plugins whose native MCP servers local runs get (absent in bare tests).
+    plugins: OnceLock<crate::plugins::Plugins>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -502,6 +504,7 @@ impl SessionsEngine {
                 local_ipc: Mutex::new(None),
                 #[cfg(test)]
                 admission_hook: Mutex::new(None),
+                plugins: OnceLock::new(),
             }),
         }
     }
@@ -604,6 +607,11 @@ impl SessionsEngine {
     /// fork's grant-built MCP servers (never stamped into `request.mcp`).
     pub fn ipc_token_file(&self) -> Option<std::path::PathBuf> {
         lock(&self.inner.ipc_token_file).clone()
+    }
+
+    /// Wire the plugins service: local runs get its native MCP servers.
+    pub fn set_plugins(&self, plugins: crate::plugins::Plugins) {
+        let _ = self.inner.plugins.set(plugins);
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -749,6 +757,50 @@ impl SessionsEngine {
             .get(chat_id)
             .filter(|h| !h.retiring.load(std::sync::atomic::Ordering::Acquire))
             .is_some_and(|h| !lock(&h.routed_steers).is_empty())
+    }
+
+    /// Ask the chat's runtime to stop one of its background processes. False
+    /// when no live runtime lists it (it ended meanwhile).
+    pub fn stop_background_task(&self, chat_id: &str, task_id: &str) -> bool {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| h.turn.stop_background_process(task_id))
+    }
+
+    /// The tail of one background process's output; `None` when no live
+    /// runtime lists it.
+    pub async fn background_task_output(
+        &self,
+        chat_id: &str,
+        task_id: &str,
+    ) -> Option<zeron_proto::BackgroundTaskOutput> {
+        let turn = lock(&self.inner.runs).get(chat_id)?.turn.clone();
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || turn.background_output(&task_id))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// One chunk of a command's whole output, read from this host's run
+    /// journal and redacted (`ReadToolOutput`, [`crate::tool_output`]).
+    pub async fn read_tool_output(
+        &self,
+        doc_id: &str,
+        tool_id: &str,
+        offset: u64,
+    ) -> Result<zeron_proto::ToolOutputChunk, crate::tool_output::ToolOutputError> {
+        let journal = self.inner.journal.clone();
+        let (doc_id, tool_id) = (doc_id.to_owned(), tool_id.to_owned());
+        tokio::task::spawn_blocking(move || {
+            crate::tool_output::read(&journal, &doc_id, &tool_id, offset)
+        })
+        .await
+        .map_err(|e| {
+            crate::tool_output::ToolOutputError::Journal(crate::run_journal::JournalError::Io(
+                std::io::Error::other(e.to_string()),
+            ))
+        })?
     }
 
     /// How many chats have a turn in flight (the Cloud runner heartbeat's
@@ -1879,6 +1931,16 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    pub fn has_run(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
+    }
+
+    pub fn inject_event(&self, chat_id: &str, event: AgentEvent) -> bool {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| h.engine_tx.send(event).is_ok())
+    }
+
     /// Fold an engine-made event (a `show_visual` page) into the chat's live
     /// run, after whatever the harness streamed so far. Returns `false` when
     /// the chat has no run on this device.
@@ -2350,10 +2412,13 @@ impl SessionsEngine {
                     enable_workers_mcp: true,
                     workers_parent_chat_id: Some(chat_id.to_owned()),
                     sessions: None,
+                    access: Default::default(),
+                    plan: false,
                     attachments: Vec::new(),
                     resume: None,
                     worktree: None,
                     env: Default::default(),
+                    extra_mcp: Vec::new(),
                 })
             })?;
         request.prompt = prompt.to_owned();
@@ -2501,6 +2566,7 @@ impl Inner {
                             is_error: true,
                             output: None,
                             diff: None,
+                            exit_code: None,
                         },
                         AgentEvent::Error {
                             message: "Generated image unavailable".into(),
@@ -2632,6 +2698,33 @@ impl Inner {
         }
     }
 
+    /// Publish the background processes `chat_id`'s runtime runs, mirrored
+    /// like [`Self::set_running_subagents`]. The live heartbeat keeps the row
+    /// fresh while they run; an engine that stops beating took them with it.
+    fn set_background_tasks(&self, chat_id: &str, tasks: Vec<zeron_proto::BackgroundTask>) {
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            if entry.background_tasks == tasks {
+                return;
+            }
+            entry.background_tasks = tasks;
+            entry.updated_at = Utc::now();
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if self.activity_tx.get().is_none()
+            && let Some(ws) = self.workspace()
+        {
+            ws.record_session(&session);
+        }
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -2687,6 +2780,7 @@ impl Inner {
                     last_turn_outcome: None,
                     terminal_activity: None,
                     running_subagents: 0,
+                    background_tasks: Vec::new(),
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -4021,6 +4115,9 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_status,
                 subagent_tail,
                 subagent_end,
+                exit_code,
+                output_truncated,
+                output_lines,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
@@ -4042,6 +4139,9 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_status: *subagent_status,
                 subagent_tail: subagent_tail.clone(),
                 subagent_end: subagent_end.clone(),
+                exit_code: *exit_code,
+                output_truncated: *output_truncated,
+                output_lines: *output_lines,
             },
             other => other.clone(),
         })
@@ -4394,6 +4494,9 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
+    // D1/D4: no host/plugin MCP injection; the fork grants are stamped separately.
+    request.mcp = None;
+    request.extra_mcp.clear();
     // A revived turn the resumed session already holds: the provider gets
     // the continuation, while the transcript, preview and title keep the
     // user's own message (and the retries carry the revival on).
@@ -4781,6 +4884,8 @@ async fn drive_run(
     // so the gate still catches real crashes. touch_session throttles at 10s.
     let mut live_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     live_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The runtime's background processes, published on the session row.
+    let mut background_processes = turn.watch_background_processes();
     // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
     // steerable harness parks here instead of ending the run — the child and
     // its steering mailbox stay warm, and the next user message (dispatch
@@ -4919,6 +5024,11 @@ async fn drive_run(
                     inner.touch_session(&chat_id);
                     continue;
                 }
+                Ok(()) = background_processes.changed() => {
+                    let tasks = background_processes.borrow_and_update().clone();
+                    inner.set_background_tasks(&chat_id, tasks);
+                    continue;
+                }
                 // A hang-up restarts the idle window, however long the call.
                 _ = resume_state.voice_active.ended.notified() => {
                     if idle_since.is_some() {
@@ -5009,7 +5119,12 @@ async fn drive_run(
                     }
                     break (SessionStatus::Idle, None);
                 }
-                Some(event) = engine_rx.recv() => event,
+                // Engine-made events are final: a `show_image` image is
+                // already in uploads, outside the generated-image intake root.
+                Some(event) = engine_rx.recv() => {
+                    prepared_events.push_back(event);
+                    continue;
+                }
                 // Only the turn the visual was checked in may take it, and it
                 // is acknowledged only once written into that turn's entry.
                 Some(publish) = visuals.rx.recv() => {
@@ -5973,6 +6088,8 @@ async fn drive_run(
         }
     }
     inner.set_running_subagents(&chat_id, 0);
+    // The runtime is gone, and its background processes with it.
+    inner.set_background_tasks(&chat_id, Vec::new());
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
@@ -7023,6 +7140,8 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            access: Default::default(),
+            plan: false,
             resume: None,
             attachments: Vec::new(),
             worktree: None,
@@ -7030,6 +7149,7 @@ mod tests {
             workers_parent_chat_id: None,
             sessions: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         }
     }
 

@@ -140,6 +140,8 @@ impl PiHarness {
         cwd: &Path,
         args: &[String],
         mcp: &[zeron_proto::McpServer],
+        mcp: Option<&zeron_proto::McpServer>,
+        extra_mcp: &[zeron_proto::McpServer],
         run_env: &std::collections::BTreeMap<String, String>,
     ) -> Result<Process, HarnessError> {
         let exe = self.resolve_executable()?;
