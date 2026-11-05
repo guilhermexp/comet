@@ -2444,10 +2444,20 @@ timeout = 5
         super::write_executable_script(&path, replacement, "replacement wrapper").unwrap();
         let mut retained = String::new();
         executing.read_to_string(&mut retained).unwrap();
-        assert_eq!(retained, original, "published scripts must never be truncated in place");
+        assert_eq!(
+            retained, original,
+            "published scripts must never be truncated in place"
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1, "no staging file leaks");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "no staging file leaks"
+        );
     }
 
     #[test]

@@ -103,3 +103,7 @@ A exceção de baseline anterior foi revogada. Gates agregados ainda pendentes n
 ### R4 — orçamento do schema
 
 RED no binário da árvore vendor original: sessions 4118 bytes, exit 101. Introdução anunciada reduzida; actions, propriedades, vocabulário/limites de keys, help e tetos (<4 KiB/domínio e <11 KiB total) intactos. GREEN: `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib mcp_host::tests::`, exit 0, 37 passed. Prova downstream e suíte completa integram o gate final após os demais patches do mesmo vendor.
+
+### R5 — publicação dos wrappers
+
+RED f84793e97: o helper truncava o inode publicado; leitor aberto passou a enxergar o novo script (exit 101). ETXTBSY também foi reproduzido pela série antiga de Grok na invocação 9 (log da rodada anterior). GREEN: staging UUID no mesmo diretório, escrita/chmod pelo descritor, close antes de rename e cleanup em erro. Regressão do inode passa; 30/30 invocações consecutivas do mesmo filtro `grok_command_wrapper --nocapture` passaram (120 testes, sem retry/sleep), exit 0. Logs r5-red.log/r5-green.log/r5-grok-green-series.log.

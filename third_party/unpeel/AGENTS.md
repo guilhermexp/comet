@@ -990,7 +990,7 @@ contracts above; it is not an upstream runtime API guarantee.
 - Executable regressions cover all ten shell reporters (online/offline,
   synchronous/asynchronous admission), OMP/Pi/Amp/OpenCode callback contracts,
   native Prime ownership/resume/lifetime, Comet activity/journal admission and
-  compacted parent attention. Run local Cargo through `scripts/cargo-verify.py`;
+  compacted parent attention. Run local Cargo natively with the Comet root contract (task/checkout-specific target, jobs=2 and sccache);
   vendor suites use `--manifest-path third_party/unpeel/crates/Cargo.toml`,
   downstream bridge suites use the root workspace. Provider-native probes need
   isolated HOME/provider/XDG directories and loopback models; never restart
@@ -1039,3 +1039,5 @@ Comet's `crates/ui/src/workers/terminal.rs`, not the Host reader.
 - GL3/4: terminal cleanup consumes CRLF once and complete ESC intermediate/final designations; bare CR retains each adapter’s documented profile, with raw replay untouched. Downstream `controller_mcp::terminal_text_consumers_normalize_crlf_and_designation_escapes` checks both consumers. GL8 advertisement assertions explicitly select no caller manifest and the effective mask; real call denial and thread-local embedding isolation stay intact. Public video guidance names `browser` action `screenshot`, never the retired alias.
 
 - CI 2026-11-05: the peer sessions schema keeps the existing <4 KiB per-domain and <11 KiB total budgets. Its introduction is terse; full action semantics remain in help. Do not enlarge budgets or reduce the key vocabulary to fit metadata.
+
+- CI R5: executable hook/wrapper assets are written to unique same-directory staging files, chmodded, closed and atomically renamed. Never truncate the published executable. The retained-reader regression `executable_script_replacement_preserves_the_published_inode` also checks permissions and staging cleanup; the Grok wrapper conformance tests execute the published scripts.

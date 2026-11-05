@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "41fd459a5803fd6b9f3b6dd0b162d73e3ec9cb7b"
+vendored_tree = "21e72951fabe313bda32658609dfe0f7b94f1d6b"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -266,3 +266,8 @@ base_revision_resolves_upstream = false
 
 # 2026-11-05 — CI R5 RED: retained-reader regression for executable script
 # replacement, before making publication atomic; no production change yet.
+
+# 2026-11-05 — CI R5 GREEN: hook_assets::write_executable_script publishes a
+# closed, chmodded UUID staging inode with same-directory rename; it never
+# truncates the published executable. Retained-reader regression and 30
+# consecutive Grok wrapper invocations (120 tests) pass without retries/sleep.
