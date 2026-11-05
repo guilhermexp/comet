@@ -41,7 +41,7 @@
 - [x] 5.5 D1a: RED próprio e ativar plugins/templates mantendo grants e sem MCP injetado.
 - [x] 5.6 Executar gates finais, DOX e relatório absoluto, sem publicação nem archive.
 
-### Resultado do follow-up
+### Resultado histórico do follow-up (aceite substituído pela seção 6)
 
 Itens 5.1–5.6 executados. F3/F4/D1a têm commits RED próprios e GREEN; grants e serviço entre engines passaram. Seletores F1/F2 corrigidos e preview Windows compila; cargo check --workspace --all-targets --locked passou. Os gates agregados ainda têm exceções anteriores comprovadas em 3f866aeb9 (Codex Voice, UI, ACP, Unpeel schema/Grok intermitente e compilação Windows do vendor). Ver verification.md e o relatório: esta marcação registra execução/aceite com as exceções permitidas pelo brief, não CI remoto nem uma suíte integral verde. Sem publicação/PR/merge/tag/dispatch e sem archive.
 
@@ -56,4 +56,6 @@ A exceção de baseline da seção 5 foi revogada pelo dono. Falhas herdadas ent
 - [x] 6.5 R5: corrigir ETXTBSY na raiz e provar ao menos 30 invocações sem falha.
 - [x] 6.6 R6: portar os caminhos Windows usados, preservando implementações reais e provar os pacotes native-platform-check via GNU.
 - [ ] 6.7 Executar todos os gates exigidos até exit 0; corrigir falhas adicionais; avaliar leaks conforme CI.
-- [ ] 6.8 Atualizar proveniência/vendor, DOX, conflicts/verification e relatório absoluto novo, sem publicação nem archive.
+- [x] 6.8 Atualizar proveniência/vendor, DOX, conflicts/verification e relatório absoluto novo, sem publicação nem archive.
+
+As falhas adicionais de pilha, Git broker, Cloud RPC, interrupt, Cursor JSON, Stop, discovery, hook roots, log writer, isolamento do browser, acceptor IPC, fixture Skill Usage e publicação da fila entram em 6.7; não há exceção de baseline. A execução nativa dos jobs Windows continua exigindo infraestrutura Windows: a única box pareada é Linux amd64. O cross-check GNU cobre o par harness/engine, sem substituir GUI, runtime, instalador ou testes Windows. Os jobs exclusivos macOS/iOS ficam “provado só no CI remoto”, conforme o brief, sem recibo remoto novo desta rodada. Não marcar 6.7 concluído enquanto faltar essa prova; não fazer dispatch ou publicação para obtê-la.

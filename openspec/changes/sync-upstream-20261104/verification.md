@@ -1,6 +1,6 @@
 # Verificação da integração
 
-Código avaliado: `7bdd0cf5efe432f875929217af71a6c7029a219b`. Logs e relatório completo no caminho absoluto do brief, dentro de `.tmp/reports/`. As duas rodadas agregadas com exit 101 na tabela conservam seu status real; scopes válidos reaproveitados e retries afetados estão discriminados.
+Histórico da integração e dos follow-ups. Código da verificação original: `7bdd0cf5efe432f875929217af71a6c7029a219b`. O fechamento da rodada 2, ao fim deste documento, substitui as exceções e pendências das rodadas anteriores; seus exits históricos continuam preservados. Logs e relatório completo no caminho absoluto do respectivo brief, dentro de `.tmp/reports/`.
 
 ## Verificação original (anterior ao D1a)
 
@@ -56,10 +56,10 @@ Bibliotecas da rodada de core (`rust-core-libs-second.log`): doc 218/0, harness 
 
 ## Limitações e riscos
 
-- `cargo test --workspace` completo pertence ao CI da PR; não foi executado localmente. Runs do CI são consultados por SHA e jobs/etapas realmente executados; este documento registra a prova local, sem declarar CI verde.
+- Na verificação original, `cargo test --workspace` completo ainda não havia sido executado localmente; as execuções completas da rodada 2 estão registradas abaixo. A prova local não declara CI remoto verde.
 - Linux não prova AppKit, macOS headed/browser focus, packaging/update instalado nem Xcode/Simulator/UIKit. Nenhum app real, dev-demo, provider autenticado ou sessão paga foi lançado como prova.
 - WPE WebKit 2.50+ não está instalado nesta box; o build Linux usa fallback WebKitGTK. Não há prova nativa de apresentação dma-buf/WPE.
-- zgx/cli/launch e serviços edge adicionais são dormentes/excluídos; a compilação do fork não prova esses produtos alternativos. Plugins retidos são exercitados por fixtures explícitas, sem ativação de produção.
+- zgx/cli/launch e serviços edge adicionais são dormentes/excluídos; a compilação do fork não prova esses produtos alternativos. D1a ativou plugins/templates no startup normal durante o follow-up abaixo, preservando grants e a ausência de MCP de plugin nas runs.
 - Bindings geradas em host Linux verificam consistência de interface, não linking iOS. Swift, header e modulemap regenerados são byte a byte iguais aos integrados após a normalização canônica do script (evidência local em `.tmp/reports/bindings-copied.json`). swift-format não está instalado, mas a normalização de trailing whitespace do Swift foi aplicada. Não inferir QA nativa desses bytes.
 - `git diff --check` do reparo retorna 0. No intervalo integrado retorna 2 somente pelo whitespace emitido no header FFI gerado; o header conserva os bytes canônicos do gerador, sem edição manual (`diff-check-integrated.log`).
 - Há warnings Linux de código dormente/deprecações; não se declarou ausência de warnings nem se atribuiu baseline sem prova.
@@ -94,7 +94,7 @@ Brief fechado: `.tmp/briefs/comet-sync-ci-d1a-20261105.md`; relatório novo `.tm
 
 ## CI integral — rodada 2 (2026-11-05)
 
-A exceção de baseline anterior foi revogada. Gates agregados ainda pendentes nesta rodada.
+A exceção de baseline anterior foi revogada. Falhas intermediárias não são aceitas; resultados finais e limites de plataforma estão no fechamento desta rodada abaixo.
 
 ### R1 — Codex Voice
 
@@ -102,7 +102,7 @@ A exceção de baseline anterior foi revogada. Gates agregados ainda pendentes n
 
 ### R4 — orçamento do schema
 
-RED no binário da árvore vendor original: sessions 4118 bytes, exit 101. Introdução anunciada reduzida; actions, propriedades, vocabulário/limites de keys, help e tetos (<4 KiB/domínio e <11 KiB total) intactos. GREEN: `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib mcp_host::tests::`, exit 0, 37 passed. Prova downstream e suíte completa integram o gate final após os demais patches do mesmo vendor.
+RED no binário da árvore vendor original: sessions 4118 bytes, exit 101. Introdução anunciada reduzida; actions, propriedades, vocabulário/limites de keys, help e tetos (<4 KiB/domínio e <11 KiB total) intactos. GREEN: `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib mcp_host::tests::`, exit 0, 37 passed. Prova downstream e suíte completa do vendor passaram, registradas em R6 e no fechamento abaixo.
 
 ### R5 — publicação dos wrappers
 
@@ -129,7 +129,7 @@ GREEN r6-green-fourth.log: mesmo par GNU, exit 0, 52.70s. Linux `cargo test --ma
 
 ### Falha adicional do gate — pilha dos probes
 
-O primeiro `scripts/ci/test-core.sh` da rodada saiu 100: 2638 passaram e três testes de substituição/cancelamento de atualização abortaram por stack overflow. A chamada ao resolvedor de versão gerenciado revelou buffers de leitura de 16 KiB mantidos através de await, contrários ao contrato da engine. RED `de45d7a45`: `version_probe_futures_hold_no_bulk_buffer` sai 101 e mede read_tail=16448, run_command_output_env=33728, installed_version_of=33936 bytes. O teto é o mesmo 8 KiB das capturas diff existentes. Correção coloca o chunk no heap, mantendo tamanho, cap de saída, timeout e pilha; GREEN: 61 testes de atualização passaram, incluindo os três aborts anteriores e o budget dos futures (exit 0, gate-probe-stack-green.log). Gates agregados em execução.
+O primeiro `scripts/ci/test-core.sh` da rodada saiu 100: 2638 passaram e três testes de substituição/cancelamento de atualização abortaram por stack overflow. A chamada ao resolvedor de versão gerenciado revelou buffers de leitura de 16 KiB mantidos através de await, contrários ao contrato da engine. RED `de45d7a45`: `version_probe_futures_hold_no_bulk_buffer` sai 101 e mede read_tail=16448, run_command_output_env=33728, installed_version_of=33936 bytes. O teto é o mesmo 8 KiB das capturas diff existentes. Correção coloca o chunk no heap, mantendo tamanho, cap de saída, timeout e pilha; GREEN: 61 testes de atualização passaram, incluindo os três aborts anteriores e o budget dos futures (exit 0, gate-probe-stack-green.log). Resultados dos gates agregados constam do fechamento abaixo.
 
 Os três casos leaky do core foram reportados como PASS pelo próprio nextest; a configuração do workflow não reprova leaks. O exit 100 veio dos três aborts de pilha, não desses casos. Removidos os dois retry overrides antigos de nextest: nenhum resultado desta rodada é aceito por retry.
 
@@ -145,10 +145,51 @@ Os três casos leaky do core foram reportados como PASS pelo próprio nextest; a
 - Discovery: RED bacce884e exige EOF ao soltar launcher e sai 101; shell morria e Python ficava com o pipe. GREEN b8ea6075a dá grupo Unix próprio aos guards e encerra shell + descendentes. Os cinco testes passaram (30,21s), exit 0, sem orfandade do servidor scrubbed.
 - Stop: eae0c7e4e troca o atraso fixo por outcomes duráveis e revela Superseded indevido (série falha na invocação 4; captura ampliada na 150). RED determinístico e0e50e40d sai 101: mensagem User não é turno Assistant. Produtores engine/client e contexto do host agora escolhem Assistant; row User legada não vira turno concluído. Três testes de fence/contexto passaram, 18 de runtime passaram e série pós-correção passou 200/200, sem retry/sleep. O teste também conserva Superseded para Assistant realmente anterior. Cliente completo: exit 0.
 
-Logs gate-broker-home-*, gate-cloud-and-interrupt-green.log, gate-cursor-json-order-*, gate-discovery-leak-*, gate-stop-context-*, gate-stop-runtime-green.log, gate-stop-client-green.log, gate-steer-stop-*.log. Gates agregados serão repetidos após essas correções; o exit 101 acima não é aceito.
+Logs gate-broker-home-*, gate-cloud-and-interrupt-green.log, gate-cursor-json-order-*, gate-discovery-leak-*, gate-stop-context-*, gate-stop-runtime-green.log, gate-stop-client-green.log, gate-steer-stop-*.log. As reexecuções agregadas estão discriminadas no fechamento abaixo; o exit 101 acima não é aceito.
 
-Nova falha do workspace (terceira execução, exit 101): somente `zeron --bin zeron`, `second_launch_never_rotates_a_live_processes_log`, assertion rotation resumes. O teste compartilha processo com installer que faz fork: flock pertence ao open-file-description, retido no filho até exec/exit mesmo com CLOEXEC. Prova sincronizada por pipes, sem sleep/retry: gate-log-fork-contract.json. Fixture agora roda uma vez em subprocesso privado, preserva todas as asserções e exige CLOEXEC no descritor real. Na quarta execução do workspace os 16 testes do binário passaram; o gate completo segue em execução. Logger de produto, orçamento e comportamento de rotação intactos.
+Nova falha do workspace (terceira execução, exit 101): somente `zeron --bin zeron`, `second_launch_never_rotates_a_live_processes_log`, assertion rotation resumes. O teste compartilha processo com installer que faz fork: flock pertence ao open-file-description, retido no filho até exec/exit mesmo com CLOEXEC. Prova sincronizada por pipes, sem sleep/retry: gate-log-fork-contract.json. Fixture agora roda uma vez em subprocesso privado, preserva todas as asserções e exige CLOEXEC no descritor real. Na quarta execução do workspace os 16 testes do binário e o gate completo passaram; as reexecuções posteriores constam do fechamento abaixo. Logger de produto, orçamento e comportamento de rotação intactos.
 
-Isolamento do browser: o exemplo upstream chamava test_shell, que fora de cfg(test) cria WorkersModel vivo. Antes de qualquer lançamento, a fixture foi ligada ao detached_fixture_shell já existente (monitor desabilitado, sem engine/polling de Workers), também exportado sob browser-fixture. Comando do workflow e todas as verificações nativas preservados. Primeiro build foi interrompido para essa correção; segundo revelou cfg ausente em WorkersModel::detached (E0599), corrigido no terceiro. As provas nativas ainda serão executadas. DOX passa a documentar a apresentação explícita Linux refresh/draw/present_if_needed, que permite esse exemplo com gpui/bench.
+Isolamento do browser: o exemplo upstream chamava test_shell, que fora de cfg(test) cria WorkersModel vivo. Antes de qualquer lançamento, a fixture foi ligada ao detached_fixture_shell já existente (monitor desabilitado, sem engine/polling de Workers), também exportado sob browser-fixture. Comando do workflow e todas as verificações nativas preservados. Primeiro build foi interrompido para essa correção; segundo revelou cfg ausente em WorkersModel::detached (E0599), corrigido no terceiro. A rodada after-ipc de browser/storage Linux passou, incluindo X11/Wayland e OpenGL forçado; os resultados finais após o reparo da fila constam do fechamento abaixo. DOX passa a documentar a apresentação explícita Linux refresh/draw/present_if_needed, que permite esse exemplo com gpui/bench.
 
-UI final após remover retries: exit 100, 2826 passed / 1 failed (bootstrap local) / 12 ignores anteriores. O shutdown já aguardava JoinHandle; diagnóstico confirmou TCP real (portas distintas). Strace mostrou fork em thread de warm-up; a reprodução controlada mantém o descritor no filho antes de exec. RED cb39c33d1: cancelar e aguardar um acceptor ainda permite conexão, exit 101. O primeiro rascunho do teste não compilou por tipo JSON não qualificado; foi corrigido antes do RED válido. GREEN de RPC: guard exclusivo construído antes de retornar o future, com shutdown do socket Linux antes do close; cobre scoped e compat mesmo sem primeiro poll. Os 42 testes RPC passaram, inclusive bearer/Origin/agent e mensagens grandes, exit 0 (gate-ipc-fork-green.log). Não afrouxa a asserção UI nem aumenta timeout. UI/stress e gates afetados serão repetidos com essa correção.
+UI final após remover retries: exit 100, 2826 passed / 1 failed (bootstrap local) / 12 ignores anteriores. O shutdown já aguardava JoinHandle; diagnóstico confirmou TCP real (portas distintas). Strace mostrou fork em thread de warm-up; a reprodução controlada mantém o descritor no filho antes de exec. RED cb39c33d1: cancelar e aguardar um acceptor ainda permite conexão, exit 101. O primeiro rascunho do teste não compilou por tipo JSON não qualificado; foi corrigido antes do RED válido. GREEN de RPC: guard exclusivo construído antes de retornar o future, com shutdown do socket Linux antes do close; cobre scoped e compat mesmo sem primeiro poll. Os 42 testes RPC passaram, inclusive bearer/Origin/agent e mensagens grandes, exit 0 (gate-ipc-fork-green.log). Não afrouxa a asserção UI nem aumenta timeout. Bootstrap isolado e 200 execuções consecutivas passaram (exit 0), assim como a UI completa after-ipc; os gates finais constam do fechamento abaixo.
+
+
+Skill Usage: a execução completa após IPC revelou uma falha em `project_skill_usage_review_f3_normal_import_after_scan`: somente `workedProjects.historyVersion` mudou, de forma legítima pelo produtor independente. `c8294f6bf` encerra e aguarda WorkedProjectsSync antes de capturar o registry para a prova de somente leitura de Skill Usage; conserva igualdade integral de Chats/Sessions e import real. RED extraído de gate-workspace-after-ipc.log em gate-skill-usage-read-only-red.log; GREEN `cargo test --locked -p zeron-engine --test project_skill_usage --test worked_projects`: exit 0, 9 + 4 passed. Os demais testes e a suíte Worked Projects conservam o startup completo. Não há mudança de comportamento de produto.
+
+
+Publicação da fila: `cargo test --workspace` após IPC saiu 101 em `message_queue::cancelling_a_turn_freezes_the_queue_until_an_explicit_send`, primeiro queue_message com ContainerDeleted. RED `97f59f01a` observa append com attachments=0/hold=false antes do fim da escrita (exit 101, gate-queue-publication-red.log). GREEN `73db07cb3` preenche maps destacados antes de append/restore, mantendo shape sincronizado e políticas de entrega. Os 14 testes da fila passaram (gate-queue-publication-green.log, exit 0), incluindo leitura concorrente nos dois caminhos. Novo Scenario unit na change e DOX da crate doc registram o contrato; os resultados dos gates sobre essa correção constam do fechamento abaixo.
+
+## Fechamento da rodada 2 — recibos finais
+
+Última alteração de código/testes avaliada: `73db07cb3`. Commits posteriores deste fechamento só alteram documentação. R1–R6 e as falhas locais adicionais foram corrigidos; nenhuma falha é dispensada por baseline. Logs em `/home/agent/projects/comet-sync-upstream-20261104/.tmp/reports/comet-sync-ci-round2-20261105-logs/`; relatório `/home/agent/projects/comet-sync-upstream-20261104/.tmp/reports/comet-sync-ci-round2-20261105.md`.
+
+| Comando | Exit | Log |
+|---|---:|---|
+| `cargo test --workspace` | 0 | gate-rust-workflow-final-queue.log |
+| `cargo test --workspace --locked --no-fail-fast` | 0 | gate-workspace-final-queue.log |
+| `scripts/ci/test-core.sh` | 0 | gate-core-final-queue.log |
+| `cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib` | 0 | gate-ui-final-queue.log |
+| `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` | 0 | gate-vendor-core-exact.log |
+| `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml --no-fail-fast` | 0 | gate-vendor-workspace-second.log |
+| `cargo check --workspace --all-targets --locked` | 0 | gate-check-workspace-final-queue.log |
+| `cargo fmt --all -- --check` | 0 | gate-fmt-final.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` | 0 | gate-windows-gnu-final-queue.log |
+| `cargo check --locked -p zeron-harness -p zeron-engine` | 0 | gate-native-linux-final-queue.log |
+| `cargo test --locked -p zeron-voice-media --lib` | 0 | gate-native-resolution-after-ipc.log |
+| `cargo test --locked -p zeron-text -p zeron-markdown -p zeron-client -p zeron-mobile` | 0 | gate-mobile-rust-final-queue.log |
+| `cargo build --locked -p zeron-ui --example browser-fixture --features browser-fixture` | 0 | gate-browser-build-final-queue.log |
+| `xvfb-run -a python3 scripts/test-browser-storage.py --fixture target/debug/examples/browser-fixture` | 0 | gate-browser-storage-final-queue.log |
+| `scripts/test-linux-browser.sh "$RUNNER_TEMP/linux-browser/default"` | 0 | gate-browser-default-final-queue.log |
+| `VK_DRIVER_FILES=/dev/null scripts/test-linux-browser.sh "$RUNNER_TEMP/linux-browser/opengl"` | 0 | gate-browser-opengl-final-queue.log |
+| `python3 -m unittest scripts/ci/test_select_ui_tests.py` | 0 | gate-selector-final.log |
+| `node --test scripts/ci/release-profile-gate.test.cjs` | 0 | gate-release-profile-final.log |
+| `python3 scripts/ci/select-ui-tests.py --all --github-output "$GITHUB_OUTPUT"` | 0 | gate-selector-all-final.log |
+| `openspec validate sync-upstream-20261104 --strict` | 0 | gate-openspec-final.log |
+
+UI: 2827 passed/12 ignores anteriores. Core: 2646 passed/27 ignores anteriores, 2 leaky PASS; o CI configurado não reprova leaks. Discovery não é mais leaky; os dois casos jsonrpc restantes são discriminados no relatório. Os dois retry overrides antigos foram removidos. Os dois comandos de workspace executaram os testes, sem se limitar a compilá-los. Vendor completo: sete membros, 1047 passed/2 ignores anteriores; comando exato core: 741 passed/2 ignores anteriores. Árvore vendor 3ccbca1ed6fe31b903a3de54f33df05cc292684c idêntica à proveniência; sua suíte completa é prova reutilizável pois nenhuma alteração posterior toca esse workspace independente.
+
+Browser final: build/storage e default/OpenGL × X11/Wayland passaram, com Shell detached e inputs/DOM/clipboard/IME/resize/sidebar reais. Todos os booleanos dos quatro linux-results.json são true; screenshots, vídeos e result.txt PASS preservados em linux-browser-final-queue/. Renderer llvmpipe, sem inferir GPU física, WPE ou AppKit. Rust puro mobile passou no Linux, sem inferir linking/QA iOS.
+
+**Aceite global de 6.7 continua incompleto:** windows.yml (UI/fontes/shader, engine/auth/paths, app/packaging/instalador/startup e GUI condicional) e a projeção/testes de runtime Voice em Windows nativo não foram executados. O par GNU harness+engine saiu 0, mas não substitui runtime Windows/MSVC/GUI. Consulta berth somente leitura encontrou apenas a box agents-us, Linux amd64; nenhum runner Windows disponível e nenhum dispatch permitido/executado. Esses comandos ficam N/E, sem exit 0 atribuído. Jobs macOS/iOS ficam “provado só no CI remoto”, conforme brief; não existe recibo remoto novo para estes commits. Inventário literal dos 52 shell steps e status por plataforma em workflow-commands.md e workflow-local-coverage.json.
+
+DOX donos e matrizes, design/specs/tasks/conflicts reconciliados. App 1.0.16, root Cargo.toml, edge/, updater/feed do app e grants/MCP preservados; nenhum novo ignore/skip/retry/sleep ou alvo de workflow removido. git diff --check da rodada sai 0. Nenhum push, merge, tag, alteração de PR ou dispatch. OpenSpec permanece aberta, sem archive por instrução do dono. Trail continua indisponível nesta box (127), sem refresh fictício de grafo.
