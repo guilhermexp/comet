@@ -161,3 +161,7 @@
 ## Follow-up F1/F2 (2026-11-05)
 
 Auditoria de todos os `-p`/`--test` em rust.yml, ui-tests.yml e test-core.sh via cargo metadata e git show 35561ead: geometry existe em crates/orb/tests/geometry.rs (agora inclui zeron-orb); codex_subagents, claude_subagents, local_profiles, pi_resume e osc7501 existem como módulos de crates/engine/tests/misc/main.rs, já selecionado. voice_orb_geometry não existe em 35561ead; a geometria ativa está na crate orb e a UI conserva --lib. Nenhum alvo perdido no merge foi identificado. Os demais pacotes/alvos explícitos correspondem aos manifestos (GPUI macOS usa o workspace third_party/zui).
+
+## Follow-up F5 (2026-11-05)
+
+servers::stop chamava libc::kill/pid_t sem cfg Unix. Windows usa ToolHelp na dependência windows-sys já existente para capturar a árvore do launcher autorizado, com handles retidos e criação pai/filho validada; TerminateProcess encerra a árvore e erros são propagados. Job do harness não é reutilizável: é privado e atribuído no spawn de processos próprios; servidores externos existentes não pertencem a ele. O check preview x86_64-pc-windows-gnu reproduziu E0425 antes e passou depois. Descoberta Windows já devolvia catálogo vazio/identity false: não foi ativada nem alegada como provada.

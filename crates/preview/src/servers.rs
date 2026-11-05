@@ -444,12 +444,138 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
         current = parent;
     }
     // Launchers first, so none of them restarts the listener in between.
+    #[cfg(unix)]
     for target in targets.iter().rev() {
         unsafe {
             libc::kill(*target as libc::pid_t, libc::SIGTERM);
         }
     }
+    // The highest validated launcher owns the listener's tree. Stopping it
+    // once also avoids revisiting descendants that already exited.
+    #[cfg(windows)]
+    if let Some(&target) = targets.last() {
+        terminate_windows_tree(target)?;
+    }
     Ok(targets)
+}
+
+/// Existing servers were not spawned in one of our jobs. Capture their live
+/// descendants with ToolHelp, retaining process handles so PID reuse cannot
+/// redirect termination. A child's creation must follow its captured parent.
+#[cfg(windows)]
+fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    fn open(pid: u32) -> std::io::Result<OwnedHandle> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: OpenProcess returned a valid, uniquely owned handle.
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+
+    fn created(process: &OwnedHandle) -> std::io::Result<u64> {
+        let (mut start, mut exit, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        if unsafe {
+            GetProcessTimes(
+                process.as_raw_handle(),
+                &mut start,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((u64::from(start.dwHighDateTime) << 32) | u64::from(start.dwLowDateTime))
+    }
+
+    let root = open(pid)?;
+    let mut tree = vec![(pid, created(&root)?, root)];
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the snapshot is valid and closed exactly once by OwnedHandle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut next = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+    while next != 0 {
+        children
+            .entry(entry.th32ParentProcessID)
+            .or_default()
+            .push(entry.th32ProcessID);
+        next = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+        return Err(error);
+    }
+    let mut seen = std::collections::HashSet::from([pid]);
+    let mut index = 0;
+    while index < tree.len() {
+        let (parent, start, _) = &tree[index];
+        let (parent, start) = (*parent, *start);
+        for &child in children.get(&parent).into_iter().flatten() {
+            if !seen.insert(child) {
+                continue;
+            }
+            let handle = match open(child) {
+                Ok(handle) => handle,
+                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let child_start = created(&handle)?;
+            if child_start >= start {
+                tree.push((child, child_start, handle));
+            }
+        }
+        index += 1;
+    }
+    // Parents first to stop restart loops; retained handles still identify
+    // children even after their parents exit. Never terminate by bare PID.
+    for (_, _, process) in tree {
+        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
+            let error = std::io::Error::last_os_error();
+            let mut exit = 0;
+            if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit) } == 0
+                || exit == STILL_ACTIVE as u32
+            {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
