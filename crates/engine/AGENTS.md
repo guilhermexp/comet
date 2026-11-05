@@ -171,6 +171,8 @@ O leitor limitado de stdout/stderr em `harness_updates::read_tail` também mant�
 
 ## Verification
 
+Referências based_on.turn_id e o contexto de avaliação usam a última entrada Assistant, nunca uma row User. A janela antes do primeiro delta não inventa um turno concluído; refs User legadas não são turnos antigos. Stops de um Assistant realmente anterior continuam Superseded. Provas: `stop_context_tracks_assistant_turns_and_preserves_stale_stop_rejection` (unit) e `tests/runtime_survival.rs::a_steer_sent_before_stop_is_cancelled_with_it` (integration, barreira de outcomes duráveis, sem atraso fixo).
+
 O e2e de interrupt observa via watch os dois commits (mensagem Aborted e comando Applied) antes de checar journal/Idle; a mensagem pode assentar antes do ACK. Não usar atraso fixo como barreira de conclusão.
 
 `tests/cloud_rpc.rs` cobre a recusa local-only de targetDeviceId antes de qualquer chamada ao edge e verifica separadamente a chamada local com bearer do usuário. D5 continua recusando forwarding de Cloud/vault.

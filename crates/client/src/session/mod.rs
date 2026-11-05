@@ -589,11 +589,17 @@ impl SessionCore {
         self.update_state(|st| st.transfer_progress = progress);
     }
 
-    fn last_entry_id(&self) -> Option<String> {
-        self.snapshot()
+    fn last_assistant_entry_id(&self) -> Option<String> {
+        let snapshot = self.snapshot();
+        snapshot
             .entries
-            .get(..self.snapshot().transcript_len)
-            .and_then(|e| e.last())
+            .get(..snapshot.transcript_len)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.message.role == MessageRole::Assistant)
+            })
             .map(|e| e.id.clone())
     }
 
@@ -604,10 +610,12 @@ impl SessionCore {
             payload,
             issued_by: device_id.to_owned(),
             issued_at: now,
-            based_on: self.last_entry_id().map(|turn_id| CommandBasedOn {
-                turn_id: Some(turn_id),
-                frontier: None,
-            }),
+            based_on: self
+                .last_assistant_entry_id()
+                .map(|turn_id| CommandBasedOn {
+                    turn_id: Some(turn_id),
+                    frontier: None,
+                }),
             expires_at: Some(now + zeron_doc::COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
             resolution: None,

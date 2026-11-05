@@ -3954,10 +3954,16 @@ impl DocHost {
             return Ok(id);
         }
         let now = now_ms();
-        let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
-            frontier: None,
-        });
+        let based_on = handle
+            .doc
+            .read_entries()?
+            .into_iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| CommandBasedOn {
+                turn_id: Some(m.id.clone()),
+                frontier: None,
+            });
         let is_message = matches!(
             payload,
             SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
@@ -5306,10 +5312,14 @@ impl DocHost {
                 payload: old.payload.clone(),
                 issued_by: self.inner.config.device_id.clone(),
                 issued_at: now,
-                based_on: messages.last().map(|m| CommandBasedOn {
-                    turn_id: Some(m.id.clone()),
-                    frontier: None,
-                }),
+                based_on: messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::Assistant)
+                    .map(|m| CommandBasedOn {
+                        turn_id: Some(m.id.clone()),
+                        frontier: None,
+                    }),
                 expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
                 status: SessionCommandStatus::Pending,
                 resolution: None,
@@ -5785,8 +5795,18 @@ impl DocHost {
                 return;
             };
             let messages = handle.doc.read_entries().unwrap_or_default();
-            let current_turn_id = messages.last().map(|m| m.id.clone());
-            let turn_is_past = |turn_id: &str| messages.iter().any(|m| m.id == turn_id);
+            let current_turn_id = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == MessageRole::Assistant)
+                .map(|m| m.id.clone());
+            // Legacy producers could reference a user row before the first
+            // assistant delta. Such a row is never a completed assistant turn.
+            let turn_is_past = |turn_id: &str| {
+                messages
+                    .iter()
+                    .any(|m| m.id == turn_id && m.role == MessageRole::Assistant)
+            };
             let disposition = evaluate_command(
                 &entry,
                 &EvaluationContext {

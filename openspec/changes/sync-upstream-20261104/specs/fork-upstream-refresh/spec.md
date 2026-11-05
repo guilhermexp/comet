@@ -42,6 +42,16 @@ Accepted access modes, process inspection and tool output SHALL preserve host ow
 - **WHEN** a Chat is created with inherited configuration
 - **THEN** its origin lineage remains recorded and it cannot create grandchildren
 
+#### Scenario: Stop arrives before the first assistant output
+- **Test:** integration
+- **WHEN** a Stop follows a send while the transcript contains only its user row, or another user row arrives during an active assistant turn
+- **THEN** the Stop ends the active runtime and earlier pending sends without treating a user row as a completed assistant turn
+
+#### Scenario: Stop targets a genuinely older assistant turn
+- **Test:** unit
+- **WHEN** a newer assistant turn exists and a delayed Stop references the older assistant entry
+- **THEN** that Stop remains superseded and does not interrupt the newer turn
+
 ### Requirement: Additional edge services remain dormant
 
 Directory/profile/badge, Cloud/vault/runner and plugin directory services SHALL remain outside the fork's published edge graph until their bindings and activation are separately authorized.

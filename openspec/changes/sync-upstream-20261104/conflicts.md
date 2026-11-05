@@ -175,3 +175,5 @@ R6 estende F5 ao par real de native-platform-check: o vendor e a fronteira Worke
 R2: a UI do fork mantém Chat titles, Collapse command blocks, Show voice orb e Computer Use/Available to; catálogo e anchors acompanham esses controles. A sidebar mantém o layout do fork (4px após branch curta, branch longa ≤ metade, PR contido). O teste mede o presenter sem cache e reutiliza o roteador OpenPullRequest do Shell, sem remover asserções. O selector de URL foi restaurado; o roteamento de preferência existente foi preservado.
 
 Rodada 2, gate workspace: `tests/cloud_rpc.rs` ainda esperava ignorar targetDeviceId. D5 exige recusar a tentativa antes do dispatch. Fixture agora exige essa recusa sem rede e mantém todas as asserções da chamada local autenticada; não habilita Cloud/runner no startup.
+
+Falha adicional round2: fila/contexto de Stop usavam a última row (inclusive User) como turn_id. Engine/client agora referenciam Assistant; avaliação do host não considera User um turno concluído. Rejeição de Stop para Assistant antigo preservada. Isso mantém a intenção D4/Stop, sem alterar grants, wire shape ou ativar runtime dormente.

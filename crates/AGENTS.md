@@ -45,6 +45,8 @@ A fronteira Workers e os metadados compartilhados do vendor reutilizam `unpeel_c
 
 ## Verification
 
+Engine e `zeron-client` referenciam a última entrada Assistant em based_on.turn_id; mensagens User/echo não são turnos. Antes da primeira resposta, o contexto fica ausente. O host mantém o guard contra Stop para um Assistant antigo; o cliente usa um único snapshot ao escolher a referência.
+
 - Comandos: `cargo test --workspace` · `cargo test -p <crate>` · `cargo fmt --all` · `cargo build -p zeron`
 
 | Camada / path | Tier exigido | Como rodar |
@@ -54,6 +56,7 @@ A fronteira Workers e os metadados compartilhados do vendor reutilizam `unpeel_c
 | `crates/{engine,harness,rpc,workers-unpeel,doc,sync,visual}/tests/**` | integration | `cargo test -p <crate>` |
 | `crates/ui/src/**` (estado, derivações) | unit | `cargo test -p zeron-ui` |
 | `crates/ui` (render gpui) | unit — fixtures `gpui::TestAppContext` de layout/render; QA visual nativo continua separado | `cargo test -p zeron-ui` · `scripts/dev-demo.sh` |
+| `crates/client/src/session/mod.rs` (contexto de Stop no ledger) | integration — demo através do cliente/host | `cargo test -p zeron-client --test demo interrupt_aborts_the_live_turn` |
 | `crates/update` | unit (versão/manifest, swap symlink, shutdown, restart gate) | `cargo test -p zeron-update` |
 
 ## Child DOX Index
