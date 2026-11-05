@@ -743,21 +743,32 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         "streaming entry",
     )
     .await;
+    let (changed, mut changes) = tokio::sync::watch::channel(());
+    let _subscription = handle.doc().doc().subscribe_root(Arc::new(move |_| {
+        changed.send_replace(());
+    }));
     queue_as_viewer(
         handle.doc(),
         "cmd-int-1",
         SessionCommandPayload::Interrupt {},
     );
 
-    wait_for(
-        || {
-            entries(&core)
+    // The aborted message and the command acknowledgement are separate
+    // commits. Observe both durable outcomes before asserting settlement.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if entries(&core)
                 .iter()
                 .any(|e| e.status == Some(MessageStatus::Aborted))
-        },
-        "aborted stamp",
-    )
-    .await;
+                && command_status(&core, "cmd-int-1") == Some((SessionCommandStatus::Applied, None))
+            {
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("aborted message and applied interrupt");
 
     let all = entries(&core);
     let assistant = all
