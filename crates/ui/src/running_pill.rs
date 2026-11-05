@@ -1,7 +1,5 @@
-//! How many subagents are running, drawn the same way wherever it turns up:
-//! the "● 3" pill on the sidebar's chat rows (beside the row's own activity
-//! indicator) and the Subagents header, and the pulsing button with a count
-//! badge on the titlebar's explorer toggle.
+//! Active-work counters: the accent subagent pill and blue CLI worker pill on
+//! sidebar Chat rows, plus the Subagents header and titlebar count badge.
 
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, Hsla, IntoElement, Render,
@@ -55,6 +53,29 @@ pub fn running_pill(key: impl Into<SharedString>, count: u32, theme: &Theme) -> 
         family: theme.font_mono.clone(),
     }
     .into_any_element()
+}
+
+/// Same geometry and pulse as subagents, with an independent blue worker tone.
+pub fn worker_pill(key: impl Into<SharedString>, count: u32, theme: &Theme) -> AnyElement {
+    let key = key.into();
+    div()
+        .id(key.clone())
+        .debug_selector({
+            let key = key.clone();
+            move || key.to_string()
+        })
+        .aria_label(format!(
+            "{count} active {}",
+            if count == 1 { "worker" } else { "workers" }
+        ))
+        .flex_none()
+        .child(RunningPill {
+            key,
+            count,
+            tone: theme.worker_activity,
+            family: theme.font_mono.clone(),
+        })
+        .into_any_element()
 }
 
 #[derive(IntoElement)]
