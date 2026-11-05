@@ -5332,11 +5332,10 @@ mod tests {
         };
 
         assert!(!format!("{error:#}").is_empty());
+        let connection = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
         assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_err(),
-            "failed bootstrap must release the IPC listener"
+            connection.is_err(),
+            "failed bootstrap must release the IPC listener: {connection:?}"
         );
     }
 
