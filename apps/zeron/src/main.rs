@@ -607,10 +607,37 @@ mod log_file_tests {
 
     #[test]
     fn second_launch_never_rotates_a_live_processes_log() {
+        const ISOLATED: &str = "ZERON_TEST_ISOLATED_LOG_ROTATION";
+        if std::env::var_os(ISOLATED).is_none() {
+            // Other unit tests fork installer processes. Even CLOEXEC fds
+            // retain their flock in a fork until exec, so dropping our File
+            // need not release the last descriptor in that shared process.
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "log_file_tests::second_launch_never_rotates_a_live_processes_log",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .env("HOME", home.path())
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated log lifetime fixture failed: {status}"
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
         // First launch owns the canonical file and keeps writing.
         let first = open_log_file_in(dir, "headed").expect("first log");
+        use std::os::fd::AsRawFd;
+        assert_ne!(
+            unsafe { libc::fcntl(first.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
         assert!(dir.join("zeron-headed.log").is_file());
         // Second launch while the first is alive: canonical file untouched,
         // pid-suffixed overflow file instead (the 2026-08-04 clobber).

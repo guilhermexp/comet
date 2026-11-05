@@ -16,7 +16,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 
 - No Linux, `zeron appshot` é somente ativação IPC local para o app headed em execução; captura/permissões/destino pertencem à UI. Não inicia uma engine nem captura no daemon.
 
-- A feature Cargo `browser-fixture` de `zeron` expõe os binários opt-in `browser-fixture` e `preview-fixture` em `zeron/src/fixtures/`. Não empacotar nem publicar. O modo `browser-fixture <output> --resize-regression` verifica hit testing do divisor e geometria fracionária sem gravação de tela; sucesso exige `result.txt` com PASS (o lifecycle GPUI pode retornar exit 0 mesmo após erro do fixture). Dev deps de `zeron-ui` ativam `gpui/test-support`, cujo flush desenha sem apresentação nativa; por isso esses rigs são binários do app, nunca exemplos/test targets da UI. Build nativa deve selecionar só `-p zeron --bin <fixture>`, sem `--workspace` que unificaria as features de teste.
+- A feature Cargo `browser-fixture` de `zeron` expõe os binários opt-in `browser-fixture` e `preview-fixture` em `zeron/src/fixtures/`. Não empacotar nem publicar. O modo `browser-fixture <output> --resize-regression` verifica hit testing do divisor e geometria fracionária sem gravação de tela; sucesso exige `result.txt` com PASS (o lifecycle GPUI pode retornar exit 0 mesmo após erro do fixture). Dev deps de `zeron-ui` ativam `gpui/test-support`, cujo flush desenha sem apresentação nativa. Esses bins usam o loop de produção e seu build seleciona só `-p zeron --bin <fixture>`, sem `--workspace`. O exemplo UI browser-fixture mais recente usa gpui/bench e apresenta explicitamente a cena em capture_frame no Linux; o CI Linux o executa com shell detached, sem engine/polling de Workers. Sua prova nativa depende das asserções, capturas e result.txt, além do exit.
 
 
 - `main` chama `zeron_engine::raise_nofile_limit` depois do tracing e **antes** de `run_app` / headless — o gpui/Metal precisa abrir `default.metallib` mesmo com dezenas de rooms.
@@ -43,10 +43,13 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 
 ## Verification
 
+O teste de lifetime/rotação de logs roda em subprocesso privado, isolado dos forks do teste de installer. Flock pertence ao open-file-description e um filho o retém até exec/exit, mesmo com CLOEXEC; fechar apenas o File do pai não garante último descritor. Todas as asserções de writer vivo/overflow/retomada são preservadas; o fixture também exige CLOEXEC. Não alterar o logger nem adicionar espera/retry para compensar concorrência entre fixtures.
+
 - Comandos: `cargo build -p zeron` · `scripts/e2e-smoke.sh`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
+| `zeron/src/main.rs` (lifetime do log/rotação) | unit — subprocesso sem forks de outros testes | `cargo test -p zeron --bin zeron log_file_tests` |
 | `zeron/src/**` (wiring, dispatch) | none — casca fina; o comportamento é testado nas crates | `cargo build -p zeron` |
 | Fluxo headed/headless real | e2e | `scripts/e2e-smoke.sh` · `scripts/dev-demo.sh` |
 | `ios/**` | unit / integration (XCTest do app UIKit; core Rust coberto por `cargo test -p zeron-mobile -p zeron-client -p zeron-text`) | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` |
