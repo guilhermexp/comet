@@ -5,6 +5,7 @@
 //! request/response envelope as Relay without AEAD. Stdout is frames only;
 //! diagnostics and audit metadata never enter the protocol stream.
 
+#[cfg(unix)]
 use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -246,10 +247,12 @@ where
     Ok(())
 }
 
+#[cfg(unix)]
 pub fn owner_subject() -> String {
     format!("uid:{}", unsafe { libc::geteuid() })
 }
 
+#[cfg(unix)]
 fn unix_user_name() -> Option<String> {
     let entry = unsafe { libc::getpwuid(libc::geteuid()) };
     if entry.is_null() {
@@ -257,6 +260,18 @@ fn unix_user_name() -> Option<String> {
     }
     let name = unsafe { CStr::from_ptr((*entry).pw_name) };
     name.to_str().ok().map(str::to_owned)
+}
+
+#[cfg(windows)]
+pub fn owner_subject() -> String {
+    let sid = crate::platform::windows::owner_sid()
+        .expect("read the OS owner SID before granting owner transport");
+    format!("sid:{sid}")
+}
+
+#[cfg(not(unix))]
+fn unix_user_name() -> Option<String> {
+    None // This audit field is specifically the Unix passwd name; SID is authoritative on Windows.
 }
 
 fn ssh_remote_address() -> Option<String> {

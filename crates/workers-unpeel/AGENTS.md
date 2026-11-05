@@ -665,6 +665,8 @@ apps/zeron (host-mode dispatch at startup).
 
 - O controller (`__workers_mcp__`) recebe o bearer IPC da engine (`ZERON_IPC_TOKEN_FILE`, ou `ZERON_IPC_TOKEN`), guarda-o em memória na partida (`space_registry::take_engine_ipc_credentials`) e o remove do próprio ambiente antes de lançar qualquer Worker; só ele disca a engine (`connect_engine`). O `unpeel-core` vendorizado também tira essas duas variáveis do launcher, do host destacado e do shell do Worker (`strip_embedder_ipc_credentials`), então Workers lançados pelo app também não as herdam. O mesmo vale para os descritores da ponte MCP do Pi (`ZERON_PI_MCP`, `ZERON_PI_MCP_<n>`), cujo JSON carrega o caminho do bearer: o controller os remove na partida e o `unpeel-core` os tira do launcher/host/shell. Prova: `tests/controller_ipc_credentials.rs`.
 
+- Locks de registry/checkout e reservas de atividade usam `unpeel_core::platform`: flock no Unix, LockFileEx no Windows, sem sucesso simulado. O lock de atividade recusa symlinks/reparse points pelo arquivo aberto. JSON privado usa 0600 no Unix e DACL do SID do processo no Windows; publicação fecha o staging sincronizado e usa rename durável. PID Windows é observado por handle e creation time; erro de observação mantém a reserva protegida. O controle FIFO de post-start continua Unix; Windows mantém o monitor/canal de parada próprio.
+
 ## Work Guidance
 
 - **Checkout lifecycle:** Chat e Workers usam o mesmo serviço. A raiz canônica
@@ -723,7 +725,7 @@ apps/zeron (host-mode dispatch at startup).
 Durable-seed fixtures that represent different hook events set distinct file mtimes explicitly. Back-to-back writes may share one filesystem timestamp/version and must not make the admission/recovery assertions depend on scheduling. This changes test inputs, never the runtime dedup policy.
 
 Run all: `cargo test -p zeron-workers-unpeel` (part of the publish gate).
-Lost hook delivery: `scripts/cargo-verify.py -- cargo test -p zeron-workers-unpeel --lib activity_bridge` covers the real activity derivation, durable Stop recovery on the next poll, unchanged/stale seeds, generation isolation and registry register/unregister with seventeen live listeners. The bridge recovers a new durable event even after hooks latch; the five-minute sweep remains a fallback. A consumed disk version is never replayed over a live event or Codex output rearm. The shared registry has no age-based entry cap: only its owner unregisters a port.
+Lost hook delivery: `cargo test -p zeron-workers-unpeel --lib activity_bridge` covers the real activity derivation, durable Stop recovery on the next poll, unchanged/stale seeds, generation isolation and registry register/unregister with seventeen live listeners. The bridge recovers a new durable event even after hooks latch; the five-minute sweep remains a fallback. A consumed disk version is never replayed over a live event or Codex output rearm. The shared registry has no age-based entry cap: only its owner unregisters a port.
 Regressão de saída: `cargo test -p zeron-workers-unpeel --test controller_mcp worker_output_preserves_answer_when_repaints_depend_on_terminal_width` preserva a resposta literal após repinturas que dependem da largura real.
 Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 

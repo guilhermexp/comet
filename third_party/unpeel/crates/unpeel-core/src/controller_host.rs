@@ -1324,6 +1324,7 @@ fn bool_field(value: &Value, names: &[&str]) -> Option<bool> {
         .find_map(|name| value.get(*name).and_then(Value::as_bool))
 }
 
+#[cfg(unix)]
 fn hostname_short() -> String {
     let mut buffer = [0u8; 256];
     let rc = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -1334,6 +1335,22 @@ fn hostname_short() -> String {
     String::from_utf8_lossy(name)
         .trim_end_matches(".local")
         .to_owned()
+}
+
+#[cfg(windows)]
+fn hostname_short() -> String {
+    let mut buffer = [0u16; 256];
+    let mut length = buffer.len() as u32;
+    if unsafe {
+        windows_sys::Win32::System::WindowsProgramming::GetComputerNameW(
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    } == 0
+    {
+        return "Host".into();
+    }
+    String::from_utf16_lossy(&buffer[..length as usize])
 }
 
 fn query_session_id(request: &ControllerRequest) -> Option<&str> {

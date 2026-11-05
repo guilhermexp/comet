@@ -114,6 +114,12 @@ impl Child {
     pub fn start_kill(&mut self) -> io::Result<()> {
         self.job.terminate()
     }
+    /// Terminate the owned Job, then reap its root process (Tokio's kill contract).
+    pub async fn kill(&mut self) -> io::Result<()> {
+        self.start_kill()?;
+        self.wait().await.map(|_| ())
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         if self.status.is_some() {
             return Ok(self.status);

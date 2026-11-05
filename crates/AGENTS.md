@@ -41,6 +41,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 - Mudança que atravessa duas crates quase sempre indica que o tipo está na camada errada: tipo de fio vai pra `proto`, forma de documento vai pra `doc`.
 - `update/` e `syntax/` são crates de arquivo único (auto-update do binário; tokenizer de highlight) — cada uma tem doc próprio, mas nenhuma tem submódulo interno.
 
+A fronteira Workers e os metadados compartilhados do vendor reutilizam `unpeel_core::platform` para locks, arquivos privados, publicação durável e identidade de processo em Unix/Windows. O Host PTY local do vendor continua explicitamente Unix. OMP usa o seam de processos do harness, com Job Object no Windows.
+
 ## Verification
 
 - Comandos: `cargo test --workspace` · `cargo test -p <crate>` · `cargo fmt --all` · `cargo build -p zeron`

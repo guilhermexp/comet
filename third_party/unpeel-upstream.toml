@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "21e72951fabe313bda32658609dfe0f7b94f1d6b"
+vendored_tree = "1897e6d20266cf20e0cc76a0974f49d629128ccd"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -271,3 +271,14 @@ base_revision_resolves_upstream = false
 # closed, chmodded UUID staging inode with same-directory rename; it never
 # truncates the published executable. Retained-reader regression and 30
 # consecutive Grok wrapper invocations (120 tests) pass without retries/sleep.
+
+# 2026-11-05 — CI R6 (local portability patch, not an upstream import):
+# - native platform primitives shared with Comet: Windows LockFileEx, private
+#   SID/DACL files, durable rename, hostname and owned process handles/times;
+#   Unix flock/0600/signals retained, MSRV 1.88 unchanged.
+# - gate POSIX-only hook facades, attach readiness and socket transport;
+#   unsupported local PTY/remote raw attach returns an explicit error.
+# - core app-state/license/Host identity and browser/server process operations
+#   consume real primitives; downstream checkout/activity/registry do likewise.
+# Windows GNU check uses the exact native-platform-check package pair.
+# local_modifications_count remains the unrecomputed historical value.

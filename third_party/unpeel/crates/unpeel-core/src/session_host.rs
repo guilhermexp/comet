@@ -2461,6 +2461,7 @@ fn fallback_shell_exec_snippet(shell_path: &str) -> String {
 /// in its wrapper; doing it generically extends the same guarantee to every
 /// provider. POSIX-only constructs so it runs under both zsh and bash. Skipped
 /// for background/MCP launches (no attach client → `wait_for_attach == false`).
+#[cfg(unix)]
 fn attach_ready_wait_snippet(session_id: &str) -> String {
     let ready = attach_ready_path(session_id);
     let quoted = shared::shell_quote(&ready.to_string_lossy());

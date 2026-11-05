@@ -34,6 +34,7 @@ pub mod mcp_gate;
 pub mod mcp_host;
 pub mod menu_prompt;
 pub mod native_initial;
+pub mod platform;
 pub mod provider_context;
 pub mod relay_connection;
 pub mod relay_crypto;

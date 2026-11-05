@@ -209,20 +209,16 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 | `third_party/unpeel/scripts/generate-runtime-client-catalog.mjs` + `third_party/unpeel/apps/shared/UnpeelShared/Sources/UnpeelShared/GeneratedRuntimeCatalog.swift` | unit — projeção determinística de descriptors/ícones; sem Cargo | `bun run --cwd "$PWD/third_party/unpeel" check:runtimes` |
 | `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · `cargo test -p zeron-workers-unpeel` |
 | `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
+| `third_party/unpeel/crates/unpeel-core/src/platform.rs` + consumidores de lock/atividade em `crates/workers-unpeel` | unit Linux + compile Windows; execução nativa Windows exige runner próprio | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib platform::tests` · `cargo test -p zeron-workers-unpeel` · `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
 | `third_party/zui` | unit no vendor (API de blur e ambas as regras de pontuação) + compile downstream da API de glifo transformado | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --lib window_blur_` · `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui --features gpui_platform/runtime_shaders --lib closing_punctuation_attached` · `cargo build -p zeron` |
 | `third_party/zui/crates/gpui_macos/tests/window_glass_backing.rs` | integration — setters reais, configuração/ordem nativa, reutilização, resize e limpeza; main thread AppKit | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --test window_glass_backing` (macOS com sessão gráfica; no CI `ui-tests.yml`, build `--no-run` e execução em bundle isolado com timeout, exit zero e marcador PASS obrigatório) |
 | Estabilidade óptica do vidro durante repaint | none — asserções AppKit não comprovam desaparecimento das ondas; comparação headed no mesmo desktop é evidência separada | Captura/comparação do vidro real sem trocar wallpaper ou preferências do usuário |
 
-### Limitação de plataforma observada (CI 2026-10-19)
+### Compatibilidade de plataforma (CI 2026-11-05)
 
-`native-platform-check (windows-latest)` no run39189505816/HEAD9e1a6b74 falhou
-em `unpeel-core` com51 diagnósticos de APIs Unix (fd/flock/mode/attach_ready_path
-entre outros). `third_party/unpeel` tem a mesma árvore Git `a59bca0a6931665574af47e635d5af09a7a47630`
-na baseline e750f810 e nesse HEAD; a incompatibilidade é preexistente e está fora
-do escopo da integração. Não desabilitar o check nem portar o vendor como parte
-desse closeout. Log/hash e limites de comprovação: `.tmp/reports/ci-20261019.md`.
+A limitação registrada em 2026-10-19 (`.tmp/reports/ci-20261019.md`) é histórica; o brief round2 autorizou a portabilidade real. `unpeel-core::platform` preserva flock/0600 no Unix e implementa LockFileEx, DACL por SID, rename durável e handles de processo no Windows; os consumidores Comet usam o mesmo seam. Adapters de hooks, socket/FIFO e Host PTY Unix conservam cfg e recusa explícita onde não há transporte Windows. O cross-check deve selecionar exatamente `zeron-harness` e `zeron-engine`, como native-platform-check; compilar preview sozinho não basta. Cross-check não prova execução/GUI no Windows.
 
 ## Child DOX Index
 

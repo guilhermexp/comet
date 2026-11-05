@@ -402,11 +402,7 @@ fn engine_socket_dir() -> PathBuf {
 /// True when `pid` names a live process (same liveness probe the session host
 /// uses). EPERM (alive, different owner) still counts as alive.
 fn pid_is_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    pid > 0 && crate::platform::pid_is_alive(pid as u32)
 }
 
 /// Remove engine state left behind by a crashed browser Chrome/daemon, but
@@ -570,7 +566,12 @@ falling back to {}",
         if pid_is_alive(pid) && !ours {
             let fallback_str = fallback.to_string_lossy();
             if pid_command_line(pid).is_some_and(|cmd| cmd.contains(fallback_str.as_ref())) {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                if let Err(error) = crate::platform::terminate_process(pid, true) {
+                    trace(&format!(
+                        "failed to terminate orphaned browser pid={pid}: {error}"
+                    ));
+                    return fallback;
+                }
                 trace(&format!(
                     "killed orphaned browser chrome pid={pid} session={session_id}"
                 ));
@@ -589,13 +590,23 @@ falling back to {}",
         if !pid_has_children(daemon)
             && pid_command_line(daemon).is_some_and(|cmd| cmd.contains("agent-browser"))
         {
-            unsafe { libc::kill(daemon, libc::SIGTERM) };
+            if let Err(error) = crate::platform::terminate_process(daemon, false) {
+                trace(&format!(
+                    "failed to terminate browserless daemon pid={daemon}: {error}"
+                ));
+                return fallback;
+            }
             let deadline = Instant::now() + Duration::from_millis(1000);
             while pid_is_alive(daemon) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
             if pid_is_alive(daemon) {
-                unsafe { libc::kill(daemon, libc::SIGKILL) };
+                if let Err(error) = crate::platform::terminate_process(daemon, true) {
+                    trace(&format!(
+                        "failed to kill browserless daemon pid={daemon}: {error}"
+                    ));
+                    return fallback;
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
             let key = engine_session_key(session_id);

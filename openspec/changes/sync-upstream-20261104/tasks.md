@@ -54,6 +54,6 @@ A exceção de baseline da seção 5 foi revogada pelo dono. Falhas herdadas ent
 - [x] 6.3 R3: tornar ACP registry determinístico e provar atualização 2.0.0 → 2.1.0.
 - [x] 6.4 R4: reduzir schema sessions dentro do orçamento atual.
 - [x] 6.5 R5: corrigir ETXTBSY na raiz e provar ao menos 30 invocações sem falha.
-- [ ] 6.6 R6: portar os caminhos Windows usados, preservando implementações reais e provar os pacotes native-platform-check via GNU.
+- [x] 6.6 R6: portar os caminhos Windows usados, preservando implementações reais e provar os pacotes native-platform-check via GNU.
 - [ ] 6.7 Executar todos os gates exigidos até exit 0; corrigir falhas adicionais; avaliar leaks conforme CI.
 - [ ] 6.8 Atualizar proveniência/vendor, DOX, conflicts/verification e relatório absoluto novo, sem publicação nem archive.

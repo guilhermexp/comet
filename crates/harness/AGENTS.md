@@ -81,6 +81,8 @@ Cursor catalog models and Max Mode default exclusions are one credential-scoped 
 - O OMP resolve seus sidecars em `omp/workers_bridge.rs` (`workers_server`/`zeron_server`) com o mesmo `with_ipc_token_file` de `servers_for_request`; qualquer env de credencial novo entra nos dois caminhos.
 - Muse Code (upstream #978) roda sem grants MCP e segura a `execution_lease` do turno inteiro.
 
+- OMP e seus sidecars usam `crate::process::{Command, Child, ChildStdout, Stdio}`: Tokio em Unix e handles/pipes + Job Object na criação no Windows. Não importar tipos Tokio diretamente nesse seam. `Child::kill` Windows termina o Job e espera o processo raiz; `compose_child_path` conserva o launcher/ambiente autorizado.
+
 ## Work Guidance
 
 - Comandos OMP locais bem-sucedidos publicam `contextUsage` via `get_state` antes de `Done`. **`/compact` roda em background no OMP: `agentInvoked:false` é só ACK, nunca conclusão.** O adapter espera `command_output` terminal (`Compaction complete.` / falha), ignora `agent_end` intermediário, mantém cancelamento e o deadline de prompt após o ACK, e só então lê usage. Sucesso suprime a prosa CLI duplicada; erro de argumento/provider termina com falha. Estado ausente não inventa contagem. `tests/omp_rpc.rs` cobre ACK antecipado com estado stale, aumento de tokens, resultado antes do ACK, falha, timeout e cancelamento.

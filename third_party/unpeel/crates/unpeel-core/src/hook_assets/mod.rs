@@ -480,6 +480,7 @@ pub(crate) fn notify_hook_script_path() -> PathBuf {
 // adapter, but these functions were already part of `unpeel_core::hook_assets`.
 // Keep their paths stable for downstream callers while new integrations call
 // the package-local setup modules directly.
+#[cfg(unix)]
 pub use crate::integrations::{
     amp::setup::{install_amp_plugin, prepare_amp_project_plugin},
     claude::setup::{claude_mcp_config_path, claude_unpeel_mcp_config_path, install_claude_hooks},
@@ -498,7 +499,7 @@ pub use crate::integrations::{
     opencode::setup::{install_opencode_plugin, opencode_config_dir},
 };
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use crate::integrations::{
     claude::setup::{
         build_hook_entry, claude_hook_script_path, is_stale_unpeel_claude_hook,

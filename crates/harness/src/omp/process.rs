@@ -1,13 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::process::{Child, ChildStdout, Command, Stdio};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::{
@@ -162,7 +161,9 @@ impl OmpProcess {
             command.arg("--no-session");
         }
         if let Some(environment) = &launch.env {
-            command.envs(environment);
+            for (key, value) in environment {
+                command.env(key, value);
+            }
         } else {
             crate::compose_child_path(&mut command, &launch.executable);
         }
@@ -506,7 +507,7 @@ impl OmpProcess {
 }
 
 async fn read_stdout(
-    stdout: tokio::process::ChildStdout,
+    stdout: ChildStdout,
     stderr_reader: Option<tokio::task::JoinHandle<()>>,
     inner: Arc<Inner>,
     event_tx: mpsc::Sender<Value>,

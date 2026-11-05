@@ -177,8 +177,6 @@ pub fn relay_entitlement_is_allowed(mac_id: &str, entitlement: &str) -> bool {
 /// this lock, but its final key check + rename is one transaction with local
 /// deactivation, so a late response cannot resurrect removed authority.
 fn with_license_lock<T>(operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::{Mutex, OnceLock};
 
     static PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -188,19 +186,19 @@ fn with_license_lock<T>(operation: impl FnOnce() -> Result<T, String>) -> Result
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let home = crate::app_paths::unpeel_home();
     std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
         .open(home.join("link-license.lock"))
         .map_err(|error| error.to_string())?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
+    crate::platform::lock_exclusive(&lock).map_err(|error| error.to_string())?;
     let result = operation();
-    let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+    let _ = crate::platform::unlock(&lock);
     result
 }
 
@@ -291,14 +289,7 @@ fn store_key(
 }
 
 fn write_private_file(path: &std::path::Path, body: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| error.to_string())?;
+    let mut file = crate::platform::create_private_file(path).map_err(|error| error.to_string())?;
     if let Err(error) = file.write_all(body) {
         drop(file);
         let _ = std::fs::remove_file(path);
@@ -462,14 +453,11 @@ fn clear_link_tombstone_unlocked() -> Result<(), String> {
 /// UUID): a random id minted once and kept in `~/.unpeel/device-id`.
 pub fn device_id() -> Result<String, String> {
     with_license_lock(|| {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = crate::app_paths::unpeel_home().join("device-id");
         match std::fs::read_to_string(&path) {
             Ok(existing) if !existing.trim().is_empty() => {
                 let trimmed = existing.trim().to_string();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                    .map_err(|error| error.to_string())?;
+                crate::platform::secure_private_file(&path).map_err(|error| error.to_string())?;
                 return Ok(trimmed);
             }
             Ok(_) => {}
