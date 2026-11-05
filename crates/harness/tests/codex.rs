@@ -2527,6 +2527,7 @@ async fn a_stopped_turn_keeps_the_app_server_for_the_next_prompt() {
     assert!(next_event(&mut stream).await.is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_voice_fixtures_distinguish_absent_and_unsupported_runtime() {
     let dir = tempfile::tempdir().unwrap();
@@ -2554,6 +2555,7 @@ fn codex_voice_fixtures_distinguish_absent_and_unsupported_runtime() {
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name, "--nocapture"])
+                .env("ZERON_TEST_CODEX_VOICE_ISOLATED", name)
                 .env("HOME", &selected_home)
                 .env("CODEX_HOME", &selected_codex_home)
                 .env("ZERON_TEST_CODEX_VOICE_EXPECT_HOME", &selected_codex_home)
