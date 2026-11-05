@@ -12,6 +12,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
+- O descriptor lazy OMP anuncia exatamente `[FullAccess]` e `supports_plan = false`, como o driver do fork. `registry::tests::lazy_omp_descriptor_matches_the_fork_driver` e o teste de todos os descriptors protegem a igualdade; Kimi permanece Usage não executável.
+
 - Sinais de review/CI mantêm cwd e limites do ProcessRequest autorizado. A identidade do viewer vem de `fetch_pr_metadata` na credencial usada pela API, sem reutilizar `account` (que no fork é fingerprint de credencial/cache, não login do gh).
 
 - `ZGX_INTERFACE_V1` é constante de compatibilidade, mas fica fora de `capabilities::CURRENT` no fork: startup dormente não promete a interface/plugins ausentes. `BACKGROUND_TASKS_V1` continua anunciado.
