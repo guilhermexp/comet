@@ -3499,7 +3499,9 @@ async fn read_tail(
     tail: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt as _;
-    let mut chunk = [0_u8; 16 * 1024];
+    // This reader is nested in update/version-probe futures. Keep its chunk
+    // off their stack frames, including unoptimized test builds.
+    let mut chunk = vec![0_u8; 16 * 1024];
     loop {
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
@@ -5432,12 +5434,33 @@ esac
         let mut tail = Vec::new();
         let executable = std::path::Path::new("unused-version-probe");
         let sizes = [
-            ("read_tail", std::mem::size_of_val(&super::read_tail(&mut pipe, &mut tail))),
-            ("run_command_output_env", std::mem::size_of_val(&super::run_command_output_env(executable, &[], std::time::Duration::from_secs(1), &[]))),
-            ("installed_version_of", std::mem::size_of_val(&super::installed_version_of(HarnessId::Omp, executable, &[]))),
+            (
+                "read_tail",
+                std::mem::size_of_val(&super::read_tail(&mut pipe, &mut tail)),
+            ),
+            (
+                "run_command_output_env",
+                std::mem::size_of_val(&super::run_command_output_env(
+                    executable,
+                    &[],
+                    std::time::Duration::from_secs(1),
+                    &[],
+                )),
+            ),
+            (
+                "installed_version_of",
+                std::mem::size_of_val(&super::installed_version_of(
+                    HarnessId::Omp,
+                    executable,
+                    &[],
+                )),
+            ),
         ];
         for (name, size) in sizes {
-            assert!(size <= BUDGET, "{name} future is {size} bytes, over the {BUDGET}-byte budget; sizes={sizes:?}");
+            assert!(
+                size <= BUDGET,
+                "{name} future is {size} bytes, over the {BUDGET}-byte budget; sizes={sizes:?}"
+            );
         }
     }
 

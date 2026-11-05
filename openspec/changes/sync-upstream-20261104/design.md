@@ -42,6 +42,8 @@ Aceitar metadata aditiva de side chat/subagent, preservando parent_chat_id e ori
 
 Aceitar lista/leitura/parada de processos em background e tails/exit code de tools, mantendo mailbox Worker, quiesce, Stop, runway e TurnSteps. ReadToolOutput autoriza host/Chat e mantém Run Journal privado; Write/Edit continuam sanitizados. Não transformar output de comando em acesso genérico ao journal.
 
+R6 (round2): corrigir o seam nativo compartilhado para que o par harness/engine compile no Windows, com locks, privacidade e observação de processo reais. OMP usa o Command/Child do harness (Job na criação em Windows); o Host PTY/socket/FIFO do vendor segue explicitamente Unix, sem anunciar capacidade inexistente. Isso não ativa descoberta de preview, Cloud ou serviços dormentes.
+
 ### D8 — publicação e engine do fork
 
 1.0.16 e workflows integrais do fork vencem; CLI/launch/channel upstream podem existir como código dormente. Main/daemon preservam engine in-process e IPC, sem zeron-engine background nem beta/feed zeron.sh. Sem force/tags/merge da PR. Alternativa rejeitada: adotar packaging beta/managed upstream implicitamente.

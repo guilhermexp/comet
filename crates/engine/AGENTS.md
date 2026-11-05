@@ -167,6 +167,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - Recovery e restart são contrato testado (`restart_resume.rs`): mudança em journal ou watchdog reprova ali antes de reprovar em produção.
 - Feature nova de backend normalmente é: RPC em `zeron-rpc` + handler aqui + comando no ledger de `zeron-doc`. Os três no mesmo commit.
 
+O leitor limitado de stdout/stderr em `harness_updates::read_tail` também mantém o chunk no heap: `version_probe_futures_hold_no_bulk_buffer` limita os futures de leitura, comando e observação de versão a 8 KiB, sem aumentar a pilha dos testes ou dos workers.
+
 ## Verification
 
 - Comandos: `cargo test -p zeron-engine` · `scripts/e2e-smoke.sh`
