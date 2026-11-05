@@ -124,8 +124,11 @@ impl SessionDoc {
             return Err(DocError::Schema("queued message text required".into()));
         }
         let queue = self.doc().get_movable_list("queue");
-        let map = queue.push_container(loro::LoroMap::new())?;
+        // A concurrent drain may take any decodable row, including before
+        // this thread commits. Publish the filled map in one attachment.
+        let map = loro::LoroMap::new();
         write_queued_map(&map, item)?;
+        queue.push_container(map)?;
         self.doc().commit();
         Ok(())
     }
@@ -142,8 +145,9 @@ impl SessionDoc {
             return Err(DocError::Schema("queued message text required".into()));
         }
         let queue = self.doc().get_movable_list("queue");
-        let map = queue.insert_container(index.min(queue.len()), loro::LoroMap::new())?;
+        let map = loro::LoroMap::new();
         write_queued_map(&map, item)?;
+        queue.insert_container(index.min(queue.len()), map)?;
         self.doc().commit();
         Ok(())
     }

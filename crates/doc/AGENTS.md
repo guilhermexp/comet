@@ -37,6 +37,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 - Corpo de mensagem é **LoroText**, nunca reescrita LWW de valor — é a forma medida em 1.03× de oplog. Trocar isso multiplica o histórico.
 - Command ledger segue as regras 1–3: entradas append-only por device; outcome só do host; dedupe/TTL/supersede avaliados na leitura. `queue_command` preenche um `LoroMap` **destacado** e o anexa inteiro: empurrar o container vazio antes expunha `{id, kind}` a leitores concorrentes (e a um commit concorrente) até o payload serializar. Entrada com `id` e sem `payload` na leitura é escrita em voo de peer antigo → `debug`; outros formatos continuam `warn`.
+- `push_queued` e `insert_queued` também preenchem um map destacado antes de anexá-lo à movable list. O drain pode ler/tomar uma row antes do commit: anexar vazio expunha uma mensagem decodificável antes de attachments/hold/gate e podia excluir seu container durante a escrita. Publicação completa preserva todos os campos e o shape sincronizado existente, sem depender de lock na engine.
 - `set_command_status` carimba **toda** entrada com aquele id, não a primeira. Id é a identidade do comando; docs de antes de 2026-08-25 carregam milhares de gêmeos `pending` de um mesmo id (loop de retry no produtor), e carimbar só o primeiro deixava o resto inalcançável — o dead-command sweep do host reportava os restos em todo drain, para sempre.
 - Constantes carregadas do comet original (`STREAM_COMMIT_MS=120`, `DO_FLUSH_MS=5s`, compactação em 8MB, retenção 30d, tail 64) são compatibilidade, não preferência — mudar exige olhar o lado do edge.
 - Split de continuação em 256KB. Tool parts renderizáveis vão pro doc; inputs completos ficam no run journal local do host.
@@ -65,6 +66,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 |---|---|---|
 | `src/**` (fold, ledger, mirror) | unit | `cargo test -p zeron-doc` |
 | `src/schema.rs` (strict parse, diagnóstico estrutural e salvage de shell incremental) | unit | `cargo test -p zeron-doc schema::tests` |
+| `src/queue.rs` (publicação completa de append/restore antes de leitura/drain concorrente) | unit | `cargo test -p zeron-doc queue::tests` |
 | `tests/attachments_roundtrip.rs` | integration | `cargo test -p zeron-doc` |
 | Interop de shape com o edge | integration — pelo `crates/sync/tests/registry_edge.rs` | `cargo test -p zeron-sync` |
 
