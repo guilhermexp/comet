@@ -407,6 +407,54 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_rows_are_complete_before_a_concurrent_drain_can_read_them() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        for insert in [false, true] {
+            let doc = SessionDoc::init("queue-publication").unwrap();
+            let mut queued = QueuedMessage::new("row", "opening", "device");
+            // Make serialization overlap the consumer, just as real upload
+            // paths can; the row must include every field when first visible.
+            queued.attachments = (0..4096)
+                .map(|i| format!("uploads/{i}/image.png"))
+                .collect();
+            queued.hold_for_turn_end = true;
+            let ready = Barrier::new(2);
+            let finished = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    ready.wait();
+                    loop {
+                        let producer_finished = finished.load(Ordering::Acquire);
+                        if let Some(observed) = doc.read_queue().unwrap().into_iter().next() {
+                            assert!(
+                                observed == queued,
+                                "insert={insert}: drain saw partial row: attachments={}, hold={}",
+                                observed.attachments.len(),
+                                observed.hold_for_turn_end
+                            );
+                            break;
+                        }
+                        assert!(!producer_finished, "published row missing");
+                        std::thread::yield_now();
+                    }
+                });
+                ready.wait();
+                let result = if insert {
+                    doc.insert_queued(0, &queued)
+                } else {
+                    doc.push_queued(&queued)
+                };
+                finished.store(true, Ordering::Release);
+                result.unwrap();
+            });
+        }
+    }
+
     use super::*;
 
     fn doc() -> SessionDoc {

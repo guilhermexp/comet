@@ -1,5 +1,14 @@
 ## ADDED Requirements
 
+### Requirement: Queued message publication is complete before delivery
+
+The integration SHALL publish each appended or restored queued message with all of its fields before a concurrent local consumer can observe or remove it, without changing the synchronized queue shape.
+
+#### Scenario: A drain reads during queued message serialization
+- **Test:** unit
+- **WHEN** a message with attachments and a hold policy is appended or restored while the host reads its queue
+- **THEN** the host observes either no row or the complete row, preserving attachments and hold policy, and cannot delete a partially written container
+
 ### Requirement: Alternative upstream interfaces require explicit activation
 
 The fork SHALL retain its gpui interface, Workers, Details, managed Usage and right-panel terminal while integrating shared upstream changes. Alternative interfaces and beta launch paths SHALL remain dormant. The normal engine startup SHALL serve plugin/template RPCs while preserving root grants and rejecting native plugin MCP injection into runs.
