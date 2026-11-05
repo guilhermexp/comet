@@ -5424,6 +5424,24 @@ esac
     }
 
     #[test]
+    fn version_probe_futures_hold_no_bulk_buffer() {
+        // Keep the same inline-memory budget as the engine's diff captures:
+        // debug callers reserve each nested future on their 2 MiB stack.
+        const BUDGET: usize = 8 * 1024;
+        let mut pipe = tokio::io::empty();
+        let mut tail = Vec::new();
+        let executable = std::path::Path::new("unused-version-probe");
+        let sizes = [
+            ("read_tail", std::mem::size_of_val(&super::read_tail(&mut pipe, &mut tail))),
+            ("run_command_output_env", std::mem::size_of_val(&super::run_command_output_env(executable, &[], std::time::Duration::from_secs(1), &[]))),
+            ("installed_version_of", std::mem::size_of_val(&super::installed_version_of(HarnessId::Omp, executable, &[]))),
+        ];
+        for (name, size) in sizes {
+            assert!(size <= BUDGET, "{name} future is {size} bytes, over the {BUDGET}-byte budget; sizes={sizes:?}");
+        }
+    }
+
+    #[test]
     fn pi_checks_the_active_package_scope() {
         assert!(matches!(
             provider(HarnessId::Pi).latest,
