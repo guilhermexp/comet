@@ -12,8 +12,24 @@ use zeron_proto::{ORIGIN_ENV, chat_origin, terminal_origin};
 /// see its proxy move elsewhere would otherwise race another test's service.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Child(std::process::Child);
+impl Child {
+    fn spawn(command: &mut std::process::Command) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        Self(command.spawn().unwrap())
+    }
+}
 impl Drop for Child {
     fn drop(&mut self) {
+        // A shell can leave its server alive after killing only the launcher.
+        // Every guard owns a fresh group, never the test runner's group.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -26,14 +42,12 @@ async fn dropping_a_launcher_closes_its_servers_output_pipe() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let dir = tempfile::tempdir().unwrap();
     let script = "import os,http.server,socketserver; server=socketserver.TCPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler); print(os.getpid(),flush=True); server.serve_forever()";
-    let mut launcher = Child(
+    let mut launcher = Child::spawn(
         std::process::Command::new("sh")
             .args(["-c", "python3 -c \"$1\"; true", "fixture-shell", script])
             .current_dir(dir.path())
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(std::process::Stdio::piped()),
     );
     let stdout = tokio::process::ChildStdout::from_std(launcher.0.stdout.take().unwrap()).unwrap();
     let mut reader = tokio::io::BufReader::new(stdout);
@@ -91,13 +105,11 @@ fn launch_from(cwd: &Path, http: bool, origin: Option<String>) -> Child {
     } else {
         command.args(["-c", "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(30)"]);
     }
-    Child(
+    Child::spawn(
         command
             .current_dir(cwd)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .unwrap(),
+            .stderr(std::process::Stdio::inherit()),
     )
 }
 async fn wait(service: &PreviewService, expected_pid: Option<u32>) {
@@ -216,15 +228,13 @@ async fn a_discovered_server_is_probed_once_not_every_cycle() {
          socketserver.TCPServer(('127.0.0.1',0),H).serve_forever()\n",
         log = log.display().to_string()
     );
-    let server = Child(
+    let server = Child::spawn(
         std::process::Command::new("python3")
             .args(["-c", &script])
             .env(ORIGIN_ENV, chat_origin(&chat))
             .current_dir(&app)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .unwrap(),
+            .stderr(std::process::Stdio::inherit()),
     );
     let service = PreviewService::new(
         temp.path().join("names.json"),
@@ -290,7 +300,7 @@ c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK'
         ready = ready.display().to_string(),
         connections = connections.display().to_string(),
     );
-    let mut callback = Child(
+    let mut callback = Child::spawn(
         std::process::Command::new("python3")
             .args([
                 "-c",
@@ -302,9 +312,7 @@ c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK'
             .env(ORIGIN_ENV, chat_origin(&chat))
             .current_dir(&app)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .unwrap(),
+            .stderr(std::process::Stdio::inherit()),
     );
     let port: u16 = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -426,14 +434,12 @@ async fn backgrounded_scrubbed_terminal_and_out_of_tree_servers_stay_attributed(
     }
     let _daemon = Kill(daemon);
     // A marked shell that stays alive around a server with no environment.
-    let _scrubbed = Child(
+    let _scrubbed = Child::spawn(
         std::process::Command::new("sh")
             .args(["-c", &format!("env -i {python} -c \"{HTTP_SERVER}\"; true")])
             .env(ORIGIN_ENV, chat_origin(&chat))
             .current_dir(&app)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(std::process::Stdio::null()),
     );
     let outside = launch(&elsewhere, true, Some(chat.as_str()));
     // From a terminal (or the project action running in one), which may

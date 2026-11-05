@@ -33,6 +33,8 @@ Preservar limites de frames, backpressure e teardown de peers. Não colocar cred
 
 ## Verification
 
+Os guards de subprocesso em `tests/discovery.rs` possuem um process group Unix exclusivo e encerram launcher + descendentes no Drop. Matar apenas o shell deixa o servidor com stderr do gate aberto; `dropping_a_launcher_closes_its_servers_output_pipe` exige EOF após teardown, sem retry/sleep. O cenário double-fork mantém seu guard explícito separado.
+
 | Camada / path | Tier | Comando |
 |---|---|---|
 | `src/**` | unit | `cargo test -p zeron-preview --lib` |
