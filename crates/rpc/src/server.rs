@@ -317,6 +317,84 @@ mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelled_ipc_acceptors_stop_listening_even_with_an_inherited_descriptor() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        struct NeverCalled;
+        #[async_trait::async_trait]
+        impl RpcService for NeverCalled {
+            async fn handle(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+            ) -> Result<crate::RpcReply, crate::RpcError> {
+                panic!("cancelled IPC must not dispatch requests")
+            }
+        }
+        struct ForkHold {
+            pid: libc::pid_t,
+            release: UnixStream,
+        }
+        impl Drop for ForkHold {
+            fn drop(&mut self) {
+                let _ = self.release.write_all(b"x");
+                unsafe {
+                    libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+
+        for scoped in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let service: Arc<dyn RpcService> = Arc::new(NeverCalled);
+            let server = if scoped {
+                tokio::spawn(serve_ws_listener_scoped(
+                    listener,
+                    service,
+                    IpcTokens::generate().unwrap(),
+                ))
+            } else {
+                tokio::spawn(serve_ws_listener(listener, service, "test-token".into()))
+            };
+            // No await after spawn: cancellation below also covers an acceptor
+            // which has never been polled. Hold its inherited fd until checked.
+            let (mut ready, child_ready) = UnixStream::pair().unwrap();
+            let (release, child_release) = UnixStream::pair().unwrap();
+            let (parent_ready_fd, parent_release_fd) = (ready.as_raw_fd(), release.as_raw_fd());
+            let (ready_fd, release_fd) = (child_ready.as_raw_fd(), child_release.as_raw_fd());
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                // Only async-signal-safe syscalls after a multithreaded fork.
+                unsafe {
+                    libc::close(parent_ready_fd);
+                    libc::close(parent_release_fd);
+                    libc::write(ready_fd, b"r".as_ptr().cast(), 1);
+                    let mut signal = 0_u8;
+                    libc::read(release_fd, (&mut signal as *mut u8).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            let hold = ForkHold { pid, release };
+            drop(child_ready);
+            drop(child_release);
+            ready.read_exact(&mut [0]).unwrap();
+            server.abort();
+            let _ = server.await;
+            let connection = tokio::net::TcpStream::connect(address).await;
+            drop(hold);
+            assert!(
+                connection.is_err(),
+                "scoped={scoped}: acceptor remained live: {connection:?}"
+            );
+        }
+    }
+
     #[test]
     fn only_an_incomplete_websocket_handshake_is_benign() {
         assert!(incomplete_handshake(&Error::Protocol(
