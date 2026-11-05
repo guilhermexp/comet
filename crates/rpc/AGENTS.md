@@ -64,6 +64,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Verification
 
+Os acceptors IPC possuem o listener exclusivamente. No Linux, cancelar/destruir o future executa shutdown do socket antes de fechar o descritor: uma cópia CLOEXEC herdada por fork não pode manter a porta escutando até exec. O guard é construído antes do future, cobrindo cancelamento antes do primeiro poll; ambas as entradas (token único e full/agent) usam o mesmo loop e mantêm autorização/Origin. Outras plataformas preservam o fechamento do handle nativo.
+
 - Comandos: `cargo test -p zeron-rpc`
 
 | Camada / path | Tier exigido | Como rodar |
@@ -71,6 +73,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 | `src/**` (envelopes, transporte) | unit | `cargo test -p zeron-rpc` |
 | `src/method.rs` (registro de métodos, incluindo aposentadoria OMP e preservação de Codex Voice) | unit | `cargo test -p zeron-rpc method::tests::every_method_has_info_and_stream_implies_forwardable -- --exact` |
 | `src/server.rs` (classificação do handshake IPC) | unit | `cargo test -p zeron-rpc server::tests::only_an_incomplete_websocket_handshake_is_benign -- --exact` |
+| `src/server.rs` (cancelamento do listener Linux com descritor herdado) | unit — fork/pipe controlado, sem timeout/sleep/retry | `cargo test -p zeron-rpc --lib cancelled_ipc_acceptors_stop_listening_even_with_an_inherited_descriptor` |
 | `src/device_room.rs` (retomada do HostRelay e cooldown remoto) | unit | `cargo test -p zeron-rpc --lib device_room::tests::local_wake -- --nocapture` |
 | `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p zeron-rpc` |
 | `tests/device_room.rs` (revogação de credencial) | integration | `cargo test -p zeron-rpc --test device_room sign_out_closes_cached_peer_links -- --exact` |

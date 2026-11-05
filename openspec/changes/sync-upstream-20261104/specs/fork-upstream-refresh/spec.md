@@ -28,6 +28,11 @@ The integration SHALL preserve root-only Chat tools, authenticated Workers clien
 - **WHEN** the Workers controller queries or creates a registered Project
 - **THEN** it authenticates to the same engine and its spawned Worker does not inherit that credential
 
+#### Scenario: Cancelled Linux IPC listener has an inherited descriptor
+- **Test:** unit
+- **WHEN** an IPC acceptor is cancelled, including before its first poll, while a pre-exec child holds an inherited listener descriptor
+- **THEN** the socket stops accepting before cancellation completes, without waiting for the child to exec or changing full/agent authorization
+
 ### Requirement: Shared improvements preserve transcript privacy and lineage
 
 Accepted access modes, process inspection and tool output SHALL preserve host ownership, sanitized transcript inputs, independent child lineage and fork steering behavior.

@@ -145,24 +145,66 @@ async fn handle_request(
 /// process (another OS user, a sandboxed app, a container sharing the host
 /// network) can open this port, and the engine behind it can start agents and
 /// broker vault grants.
-pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcService>, token: String) {
-    // One full token; an agent token no one holds.
-    let tokens = match crate::ipc_auth::generate_token() {
-        Ok(agent) => IpcTokens { full: token, agent },
-        Err(err) => {
-            tracing::error!(error = %err, "rpc: no randomness for the agent token; not serving");
-            return;
+pub fn serve_ws_listener(
+    listener: TcpListener,
+    service: Arc<dyn RpcService>,
+    token: String,
+) -> impl std::future::Future<Output = ()> + Send {
+    let listener = OwnedListener(listener);
+    async move {
+        // One full token; an agent token no one holds.
+        let tokens = match crate::ipc_auth::generate_token() {
+            Ok(agent) => IpcTokens { full: token, agent },
+            Err(err) => {
+                tracing::error!(error = %err, "rpc: no randomness for the agent token; not serving");
+                return;
+            }
+        };
+        serve_owned_listener(listener, service, tokens).await
+    }
+}
+
+/// An acceptor owns the listening socket, including copies briefly inherited
+/// by pre-exec children. Closing only our fd need not stop that socket.
+struct OwnedListener(TcpListener);
+
+impl std::ops::Deref for OwnedListener {
+    type Target = TcpListener;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for OwnedListener {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // Linux shutdown changes the shared socket state, so a fork's
+            // CLOEXEC copy cannot keep accepting after cancellation completes.
+            if unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) } < 0 {
+                tracing::debug!(error = %std::io::Error::last_os_error(), "rpc: listener shutdown failed");
+            }
         }
-    };
-    serve_ws_listener_scoped(listener, service, tokens).await
+    }
 }
 
 /// [`serve_ws_listener`] answering two tokens: the full one, and the
 /// agent-scoped one, whose connections reach only
 /// [`crate::agent_allowed`] methods and are served as
 /// [`crate::Caller::Agent`].
-pub async fn serve_ws_listener_scoped(
+pub fn serve_ws_listener_scoped(
     listener: TcpListener,
+    service: Arc<dyn RpcService>,
+    tokens: IpcTokens,
+) -> impl std::future::Future<Output = ()> + Send {
+    // Construct the guard before returning the future: an aborted task may
+    // never poll it, but must still shut down its listening socket.
+    serve_owned_listener(OwnedListener(listener), service, tokens)
+}
+
+async fn serve_owned_listener(
+    listener: OwnedListener,
     service: Arc<dyn RpcService>,
     tokens: IpcTokens,
 ) {

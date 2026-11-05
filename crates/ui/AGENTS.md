@@ -461,6 +461,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Verification
 
+Falha de bootstrap local continua exigindo porta IPC fechada antes do erro. `InProcessEngine::shutdown` aguarda o acceptor abortado; o guard RPC Linux encerra também o socket compartilhado por descritores herdados de fork. O teste mantém a asserção TCP original, sem retry/sleep; serve para a primeira montagem do processo, quando o lookup de PATH pode iniciar um shell em background.
+
 - GPUI `debug_bounds` indexes only elements with an explicit `.debug_selector`; `.id` alone does not expose test bounds. Cached-view paint replay omits that bounds map, so fixtures must invalidate and freshly paint a cached subtree before measuring its selectors. In `TestAppContext`, a top-level `Entity::update` flushes effects and may automatically draw dirty windows; nest cache invalidation and the measured `window.draw(cx).clear()` in the same outer `cx.update` so that automatic frame cannot consume the invalidation before the measured draw. Fixtures that render Shell through a cached/nested view must also retain a Shell observer that forwards invalidations to the test host.
 - Capturas nativas que chamam `window.draw` usam `AnyWindowHandle::update`: o `WindowHandle<T>::update` tipado mantém a raiz emprestada, e desenhá-la dentro desse callback causa atualização reentrante. Fixtures isoladas de componentes não inicializam Shell, engine ou providers.
 - `examples/composer-mentions-fixture.rs` monta somente Composer/Todo e `AppState` sintético, sem Shell, engine ou providers, com configuração temporária. Captura a própria janela e imprime o draft e a transformação de prompt para inspecionar identidade; encerra em tempo limitado.
