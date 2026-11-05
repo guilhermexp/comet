@@ -2211,9 +2211,16 @@ timeout = 5
         assert!(updated.contains("command = \"prettier\""));
         assert!(!updated.contains("kimi-hook.sh\\\" old"));
         assert_eq!(updated.matches("[[hooks]]").count(), 10);
+        let script = crate::app_paths::app_hooks_root().join("kimi-hook.sh");
         assert_eq!(
-            updated
-                .matches("/.zeron/workers/hooks/kimi-hook.sh")
+            parsed["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hook| hook
+                    .get("command")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|command| command.contains(script.to_string_lossy().as_ref())))
                 .count(),
             9
         );

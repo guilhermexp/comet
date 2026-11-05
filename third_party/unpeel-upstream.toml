@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "1897e6d20266cf20e0cc76a0974f49d629128ccd"
+vendored_tree = "3ccbca1ed6fe31b903a3de54f33df05cc292684c"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -282,3 +282,8 @@ base_revision_resolves_upstream = false
 #   consume real primitives; downstream checkout/activity/registry do likewise.
 # Windows GNU check uses the exact native-platform-check package pair.
 # local_modifications_count remains the unrecomputed historical value.
+
+# 2026-11-05 — round2 full-workspace fixture isolation: verify default and
+# explicit COMET_WORKERS_HOOKS_DIR roots in private subprocesses, and check
+# Kimi managed commands against the resolved root rather than a default-only
+# path substring. Runtime hooks/grants/configuration behavior unchanged.
