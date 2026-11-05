@@ -7360,6 +7360,47 @@ mod stop_fenced_hold_tests {
     use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
     use zeron_proto::HarnessId;
 
+    async fn terminal_command_status(
+        handle: &Arc<super::ChatDocHandle>,
+        id: &str,
+    ) -> SessionCommandStatus {
+        handle
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .status
+    }
+
+    #[tokio::test]
+    async fn command_status_wait_does_not_return_a_background_owners_pending_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(
+            Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap()),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("claimed-command").unwrap();
+        let id = host
+            .queue_command(&handle.chat_id, SessionCommandPayload::Interrupt {})
+            .unwrap();
+        assert!(host.claim_command_execution(&id).unwrap());
+        let wait = terminal_command_status(&handle, &id);
+        tokio::pin!(wait);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "a claim is not a terminal outcome"
+        );
+        host.resolve_command(&handle, &id, SessionCommandStatus::Applied, None);
+        lock(&host.inner.executing).remove(&id);
+        assert_eq!(wait.await, SessionCommandStatus::Applied);
+    }
+
     #[tokio::test]
     async fn stop_context_tracks_assistant_turns_and_preserves_stale_stop_rejection() {
         use zeron_doc::{MessageRole, MessageStatus, SessionMessageEntry};
