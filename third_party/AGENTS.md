@@ -220,6 +220,8 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 
 A limitação registrada em 2026-10-19 (`.tmp/reports/ci-20261019.md`) é histórica; o brief round2 autorizou a portabilidade real. `unpeel-core::platform` preserva flock/0600 no Unix e implementa LockFileEx, DACL por SID, rename durável e handles de processo no Windows; os consumidores Comet usam o mesmo seam. Adapters de hooks, socket/FIFO e Host PTY Unix conservam cfg e recusa explícita onde não há transporte Windows. O cross-check deve selecionar exatamente `zeron-harness` e `zeron-engine`, como native-platform-check; compilar preview sozinho não basta. Cross-check não prova execução/GUI no Windows.
 
+Compilar a biblioteca não prova `unpeel-core --tests` no Windows: fixtures de Host/socket/hooks e helpers de transcript ainda referenciam símbolos Unix indisponíveis nessa configuração. A regressão nova de substituição do inode executável é `cfg(unix)` por verificar permissões POSIX; não desabilitar testes neutros nem o módulo inteiro para ocultar os demais erros. A revisão OpenQodex da rodada 2 registra o teste Linux, o check Windows com `--tests` e a lista de diagnósticos remanescentes no relatório.
+
 ## Child DOX Index
 
 | Domínio | Doc | Papel |

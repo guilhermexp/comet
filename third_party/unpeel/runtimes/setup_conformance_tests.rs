@@ -2437,6 +2437,7 @@ timeout = 5
         assert!(super::GROK_COMMAND_WRAPPER_SCRIPT.contains("disable_compat_vendor_hooks"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn executable_script_replacement_preserves_the_published_inode() {
         use std::io::Read;

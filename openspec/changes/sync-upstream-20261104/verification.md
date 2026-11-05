@@ -161,7 +161,7 @@ Publicação da fila: `cargo test --workspace` após IPC saiu 101 em `message_qu
 
 ## Fechamento da rodada 2 — recibos finais
 
-Última alteração de código/testes avaliada: `73db07cb3`. Commits posteriores deste fechamento só alteram documentação. R1–R6 e as falhas locais adicionais foram corrigidos; nenhuma falha é dispensada por baseline. Logs em `/home/agent/projects/comet-sync-upstream-20261104/.tmp/reports/comet-sync-ci-round2-20261105-logs/`; relatório `/home/agent/projects/comet-sync-upstream-20261104/.tmp/reports/comet-sync-ci-round2-20261105.md`.
+Última alteração de código/testes avaliada: `73db07cb3`. O fechamento em `8f4f86ec0` alterou apenas documentação; a revisão posterior de teste está registrada ao fim deste documento. R1–R6 e as falhas locais adicionais foram corrigidos; nenhuma falha é dispensada por baseline. Logs em `/home/agent/projects/comet-sync-upstream-20261104/.tmp/reports/comet-sync-ci-round2-20261105-logs/`; relatório `/home/agent/projects/comet-sync-upstream-20261104/.tmp/reports/comet-sync-ci-round2-20261105.md`.
 
 | Comando | Exit | Log |
 |---|---:|---|
@@ -193,3 +193,12 @@ Browser final: build/storage e default/OpenGL × X11/Wayland passaram, com Shell
 **Aceite global de 6.7 continua incompleto:** windows.yml (UI/fontes/shader, engine/auth/paths, app/packaging/instalador/startup e GUI condicional) e a projeção/testes de runtime Voice em Windows nativo não foram executados. O par GNU harness+engine saiu 0, mas não substitui runtime Windows/MSVC/GUI. Consulta berth somente leitura encontrou apenas a box agents-us, Linux amd64; nenhum runner Windows disponível e nenhum dispatch permitido/executado. Esses comandos ficam N/E, sem exit 0 atribuído. Jobs macOS/iOS ficam “provado só no CI remoto”, conforme brief; não existe recibo remoto novo para estes commits. Inventário literal dos 52 shell steps e status por plataforma em workflow-commands.md e workflow-local-coverage.json.
 
 DOX donos e matrizes, design/specs/tasks/conflicts reconciliados. App 1.0.16, root Cargo.toml, edge/, updater/feed do app e grants/MCP preservados; nenhum novo ignore/skip/retry/sleep ou alvo de workflow removido. git diff --check da rodada sai 0. Nenhum push, merge, tag, alteração de PR ou dispatch. OpenSpec permanece aberta, sem archive por instrução do dono. Trail continua indisponível nesta box (127), sem refresh fictício de grafo.
+
+
+## Revisão OpenQodex — gate Unix da regressão R5 (2026-11-05)
+
+`executable_script_replacement_preserves_the_published_inode` precisava de `cfg(unix)` por usar PermissionsExt e verificar bits POSIX. Gate aplicado à função inteira, mantendo todas as asserções e os testes neutros ativos. A auditoria de std::os::unix/std::os::fd/libc nas adições e testes alterados da rodada (d710ad591..8f4f86ec0) encontrou apenas essa omissão: os demais acessos têm cfg de arquivo, módulo, função ou bloco; matriz em review-unix-test-audit.json nos logs round2.
+
+Teste Linux filtrado: exit 0, 1 passed. Check GNU `cargo check --manifest-path third_party/unpeel/crates/Cargo.toml --locked --target x86_64-pc-windows-gnu -p unpeel-core --tests`: exit 101 antes (127 diagnósticos) e depois (125). Os dois diagnósticos dessa função desapareceram. Os restantes são fixtures de hooks (110), Host (3), session_ops (5), browser_mcp (3), relay_uplink (2) e helpers de transcripts (2), que ainda importam símbolos/transportes Unix indisponíveis nessa configuração. O check idêntico com --lib no lugar de --tests saiu 0. Não se alega compilação dos testes Windows nem execução nativa. Logs review-unix-windows-before-toolchain.log, review-unix-windows-after.log, review-unix-windows-lib.log e review-unix-linux-test.log; primeiro ensaio sem o PATH do toolchain local falhou por gcc ausente, resolvido usando o toolchain já extraído nesta tarefa.
+
+Nova árvore vendor b71f4031eb8288056b88df54edb51c3661c2bbfc, base upstream e contador histórico preservados; nenhum fonte de produção ou workflow mudou. O relatório round2 recebe apêndice com o commit desta revisão e a prova downstream, sem reescrever os recibos históricos acima.

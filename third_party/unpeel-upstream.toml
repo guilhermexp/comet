@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "3ccbca1ed6fe31b903a3de54f33df05cc292684c"
+vendored_tree = "b71f4031eb8288056b88df54edb51c3661c2bbfc"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -287,3 +287,12 @@ base_revision_resolves_upstream = false
 # explicit COMET_WORKERS_HOOKS_DIR roots in private subprocesses, and check
 # Kimi managed commands against the resolved root rather than a default-only
 # path substring. Runtime hooks/grants/configuration behavior unchanged.
+
+# 2026-11-05 — OpenQodex round2 review (test portability only): gate
+# executable_script_replacement_preserves_the_published_inode with cfg(unix)
+# because it asserts POSIX permissions through PermissionsExt. Keep all its
+# assertions and platform-neutral tests intact. Audit the round2 test additions
+# for Unix/libc references; other new uses are already gated. The Linux test
+# passes; Windows core --lib checks, while --tests still reports unrelated
+# Host/socket/hook/transcript fixture portability errors (recorded separately).
+# No runtime source, upstream base or historical modification count changed.
