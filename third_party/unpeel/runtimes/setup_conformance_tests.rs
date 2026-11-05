@@ -2431,6 +2431,26 @@ timeout = 5
     }
 
     #[test]
+    fn executable_script_replacement_preserves_the_published_inode() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wrapper");
+        let original = "#!/bin/sh\nprintf old\n";
+        let replacement = "#!/bin/sh\nprintf new\n";
+        super::write_executable_script(&path, original, "original wrapper").unwrap();
+        let mut executing = fs::File::open(&path).unwrap();
+        super::write_executable_script(&path, replacement, "replacement wrapper").unwrap();
+        let mut retained = String::new();
+        executing.read_to_string(&mut retained).unwrap();
+        assert_eq!(retained, original, "published scripts must never be truncated in place");
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1, "no staging file leaks");
+    }
+
+    #[test]
     fn grok_command_wrapper_executes_with_resolved_light_overlay_config() {
         let root = temp_path("grok-wrapper");
         let real_home = root.join("real-home");

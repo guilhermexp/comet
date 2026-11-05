@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "ef358409a8cbc2e15e4efef6dad758518d21b790"
+vendored_tree = "41fd459a5803fd6b9f3b6dd0b162d73e3ec9cb7b"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -263,3 +263,6 @@ base_revision_resolves_upstream = false
 # 2026-11-05 — CI R4 (local metadata patch): shorten the sessions introduction
 # in mcp_host.rs; preserve action/argument schemas, key limits and full help.
 # Existing context-budget regression remains <4 KiB/domain and <11 KiB total.
+
+# 2026-11-05 — CI R5 RED: retained-reader regression for executable script
+# replacement, before making publication atomic; no production change yet.
