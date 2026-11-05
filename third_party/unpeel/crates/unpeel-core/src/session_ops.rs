@@ -14,6 +14,7 @@
 
 #[cfg(unix)]
 use crate::session_host::socket_path;
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -27,6 +28,7 @@ use crate::session_host::{
 };
 use crate::state::{BrowserAccess, SessionInfo};
 
+#[cfg(unix)]
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(1_000);
 // The session host escalates TERM→KILL within ~50ms of the kill command, so
 // this wait is really for the exited-manifest PUBLISH, which can lag well

@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "b71f4031eb8288056b88df54edb51c3661c2bbfc"
+vendored_tree = "ed6b1eac31ddd261194b342d15e99737331bd9a0"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -296,3 +296,7 @@ base_revision_resolves_upstream = false
 # passes; Windows core --lib checks, while --tests still reports unrelated
 # Host/socket/hook/transcript fixture portability errors (recorded separately).
 # No runtime source, upstream base or historical modification count changed.
+
+# 2026-11-05 — review2 finding 4: cfg(unix) on session_ops socket-only
+# std::io imports and SOCKET_IO_TIMEOUT, matching socket_command. No behavior,
+# base revision, license or historical modification-count change.
