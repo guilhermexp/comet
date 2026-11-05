@@ -2,12 +2,17 @@
 
 ### Requirement: Alternative upstream interfaces require explicit activation
 
-The fork SHALL retain its gpui interface, Workers, Details, managed Usage and right-panel terminal while integrating shared upstream changes. Alternative interfaces, plugins/templates and beta launch paths SHALL remain dormant until separately authorized.
+The fork SHALL retain its gpui interface, Workers, Details, managed Usage and right-panel terminal while integrating shared upstream changes. Alternative interfaces and beta launch paths SHALL remain dormant. The normal engine startup SHALL serve plugin/template RPCs while preserving root grants and rejecting native plugin MCP injection into runs.
 
 #### Scenario: Normal fork startup after integration
 - **Test:** unit
 - **WHEN** the fork starts with its existing settings
-- **THEN** its gpui shell and Workers remain available and no alternative interface or plugin service starts automatically
+- **THEN** its gpui shell and Workers remain available and plugin/template services start without activating an alternative interface or granting per-run MCP
+
+#### Scenario: Plugin identity registration is unavailable
+- **Test:** unit
+- **WHEN** plugin key registration returns 404, 501 or a network error
+- **THEN** startup and authentication remain usable, local plugins are listed, and the failure is logged without granting additional authority
 
 ### Requirement: Upstream IPC hardening preserves fork grants
 

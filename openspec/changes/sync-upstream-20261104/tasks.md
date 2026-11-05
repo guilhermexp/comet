@@ -9,7 +9,7 @@
 ## 2. Integração e contratos
 
 - [x] 2.1 Fazer merge real --no-ff --no-commit e resolver os 153 paths preservando customizações; verificar ausência de unmerged paths e pais do merge.
-- [x] 2.2 D1/D2/D8: manter zgx/plugins/templates/beta/edge adicional dormentes e publicação/engine do fork; verificar wiring e atualizar DOX donos no fechamento documental.
+- [x] 2.2 D1/D2/D8: manter inicialmente zgx/plugins/templates/beta/edge adicional dormentes (D1a ampliado na seção 5) e publicação/engine do fork; verificar wiring e atualizar DOX donos no fechamento documental.
 - [x] 2.3 D3/D4/D6/D7/D10: adaptar UI/Usage/harnesses/lineage/output e a coexistência das duas APIs de criação Files; verificar regressões focadas e registrar contratos nos DOX donos.
 - [x] 2.4 D5: adaptar escopos IPC e registry único sem perder grants/clientes; verificar regressões MCP/Workers/engine.
 - [x] 2.5 D9: portar APIs zui necessárias em fonte separada, registrar proveniência e verificar ambas regras de pontuação + compile downstream.
@@ -29,7 +29,7 @@
 
 ## Workflow follow-up
 
-- Orquestrador executa revisão/aceite no Mac; dono decide ativação futura de D1/D2/D8.
+- Orquestrador executa revisão/aceite no Mac; D1a foi autorizado; dono decide ativação futura da interface D1 e dos serviços D2/D8.
 - Não arquivar esta OpenSpec nem fazer merge da PR nesta execução.
 
 ## 5. CI e D1a (brief 2026-11-05)

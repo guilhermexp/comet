@@ -8,7 +8,7 @@ Integrar por merge real o intervalo fixo `d5a01522..35561ead` (107 commits sem m
 
 - Loro 1.17, diagnóstico de sync remoto, imagens locais/replies, anotações no Browser, busca nos Settings, atalhos macOS e scroll suave.
 - Modos de acesso/plano, Fx/ACP registry, processos em background e leitura host-owned de output, preservando OMP/Kimi, leases, grants raiz e steering.
-- Fontes zgx/plugins/templates/beta/card-web/directory entram dormentes onde conflitam com os contratos do fork; decisões conservadoras D1–D9 no design.
+- Fontes zgx/beta/card-web/directory ficam dormentes; o follow-up D1a ativa o runtime de plugins/templates da engine sem alterar grants, injetar MCP ou ativar outra interface. Decisões D1–D10 no design.
 - Versão 1.0.16, release/feed/packaging/workflows do fork, zui vendorizado com proveniência e shells gpui/Workers/Details/Usage preservados.
 
 ## Capabilities

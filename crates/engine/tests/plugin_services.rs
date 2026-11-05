@@ -144,16 +144,8 @@ fn engine(dir: &Path, device: &str, rooms: &str) -> Engine {
         })
     }));
     let links = LinkCache::new(links);
-    core.set_links(links.clone());
-    // D1: production startup leaves plugins dormant. This fixture explicitly
-    // starts and attaches the service to test its retained implementation.
-    core.plugins.set_links(links);
-    core.plugins.start();
-    let rpc = Arc::try_unwrap(core.rpc_service())
-        .ok()
-        .expect("unique fixture service")
-        .with_plugins(core.plugins.clone());
-    let service = Arc::new(rpc);
+    core.set_links(links);
+    let service = core.rpc_service();
     let host = zeron_rpc::HostRelay::spawn(
         zeron_rpc::HostRelayConfig::new(rooms, device, Arc::new(StaticToken("test-user".into()))),
         service.clone(),

@@ -10,9 +10,13 @@ Incorporar o alvo como segundo pai de um merge, após commit próprio de planeja
 
 ## Decisions
 
-### D1 — zgx, plugins e templates dormentes
+### D1 — interface dormente; D1a — runtime de plugins/templates ativo
 
-Conservar apps/zgx como fonte fora do workspace padrão, sem trocar launch, shell gpui, Workers, Details, Usage ou terminal direito. A capability zgx-interface-v1 não é anunciada. Plugins/templates e serviços novos ficam sem ativação automática na engine do fork; autorização de plugin nunca substitui grant raiz. Alternativa rejeitada: migrar a interface e iniciar código de plugin sem aceite. Decisão aberta ao dono: se e quando iniciar migração separada para zgx/plugins/templates.
+Conservar apps/zgx fora do workspace padrão, sem trocar launch, shell gpui, Workers, Details, Usage ou terminal direito. Inset/split e a interface zgx permanecem dormentes. A capability zgx-interface-v1 não é anunciada: o cliente beta a usa para a interface completa, não como gate independente de plugins/templates.
+
+D1a autorizado pelo brief de 2026-11-05: iniciar Plugins::start no boot, ligar attach_auth em set_auth, links em set_links e with_plugins no RPC normal. Plugins/templates ficam acessíveis pelos RPCs existentes, que os clientes chamam diretamente; não existe capability dedicada a anunciar. Templates conservam o requisito de assets locais previamente instalados, sem ativar renderer/instalação zgx. Falha de registro de identidade /plugin-keys (404, 501 ou rede) degrada com log; startup, sign-in e plugins locais continuam disponíveis. Os serviços adicionais do edge seguem dormentes.
+
+Grants raiz e workers_mcp continuam autoritativos: drive_run limpa mcp e extra_mcp antes do retry, nenhum MCP nativo de plugin entra nas runs, autorização de plugin não concede sessions. SessionsEngine::set_plugins só guarda o seam de injeção MCP, sem consumidor no fork; não é ligado. Alternativa rejeitada: usar a ativação do catálogo de plugins para ampliar autoridade ou anunciar a interface beta.
 
 ### D2 — edge mantém o grafo publicado do fork
 
@@ -52,7 +56,7 @@ O fork já usa parentPath/name e reply WorkspaceEntryMutation. O upstream adicio
 
 ## Risks / Trade-offs
 
-- Grande delta de plugins/registry → runtime dormente, gates e regressões focadas.
+- Grande delta de plugins/registry → D1a ativo com grants preservados, registro remoto best-effort e regressões focadas.
 - API de zui mudou → fonte separada e proveniência; compilação downstream.
 - Mudanças cross-device → campos defaultados e testes proto/doc/sync/edge.
 - Compilação cara → target exclusivo, jobs=2/sccache preservados, df antes dos builds; parar abaixo de 20 GiB.
@@ -64,4 +68,4 @@ Planejamento → fmt → merge real → resolução por arquivo → check all ta
 
 ## Open Questions
 
-Dono decide em trabalhos futuros se ativa zgx/plugins/templates (D1), directory/profile/badges/card-web (D2) ou canal beta/CLI/managed engine (D8). Nesta PR a escolha já está fixada: permanecer dormente. Aceite macOS/iOS e visual precede sair de draft.
+Dono decide em trabalhos futuros se ativa zgx/Inset/split (D1; runtime D1a autorizado), directory/profile/badges/card-web (D2) ou canal beta/CLI/managed engine (D8). D1a fica ativo; as interfaces e serviços de D1/D2/D8 continuam dormentes. Aceite macOS/iOS e visual precede sair de draft.

@@ -357,7 +357,10 @@ impl EngineCore {
                 edge.token.clone(),
             )));
         }
-        // D1: plugin services and native MCP stay dormant in the fork.
+        // D1a: plugin/template RPCs are live; per-run MCP remains grant-only.
+        // set_plugins is intentionally not wired: its native MCP seam is unused
+        // by the fork, and drive_run strips both MCP injection fields.
+        plugins.start();
         sessions.set_doc_host(doc_host.clone());
         // Seed live statuses from the persisted workspace rows so a settled
         // session's context-window usage survives an app restart: the merged
@@ -505,7 +508,7 @@ impl EngineCore {
 
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
-        // D1: do not register plugin identity or start services on sign-in.
+        self.plugins.attach_auth(auth.clone());
         *self
             .auth
             .lock()
@@ -535,7 +538,7 @@ impl EngineCore {
     /// [`Self::dial_device`], and the doc host's queued-attachment transfers.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
         self.doc_host.set_links(links.clone());
-        // D1: no plugin peer subscriptions on normal fork startup.
+        self.plugins.set_links(links.clone());
         *self
             .links
             .lock()
@@ -640,6 +643,7 @@ impl EngineCore {
         .with_remote_terminals(self.remote_terminals.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_worked_projects(self.worked_projects.clone())
+        .with_plugins(self.plugins.clone())
         .with_viewport_focus(self.viewport_focus.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
@@ -1909,6 +1913,10 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(
+            core.plugins.plugins_dir().is_dir(),
+            "plugin watcher startup creates its root"
+        );
         let client = zeron_rpc::memory_client(core.rpc_service());
         let info = client
             .call(zeron_rpc::methods::ENGINE_INFO, serde_json::Value::Null)
@@ -1922,12 +1930,112 @@ mod tests {
             .await
             .expect("normal fork startup serves local plugins");
         assert!(list["plugins"].is_array(), "{list}");
+        // Whole-app template assets are installed by their UI. Seed only the
+        // local fixture; activating the engine must not install the zgx shell.
+        std::fs::create_dir_all(
+            temp.path()
+                .join(plugins::TEMPLATES_DIR)
+                .join(plugins::templates::ZERON_DIR),
+        )
+        .unwrap();
         let templates = client
             .call(zeron_rpc::methods::LIST_TEMPLATES, serde_json::json!({}))
             .await
             .expect("normal fork startup serves templates");
         assert!(templates["templates"].is_array(), "{templates}");
         core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fork_plugin_key_failures_preserve_auth_and_local_plugins() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for failure in ["404 Not Found", "501 Not Implemented", "network"] {
+            let temp = TempDir::new().unwrap();
+            let plugin = temp.path().join("plugins/local-example");
+            std::fs::create_dir_all(&plugin).unwrap();
+            std::fs::write(
+                plugin.join("zeron-plugin.json"),
+                r#"{"id":"local-example","name":"Local","version":"1","entry":"init.luau"}"#,
+            )
+            .unwrap();
+            std::fs::write(plugin.join("init.luau"), "return {}").unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+            let edge = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let count = stream.read(&mut buffer).await.unwrap_or(0);
+                        if count == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                        assert!(request.len() < 32768);
+                    }
+                    if failure != "network" {
+                        let reply = format!(
+                            "HTTP/1.1 {failure}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    }
+                    if request.starts_with(b"POST /plugin-keys ") {
+                        let _ = attempted.send(());
+                    }
+                }
+            });
+            let core = EngineCore::assemble(
+                temp.path(),
+                Arc::new(HarnessRegistry::new()),
+                HarnessId::Mock,
+                None,
+            )
+            .unwrap();
+            let auth = Auth::new(AuthConfig::new(&url, temp.path()));
+            core.plugins
+                .set_directory(Arc::new(plugins::keys::EdgeDirectory::new(
+                    &url,
+                    Arc::new(auth.clone()),
+                )));
+            core.set_auth(auth);
+            tokio::time::timeout(std::time::Duration::from_secs(5), attempts.recv())
+                .await
+                .expect("set_auth starts plugin identity registration")
+                .expect("directory saw registration");
+            assert_eq!(core.auth().access_token().await.unwrap(), "dev-user");
+            let client = zeron_rpc::memory_client(core.rpc_service());
+            let list = client
+                .call(zeron_rpc::methods::LIST_PLUGINS, serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(
+                list["plugins"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["id"] == "local-example"),
+                "{failure}: {list}"
+            );
+            core.shutdown().await;
+            edge.abort();
+        }
     }
 
     #[tokio::test]
