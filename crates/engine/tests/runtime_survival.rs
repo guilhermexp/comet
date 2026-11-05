@@ -1017,7 +1017,13 @@ async fn a_steer_sent_before_stop_is_cancelled_with_it() {
         "the agent to be running the turn",
     )
     .await;
-    rig.core
+    let handle = rig.core.doc_host.open(CHAT).unwrap();
+    let (changed, mut changes) = tokio::sync::watch::channel(());
+    let _subscription = handle.doc().doc().subscribe_root(Arc::new(move |_| {
+        changed.send_replace(());
+    }));
+    let send_id = rig
+        .core
         .doc_host
         .queue_command(
             CHAT,
@@ -1027,19 +1033,35 @@ async fn a_steer_sent_before_stop_is_cancelled_with_it() {
             },
         )
         .unwrap();
-    rig.core
+    let stop_id = rig
+        .core
         .doc_host
         .queue_command(CHAT, SessionCommandPayload::Interrupt {})
         .unwrap();
-    wait_for(
-        || {
-            rig.ledger.kills.load(Ordering::SeqCst) == 1
-                && status(&rig.core) == Some(SessionStatus::Idle)
-        },
-        "the stop to settle",
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A durable outcome for both commands is the completion barrier. A
+    // timer can neither establish their order nor explain a lost Stop.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let commands = handle.doc().read_commands().unwrap();
+            if [&send_id, &stop_id].iter().all(|id| {
+                commands
+                    .iter()
+                    .any(|c| &c.id == *id && c.status != zeron_doc::SessionCommandStatus::Pending)
+            }) {
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("both send and Stop must have durable outcomes");
+    let commands = handle.doc().read_commands().unwrap();
+    assert_eq!(
+        commands.iter().find(|c| c.id == stop_id).unwrap().status,
+        zeron_doc::SessionCommandStatus::Applied,
+        "Stop was lost: {commands:?}"
+    );
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 1, "{commands:?}");
     assert_eq!(
         rig.ledger.spawns.load(Ordering::SeqCst),
         1,
