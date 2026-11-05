@@ -148,7 +148,12 @@ emit_chunked() {
 }
 
 local_command_completed=0
+turn_count=0
 while IFS= read -r line; do
+  # FAKE_OMP_LOG records one `<pid> <type>` row per received command, so a
+  # test can count launches (distinct pids) and wire commands.
+  [ -z "${FAKE_OMP_LOG:-}" ] || printf '%s %s\n' "$$" "$(field type "$line")" >> "$FAKE_OMP_LOG"
+  [ -z "${FAKE_OMP_LOG:-}" ] || printf '%s\n' "$line" >> "$FAKE_OMP_LOG.raw"
   case "$(field type "$line")" in
     negotiate_protocol)
       if [ "$scenario" = "refuses-chunked-frames" ]; then
@@ -227,6 +232,9 @@ while IFS= read -r line; do
       ;;
     steer)
       respond "$line" '{}'
+      ;;
+    # Fire-and-forget frames: no response exists for them.
+    extension_ui_response|host_tool_result)
       ;;
     abort)
       respond "$line" '{}'
@@ -575,6 +583,32 @@ while IFS= read -r line; do
           fail_stage expected_one_dup_result 35
         fi
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after-dup"}}'
+        emit '{"type":"agent_end","messages":[]}'
+      elif [ "$scenario" = "multi-turn" ]; then
+        # One agent run per prompt, in the SAME process. A steer that reaches
+        # a turn in flight is answered by the main loop below.
+        turn_count=$((turn_count + 1))
+        emit '{"type":"agent_start"}'
+        emit "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"turn-$turn_count\"}}"
+        if has "$line" 'hold-open'; then
+          # Stay inside the turn until a steer arrives, then consume it.
+          read -r steer
+          [ -z "${FAKE_OMP_LOG:-}" ] || printf '%s steer\n' "$$" >> "$FAKE_OMP_LOG"
+          if has "$steer" '"type":"steer"'; then
+            respond "$steer" '{}'
+            emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"late"}]}}'
+            emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" steered"}}'
+          else
+            fail_stage multi_turn_steer 80
+          fi
+        fi
+        emit '{"type":"agent_end","messages":[]}'
+      elif [ "$scenario" = "boundary-question" ]; then
+        # A question and a Workers wait still open when the turn ends.
+        emit '{"type":"agent_start"}'
+        emit '{"type":"extension_ui_request","id":"question-open","method":"confirm","title":"Continue?","message":"Run the checks?"}'
+        emit '{"type":"host_tool_call","id":"host-wait","toolCallId":"workers-wait","toolName":"workers","arguments":{"action":"wait_for_status","session_id":"w1","status":"completed","timeout_seconds":1800}}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"boundary"}}'
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "wait" ]; then
         sleep 60

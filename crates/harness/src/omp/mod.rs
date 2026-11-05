@@ -371,25 +371,6 @@ impl Harness for OmpHarness {
         let _ = process
             .request(json!({ "type": "set_ask_dialog", "enabled": true }))
             .await;
-        if let Some(session_path) = request.resume.as_deref() {
-            // Hand OMP the chat's model up front: since OMP 18.11 a headless
-            // switch_session throws "Could not restore model" when the
-            // session's saved model does not resolve at open time, instead of
-            // falling back. An explicit model skips that restore.
-            let mut switch = json!({ "type": "switch_session", "sessionPath": session_path });
-            if let Some(model) = request.model.as_deref() {
-                let (provider, model_id) = split_model_id(model)?;
-                switch["provider"] = json!(provider);
-                switch["modelId"] = json!(model_id);
-            }
-            let response = process.request(switch).await?;
-            if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
-                return Err(HarnessError::Protocol(
-                    "OMP session resume was cancelled".into(),
-                ));
-            }
-        }
-
         let executable = if workers_expected || request.sessions.is_some() {
             Some(self.workers_executable().ok_or_else(|| {
                 HarnessError::Protocol("Workers controller executable is unavailable".into())
@@ -454,6 +435,35 @@ impl Harness for OmpHarness {
                     "tools": host_tools
                 }))
                 .await?;
+        }
+
+        // Resume AFTER the host tools exist. OMP builds the resumed session's
+        // system prompt (and its tool roster) when `switch_session` loads it;
+        // with the host tools registered afterwards, the first request listed
+        // none of them in the system prompt, differed from the previous
+        // process's prefix there, and queued a hidden "Tool availability
+        // changed" notice before the user message. Anthropic then missed the
+        // prompt cache from the system block on and dropped the signed
+        // thinking of earlier turns. Measured against the installed omp 18.16
+        // (openspec preserve-omp-prompt-cache-across-turns, request-diff):
+        // tools first leaves the whole prefix byte-identical.
+        if let Some(session_path) = request.resume.as_deref() {
+            // Hand OMP the chat's model up front: since OMP 18.11 a headless
+            // switch_session throws "Could not restore model" when the
+            // session's saved model does not resolve at open time, instead of
+            // falling back. An explicit model skips that restore.
+            let mut switch = json!({ "type": "switch_session", "sessionPath": session_path });
+            if let Some(model) = request.model.as_deref() {
+                let (provider, model_id) = split_model_id(model)?;
+                switch["provider"] = json!(provider);
+                switch["modelId"] = json!(model_id);
+            }
+            let response = process.request(switch).await?;
+            if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                return Err(HarnessError::Protocol(
+                    "OMP session resume was cancelled".into(),
+                ));
+            }
         }
 
         if let Some(model) = request.model.as_deref() {
@@ -775,6 +785,41 @@ fn dispatch_steer(
     });
 }
 
+type PromptFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, HarnessError>> + Send>>;
+
+/// What a turn's end does to the runtime that ran it.
+enum TurnEnd {
+    /// Not a terminal agent end (`Continue`).
+    Open,
+    /// The turn settled; the runtime stays warm for the next message.
+    Complete,
+    /// The turn failed; the runtime ends with it.
+    Errored,
+}
+
+fn is_compact_prompt(message: &str) -> bool {
+    message.split_whitespace().next() == Some("/compact")
+}
+
+/// A follow-up turn in an already warm process: identical envelope to the
+/// first prompt (image preflight, `prompt_timeout`).
+fn begin_prompt(
+    process: OmpProcess,
+    message: String,
+    attachments: Vec<String>,
+    timeout: Duration,
+) -> PromptFuture {
+    Box::pin(async move {
+        let images = load_images(&attachments, &message, "prompt").await?;
+        let mut prompt = json!({ "type": "prompt", "message": message });
+        if !images.is_empty() {
+            prompt["images"] = Value::Array(images);
+        }
+        process.request_with_timeout(prompt, timeout).await
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     process: OmpProcess,
@@ -805,11 +850,17 @@ async fn run_session(
     let mut pending_interactive: HashMap<String, tokio_util::sync::CancellationToken> =
         HashMap::new();
     let mut normalizer = OmpNormalizer::new(cwd, model);
-    let compacting = prompt
-        .get("message")
-        .and_then(Value::as_str)
-        .is_some_and(|text| text.split_whitespace().next() == Some("/compact"));
-    let compaction_deadline = tokio::time::Instant::now() + prompt_timeout;
+    // A Done settles the TURN, not the runtime: the process, its bridges and
+    // this loop stay warm so the next user message is one more `prompt` in
+    // the same process (provider prompt cache + host tools stay put).
+    let mut turn_active = true;
+    let mut compacting = is_compact_prompt(
+        prompt
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let mut compaction_deadline = tokio::time::Instant::now() + prompt_timeout;
     let mut pending_agent_end: Option<Value> = None;
     let mut steering_open = true;
     let mut finished = false;
@@ -822,14 +873,84 @@ async fn run_session(
     let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
     let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
 
-    let prompt_fut = process.request_with_timeout(prompt, prompt_timeout);
-    tokio::pin!(prompt_fut);
+    let mut prompt_fut: PromptFuture = {
+        let process = process.clone();
+        Box::pin(async move { process.request_with_timeout(prompt, prompt_timeout).await })
+    };
     let mut prompt_pending = true;
+
+    // Where a turn's disposition lands. `Complete` returns the runtime to
+    // idle; an errored turn ends it (the engine retires an errored run).
+    macro_rules! settle {
+        ($outcome:expr) => {
+            match $outcome {
+                TurnEnd::Open => {}
+                TurnEnd::Errored => finished = true,
+                TurnEnd::Complete => {
+                    turn_active = false;
+                    compacting = false;
+                    pending_agent_end = None;
+                    // A wait_for_status still blocking when its turn ended
+                    // belongs to nobody now: release it. Its cancelled result
+                    // goes back once, through the ordinary tool channel.
+                    if let Some(workers) = workers.as_ref() {
+                        for tool_id in &pending_wait_for_status {
+                            workers.cancel_call(tool_id);
+                        }
+                    }
+                    if !steering_open {
+                        finished = true;
+                    }
+                }
+            }
+        };
+    }
+    // One user message. Inside a turn it is a steer; with no turn running it
+    // is the next `prompt` (same preflight and timeout as the first one).
+    macro_rules! deliver_message {
+        ($steer:expr) => {{
+            let SteerMessage {
+                prompt,
+                message_id,
+                attachments,
+                ..
+            } = $steer;
+            if turn_active {
+                in_flight_steers.push((prompt.clone(), message_id));
+                dispatch_steer(
+                    process.clone(),
+                    event_tx.clone(),
+                    prompt,
+                    attachments,
+                    steer_failed_tx.clone(),
+                );
+            } else {
+                turn_active = true;
+                compacting = is_compact_prompt(&prompt);
+                compaction_deadline = tokio::time::Instant::now() + prompt_timeout;
+                prompt_fut = begin_prompt(process.clone(), prompt, attachments, prompt_timeout);
+                prompt_pending = true;
+                // The engine's boundary for a message it routed into a parked
+                // runtime: it un-parks and retires the routed-steer entry.
+                if !emit(
+                    &event_tx,
+                    AgentEvent::Steered {
+                        assistant_message_id: message_id,
+                        next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()),
+                    },
+                )
+                .await
+                {
+                    finished = true;
+                }
+            }
+        }};
+    }
 
     while !finished {
         tokio::select! {
             _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
-                finish_agent_end(&process, &event_tx, &mut session_id,
+                finish_agent_end(&process, &event_tx, &mut session_id, &mut pending_interactive,
                     AgentEndDisposition::Error("OMP compaction timed out before completion".into())).await;
                 finished = true;
             }
@@ -855,14 +976,14 @@ async fn run_session(
                                 // Local commands such as /compact change context
                                 // without agent_end. Publish their fresh usage before
                                 // Done so the Chat marker can show before → after.
-                                finish_agent_end(
+                                settle!(finish_agent_end(
                                     &process,
                                     &event_tx,
                                     &mut session_id,
+                                    &mut pending_interactive,
                                     AgentEndDisposition::Complete,
-                                ).await;
+                                ).await);
                             }
-                            finished = true;
                         }
                     }
                     Err(err) => {
@@ -886,23 +1007,29 @@ async fn run_session(
                 }
             }
             _ = event_tx.closed() => {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    process.request(json!({ "type": "abort" })),
-                ).await;
+                if turn_active {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        process.request(json!({ "type": "abort" })),
+                    ).await;
+                }
                 finished = true;
             }
             _ = interrupt.cancelled() => {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    process.request(json!({ "type": "abort" })),
-                ).await;
-                let _ = emit(&event_tx, AgentEvent::Done {
-                    status: DoneStatus::Interrupted,
-                    result: None,
-                    error: None,
-                    session_id: Some(session_id.clone()),
-                }).await;
+                // An idle runtime has no turn to abort and no Done to owe:
+                // its last turn already settled.
+                if turn_active {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        process.request(json!({ "type": "abort" })),
+                    ).await;
+                    let _ = emit(&event_tx, AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: Some(session_id.clone()),
+                    }).await;
+                }
                 finished = true;
             }
             resolution = interactive_rx.recv() => {
@@ -926,17 +1053,8 @@ async fn run_session(
                 match steer {
                     Some(steer) => {
                         let prompt = steer.prompt.clone();
-                        let message_id = steer.message_id.clone();
-                        if delivering.is_empty() {
-                            let attachments = steer.attachments;
-                            in_flight_steers.push((prompt.clone(), message_id));
-                            dispatch_steer(
-                                process.clone(),
-                                event_tx.clone(),
-                                prompt,
-                                attachments,
-                                steer_failed_tx.clone(),
-                            );
+                        if !turn_active || delivering.is_empty() {
+                            deliver_message!(steer);
                         } else {
                             let is_worker_notice = prompt.starts_with("[worker-task-notification]");
                             for tool_id in &pending_wait_for_status {
@@ -952,7 +1070,14 @@ async fn run_session(
                             queued_steers.push_back(steer);
                         }
                     }
-                    None => steering_open = false,
+                    None => {
+                        steering_open = false;
+                        // Nobody can send another message: an idle runtime
+                        // has nothing left to wait for.
+                        if !turn_active {
+                            finished = true;
+                        }
+                    }
                 }
             }
             Some(failed_prompt) = steer_failed_rx.recv() => {
@@ -969,22 +1094,8 @@ async fn run_session(
                 if answered.contains(&tool_id) {
                     delivering.remove(&tool_id);
                     if delivering.is_empty() {
-                        while let Some(SteerMessage {
-                            prompt,
-                            message_id,
-                            attachments,
-                            ..
-                        }) =
-                            queued_steers.pop_front()
-                        {
-                            in_flight_steers.push((prompt.clone(), message_id));
-                            dispatch_steer(
-                                process.clone(),
-                                event_tx.clone(),
-                                prompt,
-                                attachments,
-                                steer_failed_tx.clone(),
-                            );
+                        while let Some(queued) = queued_steers.pop_front() {
+                            deliver_message!(queued);
                         }
                     }
                     continue;
@@ -1034,20 +1145,19 @@ async fn run_session(
                 }
                 delivering.remove(&tool_id);
                 if delivering.is_empty() {
-                    while let Some(SteerMessage { prompt, message_id, attachments, .. }) = queued_steers.pop_front() {
-                        in_flight_steers.push((prompt.clone(), message_id));
-                        dispatch_steer(
-                            process.clone(),
-                            event_tx.clone(),
-                            prompt,
-                            attachments,
-                            steer_failed_tx.clone(),
-                        );
+                    while let Some(queued) = queued_steers.pop_front() {
+                        deliver_message!(queued);
                     }
                 }
             }
             frame = events.recv() => {
                 let Some(frame) = frame else {
+                    // A child that dies between turns owes nobody a Done: the
+                    // last turn already settled, and the engine reads the
+                    // stream end while parked as a clean retirement.
+                    if !turn_active {
+                        break;
+                    }
                     // O reader grava a razao em `fatal` antes de fechar o canal;
                     // sem ela o chat so via a frase generica e cada ocorrencia
                     // exigia abrir o log do omp para descobrir o EPIPE.
@@ -1072,9 +1182,9 @@ async fn run_session(
                 };
                 if compacting {
                     if let Some(disposition) = compaction_completion(&frame) {
-                        finished = finish_agent_end(
-                            &process, &event_tx, &mut session_id, disposition,
-                        ).await;
+                        settle!(finish_agent_end(
+                            &process, &event_tx, &mut session_id, &mut pending_interactive, disposition,
+                        ).await);
                         continue;
                     }
                     // A summarizer's model turn is not the command lifecycle.
@@ -1096,6 +1206,12 @@ async fn run_session(
                         },
                     )
                     .await;
+                }
+                // OMP waking on its own (an async result, a queued steer it ran
+                // as a follow-up) is a turn the engine did not start: it owns
+                // one Done at its terminal agent_end, like any other turn.
+                if !turn_active && frame.get("type").and_then(Value::as_str) == Some("agent_start") {
+                    turn_active = true;
                 }
                 match frame.get("type").and_then(Value::as_str) {
                     Some("host_tool_call") => {
@@ -1228,18 +1344,23 @@ async fn run_session(
                         }
                     }
                     Some("agent_end") => {
-                        if frame.get("isTerminal").and_then(Value::as_bool) == Some(false) {
+                        // A terminal agent_end with no turn behind it was
+                        // already answered with a Done.
+                        if !turn_active
+                            || frame.get("isTerminal").and_then(Value::as_bool) == Some(false)
+                        {
                             continue;
                         }
                         match normalizer.classify_agent_end(&frame) {
                             AgentEndDisposition::Continue => pending_agent_end = Some(frame),
                             disposition => {
-                                finished = finish_agent_end(
+                                settle!(finish_agent_end(
                                     &process,
                                     &event_tx,
                                     &mut session_id,
+                                    &mut pending_interactive,
                                     disposition,
-                                ).await;
+                                ).await);
                             }
                         }
                     }
@@ -1255,12 +1376,13 @@ async fn run_session(
                             && let Some(frame) = pending_agent_end.take()
                         {
                             let disposition = normalizer.classify_agent_end(&frame);
-                            finished = finish_agent_end(
+                            settle!(finish_agent_end(
                                 &process,
                                 &event_tx,
                                 &mut session_id,
+                                &mut pending_interactive,
                                 disposition,
-                            ).await;
+                            ).await);
                         }
                     }
                 }
@@ -1308,10 +1430,25 @@ async fn finish_agent_end(
     process: &OmpProcess,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
     session_id: &mut String,
+    pending_interactive: &mut HashMap<String, tokio_util::sync::CancellationToken>,
     disposition: AgentEndDisposition,
-) -> bool {
+) -> TurnEnd {
     if disposition == AgentEndDisposition::Continue {
-        return false;
+        return TurnEnd::Open;
+    }
+    // A question that outlived its turn can no longer be answered into it:
+    // resolve it once, before the Done that closes the turn.
+    for (id, cancellation) in pending_interactive.drain() {
+        cancellation.cancel();
+        let _ = process.send_control(cancelled_interactive_response(&id, false));
+        let _ = emit(
+            event_tx,
+            AgentEvent::InputResolved {
+                request_id: id,
+                answers: None,
+            },
+        )
+        .await;
     }
     if let Ok(state) = process.request(json!({ "type": "get_state" })).await {
         if let Some(current) = state_session_id(&state) {
@@ -1341,7 +1478,7 @@ async fn finish_agent_end(
                 },
             )
             .await;
-            true
+            TurnEnd::Complete
         }
         AgentEndDisposition::Error(message) => {
             if !emit(
@@ -1352,7 +1489,7 @@ async fn finish_agent_end(
             )
             .await
             {
-                return true;
+                return TurnEnd::Errored;
             }
             let _ = emit(
                 event_tx,
@@ -1364,9 +1501,9 @@ async fn finish_agent_end(
                 },
             )
             .await;
-            true
+            TurnEnd::Errored
         }
-        AgentEndDisposition::Continue => false,
+        AgentEndDisposition::Continue => TurnEnd::Open,
     }
 }
 
