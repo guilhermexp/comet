@@ -202,3 +202,28 @@ DOX donos e matrizes, design/specs/tasks/conflicts reconciliados. App 1.0.16, ro
 Teste Linux filtrado: exit 0, 1 passed. Check GNU `cargo check --manifest-path third_party/unpeel/crates/Cargo.toml --locked --target x86_64-pc-windows-gnu -p unpeel-core --tests`: exit 101 antes (127 diagnósticos) e depois (125). Os dois diagnósticos dessa função desapareceram. Os restantes são fixtures de hooks (110), Host (3), session_ops (5), browser_mcp (3), relay_uplink (2) e helpers de transcripts (2), que ainda importam símbolos/transportes Unix indisponíveis nessa configuração. O check idêntico com --lib no lugar de --tests saiu 0. Não se alega compilação dos testes Windows nem execução nativa. Logs review-unix-windows-before-toolchain.log, review-unix-windows-after.log, review-unix-windows-lib.log e review-unix-linux-test.log; primeiro ensaio sem o PATH do toolchain local falhou por gcc ausente, resolvido usando o toolchain já extraído nesta tarefa.
 
 Nova árvore vendor b71f4031eb8288056b88df54edb51c3661c2bbfc, base upstream e contador histórico preservados; nenhum fonte de produção ou workflow mudou. O relatório round2 recebe apêndice com o commit desta revisão e a prova downstream, sem reescrever os recibos históricos acima.
+
+
+## Revisão de quatro achados — snapshot 17dabf6a0 (2026-11-05)
+
+- Drain: RED a7fb8e349 falha ao devolver Pending de uma claim de fundo como conclusão. GREEN e5adb1dae observa status terminal via watch assinado antes da leitura, com deadline de 3 s já usado nos testes doc_host. O caso real depende dos drains de fundo, conclui early antes do cenário seguinte e preserva Applied para Stop no Assistant atual/Superseded para Assistant antigo. Quatro testes focados passaram; nenhuma lógica de produção ou timeout agregado foi alterado.
+- ACP: RED f4f8dca33 tem dois controles negativos falhando (marker 2.1.0 ignorado e header ausente aceito), enquanto o controle positivo já confirma que os dois artefatos reais retornam 64 e escrevem marker. GREEN 86f053213 exige o shebang LF, verifica markers de 2.0.0 e 2.1.0 após update e após recheck Current, e mantém todos os asserts de versão/arquivos/checksum/remoção. Quatro testes passaram. O shebang do arquivo existente era correto; agora essa precondição é explícita.
+- Voice: RED 0d1370c73 captura CODEX_HOME diferente do selecionado pelo pai, expondo a segunda isolação. GREEN be9aad878 passa o marker de isolamento, gateia o controle externo em Unix e executa cada fixture nas instalações incompatível e ausente. O filho exige o CODEX_HOME exato e a presença/versão do pacote incompatível antes de cobrar estritamente Unsupported; ausência continua NativeRuntimeUnavailable. Três testes passaram, incluindo quatro filhos da matriz. MCP/canonical events/steering e ausência de turn inicial continuam exigidos; não se aceita conjunto frouxo de rejeições.
+- session_ops: 2db773142 aplica cfg(unix) a std::io e SOCKET_IO_TIMEOUT, como socket_command. Nenhum fonte de runtime tem lógica alterada. Proveniência vendor ed6b1eac31ddd261194b342d15e99737331bd9a0, base/MIT/contador histórico preservados.
+
+Logs review2-{drain,acp,codex}-{red,green}.log e review2-*-final.log no diretório round2. Gates locais desta revisão concluídos sobre be9aad878, todos exit 0, conforme a tabela abaixo. As limitações de execução Windows nativa e de testes globais do vendor registradas nas seções anteriores não são convertidas em prova nativa.
+
+| Comando da revisão de quatro achados | Exit | Log |
+|---|---:|---|
+| `cargo test --locked -p zeron-engine --lib stop_fenced_hold_tests -- --nocapture` | 0 | review2-drain-green.log |
+| `cargo test --locked -p zeron-engine --test acp_registry_rpc -- --nocapture` | 0 | review2-acp-green.log |
+| `cargo test --locked -p zeron-harness --test codex voice_ -- --nocapture` | 0 | review2-codex-green.log |
+| `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml --locked -p unpeel-core --lib session_ops::tests` | 0 | review2-session-ops-final.log |
+| `cargo test --locked -p zeron-workers-unpeel` | 0 | review2-downstream-final.log |
+| `scripts/ci/test-core.sh` | 0 | review2-core-final.log |
+| `cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib` | 0 | review2-ui-final.log |
+| `cargo check --workspace --all-targets --locked` | 0 | review2-workspace-check-final.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` | 0 | review2-windows-final.log |
+| `cargo fmt --all -- --check` | 0 | review2-fmt-final.log |
+
+Core: 2647 passed, 27 ignores anteriores e 2 leaky PASS; UI: 2827 passed/12 ignores anteriores. session_ops: 14 passed; downstream: 542 testes Rust e runner worker_restart_identity. Nenhum novo ignore/skip/retry/sleep ou timeout ampliado; markers ACP e HOME selecionado Voice têm controles de sensibilidade RED. Windows GNU não emite os diagnósticos de SOCKET_IO_TIMEOUT/std::io de session_ops apontados na revisão. Proveniência vendor conferida contra o Git. Sem push/merge/tag/PR/archive.

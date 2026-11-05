@@ -59,3 +59,14 @@ A exceção de baseline da seção 5 foi revogada pelo dono. Falhas herdadas ent
 - [x] 6.8 Atualizar proveniência/vendor, DOX, conflicts/verification e relatório absoluto novo, sem publicação nem archive.
 
 As falhas adicionais de pilha, Git broker, Cloud RPC, interrupt, Cursor JSON, Stop, discovery, hook roots, log writer, isolamento do browser, acceptor IPC, fixture Skill Usage e publicação da fila entram em 6.7; não há exceção de baseline. A execução nativa dos jobs Windows continua exigindo infraestrutura Windows: a única box pareada é Linux amd64. O cross-check GNU cobre o par harness/engine, sem substituir GUI, runtime, instalador ou testes Windows. Os jobs exclusivos macOS/iOS ficam “provado só no CI remoto”, conforme o brief, sem recibo remoto novo desta rodada. Não marcar 6.7 concluído enquanto faltar essa prova; não fazer dispatch ou publicação para obtê-la.
+
+## 7. Revisão de quatro achados — snapshot 17dabf6a0 (2026-11-05)
+
+- [x] 7.1 RED para espera de status ainda Pending; aguardar early/stop/stale-stop por eventos com deadline existente, sem depender de drain explícito.
+- [x] 7.2 RED para marker 2.1.0 não detectado e shebang ausente; conferir ambas versões e executar o probe em artefatos reais como controle positivo.
+- [x] 7.3 RED para instalação Codex Voice substituída por nova isolação; exigir CODEX_HOME selecionado e matriz ausente/Unsupported; gate Unix do controle externo.
+- [x] 7.4 Gate Unix dos imports de I/O e timeout usados só por socket_command; proveniência e DOX do vendor no mesmo commit.
+- [x] 7.5 Testes afetados, core, UI --lib, workspace all-targets check, fmt e par GNU harness/engine com exit 0.
+- [x] 7.6 Atualizar verification e acrescentar recibos/commits ao relatório round2; sem push/merge/tag/PR/archive.
+
+Esta revisão não transforma o check GNU em execução Windows nativa; a pendência de infraestrutura de 6.7 permanece distinta dos gates locais desta seção.
