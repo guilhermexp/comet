@@ -99,3 +99,7 @@ A exceção de baseline anterior foi revogada. Gates agregados ainda pendentes n
 ### R1 — Codex Voice
 
 `35561ead` resolve somente o helper adjacente (`installed_helper`); o fork documenta `media_helper`, incluindo instalações oficiais ativas em CODEX_HOME. Pacote incompatível deve retornar Unsupported, ausência deve retornar NativeRuntimeUnavailable. Os testes de ausência herdavam o ambiente real. RED `b5b6d9e6d` cria um pacote incompatível em HOME/CODEX_HOME privados e executa ambos os fixtures: exit 101, Unsupported. GREEN isola cada fixture em subprocesso com HOME/CODEX_HOME vazios e remove apenas do filho o override de helper: os três casos passam, mantendo todas as asserções originais. Logs r1-red.log/r1-green.log no relatório round2; nenhuma mudança de produto.
+
+### R4 — orçamento do schema
+
+RED no binário da árvore vendor original: sessions 4118 bytes, exit 101. Introdução anunciada reduzida; actions, propriedades, vocabulário/limites de keys, help e tetos (<4 KiB/domínio e <11 KiB total) intactos. GREEN: `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib mcp_host::tests::`, exit 0, 37 passed. Prova downstream e suíte completa integram o gate final após os demais patches do mesmo vendor.

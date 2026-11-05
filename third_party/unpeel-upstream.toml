@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "525110c5b873a71c1e39ba64e7a748dfaf1c2c80"
+vendored_tree = "ef358409a8cbc2e15e4efef6dad758518d21b790"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -259,3 +259,7 @@ base_revision_resolves_upstream = false
 # 2026-11-02 — headless controller session actions preserve the actual restart
 # or in-place resume ID in the optional sessionID response. Native Swift keeps
 # its separate asynchronous fallback. Consumer proof: worker_restart_identity.
+
+# 2026-11-05 — CI R4 (local metadata patch): shorten the sessions introduction
+# in mcp_host.rs; preserve action/argument schemas, key limits and full help.
+# Existing context-budget regression remains <4 KiB/domain and <11 KiB total.
