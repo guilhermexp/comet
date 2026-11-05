@@ -617,6 +617,18 @@ async fn admissible_wakes_preserve_missing_rows_modern_readers_and_local_epoch()
 }
 
 #[tokio::test]
+async fn legacy_fixture_has_no_born_chat2_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    legacy_chat(&workspace, "legacy-local", "host", None);
+    assert!(
+        store.snapshot_epoch("legacy-local").unwrap() < crate::chat2_host::CHAT2_DOC_EPOCH,
+        "a legacy registry row must not inherit a born-chat2 local snapshot"
+    );
+}
+
+#[tokio::test]
 async fn legacy_admission_rechecks_owner_and_retires_only_the_captured_wake() {
     let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
