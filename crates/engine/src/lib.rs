@@ -1900,7 +1900,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn fork_startup_keeps_plugin_rpc_dormant() {
+    async fn fork_startup_serves_plugins_without_the_zgx_interface() {
         let temp = TempDir::new().unwrap();
         let core = EngineCore::assemble(
             temp.path(),
@@ -1917,14 +1917,16 @@ mod tests {
         let info: zeron_proto::EngineInfo = serde_json::from_value(info).unwrap();
         assert!(!info.supports(zeron_proto::capabilities::ZGX_INTERFACE_V1));
         assert!(info.supports(zeron_proto::capabilities::BACKGROUND_TASKS_V1));
-        let error = client
+        let list = client
             .call(zeron_rpc::methods::LIST_PLUGINS, serde_json::json!({}))
             .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("Plugins aren't available here"),
-            "{error}"
-        );
+            .expect("normal fork startup serves local plugins");
+        assert!(list["plugins"].is_array(), "{list}");
+        let templates = client
+            .call(zeron_rpc::methods::LIST_TEMPLATES, serde_json::json!({}))
+            .await
+            .expect("normal fork startup serves templates");
+        assert!(templates["templates"].is_array(), "{templates}");
         core.shutdown().await;
     }
 
