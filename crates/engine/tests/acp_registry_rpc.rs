@@ -23,6 +23,13 @@ fn fake_agent() -> Vec<u8> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../harness/tests/fixtures/fake-acp.sh"),
     )
     .unwrap();
+    // Registry installs are versioned by their managed record. ACP does not
+    // promise a --version CLI; reject and record any accidental invocation.
+    let script = String::from_utf8(script).unwrap().replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then : > \"$0.version-probed\"; exit 64; fi\n",
+        1,
+    ).into_bytes();
     let mut tar = tar::Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
     header.set_size(script.len() as u64);
@@ -248,6 +255,10 @@ async fn registry_agents_are_listed_added_as_harnesses_and_removed() {
     let status = find(&statuses, "harness", "acp.fake-agent").unwrap();
     assert_eq!(status["latestVersion"], "2.1.0", "{status}");
     assert_eq!(status["phase"], "available");
+    let mut updates = client
+        .subscribe(methods::WATCH_HARNESS_UPDATES, json!({}))
+        .await
+        .unwrap();
     // Auto when idle, as any agent's policy.
     client
         .call(
@@ -258,15 +269,36 @@ async fn registry_agents_are_listed_added_as_harnesses_and_removed() {
         .expect("a policy for a registry agent");
     // …which takes it on its own, no chat running on it.
     let agent0 = zeron_proto::RegistryAgent::new("fake-agent").unwrap();
-    let mut version = String::new();
-    for _ in 0..100 {
-        version = zeron_harness::acp_registry::record(agent0).unwrap().version;
-        if version == "2.1.0" {
-            break;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(statuses) = updates.recv().await {
+            let Some(status) = find(&statuses, "harness", "acp.fake-agent") else {
+                continue;
+            };
+            assert_ne!(
+                status["phase"], "failed",
+                "automatic registry update: {status}"
+            );
+            if status["installedVersion"] == "2.1.0"
+                && matches!(status["phase"].as_str(), Some("updated" | "current"))
+            {
+                return;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert_eq!(version, "2.1.0", "updated automatically");
+        panic!("update stream ended before the registry agent was updated");
+    })
+    .await
+    .expect("automatic update within the existing ten-second budget");
+    assert_eq!(
+        zeron_harness::acp_registry::record(agent0).unwrap().version,
+        "2.1.0",
+        "updated automatically"
+    );
+    assert!(
+        !dir.path()
+            .join("agents/fake-agent/2.0.0/agent.version-probed")
+            .exists(),
+        "a registry agent's managed version must not run its CLI"
+    );
     let statuses = client
         .call(
             methods::CHECK_HARNESS_UPDATES,
