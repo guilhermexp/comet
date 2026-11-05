@@ -18981,7 +18981,7 @@ pub fn test_shell(
 }
 
 /// Synthetic native fixture shell; never starts a Workers refresh or engine.
-#[cfg(feature = "appshots-fixture")]
+#[cfg(any(feature = "appshots-fixture", feature = "browser-fixture"))]
 #[doc(hidden)]
 pub fn detached_fixture_shell(
     state: Entity<AppState>,

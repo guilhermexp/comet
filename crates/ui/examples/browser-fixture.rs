@@ -242,7 +242,7 @@ fn main() -> anyhow::Result<()> {
             app_owns_titlebar_drag: true,
             app_id: Some("zeron-browser-fixture".into()),
             ..Default::default()
-        }, |_, cx| cx.new(|cx| shell::test_shell(state.clone(), boot, cx))).unwrap();
+        }, |_, cx| cx.new(|cx| shell::detached_fixture_shell(state.clone(), boot, cx))).unwrap();
         state.update(cx, |_, cx| cx.notify());
         cx.activate(true);
         cx.spawn(async move |cx| {
