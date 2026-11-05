@@ -171,6 +171,8 @@ O leitor limitado de stdout/stderr em `harness_updates::read_tail` também mant�
 
 ## Verification
 
+O broker usa `git_at_home` para helper e identidade: HOME distinto não herda `GIT_CONFIG_GLOBAL`/`XDG_CONFIG_HOME` externos; no HOME próprio os overrides legítimos continuam respeitados. Leitores de fixtures Git também fixam os três paths, sem mudar ambiente global ou grants. `credentials::tests::a_broker_home_does_not_inherit_another_homes_git_config` é prova unit em subprocesso privado; `tests/cloud_runner.rs` verifica helper/identidade de ponta a ponta contra mocks.
+
 - Comandos: `cargo test -p zeron-engine` · `scripts/e2e-smoke.sh`
 
 | Camada / path | Tier exigido | Como rodar |

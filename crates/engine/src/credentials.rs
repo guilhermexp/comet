@@ -1290,11 +1290,8 @@ async fn configure_git_helper(home: &Path, store: &Path) -> bool {
     let key = "credential.https://github.com.helper";
     let value = format!("store --file=\"{}\"", store.display());
     let git = |args: &[&str]| {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(args)
-            .env("HOME", home)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .stdin(std::process::Stdio::null())
+        let mut cmd = git_at_home(home, args);
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         cmd
@@ -1429,10 +1426,9 @@ fn is_github_login(login: &str) -> bool {
         && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// The machine's global git identity, for the user's own terminals: set
-/// when there is none, or when it's a bot's (an agent that configured the
-/// App it pushes as). An identity the user chose stays.
-async fn configure_git_identity(home: &Path, identity: &GitIdentity) {
+/// Resolve Git configuration in the requested home. Overrides belonging to
+/// another home must not redirect a sandbox's credential or identity writes.
+fn git_at_home(home: &Path, args: &[&str]) -> tokio::process::Command {
     // `git config --global` writes $XDG_CONFIG_HOME/git/config when that file
     // exists. An XDG_CONFIG_HOME outside `home` belongs to another home (this
     // process's own, when `home` is a sandbox or a test directory), so `home`'s is
@@ -1445,13 +1441,26 @@ async fn configure_git_identity(home: &Path, identity: &GitIdentity) {
         .map(std::path::PathBuf::from)
         .filter(|dir| own_home || dir.starts_with(home))
         .unwrap_or_else(|| home.join(".config"));
+    let global_config = std::env::var_os("GIT_CONFIG_GLOBAL")
+        .filter(|file| own_home || Path::new(file).starts_with(home));
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", xdg_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    if let Some(file) = global_config {
+        cmd.env("GIT_CONFIG_GLOBAL", file);
+    } else {
+        cmd.env_remove("GIT_CONFIG_GLOBAL");
+    }
+    cmd
+}
+
+/// Set an absent/bot global identity; preserve an identity the user chose.
+async fn configure_git_identity(home: &Path, identity: &GitIdentity) {
     let git = |args: &[&str]| {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(args)
-            .env("HOME", home)
-            .env("XDG_CONFIG_HOME", &xdg_config)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .stdin(std::process::Stdio::null())
+        let mut cmd = git_at_home(home, args);
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
         cmd
@@ -1633,16 +1642,24 @@ mod tests {
             };
             assert!(super::configure_git_helper(&home, &home.join("token-store")).await);
             configure_git_identity(&home, &identity).await;
-            assert_eq!(std::fs::read(&outside).unwrap(), before, "another home's config changed");
+            assert_eq!(
+                std::fs::read(&outside).unwrap(),
+                before,
+                "another home's config changed"
+            );
             let output = std::process::Command::new("git")
                 .args(["config", "--global", "--get", "user.email"])
                 .env("HOME", &home)
                 .env("XDG_CONFIG_HOME", home.join(".config"))
                 .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .output().unwrap();
+                .output()
+                .unwrap();
             assert!(output.status.success());
-            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), identity.email);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                identity.email
+            );
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1653,14 +1670,23 @@ mod tests {
         let outside = parent_home.join("custom-gitconfig");
         std::fs::write(&outside, "[user]\nemail = parent@example.invalid\n").unwrap();
         let status = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "credentials::tests::a_broker_home_does_not_inherit_another_homes_git_config", "--nocapture"])
+            .args([
+                "--exact",
+                "credentials::tests::a_broker_home_does_not_inherit_another_homes_git_config",
+                "--nocapture",
+            ])
             .env(CHILD_HOME, &home)
             .env("HOME", &parent_home)
             .env("XDG_CONFIG_HOME", parent_home.join(".config"))
             .env("GIT_CONFIG_GLOBAL", &outside)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .status().await.unwrap();
-        assert!(status.success(), "isolated broker regression failed: {status}");
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated broker regression failed: {status}"
+        );
     }
 
     #[tokio::test]
@@ -1672,6 +1698,7 @@ mod tests {
                 .args(args)
                 .env("HOME", home.path())
                 .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("GIT_CONFIG_GLOBAL", home.path().join(".gitconfig"))
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
