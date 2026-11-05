@@ -1704,7 +1704,7 @@ impl HarnessUpdateCoordinator {
                     // pending marker and the queued lease at once.
                     let installed = match cancellable(
                         &cancel,
-                        run_version_command(
+                        installed_version_of(
                             harness,
                             &current_executable,
                             provider(harness).version_args,
@@ -1780,7 +1780,7 @@ impl HarnessUpdateCoordinator {
                 .ok_or_else(|| "The CLI's installation disappeared; checking again".to_string())?;
             let installed = cancellable(
                 &cancel,
-                run_version_command(harness, &executable, provider(harness).version_args),
+                installed_version_of(harness, &executable, provider(harness).version_args),
             )
             .await;
             if cancel.is_cancelled() {
@@ -1922,7 +1922,7 @@ impl HarnessUpdateCoordinator {
             }
             let fresh = cancellable(
                 &cancel,
-                run_version_command(harness, &executable_now, provider(harness).version_args),
+                installed_version_of(harness, &executable_now, provider(harness).version_args),
             )
             .await;
             if cancel.is_cancelled() {

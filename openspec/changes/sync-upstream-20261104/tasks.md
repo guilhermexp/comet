@@ -51,7 +51,7 @@ A exceção de baseline da seção 5 foi revogada pelo dono. Falhas herdadas ent
 
 - [x] 6.1 R1: isolar e corrigir o contrato Codex Voice com RED/GREEN e comparação 35561ead.
 - [ ] 6.2 R2: corrigir chips URL, índice General e geometria de metadata da sidebar com RED/GREEN.
-- [ ] 6.3 R3: tornar ACP registry determinístico e provar atualização 2.0.0 → 2.1.0.
+- [x] 6.3 R3: tornar ACP registry determinístico e provar atualização 2.0.0 → 2.1.0.
 - [x] 6.4 R4: reduzir schema sessions dentro do orçamento atual.
 - [x] 6.5 R5: corrigir ETXTBSY na raiz e provar ao menos 30 invocações sem falha.
 - [ ] 6.6 R6: portar os caminhos Windows usados, preservando implementações reais e provar os pacotes native-platform-check via GNU.

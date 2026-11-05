@@ -219,6 +219,16 @@ async fn registry_agents_are_listed_added_as_harnesses_and_removed() {
         "the icon after a run: {after}"
     );
 
+    // Catalog discovery may make an optional CLI probe. From this boundary,
+    // the update coordinator must use the managed record instead.
+    let probe_marker = dir
+        .path()
+        .join("agents/fake-agent/2.0.0/agent.version-probed");
+    match std::fs::remove_file(&probe_marker) {
+        Ok(()) => eprintln!("cleared optional catalog probe before update verification"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("clear fixture probe marker: {error}"),
+    }
     // Its updates: the update coordinator's, as any agent's, the registry's
     // version the latest.
     let statuses = client
@@ -294,9 +304,7 @@ async fn registry_agents_are_listed_added_as_harnesses_and_removed() {
         "updated automatically"
     );
     assert!(
-        !dir.path()
-            .join("agents/fake-agent/2.0.0/agent.version-probed")
-            .exists(),
+        !probe_marker.exists(),
         "a registry agent's managed version must not run its CLI"
     );
     let statuses = client
