@@ -7341,6 +7341,129 @@ mod stop_fenced_hold_tests {
     use zeron_proto::HarnessId;
 
     #[tokio::test]
+    async fn stop_context_tracks_assistant_turns_and_preserves_stale_stop_rejection() {
+        use zeron_doc::{MessageRole, MessageStatus, SessionMessageEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(
+            Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap()),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("chat-stop-context").unwrap();
+        let row = |id: &str, role, status| SessionMessageEntry {
+            id: id.into(),
+            role,
+            status: Some(status),
+            parts: vec![],
+            created_at: crate::now_ms(),
+            device_id: "device-a".into(),
+            duration_ms: None,
+            continuation_of: None,
+        };
+        handle
+            .doc()
+            .push_message(&row(
+                "first-user",
+                MessageRole::User,
+                MessageStatus::Complete,
+            ))
+            .unwrap();
+        let early = host
+            .queue_command(&handle.chat_id, SessionCommandPayload::Interrupt {})
+            .unwrap();
+        let commands = handle.doc().read_commands().unwrap();
+        assert!(
+            commands
+                .iter()
+                .find(|c| c.id == early)
+                .unwrap()
+                .based_on
+                .is_none(),
+            "a user row is not an assistant turn"
+        );
+
+        handle
+            .doc()
+            .push_message(&row(
+                "active-turn",
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+            ))
+            .unwrap();
+        handle
+            .doc()
+            .push_message(&row(
+                "arriving-user",
+                MessageRole::User,
+                MessageStatus::Complete,
+            ))
+            .unwrap();
+        let stop = host
+            .queue_command(&handle.chat_id, SessionCommandPayload::Interrupt {})
+            .unwrap();
+        let command = handle
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == stop)
+            .unwrap();
+        assert_eq!(
+            command.based_on.as_ref().unwrap().turn_id.as_deref(),
+            Some("active-turn")
+        );
+        host.set_sessions(crate::sessions::SessionsEngine::new(
+            "device-a".into(),
+            Arc::new(crate::run_journal::RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(crate::registry::HarnessRegistry::new()),
+        ));
+        host.drain_command_kind(&handle, true).await;
+        assert_eq!(
+            handle
+                .doc()
+                .read_commands()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.id == stop)
+                .unwrap()
+                .status,
+            SessionCommandStatus::Applied,
+            "the arriving user row must not supersede Stop"
+        );
+
+        handle
+            .doc()
+            .push_message(&row(
+                "newer-turn",
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+            ))
+            .unwrap();
+        let stale = SessionCommandEntry {
+            id: "stale-stop".into(),
+            status: SessionCommandStatus::Pending,
+            ..command
+        };
+        handle.doc().queue_command(&stale).unwrap();
+        host.drain_command_kind(&handle, true).await;
+        assert_eq!(
+            handle
+                .doc()
+                .read_commands()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.id == stale.id)
+                .unwrap()
+                .status,
+            SessionCommandStatus::Superseded,
+            "a Stop for a genuinely older assistant turn stays stale"
+        );
+    }
+
+    #[tokio::test]
     async fn hold_rejects_prompt_ordered_before_stop_without_thawing_user_queue() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store opens"));

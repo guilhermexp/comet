@@ -1059,7 +1059,8 @@ async fn a_steer_sent_before_stop_is_cancelled_with_it() {
     assert_eq!(
         commands.iter().find(|c| c.id == stop_id).unwrap().status,
         zeron_doc::SessionCommandStatus::Applied,
-        "Stop was lost: {commands:?}"
+        "Stop was lost: {commands:?}; messages={:?}",
+        handle.doc().read_entries().unwrap()
     );
     assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 1, "{commands:?}");
     assert_eq!(
