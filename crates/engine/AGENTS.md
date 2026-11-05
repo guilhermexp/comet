@@ -161,6 +161,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 - Agentes ACP instalados pelo registry usam a versão do registro gerenciado em todos os probes do coordenador, inclusive após leases e owner gates. ACP não exige comando CLI de versão; não executar `--version`/argv vazio nesses pacotes. `tests/acp_registry_rpc.rs` prova 2.0.0 → 2.1.0 por servidor loopback e watch RPC, sem polling/sleep.
 
+  A tripwire ACP exige shebang shell válido antes de instrumentar, executa os artefatos extraídos 2.0.0/2.1.0 com --version em controle positivo e verifica markers nas duas versões. Controle negativo exige que marker de 2.1.0 faça a guarda falhar; ausência de instrumentação não pode produzir aceite vazio.
+
 ## Work Guidance
 
 - Fixtures de admissão legacy importam a row diretamente: `create_chat` semeia snapshot local epoch 2, que deve prevalecer sobre room_gen antigo. Não remover a precedência do epoch para satisfazer uma fixture inconsistente. `legacy_fixture_has_no_born_chat2_snapshot` e `legacy_admission_rechecks_owner_and_retires_only_the_captured_wake` cobrem a precondição e a retirada apenas do wake capturado.

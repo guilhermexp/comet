@@ -19,6 +19,10 @@ use zeron_proto::HarnessId;
 use zeron_rpc::methods;
 
 fn instrument_version_probe(script: &str) -> String {
+    assert!(
+        script.starts_with("#!/bin/sh\n"),
+        "fixture shell shebang required before probe instrumentation"
+    );
     script.replacen(
         "#!/bin/sh\n",
         "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then : > \"$0.version-probed\"; exit 64; fi\n",
@@ -27,12 +31,13 @@ fn instrument_version_probe(script: &str) -> String {
 }
 
 fn assert_no_version_probes(root: &std::path::Path) {
-    let version = "2.0.0";
-    let marker = root.join(format!("agents/fake-agent/{version}/agent.version-probed"));
-    assert!(
-        !marker.exists(),
-        "managed version must not run its CLI: {version}"
-    );
+    for version in ["2.0.0", "2.1.0"] {
+        let marker = root.join(format!("agents/fake-agent/{version}/agent.version-probed"));
+        assert!(
+            !marker.exists(),
+            "managed version must not run its CLI: {version}"
+        );
+    }
 }
 
 #[test]
@@ -372,6 +377,7 @@ async fn registry_agents_are_listed_added_as_harnesses_and_removed() {
     assert_eq!(status["installedVersion"], "2.1.0", "{status}");
     assert_eq!(status["phase"], "current");
     assert!(dir.path().join("agents/fake-agent/2.1.0").is_dir());
+    assert_no_version_probes(dir.path());
 
     // Its environment: kept on this device, owner-only, handed to its launch.
     assert!(
