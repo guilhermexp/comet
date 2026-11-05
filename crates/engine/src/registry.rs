@@ -1192,6 +1192,21 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn lazy_omp_descriptor_matches_the_fork_driver() {
+        let registry = full_registry();
+        let descriptor = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Omp)
+            .unwrap();
+        let driver = registry.resolve(HarnessId::Omp).unwrap();
+        assert_eq!(driver.access_modes(), &[AccessMode::FullAccess]);
+        assert!(!driver.supports_plan());
+        assert_eq!(descriptor.access_modes, driver.access_modes());
+        assert_eq!(descriptor.supports_plan, driver.supports_plan());
+    }
+
     /// The composer offers what the catalog lists before any harness has
     /// resolved, so each lazy descriptor must offer the modes its harness
     /// honors once it does.
