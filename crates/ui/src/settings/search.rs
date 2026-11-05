@@ -686,6 +686,22 @@ mod tests {
     }
 
     #[test]
+    fn fork_general_controls_are_searchable_by_their_visible_titles() {
+        for title in ["Chat titles", "Collapse command blocks"] {
+            let hits = search(title, |_| true);
+            let hit = hits
+                .first()
+                .expect("the visible General control must be indexed");
+            assert_eq!(hit.entry.title, title);
+            assert_eq!(hit.entry.section, SettingsSection::General);
+            assert_eq!(
+                hits.iter().filter(|hit| hit.entry.title == title).count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn blank_queries_find_nothing() {
         assert!(search("", |_| true).is_empty());
         assert!(search("   ", |_| true).is_empty());
