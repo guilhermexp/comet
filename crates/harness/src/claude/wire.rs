@@ -41,6 +41,8 @@ pub(crate) struct ControlResponseBody {
     /// Why an `error` response failed (a string on every CLI seen so far).
     #[serde(default)]
     pub error: Option<Value>,
+    #[serde(default)]
+    pub response: Option<Value>,
 }
 
 impl ControlResponseBody {

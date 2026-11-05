@@ -2781,3 +2781,106 @@ async fn a_resume_registers_host_tools_before_loading_the_session() {
         "{order:?}"
     );
 }
+
+#[tokio::test]
+async fn context_inspection_between_turns_does_not_prompt_or_steer() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("wire");
+    let mut env = fake_env("multi-turn");
+    env.insert("FAKE_OMP_LOG".into(), log.to_string_lossy().into_owned());
+    let harness = fake_harness("multi-turn").with_env(env);
+    let (controls, steering, interrupt) = controls_with_answer("yes");
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(request("first"), controls).await.unwrap();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    let report = turn
+        .inspect_context()
+        .await
+        .expect("inspection on warm runtime");
+    assert_eq!(report.used_tokens, Some(828300));
+    assert_eq!(report.capacity, Some(1000000));
+    steering.send(SteerMessage::text("next")).await.unwrap();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    interrupt.cancel();
+    while stream.next().await.is_some() {}
+    let wire = std::fs::read_to_string(log).unwrap();
+    assert_eq!(wire.lines().filter(|l| l.ends_with(" prompt")).count(), 2);
+    assert_eq!(wire.lines().filter(|l| l.ends_with(" steer")).count(), 0);
+    assert_eq!(
+        wire.lines()
+            .filter(|l| l.ends_with(" get_context_breakdown"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn context_inspection_while_active_never_emits_steered_or_done() {
+    let harness = fake_harness("context-active");
+    let (controls, _steering, interrupt) = controls_with_answer("yes");
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(request("active"), controls).await.unwrap();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::TextDelta { .. }) {
+            break;
+        }
+    }
+    assert_eq!(
+        turn.inspect_context().await.unwrap().used_tokens,
+        Some(828300)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), stream.next())
+            .await
+            .is_err()
+    );
+    interrupt.cancel();
+    while stream.next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn context_inspection_old_runtime_is_cached_and_timeout_exit_are_bounded() {
+    for scenario in ["context-unknown", "context-timeout", "context-exit"] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("wire");
+        let mut env = fake_env(scenario);
+        env.insert("FAKE_OMP_LOG".into(), log.to_string_lossy().into_owned());
+        let harness = fake_harness(scenario).with_env(env);
+        let (controls, _steering, interrupt) = controls_with_answer("yes");
+        let turn = controls.turn.clone();
+        let mut stream = harness.run(request("first"), controls).await.unwrap();
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        let first = turn.inspect_context().await;
+        if scenario == "context-unknown" {
+            assert!(matches!(first, Err(HarnessError::Unsupported(_))));
+            assert!(matches!(
+                turn.inspect_context().await,
+                Err(HarnessError::Unsupported(_))
+            ));
+        } else {
+            assert!(first.is_err());
+        }
+        interrupt.cancel();
+        while stream.next().await.is_some() {}
+        let wire = std::fs::read_to_string(log).unwrap();
+        assert_eq!(wire.lines().filter(|l| l.ends_with(" prompt")).count(), 1);
+        assert_eq!(
+            wire.lines()
+                .filter(|l| l.ends_with(" get_context_breakdown"))
+                .count(),
+            1
+        );
+    }
+}

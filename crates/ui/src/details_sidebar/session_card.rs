@@ -190,6 +190,8 @@ impl DetailsSidebar {
         self.ensure_session_diff_watch(cx);
         self.ensure_context_sources(cx);
         self.ensure_project_skill_usage(cx);
+        self.ensure_context_breakdown(cx);
+        let context_expanded = self.sidebar.context_disclosure_expanded("expanded");
         let session = context
             .chat_id
             .as_deref()
@@ -197,8 +199,15 @@ impl DetailsSidebar {
         let mut card = details_card("workspace-widget", theme);
 
         // ── Session ────────────────────────────────────────────────────
-        if let Some(session) = session.as_ref() {
-            let fraction = session.context_usage.and_then(|usage| usage.fraction());
+        if context.chat_id.is_some() {
+            let fraction = if context_expanded {
+                self.expanded_context_fraction()
+            } else {
+                session
+                    .as_ref()
+                    .and_then(|session| session.context_usage)
+                    .and_then(|usage| usage.fraction())
+            };
             let fill = match fraction {
                 Some(f) if f >= 0.9 => theme.danger,
                 Some(f) if f >= 0.75 => theme.warning,
@@ -248,9 +257,26 @@ impl DetailsSidebar {
                 )
                 .into_any_element();
             card = card
-                .child(card_header("Session", Some(chat_actions), theme))
+                .child(card_header(
+                    "Session",
+                    session.as_ref().map(|_| chat_actions),
+                    theme,
+                ))
                 .child(
                     div()
+                        .id("context-disclosure")
+                        .debug_selector(|| "context-disclosure".into())
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .aria_label("Context budget")
+                        .aria_expanded(context_expanded)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.element_hover))
+                        .focus_visible(|style| style.bg(theme.element_active))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_context_breakdown(cx);
+                        }))
                         .h(px(28.0))
                         .px(px(12.0))
                         .flex()
@@ -269,7 +295,19 @@ impl DetailsSidebar {
                                 .flex_1()
                                 .text_size(px(12.5))
                                 .text_color(theme.text)
-                                .child("Context"),
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child("Context")
+                                .child(
+                                    icons::icon(if context_expanded {
+                                        icons::ALT_ARROW_DOWN
+                                    } else {
+                                        icons::ALT_ARROW_RIGHT
+                                    })
+                                    .size(px(12.0))
+                                    .text_color(theme.text_muted),
+                                ),
                         )
                         .child(
                             div()
@@ -278,17 +316,22 @@ impl DetailsSidebar {
                                 .child(percent),
                         ),
                 )
-                .child(
-                    div()
-                        .mx(px(12.0))
-                        .mb(px(6.0))
-                        .h(px(4.0))
-                        .rounded_full()
-                        .bg(crate::theme::ink(0.10))
-                        .child(div().h_full().rounded_full().bg(fill).w(gpui::relative(
-                            fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32,
-                        ))),
-                )
+                .when(!context_expanded, |card| {
+                    card.child(
+                        div()
+                            .mx(px(12.0))
+                            .mb(px(6.0))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(crate::theme::ink(0.10))
+                            .child(div().h_full().rounded_full().bg(fill).w(gpui::relative(
+                                fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32,
+                            ))),
+                    )
+                })
+                .when(context_expanded, |card| {
+                    card.child(self.render_context_breakdown(theme, cx))
+                })
                 .child(card_divider(theme));
         }
 
@@ -441,8 +484,8 @@ impl DetailsSidebar {
         // ── Turn stats ─────────────────────────────────────────────────
         if let Some(stats) = session.as_ref().and_then(|session| session.turn_stats) {
             card = card.child(card_divider(theme));
-            let model_ms = stats.model_ms.unwrap_or(stats.duration_ms);
-            let response_rate = stats.output_rate(model_ms);
+            let model_ms = stats.model_ms;
+            let response_rate = model_ms.and_then(|ms| stats.output_rate(ms));
             let rate = |rate: Option<f64>| -> SharedString {
                 rate.map(|r| format!("~{} tok/s", r.round() as u64))
                     .unwrap_or_else(|| "—".into())
@@ -498,7 +541,13 @@ impl DetailsSidebar {
                 let rows: Vec<(&str, SharedString)> = vec![
                     ("Response", rate(response_rate)),
                     ("Whole turn", rate(stats.output_rate(stats.duration_ms))),
-                    ("Model time", format_duration_ms(model_ms).into()),
+                    (
+                        "Model time",
+                        model_ms
+                            .map(format_duration_ms)
+                            .unwrap_or_else(|| "—".into())
+                            .into(),
+                    ),
                     (
                         "Tool time",
                         stats
@@ -762,6 +811,132 @@ mod tests {
     use super::{
         format_cache, format_cost, format_duration_ms, format_token_count, project_skills,
     };
+
+    #[gpui::test]
+    fn context_disclosure_is_inline_keyboard_accessible_and_scoped(cx: &mut gpui::TestAppContext) {
+        use super::super::*;
+        use gpui::{
+            AppContext, InputEvent as _, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Render,
+            Window,
+        };
+        let data = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state,_| {
+            state.local_device_id=Some("host".into());
+            state.sessions=vec![serde_json::from_value(serde_json::json!({"chatId":"chat","deviceId":"host","status":"idle","updatedAt":chrono::Utc::now(),"contextUsage":{"tokens":828300,"contextWindow":1000000}})).unwrap()];
+        });
+        let workers = cx.new(|cx| WorkersModel::detached(state.clone(), cx));
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let pickers = composer.read_with(cx, |c, _| c.pickers().clone());
+        let sidebar = cx.new(|cx| {
+            DetailsSidebar::new(
+                state.clone(),
+                workers,
+                DetailsSidebarPreferences::default(),
+                pickers,
+                composer,
+                cx,
+            )
+        });
+        let context = DetailsContext {
+            key: "fixture:chat".into(),
+            cwd: data.path().into(),
+            branch: None,
+            chat_id: Some("chat".into()),
+            target_device_id: Some("host".into()),
+            mode: crate::details_sidebar::context::DetailsMode::Orchestrator,
+        };
+        sidebar.update(cx, |s, _| {
+            s.sidebar.set_context(Some(context.clone()));
+            s.checkout_not_git = true;
+        });
+        struct Probe {
+            sidebar: Entity<DetailsSidebar>,
+            _observe: Subscription,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let card = self.sidebar.update(cx, |s, cx| {
+                    let context = s.sidebar.context().unwrap().clone();
+                    s.render_session_card(
+                        &context,
+                        div().into_any_element(),
+                        false,
+                        None,
+                        &theme,
+                        cx,
+                    )
+                });
+                div().w(px(300.0)).h(px(1000.0)).child(card)
+            }
+        }
+        let (_, window) = cx.add_window_view(|_, cx| Probe {
+            sidebar: sidebar.clone(),
+            _observe: cx.observe(&sidebar, |_, _, cx| cx.notify()),
+        });
+        window.update(|w, cx| w.draw(cx).clear());
+        let toggle = window
+            .debug_bounds("context-disclosure")
+            .expect("Context has an inline disclosure");
+        assert!(window.debug_bounds("context-breakdown").is_none());
+        window.simulate_click(toggle.center(), Modifiers::default());
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-breakdown").is_some());
+        let preferences = sidebar.read_with(window, |s, _| s.preferences());
+        assert!(
+            preferences.expanded["fixture:chat"]
+                .iter()
+                .any(|m| m == ":context:expanded")
+        );
+        sidebar.update(window, |s, cx| {
+            let mut other = context.clone();
+            other.key = "fixture:other".into();
+            other.chat_id = Some("other".into());
+            s.set_context(Some(other), cx);
+        });
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-breakdown").is_none());
+        sidebar.update(window, |s, cx| s.set_context(Some(context), cx));
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-breakdown").is_some());
+        // Keyboard activates the same disclosure, without toggling sibling sections.
+        window.simulate_click(toggle.center(), Modifiers::default());
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-breakdown").is_none());
+        let press = |window: &mut gpui::VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).unwrap();
+            window.update(|w, cx| {
+                w.dispatch_event(
+                    KeyDownEvent {
+                        keystroke: keystroke.clone(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            window.run_until_parked();
+            window.update(|w, cx| w.draw(cx).clear());
+            window.update(|w, cx| {
+                w.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
+            });
+            window.run_until_parked();
+        };
+        press(window, "enter");
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-breakdown").is_some());
+        press(window, "space");
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-breakdown").is_none());
+        assert!(sidebar.read_with(window, |s, _| s.turn_stats_collapsed));
+    }
 
     #[test]
     fn cache_reads_as_token_counts_with_their_share() {

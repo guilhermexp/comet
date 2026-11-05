@@ -190,6 +190,7 @@ rpc_methods! {
     ENSURE_CHAT_WORKED_PROJECTS / EnsureChatWorkedProjects = "EnsureChatWorkedProjects" { params: zeron_proto::EnsureChatWorkedProjectsParams, reply: (), forwardable: true },
     WATCH_DEVICES / WatchDevices = "WatchDevices" { params: serde_json::Value, reply: serde_json::Value },
     WATCH_PROJECT_SKILL_USAGE / WatchProjectSkillUsage = "WatchProjectSkillUsage" { params: zeron_proto::skill_usage::WatchProjectSkillUsageParams, reply: zeron_proto::skill_usage::ProjectSkillUsageSnapshot, forwardable: true, stream: true },
+    GET_CHAT_CONTEXT_BREAKDOWN / GetChatContextBreakdown = "GetChatContextBreakdown" { params: zeron_proto::GetChatContextBreakdownParams, reply: zeron_proto::ContextBreakdown, forwardable: true, deadline_secs: 10 },
     WATCH_SESSIONS / WatchSessions = "WatchSessions" { params: serde_json::Value, reply: serde_json::Value },
     /// Spaces registry (device+folder pairs) from the workspace doc.
     WATCH_SPACES / WatchSpaces = "WatchSpaces" { params: serde_json::Value, reply: serde_json::Value },

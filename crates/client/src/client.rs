@@ -1465,6 +1465,41 @@ impl Client {
         Ok(())
     }
 
+    /// Inspect an existing Chat runtime on its host, without submitting a prompt.
+    pub async fn get_chat_context_breakdown(
+        &self,
+        device_id: &str,
+        chat_id: &str,
+    ) -> Result<zeron_proto::ContextBreakdown> {
+        match self.inner.backend() {
+            Backend::Demo(_) => {
+                let mut report = zeron_proto::ContextBreakdown::unavailable(
+                    zeron_proto::ContextAvailability::Unsupported,
+                    "Native context details are unavailable in Demo",
+                );
+                report.chat_id = chat_id.into();
+                report.host_device_id = device_id.into();
+                Ok(report)
+            }
+            Backend::Live(live) => {
+                let params = zeron_proto::GetChatContextBreakdownParams {
+                    chat_id: chat_id.into(),
+                    target_device_id: None,
+                };
+                let value = live
+                    .relay
+                    .call(
+                        device_id,
+                        zeron_rpc::methods::GET_CHAT_CONTEXT_BREAKDOWN,
+                        serde_json::to_value(params)
+                            .map_err(|e| ClientError::HostError(e.to_string()))?,
+                    )
+                    .await?;
+                serde_json::from_value(value).map_err(|e| ClientError::HostError(e.to_string()))
+            }
+        }
+    }
+
     pub async fn list_refs(&self, device_id: &str, repo_path: &str) -> Result<Vec<RepoRef>> {
         match self.inner.backend() {
             Backend::Demo(demo) => demo.list_refs(repo_path).await,

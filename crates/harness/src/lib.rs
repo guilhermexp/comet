@@ -85,9 +85,19 @@ impl SteerMessage {
 pub struct TurnControl {
     stop: std::sync::Arc<tokio::sync::Notify>,
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    context: context_inspection::ContextInspection,
 }
 
 impl TurnControl {
+    /// Host: inspect the existing runtime, without sending a prompt.
+    pub async fn inspect_context(&self) -> Result<zeron_proto::ContextBreakdown, HarnessError> {
+        self.context.inspect().await
+    }
+    /// Driver: install the narrow request/reply mailbox for this runtime.
+    pub fn context_requests(&self) -> mpsc::Receiver<context_inspection::ContextInspectionRequest> {
+        self.context.attach()
+    }
+
     /// Host: end the in-flight turn, keeping the runtime and its background work.
     pub fn stop_turn(&self) {
         self.stop.notify_one();
@@ -336,6 +346,8 @@ pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
 pub mod agent_ports;
 pub mod claude;
 pub mod codex;
+pub mod context_breakdown;
+pub mod context_inspection;
 pub mod cursor;
 pub(crate) mod executable;
 pub mod install;

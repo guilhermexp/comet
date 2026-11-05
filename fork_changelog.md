@@ -2,6 +2,12 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-05 — Turn stats e Session Context (entrega local)
+
+- Model time e Response rate usam a soma completa das durações nativas; duração fracionária do OMP é preservada por arredondamento verificado, e timing parcial/ausente fica indisponível. Totais de tokens/cache/custo e exclusão de filhos continuam independentes.
+- Context mantém o indicador compacto e abre orçamento inline com categorias, estimativas e listas limitadas. Inspeção é somente leitura no host/runtime selecionado, sem prompt, polling ou provider token-count; falhas retêm o snapshot anterior como stale.
+- Claude usa apenas summary em versão verificada. OMP v1 preserva atribuição aninhada, residual BPE assinado e deferred histórico; o smoke source-built com provider loopback passou sem requests extras em inspeções. Aparência do app instalado não foi comprovada. Sem release, upgrade ou substituição do app.
+
 ## 2026-11-03: v1.0.16
 
 - Branch e projetos próximos na sidebar, sem coluna vazia entre os rótulos.

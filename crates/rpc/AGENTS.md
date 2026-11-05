@@ -12,6 +12,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Local Contracts
 
+- `GetChatContextBreakdown` is additive unary/forwardable with typed proto params/reply and a 10s forwarding deadline. The target host validates Chat ownership and never starts a runtime for inspection; old hosts may return UnknownMethod. It is registered only in `rpc_methods!`.
+
 - `GenerateCommitMessage` é unary tipado, forwardable, deadline de relay 100s; a engine aplica budget próprio de 90s também no IPC. Geração usa a autorização de checkout de Changes e devolve só um rascunho editável.
 
 - SearchGitHistory e ResolveGitAvatars são unary tipados e relay-forwardable no registry. Não recriar listas de forwardable/deadlines no handler.

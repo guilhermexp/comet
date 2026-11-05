@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `context_breakdown` defines optional ephemeral `GetChatContextBreakdown` metadata, explicit availability and native provenance. Nested category attribution and deferred tools never add active budget; missing cells/lists are not zero. `TurnMetrics.model_timing_incomplete` is defaulted for old peers and invalidates partial native model-time sums, independently of auxiliary cache/cost metrics. Detailed inspection never enters synced documents. Native metadata preserves complete identity/lifecycle, nullable local-change evidence, signed BPE residual and separate historical provider/transcript indices; unknown is never inferred false/zero.
+
 - `ListDevServersParams.chatId` e `DevServer.previewEligible` são opcionais/default None; dados antigos não prometem elegibilidade. `preview_visible_to_chat` é o predicado compartilhado de device/ownership e Chat-origem OU project cwd exato, usado no watch e na elegibilidade host-side. Não altera autorização de proxy nem persistência Loro.
 - `Chat.workedProjects` é opcional: ausência é desconhecida, não uma lista vazia confirmada. `ChatWorkedProjects` contém IDs de Space em ordem, `complete` e `historyVersion` opcional opaca (`Vec<u8>`); proto não interpreta Loro. `EnsureChatWorkedProjects` recebe `chatIds` para o host, sem abrir streams por row.
 
@@ -71,6 +73,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - Comandos: `cargo test -p zeron-proto`
 
 | Camada / path | Tier exigido | Como rodar |
+|---|---|---|
+| `src/context_breakdown.rs` (zero/desconhecido, capacidade excedida, nested/deferred sem dupla contagem) | unit | `cargo test --locked -p zeron-proto context_breakdown` |
 | `src/view` (derivações puras) | unit | `cargo test -p zeron-proto` |
 | `src/**` (tipos serde) | unit — roundtrip de serialização quando o shape tem regra | `cargo test -p zeron-proto` |
 | `src/run_errors.rs` + `src/view.rs` (limite, prazo informado, fallback diagnóstico e faixa de status) | unit | `cargo test -p zeron-proto run_errors` · `cargo test -p zeron-proto failure_text_tests` |

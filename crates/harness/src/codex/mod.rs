@@ -1943,6 +1943,7 @@ async fn run_session(session: Session) {
                                     cache_write_tokens: None,
                                     cost_usd: None,
                                     model_ms: None,
+                                    model_timing_incomplete: false,
                                 });
                             }
                         }

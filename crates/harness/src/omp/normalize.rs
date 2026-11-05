@@ -699,32 +699,37 @@ fn message_usage(frame: &Value) -> Vec<AgentEvent> {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return Vec::new();
     }
-    let Some(usage) = message.get("usage") else {
-        return Vec::new();
-    };
+    let usage = message.get("usage").unwrap_or(&Value::Null);
     let count = |key: &str| usage.get(key).and_then(Value::as_u64);
     let input = count("input");
     let output = count("output");
-    if input.is_none() && output.is_none() {
-        return Vec::new();
-    }
+    let model_ms = message
+        .get("duration")
+        .and_then(Value::as_f64)
+        .and_then(|ms| {
+            let rounded = ms.round();
+            (ms.is_finite() && ms >= 0.0 && rounded < u64::MAX as f64).then(|| rounded as u64)
+        });
     let cost = usage
         .get("cost")
         .and_then(|cost| cost.get("total"))
         .and_then(Value::as_f64);
-    vec![
-        AgentEvent::Usage {
+    let mut events = Vec::new();
+    if input.is_some() || output.is_some() {
+        events.push(AgentEvent::Usage {
             input_tokens: input.unwrap_or(0),
             output_tokens: output.unwrap_or(0),
             context_usage: None,
-        },
-        AgentEvent::TurnMetrics {
-            cache_read_tokens: count("cacheRead"),
-            cache_write_tokens: count("cacheWrite"),
-            cost_usd: cost,
-            model_ms: None,
-        },
-    ]
+        });
+    }
+    events.push(AgentEvent::TurnMetrics {
+        cache_read_tokens: count("cacheRead"),
+        cache_write_tokens: count("cacheWrite"),
+        cost_usd: cost,
+        model_ms,
+        model_timing_incomplete: model_ms.is_none(),
+    });
+    events
 }
 
 fn execution_meta(result: &Value) -> Option<ToolExecutionMeta> {
@@ -997,6 +1002,67 @@ mod tests {
     use zeron_proto::{WorkflowProgressNode, WorkflowTaskStatus, WorkflowUsage};
 
     #[test]
+    fn native_missing_invalid_and_partial_request_timing_stays_explicit() {
+        let mut normalizer = OmpNormalizer::new("/repo", "test");
+        for duration in [
+            Value::Null,
+            json!(-1.0),
+            json!(1e30),
+            json!("42"),
+            json!(f64::INFINITY),
+        ] {
+            let events=normalizer.push(json!({"type":"message_end","message":{"role":"assistant","duration":duration,"usage":{"input":1,"output":2}}}));
+            assert!(matches!(
+                events.last(),
+                Some(AgentEvent::TurnMetrics {
+                    model_ms: None,
+                    model_timing_incomplete: true,
+                    ..
+                })
+            ));
+        }
+        for duration in [0.0, 0.49, 0.5, 143607.892374] {
+            let events=normalizer.push(json!({"type":"message_end","message":{"role":"assistant","duration":duration,"usage":{"input":1,"output":2}}}));
+            assert!(matches!(
+                events.last(),
+                Some(AgentEvent::TurnMetrics {
+                    model_ms: Some(_),
+                    model_timing_incomplete: false,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn native_fractional_duration_and_zero_are_preserved() {
+        for (duration, expected) in [
+            (143607.892374, Some(143608)),
+            (0.0, Some(0)),
+            (0.49, Some(0)),
+            (0.5, Some(1)),
+            (1.5, Some(2)),
+            (-1.0, None),
+            (u64::MAX as f64, None),
+            (1e30, None),
+        ] {
+            let mut normalizer = OmpNormalizer::new("/repo", "test");
+            let events = normalizer.push(json!({"type":"message_end", "message": {
+                "role":"assistant", "duration": duration,
+                "usage":{"input":38,"output":13824,"cacheRead":5017335,"cacheWrite":52343,"cost":{"total":1.698843}}
+            }}));
+            let model_ms = events
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::TurnMetrics { model_ms, .. } => Some(*model_ms),
+                    _ => None,
+                })
+                .expect("model-bearing message emits metrics");
+            assert_eq!(model_ms, expected, "duration {duration}");
+        }
+    }
+
+    #[test]
     fn assistant_message_end_reports_usage_cache_and_cost() {
         let mut normalizer = OmpNormalizer::new("/repo", "test");
         let events = normalizer.push(json!({
@@ -1023,20 +1089,26 @@ mod tests {
                     cache_write_tokens: Some(60),
                     cost_usd: Some(0.31),
                     model_ms: None,
+                    model_timing_incomplete: true,
                 },
             ]
         );
-        // User/tool messages and usage-less ends stay silent.
+        // User/tool messages stay silent; a missing assistant measurement invalidates timing.
         assert!(
             normalizer
                 .push(json!({"type":"message_end","message":{"role":"user","usage":{"input":1}}}))
                 .is_empty()
         );
-        assert!(
+        assert!(matches!(
             normalizer
                 .push(json!({"type":"message_end","message":{"role":"assistant"}}))
-                .is_empty()
-        );
+                .as_slice(),
+            [AgentEvent::TurnMetrics {
+                model_ms: None,
+                model_timing_incomplete: true,
+                ..
+            }]
+        ));
     }
 
     #[test]

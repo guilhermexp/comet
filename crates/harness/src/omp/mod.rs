@@ -522,11 +522,13 @@ impl Harness for OmpHarness {
             .await
             .map_err(|_| HarnessError::Protocol("OMP event consumer closed".into()))?;
 
+        let context_requests = controls.turn.context_requests();
         tokio::spawn(run_session(
             process,
             events,
             event_tx,
             controls,
+            context_requests,
             workers,
             zeron,
             computer_use,
@@ -826,6 +828,7 @@ async fn run_session(
     mut events: mpsc::Receiver<Value>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
+    mut context_requests: mpsc::Receiver<crate::context_inspection::ContextInspectionRequest>,
     workers: Option<Arc<WorkersBridge>>,
     zeron: Option<Arc<WorkersBridge>>,
     computer_use: Option<Arc<WorkersBridge>>,
@@ -843,7 +846,7 @@ async fn run_session(
         mut steering,
         interrupt,
         chat_id: _,
-        turn: _,
+        turn: _turn,
     } = controls;
     let request_input: Arc<RequestInputFn> = request_input.into();
     let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
@@ -947,8 +950,38 @@ async fn run_session(
         }};
     }
 
+    let context_unsupported = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut context_tasks = tokio::task::JoinSet::new();
     while !finished {
         tokio::select! {
+            request = context_requests.recv() => {
+                if let Some(request) = request {
+                    if request.reply.is_closed() || request.deadline <= tokio::time::Instant::now() {continue;}
+                    if context_unsupported.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = request.reply.send(Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into())));
+                        continue;
+                    }
+                    if context_tasks.len() >= 8 {
+                        let _ = request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;
+                    }
+                    let process=process.clone();let unsupported=context_unsupported.clone();
+                    context_tasks.spawn(async move {
+                        let timeout=request.deadline.saturating_duration_since(tokio::time::Instant::now());
+                        let result=process.request_with_timeout(json!({"type":"get_context_breakdown"}),timeout).await;
+                        let report=match result {
+                            Ok(value)=>Ok(crate::context_breakdown::omp(&value)),
+                            Err(error) if error.to_string().contains("Unknown command")=>{
+                                unsupported.store(true,std::sync::atomic::Ordering::Release);
+                                Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into()))
+                            }
+                            Err(_)=>Err(HarnessError::Protocol("OMP context inspection failed or timed out".into())),
+                        };
+                        let _=request.reply.send(report);
+                    });
+                }
+            }
+            _ = context_tasks.join_next(), if !context_tasks.is_empty() => {}
+
             _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
                 finish_agent_end(&process, &event_tx, &mut session_id, &mut pending_interactive,
                     AgentEndDisposition::Error("OMP compaction timed out before completion".into())).await;
@@ -1390,6 +1423,9 @@ async fn run_session(
         }
     }
 
+    context_tasks.abort_all();
+    context_requests.close();
+    drop(context_requests);
     for (_, cancellation) in pending_interactive.drain() {
         cancellation.cancel();
     }

@@ -12,6 +12,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 ## Local Contracts
 
+- Native context inspection is optional metadata over `GetChatContextBreakdown`, from an existing host runtime through the harness request/reply mailbox. Proto owns budget/list types, engine owns latest-only ephemeral caching, RPC/`zeron-client` preserve host routing, and Details owns scoped disclosure preferences. It is separate from aggregate context continuity, Chat Transcript, steering and Managed Provider Usage.
+
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.
 - `edition = "2024"` em todas.
 - `mcp/src/tools.rs`: a consulta existente `list_chats.parent` descobre Chats criados por `parent_chat_id` **ou** `origin_chat_id`; summaries expõem `parentChatId` e `originChatId` separadamente. Isso não muda `Chat::is_top_level`, autoridade nem a linhagem gravada. Regressão de consumidor com RPC em memória: `creator_query_lists_both_lineages_without_reparenting`.

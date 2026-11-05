@@ -162,6 +162,15 @@ while IFS= read -r line; do
         respond "$line" '{"protocolVersion":2}'
       fi
       ;;
+    get_context_breakdown)
+      if [ "$scenario" = "context-unknown" ]; then
+        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"get_context_breakdown\",\"success\":false,\"error\":\"Unknown command: get_context_breakdown\"}"
+        continue
+      fi
+      if [ "$scenario" = "context-exit" ]; then exit 0; fi
+      if [ "$scenario" = "context-timeout" ]; then continue; fi
+      respond "$line" '{"schemaVersion":1,"identity":{"sessionId":"s-1","model":{"provider":"openai-codex","id":"gpt-5.6-sol"},"contextWindow":1000000,"compactionEpoch":0,"contextUsageRevision":1,"messageCount":2},"snapshot":{"capturedAtMs":1000,"lastProviderAtMs":900,"usedBasis":"provider-anchor","streaming":false,"pendingRequest":false},"total":{"usedTokens":828300,"contextWindow":1000000,"reserveTokens":33000,"freeTokens":138700},"categories":{"messages":{"tokens":828300,"basis":"provider-anchor-residual"},"systemPrompt":{"tokens":0,"basis":"tokenizer-estimate"},"systemTools":{"tokens":0,"basis":"tokenizer-estimate"},"systemContext":{"tokens":0,"basis":"tokenizer-estimate"},"skills":{"tokens":0,"basis":"tokenizer-estimate"}}}'
+      ;;
     get_state)
       if [ "$scenario" = "live-event-flood" ]; then
         sequence=0
@@ -584,7 +593,10 @@ while IFS= read -r line; do
         fi
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after-dup"}}'
         emit '{"type":"agent_end","messages":[]}'
-      elif [ "$scenario" = "multi-turn" ]; then
+      elif [ "$scenario" = "context-active" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"active"}}'
+      elif [ "$scenario" = "multi-turn" ] || [ "$scenario" = "context-unknown" ] || [ "$scenario" = "context-exit" ] || [ "$scenario" = "context-timeout" ]; then
         # One agent run per prompt, in the SAME process. A steer that reaches
         # a turn in flight is answered by the main loop below.
         turn_count=$((turn_count + 1))

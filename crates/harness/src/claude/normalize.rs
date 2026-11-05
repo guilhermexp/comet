@@ -1504,13 +1504,16 @@ impl Normalizer {
                 let metrics = (f.usage.cache_read_input_tokens.is_some()
                     || f.usage.cache_creation_input_tokens.is_some()
                     || f.total_cost_usd.is_some()
-                    || f.duration_api_ms.is_some())
-                .then(|| AgentEvent::TurnMetrics {
-                    cache_read_tokens: f.usage.cache_read_input_tokens,
-                    cache_write_tokens: f.usage.cache_creation_input_tokens,
-                    cost_usd: f.total_cost_usd,
-                    model_ms: f.duration_api_ms,
-                });
+                    || f.duration_api_ms.is_some()
+                    || f.usage.input_tokens > 0
+                    || f.usage.output_tokens > 0)
+                    .then(|| AgentEvent::TurnMetrics {
+                        cache_read_tokens: f.usage.cache_read_input_tokens,
+                        cache_write_tokens: f.usage.cache_creation_input_tokens,
+                        cost_usd: f.total_cost_usd,
+                        model_ms: f.duration_api_ms,
+                        model_timing_incomplete: f.duration_api_ms.is_none(),
+                    });
                 let failure = (f.subtype == "success" && !interrupted && !aborted(&f))
                     .then(|| api_failure(&f))
                     .flatten();

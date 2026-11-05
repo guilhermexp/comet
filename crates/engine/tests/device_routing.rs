@@ -2622,3 +2622,79 @@ async fn project_skill_usage_create_offline_owner_validation_is_not_suppressed()
     core.shutdown().await;
     relay.abort();
 }
+
+#[tokio::test]
+async fn context_inspection_routes_to_the_selected_host_without_local_fallback() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let core_b = assemble(&dirs.path().join("context-b"), "device-b");
+    let _host = core_b.start_host_relay(&relay_url);
+    let core_a = assemble(&dirs.path().join("context-a"), "device-a");
+    let mut links = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    links.probe_timeout = Duration::from_secs(5);
+    core_a.set_links(LinkCache::new(links));
+    // Same Chat id on both devices deliberately catches a local fallback.
+    core_a
+        .workspace
+        .create_chat("context-chat", None, Some("device-a"), None, None)
+        .unwrap();
+    core_b
+        .workspace
+        .create_chat("context-chat", None, Some("device-b"), None, None)
+        .unwrap();
+    core_b
+        .workspace
+        .create_chat("foreign-context", None, Some("device-a"), None, None)
+        .unwrap();
+    let client = zeron_rpc::memory_client(core_a.rpc_service());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if client
+                .call(
+                    methods::LIST_HARNESSES,
+                    serde_json::json!({"targetDeviceId":"device-b"}),
+                )
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let value = client
+        .call(
+            "GetChatContextBreakdown",
+            serde_json::json!({"targetDeviceId":"device-b","chatId":"context-chat"}),
+        )
+        .await
+        .unwrap();
+    let report: zeron_proto::ContextBreakdown = serde_json::from_value(value).unwrap();
+    assert_eq!(report.host_device_id, "device-b");
+    assert_eq!(report.chat_id, "context-chat");
+    assert_eq!(
+        report.availability,
+        zeron_proto::ContextAvailability::NotApplicable
+    );
+    assert!(
+        client
+            .call(
+                "GetChatContextBreakdown",
+                serde_json::json!({"targetDeviceId":"device-b","chatId":"foreign-context"})
+            )
+            .await
+            .is_err()
+    );
+    let local: zeron_proto::ContextBreakdown = client
+        .call_as(
+            "GetChatContextBreakdown",
+            serde_json::json!({"targetDeviceId":"device-a","chatId":"context-chat"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(local.host_device_id, "device-a");
+    core_a.sessions.shutdown().await;
+    core_b.sessions.shutdown().await;
+}

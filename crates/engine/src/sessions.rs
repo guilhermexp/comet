@@ -39,6 +39,8 @@ use crate::doc_host::{ChatDocHandle, DocHost};
 
 #[path = "session_activity.rs"]
 mod activity;
+#[path = "context_breakdown.rs"]
+mod context_breakdown;
 use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
@@ -373,6 +375,7 @@ struct Inner {
     doc_host: Mutex<Option<DocHost>>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    context_breakdowns: Mutex<HashMap<String, Arc<context_breakdown::ContextCache>>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -485,6 +488,7 @@ impl SessionsEngine {
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
+                context_breakdowns: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -3218,6 +3222,7 @@ struct TurnAccumulator {
     cache_write_tokens: Option<u64>,
     cost_usd: Option<f64>,
     model_ms: Option<u64>,
+    model_timing_incomplete: bool,
     /// Harness-reported tool durations (`ToolExecutionMeta`), used only when
     /// no call/result span was observed.
     tool_ms: Option<u64>,
@@ -3262,10 +3267,17 @@ impl TurnAccumulator {
                 cache_write_tokens,
                 cost_usd,
                 model_ms,
+                model_timing_incomplete,
             } => {
                 add(&mut self.cache_read_tokens, *cache_read_tokens);
                 add(&mut self.cache_write_tokens, *cache_write_tokens);
-                add(&mut self.model_ms, *model_ms);
+                self.model_timing_incomplete |= *model_timing_incomplete;
+                if let Some(value) = model_ms {
+                    match self.model_ms.unwrap_or(0).checked_add(*value) {
+                        Some(total) => self.model_ms = Some(total),
+                        None => self.model_timing_incomplete = true,
+                    }
+                }
                 if let Some(cost) = cost_usd {
                     self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
                 }
@@ -3293,9 +3305,7 @@ impl TurnAccumulator {
         } else {
             Some(union_ms(&self.tool_spans))
         };
-        let model_ms = self.model_ms.or_else(|| {
-            (duration_ms > 0).then(|| duration_ms.saturating_sub(tool_ms.unwrap_or(0)))
-        });
+        let model_ms = self.model_ms.filter(|_| !self.model_timing_incomplete);
         zeron_proto::TurnStats {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
@@ -6485,6 +6495,7 @@ mod tests {
             cache_write_tokens: Some(100),
             cost_usd: Some(0.25),
             model_ms: None,
+            model_timing_incomplete: false,
         });
         let stats = turn.finish(11_000);
         assert_eq!(
@@ -6498,14 +6509,102 @@ mod tests {
             "measured spans win over reports"
         );
         assert_eq!(
-            stats.model_ms,
-            Some(6_000),
-            "falls back to wall time minus tools"
+            stats.model_ms, None,
+            "missing native timing must remain unavailable"
         );
         assert_eq!((stats.input_tokens, stats.output_tokens), (100, 40));
         assert_eq!(stats.cost_usd, Some(0.25));
         assert_eq!(stats.cache_fraction(), Some(0.6));
         assert_eq!(stats.output_rate(10_000), Some(4.0));
+    }
+
+    #[test]
+    fn native_timing_requires_every_model_contribution_and_resets_between_turns() {
+        let metrics = |model_ms, incomplete| AgentEvent::TurnMetrics {
+            model_ms,
+            model_timing_incomplete: incomplete,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: None,
+        };
+        let mut turn = super::TurnAccumulator::starting_at(1000);
+        turn.observe(&metrics(Some(0), false));
+        assert_eq!(turn.finish(2000).model_ms, Some(0));
+        turn.observe(&metrics(Some(1234), false));
+        turn.observe(&metrics(None, false)); // auxiliary cache/cost data
+        turn.observe(&AgentEvent::Subagent {
+            parent_tool_use_id: "child".into(),
+            event: Box::new(metrics(Some(99000), true)),
+        });
+        assert_eq!(turn.finish(5000).model_ms, Some(1234));
+        turn.observe(&metrics(None, true));
+        turn.observe(&metrics(Some(500), false));
+        assert_eq!(turn.finish(6000).model_ms, None);
+        let mut next = super::TurnAccumulator::starting_at(6000);
+        next.observe(&metrics(Some(100), false));
+        assert_eq!(next.finish(7000).model_ms, Some(100));
+        next.observe(&metrics(Some(u64::MAX), false));
+        assert_eq!(
+            next.finish(8000).model_ms,
+            None,
+            "overflow cannot be measured timing"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires private read-only COMET_TIMING_REPLAY_JSONL; prints scalar accounting only"]
+    fn native_turn_replay_from_private_jsonl() {
+        let path = std::env::var("COMET_TIMING_REPLAY_JSONL")
+            .expect("set the private read-only replay path");
+        let source = std::fs::read_to_string(path).unwrap();
+        let mut normalizer = zeron_harness::omp::normalize::OmpNormalizer::new("/replay", "test");
+        let mut turn = super::TurnAccumulator::starting_at(0);
+        let mut selected = false;
+        let mut requests = 0;
+        for line in source.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row["timestamp"] == "2026-11-05T18:16:54.368Z" {
+                selected = true;
+                continue;
+            }
+            if !selected {
+                continue;
+            }
+            let Some(message) = row.get("message") else {
+                continue;
+            };
+            if message["role"] == "user" {
+                break;
+            }
+            if message["role"] != "assistant" {
+                continue;
+            }
+            requests += 1;
+            for event in
+                normalizer.push(serde_json::json!({"type":"message_end","message":message}))
+            {
+                turn.observe_at(&event, 1);
+            }
+        }
+        let stats = turn.finish(160000);
+        assert_eq!(requests, 18);
+        assert_eq!(stats.output_tokens, 13824);
+        assert_eq!(stats.input_tokens, 38);
+        assert_eq!(stats.cache_read_tokens, Some(5017335));
+        assert_eq!(stats.cache_write_tokens, Some(52343));
+        assert!((stats.cost_usd.unwrap() - 1.698843).abs() < 1e-9);
+        assert!((stats.model_ms.unwrap() as f64 - 143607.892374).abs() < 9.0);
+        assert!((stats.output_rate(stats.model_ms.unwrap()).unwrap() - 96.2621).abs() < 0.02);
+        println!(
+            "SANITIZED replay: requests={requests} model_ms={:?} output={} rate={:.4} fresh={} read={:?} write={:?} cost={:.6}",
+            stats.model_ms,
+            stats.output_tokens,
+            stats.output_rate(stats.model_ms.unwrap()).unwrap(),
+            stats.input_tokens,
+            stats.cache_read_tokens,
+            stats.cache_write_tokens,
+            stats.cost_usd.unwrap()
+        );
     }
 
     #[test]
