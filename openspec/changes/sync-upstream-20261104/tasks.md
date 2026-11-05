@@ -34,9 +34,13 @@
 
 ## 5. CI e D1a (brief 2026-11-05)
 
-- [ ] 5.1 F1/F2: corrigir seletores Cargo preservando cobertura e provar comandos dos jobs.
-- [ ] 5.2 F3: RED próprio e alinhar descriptor OMP aos modos do driver.
-- [ ] 5.3 F4: RED próprio, reproduzir e corrigir admissão legacy sem retry/sleep.
-- [ ] 5.4 F5: terminar árvore Windows, cfg Unix e cross-check dos pacotes nativos.
-- [ ] 5.5 D1a: RED próprio e ativar plugins/templates mantendo grants e sem MCP injetado.
-- [ ] 5.6 Executar gates finais, DOX e relatório absoluto, sem publicação nem archive.
+- [x] 5.1 F1/F2: corrigir seletores Cargo preservando cobertura e provar comandos dos jobs.
+- [x] 5.2 F3: RED próprio e alinhar descriptor OMP aos modos do driver.
+- [x] 5.3 F4: RED próprio, reproduzir e corrigir admissão legacy sem retry/sleep.
+- [x] 5.4 F5: terminar árvore Windows, cfg Unix e cross-check dos pacotes nativos.
+- [x] 5.5 D1a: RED próprio e ativar plugins/templates mantendo grants e sem MCP injetado.
+- [x] 5.6 Executar gates finais, DOX e relatório absoluto, sem publicação nem archive.
+
+### Resultado do follow-up
+
+Itens 5.1–5.6 executados. F3/F4/D1a têm commits RED próprios e GREEN; grants e serviço entre engines passaram. Seletores F1/F2 corrigidos e preview Windows compila; cargo check --workspace --all-targets --locked passou. Os gates agregados ainda têm exceções anteriores comprovadas em 3f866aeb9 (Codex Voice, UI, ACP, Unpeel schema/Grok intermitente e compilação Windows do vendor). Ver verification.md e o relatório: esta marcação registra execução/aceite com as exceções permitidas pelo brief, não CI remoto nem uma suíte integral verde. Sem publicação/PR/merge/tag/dispatch e sem archive.

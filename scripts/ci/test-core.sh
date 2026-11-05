@@ -14,11 +14,8 @@
 #   zeron-engine   lib + the integration tests named below. Engine has many other
 #                  integration binaries (live agents etc.) that no workflow ran, so
 #                  they are listed instead of globbed to avoid compiling them.
-#   voice (moved from voice-tests.yml offline-linux, which ran them as 14 separate
-#   `cargo test` builds): zeron-voice-media, zeron-voice-session and zeron-orb
-#                  lib, zeron-proto lib `voice` tests, zeron-mcp lib, zeron-rpc
-#                  device_room, engine voice_runtime and device_routing. They need no
-#                  audio stack, and harness already depends on all of them.
+#   zeron-orb     lib + geometry (the former UI orb geometry tests)
+# Voice media/session, RPC and MCP keep their dedicated voice-tests.yml coverage.
 # nextest does not run doctests; these crates have none (their doc comments
 # contain no Rust code blocks).
 # Native visual model/GPU and zatex unit suites are included as workspace capabilities.
