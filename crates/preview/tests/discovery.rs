@@ -19,6 +19,44 @@ impl Drop for Child {
     }
 }
 const HTTP_SERVER: &str = "import http.server,socketserver; socketserver.TCPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler).serve_forever()";
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_launcher_closes_its_servers_output_pipe() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let dir = tempfile::tempdir().unwrap();
+    let script = "import os,http.server,socketserver; server=socketserver.TCPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler); print(os.getpid(),flush=True); server.serve_forever()";
+    let mut launcher = Child(
+        std::process::Command::new("sh")
+            .args(["-c", "python3 -c \"$1\"; true", "fixture-shell", script])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = tokio::process::ChildStdout::from_std(launcher.0.stdout.take().unwrap()).unwrap();
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let server: i32 = line.trim().parse().unwrap();
+    drop(launcher);
+    let closed =
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut Vec::new())).await;
+    if closed.is_err() {
+        // Clean up only this regression's known server before reporting RED.
+        unsafe {
+            libc::kill(server, libc::SIGKILL);
+        }
+    }
+    assert!(
+        closed.is_ok(),
+        "dropping the launcher left its server and output pipe alive"
+    );
+}
 fn scope(chats: &[(&str, &Path)]) -> Scope {
     Scope {
         chats: chats
