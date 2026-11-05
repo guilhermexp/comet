@@ -492,11 +492,17 @@ fn workspace(store: Arc<DocsStore>) -> WorkspaceHost {
 }
 
 fn legacy_chat(workspace: &WorkspaceHost, id: &str, device: &str, generation: Option<u32>) {
-    workspace
-        .create_chat(id, None, Some(device), None, None)
-        .unwrap();
-    let mut row = workspace.chat(id).unwrap().unwrap();
-    row.room_gen = generation;
+    // Import a legacy row directly. create_chat also persists a born-chat2
+    // snapshot for local hosts; changing only room_gen would leave epoch 2
+    // authoritative and correctly select Join rather than legacy Seed.
+    let row = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "deviceId": device,
+        "roomGen": generation,
+        "archived": false,
+        "createdAt": chrono::Utc::now(),
+    }))
+    .unwrap();
     workspace.import_chat_row(&row).unwrap();
 }
 

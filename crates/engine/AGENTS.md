@@ -159,6 +159,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Work Guidance
 
+- Fixtures de admissão legacy importam a row diretamente: `create_chat` semeia snapshot local epoch 2, que deve prevalecer sobre room_gen antigo. Não remover a precedência do epoch para satisfazer uma fixture inconsistente. `legacy_fixture_has_no_born_chat2_snapshot` e `legacy_admission_rechecks_owner_and_retires_only_the_captured_wake` cobrem a precondição e a retirada apenas do wake capturado.
+
 - O watchdog de quietude respeita `authoritative_prompt_end` em turnos com prompt: ACP permanece `Working` até o sinal autoritativo e aceita o próximo steer. Atividade autônoma mantém o fallback, coberto por `tests/acp_lifecycle.rs`.
 - Recovery e restart são contrato testado (`restart_resume.rs`): mudança em journal ou watchdog reprova ali antes de reprovar em produção.
 - Feature nova de backend normalmente é: RPC em `zeron-rpc` + handler aqui + comando no ledger de `zeron-doc`. Os três no mesmo commit.
