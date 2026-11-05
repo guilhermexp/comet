@@ -177,6 +177,8 @@ Referências based_on.turn_id e o contexto de avaliação usam a última entrada
 
 O e2e de interrupt observa via watch os dois commits (mensagem Aborted e comando Applied) antes de checar journal/Idle; a mensagem pode assentar antes do ACK. Não usar atraso fixo como barreira de conclusão.
 
+O teste de contexto de Stop espera via watch o status terminal de cada comando (early/stop/stale-stop), com deadline de 3 s usado pelos testes do doc host. Retorno de drain explícito não é recibo de conclusão: outro drain pode possuir a claim e ainda publicar o resultado. A regressão da espera exige Pending até a escrita terminal do dono.
+
 `tests/cloud_rpc.rs` cobre a recusa local-only de targetDeviceId antes de qualquer chamada ao edge e verifica separadamente a chamada local com bearer do usuário. D5 continua recusando forwarding de Cloud/vault.
 
 O broker usa `git_at_home` para helper e identidade: HOME distinto não herda `GIT_CONFIG_GLOBAL`/`XDG_CONFIG_HOME` externos; no HOME próprio os overrides legítimos continuam respeitados. Leitores de fixtures Git também fixam os três paths, sem mudar ambiente global ou grants. `credentials::tests::a_broker_home_does_not_inherit_another_homes_git_config` é prova unit em subprocesso privado; `tests/cloud_runner.rs` verifica helper/identidade de ponta a ponta contra mocks.

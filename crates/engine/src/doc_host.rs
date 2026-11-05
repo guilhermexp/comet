@@ -7364,14 +7364,34 @@ mod stop_fenced_hold_tests {
         handle: &Arc<super::ChatDocHandle>,
         id: &str,
     ) -> SessionCommandStatus {
-        handle
-            .doc()
-            .read_commands()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.id == id)
-            .unwrap()
-            .status
+        let (changed, mut changes) = tokio::sync::watch::channel(0u64);
+        let _subscription = handle.doc().doc().subscribe_root(Arc::new(move |_| {
+            changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+        }));
+        // Use the existing three-second doc-host test deadline. Subscribe
+        // before reading: a background owner may resolve between these steps.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                changes.borrow_and_update();
+                let status = handle
+                    .doc()
+                    .read_commands()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.id == id)
+                    .unwrap()
+                    .status;
+                if status != SessionCommandStatus::Pending {
+                    return status;
+                }
+                changes
+                    .changed()
+                    .await
+                    .expect("command document watch stays live");
+            }
+        })
+        .await
+        .expect("background command owner must publish a terminal outcome")
     }
 
     #[tokio::test]
@@ -7445,6 +7465,15 @@ mod stop_fenced_hold_tests {
                 .is_none(),
             "a user row is not an assistant turn"
         );
+        host.set_sessions(crate::sessions::SessionsEngine::new(
+            "device-a".into(),
+            Arc::new(crate::run_journal::RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(crate::registry::HarnessRegistry::new()),
+        ));
+        assert_eq!(
+            terminal_command_status(&handle, &early).await,
+            SessionCommandStatus::Applied
+        );
 
         handle
             .doc()
@@ -7476,21 +7505,8 @@ mod stop_fenced_hold_tests {
             command.based_on.as_ref().unwrap().turn_id.as_deref(),
             Some("active-turn")
         );
-        host.set_sessions(crate::sessions::SessionsEngine::new(
-            "device-a".into(),
-            Arc::new(crate::run_journal::RunJournal::open(dir.path().join("journal")).unwrap()),
-            Arc::new(crate::registry::HarnessRegistry::new()),
-        ));
-        host.drain_command_kind(&handle, true).await;
         assert_eq!(
-            handle
-                .doc()
-                .read_commands()
-                .unwrap()
-                .into_iter()
-                .find(|c| c.id == stop)
-                .unwrap()
-                .status,
+            terminal_command_status(&handle, &stop).await,
             SessionCommandStatus::Applied,
             "the arriving user row must not supersede Stop"
         );
@@ -7509,16 +7525,8 @@ mod stop_fenced_hold_tests {
             ..command
         };
         handle.doc().queue_command(&stale).unwrap();
-        host.drain_command_kind(&handle, true).await;
         assert_eq!(
-            handle
-                .doc()
-                .read_commands()
-                .unwrap()
-                .into_iter()
-                .find(|c| c.id == stale.id)
-                .unwrap()
-                .status,
+            terminal_command_status(&handle, &stale.id).await,
             SessionCommandStatus::Superseded,
             "a Stop for a genuinely older assistant turn stays stale"
         );
