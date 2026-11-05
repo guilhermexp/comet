@@ -44,3 +44,16 @@
 ### Resultado do follow-up
 
 Itens 5.1–5.6 executados. F3/F4/D1a têm commits RED próprios e GREEN; grants e serviço entre engines passaram. Seletores F1/F2 corrigidos e preview Windows compila; cargo check --workspace --all-targets --locked passou. Os gates agregados ainda têm exceções anteriores comprovadas em 3f866aeb9 (Codex Voice, UI, ACP, Unpeel schema/Grok intermitente e compilação Windows do vendor). Ver verification.md e o relatório: esta marcação registra execução/aceite com as exceções permitidas pelo brief, não CI remoto nem uma suíte integral verde. Sem publicação/PR/merge/tag/dispatch e sem archive.
+
+## 6. CI integral — rodada 2 (2026-11-05)
+
+A exceção de baseline da seção 5 foi revogada pelo dono. Falhas herdadas entram no escopo; os gates abaixo devem passar sem novos skips/ignores/retries/sleeps, redução de cobertura ou aumento de orçamento/timeout. Limites de publicação e D1a/grants permanecem.
+
+- [ ] 6.1 R1: isolar e corrigir o contrato Codex Voice com RED/GREEN e comparação 35561ead.
+- [ ] 6.2 R2: corrigir chips URL, índice General e geometria de metadata da sidebar com RED/GREEN.
+- [ ] 6.3 R3: tornar ACP registry determinístico e provar atualização 2.0.0 → 2.1.0.
+- [ ] 6.4 R4: reduzir schema sessions dentro do orçamento atual.
+- [ ] 6.5 R5: corrigir ETXTBSY na raiz e provar ao menos 30 invocações sem falha.
+- [ ] 6.6 R6: portar os caminhos Windows usados, preservando implementações reais e provar os pacotes native-platform-check via GNU.
+- [ ] 6.7 Executar todos os gates exigidos até exit 0; corrigir falhas adicionais; avaliar leaks conforme CI.
+- [ ] 6.8 Atualizar proveniência/vendor, DOX, conflicts/verification e relatório absoluto novo, sem publicação nem archive.

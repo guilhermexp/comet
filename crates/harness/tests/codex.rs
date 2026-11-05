@@ -2527,6 +2527,40 @@ async fn a_stopped_turn_keeps_the_app_server_for_the_next_prompt() {
     assert!(next_event(&mut stream).await.is_none());
 }
 
+#[test]
+fn codex_voice_fixtures_are_independent_of_the_installed_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let codex_home = home.join(".codex");
+    let package = codex_home.join("packages/standalone/current");
+    std::fs::create_dir_all(package.join("bin")).unwrap();
+    std::fs::write(
+        package.join("bin/codex"),
+        "unsupported fixture installation",
+    )
+    .unwrap();
+    std::fs::write(package.join("codex-package.json"), r#"{"version":"0.1.0"}"#).unwrap();
+    for name in [
+        "idle_voice_runtime_has_no_initial_turn_and_preserves_mcp",
+        "external_voice_keeps_canonical_events_without_any_local_helper",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("HOME", &home)
+            .env("CODEX_HOME", &codex_home)
+            .env_remove("ZERON_VOICE_MEDIA_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+}
+
 #[tokio::test]
 async fn idle_voice_runtime_has_no_initial_turn_and_preserves_mcp() {
     let dir = tempfile::tempdir().unwrap();
