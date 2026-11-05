@@ -235,6 +235,31 @@ fn sessions_for_parent_chat_from_links<'a>(
         .collect()
 }
 
+fn active_worker_counts_from_links(
+    sessions: &[WorkersSession],
+    links: &[WorkerParentLink],
+) -> HashMap<String, u32> {
+    let mut active = sessions
+        .iter()
+        .filter(|session| {
+            !session.archived
+                && crate::details_sidebar::chat_workers::worker_semantic(
+                    &session.state,
+                    &session.activity,
+                )
+                .is_active()
+        })
+        .map(|session| session.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut counts = HashMap::new();
+    for link in links {
+        if active.remove(link.worker_session_id.as_str()) {
+            *counts.entry(link.parent_chat_id.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 pub fn resolve_session_target<'a>(
     target: &WorkersSessionTarget,
     sessions: &'a [WorkersSession],
@@ -490,6 +515,8 @@ pub struct WorkersModel {
     spaces: Vec<zeron_workers_unpeel::space_registry::SpaceRef>,
     _spaces_observer: Option<gpui::Subscription>,
     pub snapshot: Option<WorkersBootstrap>,
+    /// Derived during the existing refresh, never by reading links during paint.
+    pub(crate) active_workers_by_chat: HashMap<String, u32>,
     pub selected_project_id: Option<String>,
     pub selected_session_id: Option<String>,
     /// Sidebar tree filter: a root project id, or `None` for "All projects".
@@ -612,6 +639,7 @@ impl WorkersModel {
             spaces,
             _spaces_observer: Some(spaces_observer),
             snapshot: None,
+            active_workers_by_chat: HashMap::new(),
             selected_project_id: None,
             selected_session_id: None,
             project_filter: None,
@@ -1060,6 +1088,12 @@ impl WorkersModel {
                 .spawn(async move {
                     let settings = needs_settings.then(|| client.settings());
                     let snapshot = client.bootstrap()?;
+                    let active_workers_by_chat = worker_parent_links()
+                        .map(|links| active_worker_counts_from_links(&snapshot.sessions, &links))
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "worker parent activity links are unreadable");
+                            HashMap::new()
+                        });
                     let project_names = snapshot
                         .projects
                         .iter()
@@ -1096,7 +1130,12 @@ impl WorkersModel {
                             }
                         })
                         .collect::<Vec<_>>();
-                    Ok::<_, zeron_workers_unpeel::WorkersError>((snapshot, settings, deliveries))
+                    Ok::<_, zeron_workers_unpeel::WorkersError>((
+                        snapshot,
+                        settings,
+                        deliveries,
+                        active_workers_by_chat,
+                    ))
                 })
                 .await;
             this.update(cx, |model, cx| {
@@ -1106,7 +1145,7 @@ impl WorkersModel {
                 model.refresh_task = None;
                 model.loading = false;
                 match result {
-                    Ok((snapshot, settings, deliveries)) => {
+                    Ok((snapshot, settings, deliveries, active_workers_by_chat)) => {
                         if let Some(settings) = settings {
                             match settings {
                                 Ok(settings) => {
@@ -1117,6 +1156,7 @@ impl WorkersModel {
                             }
                         }
                         let app_focused = cx.active_window().is_some();
+                        model.active_workers_by_chat = active_workers_by_chat;
                         model.apply_snapshot(snapshot, app_focused);
                         let catalog = crate::state::WorkersToolCatalog {
                             projects: model.projects().iter()
@@ -2966,6 +3006,50 @@ mod tests {
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["worker-a"]
+        );
+    }
+
+    #[test]
+    fn active_worker_counts_follow_parent_and_task_lifecycle() {
+        let mut sessions = Vec::new();
+        let mut links = Vec::new();
+        for (id, parent, state, activity, archived) in [
+            ("working", "chat-a", "running", "working", false),
+            ("starting", "chat-a", "running", "starting", false),
+            ("blocked", "chat-b", "running", "blocked", false),
+            ("idle", "chat-a", "running", "idle", false),
+            ("done", "chat-a", "running", "done", false),
+            ("exited", "chat-a", "exited", "working", false),
+            ("archived", "chat-a", "running", "working", true),
+        ] {
+            let mut worker = session(id, "same-project", true);
+            worker.state = state.into();
+            worker.activity = activity.into();
+            worker.archived = archived;
+            sessions.push(worker);
+            links.push(WorkerParentLink {
+                worker_session_id: id.into(),
+                parent_chat_id: parent.into(),
+                registered_at_unix_ms: 1,
+            });
+        }
+        sessions.push(session("unbound", "same-project", true));
+        links.push(links[0].clone());
+        links.push(WorkerParentLink {
+            worker_session_id: "missing".into(),
+            parent_chat_id: "chat-a".into(),
+            registered_at_unix_ms: 1,
+        });
+        assert_eq!(
+            super::active_worker_counts_from_links(&sessions, &links),
+            HashMap::from([("chat-a".into(), 2), ("chat-b".into(), 1)])
+        );
+
+        sessions[0].activity = "done".into();
+        sessions[1].state = "exited".into();
+        assert_eq!(
+            super::active_worker_counts_from_links(&sessions, &links),
+            HashMap::from([("chat-b".into(), 1)])
         );
     }
 

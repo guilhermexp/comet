@@ -175,6 +175,58 @@ fn select(shell: &mut Shell, chat: Option<&str>, cx: &mut Context<Shell>) {
 }
 
 #[gpui::test]
+fn sidebar_worker_pills_remain_after_parent_turn_and_clear_per_chat(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    let repaint_sidebar = |cx: &mut VisualTestContext| {
+        let pane = shell.read_with(cx, |shell, _| shell.sidebar_pane.clone());
+        // A cached replay clears debug_bounds. Measure the invalidated pane
+        // in the same outer update, as the existing sidebar drag fixture does.
+        cx.update(|window, cx| {
+            pane.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear();
+        });
+    };
+    for (compact, first, second) in [
+        (false, "chat-a-workers-idle", "chat-b-workers-idle"),
+        (true, "chat-a-workers-compact", "chat-b-workers-compact"),
+    ] {
+        change(&shell, cx, |shell, _, cx| {
+            shell.settings.sidebar_compact = compact;
+            shell.workers_model.update(cx, |model, cx| {
+                model.active_workers_by_chat =
+                    std::collections::HashMap::from([("a".into(), 2), ("b".into(), 1)]);
+                cx.notify();
+            });
+        });
+        repaint_sidebar(cx);
+        assert!(
+            cx.debug_bounds(first).is_some(),
+            "idle parent's worker pill"
+        );
+        assert!(
+            cx.debug_bounds(second).is_some(),
+            "other chat's worker pill"
+        );
+
+        change(&shell, cx, |shell, _, cx| {
+            shell.workers_model.update(cx, |model, cx| {
+                model.active_workers_by_chat.remove("a");
+                cx.notify();
+            });
+        });
+        repaint_sidebar(cx);
+        assert!(
+            cx.debug_bounds(first).is_none(),
+            "finished workers stay hidden"
+        );
+        assert!(
+            cx.debug_bounds(second).is_some(),
+            "other chat remains active"
+        );
+    }
+}
+
+#[gpui::test]
 fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);
     // A right-pane toggle can only open a live surface in the fork. Open a
