@@ -1,5 +1,5 @@
 //! CursorHarness integration tests against the fake shim in
-//! `tests/fixtures/fake-cursor-shim.sh` (no node/@cursor/sdk involved).
+//! `tests/fixtures/fake-cursor-shim.sh` (no @cursor/sdk involved; steering fixtures use Node).
 
 #![cfg(unix)]
 

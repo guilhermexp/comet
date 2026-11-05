@@ -92,6 +92,8 @@ Cursor catalog models and Max Mode default exclusions are one credential-scoped 
 
 ## Verification
 
+A fixture JSONL Cursor valida campos de imagem semanticamente, sem depender da ordem de chaves de serde_json/preserve_order. Mantém cardinalidade, type/mime/data e bytes exatos no caso de caps; Node já é dependência dos peers de steering. `cargo test --locked -p zeron-harness --test cursor --features serde_json/preserve_order` cobre a mesma unificação do workspace.
+
 - Comandos: `cargo test -p zeron-harness`
 
 | Camada / path | Tier exigido | Como rodar |
