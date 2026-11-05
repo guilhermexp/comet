@@ -1621,6 +1621,49 @@ mod tests {
     use super::{GitIdentity, configure_git_identity};
 
     #[tokio::test]
+    async fn a_broker_home_does_not_inherit_another_homes_git_config() {
+        const CHILD_HOME: &str = "ZERON_TEST_BROKER_GIT_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let home = std::path::PathBuf::from(home);
+            let outside = std::path::PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").unwrap());
+            let before = std::fs::read(&outside).unwrap();
+            let identity = GitIdentity {
+                name: "Broker User".into(),
+                email: "broker@example.invalid".into(),
+            };
+            assert!(super::configure_git_helper(&home, &home.join("token-store")).await);
+            configure_git_identity(&home, &identity).await;
+            assert_eq!(std::fs::read(&outside).unwrap(), before, "another home's config changed");
+            let output = std::process::Command::new("git")
+                .args(["config", "--global", "--get", "user.email"])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), identity.email);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("broker");
+        let parent_home = dir.path().join("parent");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&parent_home).unwrap();
+        let outside = parent_home.join("custom-gitconfig");
+        std::fs::write(&outside, "[user]\nemail = parent@example.invalid\n").unwrap();
+        let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "credentials::tests::a_broker_home_does_not_inherit_another_homes_git_config", "--nocapture"])
+            .env(CHILD_HOME, &home)
+            .env("HOME", &parent_home)
+            .env("XDG_CONFIG_HOME", parent_home.join(".config"))
+            .env("GIT_CONFIG_GLOBAL", &outside)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status().await.unwrap();
+        assert!(status.success(), "isolated broker regression failed: {status}");
+    }
+
+    #[tokio::test]
     async fn the_machine_identity_never_overrides_the_users_own() {
         let home = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
