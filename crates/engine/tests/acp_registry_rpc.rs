@@ -18,6 +18,67 @@ use zeron_engine::EngineCore;
 use zeron_proto::HarnessId;
 use zeron_rpc::methods;
 
+fn instrument_version_probe(script: &str) -> String {
+    script.replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then : > \"$0.version-probed\"; exit 64; fi\n",
+        1,
+    )
+}
+
+fn assert_no_version_probes(root: &std::path::Path) {
+    let version = "2.0.0";
+    let marker = root.join(format!("agents/fake-agent/{version}/agent.version-probed"));
+    assert!(
+        !marker.exists(),
+        "managed version must not run its CLI: {version}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "shebang")]
+fn probe_instrumentation_refuses_a_missing_shell_header() {
+    instrument_version_probe("echo uninstrumented\n");
+}
+
+#[test]
+#[should_panic(expected = "2.1.0")]
+fn a_probe_of_the_updated_registry_binary_fails_the_guard() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root
+        .path()
+        .join("agents/fake-agent/2.1.0/agent.version-probed");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(marker, b"probe").unwrap();
+    assert_no_version_probes(root.path());
+}
+
+#[test]
+fn archived_agents_reject_and_record_probes_in_both_version_directories() {
+    let root = tempfile::tempdir().unwrap();
+    for version in ["2.0.0", "2.1.0"] {
+        let installed = root.path().join(version);
+        let gzip = flate2::read::GzDecoder::new(std::io::Cursor::new(fake_agent()));
+        tar::Archive::new(gzip).unpack(&installed).unwrap();
+        let agent = installed.join("agent");
+        assert!(std::fs::read(&agent).unwrap().starts_with(b"#!/bin/sh\n"));
+        let status = std::process::Command::new(&agent)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(64),
+            "{version}: probe tripwire must execute"
+        );
+        assert!(
+            installed.join("agent.version-probed").exists(),
+            "{version}: marker must be observable"
+        );
+    }
+}
+
 fn fake_agent() -> Vec<u8> {
     let script = std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../harness/tests/fixtures/fake-acp.sh"),
@@ -25,11 +86,7 @@ fn fake_agent() -> Vec<u8> {
     .unwrap();
     // Registry installs are versioned by their managed record. ACP does not
     // promise a --version CLI; reject and record any accidental invocation.
-    let script = String::from_utf8(script).unwrap().replacen(
-        "#!/bin/sh\n",
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then : > \"$0.version-probed\"; exit 64; fi\n",
-        1,
-    ).into_bytes();
+    let script = instrument_version_probe(&String::from_utf8(script).unwrap()).into_bytes();
     let mut tar = tar::Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
     header.set_size(script.len() as u64);
@@ -303,10 +360,7 @@ async fn registry_agents_are_listed_added_as_harnesses_and_removed() {
         "2.1.0",
         "updated automatically"
     );
-    assert!(
-        !probe_marker.exists(),
-        "a registry agent's managed version must not run its CLI"
-    );
+    assert_no_version_probes(dir.path());
     let statuses = client
         .call(
             methods::CHECK_HARNESS_UPDATES,
