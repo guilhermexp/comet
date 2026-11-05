@@ -49,7 +49,7 @@ Itens 5.1–5.6 executados. F3/F4/D1a têm commits RED próprios e GREEN; grants
 
 A exceção de baseline da seção 5 foi revogada pelo dono. Falhas herdadas entram no escopo; os gates abaixo devem passar sem novos skips/ignores/retries/sleeps, redução de cobertura ou aumento de orçamento/timeout. Limites de publicação e D1a/grants permanecem.
 
-- [ ] 6.1 R1: isolar e corrigir o contrato Codex Voice com RED/GREEN e comparação 35561ead.
+- [x] 6.1 R1: isolar e corrigir o contrato Codex Voice com RED/GREEN e comparação 35561ead.
 - [ ] 6.2 R2: corrigir chips URL, índice General e geometria de metadata da sidebar com RED/GREEN.
 - [ ] 6.3 R3: tornar ACP registry determinístico e provar atualização 2.0.0 → 2.1.0.
 - [ ] 6.4 R4: reduzir schema sessions dentro do orçamento atual.

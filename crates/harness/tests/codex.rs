@@ -2561,8 +2561,41 @@ fn codex_voice_fixtures_are_independent_of_the_installed_runtime() {
     }
 }
 
+// The driver deliberately discovers active official packages as well as the CLI-adjacent
+// helper. Keep absence-of-helper fixtures independent of the developer's installations.
+async fn isolate_voice_fixture(name: &str) -> bool {
+    const MARKER: &str = "ZERON_TEST_CODEX_VOICE_ISOLATED";
+    if std::env::var(MARKER).as_deref() == Ok(name) {
+        return false;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let codex_home = home.join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(MARKER, name)
+        .env("HOME", &home)
+        .env("CODEX_HOME", &codex_home)
+        .env_remove("ZERON_VOICE_MEDIA_DIR")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{name}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    true
+}
+
 #[tokio::test]
 async fn idle_voice_runtime_has_no_initial_turn_and_preserves_mcp() {
+    if isolate_voice_fixture("idle_voice_runtime_has_no_initial_turn_and_preserves_mcp").await {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex-voice.py");
@@ -2689,6 +2722,10 @@ async fn a_side_chats_only_thread_starts_without_agent_tools() {
 #[cfg(unix)]
 #[tokio::test]
 async fn external_voice_keeps_canonical_events_without_any_local_helper() {
+    if isolate_voice_fixture("external_voice_keeps_canonical_events_without_any_local_helper").await
+    {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     use zeron_harness::codex::realtime::{VoiceCommand, channel};
     use zeron_proto::voice::{VoiceEvent, remote::Sdp};
