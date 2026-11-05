@@ -1210,7 +1210,8 @@ impl HarnessesPage {
                         "Computer Use",
                         "Lets agents drive Mac apps through ChatGPT.app's Computer Use (needs ChatGPT.app and Accessibility permission). Applies to new sessions on this Mac. Codex's native Computer Use is not affected.",
                     ))
-                    .child(switch),
+                    .child(switch)
+                    .search_anchor(SettingId::ComputerUse),
             )
             .child(
                 widgets::card_row(theme, false)
@@ -1218,7 +1219,8 @@ impl HarnessesPage {
                         "Available to",
                         "Comet chats only, or Workers too.",
                     ))
-                    .child(selector),
+                    .child(selector)
+                    .search_anchor(SettingId::ComputerUseScope),
             )
             .into_any_element()
     }

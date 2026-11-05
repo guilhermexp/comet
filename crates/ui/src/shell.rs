@@ -16127,40 +16127,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &RandomWallpaper, _, cx| {
                 this.random_wallpaper(cx);
             }))
-            .on_action(cx.listener(
-                |this, action: &crate::pull_request_detail::OpenPullRequest, window, cx| {
-                    // From a chat (a sidebar badge, the composer's badge), the
-                    // pull request opens beside the focused session, so
-                    // several can be compared in one conversation.
-                    if this.chat_pull_requests_available(cx) {
-                        let target = this.chat_pull_request_device(action.1.clone(), cx);
-                        this.open_chat_pull_request(action.0.clone(), target, window, cx);
-                        return;
-                    }
-                    let target = if let Some(device) = action.1.clone() {
-                        (Some(device.as_str()) != this.state.read(cx).local_device_id.as_deref())
-                            .then_some(device)
-                    } else if matches!(this.route, Route::PullRequests) {
-                        this.pull_requests_page
-                            .as_ref()
-                            .and_then(|page| page.read(cx).target_device())
-                    } else {
-                        let state = this.state.read(cx);
-                        state.selected_chat_row().and_then(|chat| {
-                            (Some(chat.device_id.as_str()) != state.local_device_id.as_deref())
-                                .then(|| chat.device_id.clone())
-                        })
-                    };
-                    // Back from a pull request returns to wherever it was
-                    // opened from: a chat, the board, or another pull request.
-                    this.enter_pull_requests_route(cx);
-                    this.nav.push(NavEntry::PullRequest {
-                        url: action.0.clone(),
-                        device: target.clone(),
-                    });
-                    this.show_pull_request_detail(action.0.clone(), target, window, cx);
-                },
-            ))
+            .on_action(cx.listener(Self::on_open_pull_request))
             .on_action(cx.listener(
                 |this,
                  action: &crate::pull_request_detail::OpenPullRequestInBrowser,

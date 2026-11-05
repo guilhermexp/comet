@@ -13149,6 +13149,7 @@ fn user_bubble_text(
     .absolute()
     .size_full();
     let selectable = render::selectable_text_wrap()
+        .debug_selector(|| "user-bubble-text".into())
         .child(underlay)
         .child(text_element)
         .into_any_element();

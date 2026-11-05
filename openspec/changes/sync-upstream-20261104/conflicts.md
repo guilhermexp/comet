@@ -165,3 +165,11 @@ Auditoria de todos os `-p`/`--test` em rust.yml, ui-tests.yml e test-core.sh via
 ## Follow-up F5 (2026-11-05)
 
 servers::stop chamava libc::kill/pid_t sem cfg Unix. Windows usa ToolHelp na dependência windows-sys já existente para capturar a árvore do launcher autorizado, com handles retidos e criação pai/filho validada; TerminateProcess encerra a árvore e erros são propagados. A API de Job do harness não adota uma árvore existente: ela é usada no spawn de processos próprios; servidores externos existentes não pertencem a ele. O check preview x86_64-pc-windows-gnu reproduziu E0425 antes e passou depois. Descoberta Windows já devolvia catálogo vazio/identity false: não foi ativada nem alegada como provada.
+
+## Round2 — R3/R4/R5/R6 (2026-11-05)
+
+A regra de exceção por baseline foi revogada. ACP registry mantém o índice/artefato loopback e versões esperadas; os probes de apply usam o registro gerenciado, pois ACP não exige CLI de versão. O schema peer sessions mantém ações/argumentos/help e tetos; somente a introdução anunciada foi resumida. Wrappers são publicados após staging único, chmod e close, sem truncar o inode executável.
+
+R6 estende F5 ao par real de native-platform-check: o vendor e a fronteira Workers usam primitivas Unix/Win32 reais (locks, DACL/SID, rename durável e identidade de processo), com erros em operações não suportadas. OMP passa pelos tipos de processo do harness para conservar Job Object e pipes Windows. O Host PTY local continua Unix por contrato; nenhum no-op anuncia sucesso no Windows. Nenhuma versão do app, feed/updater do app, edge, grant ou MCP de plugin foi alterado nesta rodada.
+
+R2: a UI do fork mantém Chat titles, Collapse command blocks, Show voice orb e Computer Use/Available to; catálogo e anchors acompanham esses controles. A sidebar mantém o layout do fork (4px após branch curta, branch longa ≤ metade, PR contido). O teste mede o presenter sem cache e reutiliza o roteador OpenPullRequest do Shell, sem remover asserções. O selector de URL foi restaurado; o roteamento de preferência existente foi preservado.

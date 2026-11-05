@@ -652,22 +652,30 @@ mod tests {
         let sections = SettingsSection::ALL
             .into_iter()
             .filter(|section| section.visible_in_nav() && !section.needs_account());
+        let mut disagreements = Vec::new();
         for section in sections {
             take_anchored();
             take_row_titles();
             shell.update(cx, |shell, cx| shell.open_settings(section, cx));
             draw(cx);
-            assert_eq!(
-                unindexed(section, &take_row_titles()),
-                Vec::<String>::new(),
-                "{section:?} draws settings the search cannot find"
-            );
-            assert_eq!(
-                unanchored(section, &take_anchored()),
-                [],
-                "{section:?} has hits that land nowhere"
-            );
+            let missing = unindexed(section, &take_row_titles());
+            if !missing.is_empty() {
+                disagreements.push(format!(
+                    "{section:?} draws settings the search cannot find: {missing:?}"
+                ));
+            }
+            let missing = unanchored(section, &take_anchored());
+            if !missing.is_empty() {
+                disagreements.push(format!(
+                    "{section:?} has hits that land nowhere: {missing:?}"
+                ));
+            }
         }
+        assert_eq!(
+            disagreements,
+            Vec::<String>::new(),
+            "all pages must agree with the index"
+        );
         // A provider's details draw only once it is expanded, with its data
         // loaded: draw every section they can show, and hold those rows to
         // the same agreement. The provider's own name is not a setting.

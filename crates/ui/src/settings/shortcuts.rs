@@ -832,7 +832,8 @@ impl Render for ShortcutsPage {
                         crate::settings::set_transcript_compact_mode(!compact_mode, cx);
                         cx.notify();
                     })),
-            );
+            )
+            .search_anchor(SettingId::CompactMode);
         let collapse_commands_row = widgets::card_row(&theme, false)
             .child(
                 div()
@@ -865,7 +866,8 @@ impl Render for ShortcutsPage {
                         crate::settings::set_collapse_command_blocks(!collapse_commands, cx);
                         cx.notify();
                     })),
-            );
+            )
+            .search_anchor(SettingId::CollapseCommandBlocks);
         let compact_model_picker = crate::settings::compact_model_picker(cx);
         let compact_model_picker_row = widgets::card_row(&theme, false)
             .child(

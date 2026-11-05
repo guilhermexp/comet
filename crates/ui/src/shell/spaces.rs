@@ -400,6 +400,23 @@ pub(super) mod pinned_session_tests {
 
     #[gpui::test]
     fn sidebar_metadata_short_branch_is_adjacent_to_projects(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        struct MetadataSidebar {
+            shell: Entity<Shell>,
+            _observation: gpui::Subscription,
+        }
+        impl Render for MetadataSidebar {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.shell.update(cx, |shell, cx| {
+                    div()
+                        .w(px(shell.settings.sidebar_width))
+                        .h_full()
+                        .on_action(cx.listener(Shell::on_open_pull_request))
+                        .child(shell.render_chat_sidebar(&Theme::default(), cx))
+                })
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             let mut settings = crate::settings::UiSettings::default();
@@ -446,20 +463,28 @@ pub(super) mod pinned_session_tests {
                 cx.notify();
             })
             .unwrap();
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        let sidebar_pane = window
-            .read_with(&cx, |shell, _| shell.sidebar_pane.clone())
-            .unwrap();
-        for width in [242.0, 256.0, 400.0] {
-            window
-                .update(&mut cx, |shell, _, cx| {
-                    shell.settings.sidebar_width = width;
-                    cx.notify();
+        // Exercise the real sidebar renderer without Shell's cached view.
+        // Automatic frames after a measured draw otherwise replay its scene
+        // and erase debug bounds even though the rows remain on screen.
+        let shell = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let host = window
+            .update(cx, |_, window, cx| {
+                window.replace_root(cx, |_, cx| MetadataSidebar {
+                    _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
+                    shell: shell.clone(),
                 })
-                .unwrap();
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [242.0, 256.0, 400.0] {
+            shell.update(&mut cx, |shell, cx| {
+                shell.settings.sidebar_width = width;
+                cx.notify();
+            });
             cx.run_until_parked();
             cx.update(|window, cx| {
-                sidebar_pane.update(cx, |_, cx| cx.notify());
+                host.update(cx, |_, cx| cx.notify());
+                window.refresh();
                 window.draw(cx).clear();
             });
             for (id, branch_selector, projects_selector) in [
@@ -488,64 +513,77 @@ pub(super) mod pinned_session_tests {
                 );
             }
         }
-        window
-            .update(&mut cx, |shell, _, cx| {
-                shell.settings.sidebar_show_pull_request = true;
-                shell.active_chat = "normal".into();
-                shell.state.update(cx, |state, _| {
-                    let branch = "feature/a-very-long-branch-name-for-sidebar-layout";
-                    state.chats[0].source_context.as_mut().unwrap().branch = branch.into();
-                    state.spaces.push(
-                        serde_json::from_value(serde_json::json!({
-                            "id":"second", "deviceId":"local", "path":"/projects/second",
-                            "createdAt":chrono::Utc::now()
-                        }))
-                        .unwrap(),
-                    );
-                    state.chats[0]
-                        .worked_projects
-                        .as_mut()
-                        .unwrap()
-                        .project_ids
-                        .push("second".into());
-                    state.selected_chat = Some("normal".into());
-                    state.fixture_sidebar_change_request(
-                        zeron_proto::CheckoutChangeRequestStatus {
-                            checkout_id: "fixture-checkout".into(),
-                            device_id: "local".into(),
-                            cwd: "/fixture".into(),
-                            branch: branch.into(),
-                            updated_at: chrono::Utc::now(),
-                            change_request: Some(zeron_proto::ChangeRequestSummary {
-                                signals: Default::default(),
+        shell.update(&mut cx, |shell, cx| {
+            shell.settings.sidebar_show_pull_request = true;
+            shell.active_chat = "normal".into();
+            shell.state.update(cx, |state, _| {
+                let branch = "feature/a-very-long-branch-name-for-sidebar-layout";
+                state.chats[0].source_context.as_mut().unwrap().branch = branch.into();
+                state.spaces.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id":"second", "deviceId":"local", "path":"/projects/second",
+                        "createdAt":chrono::Utc::now()
+                    }))
+                    .unwrap(),
+                );
+                state.chats[0]
+                    .worked_projects
+                    .as_mut()
+                    .unwrap()
+                    .project_ids
+                    .push("second".into());
+                state.selected_chat = Some("normal".into());
+                state.fixture_sidebar_change_request(zeron_proto::CheckoutChangeRequestStatus {
+                    checkout_id: "fixture-checkout".into(),
+                    device_id: "local".into(),
+                    cwd: "/fixture".into(),
+                    branch: branch.into(),
+                    updated_at: chrono::Utc::now(),
+                    change_request: Some(zeron_proto::ChangeRequestSummary {
+                        signals: Default::default(),
 
-                                provider: "github".into(),
-                                number: 42,
-                                title: "Fixture".into(),
-                                url: "https://github.com/acme/fixture/pull/42".into(),
-                                state: zeron_proto::ChangeRequestState::Open,
-                                base_ref: "main".into(),
-                                head_ref: branch.into(),
-                            }),
-                        },
-                    );
+                        provider: "github".into(),
+                        number: 42,
+                        title: "Fixture".into(),
+                        url: "https://github.com/acme/fixture/pull/42".into(),
+                        state: zeron_proto::ChangeRequestState::Open,
+                        base_ref: "main".into(),
+                        head_ref: branch.into(),
+                    }),
                 });
-                cx.notify();
-            })
-            .unwrap();
+            });
+            cx.notify();
+        });
         for width in [242.0, 256.0, 400.0] {
-            window
-                .update(&mut cx, |shell, _, cx| {
-                    shell.settings.sidebar_width = width;
-                    cx.notify();
-                })
-                .unwrap();
+            shell.update(&mut cx, |shell, cx| {
+                shell.settings.sidebar_width = width;
+                cx.notify();
+            });
             cx.run_until_parked();
             cx.update(|window, cx| {
-                sidebar_pane.update(cx, |_, cx| cx.notify());
+                host.update(cx, |_, cx| cx.notify());
+                window.refresh();
                 window.draw(cx).clear();
             });
-            let row = cx.debug_bounds("chat-normal").expect("row");
+            let row = cx.debug_bounds("chat-normal").unwrap_or_else(|| {
+                let bounds = [
+                    "sidebar-column",
+                    "session-slot-normal",
+                    "chat-archived",
+                    "chat-branch-normal",
+                    "chat-worked-projects-normal",
+                    "pull-request-badge-chat-normal-pr",
+                ]
+                .map(|selector| (selector, cx.debug_bounds(selector)));
+                let state = shell.update(&mut cx, |shell, cx| {
+                    (
+                        shell.route,
+                        shell.settings.sidebar_organization,
+                        shell.sidebar_visible_order(cx),
+                    )
+                });
+                panic!("row missing at width {width}: {bounds:?}; {state:?}");
+            });
             let branch = cx.debug_bounds("chat-branch-normal").expect("long branch");
             let projects = cx
                 .debug_bounds("chat-worked-projects-normal")
@@ -557,27 +595,23 @@ pub(super) mod pinned_session_tests {
             assert!(projects.size.width > gpui::px(0.0));
             assert!(projects.right() <= badge.left() && badge.right() <= row.right());
         }
-        window
-            .read_with(&cx, |shell, cx| assert!(!shell.right_pane_open(cx)))
-            .unwrap();
+        shell.read_with(&cx, |shell, cx| assert!(!shell.right_pane_open(cx)));
         let badge = cx
             .debug_bounds("pull-request-badge-chat-normal-pr")
             .unwrap();
         cx.simulate_click(badge.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        window
-            .read_with(&cx, |shell, cx| {
-                assert!(shell.right_pane_open(cx), "PR click opens the right pane");
-                let crate::shell::RightSurface::PullRequest(id) = shell.resolved_right_active(cx)
-                else {
-                    panic!("PR click activates a pull request view");
-                };
-                assert_eq!(
-                    shell.chat_pull_requests[&id].url,
-                    "https://github.com/acme/fixture/pull/42"
-                );
-            })
-            .unwrap();
+        shell.read_with(&cx, |shell, cx| {
+            assert!(shell.right_pane_open(cx), "PR click opens the right pane");
+            let crate::shell::RightSurface::PullRequest(id) = shell.resolved_right_active(cx)
+            else {
+                panic!("PR click activates a pull request view");
+            };
+            assert_eq!(
+                shell.chat_pull_requests[&id].url,
+                "https://github.com/acme/fixture/pull/42"
+            );
+        });
     }
 
     #[gpui::test]

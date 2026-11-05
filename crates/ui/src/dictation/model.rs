@@ -431,8 +431,10 @@ impl Render for VoiceCard {
         );
         // Voice orb visibility: a UI preference, independent of Reduce
         // motion and of the call itself (shared presenter).
-        let conversation_card =
-            conversation_card.child(crate::voice_surfaces::show_voice_orb_row(&theme, cx));
+        let conversation_card = conversation_card.child(
+            crate::voice_surfaces::show_voice_orb_row(&theme, cx)
+                .search_anchor(SettingId::ShowVoiceOrb),
+        );
         let enabled = settings::current(cx).dictation_enabled;
         let downloading = self.cancel.is_some();
         let on = downloading || (enabled && self.ready);
