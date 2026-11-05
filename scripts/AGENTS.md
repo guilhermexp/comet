@@ -73,3 +73,5 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 Sem filhos.
 
 `ci/test-core.sh` includes `zeron-visual`, `zeron-visual-gpu` and `zatex` unit targets alongside the existing core packages. The UI workflow path selectors include these new shared dependencies for core/native/iOS; a green recipe is not proof until the exact revision runs.
+
+`ci/test-core.sh` seleciona `zeron-orb --test geometry`; regressões engine `codex_subagents`, `claude_subagents`, `local_profiles`, `pi_resume` e `osc7501` já pertencem ao binário `misc`. Não listar módulos de `tests/misc/` como alvos Cargo independentes. A UI roda `--lib`; `voice_orb_geometry` não existe no fork nem no upstream 35561ead.

@@ -31,3 +31,12 @@
 
 - Orquestrador executa revisão/aceite no Mac; dono decide ativação futura de D1/D2/D8.
 - Não arquivar esta OpenSpec nem fazer merge da PR nesta execução.
+
+## 5. CI e D1a (brief 2026-11-05)
+
+- [ ] 5.1 F1/F2: corrigir seletores Cargo preservando cobertura e provar comandos dos jobs.
+- [ ] 5.2 F3: RED próprio e alinhar descriptor OMP aos modos do driver.
+- [ ] 5.3 F4: RED próprio, reproduzir e corrigir admissão legacy sem retry/sleep.
+- [ ] 5.4 F5: terminar árvore Windows, cfg Unix e cross-check dos pacotes nativos.
+- [ ] 5.5 D1a: RED próprio e ativar plugins/templates mantendo grants e sem MCP injetado.
+- [ ] 5.6 Executar gates finais, DOX e relatório absoluto, sem publicação nem archive.

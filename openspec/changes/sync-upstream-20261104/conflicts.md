@@ -157,3 +157,7 @@
 | `scripts/ci/test-core.sh` | D8: versão, workspace, engine/CLI, packaging e CI do fork; imports/dependências compatíveis, Cargo lock regenerado. |
 | `scripts/dev-demo.sh` | D8: versão, workspace, engine/CLI, packaging e CI do fork; imports/dependências compatíveis, Cargo lock regenerado. |
 | `scripts/ios/build-core.sh` | Fluxo de build do fork preserva normalização Swift canônica; refresh de header/modulemap aditivo, bindings geradas do core integrado. Link iOS pendente no Mac. |
+
+## Follow-up F1/F2 (2026-11-05)
+
+Auditoria de todos os `-p`/`--test` em rust.yml, ui-tests.yml e test-core.sh via cargo metadata e git show 35561ead: geometry existe em crates/orb/tests/geometry.rs (agora inclui zeron-orb); codex_subagents, claude_subagents, local_profiles, pi_resume e osc7501 existem como módulos de crates/engine/tests/misc/main.rs, já selecionado. voice_orb_geometry não existe em 35561ead; a geometria ativa está na crate orb e a UI conserva --lib. Nenhum alvo perdido no merge foi identificado. Os demais pacotes/alvos explícitos correspondem aos manifestos (GPUI macOS usa o workspace third_party/zui).

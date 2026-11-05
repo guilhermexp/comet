@@ -11,8 +11,6 @@
 #   zeron-preview  every test binary (preview-tests)
 #   zeron-doc      lib + persistence and memory regressions + attachments_roundtrip
 #   zeron-sync, zeron-update   lib only (session-sync-regressions)
-#   zeron-cli, zeron-launch, zeron-notify   `zeron`'s command line, the engine
-#                  helper's start-up and the zeron:// links, shared by the apps
 #   zeron-engine   lib + the integration tests named below. Engine has many other
 #                  integration binaries (live agents etc.) that no workflow ran, so
 #                  they are listed instead of globbed to avoid compiling them.
@@ -39,12 +37,12 @@ for f in crates/harness/tests/*.rs crates/preview/tests/*.rs crates/doc/tests/*.
   name="$(basename "$f" .rs)"
   [[ "$skip" == *" $name "* ]] || tests+=(--test "$name")
 done
-for t in misc geometry session_publication restart_resume side_chats codex_subagents claude_subagents provider_switch run_recovery local_profiles message_queue pi_resume attachments_roundtrip osc7501; do
+for t in misc geometry session_publication restart_resume side_chats provider_switch run_recovery message_queue; do
   tests+=(--test "$t")
 done
 
 exec cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast \
   -p zeron-harness -p zeron-engine -p zeron-sync -p zeron-update -p zeron-doc -p zeron-preview \
-  -p zeron-visual -p zeron-visual-gpu -p zatex \
+  -p zeron-visual -p zeron-visual-gpu -p zatex -p zeron-orb \
   --features zeron-harness/native-fixture,zatex/bundled \
   --lib --bins "${tests[@]}" "$@"
