@@ -2528,7 +2528,7 @@ async fn a_stopped_turn_keeps_the_app_server_for_the_next_prompt() {
 }
 
 #[test]
-fn codex_voice_fixtures_are_independent_of_the_installed_runtime() {
+fn codex_voice_fixtures_distinguish_absent_and_unsupported_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let codex_home = home.join(".codex");
@@ -2540,24 +2540,62 @@ fn codex_voice_fixtures_are_independent_of_the_installed_runtime() {
     )
     .unwrap();
     std::fs::write(package.join("codex-package.json"), r#"{"version":"0.1.0"}"#).unwrap();
-    for name in [
-        "idle_voice_runtime_has_no_initial_turn_and_preserves_mcp",
-        "external_voice_keeps_canonical_events_without_any_local_helper",
-    ] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
-            .env("HOME", &home)
-            .env("CODEX_HOME", &codex_home)
-            .env_remove("ZERON_VOICE_MEDIA_DIR")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{name}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+    for installation in ["unsupported", "absent"] {
+        let selected_home = if installation == "unsupported" {
+            home.clone()
+        } else {
+            dir.path().join("absent")
+        };
+        let selected_codex_home = selected_home.join(".codex");
+        std::fs::create_dir_all(&selected_codex_home).unwrap();
+        for name in [
+            "idle_voice_runtime_has_no_initial_turn_and_preserves_mcp",
+            "external_voice_keeps_canonical_events_without_any_local_helper",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("HOME", &selected_home)
+                .env("CODEX_HOME", &selected_codex_home)
+                .env("ZERON_TEST_CODEX_VOICE_EXPECT_HOME", &selected_codex_home)
+                .env("ZERON_TEST_CODEX_VOICE_INSTALLATION", installation)
+                .env_remove("ZERON_VOICE_MEDIA_DIR")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+}
+
+fn fixture_voice_rejection() -> zeron_proto::voice::VoiceRejection {
+    let codex_home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("isolated Codex home"));
+    if let Some(expected) = std::env::var_os("ZERON_TEST_CODEX_VOICE_EXPECT_HOME") {
+        assert_eq!(
+            codex_home,
+            PathBuf::from(expected),
+            "the selected installation must reach the driver fixture"
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+    let manifest = codex_home.join("packages/standalone/current/codex-package.json");
+    if std::env::var("ZERON_TEST_CODEX_VOICE_INSTALLATION").as_deref() == Ok("unsupported") {
+        let package: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(manifest)
+                .expect("unsupported package must exist in the active Codex home"),
+        )
+        .unwrap();
+        assert_eq!(package["version"], "0.1.0");
+        zeron_proto::voice::VoiceRejection::Unsupported
+    } else {
+        assert!(
+            !manifest.exists(),
+            "absence fixture must not contain an installed package"
+        );
+        zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable
     }
 }
 
@@ -2633,10 +2671,7 @@ async fn idle_voice_runtime_has_no_initial_turn_and_preserves_mcp() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        receive.await.unwrap(),
-        Err(zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable)
-    );
+    assert_eq!(receive.await.unwrap(), Err(fixture_voice_rejection()));
     let calls = std::fs::read_to_string(dir.path().join("voice-wire.jsonl")).unwrap();
     assert!(!calls.contains("turn/start"));
     assert!(!calls.contains("thread/realtime/start"));
@@ -2761,10 +2796,7 @@ async fn external_voice_keeps_canonical_events_without_any_local_helper() {
     ));
     let pump = tokio::spawn(async move { while stream.next().await.is_some() {} });
     assert!(voice.probe_external().await.unwrap().available);
-    assert_eq!(
-        voice.probe().await.unwrap_err(),
-        zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable
-    );
+    assert_eq!(voice.probe().await.unwrap_err(), fixture_voice_rejection());
     let (reply, answer) = oneshot::channel();
     voice
         .commands
