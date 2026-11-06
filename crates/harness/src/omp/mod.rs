@@ -761,32 +761,15 @@ fn user_steering_text(frame: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn dispatch_steer(
-    process: OmpProcess,
-    event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    prompt: String,
-    attachments: Vec<String>,
-    failed: mpsc::UnboundedSender<String>,
-) {
-    tokio::spawn(async move {
-        let result = async {
-            let images = load_images(&attachments, &prompt, "steer").await?;
-            let mut request = json!({ "type": "steer", "message": prompt });
-            if !images.is_empty() {
-                request["images"] = Value::Array(images);
-            }
-            process.request(request).await.map(|_| ())
+fn dispatch_steer(process: OmpProcess, prompt: String, attachments: Vec<String>) -> PromptFuture {
+    Box::pin(async move {
+        let images = load_images(&attachments, &prompt, "steer").await?;
+        let mut request = json!({ "type": "steer", "message": prompt });
+        if !images.is_empty() {
+            request["images"] = Value::Array(images);
         }
-        .await;
-        match result {
-            Ok(_) => {}
-            Err(error) => {
-                let _ = failed.send(prompt);
-                let message = protocol::sanitize_diagnostic(&error.to_string());
-                let _ = emit(&event_tx, AgentEvent::Error { message }).await;
-            }
-        }
-    });
+        process.request(request).await
+    })
 }
 
 type PromptFuture =
@@ -884,7 +867,9 @@ async fn run_session(
     let mut interrupted_waits: HashMap<String, bool> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
     let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
-    let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
+    let mut steer_fut: PromptFuture = Box::pin(std::future::pending());
+    let mut steer_pending = false;
+    let mut active_steer: Option<(String, Option<String>)> = None;
 
     let mut prompt_fut: PromptFuture = {
         let process = process.clone();
@@ -911,9 +896,6 @@ async fn run_session(
                             workers.cancel_call(tool_id);
                         }
                     }
-                    if !steering_open {
-                        finished = true;
-                    }
                 }
             }
         };
@@ -938,14 +920,11 @@ async fn run_session(
                 ..
             } = $steer;
             if turn_active {
-                in_flight_steers.push((prompt.clone(), message_id));
-                dispatch_steer(
-                    process.clone(),
-                    event_tx.clone(),
-                    prompt,
-                    attachments,
-                    steer_failed_tx.clone(),
-                );
+                let identity = (prompt.clone(), message_id);
+                in_flight_steers.push(identity.clone());
+                active_steer = Some(identity);
+                steer_fut = dispatch_steer(process.clone(), prompt, attachments);
+                steer_pending = true;
             } else {
                 turn_active = true;
                 compacting = is_compact_prompt(&prompt);
@@ -977,6 +956,19 @@ async fn run_session(
     }
 
     while !finished {
+        // One delivery at a time: image preflight cannot reorder adjacent
+        // messages, and nothing overtakes the opening prompt's ACK or a
+        // pending host-tool result. Keep the complete message until dispatch.
+        if !prompt_pending && !steer_pending && (!turn_active || delivering.is_empty()) {
+            if let Some(queued) = queued_steers.pop_front() {
+                deliver_message!(queued);
+            } else if !turn_active && !steering_open {
+                finished = true;
+            }
+        }
+        if finished {
+            break;
+        }
         tokio::select! {
             _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
                 finish_agent_end(&process, &event_tx, &mut session_id, &mut pending_interactive,
@@ -1082,9 +1074,7 @@ async fn run_session(
                 match steer {
                     Some(steer) => {
                         let prompt = steer.prompt.clone();
-                        if !turn_active || delivering.is_empty() {
-                            deliver_message!(steer);
-                        } else {
+                        if turn_active && !delivering.is_empty() {
                             let is_worker_notice = prompt.starts_with("[worker-task-notification]");
                             for tool_id in &pending_wait_for_status {
                                 if let Some(notice) = interrupted_waits.get_mut(tool_id) {
@@ -1096,25 +1086,21 @@ async fn run_session(
                                     workers.cancel_call(tool_id);
                                 }
                             }
-                            enqueue_steer!(steer);
                         }
+                        enqueue_steer!(steer);
                     }
-                    None => {
-                        steering_open = false;
-                        // Nobody can send another message: an idle runtime
-                        // has nothing left to wait for.
-                        if !turn_active {
-                            finished = true;
-                        }
-                    }
+                    None => steering_open = false,
                 }
             }
-            Some(failed_prompt) = steer_failed_rx.recv() => {
-                if let Some(index) = in_flight_steers
-                    .iter()
-                    .position(|(prompt, _)| prompt == &failed_prompt)
-                {
-                    in_flight_steers.remove(index);
+            steer_res = &mut steer_fut, if steer_pending => {
+                steer_pending = false;
+                let identity = active_steer.take().expect("a pending steer has its identity");
+                if let Err(error) = steer_res {
+                    if let Some(index) = in_flight_steers.iter().position(|entry| entry == &identity) {
+                        in_flight_steers.remove(index);
+                    }
+                    let message = protocol::sanitize_diagnostic(&error.to_string());
+                    let _ = emit(&event_tx, AgentEvent::Error { message }).await;
                 }
             }
             Some((tool_id, outcome)) = tool_rx.recv() => {
@@ -1122,11 +1108,6 @@ async fn run_session(
                 let interrupted_wait = interrupted_waits.remove(&tool_id);
                 if answered.contains(&tool_id) {
                     delivering.remove(&tool_id);
-                    if delivering.is_empty() {
-                        while let Some(queued) = queued_steers.pop_front() {
-                            deliver_message!(queued);
-                        }
-                    }
                     continue;
                 }
                 answered.insert(tool_id.clone());
@@ -1173,11 +1154,6 @@ async fn run_session(
                     }
                 }
                 delivering.remove(&tool_id);
-                if delivering.is_empty() {
-                    while let Some(queued) = queued_steers.pop_front() {
-                        deliver_message!(queued);
-                    }
-                }
             }
             frame = events.recv() => {
                 let Some(frame) = frame else {
