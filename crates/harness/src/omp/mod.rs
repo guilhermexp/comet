@@ -2038,7 +2038,7 @@ mod tests {
         );
         // attach() replaces the sender while this active driver owns the old receiver.
         let _replacement = turn.context_requests();
-        let wakes = idle_poll_wakes(actor.as_mut()).await;
+        let (wakes, budget_remaining) = idle_poll_wakes(actor.as_mut()).await;
         frames.send(text_frame("after close")).await.unwrap();
         let following = next_text(actor.as_mut(), &mut event_rx).await;
         interrupt.cancel();
@@ -2046,6 +2046,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(following, "after close");
+        assert!(
+            budget_remaining,
+            "closed context mailbox must not consume the entire cooperative poll budget (wakes={wakes})"
+        );
         assert_eq!(
             wakes, 0,
             "closed context mailbox must park without self-waking"

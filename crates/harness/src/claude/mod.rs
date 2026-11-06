@@ -2359,7 +2359,7 @@ mod tests {
         tokio::pin!(actor);
         assert_eq!(next_text(actor.as_mut(), &mut event_rx).await, "active");
         let _replacement = turn.context_requests();
-        let wakes = idle_poll_wakes(actor.as_mut()).await;
+        let (wakes, budget_remaining) = idle_poll_wakes(actor.as_mut()).await;
         steering_tx
             .send(crate::SteerMessage::text("after close"))
             .await
@@ -2370,6 +2370,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(following, "active");
+        assert!(
+            budget_remaining,
+            "closed context mailbox must not consume the entire cooperative poll budget (wakes={wakes})"
+        );
         assert_eq!(
             wakes, 0,
             "closed context mailbox must park without self-waking"

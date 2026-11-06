@@ -50,7 +50,7 @@ pub(crate) mod tests {
     /// a parked select registers the waker but does not schedule another poll.
     pub(crate) async fn idle_poll_wakes(
         mut driver: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
-    ) -> usize {
+    ) -> (usize, bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Wakes(AtomicUsize);
         impl std::task::Wake for Wakes {
@@ -71,7 +71,10 @@ pub(crate) mod tests {
             driver.as_mut().poll(&mut cx).is_pending(),
             "active session ended"
         );
-        wakes.0.load(Ordering::SeqCst)
+        let budget_remaining = tokio::task::coop::has_budget_remaining();
+        // Tokio defers cooperative wakes until the scheduler regains control.
+        tokio::task::yield_now().await;
+        (wakes.0.load(Ordering::SeqCst), budget_remaining)
     }
 
     pub(crate) async fn next_text(
