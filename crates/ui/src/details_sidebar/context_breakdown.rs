@@ -275,10 +275,9 @@ impl DetailsSidebar {
                 )),
             };
             let _ = this.update(cx, |this, cx| {
-                if this.sidebar.context_disclosure_expanded("expanded")
-                    && this.context_selection(cx).as_ref() == Some(&key)
-                    && this.context_breakdown.receive(generation, &key, result)
-                {
+                // Only the stored generation/key decide whether this response
+                // is current; presence and disclosure may change between frames.
+                if this.context_breakdown.receive(generation, &key, result) {
                     cx.notify();
                 }
             });
