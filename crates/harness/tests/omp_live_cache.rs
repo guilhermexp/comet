@@ -7,9 +7,9 @@
 //!
 //! * `COMET_OMP_LIVE_TURNS`   turns, one process each (default 4, minimum 2)
 //! * `COMET_OMP_LIVE_MODEL`   `provider/model` (default `anthropic/claude-sonnet-5-5`)
-//! * `COMET_OMP_LIVE_OUT`     directory for `report.txt` and the session copy
+//! * `COMET_OMP_LIVE_OUT`     base directory; each test owns a named subdirectory
 //! * `COMET_OMP_LIVE_CAPTURE` `1` sets `PI_REQ_DEBUG=1`: omp then writes every
-//!   provider request/response to `rr-session-N.json` in `<out>/capture/`
+//!   provider request/response to `rr-session-N.json` in `<out>/<test>/capture/`
 //!   (its working directory). No omp change; the request-diff evidence uses it.
 //!
 //! The harness registers host tools through the fixture workers controller, so
@@ -266,7 +266,7 @@ struct Live {
 }
 
 /// `None` unless `COMET_OMP_LIVE_CACHE=1`.
-fn live() -> Option<Live> {
+fn live(test_name: &str) -> Option<Live> {
     if std::env::var("COMET_OMP_LIVE_CACHE").as_deref() != Ok("1") {
         eprintln!("skipped: set COMET_OMP_LIVE_CACHE=1 to run the live OMP cache tests");
         return None;
@@ -280,7 +280,8 @@ fn live() -> Option<Live> {
         .unwrap_or_else(|_| "anthropic/claude-sonnet-5-5".into());
     let out = std::env::var_os("COMET_OMP_LIVE_OUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("comet-omp-live-cache"));
+        .unwrap_or_else(|| std::env::temp_dir().join("comet-omp-live-cache"))
+        .join(test_name);
     let capture = std::env::var("COMET_OMP_LIVE_CAPTURE").as_deref() == Ok("1");
     let cwd = out.join("capture");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -428,7 +429,9 @@ impl Live {
 /// `OmpHarness::run` resuming the previous session file.
 #[tokio::test]
 async fn a_resumed_omp_process_keeps_the_prompt_cache() {
-    let Some(live) = live() else { return };
+    let Some(live) = live("a_resumed_omp_process_keeps_the_prompt_cache") else {
+        return;
+    };
     let mut session: Option<String> = None;
     for turn in 1..=live.turns {
         let (controls, steer_tx) = controls();
@@ -460,7 +463,9 @@ async fn a_resumed_omp_process_keeps_the_prompt_cache() {
 /// as a `prompt` into the same real omp process.
 #[tokio::test]
 async fn a_warm_omp_process_takes_every_next_message_as_a_prompt() {
-    let Some(live) = live() else { return };
+    let Some(live) = live("a_warm_omp_process_takes_every_next_message_as_a_prompt") else {
+        return;
+    };
     let (controls, steer_tx) = controls();
     let mut stream = live
         .harness
