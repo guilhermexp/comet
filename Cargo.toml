@@ -49,7 +49,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.0.16"
+version = "1.0.17"
 edition = "2024"
 license = "MIT"
 publish = false
