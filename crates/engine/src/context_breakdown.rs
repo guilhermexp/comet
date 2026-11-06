@@ -178,6 +178,9 @@ impl SessionsEngine {
             Err(zeron_harness::HarnessError::Unsupported(reason)) => {
                 ContextBreakdown::unavailable(ContextAvailability::Unsupported, reason)
             }
+            Err(zeron_harness::HarnessError::Protocol(reason)) => {
+                ContextBreakdown::unavailable(ContextAvailability::Error, reason)
+            }
             Err(_) => ContextBreakdown::unavailable(
                 ContextAvailability::Error,
                 "Context inspection failed or timed out",
