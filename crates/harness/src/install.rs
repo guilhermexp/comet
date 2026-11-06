@@ -52,7 +52,11 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
     use Method::*;
     let windows = platform == Platform::Windows;
     match id {
-        Mock | Kimi | Omp => vec![],
+        // A registry agent installs from its registry entry
+        // (`crate::acp_registry`), never through a vendor script.
+        Mock | Kimi | Omp | Registry(_) => vec![],
+        Fx if windows => vec![],
+        Fx => vec![Shell("curl -fsSL https://fx.sh/setup.sh | bash", "bash")],
         Antigravity => vec![Archive],
         Muse if windows => vec![PowerShell("irm https://dev.meta.ai/install.ps1 | iex")],
         Muse => vec![Shell(
@@ -164,7 +168,8 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Hermes => "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
         Devin => "curl -fsSL https://cli.devin.ai/install.sh | bash",
         Muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
-        Antigravity | Mock | Kimi | Omp => return None,
+        Fx => "curl -fsSL https://fx.sh/setup.sh | bash",
+        Antigravity | Mock | Kimi | Omp | Registry(_) => return None,
     })
 }
 
@@ -184,6 +189,8 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Kimi => ("kimi", "PATH"),
         Muse => ("muse", "~/.local/bin"),
         Mock => ("mock", "PATH"),
+        Fx => ("fx", "~/.local/bin"),
+        Registry(agent) => (agent.registry_id(), "~/.zeron/agents"),
     }
 }
 
@@ -201,7 +208,9 @@ pub fn installed(id: HarnessId) -> bool {
         Antigravity => crate::AcpHarness::antigravity().installed(),
         Omp => crate::OmpHarness::new().installed(),
         Muse => crate::MuseHarness::new().installed(),
-        Kimi | Mock => false,
+        Mock | Kimi => false,
+        Fx => crate::AcpHarness::fx().installed(),
+        Registry(agent) => crate::acp_registry::installed(agent),
     }
 }
 
@@ -402,7 +411,7 @@ async fn run(
 mod tests {
     use super::*;
 
-    const IDS: [HarnessId; 10] = [
+    const IDS: [HarnessId; 11] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
@@ -410,6 +419,7 @@ mod tests {
         HarnessId::Pi,
         HarnessId::Grok,
         HarnessId::Hermes,
+        HarnessId::Fx,
         HarnessId::Devin,
         HarnessId::Antigravity,
         HarnessId::Mock,
@@ -420,7 +430,10 @@ mod tests {
         for platform in [Platform::Unix, Platform::Mac, Platform::Windows] {
             for id in IDS {
                 let list = methods(id, platform);
-                assert_eq!(list.is_empty(), id == HarnessId::Mock);
+                assert_eq!(
+                    list.is_empty(),
+                    id == HarnessId::Mock || (id == HarnessId::Fx && platform == Platform::Windows)
+                );
                 for method in list {
                     assert!(available(method, platform, &|_| true, true));
                     assert!(!available(method, platform, &|_| false, false));

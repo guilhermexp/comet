@@ -841,6 +841,59 @@ mod test {
         }
     }
 
+    struct Dragged;
+
+    impl Render for Dragged {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    struct DragSource {
+        clicks: usize,
+    }
+
+    impl Render for DragSource {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            use crate::{StatefulInteractiveElement as _, Styled as _, px};
+            div().size_full().child(
+                div()
+                    .id("source")
+                    .size(px(100.0))
+                    .on_click(cx.listener(|this, _, _, _| this.clicks += 1))
+                    .on_drag((), |_, _, _, cx| cx.new(|_| Dragged)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn drag_needs_travel_past_the_threshold_with_the_button_held(cx: &mut TestAppContext) {
+        use crate::{Modifiers, MouseButton, point, px};
+        let (view, cx) = cx.add_window_view(|_, _| DragSource { clicks: 0 });
+        let none = Modifiers::default();
+        let start = point(px(50.0), px(50.0));
+
+        // Jitter within the threshold stays a click.
+        cx.simulate_mouse_down(start, MouseButton::Left, none);
+        cx.simulate_mouse_move(point(px(53.0), px(50.0)), MouseButton::Left, none);
+        assert!(!cx.update(|_, cx| cx.has_active_drag()));
+        cx.simulate_mouse_up(point(px(53.0), px(50.0)), MouseButton::Left, none);
+        assert_eq!(view.read_with(cx, |view, _| view.clicks), 1);
+
+        // A press whose release never arrived: moving without the button
+        // held is a hover, not a drag, and the stale press is forgotten.
+        cx.simulate_mouse_down(start, MouseButton::Left, none);
+        cx.simulate_mouse_move(point(px(70.0), px(50.0)), None, none);
+        assert!(!cx.update(|_, cx| cx.has_active_drag()));
+        cx.simulate_mouse_move(point(px(90.0), px(50.0)), MouseButton::Left, none);
+        assert!(!cx.update(|_, cx| cx.has_active_drag()));
+
+        // Held and moved past the threshold: a drag.
+        cx.simulate_mouse_down(start, MouseButton::Left, none);
+        cx.simulate_mouse_move(point(px(56.0), px(50.0)), MouseButton::Left, none);
+        assert!(cx.update(|_, cx| cx.has_active_drag()));
+    }
+
     #[gpui::test]
     fn test_on_events(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {

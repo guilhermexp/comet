@@ -86,6 +86,10 @@ mod tests {
             id: id.into(),
             role: MessageRole::Assistant,
             parts: vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: format!("tool-{id}"),
                 call: ToolCall::Todo {
                     items: items

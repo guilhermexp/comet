@@ -413,6 +413,10 @@ pub async fn run_recap_model(
         Duration::from_secs(RUN_ATTEMPT_SECS),
         move |attempt| async move {
             let request = RunRequest {
+                access: Default::default(),
+                extra_mcp: Default::default(),
+                plan: Default::default(),
+
                 prompt: prompt.to_string(),
                 harness: Some(harness_id),
                 model: cheap.clone(),

@@ -154,13 +154,26 @@ async fn cloud_rpcs_reach_the_edge_as_the_user_and_are_never_forwarded() {
     .unwrap();
     let client = memory_client(core.rpc_service());
 
-    // A targetDeviceId is ignored: these act for THIS runtime's user only
-    // (no peer links exist here, so a forward would have failed).
-    let status: CloudStatus = client
-        .call_as(
+    // The fork's IPC-only contract rejects device addressing before dispatch.
+    let error = client
+        .call(
             methods::CLOUD_STATUS,
             serde_json::json!({ "targetDeviceId": "some-other-device" }),
         )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("CloudStatus' is local-only"),
+        "{error}"
+    );
+    assert!(
+        !seen.lock().unwrap().iter().any(|(request, _)| {
+            request.starts_with("GET /cloud/") || request.starts_with("GET /vault/")
+        }),
+        "a rejected device target reached the edge"
+    );
+    let status: CloudStatus = client
+        .call_as(methods::CLOUD_STATUS, serde_json::json!({}))
         .await
         .unwrap();
     assert_eq!(status.state, CloudState::Ready);

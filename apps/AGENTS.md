@@ -12,9 +12,11 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 
 ## Local Contracts
 
+- Sync `35561ead`: `apps/zeron` preserva CLI/daemon/engine in-process e feed do fork. `apps/zgx` é fonte dormente fora do workspace, sem substituir launch/packaging. `crates/cli` e `crates/launch` também ficam excluídas. Versão continua 1.0.16; beta/managed updater não é ativado.
+
 - No Linux, `zeron appshot` é somente ativação IPC local para o app headed em execução; captura/permissões/destino pertencem à UI. Não inicia uma engine nem captura no daemon.
 
-- A feature Cargo `browser-fixture` de `zeron` expõe os binários opt-in `browser-fixture` e `preview-fixture` em `zeron/src/fixtures/`. Não empacotar nem publicar. O modo `browser-fixture <output> --resize-regression` verifica hit testing do divisor e geometria fracionária sem gravação de tela; sucesso exige `result.txt` com PASS (o lifecycle GPUI pode retornar exit 0 mesmo após erro do fixture). Dev deps de `zeron-ui` ativam `gpui/test-support`, cujo flush desenha sem apresentação nativa; por isso esses rigs são binários do app, nunca exemplos/test targets da UI. Build nativa deve selecionar só `-p zeron --bin <fixture>`, sem `--workspace` que unificaria as features de teste.
+- A feature Cargo `browser-fixture` de `zeron` expõe os binários opt-in `browser-fixture` e `preview-fixture` em `zeron/src/fixtures/`. Não empacotar nem publicar. O modo `browser-fixture <output> --resize-regression` verifica hit testing do divisor e geometria fracionária sem gravação de tela; sucesso exige `result.txt` com PASS (o lifecycle GPUI pode retornar exit 0 mesmo após erro do fixture). Dev deps de `zeron-ui` ativam `gpui/test-support`, cujo flush desenha sem apresentação nativa. Esses bins usam o loop de produção e seu build seleciona só `-p zeron --bin <fixture>`, sem `--workspace`. O exemplo UI browser-fixture mais recente usa gpui/bench e apresenta explicitamente a cena em capture_frame no Linux; o CI Linux o executa com shell detached, sem engine/polling de Workers. Sua prova nativa depende das asserções, capturas e result.txt, além do exit.
 
 
 - `main` chama `zeron_engine::raise_nofile_limit` depois do tracing e **antes** de `run_app` / headless — o gpui/Metal precisa abrir `default.metallib` mesmo com dezenas de rooms.
@@ -30,7 +32,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 - No iOS, `NativeTranscriptTable` preserva identidade/posição de células e aplica keyboard inset com a animação nativa. `SessionStore.lastSubmittedMessageId` distingue envio local de entradas remotas; folding de mensagem vive no store quente. `ComposerEditorController` confirma IME antes do envio e aplica o draft resultante imediatamente. Disclosure de tools é local à célula, sem reconfigurar todo o transcript.
 - Imagens geradas no transcript carregam apenas `path/name/mimeType` no ChatDoc. O iOS valida os quatro MIME raster suportados, tenta o device dono antes do host e decodifica uma única frame com limite de bytes e dimensões antes de medir/renderizar; cache genérico e cache com MIME esperado são chaves distintas.
 - Appshots no iOS preservam o screenshot como anexo e projetam no transcript apenas origem/título; o texto AX observado fica oculto. O parser escolhe o último trailer de anexos válido e ignora marcadores que apareçam dentro do XML observado.
-- Voz Codex no iOS usa o estado compartilhado de `crates/voice-session` e media nativa via WebRTC/CoreAudio, com Live Activities/Dynamic Island; permanece cliente da engine host do Chat. Falha ao abrir Chat real retorna à navegação real com erro, nunca a fixture/demo. O Live OMP mantém seu contrato independente na engine.
+- Voz Codex no iOS usa o estado compartilhado de `crates/voice-session` e media nativa via WebRTC/CoreAudio, com Live Activities/Dynamic Island; permanece cliente da engine host do Chat. Falha ao abrir Chat real retorna à navegação real com erro, nunca a fixture/demo. A integração antiga de Live Voice OMP permanece aposentada.
 - `apps/zeron/build.rs` inclui a declaração de microfone de `Info-unbundled.plist` no Mach-O para launches sem bundle; o runner de dev continua usando identidade própria de Zeron Dev.
 - O shell iOS alterna tab/split com retenção de navegação e usa safe areas reais para transcript/composer; visuals nativos e math são projetados pelo core Rust. Linux não comprova UIKit.
 - `apps/ios` não entra no `cargo build`; build e teste são pelo Xcode.
@@ -41,10 +43,13 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 
 ## Verification
 
+O teste de lifetime/rotação de logs roda em subprocesso privado, isolado dos forks do teste de installer. Flock pertence ao open-file-description e um filho o retém até exec/exit, mesmo com CLOEXEC; fechar apenas o File do pai não garante último descritor. Todas as asserções de writer vivo/overflow/retomada são preservadas; o fixture também exige CLOEXEC. Não alterar o logger nem adicionar espera/retry para compensar concorrência entre fixtures.
+
 - Comandos: `cargo build -p zeron` · `scripts/e2e-smoke.sh`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
+| `zeron/src/main.rs` (lifetime do log/rotação) | unit — subprocesso sem forks de outros testes | `cargo test -p zeron --bin zeron log_file_tests` |
 | `zeron/src/**` (wiring, dispatch) | none — casca fina; o comportamento é testado nas crates | `cargo build -p zeron` |
 | Fluxo headed/headless real | e2e | `scripts/e2e-smoke.sh` · `scripts/dev-demo.sh` |
 | `ios/**` | unit / integration (XCTest do app UIKit; core Rust coberto por `cargo test -p zeron-mobile -p zeron-client -p zeron-text`) | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` |
@@ -53,4 +58,6 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 
 | Domínio | Doc | Papel |
 |---|---|---|
+| Card web dormente | [`card-web/AGENTS.md`](card-web/AGENTS.md) | Página pública upstream fora do build publicado |
+| Interface zgx dormente | [`zgx/AGENTS.md`](zgx/AGENTS.md) | Fonte alternativa excluída, sem launch/packaging no fork |
 | Cliente iOS | [`ios/AGENTS.md`](ios/AGENTS.md) | UIKit, core UniFFI, Chat, media nativa e Live Activities |

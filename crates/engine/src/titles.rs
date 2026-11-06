@@ -221,6 +221,10 @@ impl TitleGenerator {
             std::time::Duration::from_secs(crate::recap::RUN_ATTEMPT_SECS),
             move |attempt| async move {
                 let mut request = RunRequest {
+                    access: Default::default(),
+                    extra_mcp: Default::default(),
+                    plan: Default::default(),
+
                     prompt: title_prompt.clone(),
                     harness: Some(harness_id),
                     model: cheap.clone(),
@@ -469,10 +473,13 @@ mod tests {
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
             sessions: None,
+            access: Default::default(),
+            plan: false,
             resume: None,
             attachments: vec![],
             worktree: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         };
         let result = collect_text(&harness, "title-test", request, None).await;
         assert!(

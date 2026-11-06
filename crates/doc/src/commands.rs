@@ -361,10 +361,13 @@ mod tests {
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
             sessions: None,
+            access: Default::default(),
+            plan: false,
             attachments: Vec::new(),
             worktree: None,
             resume: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         }
     }
 }

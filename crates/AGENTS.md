@@ -12,6 +12,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 ## Local Contracts
 
+- Sync `35561ead`: `plugin-guard` e `preview-label` são membros compartilhados; `cli`, `launch` e `apps/zgx` permanecem excluídos. D1a ativa o runtime engine de plugins/templates no startup, com auth/links/RPC; interface zgx e MCP nativo nas runs seguem desligados. O MCP preserva o default side chat e os modos configured/inherit, aceitando subagent explícito e recusando netos/overrides de access/plan no inherit.
+
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.
 - `edition = "2024"` em todas.
 - `mcp/src/tools.rs`: a consulta existente `list_chats.parent` descobre Chats criados por `parent_chat_id` **ou** `origin_chat_id`; summaries expõem `parentChatId` e `originChatId` separadamente. Isso não muda `Chat::is_top_level`, autoridade nem a linhagem gravada. Regressão de consumidor com RPC em memória: `creator_query_lists_both_lineages_without_reparenting`.
@@ -39,7 +41,11 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 - Mudança que atravessa duas crates quase sempre indica que o tipo está na camada errada: tipo de fio vai pra `proto`, forma de documento vai pra `doc`.
 - `update/` e `syntax/` são crates de arquivo único (auto-update do binário; tokenizer de highlight) — cada uma tem doc próprio, mas nenhuma tem submódulo interno.
 
+A fronteira Workers e os metadados compartilhados do vendor reutilizam `unpeel_core::platform` para locks, arquivos privados, publicação durável e identidade de processo em Unix/Windows. O Host PTY local do vendor continua explicitamente Unix. OMP usa o seam de processos do harness, com Job Object no Windows.
+
 ## Verification
+
+Engine e `zeron-client` referenciam a última entrada Assistant em based_on.turn_id; mensagens User/echo não são turnos. Antes da primeira resposta, o contexto fica ausente. O host mantém o guard contra Stop para um Assistant antigo; o cliente usa um único snapshot ao escolher a referência.
 
 - Comandos: `cargo test --workspace` · `cargo test -p <crate>` · `cargo fmt --all` · `cargo build -p zeron`
 
@@ -50,12 +56,17 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `crates/{engine,harness,rpc,workers-unpeel,doc,sync,visual}/tests/**` | integration | `cargo test -p <crate>` |
 | `crates/ui/src/**` (estado, derivações) | unit | `cargo test -p zeron-ui` |
 | `crates/ui` (render gpui) | unit — fixtures `gpui::TestAppContext` de layout/render; QA visual nativo continua separado | `cargo test -p zeron-ui` · `scripts/dev-demo.sh` |
+| `crates/client/src/session/mod.rs` (contexto de Stop no ledger) | integration — demo através do cliente/host | `cargo test -p zeron-client --test demo interrupt_aborts_the_live_turn` |
 | `crates/update` | unit (versão/manifest, swap symlink, shutdown, restart gate) | `cargo test -p zeron-update` |
 
 ## Child DOX Index
 
 | Crate | Doc | Papel |
 |---|---|---|
+| `zeron-cli` (excluída) | [`cli/AGENTS.md`](cli/AGENTS.md) | CLI upstream dormente |
+| `zeron-launch` (excluída) | [`launch/AGENTS.md`](launch/AGENTS.md) | Launch/engine managed dormentes |
+| `zeron-plugin-guard` | [`plugin-guard/AGENTS.md`](plugin-guard/AGENTS.md) | Validação pura de permissões dos plugins |
+| `zeron-preview-label` | [`preview-label/AGENTS.md`](preview-label/AGENTS.md) | Nomes e labels puros para processos/previews |
 | `zeron-proto` | [`proto/AGENTS.md`](proto/AGENTS.md) | Tipos de fio + derivações puras compartilhadas |
 | `zeron-doc` | [`doc/AGENTS.md`](doc/AGENTS.md) | Schemas Loro (session/workspace) + mirror layer |
 | `zeron-sync` | [`sync/AGENTS.md`](sync/AGENTS.md) | Cliente de room Loro + DocsStore (snapshot de nascimento e sinais efêmeros de histórico local) |

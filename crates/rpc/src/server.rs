@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_tungstenite::tungstenite::http::StatusCode;
 
+use crate::ipc_auth::IpcTokens;
 use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
 
 /// Serve one connection: read client frames from `inbound`, write server frames to `out`.
@@ -144,13 +145,75 @@ async fn handle_request(
 /// process (another OS user, a sandboxed app, a container sharing the host
 /// network) can open this port, and the engine behind it can start agents and
 /// broker vault grants.
-pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcService>, token: String) {
-    let token: Arc<str> = token.into();
+pub fn serve_ws_listener(
+    listener: TcpListener,
+    service: Arc<dyn RpcService>,
+    token: String,
+) -> impl std::future::Future<Output = ()> + Send {
+    let listener = OwnedListener(listener);
+    async move {
+        // One full token; an agent token no one holds.
+        let tokens = match crate::ipc_auth::generate_token() {
+            Ok(agent) => IpcTokens { full: token, agent },
+            Err(err) => {
+                tracing::error!(error = %err, "rpc: no randomness for the agent token; not serving");
+                return;
+            }
+        };
+        serve_owned_listener(listener, service, tokens).await
+    }
+}
+
+/// An acceptor owns the listening socket, including copies briefly inherited
+/// by pre-exec children. Closing only our fd need not stop that socket.
+struct OwnedListener(TcpListener);
+
+impl std::ops::Deref for OwnedListener {
+    type Target = TcpListener;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for OwnedListener {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // Linux shutdown changes the shared socket state, so a fork's
+            // CLOEXEC copy cannot keep accepting after cancellation completes.
+            if unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) } < 0 {
+                tracing::debug!(error = %std::io::Error::last_os_error(), "rpc: listener shutdown failed");
+            }
+        }
+    }
+}
+
+/// [`serve_ws_listener`] answering two tokens: the full one, and the
+/// agent-scoped one, whose connections reach only
+/// [`crate::agent_allowed`] methods and are served as
+/// [`crate::Caller::Agent`].
+pub fn serve_ws_listener_scoped(
+    listener: TcpListener,
+    service: Arc<dyn RpcService>,
+    tokens: IpcTokens,
+) -> impl std::future::Future<Output = ()> + Send {
+    // Construct the guard before returning the future: an aborted task may
+    // never poll it, but must still shut down its listening socket.
+    serve_owned_listener(OwnedListener(listener), service, tokens)
+}
+
+async fn serve_owned_listener(
+    listener: OwnedListener,
+    service: Arc<dyn RpcService>,
+    tokens: IpcTokens,
+) {
+    let tokens = Arc::new(tokens);
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 tracing::debug!(%peer, "rpc: connection accepted");
-                tokio::spawn(serve_ws_socket(stream, service.clone(), token.clone()));
+                tokio::spawn(serve_ws_socket(stream, service.clone(), tokens.clone()));
             }
             Err(err) => {
                 tracing::warn!(error = %err, "rpc: accept failed");
@@ -164,7 +227,34 @@ fn incomplete_handshake(error: &WsError) -> bool {
     matches!(error, WsError::Protocol(ProtocolError::HandshakeIncomplete))
 }
 
-async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token: Arc<str>) {
+/// An agent-token connection's view of the service: only what
+/// [`crate::agent_allowed`] lists, each served as [`crate::Caller::Agent`].
+pub(crate) struct AgentGuard {
+    pub(crate) inner: Arc<dyn RpcService>,
+    pub(crate) chat: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl RpcService for AgentGuard {
+    async fn handle(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<crate::RpcReply, RpcError> {
+        if !crate::agent_allowed(method) {
+            tracing::warn!(method, chat = ?self.chat, "rpc: refused an agent's call outside its scope");
+            return Err(RpcError::Failed(format!(
+                "{method} isn't open to agents: only the person can do that, in Zeron"
+            )));
+        }
+        let caller = crate::Caller::Agent {
+            chat: self.chat.clone(),
+        };
+        crate::with_caller(caller, self.inner.handle(method, params)).await
+    }
+}
+
+async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, tokens: Arc<IpcTokens>) {
     // Two independent gates, both required:
     //
     // 1. Origin. Native viewports dial this socket without an `Origin`
@@ -179,6 +269,9 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token:
     //
     // The large `Err` (ErrorResponse) is the shape tungstenite's Callback
     // trait requires; it can't be boxed away here.
+    // Set by the handshake when the agent-scoped token was presented: the
+    // chat it says it serves.
+    let scope: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
     #[allow(clippy::result_large_err)]
     let authorize = |req: &HandshakeRequest, resp: HandshakeResponse| {
         if let Some(origin) = req.headers().get("origin") {
@@ -194,7 +287,7 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token:
             .headers()
             .get(tokio_tungstenite::tungstenite::http::header::AUTHORIZATION)
             .map(|value| value.as_bytes());
-        if !crate::ipc_auth::bearer_matches(&token, presented) {
+        let Some(agent) = crate::ipc_auth::bearer_scope(&tokens, presented) else {
             tracing::warn!(
                 presented = presented.is_some(),
                 "rpc: rejecting IPC handshake without the engine's bearer token"
@@ -204,6 +297,16 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token:
             ));
             *err.status_mut() = StatusCode::UNAUTHORIZED;
             return Err(err);
+        };
+        if agent {
+            let chat = req
+                .headers()
+                .get(crate::ipc_auth::CHAT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(|chat| chat.chars().take(128).collect::<String>());
+            *scope
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chat);
         }
         Ok(resp)
     };
@@ -237,6 +340,16 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token:
         }
     });
 
+    let service: Arc<dyn RpcService> = match scope
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Some(chat) => Arc::new(AgentGuard {
+            inner: service,
+            chat,
+        }),
+        None => service,
+    };
     serve_connection(service, out_tx, in_rx).await;
     pump.abort();
 }
@@ -245,6 +358,84 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token:
 mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelled_ipc_acceptors_stop_listening_even_with_an_inherited_descriptor() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        struct NeverCalled;
+        #[async_trait::async_trait]
+        impl RpcService for NeverCalled {
+            async fn handle(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+            ) -> Result<crate::RpcReply, crate::RpcError> {
+                panic!("cancelled IPC must not dispatch requests")
+            }
+        }
+        struct ForkHold {
+            pid: libc::pid_t,
+            release: UnixStream,
+        }
+        impl Drop for ForkHold {
+            fn drop(&mut self) {
+                let _ = self.release.write_all(b"x");
+                unsafe {
+                    libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+
+        for scoped in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let service: Arc<dyn RpcService> = Arc::new(NeverCalled);
+            let server = if scoped {
+                tokio::spawn(serve_ws_listener_scoped(
+                    listener,
+                    service,
+                    IpcTokens::generate().unwrap(),
+                ))
+            } else {
+                tokio::spawn(serve_ws_listener(listener, service, "test-token".into()))
+            };
+            // No await after spawn: cancellation below also covers an acceptor
+            // which has never been polled. Hold its inherited fd until checked.
+            let (mut ready, child_ready) = UnixStream::pair().unwrap();
+            let (release, child_release) = UnixStream::pair().unwrap();
+            let (parent_ready_fd, parent_release_fd) = (ready.as_raw_fd(), release.as_raw_fd());
+            let (ready_fd, release_fd) = (child_ready.as_raw_fd(), child_release.as_raw_fd());
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                // Only async-signal-safe syscalls after a multithreaded fork.
+                unsafe {
+                    libc::close(parent_ready_fd);
+                    libc::close(parent_release_fd);
+                    libc::write(ready_fd, b"r".as_ptr().cast(), 1);
+                    let mut signal = 0_u8;
+                    libc::read(release_fd, (&mut signal as *mut u8).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            let hold = ForkHold { pid, release };
+            drop(child_ready);
+            drop(child_release);
+            ready.read_exact(&mut [0]).unwrap();
+            server.abort();
+            let _ = server.await;
+            let connection = tokio::net::TcpStream::connect(address).await;
+            drop(hold);
+            assert!(
+                connection.is_err(),
+                "scoped={scoped}: acceptor remained live: {connection:?}"
+            );
+        }
+    }
 
     #[test]
     fn only_an_incomplete_websocket_handshake_is_benign() {

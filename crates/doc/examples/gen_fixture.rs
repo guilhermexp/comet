@@ -56,6 +56,7 @@ fn main() {
             output: None,
             diff: None,
             execution: None,
+            exit_code: None,
         },
     );
     fold_event_into_parts(

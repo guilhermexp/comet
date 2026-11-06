@@ -17,6 +17,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+
+mod caller;
 mod client;
 pub mod device_room;
 pub mod ipc_auth;
@@ -24,14 +26,108 @@ pub mod method;
 mod server;
 mod ws;
 
-pub use client::{RpcClient, RpcSubscription, connect_ipc, connect_ipc_url, connect_ws};
+pub use caller::{Caller, caller, with_caller};
+pub use client::{
+    RpcClient, RpcSubscription, connect_ipc, connect_ipc_as_agent, connect_ipc_url, connect_ws,
+};
 pub use device_room::{
-    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
-    decode_device_frame, device_room_ws_url, encode_device_frame, is_liveness_probe,
+    CallerProof, CallerProofFn, DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig,
+    LinkCache, LinkCacheConfig, NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken,
+    TokenError, TokenSource, caller_proof_message, decode_device_frame, device_room_ws_url,
+    encode_device_frame, is_liveness_probe,
 };
 pub use method::{ALL_METHOD_NAMES, MethodInfo, RpcMethod, info, methods};
-pub use server::{serve_connection, serve_ws_listener};
+pub use server::{serve_connection, serve_ws_listener, serve_ws_listener_scoped};
+
+/// Methods answered only over this device's own local IPC, never to a peer
+/// device through the device-room relay ([`HostRelay`] refuses them): they
+/// hand the caller this device's credentials.
+pub fn local_only(method: &str) -> bool {
+    methods::is_local_only(method)
+}
+
+/// Methods a peer device may not have answered here even though they're
+/// relay-forwardable: allowing a plugin is this device's person's decision,
+/// made in this device's consent window; and a file path names a file on
+/// the caller's device, never this one. Declining, turning off, removing,
+/// and installing from a link (which lands waiting here) stay open to your
+/// other devices (Settings → Plugins' device switcher).
+pub fn peer_refused(method: &str, params: &serde_json::Value) -> bool {
+    if local_only(method) {
+        return true;
+    }
+    match method {
+        methods::DECIDE_PLUGIN => params
+            .get("allow")
+            .is_none_or(|allow| allow != &serde_json::Value::Bool(false)),
+        methods::INSTALL_PLUGIN => params.get("path").is_some_and(|path| !path.is_null()),
+        _ => false,
+    }
+}
+
+/// The methods an agent's `zeron mcp` server may call with the
+/// agent-scoped IPC token: what its tools need and nothing that grants
+/// power. An allow-list, so a method added later stays the app's until
+/// it's listed here. Never here: deciding or reviewing (`Decide*`,
+/// `Review*`), signing (`SignPlugin`, `PluginSigningKey`), updating
+/// (`UpdatePlugin`, `UpdateTemplate`, the engine's and harnesses'),
+/// credentials (`AccessToken`, sign-in, `StepUp`, `DeleteAccount`),
+/// terminals, files, vault and agent logins, and a command's whole output
+/// (`ReadToolOutput`: an agent reads a chat as its doc keeps it).
+pub fn agent_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        // Discovery.
+        methods::ENGINE_INFO
+            | methods::LOCAL_DEVICE
+            | methods::WATCH_DEVICES
+            | methods::WATCH_SPACES
+            | methods::WATCH_CHATS
+            | methods::WATCH_SESSIONS
+            | methods::WATCH_DOC_MESSAGES
+            | methods::LIST_HARNESSES
+            | methods::LIST_MODELS
+            | methods::LIST_AGENT_ACCOUNTS
+            // Chats: create, message, steer, archive (`Mutate`).
+            | methods::MUTATE
+            | methods::QUEUE_MESSAGE
+            | methods::QUEUE_COMMAND
+            // Showing the person something in the calling chat.
+            | methods::PUBLISH_VISUAL
+            | methods::PUBLISH_IMAGE
+            // Plugins: authoring, installing (lands waiting for the person),
+            // checking for updates, and their tools.
+            | methods::LIST_PLUGINS
+            | methods::PLUGIN_STATUS
+            | methods::NEW_PLUGIN
+            | methods::INSTALL_PLUGIN
+            | methods::CHECK_PLUGIN_UPDATES
+            | methods::LIST_PLUGIN_TOOLS
+            | methods::WATCH_PLUGIN_TOOLS
+            | methods::CALL_PLUGIN_TOOL
+            | methods::DESCRIBE_ELEMENTS
+            // Templates: authoring and switching (the app shows an
+            // unapproved one as a preview until the person keeps it), and
+            // importing (lands waiting for the person).
+            | methods::LIST_TEMPLATES
+            | methods::DESCRIBE_APP
+            | methods::CREATE_TEMPLATE
+            | methods::USE_TEMPLATE
+            | methods::TEMPLATE_STATUS
+            | methods::DELETE_TEMPLATE
+            | methods::EXPORT_TEMPLATE
+            | methods::IMPORT_TEMPLATE
+            // Themes: data only (no consent: a theme can't run anything),
+            // read, made, changed, deleted (yours only) and worn. Not the
+            // window's watch.
+            | methods::LIST_THEMES
+            | methods::GET_THEME
+            | methods::CREATE_THEME
+            | methods::UPDATE_THEME
+            | methods::DELETE_THEME
+            | methods::USE_THEME
+    )
+}
 
 /// Stable capability error codes transported without provider stderr.
 pub mod capability_errors {
@@ -41,6 +137,11 @@ pub mod capability_errors {
     pub const PULL_REQUESTS_TIMEOUT: &str = "pull_requests.timeout";
     pub const PULL_REQUESTS_DECODE: &str = "pull_requests.decode";
     pub const PULL_REQUESTS_COMMAND_FAILED: &str = "pull_requests.command_failed";
+    /// `ReadToolOutput`: the host's journal doesn't hold that command (an
+    /// old chat, or one whose journal is gone).
+    pub const TOOL_OUTPUT_UNAVAILABLE: &str = "tool_output.unavailable";
+    /// `ReadToolOutput`: the command has no result yet.
+    pub const TOOL_OUTPUT_NOT_FINISHED: &str = "tool_output.not_finished";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -284,6 +385,60 @@ mod tests {
                 )),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
+        }
+    }
+
+    #[test]
+    fn plugin_methods_are_local_only_but_managing_delivering_and_serving() {
+        for method in [
+            methods::NEW_PLUGIN,
+            methods::SIGN_PLUGIN,
+            methods::VERIFY_PLUGIN,
+            methods::LIST_PLUGIN_TOOLS,
+            methods::WATCH_PLUGIN_TOOLS,
+            methods::CALL_PLUGIN_TOOL,
+            methods::SERVE_PLUGIN_TOOLS,
+            methods::PLUGIN_TOOL_RESULT,
+            methods::PLUGIN_SEND,
+            methods::CALL_PLUGIN_SERVICE,
+            methods::WATCH_PLUGIN_CHANNEL,
+            methods::PLUGIN_SIGNING_KEY,
+            methods::LIST_TEMPLATES,
+            methods::CREATE_TEMPLATE,
+            methods::USE_TEMPLATE,
+            methods::TEMPLATE_STATUS,
+            methods::DELETE_TEMPLATE,
+            methods::EXPORT_TEMPLATE,
+            methods::IMPORT_TEMPLATE,
+            methods::DECIDE_TEMPLATE,
+            methods::CHECK_TEMPLATE_UPDATES,
+            methods::UPDATE_TEMPLATE,
+            methods::DESCRIBE_APP,
+            methods::LIST_THEMES,
+            methods::GET_THEME,
+            methods::CREATE_THEME,
+            methods::UPDATE_THEME,
+            methods::DELETE_THEME,
+            methods::USE_THEME,
+            methods::WATCH_THEMES,
+        ] {
+            assert!(local_only(method), "{method}");
+        }
+        assert!(!local_only(methods::PLUGIN_DELIVER));
+        assert!(!local_only(methods::SERVE_PLUGIN_CALL));
+        // Your other devices manage this one's plugins (Settings → Plugins).
+        for method in [
+            methods::LIST_PLUGINS,
+            methods::WATCH_PLUGINS,
+            methods::DECIDE_PLUGIN,
+            methods::SET_PLUGIN_OFF,
+            methods::REMOVE_PLUGIN,
+            methods::INSTALL_PLUGIN,
+            methods::CHECK_PLUGIN_UPDATES,
+            methods::UPDATE_PLUGIN,
+            methods::PLUGIN_STATUS,
+        ] {
+            assert!(!local_only(method), "{method}");
         }
     }
 
@@ -586,6 +741,134 @@ mod tests {
             .unwrap();
         let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
         assert_eq!(echoed, serde_json::json!("ok"));
+    }
+
+    /// Answers every method with the caller it ran as.
+    struct WhoAsked;
+    #[async_trait]
+    impl RpcService for WhoAsked {
+        async fn handle(
+            &self,
+            _method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            Ok(RpcReply::Value(serde_json::json!(format!(
+                "{:?}",
+                crate::caller()
+            ))))
+        }
+    }
+
+    /// R6/R16: the agent-scoped token (what `zeron mcp` holds) reaches its
+    /// tools' methods as an agent, and nothing that decides, signs, updates
+    /// or hands out credentials; the full token still reaches everything.
+    #[tokio::test]
+    async fn the_agent_token_refuses_everything_that_grants_power() {
+        let tokens = ipc_auth::IpcTokens::generate().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener_scoped(
+            listener,
+            Arc::new(WhoAsked),
+            tokens.clone(),
+        ));
+        let url = format!("ws://127.0.0.1:{port}");
+
+        let agent = connect_ws(&url, Some(&tokens.agent)).await.unwrap();
+        for method in [
+            methods::DECIDE_PLUGIN,
+            methods::REVIEW_PLUGIN,
+            methods::SIGN_PLUGIN,
+            methods::PLUGIN_SIGNING_KEY,
+            methods::DECIDE_TEMPLATE,
+            methods::REVIEW_TEMPLATE,
+            methods::UPDATE_PLUGIN,
+            methods::UPDATE_TEMPLATE,
+            methods::APPLY_UPDATE,
+            methods::ACCESS_TOKEN,
+            methods::STEP_UP,
+            methods::DELETE_ACCOUNT,
+            methods::SIGN_IN,
+            methods::COMPLETE_SIGN_IN,
+            methods::SIGN_OUT,
+            methods::SET_PLUGIN_OFF,
+            methods::REMOVE_PLUGIN,
+            methods::SET_BUILTIN_PLUGINS,
+            methods::OPEN_TERMINAL,
+            methods::WRITE_TERMINAL,
+            methods::WRITE_WORKSPACE_FILE,
+            methods::EXPORT_PLUGIN,
+            // The window's own watch of the theme files.
+            methods::WATCH_THEMES,
+            methods::READ_TOOL_OUTPUT,
+        ] {
+            assert!(!agent_allowed(method), "{method}");
+            match agent.call(method, serde_json::json!({})).await {
+                Err(RpcError::Failed(message)) => assert!(
+                    message.contains("isn't open to agents"),
+                    "{method}: {message}"
+                ),
+                other => panic!("an agent reached {method}: {other:?}"),
+            }
+        }
+        let asked = agent
+            .call(methods::LIST_PLUGINS, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(asked.as_str().unwrap().starts_with("Agent"), "{asked}");
+        // The theme tools' methods, exactly: data only.
+        for method in [
+            methods::LIST_THEMES,
+            methods::GET_THEME,
+            methods::CREATE_THEME,
+            methods::UPDATE_THEME,
+            methods::DELETE_THEME,
+            methods::USE_THEME,
+        ] {
+            assert!(agent_allowed(method), "{method}");
+            let asked = agent.call(method, serde_json::json!({})).await.unwrap();
+            assert!(
+                asked.as_str().unwrap().starts_with("Agent"),
+                "{method}: {asked}"
+            );
+        }
+
+        let app = connect_ws(&url, Some(&tokens.full)).await.unwrap();
+        for method in [methods::DECIDE_PLUGIN, methods::ACCESS_TOKEN] {
+            let asked = app.call(method, serde_json::json!({})).await.unwrap();
+            assert_eq!(asked, serde_json::json!("Local"), "{method}");
+        }
+    }
+
+    #[test]
+    fn peers_may_decline_but_never_allow() {
+        let hash = "ab".repeat(32);
+        assert!(peer_refused(
+            methods::DECIDE_PLUGIN,
+            &serde_json::json!({"id": "x", "allow": true, "hash": hash})
+        ));
+        assert!(peer_refused(
+            methods::DECIDE_PLUGIN,
+            &serde_json::json!({"id": "x", "allow": "yes"})
+        ));
+        assert!(!peer_refused(
+            methods::DECIDE_PLUGIN,
+            &serde_json::json!({"id": "x", "allow": false})
+        ));
+        assert!(peer_refused(
+            methods::INSTALL_PLUGIN,
+            &serde_json::json!({"path": "/x"})
+        ));
+        assert!(!peer_refused(
+            methods::INSTALL_PLUGIN,
+            &serde_json::json!({"url": "https://x", "path": null})
+        ));
+        assert!(peer_refused(methods::REVIEW_PLUGIN, &serde_json::json!({})));
+        assert!(peer_refused(methods::SIGN_PLUGIN, &serde_json::json!({})));
+        assert!(peer_refused(
+            methods::DELETE_ACCOUNT,
+            &serde_json::json!({})
+        ));
     }
 
     #[tokio::test]

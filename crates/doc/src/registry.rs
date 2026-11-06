@@ -1244,6 +1244,12 @@ impl RegistryDoc {
             ("githubRepo", opt_str(space.github_repo.as_deref())),
             ("createdAt", json!(space.created_at.timestamp_millis())),
         ]);
+        // (Its icon only when it has one: an upsert never clears a picture
+        // set meanwhile from another device.)
+        let mut set = set;
+        if let Some(icon) = &space.icon {
+            set.insert("icon".into(), json!(icon));
+        }
         self.write(KIND_SPACES, &space.id.clone(), OpKind::Upsert, set);
         Ok(())
     }
@@ -1276,6 +1282,26 @@ impl RegistryDoc {
             space_id,
             OpKind::Update,
             fields([("name", opt_str(name))]),
+        );
+        Ok(true)
+    }
+
+    /// LWW picture set from any device, whole (emoji, image and hue in one
+    /// field); `None` clears back to the default tile. `false` when no row.
+    pub fn set_space_icon(
+        &mut self,
+        space_id: &str,
+        icon: Option<&zeron_proto::SpaceIcon>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_SPACES, space_id) {
+            return Ok(false);
+        }
+        let value = icon.map_or(Value::Null, |icon| json!(icon));
+        self.write(
+            KIND_SPACES,
+            space_id,
+            OpKind::Update,
+            fields([("icon", value)]),
         );
         Ok(true)
     }
@@ -1382,6 +1408,10 @@ impl RegistryDoc {
             ),
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
             ("originChatId", opt_str(chat.origin_chat_id.as_deref())),
+            (
+                "childKind",
+                opt_str(chat.child_kind.map(zeron_proto::ChildKind::as_str)),
+            ),
         ]);
         // Full-row callers can hold an older summary across a concurrent host
         // publication. Only seed an absent field; later writes use its setter.
@@ -1704,6 +1734,10 @@ impl RegistryDoc {
             ("contextTokens", context_tokens),
             ("contextWindow", context_window),
             ("runningSubagents", json!(session.running_subagents)),
+            (
+                "backgroundTasks",
+                serde_json::to_value(&session.background_tasks)?,
+            ),
         ]);
         self.write(KIND_SESSIONS, &session.chat_id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1873,6 +1907,11 @@ impl RegistryDoc {
                     // Spawned-Chat lineage is distinct from a UI side chat's
                     // parent and must survive a seeded snapshot.
                     ("originChatId", opt_str(chat.origin_chat_id.as_deref())),
+                    ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+                    (
+                        "childKind",
+                        opt_str(chat.child_kind.map(zeron_proto::ChildKind::as_str)),
+                    ),
                 ]),
             );
         }

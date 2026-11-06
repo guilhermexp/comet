@@ -51,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
         cwd: workspace.path().to_string_lossy().into_owned(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: vec![],
         worktree: None,
         resume: None,
@@ -58,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         workers_parent_chat_id: None,
         sessions: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     let controls = RunControls {
         realtime: None,

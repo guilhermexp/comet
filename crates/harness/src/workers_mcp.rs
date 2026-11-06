@@ -486,6 +486,10 @@ mod tests {
 
     fn request(workers: bool, sessions: bool) -> zeron_proto::RunRequest {
         zeron_proto::RunRequest {
+            access: Default::default(),
+            extra_mcp: Default::default(),
+            plan: Default::default(),
+
             prompt: "p".into(),
             harness: None,
             model: None,

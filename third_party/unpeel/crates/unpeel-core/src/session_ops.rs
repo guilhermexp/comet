@@ -12,18 +12,23 @@
 //!   loop that beats the host's racing final manifest write), spawn a fresh
 //!   host under a NEW session id carrying the old `created_at`/label.
 
+#[cfg(unix)]
+use crate::session_host::socket_path;
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::app_paths;
 use crate::session_host::{
-    load_manifest, socket_path, write_launch_file, HostedSessionManifest, HostedSessionState,
+    load_manifest, write_launch_file, HostedSessionManifest, HostedSessionState,
     SessionHostCommand, SessionHostLaunch,
 };
 use crate::state::{BrowserAccess, SessionInfo};
 
+#[cfg(unix)]
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(1_000);
 // The session host escalates TERM→KILL within ~50ms of the kill command, so
 // this wait is really for the exited-manifest PUBLISH, which can lag well
@@ -57,6 +62,7 @@ fn session_dir(session_id: &str) -> PathBuf {
     app_paths::app_sessions_root().join(session_id)
 }
 
+#[cfg(unix)]
 fn socket_command(
     session_id: &str,
     command: serde_json::Value,
@@ -79,6 +85,14 @@ fn socket_command(
     let mut response = String::new();
     reader.read_line(&mut response).map_err(|e| e.to_string())?;
     serde_json::from_str(response.trim()).map_err(|e| format!("bad response: {e}"))
+}
+
+#[cfg(not(unix))]
+fn socket_command(
+    _session_id: &str,
+    _command: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    Err("Persistent session host is currently only supported on Unix.".into())
 }
 
 fn manifest(session_id: &str) -> Result<HostedSessionManifest, String> {

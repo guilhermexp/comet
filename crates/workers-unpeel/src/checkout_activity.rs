@@ -167,34 +167,17 @@ fn with_action_lock_at<T>(
 }
 
 fn lock_action_file(path: &Path) -> Result<ActivityActionLock, String> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let parent = path.parent().ok_or("Checkout action lock has no parent")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    // SAFETY: `file` owns this valid descriptor for the lock guard's lifetime.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
+    let file =
+        unpeel_core::platform::open_lock_file(path, true).map_err(|error| error.to_string())?;
+    unpeel_core::platform::lock_exclusive(&file).map_err(|error| error.to_string())?;
     Ok(ActivityActionLock(file))
 }
 
 impl Drop for ActivityActionLock {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        // SAFETY: this guard still owns the valid descriptor.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = unpeel_core::platform::unlock(&self.0);
     }
 }
 
@@ -347,19 +330,13 @@ fn write(path: &Path, state: &ActivityFile) -> Result<(), String> {
     ));
     let result = (|| {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
+        let mut file = unpeel_core::platform::create_private_file(&temporary)
             .map_err(|error| error.to_string())?;
         serde_json::to_writer(&mut file, state).map_err(|error| error.to_string())?;
         file.flush().map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, path).map_err(|error| error.to_string())?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        drop(file);
+        unpeel_core::platform::publish_synced_file(&temporary, path)
             .map_err(|error| error.to_string())?;
         Ok(())
     })();
@@ -476,15 +453,10 @@ pub(crate) fn busy_except_at(
 /// A recorded start time that no longer matches means the PID was reused.
 /// An unreadable start time keeps the entry busy.
 fn process_is_alive(process_id: u32, recorded_start: Option<u64>) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(process_id) else {
-        return true;
-    };
-    if pid <= 0 {
+    if process_id == 0 {
         return true;
     }
-    // SAFETY: signal 0 only probes whether the process exists.
-    let probed = unsafe { libc::kill(pid, 0) };
-    if probed != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+    if !unpeel_core::platform::pid_is_alive(process_id) {
         return false;
     }
     match (recorded_start, process_start_time(process_id)) {
@@ -518,7 +490,12 @@ fn process_start_time(process_id: u32) -> Option<u64> {
     fields.split_whitespace().nth(19)?.parse().ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn process_start_time(process_id: u32) -> Option<u64> {
+    unpeel_core::platform::process_start_time(process_id)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn process_start_time(_process_id: u32) -> Option<u64> {
     None
 }

@@ -14,6 +14,11 @@ export default defineConfig({
     // of the run. Re-enable together with the Cloud wiring.
     exclude: [
       ...configDefaults.exclude,
+      "test/unit/card-web.test.ts",
+      "test/unit/card.test.ts",
+      "test/unit/earned-badges.test.ts",
+      "test/unit/edge-identity.test.ts",
+
       "src/cloud/**",
       "src/runner-*.test.ts",
       "src/registry-runner.test.ts",

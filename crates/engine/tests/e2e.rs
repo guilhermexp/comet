@@ -40,10 +40,13 @@ fn run_request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     }
 }
 
@@ -81,6 +84,7 @@ fn mock_script() -> Vec<AgentEvent> {
             output: None,
             diff: None,
             execution: None,
+            exit_code: None,
         },
         done(DoneStatus::Completed),
     ]
@@ -739,21 +743,32 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         "streaming entry",
     )
     .await;
+    let (changed, mut changes) = tokio::sync::watch::channel(());
+    let _subscription = handle.doc().doc().subscribe_root(Arc::new(move |_| {
+        changed.send_replace(());
+    }));
     queue_as_viewer(
         handle.doc(),
         "cmd-int-1",
         SessionCommandPayload::Interrupt {},
     );
 
-    wait_for(
-        || {
-            entries(&core)
+    // The aborted message and the command acknowledgement are separate
+    // commits. Observe both durable outcomes before asserting settlement.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if entries(&core)
                 .iter()
                 .any(|e| e.status == Some(MessageStatus::Aborted))
-        },
-        "aborted stamp",
-    )
-    .await;
+                && command_status(&core, "cmd-int-1") == Some((SessionCommandStatus::Applied, None))
+            {
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("aborted message and applied interrupt");
 
     let all = entries(&core);
     let assistant = all
@@ -1606,6 +1621,9 @@ fn spawn_chip(id: &str, status: SubagentStatus) -> MessagePart {
         execution: None,
         file_preview: None,
         subagent_end: None,
+        exit_code: None,
+        output_truncated: false,
+        output_lines: None,
     }
 }
 
@@ -2909,10 +2927,13 @@ async fn real_claude_sees_uploaded_image_inline() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: vec![path],
         resume: None,
         worktree: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     core.doc_host
         .queue_command(
@@ -3151,6 +3172,7 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
             output: None,
             diff: None,
             execution: None,
+            exit_code: None,
         },
         AgentEvent::TextDelta { text: "two".into() },
         done(DoneStatus::Completed),
@@ -3936,6 +3958,7 @@ async fn generated_image_is_materialized_before_publication_and_survives_reopen(
             output: None,
             diff: None,
             execution: None,
+            exit_code: None,
         },
         image.clone(),
         image.clone(),
@@ -4117,6 +4140,9 @@ async fn spawn_chat_watch_emits_the_child_and_the_first_run_uses_the_prompt() {
             Some("space-e2e"),
             Some(&core.device_id),
             Some(ChatConfig {
+                access: Default::default(),
+                plan: Default::default(),
+
                 harness: HarnessId::Mock,
                 model: Some("parent-model".into()),
                 reasoning: Some(ReasoningLevel::High),
@@ -4657,5 +4683,319 @@ async fn visual_publication_is_bound_to_the_turn_it_was_checked_in() {
             .await
     );
     assert_eq!(visual_ids(&core), ["v:ok"]);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn publish_image_lands_in_the_live_turn() {
+    use base64::Engine as _;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(HoldsTurn {
+            events: std::sync::Mutex::new(Some(rx)),
+        }),
+    );
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let png = {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(3, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
+    let publish = |bytes: &[u8]| {
+        client.call(
+            zeron_rpc::methods::PUBLISH_IMAGE,
+            serde_json::json!({
+                "chatId": CHAT,
+                "name": "before.png",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+    };
+    assert!(publish(&png).await.is_err(), "no live turn yet");
+
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("show me"), None)
+        .await
+        .unwrap();
+    tx.send(mock_script()[0].clone()).unwrap();
+    tx.send(AgentEvent::TextDelta {
+        text: "Here it is.".into(),
+    })
+    .unwrap();
+    wait_for(|| core.sessions.turn_in_flight(CHAT), "turn starts").await;
+    let refused = publish(b"plain text").await.unwrap_err().to_string();
+    assert!(refused.contains("not a PNG"), "{refused}");
+    let shown = publish(&png).await.expect("PublishImage");
+    assert_eq!(shown["name"], "before.png");
+    assert_eq!(shown["mimeType"], "image/png");
+    tx.send(AgentEvent::TextDelta {
+        text: "Card 4 is clipped.".into(),
+    })
+    .unwrap();
+    tx.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::Image { .. }))
+            }) && !core.sessions.turn_in_flight(CHAT)
+        },
+        "image folded",
+    )
+    .await;
+    let parts: Vec<MessagePart> = entries(&core)
+        .into_iter()
+        .filter(|e| e.role == MessageRole::Assistant)
+        .flat_map(|e| e.parts)
+        .collect();
+    let at = parts
+        .iter()
+        .position(|p| matches!(p, MessagePart::Image { .. }))
+        .unwrap();
+    let MessagePart::Image {
+        path,
+        name,
+        mime_type,
+        ..
+    } = &parts[at]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (name.as_str(), mime_type.as_str()),
+        ("before.png", "image/png")
+    );
+    assert!(
+        std::path::Path::new(path).starts_with(core.uploads.dir()),
+        "stored in uploads: {path}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), png);
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|p| matches!(p, MessagePart::Image { .. }))
+            .count(),
+        1,
+        "the refused file left no part"
+    );
+    assert!(
+        matches!(&parts[at - 1], MessagePart::Text { text, .. } if text.ends_with("Here it is.")),
+        "the image follows what streamed before it: {parts:?}"
+    );
+    assert!(
+        matches!(&parts[at + 1], MessagePart::Text { text, .. } if text == "Card 4 is clipped."),
+        "{parts:?}"
+    );
+    assert!(
+        !parts.iter().any(|p| matches!(p, MessagePart::Error { .. })),
+        "no intake error: {parts:?}"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn chat_images_come_only_from_their_chats_own_folder() {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(HoldsTurn {
+            events: std::sync::Mutex::new(None),
+        }),
+    );
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let png = {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(3, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
+    let (ours, theirs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let before = ours.path().join("before.png");
+    let after = theirs.path().join("after.png");
+    std::fs::write(&before, &png).unwrap();
+    std::fs::write(&after, &png).unwrap();
+    let here = core.device_id.clone();
+    let folder = |path: &std::path::Path| Some(path.to_string_lossy().into_owned());
+    for (chat, device, cwd) in [
+        ("ours", here.as_str(), folder(ours.path())),
+        ("theirs", here.as_str(), folder(theirs.path())),
+        // `/`, or a drive (`C:\`) on Windows, where `/` isn't absolute.
+        (
+            "root",
+            here.as_str(),
+            folder(dir.path().ancestors().last().unwrap()),
+        ),
+        ("data", here.as_str(), folder(dir.path())),
+        ("remote", "another-device", folder(ours.path())),
+        (
+            "scratch",
+            here.as_str(),
+            Some("~/.zeron/scratch/2026-10-25-a1b2c3d4".into()),
+        ),
+    ] {
+        core.workspace
+            .create_chat(chat, None, Some(device), None, cwd)
+            .unwrap();
+    }
+    let read = |chat: &str, path: &std::path::Path| {
+        client.call(
+            zeron_rpc::methods::READ_CHAT_IMAGE_CHUNK,
+            serde_json::json!({ "chatId": chat, "path": path, "offset": 0 }),
+        )
+    };
+    let chunk = read("ours", &before).await.expect("its own folder");
+    let data = chunk["data"].as_str().unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        png
+    );
+    assert_eq!(chunk["mimeType"], "image/png");
+    assert!(read("theirs", &after).await.is_ok());
+    // A projectless chat's scratch folder is named, never created, by a read.
+    let scratch = dir.path().join("scratch").join("2026-10-25-a1b2c3d4");
+    let refused = read("scratch", &scratch.join("x.png")).await.unwrap_err();
+    assert!(refused.to_string().contains("doesn't exist"), "{refused}");
+    assert!(!scratch.exists());
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(scratch.join("x.png"), &png).unwrap();
+    assert!(read("scratch", &scratch.join("x.png")).await.is_ok());
+    for (chat, path, why) in [
+        ("ours", after.as_path(), "outside the chat's folder"),
+        ("theirs", before.as_path(), "outside the chat's folder"),
+        ("root", before.as_path(), "home folder, above it"),
+        ("data", before.as_path(), "around Zeron's data"),
+        ("remote", before.as_path(), "another device"),
+        ("missing", before.as_path(), "chat not found"),
+    ] {
+        let error = read(chat, path).await.expect_err(chat).to_string();
+        assert!(error.contains(why), "{chat}: {error}");
+    }
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_commands_whole_output_is_read_from_its_hosts_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let output: String = (1..=300)
+        .map(|i| format!("test case_{i} ... ok\n"))
+        .collect::<String>()
+        + "export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n";
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::ToolCall {
+                    id: "t1".into(),
+                    call: ToolCall::Exec {
+                        command: "cargo test".into(),
+                    },
+                },
+                AgentEvent::ToolResult {
+                    execution: Default::default(),
+
+                    id: "t1".into(),
+                    is_error: false,
+                    output: Some(output.clone()),
+                    diff: None,
+                    exit_code: Some(0),
+                },
+                AgentEvent::ToolCall {
+                    id: "r1".into(),
+                    call: ToolCall::ReadFile {
+                        path: "/w/a.rs".into(),
+                    },
+                },
+                AgentEvent::ToolResult {
+                    execution: Default::default(),
+
+                    id: "r1".into(),
+                    is_error: false,
+                    output: Some("fn main() {}".into()),
+                    diff: None,
+                    exit_code: None,
+                },
+                done(DoneStatus::Completed),
+            ],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: false,
+        }),
+    );
+    let here = core.device_id.clone();
+    core.workspace
+        .create_chat(CHAT, None, Some(&here), None, None)
+        .unwrap();
+    core.workspace
+        .create_chat("remote", None, Some("another-device"), None, None)
+        .unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-output",
+        SessionCommandPayload::Run {
+            request: run_request("test"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "complete reply",
+    )
+    .await;
+    let all = entries(&core);
+    let tool = all
+        .iter()
+        .flat_map(|e| &e.parts)
+        .find(|p| p.id() == "t1")
+        .unwrap_or_else(|| panic!("the command's part: {all:#?}"));
+    let MessagePart::Tool {
+        output: Some(tail),
+        output_truncated: true,
+        output_lines: Some(lines),
+        ..
+    } = tool
+    else {
+        panic!("no tail: {tool:?}");
+    };
+    assert_eq!(tail.lines().count(), zeron_doc::COMMAND_TAIL_MAX_LINES);
+    assert_eq!(*lines, 301);
+
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let read = |chat: &str, tool: &str| {
+        client.call(
+            zeron_rpc::methods::READ_TOOL_OUTPUT,
+            serde_json::json!({ "chatId": chat, "toolId": tool, "offset": 0 }),
+        )
+    };
+    let chunk: zeron_proto::ToolOutputChunk =
+        serde_json::from_value(read(CHAT, "t1").await.expect("the whole output")).unwrap();
+    assert!(chunk.done && !chunk.trimmed);
+    assert_eq!((chunk.lines, chunk.exit_code), (301, Some(0)));
+    assert!(chunk.text.starts_with("test case_1 ... ok\n"));
+    assert!(chunk.text.contains("test case_300 ... ok"));
+    assert!(!chunk.text.contains("ghp_abcdef"), "{}", chunk.text);
+    // Its last lines are the doc's tail, word for word.
+    assert!(chunk.text.ends_with(tail.as_str()));
+    for (chat, tool, why) in [
+        (CHAT, "r1", "Only a command's output"),
+        (CHAT, "nope", "tool_output.unavailable"),
+        ("remote", "t1", "another device"),
+        ("missing", "t1", "chat not found"),
+    ] {
+        let error = read(chat, tool).await.expect_err(tool).to_string();
+        assert!(error.contains(why), "{chat}/{tool}: {error}");
+    }
     core.shutdown().await;
 }

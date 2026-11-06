@@ -703,6 +703,8 @@ mod tests {
     #[test]
     fn worked_projects_other_session_updates_do_not_invalidate_a_cold_read() {
         let session = |id: &str| zeron_proto::Session {
+            background_tasks: Default::default(),
+
             chat_id: id.into(),
             device_id: "host".into(),
             status: zeron_proto::SessionStatus::Idle,

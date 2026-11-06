@@ -396,6 +396,7 @@ impl Harness for PiHarness {
         // Fork MCP grant: the Workers/sessions servers ride beside the
         // request's own server, one bridge extension each.
         let mut servers: Vec<zeron_proto::McpServer> = request.mcp.iter().cloned().collect();
+        servers.extend(request.extra_mcp.iter().cloned());
         servers.extend(
             crate::workers_mcp::servers_for_request(&request)
                 .iter()

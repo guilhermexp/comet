@@ -436,6 +436,10 @@ async fn project_skill_usage_review_f3_normal_import_after_scan() {
     use zeron_sync::chat_client::ChatDocSink;
     let dir = tempfile::tempdir().unwrap();
     let core = core(dir.path());
+    // This case asserts that Skill Usage itself never writes the registry.
+    // WorkedProjectsSync independently publishes history evidence on import;
+    // join that writer before taking the unchanged-registry witness below.
+    core.worked_projects.shutdown().await;
     setup(&core);
     let disk = Arc::new(store(dir.path()));
     let source = seed(&core, &disk, "a", "p", 5, 0);

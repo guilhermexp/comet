@@ -41,6 +41,8 @@ presentation of `UpdateStatus`.
 
 ## Local Contracts
 
+- Sync `35561ead`: o `lib.rs` e o feed/RestartGate do fork prevalecem integralmente. Fontes novas de channel/desktop/launch do upstream não são ligadas pelo módulo público nem pelo binário. Ativar beta ou engine gerenciada exige decisão própria do dono; nunca apontar o app instalado ao feed zeron.sh implicitamente.
+
 - Artifact names and the manifest schema are a contract with the release
   workflow and `edge/src/install.sh` — a mismatch silently breaks updates;
   `artifact_names_match_packaging` pins the current pairs.

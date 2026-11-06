@@ -12,6 +12,45 @@ pub(super) struct ChatPullRequest {
 }
 
 impl Shell {
+    /// Shared action routing for the Shell root and isolated sidebar fixtures.
+    pub(super) fn on_open_pull_request(
+        &mut self,
+        action: &crate::pull_request_detail::OpenPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // From a chat (a sidebar badge, the composer's badge), the
+        // pull request opens beside the focused session, so
+        // several can be compared in one conversation.
+        if self.chat_pull_requests_available(cx) {
+            let target = self.chat_pull_request_device(action.1.clone(), cx);
+            self.open_chat_pull_request(action.0.clone(), target, window, cx);
+            return;
+        }
+        let target = if let Some(device) = action.1.clone() {
+            (Some(device.as_str()) != self.state.read(cx).local_device_id.as_deref())
+                .then_some(device)
+        } else if matches!(self.route, Route::PullRequests) {
+            self.pull_requests_page
+                .as_ref()
+                .and_then(|page| page.read(cx).target_device())
+        } else {
+            let state = self.state.read(cx);
+            state.selected_chat_row().and_then(|chat| {
+                (Some(chat.device_id.as_str()) != state.local_device_id.as_deref())
+                    .then(|| chat.device_id.clone())
+            })
+        };
+        // Back from a pull request returns to wherever it was
+        // opened from: a chat, the board, or another pull request.
+        self.enter_pull_requests_route(cx);
+        self.nav.push(NavEntry::PullRequest {
+            url: action.0.clone(),
+            device: target.clone(),
+        });
+        self.show_pull_request_detail(action.0.clone(), target, window, cx);
+    }
+
     /// Whether a pull request opens in the focused session's pane: on the
     /// chat route, with a session (not the new-session canvas) in focus.
     pub(super) fn chat_pull_requests_available(&self, cx: &App) -> bool {

@@ -160,6 +160,7 @@ impl Normalizer {
                 output,
                 diff,
                 execution: None,
+                exit_code: None,
             });
         }
         events
@@ -203,6 +204,7 @@ impl Normalizer {
                     output,
                     diff: None,
                     execution: None,
+                    exit_code: None,
                 });
             }
         }
@@ -236,6 +238,7 @@ impl Normalizer {
                         .map(|text| cap(text, 16384)),
                     diff: None,
                     execution: None,
+                    exit_code: None,
                 });
             }
         }

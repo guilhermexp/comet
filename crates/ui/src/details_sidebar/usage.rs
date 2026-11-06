@@ -419,6 +419,8 @@ mod tests {
         windows: Vec<AgentUsageWindow>,
     ) -> AgentAccount {
         AgentAccount {
+            codex_reset_credits: Default::default(),
+
             id: id.into(),
             harness,
             email: None,

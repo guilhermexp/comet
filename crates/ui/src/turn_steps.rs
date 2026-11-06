@@ -343,6 +343,10 @@ mod tests {
 
     fn tool(id: &str, call: ToolCall, resolved: bool) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call,
             is_error: false,

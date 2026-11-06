@@ -384,6 +384,8 @@ impl OmpNormalizer {
             }
             // Resolve the synthetic spawn chip so it never spins forever.
             events.push(AgentEvent::ToolResult {
+                exit_code: None,
+
                 id: compound.clone(),
                 is_error: failed,
                 output: Some(error.clone().unwrap_or_else(|| status.to_owned())),
@@ -681,6 +683,10 @@ fn tool_end(frame: &Value) -> Option<AgentEvent> {
     let id = frame.get("toolCallId")?.as_str()?;
     let result = frame.get("result");
     Some(AgentEvent::ToolResult {
+        exit_code: result
+            .and_then(execution_meta)
+            .and_then(|meta| meta.exit_code),
+
         id: id.to_owned(),
         is_error: frame.get("isError").and_then(Value::as_bool) == Some(true),
         output: result.and_then(tool_output),

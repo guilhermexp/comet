@@ -12,6 +12,9 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Local Contracts
 
+- Sync `35561ead`: Caller/agent-scoped bearer e provas de device são aditivos; `local_only` permanece atributo do registry único `method.rs`, consultado também pelo relay. Novos métodos de ACP, output/processos, imagens, plugins e temas não criam outra tabela de forwardables/deadlines. `PublishImage` é local-only.
+- `zeron mcp` e controller Workers do fork continuam usando o bearer completo do engine do grant e a validação de identidade; o novo allowlist de agente não representa integralmente `SpawnChat`/`WorkerWaitState`. Não ampliar o allowlist para contornar isso. Token nunca é herdado pelos Workers.
+
 - `GenerateCommitMessage` é unary tipado, forwardable, deadline de relay 100s; a engine aplica budget próprio de 90s também no IPC. Geração usa a autorização de checkout de Changes e devolve só um rascunho editável.
 
 - SearchGitHistory e ResolveGitAvatars são unary tipados e relay-forwardable no registry. Não recriar listas de forwardable/deadlines no handler.
@@ -29,7 +32,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 - `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
 
-- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `DeleteWorkspaceEntry` e `MoveWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Move usa deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash). Desde o sync v0.2.102, `MoveWorkspaceEntry`/`DeleteWorkspaceEntry` usam o modelo do upstream #514 (`operationId`, `expectedCheckoutId`, `expectedSourceRevision`, `expectedKind`, `destinationPath`, `recursive`; reply `WorkspaceMutationOutcome`). Create continua do fork, com reply `WorkspaceEntryMutation`.
+- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile`, `WatchWorkspaceFiles`, `CreateWorkspaceEntry`, `DeleteWorkspaceEntry` e `MoveWorkspaceEntry` são tipados e relay-forwardable; só `WatchWorkspaceFiles` é stream. Move usa deadline de 60s. Ownership, jaula de path relativo e limites de filesystem são validados pela engine de destino. Delete é permanente (sem Trash). Desde o sync v0.2.102, `MoveWorkspaceEntry`/`DeleteWorkspaceEntry` usam o modelo do upstream #514 (`operationId`, `expectedCheckoutId`, `expectedSourceRevision`, `expectedKind`, `destinationPath`, `recursive`; reply `WorkspaceMutationOutcome`). Create preserva o formato do fork (`parentPath/name`, reply `WorkspaceEntryMutation`) e aceita o formato guardado novo (`operationId/path/expectedCheckoutId`, reply `WorkspaceMutationOutcome`).
 
 - `SpawnChat` é `local_only`: params `parentChatId`, `prompt`, `spaceId?`; reply `chatId`, `spaceId?`, `deviceId`. Não é relay-forwardable.
 - `WorkerWaitState` é `local_only`: params `{chatId}`, reply `{pendingMessage}`. Unary tipado, rejeitado no relay de ingress (`!forwardable`). Consulta steers aceitos e não consumidos no ledger da engine para destravar esperas de Worker sem alterar lifecycle ou scheduling do agente.
@@ -61,6 +64,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Verification
 
+Os acceptors IPC possuem o listener exclusivamente. No Linux, cancelar/destruir o future executa shutdown do socket antes de fechar o descritor: uma cópia CLOEXEC herdada por fork não pode manter a porta escutando até exec. O guard é construído antes do future, cobrindo cancelamento antes do primeiro poll; ambas as entradas (token único e full/agent) usam o mesmo loop e mantêm autorização/Origin. Outras plataformas preservam o fechamento do handle nativo.
+
 - Comandos: `cargo test -p zeron-rpc`
 
 | Camada / path | Tier exigido | Como rodar |
@@ -68,6 +73,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 | `src/**` (envelopes, transporte) | unit | `cargo test -p zeron-rpc` |
 | `src/method.rs` (registro de métodos, incluindo aposentadoria OMP e preservação de Codex Voice) | unit | `cargo test -p zeron-rpc method::tests::every_method_has_info_and_stream_implies_forwardable -- --exact` |
 | `src/server.rs` (classificação do handshake IPC) | unit | `cargo test -p zeron-rpc server::tests::only_an_incomplete_websocket_handshake_is_benign -- --exact` |
+| `src/server.rs` (cancelamento do listener Linux com descritor herdado) | unit — fork/pipe controlado, sem timeout/sleep/retry | `cargo test -p zeron-rpc --lib cancelled_ipc_acceptors_stop_listening_even_with_an_inherited_descriptor` |
 | `src/device_room.rs` (retomada do HostRelay e cooldown remoto) | unit | `cargo test -p zeron-rpc --lib device_room::tests::local_wake -- --nocapture` |
 | `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p zeron-rpc` |
 | `tests/device_room.rs` (revogação de credencial) | integration | `cargo test -p zeron-rpc --test device_room sign_out_closes_cached_peer_links -- --exact` |

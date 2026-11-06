@@ -101,6 +101,8 @@ struct Inner {
     callback_routes: CallbackRoutes,
     /// Sign-in callbacks this device forwards to the device running them.
     callback_tunnels: CallbackTunnels,
+    /// Redials a refused signaling connection when a sign-in starts.
+    signaling_wake: Arc<tokio::sync::Notify>,
     peers: std::sync::OnceLock<Peers>,
     /// Engine-provided stream services peers may open, by id prefix.
     streams: StreamServices,
@@ -175,6 +177,7 @@ pub(crate) fn attributed_candidates(
                 && !reserved_ports.contains(&l.address.port())
                 && l.pid != std::process::id()
                 && !l.is_authentication_command()
+                && !l.signing_in
                 && !l.is_zeron_engine()
         })
         .filter_map(|mut listener| {
@@ -198,14 +201,16 @@ pub(crate) fn attributed_candidates(
 }
 impl PreviewService {
     pub fn new(file: PathBuf, device_id: String, device_name: String) -> anyhow::Result<Self> {
+        let signaling_wake = Arc::new(tokio::sync::Notify::new());
         Ok(Self(Arc::new(Inner {
             catalog: Catalog::open(file, device_id, device_name)?,
             stop: CancellationToken::new(),
             started: AtomicBool::new(false),
             projects: std::sync::OnceLock::new(),
             tasks: Mutex::new(Vec::new()),
-            callback_routes: CallbackRoutes::default(),
+            callback_routes: CallbackRoutes::notifying(signaling_wake.clone()),
             callback_tunnels: CallbackTunnels::default(),
+            signaling_wake,
             peers: std::sync::OnceLock::new(),
             streams: StreamServices::default(),
         })))
@@ -296,10 +301,21 @@ impl PreviewService {
         });
         let forwarder = CallbackForwarder::bind(port, lifetime, open).await?;
         self.0.callback_tunnels.insert(login_id, forwarder);
+        self.0.signaling_wake.notify_one();
         Ok(())
     }
     pub fn close_login_tunnel(&self, login_id: &str) {
         self.0.callback_tunnels.close(login_id);
+    }
+    /// A provider sign-in's callback rides the direct connection on either
+    /// end — the device running the login, or the one forwarding to it — so
+    /// signaling joins as a sign-in, past the coordinator's device limit.
+    fn signing_in(&self) -> signaling::SigningIn {
+        let (routes, tunnels) = (
+            self.0.callback_routes.clone(),
+            self.0.callback_tunnels.clone(),
+        );
+        Arc::new(move || routes.any_live() || tunnels.any_live())
     }
     pub async fn start(&self, projects: Projects, signaling: Option<signaling::Config>) {
         if self.0.started.swap(true, Ordering::SeqCst) {
@@ -329,7 +345,7 @@ impl PreviewService {
             loop {
                 let binding = tokio::select! {
                     _ = proxy_stop.cancelled() => break,
-                    binding = proxy::serve(router.clone(), zeron_proto::PREVIEW_PROXY_PORT, proxy_stop.child_token()) => binding,
+                    binding = serve_proxy(router.clone(), &proxy_stop) => binding,
                 };
                 match binding {
                     Ok((port, tasks)) => {
@@ -339,12 +355,13 @@ impl PreviewService {
                         }
                         break;
                     }
-                    Err(error) => proxy_catalog.set_proxy_status(
-                        zeron_proto::PREVIEW_PROXY_PORT,
-                        Some(format!(
-                            "Local previews could not listen on port 7331: {error}"
-                        )),
-                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "local previews could not start; retrying");
+                        proxy_catalog.set_proxy_status(
+                            zeron_proto::PREVIEW_PROXY_PORT,
+                            Some(format!("Local previews could not start: {error}")),
+                        )
+                    }
                 }
                 tokio::select! { _ = proxy_stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
             }
@@ -412,12 +429,14 @@ impl PreviewService {
         let mut tasks = self.0.tasks.lock().unwrap();
         tasks.push(scanner);
         if let Some(config) = signaling {
-            tasks.push(tokio::spawn(signaling::run(
+            tasks.push(tokio::spawn(signaling::run_signing_in(
                 config,
                 self.0.catalog.clone(),
                 peers,
                 output,
                 self.0.stop.child_token(),
+                self.0.signaling_wake.clone(),
+                self.signing_in(),
             )));
         }
     }
@@ -472,6 +491,39 @@ impl Connector for LocalConnector {
     }
 }
 
+/// The local preview proxy, listening: on its usual port, or, with that
+/// taken (another Zeron engine on this computer has it: the app's and a
+/// development one, say), on one the system picks. Every preview address is
+/// built from the port it got (`PreviewSnapshot::proxy_port`), so nothing
+/// that opens a preview depends on which.
+async fn serve_proxy(
+    router: proxy::Router,
+    stop: &CancellationToken,
+) -> anyhow::Result<(u16, Vec<tokio::task::JoinHandle<()>>)> {
+    match proxy::serve(
+        router.clone(),
+        zeron_proto::PREVIEW_PROXY_PORT,
+        stop.child_token(),
+    )
+    .await
+    {
+        Err(error) if address_in_use(&error) => {
+            tracing::info!(
+                port = zeron_proto::PREVIEW_PROXY_PORT,
+                "the preview proxy's port is taken; listening on another"
+            );
+            proxy::serve(router, 0, stop.child_token()).await
+        }
+        served => served,
+    }
+}
+
+fn address_in_use(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +539,7 @@ mod tests {
             zeron_owned: true,
             origin: Some("chat:chat".into()),
             chat_id: Some("chat".into()),
+            signing_in: false,
         }
     }
 

@@ -46,15 +46,12 @@ use std::{
 use super::ImageCacheProvider;
 
 /// Pointer travel (px) that promotes a mouse-down into a drag. Zed's
-/// original 2px is tuned for precise macOS trackpads; on Windows, ordinary
-/// mouse jitter routinely crosses it mid-click, promoting plain clicks into
-/// accidental drags. Windows uses its system drag rectangle instead
-/// (`SM_CXDRAG`/`SM_CYDRAG`, 4px by default) — the same click-vs-drag
-/// disambiguation native Windows apps apply.
-#[cfg(target_os = "windows")]
+/// original 2px is crossed by ordinary jitter mid-click — a physical
+/// trackpad press rolls the pointer that far, as does a mouse on Windows —
+/// promoting plain clicks into accidental drags. 4px is Windows' system drag
+/// rectangle (`SM_CXDRAG`/`SM_CYDRAG`), the click-vs-drag disambiguation
+/// native apps apply, and is used on every platform.
 const DRAG_THRESHOLD: f64 = 4.;
-#[cfg(not(target_os = "windows"))]
-const DRAG_THRESHOLD: f64 = 2.;
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
 
@@ -2773,6 +2770,17 @@ impl Interactivity {
                         }
 
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
+                        // A press is only a drag while its button is still
+                        // held. One whose release this element never saw (it
+                        // wasn't painted that frame) would otherwise turn the
+                        // next plain hover into a drag.
+                        if pending_mouse_down
+                            .as_ref()
+                            .is_some_and(|down| event.pressed_button != Some(down.button))
+                        {
+                            pending_mouse_down.take();
+                            return;
+                        }
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
                             && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD

@@ -76,7 +76,40 @@ mod tests {
 
     #[test]
     fn managed_hooks_use_a_comet_owned_root() {
+        const CHILD: &str = "COMET_TEST_HOOKS_ROOT_CASE";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            for custom in [false, true] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "app_paths::tests::managed_hooks_use_a_comet_owned_root",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("HOME", dir.path())
+                    .env_remove("COMET_WORKERS_HOOKS_DIR")
+                    .env_remove("COMET_TEST_EXPECTED_HOOKS_ROOT");
+                if custom {
+                    let expected = dir.path().join("custom/hooks");
+                    command
+                        .env("COMET_TEST_EXPECTED_HOOKS_ROOT", &expected)
+                        .env(
+                            "COMET_WORKERS_HOOKS_DIR",
+                            format!(" {} ", expected.display()),
+                        );
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "custom={custom}: {output:?}");
+            }
+            return;
+        }
         let root = app_hooks_root();
+        if let Some(expected) = std::env::var_os("COMET_TEST_EXPECTED_HOOKS_ROOT") {
+            assert_eq!(root, PathBuf::from(expected));
+            return;
+        }
         assert!(root.ends_with(".zeron/workers/hooks"));
         assert!(!root.to_string_lossy().contains("/.unpeel/hooks"));
     }

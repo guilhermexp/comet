@@ -14,8 +14,8 @@ use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
+    AccessMode, AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel,
+    TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -118,10 +118,13 @@ fn request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     }
 }
 
@@ -404,6 +407,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
             exit_code: Some(1),
             duration_ms: None,
         }),
+        exit_code: Some(1),
     }));
 
     // fileChange (single add): WriteFile, refreshed at completion.
@@ -427,6 +431,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         output: None,
         diff: None,
         execution: None,
+        exit_code: None,
     }));
 
     // mcpToolCall with failed status.
@@ -444,6 +449,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         output: None,
         diff: None,
         execution: None,
+        exit_code: None,
     }));
 
     // webSearch lifecycle.
@@ -459,6 +465,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         output: None,
         diff: None,
         execution: None,
+        exit_code: None,
     }));
 
     // Completion-only todoList still opens and closes the lifecycle.
@@ -477,6 +484,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         output: None,
         diff: None,
         execution: None,
+        exit_code: None,
     }));
 
     // Streamed agentMessage must not re-emit its completed text…
@@ -716,6 +724,50 @@ async fn open_commands_report_background_work_and_killed_ones_do_not() {
     assert!(!turn.background_live(), "nothing left running");
 }
 
+/// A command that outlived its turn is listed as the person typed it, with
+/// its output; stopping it terminates its exec session.
+#[tokio::test]
+async fn a_background_command_is_listed_read_and_terminated() {
+    use zeron_harness::TurnControl;
+    let (mut controls, _steer, _token) = controls("Yes");
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut processes = turn.watch_background_processes();
+    let mut stream = harness()
+        .run(request("scenario:background-terminate"), controls)
+        .await
+        .expect("run starts");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event.expect("event"), AgentEvent::Done { .. }) {
+                return;
+            }
+        }
+        panic!("stream ended without Done");
+    })
+    .await
+    .expect("turn ends");
+
+    let listed = processes.borrow_and_update().clone();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].id, "bg");
+    assert_eq!(listed[0].command, "npm run dev");
+    assert_eq!(
+        turn.background_output("bg").expect("listed").text,
+        "ready on :3000"
+    );
+
+    assert!(turn.stop_background_process("bg"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !processes.borrow_and_update().is_empty() {
+            processes.changed().await.expect("runtime alive");
+        }
+    })
+    .await
+    .expect("the terminated command leaves the list");
+    assert!(!turn.background_live());
+}
+
 #[tokio::test]
 async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     let (controls, steer, _token) = controls("Yes");
@@ -804,6 +856,7 @@ async fn approvals_round_trip_as_input_requests() {
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;
+    req.access = AccessMode::Supervised;
     let events = run_to_end(&harness(), req, controls).await;
 
     let asked = asked.lock().unwrap();
@@ -838,9 +891,138 @@ async fn approval_no_answer_becomes_decline() {
     let (controls, _steer, _token) = controls("No");
     let mut req = request("scenario:decline");
     req.auto_approve = false;
+    req.access = AccessMode::Supervised;
     let events = run_to_end(&harness(), req, controls).await;
 
     // The fake only completes the turn after seeing the decline decision.
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+/// Controls whose `request_input` answers `answer_label` and records what
+/// it was asked.
+fn recording_controls(
+    answer_label: &'static str,
+) -> (
+    RunControls,
+    Arc<Mutex<Vec<UserInputQuestion>>>,
+    mpsc::Sender<SteerMessage>,
+) {
+    let (mut controls, steer, _token) = controls(answer_label);
+    let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    controls.request_input = Box::new(move |questions| {
+        seen.lock().unwrap().extend(questions.iter().cloned());
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(
+            questions
+                .iter()
+                .map(|q| UserInputAnswer {
+                    question_id: q.id.clone(),
+                    labels: vec![answer_label.into()],
+                })
+                .collect(),
+        );
+        rx
+    });
+    (controls, asked, steer)
+}
+
+#[tokio::test]
+async fn auto_accept_edits_applies_file_changes_and_asks_before_the_rest() {
+    let (controls, asked, _steer) = recording_controls("No");
+    let mut req = request("scenario:auto-edits");
+    req.auto_approve = false;
+    req.access = AccessMode::AutoAcceptEdits;
+    let events = run_to_end(&harness(), req, controls).await;
+
+    // The fake checks the untrusted / workspace-write wire and completes
+    // only after the file change is accepted and the rest declined.
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    let asked = asked.lock().unwrap();
+    let headers: Vec<&str> = asked.iter().map(|q| q.header.as_str()).collect();
+    assert_eq!(headers, ["Approve command", "Approve permissions"]);
+    assert_eq!(
+        asked[0].question,
+        "Codex wants to run `git push`. Allow it?"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_rides_each_turn_and_leaving_it_is_explicit() {
+    let (controls, asked, steer) = recording_controls("Yes");
+    let mut req = request("scenario:plan");
+    req.plan = true;
+    let mut stream = harness().run(req, controls).await.expect("run starts");
+    // Leaving plan for supervised applies in place, from the next turn; a
+    // plain follow-up keeps naming the default mode.
+    let mut build = request("");
+    build.auto_approve = false;
+    build.access = AccessMode::Supervised;
+    let mut steers = vec![
+        SteerMessage {
+            config: Some(Box::new(build)),
+            ..SteerMessage::text("build it")
+        },
+        SteerMessage::text("plain"),
+    ]
+    .into_iter();
+    let mut events = Vec::new();
+    let mut completed = 0;
+    while completed < 3 {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("stream event");
+        if let AgentEvent::Done { status, error, .. } = &event {
+            assert_eq!(*status, DoneStatus::Completed, "{error:?}");
+            completed += 1;
+            if let Some(next) = steers.next() {
+                steer.send(next).await.unwrap();
+            }
+        }
+        events.push(event);
+    }
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text,
+        "Here is the plan.\n\n# Plan\n\n1. Read\n2. Change\n\nbuild itplain"
+    );
+    assert!(asked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_resumed_thread_left_in_plan_mode_is_taken_out_of_it() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:leave-plan");
+    req.resume = Some("resume-in-plan".into());
+    req.model = None;
+    req.reasoning = None;
+    let events = run_to_end(&harness(), req, controls).await;
     assert!(
         matches!(
             events.last(),
@@ -1497,6 +1679,7 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
                 exit_code: Some(0),
                 duration_ms: None,
             }),
+            exit_code: Some(0),
         }),
     }));
     // The parent's steer (a userMessage item on the CHILD thread) arrives as
@@ -1872,6 +2055,7 @@ async fn view_image_reads_as_a_file_read() {
                 output: None,
                 diff: None,
                 execution: None,
+                exit_code: None,
             },
         ]
     );
@@ -2343,8 +2527,115 @@ async fn a_stopped_turn_keeps_the_app_server_for_the_next_prompt() {
     assert!(next_event(&mut stream).await.is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_voice_fixtures_distinguish_absent_and_unsupported_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let codex_home = home.join(".codex");
+    let package = codex_home.join("packages/standalone/current");
+    std::fs::create_dir_all(package.join("bin")).unwrap();
+    std::fs::write(
+        package.join("bin/codex"),
+        "unsupported fixture installation",
+    )
+    .unwrap();
+    std::fs::write(package.join("codex-package.json"), r#"{"version":"0.1.0"}"#).unwrap();
+    for installation in ["unsupported", "absent"] {
+        let selected_home = if installation == "unsupported" {
+            home.clone()
+        } else {
+            dir.path().join("absent")
+        };
+        let selected_codex_home = selected_home.join(".codex");
+        std::fs::create_dir_all(&selected_codex_home).unwrap();
+        for name in [
+            "idle_voice_runtime_has_no_initial_turn_and_preserves_mcp",
+            "external_voice_keeps_canonical_events_without_any_local_helper",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("ZERON_TEST_CODEX_VOICE_ISOLATED", name)
+                .env("HOME", &selected_home)
+                .env("CODEX_HOME", &selected_codex_home)
+                .env("ZERON_TEST_CODEX_VOICE_EXPECT_HOME", &selected_codex_home)
+                .env("ZERON_TEST_CODEX_VOICE_INSTALLATION", installation)
+                .env_remove("ZERON_VOICE_MEDIA_DIR")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+}
+
+fn fixture_voice_rejection() -> zeron_proto::voice::VoiceRejection {
+    let codex_home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("isolated Codex home"));
+    if let Some(expected) = std::env::var_os("ZERON_TEST_CODEX_VOICE_EXPECT_HOME") {
+        assert_eq!(
+            codex_home,
+            PathBuf::from(expected),
+            "the selected installation must reach the driver fixture"
+        );
+    }
+    let manifest = codex_home.join("packages/standalone/current/codex-package.json");
+    if std::env::var("ZERON_TEST_CODEX_VOICE_INSTALLATION").as_deref() == Ok("unsupported") {
+        let package: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(manifest)
+                .expect("unsupported package must exist in the active Codex home"),
+        )
+        .unwrap();
+        assert_eq!(package["version"], "0.1.0");
+        zeron_proto::voice::VoiceRejection::Unsupported
+    } else {
+        assert!(
+            !manifest.exists(),
+            "absence fixture must not contain an installed package"
+        );
+        zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable
+    }
+}
+
+// The driver deliberately discovers active official packages as well as the CLI-adjacent
+// helper. Keep absence-of-helper fixtures independent of the developer's installations.
+async fn isolate_voice_fixture(name: &str) -> bool {
+    const MARKER: &str = "ZERON_TEST_CODEX_VOICE_ISOLATED";
+    if std::env::var(MARKER).as_deref() == Ok(name) {
+        return false;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let codex_home = home.join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(MARKER, name)
+        .env("HOME", &home)
+        .env("CODEX_HOME", &codex_home)
+        .env_remove("ZERON_VOICE_MEDIA_DIR")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{name}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    true
+}
+
 #[tokio::test]
 async fn idle_voice_runtime_has_no_initial_turn_and_preserves_mcp() {
+    if isolate_voice_fixture("idle_voice_runtime_has_no_initial_turn_and_preserves_mcp").await {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex-voice.py");
@@ -2382,10 +2673,7 @@ async fn idle_voice_runtime_has_no_initial_turn_and_preserves_mcp() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        receive.await.unwrap(),
-        Err(zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable)
-    );
+    assert_eq!(receive.await.unwrap(), Err(fixture_voice_rejection()));
     let calls = std::fs::read_to_string(dir.path().join("voice-wire.jsonl")).unwrap();
     assert!(!calls.contains("turn/start"));
     assert!(!calls.contains("thread/realtime/start"));
@@ -2471,6 +2759,10 @@ async fn a_side_chats_only_thread_starts_without_agent_tools() {
 #[cfg(unix)]
 #[tokio::test]
 async fn external_voice_keeps_canonical_events_without_any_local_helper() {
+    if isolate_voice_fixture("external_voice_keeps_canonical_events_without_any_local_helper").await
+    {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     use zeron_harness::codex::realtime::{VoiceCommand, channel};
     use zeron_proto::voice::{VoiceEvent, remote::Sdp};
@@ -2506,10 +2798,7 @@ async fn external_voice_keeps_canonical_events_without_any_local_helper() {
     ));
     let pump = tokio::spawn(async move { while stream.next().await.is_some() {} });
     assert!(voice.probe_external().await.unwrap().available);
-    assert_eq!(
-        voice.probe().await.unwrap_err(),
-        zeron_proto::voice::VoiceRejection::NativeRuntimeUnavailable
-    );
+    assert_eq!(voice.probe().await.unwrap_err(), fixture_voice_rejection());
     let (reply, answer) = oneshot::channel();
     voice
         .commands

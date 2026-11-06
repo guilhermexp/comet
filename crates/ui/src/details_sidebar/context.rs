@@ -129,6 +129,8 @@ mod tests {
 
     fn space() -> Space {
         Space {
+            icon: Default::default(),
+
             id: "space-1".into(),
             device_id: "device-1".into(),
             path: "/tmp/project".into(),
@@ -144,6 +146,8 @@ mod tests {
 
     fn chat() -> Chat {
         Chat {
+            child_kind: Default::default(),
+
             id: "chat-1".into(),
             device_id: "device-1".into(),
             title: None,

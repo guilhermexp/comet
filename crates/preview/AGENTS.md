@@ -12,6 +12,8 @@ Catálogo, descoberta de listeners/processos, proxy HTTP/WebSocket, multiplexaç
 
 ## Local Contracts
 
+- Sync `35561ead`: reserva de peers para provider sign-in não amplia visibilidade de previews. `signIn` é capacidade carimbada pelo host e header interno substituído no edge. Labels/processos compartilhados vêm de `zeron-preview-label`; links RTC aceitam fragmentação UDP preservando autenticação, e terminais Cloud continuam excluídos.
+
 - `DevServer.preview_eligible` combina `service::attributed_candidates` com `zeron_proto::preview_visible_to_chat`: device, origem própria OU project cwd exato do Chat selecionado, como seu watch. Raízes Projects worked não autorizam previews de outro Chat/pasta. `PreviewService` usa o mesmo provider de Scope da descoberta; o contexto de seleção vem da engine, não do comando/porta da UI. Sem Scope/Chat, `None`; `Some(true)` ainda não promete HTTP ou exposição adicional. Provas: `worked_root_eligibility_matches_the_selected_chats_watch` e `details_eligibility_uses_preview_host_attribution_before_discovery`.
 
 - Port adaptado de upstream #290/#295 (MIT). URLs persistidas não dependem da porta do processo. Revalidar PID, início do processo, cwd e listener antes de conectar evita reutilização indevida de porta.
@@ -21,7 +23,7 @@ Catálogo, descoberta de listeners/processos, proxy HTTP/WebSocket, multiplexaç
 - Descoberta roda fora da thread de UI; start é idempotente, stop cancela o serviço e shutdown aguarda tarefas. Novo runtime usa nova instância.
 - Descoberta mantém verdict de HTTP por `(pid, started_at, address)`: listeners confirmados não recebem novo probe a cada ciclo; listeners não-HTTP usam backoff e uma troca de processo/porta invalida o cache. O proxy valida somente o PID e o horário de início antes de conectar. Pairing é refeito a cada 10s enquanto aguarda e um `connect` com nova sessão substitui o peer zumbi. Listener cujo programa é `zeron` (outra instância do app/engine, ex. `cargo run` do checkout) não é candidato: a porta IPC dele só fala WebSocket, e o `HEAD /` gerava warning de handshake naquele processo a cada varredura.
 
-- `servers.rs` (Details → Servers) é separado do catálogo: lista só **servidores de dev** sob as raízes pedidas (pasta do chat + Projects worked): o listener ou um launcher acima dele (até shell/agente) precisa casar com um comando de dev (`dev_signatures`: `npm run dev`, `next dev`, `vite`, `cargo run`, `mix phx.server`…). Postgres, redis, minio, agentes e browsers ficam de fora. Cada linha leva as `signatures` para a UI casar com os comandos do chat. `stop` revalida pid + start time + raiz no host e manda SIGTERM ao listener e aos launchers acima dele com cwd na mesma raiz, parando em shell, CLI de agente, Zeron ou após 3 níveis — nunca derruba o agente que lançou o servidor.
+- `servers.rs` (Details → Servers) é separado do catálogo: lista só **servidores de dev** sob as raízes pedidas (pasta do chat + Projects worked): o listener ou um launcher acima dele (até shell/agente) precisa casar com um comando de dev (`dev_signatures`: `npm run dev`, `next dev`, `vite`, `cargo run`, `mix phx.server`…). Postgres, redis, minio, agentes e browsers ficam de fora. Cada linha leva as `signatures` para a UI casar com os comandos do chat. `stop` revalida pid + start time + raiz no host e manda SIGTERM ao listener e aos launchers acima dele com cwd na mesma raiz, parando em shell, CLI de agente, Zeron ou após 3 níveis — nunca derruba o agente que lançou o servidor. SIGTERM é exclusivo de Unix. Windows captura handles e criação de cada alvo antes de revalidar sua metadata: termina só o listener e a cadeia validada de launchers (launchers primeiro), expandindo com ToolHelp apenas descendentes do próprio listener. Irmãos sob qualquer launcher ficam intocados. Os handles capturados não são reabertos pelo PID; criação de launcher não pode ser posterior à do filho capturado, e criação de descendente não pode ser anterior à do pai. Falhas de abertura/leitura da criação de um alvo ou descendente são registradas e o processo não validável é pulado, sem interromper as demais tentativas; sem criação do listener, seus descendentes não são autorizados. O primeiro erro relevante só volta após tentar os outros handles validados, mesmo se um término falhar. ERROR_INVALID_PARAMETER de OpenProcess indica processo ausente. Falha de snapshot não impede o término dos alvos explícitos já capturados, mas impede expandir descendentes e também é devolvida após as tentativas. TerminateProcess sempre recebe o handle retido, nunca PID nu. A API pública de Job do harness cobre processos atribuídos no spawn; não oferece adoção da árvore de servidores já existentes. A descoberta Windows continua indisponível na baseline; cross-check prova compilação do caminho de término, não execução nativa nem descoberta Windows.
 
 - Previews (upstream #1023): só entram no catálogo/"Ports" servidores carimbados com `ZERON_ORIGIN=chat:<id>`/`terminal:<id>` de um chat hospedado aqui (`PreviewService.chat_id`). Servidores iniciados por Workers (host Unpeel) não têm carimbo e saem do catálogo; continuam em Settings → Servers (`servers.rs`, por raiz de projeto, `Origins` vazio). Pendência de produto registrada no sync v0.2.126.
 
@@ -31,12 +33,14 @@ Preservar limites de frames, backpressure e teardown de peers. Não colocar cred
 
 ## Verification
 
+Os guards de subprocesso em `tests/discovery.rs` possuem um process group Unix exclusivo e encerram launcher + descendentes no Drop. Matar apenas o shell deixa o servidor com stderr do gate aberto; `dropping_a_launcher_closes_its_servers_output_pipe` exige EOF após teardown, sem retry/sleep. O cenário double-fork mantém seu guard explícito separado.
+
 | Camada / path | Tier | Comando |
 |---|---|---|
 | `src/**` | unit | `cargo test -p zeron-preview --lib` |
 | `tests/**` | integration | `cargo test -p zeron-preview --tests` |
 | browser/pairing real | none — BCU e dois devices; fixtures locais não provam rede publicada | ver change OpenSpec |
-| `servers.rs` list/stop guards | unit | `cargo test -p zeron-preview --lib servers` |
+| `servers.rs` list/stop guards | unit | `cargo test -p zeron-preview --lib servers` (coleta/terminação Windows usa o mesmo seam com handles falsos no Linux: irmãos preservados, launchers primeiro, erros open/creation/terminate/snapshot, primeiro erro, criação obrigatória de cada alvo, criação pai/filho e deduplicação; Win32 tem cross-check de compilação, execução nativa não provada) |
 | discovery probe cache + same-process guard + peer re-pair | unit / integration | `cargo test -p zeron-preview --lib` · `cargo test -p zeron-preview --test discovery` |
 
 ## Child DOX Index

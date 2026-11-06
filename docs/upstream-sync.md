@@ -84,7 +84,7 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
    - Se a ancestralidade quebrar (como na reassinatura de set/2026), use o graft temporário descrito em `sync-upstream-v0-2-83` D1.
 7. **Resolver os conflitos por arquivo.** Dá para paralelizar entre agentes, desde que cada um fique com arquivos disjuntos, não rode `git checkout`/`stash`/`commit` nem compile. A compilação e a correção do que ela quebrar ficam com quem coordena.
 8. **Compilar e testar conforme o escopo e o `AGENTS.md` raiz:**
-   - Checks locais Cargo no macOS/Linux passam por uma única rodada de `scripts/cargo-verify.py`; agrupar comandos e reaproveitar dependências, sem targets concorrentes.
+   - Checks locais Cargo no macOS/Linux usam Cargo nativo diretamente, target exclusivo da tarefa/checkout, jobs=2 e sccache. Conferir disco antes de compilar; não usar fila global nem wrapper de serialização.
    - Validar APIs entre crates com `cargo check --workspace --all-targets` quando a integração atravessar essas fronteiras; executar regressões focadas das áreas alteradas e provas nativas exigidas.
    - A regressão ampla `cargo test --workspace --no-fail-fast` fica preferencialmente no CI existente; registrar a revisão e os jobs realmente executados. Não declarar CI verde para commits locais ainda não publicados nem repetir bateria pesada só para espelhar CI.
    - Se tocar a Edge: `npm -C edge run typecheck && npm -C edge run test`.
@@ -145,6 +145,10 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Workflows `macos.yml`, `testflight.yml`, `android.yml`, mudanças em `windows.yml`, `CODEOWNERS`, job `vault` no `preview-tests.yml` | CI | v0.2.126 | O fork mantém os próprios workflows |
 | Esc fecha a pergunta sem responder | #1022 (UI) | v0.2.126 | Esc continua subindo até o Stop; fechar sem responder é pelo botão |
 | Criação de worktree Windows em duas etapas e workaround de arquivos >300 unidades UTF-16 | #530 | v0.2.112 | Fork mantém o lifecycle comum Chat/Workers e ProcessRunner; algoritmo específico Windows não entra. Validação lexical de paths e rejeição de cwd não lançável foram mantidas |
+| Ativação automática zgx/Inset/split (D1) | #1123–#1198 | 35561ead (2026-11-04) | Interface retida dormente; shell gpui, Workers, Details e terminal direito do fork vencem. D1a autorizado em 2026-11-05 ativa apenas runtime de plugins/templates na engine, sem capability zgx ou injeção MCP |
+| Directory/profile/badges/card-web/onboarding/plugin-keys e novos bindings do edge (D2) | #1105–#1193 | 35561ead | Fora do grafo publicado/config/testes ativos; sem provisionamento ou deploy implícito |
+| Retorno do anel Usage, Mermaid cache do upstream, CommitCredit/banner GitHub e terminal de rodapé (D3) | #1067/#1089/#1168 | 35561ead | Preservar Usage próprio, QuickJS, TurnSteps e apresentação do fork; não ressuscitar decisões antigas por merge limpo |
+| Canal beta, CLI/launch/engine managed e CI unificado upstream (D8) | #1077 e zgx beta | 35561ead | 1.0.16, workflows integrais, updater/feed/RestartGate e engine in-process do fork. CLI/launch/zgx ficam fora do workspace |
 
 ## Aceito com adaptação
 
@@ -201,6 +205,13 @@ Prova de instalação não equivale a resolução dos conflitos, CI de produto v
 | Retry de start e revival de turno cortado | #977 | v0.2.126 | Cada tentativa pega a execution lease de novo; o `shutdown` concorrente do fork usa `terminate` para permitir o revival |
 | Rail do transcript, caminho digitável do New project, destino de PR, card de sessão | #958/#1049/#998/#1026/#950/#1028 | v0.2.126 | Rail sobre `RailSnapshot`; alvo Worker local-only no ⌘L; `pullRequestOpenIn` + chave antiga; totais da branch sob `show_context_metadata` e ramo Workers; `clocked_tween` |
 | Queue compartilhada | — | v0.2.83 | Coexiste com o steer. Steers de harness que só lê no fim do turno ficam retidos |
+| Settings search, Markdown de usuário/rail, anotações e smooth scrolling (D3) | #1018/#1067/#1089/#814/#1005 | 35561ead | Projects/Accounts separados de Harnesses, chips/seleção/Appshots/writer central e RailSnapshot do fork; Mermaid QuickJS permanece |
+| Access/plan, Fx e ACP registry (D4) | #1088/#1099 e registry | 35561ead | OMP/Kimi e leases preservados, modos só se suportados, igualdade de runtime compara grants e acesso efetivo; engine limpa mcp e extra_mcp antes do retry |
+| Caller/IPC agent-scoped e registry único (D5) | plugins/registry | 35561ead | Métodos novos portados a method.rs. zeron mcp/controller mantêm bearer completo do grant + bind de device, pois o allowlist novo não cobre SpawnChat/WorkerWaitState; sem ampliar autoridade |
+| ChildKind aditivo (D6) | #1170 | 35561ead | originChatId/parentChatId independentes; ambos negam grant raiz/netos. Default side e configured/inherit do fork preservados; subagent explícito aceito |
+| Background processes, ReadToolOutput e tails/exit code (D7) | #1092/#1168/#1190/#1036 | 35561ead | Host autorizado, output limitado/redigido de comando, resumo não-command e metadata do fork; Write/Edit sanitizados, Stop/quiesce e Workers mantidos |
+| zui b564a34 com dma-buf e frame callbacks (D9) | #1039 | 35561ead | Fonte separada, quatro commits upstream portados; proveniência/tree incluindo symlinks e formatting; vidro/headless e duas regras de pontuação preservados |
+| Dois formatos de CreateWorkspaceEntry (D10) | Explorer create | 35561ead | Legado parentPath/name → WorkspaceEntryMutation preservado; operationId/path/expectedCheckoutId → WorkspaceMutationOutcome aditivo. Tipo novo renomeado e dispatch por operationId; regressão cobre ambos/no-replace/stale |
 
 ## Integração local de 18/10/2026 (em revisão)
 
@@ -310,3 +321,10 @@ A integração foi revisada com preservação dos contratos do fork. Workspace/a
 | 2026-10-07 | até `916cb1cc` (v0.2.106) | `openspec/changes/archive/2026-10-07-sync-upstream-v0-2-106/` | Merge `cd38b6dc`; 15 commits, Codex voice local/remoto/iOS, chips, identidade Git e catálogos; contratos do fork preservados. Prova desktop/iOS passou; RPC worktree e preview churn permanecem pendentes |
 | 2026-10-09 | `916cb1cc..1074bc54` (v0.2.107) | `openspec/changes/archive/2026-10-09-sync-upstream-v0-2-107/` | Oito commits: memória, runtimes/Stop, snapshots privados, entrega remota, imagens/badges e subagentes concluídos; contratos do fork preservados. Provas e limites registrados no arquivo verification.md |
 | 2026-10-26 | `c526d6f7..d5a01522` (v0.2.126) | `openspec/changes/archive/2026-10-27-sync-upstream-v0-2-126/` | 74 commits; Cloud e engine em background recusados/dormentes, IPC com bearer, troca de provider, Muse, terminal RTC; publicado em `a1fa9159`; relato em `.upstream-sync/history/` |
+| 2026-11-04 | `d5a01522..35561ead` (#1198) | `openspec/changes/sync-upstream-20261104/` | 107 commits: 9 TAKE / 85 ADAPT / 13 SKIP, 153 conflitos; merge real, 1.0.16 preservada, D1–D10. Branch sync/upstream-20261104 e PR draft; aceite macOS/iOS pendente. Registro YAML desta execução em `.upstream-sync/history/` |
+
+### Follow-up CI e D1a — 2026-11-05
+
+D1a liga start/auth/links/RPC de plugins/templates no startup normal. Grants raiz e workers_mcp permanecem autoritativos: drive_run limpa mcp/extra_mcp antes do retry; SessionsEngine::set_plugins não é ligado, pois só guarda o seam de injeção nativa sem consumidor no fork. Falhas 404/501/rede em /plugin-keys degradam com log, sem impedir autenticação nem plugins locais. Templates conservam assets locais como precondição e não instalam/ativam zgx. Clientes chamam esses RPCs diretamente, sem capability própria: ZGX_INTERFACE_V1 anuncia a interface beta completa e continua fora de CURRENT. D2/D8, Inset/split, edge, updater/feed e versão 1.0.16 permanecem conforme as decisões anteriores. Esta execução é local, sem operações na PR/publicação; OpenSpec sync-upstream-20261104 continua aberta.
+
+F1/F2 alinham seletores Cargo: geometry pertence à crate orb e módulos engine/misc não são alvos independentes. F3 anuncia OMP FullAccess/sem plan conforme o driver. F4 corrige a fixture legacy para não criar snapshot de nascimento epoch 2, preservando a precedência correta do epoch local. Evidências desta rodada ficam em `.tmp/reports/comet-sync-ci-d1a-20261105.md` e na verification da change; receita alterada não equivale a CI remoto aprovado.

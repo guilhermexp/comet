@@ -50,6 +50,15 @@ export default defineConfig({
     // above that the fork does not configure).
     exclude: [
       ...configDefaults.exclude,
+      "test/workerd/card-pages.workerd.test.ts",
+      "test/workerd/device-link.workerd.test.ts",
+      "test/workerd/onboarding.workerd.test.ts",
+      "test/workerd/org-creation.workerd.test.ts",
+      "test/workerd/plugin-keys.workerd.test.ts",
+      "test/workerd/profile.workerd.test.ts",
+      "test/workerd/user-directory.workerd.test.ts",
+      "test/workerd/usernames.workerd.test.ts",
+
       "test/workerd/cloud*.workerd.test.ts",
       "test/workerd/runner-boundary.workerd.test.ts",
       "test/workerd/vault-routes.workerd.test.ts"

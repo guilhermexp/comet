@@ -15,8 +15,27 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use zeron_sync::DocsStore;
 
+pub mod acp_registry;
 pub mod agent_accounts;
 pub(crate) mod antigravity_usage;
+
+/// Which build this engine is: its git commit and when its executable was
+/// built (the file's modification time, in seconds), as
+/// `"<commit>.<seconds>"`. Read once, as the engine starts: a binary replaced
+/// on disk while it runs leaves its id as it was, so a client can compare it
+/// with `zeron-engine --build-id` of the binary there now.
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let built = std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        format!("{}.{built}", env!("ZERON_GIT_COMMIT"))
+    })
+}
 pub mod auth;
 mod change_request_store;
 pub mod change_requests;
@@ -42,6 +61,7 @@ pub(crate) mod kimi_usage;
 pub mod local_import;
 pub mod managed;
 mod model_catalogs;
+pub mod plugins;
 pub(crate) mod process;
 pub mod profile;
 pub mod project_actions;
@@ -59,6 +79,7 @@ pub mod source_control;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
+pub mod tool_output;
 mod transcript_history;
 pub mod uploads;
 pub mod voice;
@@ -69,7 +90,7 @@ pub mod workspace_search;
 mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership, ScreenHint, SignInOptions};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, CheckoutPin, DiffFileTextPair, DiffSidecar, DiffSnapshot, TreeSnapshot,
@@ -178,6 +199,8 @@ pub struct EngineCore {
     pub viewport_focus: desktop_notify::ViewportFocus,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
+    /// Plugins under `{data}/plugins/` (the plugins contract).
+    pub plugins: plugins::Plugins,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -285,6 +308,59 @@ impl EngineCore {
         )?;
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
+        let plugins = plugins::Plugins::new(data_dir, &device_id);
+        plugins.set_workspace(workspace.clone());
+        // A service's `zeron.folders()`: where this device's chats and
+        // projects are (the built-in Git service works in these alone).
+        {
+            let (workspace, device_id) = (workspace.clone(), device_id.clone());
+            plugins.set_folders(move || {
+                let chats = workspace.read_chats().unwrap_or_default();
+                let spaces = workspace.read_spaces().unwrap_or_default();
+                let mut folders: Vec<String> = chats
+                    .into_iter()
+                    .filter(|c| c.device_id == device_id)
+                    .filter_map(|c| c.cwd)
+                    .chain(
+                        spaces
+                            .into_iter()
+                            .filter(|s| s.device_id == device_id)
+                            .map(|s| s.path),
+                    )
+                    .filter(|f| !f.is_empty())
+                    .collect();
+                folders.sort();
+                folders.dedup();
+                folders
+            });
+        }
+        // A plugin service's `zeron.notify`: as `PostNotification` posts.
+        let viewport_focus = desktop_notify::ViewportFocus::default();
+        {
+            let (data_dir, focus) = (data_dir.to_path_buf(), viewport_focus.clone());
+            plugins.set_notifier(move |source, title, body, session| {
+                let title: String = title
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(120)
+                    .collect();
+                desktop_notify::post_for(&data_dir, &focus, source, &title, body, session)
+                    .to_owned()
+            });
+        }
+        if let Some(edge) = &edge {
+            plugins.set_directory(Arc::new(plugins::keys::EdgeDirectory::new(
+                &edge.url,
+                edge.token.clone(),
+            )));
+        }
+        // D1a: plugin/template RPCs are live; per-run MCP remains grant-only.
+        // set_plugins is intentionally not wired: its native MCP seam is unused
+        // by the fork, and drive_run strips both MCP injection fields.
+        plugins.start();
         sessions.set_doc_host(doc_host.clone());
         // Seed live statuses from the persisted workspace rows so a settled
         // session's context-window usage survives an app restart: the merged
@@ -370,6 +446,9 @@ impl EngineCore {
         registry.set_account_environment(Arc::new(agent_accounts::MuseRunEnvironment(
             agent_accounts.clone(),
         )));
+        // Agents added from the ACP registry (this engine's own, under its
+        // data dir): harnesses before the update coordinator lists them.
+        acp_registry::start(data_dir, &registry);
         let harness_updates =
             harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
         harness_updates.start();
@@ -411,13 +490,14 @@ impl EngineCore {
             harness_updates,
             device_id,
             local_import,
+            plugins,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
             updater_wake: std::sync::Mutex::new(None),
             cloud: std::sync::Mutex::new(None),
-            viewport_focus: desktop_notify::ViewportFocus::default(),
+            viewport_focus,
             _instance_lock: lock,
         })
     }
@@ -428,6 +508,7 @@ impl EngineCore {
 
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
+        self.plugins.attach_auth(auth.clone());
         *self
             .auth
             .lock()
@@ -457,6 +538,7 @@ impl EngineCore {
     /// [`Self::dial_device`], and the doc host's queued-attachment transfers.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
         self.doc_host.set_links(links.clone());
+        self.plugins.set_links(links.clone());
         *self
             .links
             .lock()
@@ -561,6 +643,7 @@ impl EngineCore {
         .with_remote_terminals(self.remote_terminals.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_worked_projects(self.worked_projects.clone())
+        .with_plugins(self.plugins.clone())
         .with_viewport_focus(self.viewport_focus.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
@@ -625,6 +708,7 @@ impl EngineCore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.plugins.shutdown();
         self.previews.shutdown().await;
         self.harness_updates.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
@@ -893,6 +977,7 @@ impl Engine {
                 }
                 capabilities
             },
+            build: Some(crate::build_id().to_owned()),
         })
     }
 
@@ -1105,6 +1190,20 @@ impl Engine {
             link_config.liveness = Some(Arc::new(move |device_id: &str| {
                 workspace_for_liveness.peer_liveness(device_id)
             }));
+            // Prove which device dials (its registered plugin key), so the
+            // peer's edge stamps it and the peer knows who's asking
+            // (`Caller::Peer{device}`); without a key, dials go unstamped.
+            let (proof_dir, proof_device) = (config.data_dir.clone(), core.device_id.clone());
+            link_config.caller_proof =
+                Some(Arc::new(move |target: &str, conn_id: &str, ts: i64| {
+                    let (key, signature) =
+                        plugins::signing::device_link_proof(&proof_dir, target, conn_id, ts)?;
+                    Some(zeron_rpc::CallerProof {
+                        device: proof_device.clone(),
+                        key,
+                        signature,
+                    })
+                }));
             let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace
@@ -1268,8 +1367,10 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// port, not who can reach it.
 ///
 /// Every call mints a fresh bearer at `{data_dir}/ipc-token` (0600) that each
-/// handshake must present ([`zeron_rpc::ipc_auth`]); viewports, the CLI and
-/// `zeron mcp` read it at dial time. The caller owns `data_dir` (it holds the
+/// handshake must present ([`zeron_rpc::ipc_auth`]); viewports and the CLI
+/// read it at dial time. Agents' `zeron mcp` servers get the agent-scoped
+/// one (`{data_dir}/ipc-token-agent`), which reaches only their tools'
+/// methods ([`zeron_rpc::agent_allowed`]). The caller owns `data_dir` (it holds the
 /// [`InstanceLock`]), so rotating the file before binding cannot strand
 /// another engine's clients — and a client that sees the port open always
 /// finds the new token already published.
@@ -1278,11 +1379,11 @@ pub async fn serve_ipc(
     data_dir: &Path,
     service: std::sync::Arc<dyn zeron_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let token = zeron_rpc::ipc_auth::issue_token(data_dir)?;
+    let tokens = zeron_rpc::ipc_auth::issue_tokens(data_dir)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "IPC server listening");
-    Ok(tokio::spawn(zeron_rpc::serve_ws_listener(
-        listener, service, token,
+    Ok(tokio::spawn(zeron_rpc::serve_ws_listener_scoped(
+        listener, service, tokens,
     )))
 }
 
@@ -1801,6 +1902,141 @@ fn cleanup_removed_trajectory_store(store_root: &Path) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn fork_startup_serves_plugins_without_the_zgx_interface() {
+        let temp = TempDir::new().unwrap();
+        let core = EngineCore::assemble(
+            temp.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        assert!(
+            core.plugins.plugins_dir().is_dir(),
+            "plugin watcher startup creates its root"
+        );
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        let info = client
+            .call(zeron_rpc::methods::ENGINE_INFO, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let info: zeron_proto::EngineInfo = serde_json::from_value(info).unwrap();
+        assert!(!info.supports(zeron_proto::capabilities::ZGX_INTERFACE_V1));
+        assert!(info.supports(zeron_proto::capabilities::BACKGROUND_TASKS_V1));
+        let list = client
+            .call(zeron_rpc::methods::LIST_PLUGINS, serde_json::json!({}))
+            .await
+            .expect("normal fork startup serves local plugins");
+        assert!(list["plugins"].is_array(), "{list}");
+        // Whole-app template assets are installed by their UI. Seed only the
+        // local fixture; activating the engine must not install the zgx shell.
+        std::fs::create_dir_all(
+            temp.path()
+                .join(plugins::TEMPLATES_DIR)
+                .join(plugins::templates::ZERON_DIR),
+        )
+        .unwrap();
+        let templates = client
+            .call(zeron_rpc::methods::LIST_TEMPLATES, serde_json::json!({}))
+            .await
+            .expect("normal fork startup serves templates");
+        assert!(templates["templates"].is_array(), "{templates}");
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fork_plugin_key_failures_preserve_auth_and_local_plugins() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for failure in ["404 Not Found", "501 Not Implemented", "network"] {
+            let temp = TempDir::new().unwrap();
+            let plugin = temp.path().join("plugins/local-example");
+            std::fs::create_dir_all(&plugin).unwrap();
+            std::fs::write(
+                plugin.join("zeron-plugin.json"),
+                r#"{"id":"local-example","name":"Local","version":"1","entry":"init.luau"}"#,
+            )
+            .unwrap();
+            std::fs::write(plugin.join("init.luau"), "return {}").unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+            let edge = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let count = stream.read(&mut buffer).await.unwrap_or(0);
+                        if count == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                        assert!(request.len() < 32768);
+                    }
+                    if failure != "network" {
+                        let reply = format!(
+                            "HTTP/1.1 {failure}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    }
+                    if request.starts_with(b"POST /plugin-keys ") {
+                        let _ = attempted.send(());
+                    }
+                }
+            });
+            let core = EngineCore::assemble(
+                temp.path(),
+                Arc::new(HarnessRegistry::new()),
+                HarnessId::Mock,
+                None,
+            )
+            .unwrap();
+            let auth = Auth::new(AuthConfig::new(&url, temp.path()));
+            core.plugins
+                .set_directory(Arc::new(plugins::keys::EdgeDirectory::new(
+                    &url,
+                    Arc::new(auth.clone()),
+                )));
+            core.set_auth(auth);
+            tokio::time::timeout(std::time::Duration::from_secs(5), attempts.recv())
+                .await
+                .expect("set_auth starts plugin identity registration")
+                .expect("directory saw registration");
+            assert_eq!(core.auth().access_token().await.unwrap(), "dev-user");
+            let client = zeron_rpc::memory_client(core.rpc_service());
+            let list = client
+                .call(zeron_rpc::methods::LIST_PLUGINS, serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(
+                list["plugins"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["id"] == "local-example"),
+                "{failure}: {list}"
+            );
+            core.shutdown().await;
+            edge.abort();
+        }
+    }
 
     #[tokio::test]
     async fn test_boot_cleanup_removes_trajectory_store_leftovers() {

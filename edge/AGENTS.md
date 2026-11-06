@@ -12,6 +12,9 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 
 ## Local Contracts
 
+- Sync `35561ead`: Loro 1.17.1 acompanha o lado Rust; materialização conserva `childKind` e tails/exit code opcionais. Preview reserva capacidade para login por header interno sobrescrito no ingresso, preservando isolamento por org/usuário.
+- Directory/profile/badges/card-web, onboarding/device-link/plugin-keys, Cloud/vault/runner permanecem fonte dormente: fora de `index.ts`, dos bindings/wrangler e das seleções ativas de typecheck/vitest. As exclusões estão explícitas nos configs; os testes desses serviços não provam o Worker publicado do fork. Nenhum novo asset build/deploy é ligado pelo package.json.
+
 - Parts `image` preservam `id/path/name/mimeType` no materializador, em paridade com `zeron-doc`; a engine importa os bytes antes de publicar a referência. Regressão: `src/session-doc/generated-images.test.ts`.
 
 - `PreviewRoom` (`preview1/{org}/{userId}`) isola catálogo/sinalização por identidade autenticada, confirma org e sobrescreve headers internos no ingresso. Não transporta bytes de páginas. WebSockets têm limites de tamanho, taxa e peers e removem catálogo stale. Adicionar binding/migration não autoriza deploy.
@@ -49,7 +52,7 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 | `src/{session-room,device-room}.ts` (DOs) | integration — convergência pelo lado Rust | `cargo test -p zeron-sync` |
 | `src/{auth,auth-routes,workos}.ts` | integration | `npm -C edge run test` + `npm -C edge run smoke` |
 | `src/preview-room.ts` | integration — auth, isolamento e protocolo DO | `npm -C edge run test:workerd` |
-| Tipos (todo o `src/**`) | typecheck obrigatório | `npm -C edge run typecheck` |
+| Tipos do grafo ativo (`tsconfig.json`) | typecheck obrigatório | `npm -C edge run typecheck` |
 
 Additional integration coverage:
 
@@ -59,4 +62,6 @@ Additional integration coverage:
 
 ## Child DOX Index
 
-Sem filhos. `src/session-doc/` segue o contrato de [`../crates/doc/AGENTS.md`](../crates/doc/AGENTS.md).
+Sem filhos. A fonte dormente da página pública tem contrato em [`../apps/card-web/AGENTS.md`](../apps/card-web/AGENTS.md).
+
+`src/session-doc/` segue o contrato de [`../crates/doc/AGENTS.md`](../crates/doc/AGENTS.md).

@@ -1385,6 +1385,17 @@ fn api_write_raw<W: Write>(
 ) {
     // Feature-flagged with the remote-attach client: answers as if the
     // endpoint does not exist until the operator opts in.
+    #[cfg(not(unix))]
+    {
+        write_error(
+            stream,
+            501,
+            "Not Implemented",
+            "Remote PTY attach requires a Unix Host",
+        );
+        return;
+    }
+    #[cfg(unix)]
     if !crate::remote_attach::remote_attach_enabled() {
         write_error(stream, 404, "Not Found", "Unknown endpoint");
         return;

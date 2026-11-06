@@ -3954,10 +3954,16 @@ impl DocHost {
             return Ok(id);
         }
         let now = now_ms();
-        let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
-            frontier: None,
-        });
+        let based_on = handle
+            .doc
+            .read_entries()?
+            .into_iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| CommandBasedOn {
+                turn_id: Some(m.id.clone()),
+                frontier: None,
+            });
         let is_message = matches!(
             payload,
             SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
@@ -5306,10 +5312,14 @@ impl DocHost {
                 payload: old.payload.clone(),
                 issued_by: self.inner.config.device_id.clone(),
                 issued_at: now,
-                based_on: messages.last().map(|m| CommandBasedOn {
-                    turn_id: Some(m.id.clone()),
-                    frontier: None,
-                }),
+                based_on: messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::Assistant)
+                    .map(|m| CommandBasedOn {
+                        turn_id: Some(m.id.clone()),
+                        frontier: None,
+                    }),
                 expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
                 status: SessionCommandStatus::Pending,
                 resolution: None,
@@ -5785,8 +5795,18 @@ impl DocHost {
                 return;
             };
             let messages = handle.doc.read_entries().unwrap_or_default();
-            let current_turn_id = messages.last().map(|m| m.id.clone());
-            let turn_is_past = |turn_id: &str| messages.iter().any(|m| m.id == turn_id);
+            let current_turn_id = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == MessageRole::Assistant)
+                .map(|m| m.id.clone());
+            // Legacy producers could reference a user row before the first
+            // assistant delta. Such a row is never a completed assistant turn.
+            let turn_is_past = |turn_id: &str| {
+                messages
+                    .iter()
+                    .any(|m| m.id == turn_id && m.role == MessageRole::Assistant)
+            };
             let disposition = evaluate_command(
                 &entry,
                 &EvaluationContext {
@@ -6305,6 +6325,8 @@ impl DocHost {
                         reasoning: request.reasoning,
                         model_options: request.model_options.clone(),
                         sandbox: request.sandbox,
+                        access: request.access,
+                        plan: request.plan,
                     };
                     if let Err(err) = ws.set_chat_config(chat_id, &config) {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
@@ -6939,10 +6961,13 @@ impl DocHost {
             enable_workers_mcp: true,
             workers_parent_chat_id: Some(chat_id.to_owned()),
             sessions: None,
+            access: config.as_ref().map(|c| c.access).unwrap_or_default(),
+            plan: config.as_ref().is_some_and(|c| c.plan),
             attachments: Vec::new(),
             resume: None,
             worktree: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         };
         if let Some(sessions) = self.sessions() {
             sessions.stamp_sessions_grant(chat_id, &mut request);
@@ -7334,6 +7359,178 @@ mod stop_fenced_hold_tests {
     use std::sync::Arc;
     use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
     use zeron_proto::HarnessId;
+
+    async fn terminal_command_status(
+        handle: &Arc<super::ChatDocHandle>,
+        id: &str,
+    ) -> SessionCommandStatus {
+        let (changed, mut changes) = tokio::sync::watch::channel(0u64);
+        let _subscription = handle.doc().doc().subscribe_root(Arc::new(move |_| {
+            changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+        }));
+        // Use the existing three-second doc-host test deadline. Subscribe
+        // before reading: a background owner may resolve between these steps.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                changes.borrow_and_update();
+                let status = handle
+                    .doc()
+                    .read_commands()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.id == id)
+                    .unwrap()
+                    .status;
+                if status != SessionCommandStatus::Pending {
+                    return status;
+                }
+                changes
+                    .changed()
+                    .await
+                    .expect("command document watch stays live");
+            }
+        })
+        .await
+        .expect("background command owner must publish a terminal outcome")
+    }
+
+    #[tokio::test]
+    async fn command_status_wait_does_not_return_a_background_owners_pending_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(
+            Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap()),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("claimed-command").unwrap();
+        let id = host
+            .queue_command(&handle.chat_id, SessionCommandPayload::Interrupt {})
+            .unwrap();
+        assert!(host.claim_command_execution(&id).unwrap());
+        let wait = terminal_command_status(&handle, &id);
+        tokio::pin!(wait);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "a claim is not a terminal outcome"
+        );
+        host.resolve_command(&handle, &id, SessionCommandStatus::Applied, None);
+        lock(&host.inner.executing).remove(&id);
+        assert_eq!(wait.await, SessionCommandStatus::Applied);
+    }
+
+    #[tokio::test]
+    async fn stop_context_tracks_assistant_turns_and_preserves_stale_stop_rejection() {
+        use zeron_doc::{MessageRole, MessageStatus, SessionMessageEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(
+            Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap()),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("chat-stop-context").unwrap();
+        let row = |id: &str, role, status| SessionMessageEntry {
+            id: id.into(),
+            role,
+            status: Some(status),
+            parts: vec![],
+            created_at: crate::now_ms(),
+            device_id: "device-a".into(),
+            duration_ms: None,
+            continuation_of: None,
+        };
+        handle
+            .doc()
+            .push_message(&row(
+                "first-user",
+                MessageRole::User,
+                MessageStatus::Complete,
+            ))
+            .unwrap();
+        let early = host
+            .queue_command(&handle.chat_id, SessionCommandPayload::Interrupt {})
+            .unwrap();
+        let commands = handle.doc().read_commands().unwrap();
+        assert!(
+            commands
+                .iter()
+                .find(|c| c.id == early)
+                .unwrap()
+                .based_on
+                .is_none(),
+            "a user row is not an assistant turn"
+        );
+        host.set_sessions(crate::sessions::SessionsEngine::new(
+            "device-a".into(),
+            Arc::new(crate::run_journal::RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(crate::registry::HarnessRegistry::new()),
+        ));
+        assert_eq!(
+            terminal_command_status(&handle, &early).await,
+            SessionCommandStatus::Applied
+        );
+
+        handle
+            .doc()
+            .push_message(&row(
+                "active-turn",
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+            ))
+            .unwrap();
+        handle
+            .doc()
+            .push_message(&row(
+                "arriving-user",
+                MessageRole::User,
+                MessageStatus::Complete,
+            ))
+            .unwrap();
+        let stop = host
+            .queue_command(&handle.chat_id, SessionCommandPayload::Interrupt {})
+            .unwrap();
+        let command = handle
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == stop)
+            .unwrap();
+        assert_eq!(
+            command.based_on.as_ref().unwrap().turn_id.as_deref(),
+            Some("active-turn")
+        );
+        assert_eq!(
+            terminal_command_status(&handle, &stop).await,
+            SessionCommandStatus::Applied,
+            "the arriving user row must not supersede Stop"
+        );
+
+        handle
+            .doc()
+            .push_message(&row(
+                "newer-turn",
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+            ))
+            .unwrap();
+        let stale = SessionCommandEntry {
+            id: "stale-stop".into(),
+            status: SessionCommandStatus::Pending,
+            ..command
+        };
+        handle.doc().queue_command(&stale).unwrap();
+        assert_eq!(
+            terminal_command_status(&handle, &stale.id).await,
+            SessionCommandStatus::Superseded,
+            "a Stop for a genuinely older assistant turn stays stale"
+        );
+    }
 
     #[tokio::test]
     async fn hold_rejects_prompt_ordered_before_stop_without_thawing_user_queue() {

@@ -142,3 +142,61 @@ async fn foreign_device_is_refused() {
     assert!(!root.join("x.txt").exists());
     core.shutdown().await;
 }
+
+/// Both clients share the RPC name: the fork uses parentPath/name, while
+/// Explorer's guarded mutations use operationId/path and a checkout identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_create_coexists_with_fork_create_and_rejects_stale_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let core = assemble(&temp.path().join("data"));
+    create_owned_space(&core, &root);
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let old = client
+        .call(
+            "CreateWorkspaceEntry",
+            json!({
+                "spaceId": "files", "parentPath": "", "name": "fork.txt", "kind": "file"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old["path"], "fork.txt");
+    let read = client
+        .call(
+            "ReadWorkspaceFile",
+            json!({
+                "spaceId": "files", "path": "fork.txt"
+            }),
+        )
+        .await
+        .unwrap();
+    let request = json!({
+        "spaceId": "files", "operationId": "create-explorer", "expectedCheckoutId": read["checkoutId"],
+        "path": "explorer.txt", "kind": "file"
+    });
+    let created = client
+        .call("CreateWorkspaceEntry", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(created["status"], "applied");
+    assert_eq!(created["entry"]["path"], "explorer.txt");
+    let duplicate = client.call("CreateWorkspaceEntry", request).await.unwrap();
+    assert_eq!(duplicate["reason"], "destinationExists");
+    let stale = client
+        .call(
+            "CreateWorkspaceEntry",
+            json!({
+                "spaceId": "files", "operationId": "stale", "expectedCheckoutId": "stale",
+                "path": "never.txt", "kind": "file"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale["reason"], "workspaceChanged");
+    assert!(!root.join("never.txt").exists());
+    assert_eq!(std::fs::read(root.join("fork.txt")).unwrap(), b"");
+    assert_eq!(std::fs::read(root.join("explorer.txt")).unwrap(), b"");
+    core.shutdown().await;
+}

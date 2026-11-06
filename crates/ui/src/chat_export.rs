@@ -778,6 +778,10 @@ mod tests {
         subagent_ref: Option<&str>,
     ) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.to_owned(),
             call,
             is_error: false,

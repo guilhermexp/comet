@@ -1,5 +1,5 @@
 //! CursorHarness integration tests against the fake shim in
-//! `tests/fixtures/fake-cursor-shim.sh` (no node/@cursor/sdk involved).
+//! `tests/fixtures/fake-cursor-shim.sh` (no @cursor/sdk involved; steering fixtures use Node).
 
 #![cfg(unix)]
 
@@ -43,10 +43,13 @@ fn request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     }
 }
 
@@ -308,6 +311,7 @@ async fn happy_path_maps_shim_frames_and_tags_subagents() {
         output: None,
         diff: None,
         execution: None,
+        exit_code: None,
     }));
 
     // The task spawn is a parent chip; its interior arrives tagged, never bare.
