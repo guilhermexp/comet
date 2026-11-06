@@ -470,9 +470,9 @@ struct WindowsProcess {
 }
 
 #[cfg(windows)]
-fn capture_windows_process(pid: u32) -> std::io::Result<WindowsProcess> {
+fn capture_windows_process(pid: u32) -> std::io::Result<Option<WindowsProcess>> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
@@ -485,7 +485,12 @@ fn capture_windows_process(pid: u32) -> std::io::Result<WindowsProcess> {
         )
     };
     if handle.is_null() {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
     }
     // SAFETY: OpenProcess returned a valid, uniquely owned handle.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
@@ -507,10 +512,10 @@ fn capture_windows_process(pid: u32) -> std::io::Result<WindowsProcess> {
     {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(WindowsProcess {
+    Ok(Some(WindowsProcess {
         handle,
         created: (u64::from(start.dwHighDateTime) << 32) | u64::from(start.dwLowDateTime),
-    })
+    }))
 }
 
 /// Stop only the validated launchers and listener's own descendants. Existing
@@ -519,12 +524,10 @@ fn capture_windows_process(pid: u32) -> std::io::Result<WindowsProcess> {
 #[cfg(windows)]
 fn terminate_windows_tree(
     targets: &[u32],
-    mut captured: HashMap<u32, std::io::Result<WindowsProcess>>,
+    mut captured: HashMap<u32, std::io::Result<Option<WindowsProcess>>>,
 ) -> std::io::Result<()> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{
-        ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, STILL_ACTIVE,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, STILL_ACTIVE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -563,18 +566,12 @@ fn terminate_windows_tree(
         |pid| {
             // Explicit targets must use the handles captured during validation.
             // A failed capture must not reopen a possibly recycled PID.
-            let process = if targets.contains(&pid) {
+            if targets.contains(&pid) {
                 captured
                     .remove(&pid)
                     .expect("validated target was captured")
             } else {
                 capture_windows_process(pid)
-            };
-            match process {
-                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
-                    Ok(None)
-                }
-                result => result.map(Some),
             }
         },
         |process| Ok(process.created),
