@@ -338,6 +338,8 @@ impl Harness for OmpHarness {
             && crate::same_model_options(&live.model_options, &next.model_options)
             && live.cwd == next.cwd
             && crate::same_worker_mcp_config(live, next)
+            && live.access == next.access
+            && live.plan == next.plan
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {

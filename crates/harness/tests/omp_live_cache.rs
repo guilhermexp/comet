@@ -184,6 +184,9 @@ fn report(analysis: &Analysis) -> String {
 
 fn request(model: &str, cwd: &Path, resume: Option<String>, prompt: String) -> RunRequest {
     RunRequest {
+        access: Default::default(),
+        extra_mcp: Default::default(),
+        plan: Default::default(),
         prompt,
         harness: Some(HarnessId::Omp),
         model: Some(model.to_owned()),
