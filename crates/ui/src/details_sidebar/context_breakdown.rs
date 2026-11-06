@@ -876,6 +876,8 @@ mod tests {
             model: Some("new".into()),
             reasoning: None,
             model_options: Default::default(),
+            access: Default::default(),
+            plan: Default::default(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         });
         assert!(panel.select(model.clone()));

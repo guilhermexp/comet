@@ -105,6 +105,8 @@ async fn source_built_omp_context_inspection_preserves_provider_and_turn_state()
         model: Some("fixture/fixture".into()),
         reasoning: None,
         model_options: Default::default(),
+        access: Default::default(),
+        plan: Default::default(),
         cwd: dir.path().to_string_lossy().into_owned(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
@@ -115,6 +117,7 @@ async fn source_built_omp_context_inspection_preserves_provider_and_turn_state()
         attachments: vec![],
         worktree: None,
         mcp: None,
+        extra_mcp: Default::default(),
         env: Default::default(),
     };
     let (_, mut events) = core.sessions.subscribe("source-chat", 0).unwrap();
@@ -324,6 +327,8 @@ async fn context_rpc_never_spawns_and_reads_only_the_selected_live_host() {
         model: None,
         reasoning: None,
         model_options: Default::default(),
+        access: Default::default(),
+        plan: Default::default(),
         cwd: dir.path().to_string_lossy().into_owned(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
@@ -334,6 +339,7 @@ async fn context_rpc_never_spawns_and_reads_only_the_selected_live_host() {
         attachments: vec![],
         worktree: None,
         mcp: None,
+        extra_mcp: Default::default(),
         env: Default::default(),
     };
     core.sessions
@@ -497,6 +503,8 @@ async fn context_rpc_rejects_late_model_and_runtime_results_without_caching_them
         model: Some(model.into()),
         reasoning: None,
         model_options: Default::default(),
+        access: Default::default(),
+        plan: Default::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
     };
     let request = |model: &str| RunRequest {
@@ -505,6 +513,8 @@ async fn context_rpc_rejects_late_model_and_runtime_results_without_caching_them
         model: Some(model.into()),
         reasoning: None,
         model_options: Default::default(),
+        access: Default::default(),
+        plan: Default::default(),
         cwd: dir.path().to_string_lossy().into_owned(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
@@ -515,6 +525,7 @@ async fn context_rpc_rejects_late_model_and_runtime_results_without_caching_them
         attachments: vec![],
         worktree: None,
         mcp: None,
+        extra_mcp: Default::default(),
         env: Default::default(),
     };
     core.workspace
@@ -640,6 +651,8 @@ async fn context_reply_cannot_become_current_after_chat_deletion() {
         model: Some("selected-model".into()),
         reasoning: None,
         model_options: Default::default(),
+        access: Default::default(),
+        plan: Default::default(),
         cwd: dir.path().to_string_lossy().into_owned(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
@@ -650,6 +663,7 @@ async fn context_reply_cannot_become_current_after_chat_deletion() {
         attachments: vec![],
         worktree: None,
         mcp: None,
+        extra_mcp: Default::default(),
         env: Default::default(),
     };
     core.sessions

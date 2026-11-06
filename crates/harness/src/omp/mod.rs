@@ -2000,11 +2000,13 @@ mod tests {
             chat_id: "ordered-fixture".into(),
             turn: Default::default(),
         };
+        let context_requests = controls.turn.context_requests();
         let actor = tokio::spawn(run_session(
             process.clone(),
             process.take_events().unwrap(),
             event_tx,
             controls,
+            context_requests,
             None,
             None,
             None,
