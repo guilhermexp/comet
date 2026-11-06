@@ -485,6 +485,194 @@ impl zeron_harness::Harness for ControlledInspection {
 }
 
 #[tokio::test]
+async fn only_available_context_reports_are_retained_after_failures_and_runtime_exit() {
+    use zeron_harness::HarnessError;
+    let (pending, mut native) = tokio::sync::mpsc::unbounded_channel();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(ControlledInspection {
+        pending,
+        starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Omp, None).unwrap();
+    let request = RunRequest {
+        prompt: "synthetic".into(),
+        harness: Some(HarnessId::Omp),
+        model: Some("selected-model".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        access: Default::default(),
+        plan: false,
+        cwd: dir.path().to_string_lossy().into_owned(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: false,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
+        sessions: None,
+        resume: None,
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+        extra_mcp: Default::default(),
+        env: Default::default(),
+    };
+    let client = Arc::new(zeron_rpc::memory_client(core.rpc_service()));
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (index, availability) in [
+        ContextAvailability::Error,
+        ContextAvailability::NotApplicable,
+        ContextAvailability::Partial,
+        ContextAvailability::Unsupported,
+        ContextAvailability::Available,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let chat = format!("retention-{index}");
+        core.workspace
+            .create_chat(&chat, None, Some(&core.device_id), None, None)
+            .unwrap();
+        core.sessions
+            .dispatch(&chat, HarnessId::Omp, request.clone(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while core
+                .sessions
+                .session_status(&chat)
+                .is_none_or(|s| s.status != SessionStatus::Idle)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let caller = client.clone();
+        let id = chat.clone();
+        let first = tokio::spawn(async move {
+            caller
+                .call("GetChatContextBreakdown", json!({"chatId":id}))
+                .await
+        });
+        let first_request = tokio::time::timeout(Duration::from_secs(2), native.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = match availability {
+            ContextAvailability::Error => Err(HarnessError::Protocol("first failure".into())),
+            ContextAvailability::Available | ContextAvailability::Partial => Ok(ContextBreakdown {
+                availability,
+                used_tokens: Some(123),
+                ..Default::default()
+            }),
+            _ => Ok(ContextBreakdown::unavailable(
+                availability,
+                "first unavailable",
+            )),
+        };
+        first_request.reply.send(reply).unwrap();
+        let first: ContextBreakdown =
+            serde_json::from_value(first.await.unwrap().unwrap()).unwrap();
+        assert!(!first.stale);
+        let caller = client.clone();
+        let id = chat.clone();
+        let mut second = tokio::spawn(async move {
+            caller
+                .call("GetChatContextBreakdown", json!({"chatId":id}))
+                .await
+        });
+        // Answer an unexpected Unsupported re-probe too, so losing the
+        // short-circuit fails an assertion rather than a timeout.
+        let (second, inspected) = tokio::select! {
+            result = &mut second => (result.unwrap().unwrap(), false),
+            pending = native.recv() => {
+                pending.unwrap().reply.send(Err(HarnessError::Protocol("second failure".into()))).unwrap();
+                (second.await.unwrap().unwrap(), true)
+            }
+        };
+        let second: ContextBreakdown = serde_json::from_value(second).unwrap();
+        let available = availability == ContextAvailability::Available;
+        let unsupported = availability == ContextAvailability::Unsupported;
+        let expected_second = if available {
+            ContextAvailability::Available
+        } else if unsupported {
+            ContextAvailability::Unsupported
+        } else {
+            ContextAvailability::Error
+        };
+        actual.push((
+            availability,
+            "live",
+            second.availability,
+            second.stale,
+            second.used_tokens,
+            second
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("retained snapshot")),
+            inspected,
+        ));
+        expected.push((
+            availability,
+            "live",
+            expected_second,
+            available,
+            if available { Some(123) } else { None },
+            available,
+            !unsupported,
+        ));
+        if available {
+            assert_eq!(second.observed_at_ms, first.observed_at_ms);
+        }
+        if unsupported {
+            assert_eq!(
+                second, first,
+                "Unsupported keeps its existing short-circuit"
+            );
+        }
+        core.sessions.terminate(&chat).await.unwrap();
+        let ended: ContextBreakdown = serde_json::from_value(
+            client
+                .call("GetChatContextBreakdown", json!({"chatId":chat}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        actual.push((
+            availability,
+            "ended",
+            ended.availability,
+            ended.stale,
+            ended.used_tokens,
+            ended
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("retained snapshot")),
+            false,
+        ));
+        expected.push((
+            availability,
+            "ended",
+            if available {
+                ContextAvailability::Available
+            } else {
+                ContextAvailability::NotApplicable
+            },
+            available,
+            if available { Some(123) } else { None },
+            available,
+            false,
+        ));
+    }
+    core.shutdown().await;
+    assert_eq!(
+        actual, expected,
+        "only an Available measurement can become a retained stale snapshot"
+    );
+}
+
+#[tokio::test]
 async fn context_rpc_preserves_protocol_reasons_and_keeps_other_errors_generic() {
     use zeron_harness::HarnessError;
     let (pending, mut native) = tokio::sync::mpsc::unbounded_channel();

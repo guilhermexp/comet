@@ -40,6 +40,14 @@ fn cache_for(
     Some(cache)
 }
 
+// Keep the ownership sweep separate from admission so its lock boundary is testable.
+fn prune_caches(
+    caches: &Mutex<HashMap<String, Arc<ContextCache>>>,
+    mut is_local: impl FnMut(&str) -> bool,
+) {
+    lock(caches).retain(|id, _| is_local(id));
+}
+
 impl SessionsEngine {
     pub async fn context_breakdown(
         &self,
@@ -57,9 +65,8 @@ impl SessionsEngine {
         };
         let cache = {
             let workspace = self.inner.workspace();
-            let mut caches = lock(&self.inner.context_breakdowns);
             if let Some(workspace) = workspace {
-                caches.retain(|id, _| {
+                prune_caches(&self.inner.context_breakdowns, |id| {
                     workspace
                         .chat(id)
                         .ok()
@@ -67,7 +74,7 @@ impl SessionsEngine {
                         .is_some_and(|chat| chat.device_id == self.inner.device_id)
                 });
             }
-            cache_for(&mut caches, chat_id)
+            cache_for(&mut lock(&self.inner.context_breakdowns), chat_id)
         };
         let Some(cache) = cache else {
             let mut report = unavailable("Context inspection is busy; refresh to retry");
@@ -229,6 +236,71 @@ impl SessionsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_pruning_queries_without_map_lock_and_keeps_active_gates() {
+        let caches = Mutex::new(HashMap::new());
+        for id in ["local", "missing", "foreign", "read-error"] {
+            drop(cache_for(&mut lock(&caches), id).unwrap());
+        }
+        let active = cache_for(&mut lock(&caches), "active-missing").unwrap();
+        let gate = active.gate.try_lock().unwrap();
+        let mut checked = Vec::new();
+        let mut available_during_query = true;
+        prune_caches(&caches, |id| {
+            available_during_query &= caches.try_lock().is_ok();
+            checked.push(id.to_owned());
+            id == "local"
+        });
+        let mut remaining = lock(&caches).keys().cloned().collect::<Vec<_>>();
+        remaining.sort();
+        drop(gate);
+        drop(active);
+        prune_caches(&caches, |id| id == "local");
+        let after_release = lock(&caches).keys().cloned().collect::<Vec<_>>();
+        assert_eq!(checked.len(), 5, "all captured IDs must be queried");
+        assert!(
+            available_during_query,
+            "workspace lookup must run without the cache-map mutex"
+        );
+        assert_eq!(
+            remaining,
+            ["active-missing", "local"],
+            "active gates cannot be removed by ownership pruning"
+        );
+        assert_eq!(
+            after_release,
+            ["local"],
+            "inactive missing/foreign/unreadable entries must be removed"
+        );
+    }
+
+    #[test]
+    fn cache_pruning_does_not_remove_a_replacement_created_during_lookup() {
+        let caches = Mutex::new(HashMap::new());
+        drop(cache_for(&mut lock(&caches), "missing").unwrap());
+        let mut replacement = None;
+        prune_caches(&caches, |id| {
+            assert_eq!(id, "missing");
+            if let Ok(mut map) = caches.try_lock() {
+                let next = Arc::new(ContextCache::default());
+                replacement = Some(Arc::downgrade(&next));
+                map.insert(id.to_owned(), next);
+            }
+            false
+        });
+        assert!(
+            replacement.is_some(),
+            "lookup must allow concurrent cache admission"
+        );
+        let map = lock(&caches);
+        assert!(
+            map.get("missing").is_some_and(|current| {
+                std::sync::Weak::ptr_eq(replacement.as_ref().unwrap(), &Arc::downgrade(current))
+            }),
+            "the stale lookup result must not remove a new cache with the same ID"
+        );
+    }
+
     #[test]
     fn context_cache_bounds_chats_and_spares_inflight_readers() {
         let mut caches = HashMap::new();
