@@ -32,8 +32,20 @@ impl ContextInspection {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         sender
             .try_send(ContextInspectionRequest { deadline, reply })
-            .map_err(|_| {
-                HarnessError::Protocol("Context inspection mailbox is closed or busy".into())
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    HarnessError::Protocol("Context inspection is busy".into())
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    let mut attached = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                    if attached
+                        .as_ref()
+                        .is_some_and(|current| current.same_channel(&sender))
+                    {
+                        *attached = None;
+                    }
+                    HarnessError::Protocol("Context inspection runtime exited".into())
+                }
             })?;
         tokio::time::timeout_at(deadline, rx)
             .await
