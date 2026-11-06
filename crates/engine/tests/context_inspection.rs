@@ -495,9 +495,6 @@ async fn context_rpc_preserves_protocol_reasons_and_keeps_other_errors_generic()
     }));
     let dir = tempfile::tempdir().unwrap();
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Omp, None).unwrap();
-    core.workspace
-        .create_chat("chat", None, Some(&core.device_id), None, None)
-        .unwrap();
     let request = RunRequest {
         prompt: "synthetic".into(),
         harness: Some(HarnessId::Omp),
@@ -519,26 +516,11 @@ async fn context_rpc_preserves_protocol_reasons_and_keeps_other_errors_generic()
         extra_mcp: Default::default(),
         env: Default::default(),
     };
-    core.sessions
-        .dispatch("chat", HarnessId::Omp, request, None)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while core
-            .sessions
-            .session_status("chat")
-            .is_none_or(|s| s.status != SessionStatus::Idle)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
     let client = Arc::new(zeron_rpc::memory_client(core.rpc_service()));
     let mut outcomes = Vec::new();
     // Both protocol reasons must survive the serialized host boundary. Other
     // errors must still hide implementation-specific details; Unsupported stays distinct.
-    for (error, availability, reason) in [
+    for (index, (error, availability, reason)) in [
         (
             HarnessError::Protocol("Runtime configuration is not settled".into()),
             ContextAvailability::Error,
@@ -559,11 +541,36 @@ async fn context_rpc_preserves_protocol_reasons_and_keeps_other_errors_generic()
             ContextAvailability::Unsupported,
             "Runtime update required",
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Separate Chats keep prior-error retention and Unsupported caching
+        // from changing the classification/reason under test.
+        let chat_id = format!("error-{index}");
+        core.workspace
+            .create_chat(&chat_id, None, Some(&core.device_id), None, None)
+            .unwrap();
+        core.sessions
+            .dispatch(&chat_id, HarnessId::Omp, request.clone(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while core
+                .sessions
+                .session_status(&chat_id)
+                .is_none_or(|s| s.status != SessionStatus::Idle)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let caller = client.clone();
+        let requested_chat = chat_id.clone();
         let read = tokio::spawn(async move {
             caller
-                .call("GetChatContextBreakdown", json!({"chatId":"chat"}))
+                .call("GetChatContextBreakdown", json!({"chatId":requested_chat}))
                 .await
         });
         let waiter = tokio::time::timeout(Duration::from_secs(2), native.recv())
@@ -573,7 +580,7 @@ async fn context_rpc_preserves_protocol_reasons_and_keeps_other_errors_generic()
         waiter.reply.send(Err(error)).unwrap();
         let report: ContextBreakdown =
             serde_json::from_value(read.await.unwrap().unwrap()).unwrap();
-        assert_eq!(report.chat_id, "chat");
+        assert_eq!(report.chat_id, chat_id);
         assert_eq!(report.host_device_id, core.device_id);
         assert_eq!(report.used_tokens, None);
         outcomes.push((
@@ -581,7 +588,6 @@ async fn context_rpc_preserves_protocol_reasons_and_keeps_other_errors_generic()
             (report.availability, report.reason.unwrap()),
         ));
     }
-    core.sessions.terminate("chat").await.unwrap();
     core.shutdown().await;
     for (expected, actual) in outcomes {
         assert_eq!(
