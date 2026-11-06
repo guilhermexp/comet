@@ -88,6 +88,10 @@ Esta revisão não transforma o check GNU em execução Windows nativa; a pendê
 ## 10. Integração de origin/main após CI do merge ref (2026-11-05)
 
 - [x] 10.1 Fetch de origin e merge real de 3f10dc3a0, preservando warm runtime OMP e suas provas/DOX/OpenSpec/trail; conferir dois pais e nenhum conflito pendente.
-- [ ] 10.2 Reproduzir E0063 e defaultar access/extra_mcp/plan nos testes novos do main; preservar D4/F3 e fronteiras de configuração do runtime com RED/GREEN.
+- [x] 10.2 Reproduzir E0063 e defaultar access/extra_mcp/plan nos testes novos do main; preservar D4/F3 e fronteiras de configuração do runtime com RED/GREEN.
 - [x] 10.3 Substituir macos-14 por macos-15 nos dois matrix de voice-tests.yml sem retirar jobs ou etapas.
-- [ ] 10.4 Provar OMP/descriptor/grants e rodar core, nextest UI --lib, workspace test/check, fmt, par GNU e OpenSpec strict até exit 0; registrar conflitos, recibos e apêndice round2, sem push/PR/archive.
+- [x] 10.4 Provar OMP/descriptor/grants e rodar core, nextest UI --lib, workspace test/check, fmt, par GNU e OpenSpec strict até exit 0; registrar conflitos, recibos e apêndice round2, sem push/PR/archive.
+- [x] 10.5 Corrigir a corrida de credencial nas fixtures wait_core_tests revelada pelo workspace, preservando o erro estrito de resposta malformada e os gates de auth; provar testes e workspace completos.
+
+
+Recibo remoto recebido neste follow-up: o head 8ec7ab6e6 teve 14 checks verdes (13 jobs Actions e o status CodeRabbit), inclusive Windows nativo (compilação, resolução de runtime e inicialização da projeção, etapas conferidas pela API), iOS, macOS frame recovery e browser Linux. Não encerra 6.7: core/test desse head falharam no merge ref e dois jobs macOS foram cancelados pelo runner indisponível. Os novos commits locais precisam ser publicados pelo dono antes de obter CI da integração atual; sem dispatch/publicação nesta execução.

@@ -266,3 +266,28 @@ GREEN 9a3f5830a: sete testes focados passam, exercitando exatamente o seam chama
 | `openspec validate sync-upstream-20261104 --strict` | 0 | review4-openspec-final.log |
 
 Preview completo: 43 unitários + 9 integrações aprovados; 2 benchmarks e 1 integração com Worker local já ignorados antes desta rodada, sem novos ignores/skips. O teste de leak passou. O fake não sinaliza processos reais e não usa sleep/retry; o caminho Win32 continua retendo OwnedHandle, verificando criação e tolerando TerminateProcess falho somente quando GetExitCodeProcess comprova saída. Compilar Windows GNU não prova execução Win32 nativa, permissão real ou descoberta Windows. Plugins::start e vendor permanecem inalterados; nenhum push, merge, tag, PR, dispatch ou archive. A pendência histórica 6.7 não é encerrada por estes checks.
+
+
+## Integração de origin/main após CI do merge ref (2026-11-05)
+
+Fetch trouxe origin/main=3f10dc3a0 (feature bf1d08d4d e seus docs/OpenSpec/trail). Merge real 0f939003f tem dois pais: 8ec7ab6e6 e 3f10dc3a0, sem conflitos textuais pendentes. OmpHarness::run_session permanece exatamente como no main; seu único delta de produção para o main são as comparações access/plan em same_runtime. Registro em main-merge-source-audit.json. Os dois novos arquivos de teste do main diferem dele somente pelos três campos defaultados de RunRequest; nenhuma asserção foi removida ou afrouxada.
+
+REDs de compilação: omp_live_cache e omp_warm_runtime reproduziram E0063, exit 101 (main-merge-harness-red.log e main-merge-engine-red.log). RED a65ecca48 protege separadamente access e plan: ambas as decisões de reuso estavam incorretas, duas falhas de asserção e exit 101 (main-merge-runtime-red-final.log). GREEN 13d93db4a: omp_rpc 73 passed/2 ignores anteriores; as duas funções live-cache compilam e retornam sem opt-in real (não se alega prova do cache Anthropic); omp_warm_runtime 5 passed. O teste de resume exige set_host_tools antes de switch_session e o de duas mensagens exige um processo/registro e um Done por turno. F3, comparação dos descriptors, grants de host tools e limpeza de MCP seguem estritos.
+
+O primeiro workspace completo executou todos os alvos, mas saiu 101 somente em zeron-workers-unpeel --lib: probe_rejects_malformed_reply recebeu 401 antes de exercitar a resposta inválida. O helper da fixture instalava o bearer dentro da thread do servidor, depois que o probe podia ler ambiente vazio. Fix dfbc24b60 injeta token no ambiente dos dois subprocessos isolados antes de iniciar servidor/cliente e transforma o helper em função pura. O texto estrito malformed WorkerWaitState reply e is_err permanecem; a nova asserção do pai propaga a falha do filho. Nenhum caminho de auth de produção foi alterado. GREEN focado: sete testes, exit 0, incluindo o filho que exige a resposta inválida e o dispatch autenticado. Logs main-merge-workspace-final.log (RED completo) e main-merge-probe-green.log (GREEN).
+
+A única diferença Rust posterior a 13d93db4a é inteiramente no módulo cfg(test) wait_core_tests. Core e UI não selecionam os testes unitários de zeron-workers-unpeel; fora desse módulo, cada byte Rust coincide com o snapshot que passou. Suas provas são reutilizadas por escopo conforme o AGENTS.md; workspace completo e all-targets check são repetidos após a correção. Não há nova exceção por baseline, retry, ignore, sleep de teste ou timeout ampliado.
+
+| Gate desta integração | Exit | Log |
+|---|---:|---|
+| `scripts/ci/test-core.sh` | 0 | main-merge-core-final.log |
+| `cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib` | 0 | main-merge-ui-final.log |
+| `cargo test --workspace --locked --no-fail-fast` | 0 | main-merge-workspace-after-probe.log |
+| `cargo check --workspace --all-targets --locked` | 0 | main-merge-check-after-probe.log |
+| `cargo fmt --all -- --check` | 0 | main-merge-fmt-after-probe.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` | 0 | main-merge-windows-final.log |
+| `openspec validate sync-upstream-20261104 --strict` | 0 | main-merge-openspec-final.log |
+
+Todos os sete gates exigidos têm recibos válidos exit 0. Core: 2669 passed/27 skips anteriores (2 leaky PASS); UI nextest: 2827 passed/12 skips anteriores. O workspace completo após o fix executou todos os alvos sem falha, incluindo 336/336 unitários Workers e spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent. Check all-targets e fmt foram repetidos após a correção e passaram. As etapas normais GNU compilam o mesmo código de produção, pois o único delta posterior ao GREEN OMP é cfg(test). Logs/recibos e auditoria de escopo ficam no diretório round2. Nenhuma falha inicial foi promovida a aceite.
+
+Runner: voice-tests.yml só muda dois labels macos-14 → macos-15, preservando jobs, plataformas restantes e etapas. A API confirmou no head remoto 8ec7ab6e6 os 14 checks verdes (13 jobs Actions e CodeRabbit), duas falhas, dois cancelamentos e um skip. O Windows nativo terminou suas etapas de compilação, resolução de runtime e inicialização projetada; recibo main-merge-remote-windows-before.json. Essa prova é do head publicado anterior, sem estendê-la aos novos commits. O novo agendamento macOS e o CI da integração dependem da publicação pelo dono. A pendência histórica 6.7 continua aberta. Nenhum push, merge de PR, tag, edição de PR, dispatch ou archive da change sync foi feito.
