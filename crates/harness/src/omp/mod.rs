@@ -959,7 +959,7 @@ async fn run_session(
         // One delivery at a time: image preflight cannot reorder adjacent
         // messages, and nothing overtakes the opening prompt's ACK or a
         // pending host-tool result. Keep the complete message until dispatch.
-        if !prompt_pending && !steer_pending && (!turn_active || delivering.is_empty()) {
+        if !prompt_pending && !steer_pending && delivering.is_empty() {
             if let Some(queued) = queued_steers.pop_front() {
                 deliver_message!(queued);
             } else if !turn_active && !steering_open {
