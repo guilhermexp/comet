@@ -1957,6 +1957,103 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn closed_context_mailbox_parks_and_keeps_processing_events() {
+        use crate::context_inspection::tests::{idle_poll_wakes, next_text};
+        let dir = tempfile::tempdir().unwrap();
+        let process = OmpProcess::start(process::OmpLaunch {
+            executable: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-omp-rpc.sh"),
+            cwd: dir.path().to_owned(),
+            ephemeral: true,
+            system_prompt_append: None,
+            env: Some(HashMap::from([(
+                "FAKE_OMP_SCENARIO".into(),
+                "context-active".into(),
+            )])),
+            handshake_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+        })
+        .await
+        .unwrap();
+        let mut native_events = process.take_events().unwrap();
+        let (frames, events) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (_steer, steering) = mpsc::channel(8);
+        let interrupt = tokio_util::sync::CancellationToken::new();
+        let turn = crate::TurnControl::default();
+        let context_requests = turn.context_requests();
+        let controls = RunControls {
+            realtime: None,
+            execution_lease: None,
+            request_input: Box::new(|_| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Vec::new());
+                rx
+            }),
+            steering,
+            interrupt: interrupt.clone(),
+            chat_id: "closed-context".into(),
+            turn: turn.clone(),
+        };
+        let actor = run_session(
+            process,
+            events,
+            event_tx,
+            controls,
+            context_requests,
+            None,
+            None,
+            None,
+            dir.path().to_string_lossy().into_owned(),
+            "fixture".into(),
+            "session".into(),
+            json!({"type":"prompt","message":"synthetic"}),
+            Duration::from_secs(1),
+            None,
+        );
+        tokio::pin!(actor);
+        // Positive acknowledgement from the real CLI transport: the prompt
+        // started, and its turn remains active until the test sends an end.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    _ = actor.as_mut() => panic!("session ended before prompt startup"),
+                    frame = native_events.recv() => {
+                        let frame = frame.unwrap();
+                        if frame["assistantMessageEvent"]["delta"] == "active" { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let text_frame = |text| {
+            json!({"type":"message_update",
+            "assistantMessageEvent":{"type":"text_delta","delta":text}})
+        };
+        frames.send(text_frame("before close")).await.unwrap();
+        assert_eq!(
+            next_text(actor.as_mut(), &mut event_rx).await,
+            "before close"
+        );
+        // attach() replaces the sender while this active driver owns the old receiver.
+        let _replacement = turn.context_requests();
+        let wakes = idle_poll_wakes(actor.as_mut()).await;
+        frames.send(text_frame("after close")).await.unwrap();
+        let following = next_text(actor.as_mut(), &mut event_rx).await;
+        interrupt.cancel();
+        tokio::time::timeout(Duration::from_secs(3), actor.as_mut())
+            .await
+            .unwrap();
+        assert_eq!(following, "after close");
+        assert_eq!(
+            wakes, 0,
+            "closed context mailbox must park without self-waking"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn warm_prompt_preflight_and_ack_precede_ordered_steers() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("attachment.png");

@@ -2294,6 +2294,88 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_context_mailbox_parks_and_keeps_processing_events() {
+        use crate::context_inspection::tests::{idle_poll_wakes, next_text};
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = workers_request(false);
+        request.cwd = dir.path().to_string_lossy().into_owned();
+        request.env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            dir.path().join("config").to_string_lossy().into_owned(),
+        );
+        request
+            .env
+            .insert("COMET_CONTEXT_FIXTURE_MODE".into(), "active".into());
+        let exe =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-context-claude.py");
+        let Runtime {
+            child,
+            stdout_lines,
+            mut stdin,
+            stderr_tail,
+        } = ClaudeHarness::launch(&exe, &request, None).unwrap();
+        let first_command = uuid::Uuid::new_v4().to_string();
+        stdin.line(wire::initialize_request_line("zeron_initialize"));
+        stdin.line(wire::prompt_line("synthetic", &first_command, &[]));
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (steering_tx, steering) = mpsc::channel(8);
+        let interrupt = crate::CancellationToken::new();
+        let turn = crate::TurnControl::default();
+        let context_requests = turn.context_requests();
+        let controls = RunControls {
+            realtime: None,
+            execution_lease: None,
+            request_input: Box::new(|_| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Vec::new());
+                rx
+            }),
+            steering,
+            interrupt: interrupt.clone(),
+            chat_id: "closed-context".into(),
+            turn: turn.clone(),
+        };
+        let actor = run_session(Session {
+            inspection_supported: true,
+            context_requests,
+            normalizer: Normalizer::new(),
+            instructions: None,
+            exe,
+            launched: request.clone(),
+            child,
+            stdout_lines,
+            first_command,
+            stdin,
+            event_tx,
+            controls,
+            config: request,
+            interrupt_grace: Duration::from_millis(100),
+            kill_grace: Duration::from_millis(100),
+            lock_dir: dir.path().join("config"),
+            stderr_tail,
+        });
+        tokio::pin!(actor);
+        assert_eq!(next_text(actor.as_mut(), &mut event_rx).await, "active");
+        let _replacement = turn.context_requests();
+        let wakes = idle_poll_wakes(actor.as_mut()).await;
+        steering_tx
+            .send(crate::SteerMessage::text("after close"))
+            .await
+            .unwrap();
+        let following = next_text(actor.as_mut(), &mut event_rx).await;
+        interrupt.cancel();
+        tokio::time::timeout(Duration::from_secs(3), actor.as_mut())
+            .await
+            .unwrap();
+        assert_eq!(following, "active");
+        assert_eq!(
+            wakes, 0,
+            "closed context mailbox must park without self-waking"
+        );
+    }
+
     #[test]
     fn native_workers_mcp_config_mounts_the_controller_without_persistence() {
         let request = workers_request(true);
