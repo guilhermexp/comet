@@ -883,6 +883,31 @@ mod tests {
                 mode: crate::details_sidebar::context::DetailsMode::Orchestrator,
             }));
         });
+        // Settle the constructor's independent Usage request before observing
+        // context notifications, so it cannot provide a false positive.
+        cx.run_until_parked();
+        let accounts: zeron_rpc::ClientFrame =
+            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            accounts.method.as_deref(),
+            Some(methods::LIST_AGENT_ACCOUNTS)
+        );
+        replies
+            .try_send(
+                serde_json::to_string(&zeron_rpc::ServerFrame {
+                    id: accounts.id,
+                    ok: Some(
+                        serde_json::to_value(zeron_proto::AgentAccountsSnapshot::default())
+                            .unwrap(),
+                    ),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        runtime.block_on(tokio::task::yield_now());
+        cx.run_until_parked();
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.usage_snapshot.is_some()));
         let mut actual = Vec::new();
         let mut expected = Vec::new();
         for collapsed in [false, true] {
@@ -938,6 +963,13 @@ mod tests {
                     .unwrap();
                 runtime.block_on(tokio::task::yield_now());
                 cx.run_until_parked();
+                let task = sidebar.update(cx, |sidebar, _| {
+                    sidebar.context_breakdown_task.take().unwrap()
+                });
+                assert!(
+                    task.now_or_never().is_some(),
+                    "the RPC callback finished before presentation returns"
+                );
                 let notified = notifications.next().now_or_never() == Some(Some(()));
 
                 state.update(cx, |state, _| {
