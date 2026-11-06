@@ -486,7 +486,14 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
             )
         };
         if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            return Err(
+                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, error)
+                } else {
+                    error
+                },
+            );
         }
         // SAFETY: OpenProcess returned a valid, uniquely owned handle.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
@@ -514,8 +521,20 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
         Ok((u64::from(start.dwHighDateTime) << 32) | u64::from(start.dwLowDateTime))
     }
 
+    fn terminate(process: &OwnedHandle) -> std::io::Result<()> {
+        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
+            let error = std::io::Error::last_os_error();
+            let mut exit = 0;
+            if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit) } == 0
+                || exit == STILL_ACTIVE as u32
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     let root = open(pid)?;
-    let mut tree = vec![(pid, created(&root)?, root)];
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
@@ -539,6 +558,21 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
     if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
         return Err(error);
     }
+    terminate_captured_tree(pid, root, &children, open, created, terminate)
+}
+
+/// Keep collection and termination policy shared with portable fake-handle tests.
+/// Only `open` accepts a PID; creation and termination always use retained handles.
+#[cfg(any(windows, test))]
+fn terminate_captured_tree<H>(
+    pid: u32,
+    root: H,
+    children: &HashMap<u32, Vec<u32>>,
+    mut open: impl FnMut(u32) -> std::io::Result<H>,
+    mut created: impl FnMut(&H) -> std::io::Result<u64>,
+    mut terminate: impl FnMut(&H) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut tree = vec![(pid, created(&root)?, root)];
     let mut seen = std::collections::HashSet::from([pid]);
     let mut index = 0;
     while index < tree.len() {
@@ -550,9 +584,7 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
             }
             let handle = match open(child) {
                 Ok(handle) => handle,
-                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
-                    continue;
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
             let child_start = created(&handle)?;
@@ -565,15 +597,7 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
     // Parents first to stop restart loops; retained handles still identify
     // children even after their parents exit. Never terminate by bare PID.
     for (_, _, process) in tree {
-        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
-            let error = std::io::Error::last_os_error();
-            let mut exit = 0;
-            if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit) } == 0
-                || exit == STILL_ACTIVE as u32
-            {
-                return Err(error);
-            }
-        }
+        terminate(&process)?;
     }
     Ok(())
 }
@@ -581,7 +605,197 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    struct CapturedProcess {
+        pid: u32,
+        created: u64,
+        identity: u64,
+    }
+
+    #[derive(Default)]
+    struct FakeProcessTree {
+        open_errors: HashMap<u32, std::io::ErrorKind>,
+        creation_errors: HashMap<u32, std::io::ErrorKind>,
+        termination_errors: HashMap<u32, std::io::ErrorKind>,
+        opened: Vec<u32>,
+        terminated: Vec<u32>,
+    }
+
+    impl FakeProcessTree {
+        fn process(pid: u32) -> CapturedProcess {
+            CapturedProcess {
+                pid,
+                created: u64::from(pid),
+                identity: 1000 + u64::from(pid),
+            }
+        }
+
+        fn stop(&mut self, children: &[(u32, Vec<u32>)]) -> std::io::Result<()> {
+            let state = RefCell::new(self);
+            terminate_captured_tree(
+                10,
+                Self::process(10),
+                &children.iter().cloned().collect(),
+                |pid| {
+                    let mut state = state.borrow_mut();
+                    state.opened.push(pid);
+                    if let Some(&kind) = state.open_errors.get(&pid) {
+                        return Err(std::io::Error::new(kind, format!("open {pid}")));
+                    }
+                    Ok(Self::process(pid))
+                },
+                |handle| {
+                    if let Some(&kind) = state.borrow().creation_errors.get(&handle.pid) {
+                        return Err(std::io::Error::new(
+                            kind,
+                            format!("creation {}", handle.pid),
+                        ));
+                    }
+                    Ok(handle.created)
+                },
+                |handle| {
+                    // A PID alone is not an identity: the captured token must survive.
+                    assert_eq!(handle.identity, 1000 + u64::from(handle.pid));
+                    let mut state = state.borrow_mut();
+                    state.terminated.push(handle.pid);
+                    if let Some(&kind) = state.termination_errors.get(&handle.pid) {
+                        return Err(std::io::Error::new(
+                            kind,
+                            format!("terminate {}", handle.pid),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn tree_stop_continues_after_descendant_open_failure() {
+        let mut tree = FakeProcessTree {
+            open_errors: [(20, std::io::ErrorKind::PermissionDenied)].into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30]), (20, vec![40]), (30, vec![50])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10, 30, 50],
+            "the root and accessible branch must stop before returning the open error"
+        );
+        assert_eq!(
+            tree.opened,
+            [20, 30, 50],
+            "an unvalidated parent cannot authorize its child"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "open 20");
+    }
+
+    #[test]
+    fn tree_stop_continues_after_descendant_creation_failure() {
+        let mut tree = FakeProcessTree {
+            creation_errors: [(20, std::io::ErrorKind::PermissionDenied)].into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30]), (20, vec![40]), (30, vec![50])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10, 30, 50],
+            "a creation-read error must not retain the root and accessible branch"
+        );
+        assert_eq!(tree.opened, [20, 30, 50]);
+        assert_eq!(error.to_string(), "creation 20");
+    }
+
+    #[test]
+    fn tree_stop_continues_after_termination_failure() {
+        let mut tree = FakeProcessTree {
+            termination_errors: [
+                (10, std::io::ErrorKind::PermissionDenied),
+                (20, std::io::ErrorKind::Other),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30]), (20, vec![40])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10, 20, 30, 40],
+            "every retained handle must be attempted despite earlier termination errors"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "terminate 10");
+    }
+
+    #[test]
+    fn tree_stop_returns_first_error_after_all_accessible_handles() {
+        let mut tree = FakeProcessTree {
+            open_errors: [(20, std::io::ErrorKind::PermissionDenied)].into(),
+            creation_errors: [(30, std::io::ErrorKind::Other)].into(),
+            termination_errors: [(10, std::io::ErrorKind::Other)].into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30, 40]), (40, vec![50])])
+            .unwrap_err();
+        assert_eq!(tree.terminated, [10, 40, 50]);
+        assert_eq!(tree.opened, [20, 30, 40, 50]);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "open 20",
+            "later errors must not hide the first failure"
+        );
+    }
+
+    #[test]
+    fn tree_stop_retains_root_handle_when_its_creation_cannot_be_read() {
+        let mut tree = FakeProcessTree {
+            creation_errors: [(10, std::io::ErrorKind::PermissionDenied)].into(),
+            ..Default::default()
+        };
+        let error = tree.stop(&[(10, vec![20, 30])]).unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10],
+            "the captured root handle remains usable even without its creation time"
+        );
+        assert!(
+            tree.opened.is_empty(),
+            "children cannot be validated without their parent's creation time"
+        );
+        assert_eq!(error.to_string(), "creation 10");
+    }
+
+    #[test]
+    fn tree_stop_rejects_older_children_and_deduplicates_handles() {
+        let mut tree = FakeProcessTree {
+            open_errors: [(20, std::io::ErrorKind::NotFound)].into(),
+            ..Default::default()
+        };
+        tree.stop(&[
+            (10, vec![5, 20, 30, 30]),
+            (5, vec![40]),
+            (20, vec![50]),
+            (30, vec![25, 30, 60]),
+            (60, vec![10]),
+        ])
+        .unwrap();
+        assert_eq!(tree.opened, [5, 20, 30, 25, 60]);
+        assert_eq!(
+            tree.terminated,
+            [10, 30, 60],
+            "reject children older than their captured parent, including at deeper levels"
+        );
+    }
 
     fn listener(pid: u32, cwd: &str, port: u16, args: &[&str], v6: bool) -> Listener {
         Listener {

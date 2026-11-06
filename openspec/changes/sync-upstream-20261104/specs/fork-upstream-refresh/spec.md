@@ -1,5 +1,14 @@
 ## ADDED Requirements
 
+### Requirement: Windows server termination continues after individual process failures
+
+The integration SHALL attempt termination of every safely captured process handle, including the launcher root, before returning the first relevant error. A descendant that cannot be opened or whose creation cannot be read SHALL be logged and skipped together with descendants that cannot be validated through it. Termination SHALL never use a bare PID, and a captured child SHALL NOT predate its captured parent.
+
+#### Scenario: One descendant is inaccessible or one termination fails
+- **Test:** unit
+- **WHEN** a descendant cannot be opened, its creation time cannot be read, or termination of one captured handle fails
+- **THEN** the other validated handles, including the root, are still attempted in parent-first order and the first relevant error is returned only after those attempts
+
 ### Requirement: Browser cleanup tolerates a process disappearing after identity checks
 
 The integration SHALL classify a missing positive process ID as NotFound and allow browser artifact cleanup to continue after that process has disappeared. Permission and other termination errors SHALL preserve the artifacts and be traced. Other callers SHALL retain their explicit error policy.

@@ -78,3 +78,9 @@ Esta revisão não transforma o check GNU em execução Windows nativa; a pendê
 - [x] 8.2 RED de arquivos singleton/socket/PID retidos após ESRCH, sem sinalizar PID alocável.
 - [x] 8.3 Normalizar ausência na plataforma; Browser aceita só NotFound, preserva arquivos em negação e não espera/escala PID desaparecido; proveniência e DOX no mesmo commit.
 - [x] 8.4 unpeel-core completo, consumidor Workers, par GNU harness/engine e core --lib, fmt e OpenSpec exit 0; acrescentar recibos ao relatório sem push/archive.
+
+## 9. Revisão rodada 4 — árvore de servidores Windows (2026-11-05)
+
+- [x] 9.1 Extrair coleta/terminação com handles e provar RED no Linux para open, criação e término de descendentes.
+- [ ] 9.2 Registrar/pular descendentes inacessíveis, tentar todos os handles seguros antes do primeiro erro, preservar validação pai/filho e nunca terminar por PID nu.
+- [ ] 9.3 Testes zeron-preview, checks GNU preview e harness/engine, fmt e OpenSpec exit 0; DOX, commits e apêndice ao relatório round2, sem push/archive. Plugins::start permanece inalterado.
