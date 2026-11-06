@@ -826,6 +826,153 @@ mod tests {
             ..Default::default()
         }
     }
+    #[gpui::test]
+    fn context_response_finishes_loading_when_presentation_changes(cx: &mut gpui::TestAppContext) {
+        use futures::{FutureExt, StreamExt};
+        use gpui::AppContext;
+        use serde_json::json;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let data = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
+            cx.set_global(Theme::dark());
+        });
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.local_device_id = Some("local".into());
+            state.devices = vec![
+                serde_json::from_value(json!({
+                    "id":"host", "name":"Host", "platform":"linux",
+                    "lastSeenAt":chrono::Utc::now()
+                }))
+                .unwrap(),
+            ];
+            state.connectivity.state = zeron_proto::ConnectivityState::Connected;
+        });
+        let workers = cx.new(|cx| WorkersModel::detached(state.clone(), cx));
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let pickers = composer.read_with(cx, |c, _| c.pickers().clone());
+        let sidebar = cx.new(|cx| {
+            DetailsSidebar::new(
+                state.clone(),
+                workers,
+                DetailsSidebarPreferences::default(),
+                pickers,
+                composer,
+                cx,
+            )
+        });
+        sidebar.update(cx, |sidebar, _| {
+            sidebar.sidebar.set_context(Some(DetailsContext {
+                key: "response-fixture".into(),
+                cwd: "/fixture".into(),
+                branch: None,
+                chat_id: Some("chat".into()),
+                target_device_id: Some("host".into()),
+                mode: crate::details_sidebar::context::DetailsMode::Orchestrator,
+            }));
+        });
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for collapsed in [false, true] {
+            for failed in [false, true] {
+                state.update(cx, |state, _| {
+                    state.connectivity.state = zeron_proto::ConnectivityState::Connected;
+                });
+                let (key, generation) = sidebar.update(cx, |sidebar, cx| {
+                    sidebar.hide_context_breakdown();
+                    if !sidebar.sidebar.context_disclosure_expanded("expanded") {
+                        sidebar.sidebar.toggle_context_disclosure("expanded");
+                    }
+                    sidebar.ensure_context_breakdown(cx);
+                    assert!(sidebar.context_breakdown.loading);
+                    let key = sidebar.context_breakdown.key.clone().unwrap();
+                    assert!(key.available);
+                    (key, sidebar.context_breakdown.generation)
+                });
+                cx.run_until_parked();
+                let request: zeron_rpc::ClientFrame =
+                    serde_json::from_str(&requests.try_recv().expect("inspection was sent"))
+                        .unwrap();
+                assert_eq!(
+                    request.method.as_deref(),
+                    Some(methods::GET_CHAT_CONTEXT_BREAKDOWN)
+                );
+                assert_eq!(request.params["chatId"], "chat");
+                assert_eq!(request.params["targetDeviceId"], "host");
+
+                // Change presentation before a subsequent render/select runs.
+                // The outstanding request still owns this generation and key.
+                if collapsed {
+                    sidebar.update(cx, |sidebar, _| {
+                        sidebar.sidebar.toggle_context_disclosure("expanded");
+                    });
+                } else {
+                    state.update(cx, |state, _| {
+                        state.connectivity.state = zeron_proto::ConnectivityState::Reconnecting;
+                    });
+                    sidebar.read_with(cx, |sidebar, cx| {
+                        assert!(sidebar.context_selection(cx).as_ref() != Some(&key));
+                    });
+                }
+                let mut notifications = gpui::observe(&sidebar, cx);
+                let response = zeron_rpc::ServerFrame {
+                    id: request.id,
+                    ok: (!failed).then(|| serde_json::to_value(report("chat", "host")).unwrap()),
+                    err: failed.then(|| "synthetic failure".into()),
+                    ..Default::default()
+                };
+                replies
+                    .try_send(serde_json::to_string(&response).unwrap())
+                    .unwrap();
+                runtime.block_on(tokio::task::yield_now());
+                cx.run_until_parked();
+                let notified = notifications.next().now_or_never() == Some(Some(()));
+
+                state.update(cx, |state, _| {
+                    state.connectivity.state = zeron_proto::ConnectivityState::Connected;
+                });
+                sidebar.update(cx, |sidebar, cx| {
+                    if collapsed {
+                        sidebar.sidebar.toggle_context_disclosure("expanded");
+                    }
+                    assert!(sidebar.context_selection(cx).as_ref() == Some(&key));
+                    sidebar.ensure_context_breakdown(cx);
+                    assert_eq!(sidebar.context_breakdown.generation, generation);
+                    actual.push((
+                        collapsed,
+                        failed,
+                        sidebar.context_breakdown.loading,
+                        sidebar.context_breakdown.failure.is_some(),
+                        sidebar.context_breakdown.snapshot.is_some(),
+                        notified,
+                    ));
+                });
+                cx.run_until_parked();
+                assert!(
+                    requests.try_recv().is_err(),
+                    "the same Selection sends no follow-up request"
+                );
+                expected.push((collapsed, failed, false, failed, true, true));
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "current responses must settle loading and notify despite transient presentation changes"
+        );
+    }
+
     #[test]
     fn context_results_are_latest_only_and_never_cross_chat_host_or_model() {
         let a = selection("a", "host");
