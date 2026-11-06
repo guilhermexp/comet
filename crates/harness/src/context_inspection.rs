@@ -45,6 +45,83 @@ impl ContextInspection {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn full_mailbox_reports_busy_without_detaching_runtime() {
+        let inspection = ContextInspection::default();
+        let mut receiver = inspection.attach();
+        let mut pending = (0..receiver.max_capacity())
+            .map(|_| Box::pin(inspection.inspect()))
+            .collect::<Vec<_>>();
+        for read in &mut pending {
+            assert!(futures::poll!(read.as_mut()).is_pending());
+        }
+        assert_eq!(receiver.len(), receiver.max_capacity());
+        let result = inspection
+            .inspect()
+            .now_or_never()
+            .expect("a full mailbox must fail immediately");
+        assert!(
+            matches!(&result, Err(HarnessError::Protocol(reason)) if reason == "Context inspection is busy"),
+            "unexpected full-mailbox result: {result:?}"
+        );
+        assert!(inspection.0.lock().unwrap().is_some());
+        // Previously accepted requests must still complete on this receiver.
+        for read in pending {
+            receiver
+                .try_recv()
+                .unwrap()
+                .reply
+                .send(Ok(ContextBreakdown::default()))
+                .unwrap();
+            assert!(read.await.is_ok());
+        }
+        let read = inspection.inspect();
+        tokio::pin!(read);
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        receiver
+            .try_recv()
+            .unwrap()
+            .reply
+            .send(Ok(ContextBreakdown::default()))
+            .unwrap();
+        assert!(read.await.is_ok(), "Full must preserve the attached sender");
+    }
+
+    #[tokio::test]
+    async fn closed_mailbox_reports_exit_and_detaches_runtime() {
+        let inspection = ContextInspection::default();
+        drop(inspection.attach());
+        let result = inspection
+            .inspect()
+            .now_or_never()
+            .expect("a closed mailbox must fail immediately");
+        assert!(
+            matches!(&result, Err(HarnessError::Protocol(reason)) if reason == "Context inspection runtime exited"),
+            "unexpected closed-mailbox result: {result:?}"
+        );
+        assert!(
+            inspection.0.lock().unwrap().is_none(),
+            "the exited runtime's sender must be cleared"
+        );
+        assert!(matches!(
+            inspection.inspect().await,
+            Err(HarnessError::Unsupported(_))
+        ));
+        let mut replacement = inspection.attach();
+        let read = inspection.inspect();
+        tokio::pin!(read);
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        replacement
+            .try_recv()
+            .unwrap()
+            .reply
+            .send(Ok(ContextBreakdown::default()))
+            .unwrap();
+        assert!(read.await.is_ok(), "a new attach must remain usable");
+    }
+
     /// Drive the actual session future with a counting waker. A closed recv
     /// that spins exhausts Tokio's cooperative budget and wakes itself again;
     /// a parked select registers the waker but does not schedule another poll.
