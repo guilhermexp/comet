@@ -911,21 +911,18 @@ async fn every_omp_chat_run_receives_the_omp_system_prompt() {
     request.cwd = project.path().to_string_lossy().into_owned();
     assert!(!request.enable_workers_mcp);
 
-    let events = harness
-        .run(request, controls)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    // A Done settles the turn, not the runtime: the stream stays open for the
+    // next message, so read up to the Done instead of to the end.
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
 
-    assert!(events.iter().all(Result::is_ok));
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            Ok(AgentEvent::Done {
+            AgentEvent::Done {
                 status: DoneStatus::Completed,
                 ..
-            })
+            }
         )
     }));
 }
@@ -939,21 +936,18 @@ async fn every_omp_launch_scopes_skills_to_the_project() {
     let harness = fake_harness("require-skill-scope");
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");
 
-    let events = harness
-        .run(request("hello"), controls)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    // A Done settles the turn, not the runtime: the stream stays open for the
+    // next message, so read up to the Done instead of to the end.
+    let mut stream = harness.run(request("hello"), controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
 
-    assert!(events.iter().all(Result::is_ok));
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            Ok(AgentEvent::Done {
+            AgentEvent::Done {
                 status: DoneStatus::Completed,
                 ..
-            })
+            }
         )
     }));
 }
@@ -2357,4 +2351,440 @@ fn omp_normalizer_handles_web_tools_and_structured_clean_outputs() {
             ..
         } if id == "search_1" && out == "Top result: The Rust Programming Language"
     ));
+}
+
+// ── Warm runtime across turns ────────────────────────────────────────────────
+//
+// A Done settles a turn, not the runtime: the process, its bridges and the
+// loop stay alive, and the next user message is one more `prompt` in the same
+// process. The fixture logs every command it receives, tagged with its pid,
+// so launches and wire commands are counted from the child's side.
+
+struct WarmFixture {
+    harness: OmpHarness,
+    log: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl WarmFixture {
+    fn new(scenario: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("commands.log");
+        let mut env = fake_env(scenario);
+        env.insert("FAKE_OMP_LOG".into(), log.to_string_lossy().into_owned());
+        let harness = OmpHarness::new()
+            .with_executable(fixture_path())
+            .with_env(env)
+            .with_workers_mcp_executable(fake_workers_controller_path())
+            .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+        Self {
+            harness,
+            log,
+            _dir: dir,
+        }
+    }
+
+    /// `(pid, command type)` rows, in the order the child received them.
+    fn rows(&self) -> Vec<(u32, String)> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let (pid, kind) = line.split_once(' ')?;
+                Some((pid.parse().ok()?, kind.to_owned()))
+            })
+            .collect()
+    }
+
+    fn count(&self, kind: &str) -> usize {
+        self.rows().iter().filter(|(_, row)| row == kind).count()
+    }
+
+    fn launches(&self) -> usize {
+        let mut pids: Vec<u32> = self.rows().into_iter().map(|(pid, _)| pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids.len()
+    }
+
+    fn pid(&self) -> u32 {
+        self.rows().first().expect("the child received a command").0
+    }
+
+    fn raw(&self) -> String {
+        std::fs::read_to_string(format!("{}.raw", self.log.display())).unwrap_or_default()
+    }
+}
+
+fn warm_request(prompt: &str) -> RunRequest {
+    let mut request = request(prompt);
+    request.model = Some("openai-codex/gpt-5.6-sol".into());
+    request.reasoning = Some(ReasoningLevel::High);
+    request.enable_workers_mcp = true;
+    request.workers_parent_chat_id = Some("chat-1".into());
+    request
+}
+
+fn user_message(prompt: &str, id: &str) -> SteerMessage {
+    SteerMessage {
+        prompt: prompt.into(),
+        message_id: Some(id.into()),
+        attachments: Vec::new(),
+        config: None,
+    }
+}
+
+async fn next_turn(
+    stream: &mut BoxStream<'static, Result<AgentEvent, HarnessError>>,
+) -> Vec<AgentEvent> {
+    tokio::time::timeout(Duration::from_secs(5), collect_until_done(stream))
+        .await
+        .expect("turn did not finish")
+}
+
+fn text_of(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn done_count(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Done { .. }))
+        .count()
+}
+
+async fn assert_process_gone(pid: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("OMP process {pid} survived its runtime");
+}
+
+/// The stream ends (no further event) within a bound.
+async fn assert_stream_ends(stream: &mut BoxStream<'static, Result<AgentEvent, HarnessError>>) {
+    let next = tokio::time::timeout(Duration::from_secs(4), stream.next())
+        .await
+        .expect("the stream should end");
+    assert!(next.is_none(), "unexpected event after Done: {next:?}");
+}
+
+#[tokio::test]
+async fn two_turns_share_one_process_with_one_registration_and_one_done_each() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut request = warm_request("first");
+    request.resume = Some("/tmp/omp-session.jsonl".into());
+    let mut stream = fixture.harness.run(request, controls).await.unwrap();
+
+    let first = next_turn(&mut stream).await;
+    assert_eq!(text_of(&first), "turn-1");
+    assert_eq!(done_count(&first), 1);
+
+    steer.send(user_message("second", "m2")).await.unwrap();
+    let second = next_turn(&mut stream).await;
+    assert_eq!(text_of(&second), "turn-2");
+    assert_eq!(done_count(&second), 1);
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Steered { .. })),
+        "the engine un-parks on the boundary of a message it routed: {second:?}"
+    );
+
+    assert_eq!(fixture.launches(), 1, "rows: {:?}", fixture.rows());
+    assert_eq!(fixture.count("switch_session"), 1);
+    assert_eq!(fixture.count("set_host_tools"), 1);
+    assert_eq!(fixture.count("set_model"), 1);
+    assert_eq!(fixture.count("set_thinking_level"), 1);
+    assert_eq!(fixture.count("prompt"), 2);
+    assert_eq!(fixture.count("steer"), 0);
+
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn a_message_to_an_idle_runtime_is_a_new_prompt_with_its_images_and_no_steer() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let image_dir = tempfile::tempdir().unwrap();
+    let image_path = image_dir.path().join("idle.png");
+    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+    let mut stream = fixture
+        .harness
+        .run(warm_request("first"), controls)
+        .await
+        .unwrap();
+    next_turn(&mut stream).await;
+
+    steer
+        .send(SteerMessage {
+            prompt: "with picture".into(),
+            message_id: Some("m2".into()),
+            attachments: vec![image_path.to_string_lossy().into_owned()],
+            config: None,
+        })
+        .await
+        .unwrap();
+    let second = next_turn(&mut stream).await;
+    assert_eq!(text_of(&second), "turn-2");
+
+    assert_eq!(fixture.count("steer"), 0);
+    let raw = fixture.raw();
+    let prompt_with_image = raw
+        .lines()
+        .find(|line| line.contains("with picture"))
+        .expect("the idle message reached the child");
+    assert!(prompt_with_image.contains(r#""type":"prompt""#));
+    assert!(prompt_with_image.contains(r#""mimeType":"image/png""#));
+    assert!(prompt_with_image.contains(r#""data":"iVBORw0KGgpmaXh0dXJl""#));
+}
+
+#[tokio::test]
+async fn a_message_during_a_running_turn_is_one_steer_in_that_turn() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(warm_request("hold-open"), controls)
+        .await
+        .unwrap();
+    // The fixture holds this turn open until a steer arrives.
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("turn start")
+            .expect("stream")
+            .unwrap();
+        if matches!(&event, AgentEvent::TextDelta { text } if text == "turn-1") {
+            break;
+        }
+    }
+    steer.send(user_message("late", "m-late")).await.unwrap();
+    let rest = next_turn(&mut stream).await;
+
+    assert_eq!(text_of(&rest), " steered");
+    assert_eq!(
+        rest.iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "consumed exactly once: {rest:?}"
+    );
+    assert_eq!(done_count(&rest), 1);
+    assert_eq!(fixture.count("steer"), 1);
+    assert_eq!(fixture.count("prompt"), 1, "a steer never starts a turn");
+
+    // The warm process then takes the next message as a prompt.
+    steer.send(user_message("after", "m3")).await.unwrap();
+    let next = next_turn(&mut stream).await;
+    assert_eq!(text_of(&next), "turn-2");
+    assert_eq!(fixture.launches(), 1);
+    assert_eq!(fixture.count("prompt"), 2);
+}
+
+#[tokio::test]
+async fn dropping_the_stream_of_an_idle_runtime_leaves_no_child() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(warm_request("first"), controls)
+        .await
+        .unwrap();
+    next_turn(&mut stream).await;
+    let pid = fixture.pid();
+    drop(stream);
+    assert_process_gone(pid).await;
+}
+
+#[tokio::test]
+async fn interrupting_an_idle_runtime_ends_it_without_a_second_done() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, _steer, interrupt) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(warm_request("first"), controls)
+        .await
+        .unwrap();
+    next_turn(&mut stream).await;
+    interrupt.cancel();
+    assert_stream_ends(&mut stream).await;
+    assert_process_gone(fixture.pid()).await;
+    assert_eq!(
+        fixture.count("abort"),
+        0,
+        "an idle runtime has nothing to abort"
+    );
+}
+
+#[tokio::test]
+async fn closing_the_steering_mailbox_of_an_idle_runtime_ends_it() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(warm_request("first"), controls)
+        .await
+        .unwrap();
+    next_turn(&mut stream).await;
+    drop(steer);
+    assert_stream_ends(&mut stream).await;
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn closing_the_mailbox_during_a_turn_ends_the_runtime_once_the_turn_settles() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    drop(steer);
+    let mut stream = fixture
+        .harness
+        .run(warm_request("first"), controls)
+        .await
+        .unwrap();
+    let first = next_turn(&mut stream).await;
+    assert_eq!(done_count(&first), 1);
+    assert_stream_ends(&mut stream).await;
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn an_errored_turn_ends_the_runtime_and_leaves_no_child() {
+    let fixture = WarmFixture::new("provider-error");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(warm_request("fail"), controls)
+        .await
+        .unwrap();
+    let events = next_turn(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        }
+    )));
+    assert_stream_ends(&mut stream).await;
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn a_child_that_dies_between_turns_ends_the_stream_without_inventing_a_failure() {
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(warm_request("first"), controls)
+        .await
+        .unwrap();
+    next_turn(&mut stream).await;
+    let status = std::process::Command::new("kill")
+        .args(["-9", &fixture.pid().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // The engine reads this end, while parked, as a clean retirement; an
+    // Error/Done pair here would stamp a finished turn as failed.
+    assert_stream_ends(&mut stream).await;
+}
+
+#[tokio::test]
+async fn a_question_and_a_wait_open_at_the_turn_boundary_resolve_exactly_once() {
+    let fixture = WarmFixture::new("boundary-question");
+    let (controls, _steer, _interrupt) = controls_with_pending_answer();
+    let mut stream = fixture
+        .harness
+        .run(warm_request("boundary"), controls)
+        .await
+        .unwrap();
+    let events = next_turn(&mut stream).await;
+
+    // The question is closed before the Done that ends its turn, once.
+    let resolved = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::InputResolved { answers: None, .. }))
+        .expect("the open question is resolved");
+    let done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(resolved < done, "events: {events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::InputResolved { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(done_count(&events), 1);
+
+    // Both are answered to OMP once, whatever the settle order.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while fixture.count("host_tool_result") < 1 || fixture.count("extension_ui_response") < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rows: {:?}",
+            fixture.rows()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fixture.count("host_tool_result"), 1, "{:?}", fixture.rows());
+    assert_eq!(fixture.count("extension_ui_response"), 1);
+    assert_eq!(fixture.launches(), 1);
+}
+
+#[tokio::test]
+async fn a_resume_registers_host_tools_before_loading_the_session() {
+    // Measured against omp 18.16 (request-diff evidence): the session's system
+    // prompt and tool roster are built when `switch_session` loads it. Host
+    // tools registered after that are missing from the first request's system
+    // prompt and queue a "Tool availability changed" notice, which breaks the
+    // provider prompt cache. The order below is what keeps the prefix whole.
+    let fixture = WarmFixture::new("multi-turn");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut request = warm_request("first");
+    request.resume = Some("/tmp/omp-session.jsonl".into());
+    let mut stream = fixture.harness.run(request, controls).await.unwrap();
+    next_turn(&mut stream).await;
+
+    let order: Vec<String> = fixture.rows().into_iter().map(|(_, kind)| kind).collect();
+    let position = |kind: &str| {
+        order
+            .iter()
+            .position(|row| row == kind)
+            .unwrap_or_else(|| panic!("{kind} missing from {order:?}"))
+    };
+    assert!(
+        position("set_host_tools") < position("switch_session"),
+        "host tools must exist before the session loads: {order:?}"
+    );
+    assert!(
+        position("switch_session") < position("set_model"),
+        "{order:?}"
+    );
+    assert!(
+        position("set_model") < position("set_thinking_level"),
+        "{order:?}"
+    );
+    assert!(
+        position("set_thinking_level") < position("prompt"),
+        "{order:?}"
+    );
 }
