@@ -291,3 +291,28 @@ A única diferença Rust posterior a 13d93db4a é inteiramente no módulo cfg(te
 Todos os sete gates exigidos têm recibos válidos exit 0. Core: 2669 passed/27 skips anteriores (2 leaky PASS); UI nextest: 2827 passed/12 skips anteriores. O workspace completo após o fix executou todos os alvos sem falha, incluindo 336/336 unitários Workers e spawn_chat_inherits_config_and_stamps_sessions_only_on_the_parent. Check all-targets e fmt foram repetidos após a correção e passaram. As etapas normais GNU compilam o mesmo código de produção, pois o único delta posterior ao GREEN OMP é cfg(test). Logs/recibos e auditoria de escopo ficam no diretório round2. Nenhuma falha inicial foi promovida a aceite.
 
 Runner: voice-tests.yml só muda dois labels macos-14 → macos-15, preservando jobs, plataformas restantes e etapas. A API confirmou no head remoto 8ec7ab6e6 os 14 checks verdes (13 jobs Actions e CodeRabbit), duas falhas, dois cancelamentos e um skip. O Windows nativo terminou suas etapas de compilação, resolução de runtime e inicialização projetada; recibo main-merge-remote-windows-before.json. Essa prova é do head publicado anterior, sem estendê-la aos novos commits. O novo agendamento macOS e o CI da integração dependem da publicação pelo dono. A pendência histórica 6.7 continua aberta. Nenhum push, merge de PR, tag, edição de PR, dispatch ou archive da change sync foi feito.
+
+
+## Revisão rodada 6 — prompt antes dos steers e evidência live (2026-11-05)
+
+RED cb0dfaefb: cargo test --locked -p zeron-harness --lib warm_prompt_preflight_and_ack_precede_ordered_steers -- --nocapture saiu 101 na comparação dos frames reais recebidos pelo child: prompt first, steer one, steer two, prompt opening, steer three; a liberação do ACK só veio depois de three. Sem sleep: o attachment passa por gate cfg(test) controlado por Notify, e a fixture retém o ACK; transições esperam eventos positivos da fila ou do child. O timeout de 3 s é somente guarda de fixture quebrada. Duas tentativas iniciais de construção da fixture (tipos do RunControls e id da resposta de controle no shell) estão preservadas em review6-order-initial-{compile,fixture}.log, sem serem usadas como prova RED. O RED válido é review6-order-red.log.
+
+GREEN 39bf6e7b0: mensagens completas são enfileiradas em FIFO, sem dreno durante prompt_pending, steer_pending ou host tool bloqueante. Um future de steer por vez serializa preflight/RPC sem bloquear eventos/cancelamento; o consumo carrega o message_id original. Mailbox fechado aguarda as mensagens da fila local antes de aposentar o runtime ocioso. Refinamento 08373c8bc mantém também o prompt de turno seguinte atrás de resultados de host tools ainda pendentes; a primeira bateria foi interrompida durante a compilação do workspace (143, sem aceite) e os gates afetados foram reiniciados. A mesma prova agora exige a sequência prompt first → prompt opening → steer one/two/three, todos os steers após release_prompt_ack, IDs opening-id/id-one/id-two/id-three e bytes inline do attachment. Hooks de gate/observação existem somente sob cfg(test); o teste com shell child é cfg(unix), sem no-op Windows de produto.
+
+Provas focadas: novo caso 1 passed; harness --lib omp:: 36 passed; omp_rpc 73 passed/2 ignores anteriores; omp_warm_runtime 5 passed e runtime_survival 18 passed. Logs review6-order-green.log, review6-harness-lib-final.log, review6-harness-integration-final.log e review6-engine-omp-final.log, todos exit 0.
+
+98f062ccd dá um subdiretório por nome de teste sob o output base: a_resumed_omp_process_keeps_the_prompt_cache e a_warm_omp_process_takes_every_next_message_as_a_prompt. cwd/capture, report, session copy e boundaries derivam dessa raiz, sem serializar os testes nem mudar as asserções de cache/thinking/roster. A auditoria das chamadas e dos caminhos está em review6-source-audit.json. Os dois testes live conservam o opt-in real; não se alega execução Anthropic ou prova de cache real por seu retorno normal sem opt-in.
+
+| Comando sobre o código final 08373c8bc | Exit | Log |
+|---|---:|---|
+| `cargo test --locked -p zeron-harness --lib omp::` | 0 | review6-harness-lib-final.log |
+| `cargo test --locked -p zeron-harness --test omp_rpc --test omp_live_cache --no-fail-fast` | 0 | review6-harness-integration-final.log |
+| `cargo test --locked -p zeron-engine --test omp_warm_runtime --test runtime_survival --no-fail-fast` | 0 | review6-engine-omp-final.log |
+| `scripts/ci/test-core.sh` | 0 | review6-core-after-host-order.log |
+| `cargo test --workspace --locked --no-fail-fast` | 0 | review6-workspace-after-host-order.log |
+| `cargo check --workspace --all-targets --locked` | 0 | review6-check-final.log |
+| `cargo fmt --all -- --check` | 0 | review6-fmt-final.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` | 0 | review6-windows-final.log |
+| `openspec validate sync-upstream-20261104 --strict` | 0 | review6-openspec-final.log |
+
+Todos os recibos exigidos saíram 0 no código final, após o refinamento do dreno. Core: 2670 passed/27 skips anteriores, incluindo o novo caso e 2 leaky PASS anteriores. Workspace completo executou todos os alvos e doc-tests sem falha; o novo caso de frames, F3, access/plan, grants/limpeza de MCP e a regressão de credencial do controller passaram. Check GNU prova compilação, sem execução nativa Windows. Logs e .exit em review6-final-gates.json; o workspace interrompido em 98f062ccd não é usado para aceite. test-core.sh, workflows, cli/launch excluídos, notify no workspace, F3/drive_run e vendor permanecem sem alteração nesta rodada. A pendência histórica 6.7 de CI permanece distinta. Sem push, merge, tags, PR, dispatch ou archive da change sync.
