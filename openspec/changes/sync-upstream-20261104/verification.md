@@ -227,3 +227,24 @@ Logs review2-{drain,acp,codex}-{red,green}.log e review2-*-final.log no diretór
 | `cargo fmt --all -- --check` | 0 | review2-fmt-final.log |
 
 Core: 2647 passed, 27 ignores anteriores e 2 leaky PASS; UI: 2827 passed/12 ignores anteriores. session_ops: 14 passed; downstream: 542 testes Rust e runner worker_restart_identity. Nenhum novo ignore/skip/retry/sleep ou timeout ampliado; markers ACP e HOME selecionado Voice têm controles de sensibilidade RED. Windows GNU não emite os diagnósticos de SOCKET_IO_TIMEOUT/std::io de session_ops apontados na revisão. Proveniência vendor conferida contra o Git. Sem push/merge/tag/PR/archive.
+
+
+## Revisão rodada 3 — término de processo ausente no Browser (2026-11-05)
+
+RED f1031c2b8: regressões de singleton e socket/PID falharam por ESRCH (exit 101); os arquivos privados permaneceram após a tentativa de término. A extração dos passos de aposentadoria mantém a lógica anterior e permite testar os mesmos passos chamados por resolve_profile_dir sem depender de uma corrida do agendador. PID positivo i32::MAX é comprovado fora do intervalo alocável do kernel Linux antes de qualquer sinal; os testes não tocam processos de outras sessões.
+
+GREEN 9690c28b0: platform::terminate_process retorna NotFound só para ESRCH no Unix e ERROR_INVALID_PARAMETER de OpenProcess no Windows; pid <= 0 permanece InvalidInput e outros erros, inclusive TerminateProcess/access denied, não são normalizados. Browser tolera NotFound e limpa seus artefatos sem aguardar/escalar um PID desaparecido; negação preserva todos os arquivos e chega ao trace/retorno antecipado do chamador. Checagens de argv/ownership e graça/escalada após sinal bem-sucedido permanecem. Auditoria das quatro chamadas em review3-caller-audit.json: três Browser (força, TERM, escalada) adotam a política local; local_urls::stop_server_for_url continua Err para qualquer erro, incluindo NotFound, com lógica e texto de erro preservados.
+
+Suíte core completa: 746 passed, 2 ignores anteriores; Browser: 18 passed. As regressões novas cobrem ausência com symlink/socket reais, arquivos preservados em PermissionDenied, ausência sem escalada e classificação/mensagem/errno preservados. Downstream: 542 testes Rust, zero falhas/ignores e runner worker_restart_identity. Sem novos sleeps ou retries: as duas esperas existentes do fluxo vivo foram movidas sem mudar seus valores; não há espera/escalada adicional após observar NotFound.
+
+| Comando desta revisão | Exit | Log |
+|---|---:|---|
+| `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml --locked -p unpeel-core --lib browser_mcp::tests -- --nocapture` | 0 | review3-browser-green.log |
+| `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml --locked -p unpeel-core --no-fail-fast` | 0 | review3-core-final.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` | 0 | review3-windows-pair-final.log |
+| `cargo check --manifest-path third_party/unpeel/crates/Cargo.toml --locked --target x86_64-pc-windows-gnu -p unpeel-core --lib` | 0 | review3-windows-lib-final.log |
+| `cargo test --locked -p zeron-workers-unpeel` | 0 | review3-downstream-final.log |
+| `cargo fmt --all -- --check` | 0 | review3-fmt-final.log |
+| `rustfmt --edition 2021 --check third_party/unpeel/crates/unpeel-core/src/browser_mcp.rs third_party/unpeel/crates/unpeel-core/src/platform.rs third_party/unpeel/crates/unpeel-core/src/local_urls.rs` | 0 | review3-vendor-fmt-final.log |
+
+Proveniência vendor b9a4a25440b79a165a59259b77601c030e8b6534 conferida no Git; base, MIT e contador histórico preservados. Check GNU não é execução Windows nativa; não houve QA nativa de Browser/AppKit nesta box Linux. Sem app/profile real, push, merge, tags, PR, dispatch ou archive.

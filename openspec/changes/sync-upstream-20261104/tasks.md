@@ -70,3 +70,11 @@ As falhas adicionais de pilha, Git broker, Cloud RPC, interrupt, Cursor JSON, St
 - [x] 7.6 Atualizar verification e acrescentar recibos/commits ao relatório round2; sem push/merge/tag/PR/archive.
 
 Esta revisão não transforma o check GNU em execução Windows nativa; a pendência de infraestrutura de 6.7 permanece distinta dos gates locais desta seção.
+
+
+## 8. Revisão rodada 3 — PID ausente na limpeza Browser (2026-11-05)
+
+- [x] 8.1 Auditar todas as quatro chamadas; preservar o erro estrito de stop_server_for_url.
+- [x] 8.2 RED de arquivos singleton/socket/PID retidos após ESRCH, sem sinalizar PID alocável.
+- [x] 8.3 Normalizar ausência na plataforma; Browser aceita só NotFound, preserva arquivos em negação e não espera/escala PID desaparecido; proveniência e DOX no mesmo commit.
+- [x] 8.4 unpeel-core completo, consumidor Workers, par GNU harness/engine e core --lib, fmt e OpenSpec exit 0; acrescentar recibos ao relatório sem push/archive.
