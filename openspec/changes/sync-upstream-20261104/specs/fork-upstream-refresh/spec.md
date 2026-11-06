@@ -64,6 +64,11 @@ The integration SHALL preserve root-only Chat tools, authenticated Workers clien
 
 Accepted access modes, process inspection and tool output SHALL preserve host ownership, sanitized transcript inputs, independent child lineage and fork steering behavior.
 
+#### Scenario: OMP warm runtime crosses a sync configuration boundary
+- **Test:** integration
+- **WHEN** a subsequent OMP request changes access, plan or its host-tool grants
+- **THEN** the runtime is replaced before that prompt, while identical configuration keeps the warm process and OMP continues advertising only FullAccess without plan support
+
 #### Scenario: Tool output is read on its host
 - **Test:** integration
 - **WHEN** an authorized caller requests a command output for its Chat

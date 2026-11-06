@@ -84,3 +84,10 @@ Esta revisão não transforma o check GNU em execução Windows nativa; a pendê
 - [x] 9.1 Extrair coleta/terminação com handles e provar RED no Linux para open, criação e término de descendentes.
 - [x] 9.2 Registrar/pular descendentes inacessíveis, tentar todos os handles seguros antes do primeiro erro, preservar validação pai/filho e nunca terminar por PID nu.
 - [x] 9.3 Testes zeron-preview, checks GNU preview e harness/engine, fmt e OpenSpec exit 0; DOX, commits e apêndice ao relatório round2, sem push/archive. Plugins::start permanece inalterado.
+
+## 10. Integração de origin/main após CI do merge ref (2026-11-05)
+
+- [x] 10.1 Fetch de origin e merge real de 3f10dc3a0, preservando warm runtime OMP e suas provas/DOX/OpenSpec/trail; conferir dois pais e nenhum conflito pendente.
+- [ ] 10.2 Reproduzir E0063 e defaultar access/extra_mcp/plan nos testes novos do main; preservar D4/F3 e fronteiras de configuração do runtime com RED/GREEN.
+- [x] 10.3 Substituir macos-14 por macos-15 nos dois matrix de voice-tests.yml sem retirar jobs ou etapas.
+- [ ] 10.4 Provar OMP/descriptor/grants e rodar core, nextest UI --lib, workspace test/check, fmt, par GNU e OpenSpec strict até exit 0; registrar conflitos, recibos e apêndice round2, sem push/PR/archive.
