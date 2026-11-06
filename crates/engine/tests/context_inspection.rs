@@ -597,6 +597,36 @@ async fn context_rpc_rejects_late_model_and_runtime_results_without_caching_them
         native.try_recv().is_err(),
         "settings from another runtime must not be inspected"
     );
+    // Keep model/reasoning/options/sandbox identical to the warm runtime.
+    // A change to access alone or plan alone must reject it before inspection.
+    let mut access_only = config("old");
+    access_only.access = zeron_proto::AccessMode::Supervised;
+    let mut plan_only = config("old");
+    plan_only.plan = true;
+    let mut outcomes = Vec::new();
+    for (setting, selected) in [("access", access_only), ("plan", plan_only)] {
+        core.workspace.set_chat_config("chat", &selected).unwrap();
+        let read = client.call("GetChatContextBreakdown", json!({"chatId":"chat"}));
+        tokio::pin!(read);
+        let (reply, inspected) = tokio::select! {
+            reply = &mut read => (reply, false),
+            waiter = native.recv() => {
+                // Let an incorrect implementation finish so both independent
+                // settings are checked, without relying on a timeout failure.
+                waiter.unwrap().reply.send(Ok(ContextBreakdown {
+                    used_tokens: Some(777),
+                    ..Default::default()
+                })).unwrap();
+                (read.await, true)
+            }
+        };
+        let report: ContextBreakdown = serde_json::from_value(reply.unwrap()).unwrap();
+        outcomes.push((setting, report.availability, report.used_tokens, inspected));
+    }
+    assert_eq!(outcomes, vec![
+        ("access", ContextAvailability::NotApplicable, None, false),
+        ("plan", ContextAvailability::NotApplicable, None, false),
+    ], "access/plan-only changes must not inspect or cache the old warm runtime");
     core.workspace
         .set_chat_config("chat", &config("old"))
         .unwrap();
