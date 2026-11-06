@@ -265,6 +265,45 @@ struct Live {
     harness: OmpHarness,
 }
 
+/// Prepare only this test's capture namespace before any process is launched.
+fn prepare_capture(out: &Path) -> PathBuf {
+    let cwd = out.join("capture");
+    std::fs::create_dir_all(&cwd).unwrap();
+    cwd
+}
+
+#[test]
+fn preparing_live_capture_discards_previous_process_boundaries_and_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("this-test");
+    let cwd = prepare_capture(&out);
+    std::fs::write(cwd.join("rr-session-900.json"), "old request").unwrap();
+    note_process_boundary(&cwd);
+    let sibling = root.path().join("other-test/capture");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("boundaries.json"), "[700]").unwrap();
+
+    let cwd = prepare_capture(&out);
+    std::fs::write(cwd.join("rr-session-1.json"), "new request").unwrap();
+    note_process_boundary(&cwd);
+    let boundaries: Vec<u64> =
+        serde_json::from_str(&std::fs::read_to_string(cwd.join("boundaries.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        boundaries,
+        [1],
+        "only this execution may contribute process boundaries"
+    );
+    assert!(
+        !cwd.join("rr-session-900.json").exists(),
+        "old request evidence must not survive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sibling.join("boundaries.json")).unwrap(),
+        "[700]"
+    );
+}
+
 /// `None` unless `COMET_OMP_LIVE_CACHE=1`.
 fn live(test_name: &str) -> Option<Live> {
     if std::env::var("COMET_OMP_LIVE_CACHE").as_deref() != Ok("1") {
@@ -283,8 +322,7 @@ fn live(test_name: &str) -> Option<Live> {
         .unwrap_or_else(|| std::env::temp_dir().join("comet-omp-live-cache"))
         .join(test_name);
     let capture = std::env::var("COMET_OMP_LIVE_CAPTURE").as_deref() == Ok("1");
-    let cwd = out.join("capture");
-    std::fs::create_dir_all(&cwd).unwrap();
+    let cwd = prepare_capture(&out);
     let mut env = HashMap::new();
     if capture {
         env.insert("PI_REQ_DEBUG".to_owned(), "1".to_owned());
