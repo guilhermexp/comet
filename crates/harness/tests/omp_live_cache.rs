@@ -268,6 +268,11 @@ struct Live {
 /// Prepare only this test's capture namespace before any process is launched.
 fn prepare_capture(out: &Path) -> PathBuf {
     let cwd = out.join("capture");
+    match std::fs::remove_dir_all(&cwd) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to clear capture {}: {error}", cwd.display()),
+    }
     std::fs::create_dir_all(&cwd).unwrap();
     cwd
 }

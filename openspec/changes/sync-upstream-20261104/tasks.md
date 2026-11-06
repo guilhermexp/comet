@@ -108,5 +108,5 @@ Recibo remoto recebido neste follow-up: o head 8ec7ab6e6 teve 14 checks verdes (
 
 - [x] 12.1 RED em tabela fake Linux: seleção Windows não inclui irmãos do listener/launchers.
 - [x] 12.2 Terminar launchers validados primeiro por handles retidos e criação conferida; expandir somente o listener, continuar após erros e devolver o primeiro.
-- [ ] 12.3 Limpar a captura de cada teste live no início, com regressão determinística para boundaries antigos.
+- [x] 12.3 Limpar a captura de cada teste live no início, com regressão determinística para boundaries antigos.
 - [ ] 12.4 Preview e OMP, GNU preview/harness/engine, core, all-targets, fmt e OpenSpec strict exit 0; DOX/relatório, sem push e sem alterar test-core.sh.
