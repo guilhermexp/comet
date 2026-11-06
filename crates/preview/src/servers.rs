@@ -410,6 +410,8 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
     let root = roots
         .first()
         .ok_or_else(|| anyhow::anyhow!("no project root"))?;
+    #[cfg(windows)]
+    let mut captured = HashMap::from([(pid, capture_windows_process(pid))]);
     anyhow::ensure!(
         discovery::same_process(pid, started_at),
         "that server already exited"
@@ -434,6 +436,10 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
         if parent <= 1 || parent == me {
             break;
         }
+        #[cfg(windows)]
+        captured
+            .entry(parent)
+            .or_insert_with(|| capture_windows_process(parent));
         let Some((_, command)) = process_info(parent) else {
             break;
         };
@@ -451,139 +457,149 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
         }
     }
     #[cfg(windows)]
-    terminate_windows_tree(&targets)?;
+    terminate_windows_tree(&targets, captured)?;
     Ok(targets)
 }
 
-/// Existing servers were not spawned in one of our jobs. Capture their live
-/// descendants with ToolHelp, retaining process handles so PID reuse cannot
-/// redirect termination. A child's creation must follow its captured parent.
+/// Handles are captured before stop revalidates each target's metadata. Reading
+/// creation from this same retained handle cannot switch to a recycled PID.
 #[cfg(windows)]
-fn terminate_windows_tree(targets: &[u32]) -> std::io::Result<()> {
+struct WindowsProcess {
+    handle: std::os::windows::io::OwnedHandle,
+    created: u64,
+}
+
+#[cfg(windows)]
+fn capture_windows_process(pid: u32) -> std::io::Result<WindowsProcess> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcess returned a valid, uniquely owned handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let (mut start, mut exit, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    if unsafe {
+        GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut start,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(WindowsProcess {
+        handle,
+        created: (u64::from(start.dwHighDateTime) << 32) | u64::from(start.dwLowDateTime),
+    })
+}
+
+/// Stop only the validated launchers and listener's own descendants. Existing
+/// servers were not spawned in our jobs; ToolHelp supplies candidate edges,
+/// while retained handles and parent/child creation checks authorize children.
+#[cfg(windows)]
+fn terminate_windows_tree(
+    targets: &[u32],
+    mut captured: HashMap<u32, std::io::Result<WindowsProcess>>,
+) -> std::io::Result<()> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{
-        ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+        ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, STILL_ACTIVE,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_TERMINATE, TerminateProcess,
-    };
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, TerminateProcess};
 
-    fn open(pid: u32) -> std::io::Result<OwnedHandle> {
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
-                0,
-                pid,
-            )
+    let snapshot = (|| {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the snapshot is valid and closed exactly once by OwnedHandle.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
         };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut next = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+        while next != 0 {
+            children
+                .entry(entry.th32ParentProcessID)
+                .or_default()
+                .push(entry.th32ProcessID);
+            next = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
         }
-        // SAFETY: OpenProcess returned a valid, uniquely owned handle.
-        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
-    }
-
-    fn created(process: &OwnedHandle) -> std::io::Result<u64> {
-        let (mut start, mut exit, mut kernel, mut user) = (
-            FILETIME::default(),
-            FILETIME::default(),
-            FILETIME::default(),
-            FILETIME::default(),
-        );
-        if unsafe {
-            GetProcessTimes(
-                process.as_raw_handle(),
-                &mut start,
-                &mut exit,
-                &mut kernel,
-                &mut user,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+            return Err(error);
         }
-        Ok((u64::from(start.dwHighDateTime) << 32) | u64::from(start.dwLowDateTime))
-    }
-
-    fn terminate(process: &OwnedHandle) -> std::io::Result<()> {
-        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
-            let error = std::io::Error::last_os_error();
-            let mut exit = 0;
-            if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit) } == 0
-                || exit == STILL_ACTIVE as u32
-            {
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: the snapshot is valid and closed exactly once by OwnedHandle.
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut next = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
-    while next != 0 {
-        children
-            .entry(entry.th32ParentProcessID)
-            .or_default()
-            .push(entry.th32ProcessID);
-        next = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
-        return Err(error);
-    }
+        Ok(children)
+    })();
     terminate_selected_tree(
         targets,
-        &children,
-        |pid| match open(pid) {
-            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => Ok(None),
-            result => result.map(Some),
+        snapshot,
+        |pid| {
+            // Explicit targets must use the handles captured during validation.
+            // A failed capture must not reopen a possibly recycled PID.
+            let process = if targets.contains(&pid) {
+                captured
+                    .remove(&pid)
+                    .expect("validated target was captured")
+            } else {
+                capture_windows_process(pid)
+            };
+            match process {
+                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+                    Ok(None)
+                }
+                result => result.map(Some),
+            }
         },
-        created,
-        terminate,
+        |process| Ok(process.created),
+        |process| {
+            if unsafe { TerminateProcess(process.handle.as_raw_handle(), 1) } == 0 {
+                let error = std::io::Error::last_os_error();
+                let mut exit = 0;
+                if unsafe { GetExitCodeProcess(process.handle.as_raw_handle(), &mut exit) } == 0
+                    || exit == STILL_ACTIVE as u32
+                {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        },
     )
 }
 
-/// Select termination roots using the same policy as the native stop path.
+/// Share selection and termination with portable fake-handle tests. `targets`
+/// is listener-first; only that listener's subtree is expanded. `open` accepts
+/// PIDs, but creation and termination always use the same retained handles.
 #[cfg(any(windows, test))]
 fn terminate_selected_tree<H>(
     targets: &[u32],
-    children: &HashMap<u32, Vec<u32>>,
-    mut open: impl FnMut(u32) -> std::io::Result<Option<H>>,
-    created: impl FnMut(&H) -> std::io::Result<u64>,
-    terminate: impl FnMut(&H) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let Some(&pid) = targets.last() else {
-        return Ok(());
-    };
-    let Some(root) = open(pid)? else {
-        return Ok(());
-    };
-    terminate_captured_tree(pid, root, children, open, created, terminate)
-}
-
-/// Keep collection and termination policy shared with portable fake-handle tests.
-/// Only `open` accepts a PID (`None` means it disappeared); creation and
-/// termination always use retained handles. Other errors remain relevant.
-#[cfg(any(windows, test))]
-fn terminate_captured_tree<H>(
-    pid: u32,
-    root: H,
-    children: &HashMap<u32, Vec<u32>>,
+    children: std::io::Result<HashMap<u32, Vec<u32>>>,
     mut open: impl FnMut(u32) -> std::io::Result<Option<H>>,
     mut created: impl FnMut(&H) -> std::io::Result<u64>,
     mut terminate: impl FnMut(&H) -> std::io::Result<()>,
@@ -593,25 +609,63 @@ fn terminate_captured_tree<H>(
         tracing::warn!(pid, operation, %error, "failed to stop part of a server process tree");
         first_error.get_or_insert(error);
     };
-    let root_start = match created(&root) {
-        Ok(start) => Some(start),
+    let mut tree = Vec::new();
+    let mut launchers = Vec::new();
+    let mut last_child_start = None;
+    let mut seen = std::collections::HashSet::new();
+    for (index, &pid) in targets.iter().enumerate() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let handle = match open(pid) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => continue,
+            Err(error) => {
+                record_error(pid, "open", error);
+                continue;
+            }
+        };
+        let start = match created(&handle) {
+            Ok(start) => start,
+            Err(error) => {
+                record_error(pid, "read creation", error);
+                continue;
+            }
+        };
+        // A newer launcher cannot be the captured child's original parent.
+        if index > 0 && last_child_start.is_some_and(|child| start > child) {
+            record_error(
+                pid,
+                "validate creation",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "launcher is newer than its captured child",
+                ),
+            );
+            continue;
+        }
+        last_child_start = Some(start);
+        if index == 0 {
+            tree.push((pid, start, handle));
+        } else {
+            launchers.push((pid, start, handle));
+        }
+    }
+    let children = match children {
+        Ok(children) => children,
         Err(error) => {
-            record_error(pid, "read creation", error);
-            None
+            record_error(
+                targets.first().copied().unwrap_or_default(),
+                "snapshot",
+                error,
+            );
+            HashMap::new()
         }
     };
-    let mut tree = vec![(pid, root_start, root)];
-    let mut seen = std::collections::HashSet::from([pid]);
     let mut index = 0;
     while index < tree.len() {
         let (parent, start, _) = &tree[index];
         let (parent, start) = (*parent, *start);
-        // Without a parent creation time no child can be safely attributed.
-        // Its own captured handle can still be terminated below.
-        let Some(start) = start else {
-            index += 1;
-            continue;
-        };
         for &child in children.get(&parent).into_iter().flatten() {
             if !seen.insert(child) {
                 continue;
@@ -632,14 +686,14 @@ fn terminate_captured_tree<H>(
                 }
             };
             if child_start >= start {
-                tree.push((child, Some(child_start), handle));
+                tree.push((child, child_start, handle));
             }
         }
         index += 1;
     }
-    // Parents first to stop restart loops; retained handles still identify
-    // children even after their parents exit. Never terminate by bare PID.
-    for (pid, _, process) in tree {
+    // Launchers first without expanding their other branches; then the
+    // listener and its descendants, parent-first. Never terminate by bare PID.
+    for (pid, _, process) in launchers.into_iter().rev().chain(tree) {
         if let Err(error) = terminate(&process) {
             record_error(pid, "terminate", error);
         }
@@ -690,7 +744,7 @@ mod tests {
             let state = RefCell::new(self);
             terminate_selected_tree(
                 targets,
-                &children.iter().cloned().collect(),
+                Ok(children.iter().cloned().collect()),
                 |pid| {
                     let mut state = state.borrow_mut();
                     if !targets.contains(&pid) {
@@ -760,6 +814,76 @@ mod tests {
                 tree.opened
             );
         }
+    }
+
+    #[test]
+    fn selected_tree_stop_attempts_other_targets_after_capture_or_termination_errors() {
+        for operation in ["open", "creation", "terminate"] {
+            let mut tree = FakeProcessTree::default();
+            let errors = match operation {
+                "open" => &mut tree.open_errors,
+                "creation" => &mut tree.creation_errors,
+                _ => &mut tree.termination_errors,
+            };
+            errors.insert(20, std::io::ErrorKind::PermissionDenied);
+            let error = tree
+                .stop_targets(
+                    &[30, 20, 10],
+                    &[(10, vec![20, 80]), (20, vec![30, 50]), (30, vec![40])],
+                )
+                .unwrap_err();
+            let expected = if operation == "terminate" {
+                vec![10, 20, 30, 40]
+            } else {
+                vec![10, 30, 40]
+            };
+            assert_eq!(
+                tree.terminated, expected,
+                "{operation}: accessible targets and listener descendants must still stop"
+            );
+            assert_eq!(error.to_string(), format!("{operation} 20"));
+            assert_eq!(
+                tree.opened,
+                [40],
+                "never open siblings even on a partial failure"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_tree_stop_rejects_a_recycled_launcher() {
+        let mut tree = FakeProcessTree::default();
+        let error = tree
+            .stop_targets(&[10, 20], &[(20, vec![10, 30])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10],
+            "a parent created after its child is not the validated launcher"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(tree.opened.is_empty());
+    }
+
+    #[test]
+    fn selected_tree_stop_still_attempts_targets_after_snapshot_failure() {
+        let mut terminated = Vec::new();
+        let error = terminate_selected_tree(
+            &[30, 20, 10],
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "snapshot",
+            )),
+            |pid| Ok(Some(FakeProcessTree::process(pid))),
+            |handle| Ok(handle.created),
+            |handle| {
+                terminated.push(handle.pid);
+                Err(std::io::Error::other("later termination error"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(terminated, [10, 20, 30]);
+        assert_eq!(error.to_string(), "snapshot");
     }
 
     #[test]
@@ -847,16 +971,15 @@ mod tests {
     }
 
     #[test]
-    fn tree_stop_retains_root_handle_when_its_creation_cannot_be_read() {
+    fn tree_stop_rejects_root_when_its_creation_cannot_be_read() {
         let mut tree = FakeProcessTree {
             creation_errors: [(10, std::io::ErrorKind::PermissionDenied)].into(),
             ..Default::default()
         };
         let error = tree.stop(&[(10, vec![20, 30])]).unwrap_err();
-        assert_eq!(
-            tree.terminated,
-            [10],
-            "the captured root handle remains usable even without its creation time"
+        assert!(
+            tree.terminated.is_empty(),
+            "each explicit target must pass its creation check before termination"
         );
         assert!(
             tree.opened.is_empty(),
