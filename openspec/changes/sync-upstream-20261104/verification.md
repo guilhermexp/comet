@@ -248,3 +248,21 @@ Suíte core completa: 746 passed, 2 ignores anteriores; Browser: 18 passed. As r
 | `rustfmt --edition 2021 --check third_party/unpeel/crates/unpeel-core/src/browser_mcp.rs third_party/unpeel/crates/unpeel-core/src/platform.rs third_party/unpeel/crates/unpeel-core/src/local_urls.rs` | 0 | review3-vendor-fmt-final.log |
 
 Proveniência vendor b9a4a25440b79a165a59259b77601c030e8b6534 conferida no Git; base, MIT e contador histórico preservados. Check GNU não é execução Windows nativa; não houve QA nativa de Browser/AppKit nesta box Linux. Sem app/profile real, push, merge, tags, PR, dispatch ou archive.
+
+
+## Revisão rodada 4 — árvore de servidores Windows (2026-11-05)
+
+RED e0711c693: a lógica real de coleta/terminação foi extraída para um seam privado com operações de handles substituíveis, mantendo os retornos antecipados. No Linux, o comando filtrado tree_stop_ saiu 101: cinco falhas de asserção e um controle aprovado. Erros open/creation deixavam a lista de tentativas vazia, TerminateProcess interrompia na raiz e a combinação de falhas não chegava aos handles seguros. A asserção adicional de criação da raiz também demonstrou que seu handle não era tentado. O controle de criação pai/filho e deduplicação já passava.
+
+GREEN 9a3f5830a: sete testes focados passam, exercitando exatamente o seam chamado pela implementação Win32. Um RED adicional durante a revisão do adapter mostrou que ErrorKind::NotFound genérico era amplo demais (exit 101); ausência agora é um resultado Option explícito, produzido apenas para OpenProcess/ERROR_INVALID_PARAMETER no adapter nativo. O teste final mantém outros NotFound como erro e confirma as outras tentativas antes da devolução. Logs review4-tree-red-final.log, review4-missing-classification-red.log e review4-tree-green-final.log; fonte/patch intermediário e hashes em review4-source-audit.json.
+
+| Comando desta revisão (código 9a3f5830a) | Exit | Log |
+|---|---:|---|
+| `cargo test --locked -p zeron-preview --lib tree_stop_ -- --nocapture` | 0 | review4-tree-green-final.log |
+| `cargo test --locked -p zeron-preview --no-fail-fast` | 0 | review4-preview-final.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-preview` | 0 | review4-windows-preview-final.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` | 0 | review4-windows-pair-final.log |
+| `cargo fmt --all -- --check` | 0 | review4-fmt-final.log |
+| `openspec validate sync-upstream-20261104 --strict` | 0 | review4-openspec-final.log |
+
+Preview completo: 43 unitários + 9 integrações aprovados; 2 benchmarks e 1 integração com Worker local já ignorados antes desta rodada, sem novos ignores/skips. O teste de leak passou. O fake não sinaliza processos reais e não usa sleep/retry; o caminho Win32 continua retendo OwnedHandle, verificando criação e tolerando TerminateProcess falho somente quando GetExitCodeProcess comprova saída. Compilar Windows GNU não prova execução Win32 nativa, permissão real ou descoberta Windows. Plugins::start e vendor permanecem inalterados; nenhum push, merge, tag, PR, dispatch ou archive. A pendência histórica 6.7 não é encerrada por estes checks.

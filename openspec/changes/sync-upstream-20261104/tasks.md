@@ -83,4 +83,4 @@ Esta revisão não transforma o check GNU em execução Windows nativa; a pendê
 
 - [x] 9.1 Extrair coleta/terminação com handles e provar RED no Linux para open, criação e término de descendentes.
 - [x] 9.2 Registrar/pular descendentes inacessíveis, tentar todos os handles seguros antes do primeiro erro, preservar validação pai/filho e nunca terminar por PID nu.
-- [ ] 9.3 Testes zeron-preview, checks GNU preview e harness/engine, fmt e OpenSpec exit 0; DOX, commits e apêndice ao relatório round2, sem push/archive. Plugins::start permanece inalterado.
+- [x] 9.3 Testes zeron-preview, checks GNU preview e harness/engine, fmt e OpenSpec exit 0; DOX, commits e apêndice ao relatório round2, sem push/archive. Plugins::start permanece inalterado.

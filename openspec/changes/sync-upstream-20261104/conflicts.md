@@ -186,3 +186,10 @@ Publicação da fila: append/restore anexavam um LoroMap vazio antes de escrever
 
 
 Revisão 3 do Browser: R6 passou a propagar erros de término, mas ESRCH/OpenProcess ERROR_INVALID_PARAMETER após a prova de identidade precisam permitir limpeza. platform::terminate_process agora tipa só essa ausência positiva como NotFound; Browser a aceita e limpa sem esperar/escalar novamente. Acesso negado e demais erros continuam preservando artefatos e retornando com trace. As verificações de argv/ownership e a graça/escalada para sinais bem-sucedidos permanecem. A quarta chamada, local_urls::stop_server_for_url, mantém Err para qualquer falha, inclusive NotFound, com a mesma mensagem.
+
+
+## Revisão rodada 4 — término da árvore Windows de preview (2026-11-05)
+
+A implementação F5 abortava a coleta diante de um descendente inacessível/sem criação legível, ou a terminação no primeiro erro, deixando até a raiz retida sem tentativa. O seam privado terminate_captured_tree agora registra cada falha e conserva o primeiro erro, pula ramos sem identidade validável e termina todos os demais handles em ordem pai-primeiro antes de retornar Err. O adapter Win32 só converte ERROR_INVALID_PARAMETER de OpenProcess de um descendente em ausência explícita; outros erros mantêm seu código e são relevantes, mesmo quando o ErrorKind é NotFound. GetExitCodeProcess continua tolerando uma falha de TerminateProcess apenas quando o handle comprova que o processo já saiu.
+
+Nunca há término por PID nu. O handle raiz é capturado antes do snapshot; criação de filho precisa ser >= à do pai, e ciclos/duplicatas são recusados. Se a criação da própria raiz falhar, ainda se tenta seu handle, mas não se autoriza descendente sem a criação do pai. Não se amplia descoberta Windows nem adoção de Job. A suspeita de Plugins::start sem runtime foi refutada: Handle::try_current já retorna antes de qualquer spawn; engine/plugins não foram alterados. Vendor/proveniência permanecem iguais à revisão 3.
