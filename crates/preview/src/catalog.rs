@@ -497,7 +497,8 @@ mod tests {
         .unwrap();
         let mut listener = server(3000, 1, "server.js");
         listener.args.extend([
-            "--token=abc".into(),
+            // Keep the secret outside the hex alphabet of random catalog UUIDs.
+            "--token=preview-fixture-secret".into(),
             "--password".into(),
             "hunter2".into(),
             "https://user:pass@host/x?key=1".into(),
@@ -511,7 +512,7 @@ mod tests {
             "{advertised}"
         );
         for secret in [
-            "abc",
+            "preview-fixture-secret",
             "hunter2",
             "user:pass",
             "key=1",
