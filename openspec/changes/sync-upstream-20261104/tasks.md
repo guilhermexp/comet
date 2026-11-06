@@ -103,3 +103,10 @@ Recibo remoto recebido neste follow-up: o head 8ec7ab6e6 teve 14 checks verdes (
 - [x] 11.2 Reter steers até ACK do prompt e drenar em ordem, conservando host tools, cancelamento, D4/F3 e runtime warm; GREEN.
 - [x] 11.3 Separar output/cwd dos dois testes live por subdiretório próprio; não executar provider real sem opt-in.
 - [x] 11.4 Testes OMP harness/engine, core, workspace completo, all-targets check, fmt, GNU e OpenSpec strict exit 0; DOX e relatório round2, sem push/archive. Não alterar test-core.sh para o achado refutado.
+
+## 12. Revisão rodada 7 — escopo do stop Windows e capturas limpas (2026-11-05)
+
+- [x] 12.1 RED em tabela fake Linux: seleção Windows não inclui irmãos do listener/launchers.
+- [ ] 12.2 Terminar launchers validados primeiro por handles retidos e criação conferida; expandir somente o listener, continuar após erros e devolver o primeiro.
+- [ ] 12.3 Limpar a captura de cada teste live no início, com regressão determinística para boundaries antigos.
+- [ ] 12.4 Preview e OMP, GNU preview/harness/engine, core, all-targets, fmt e OpenSpec strict exit 0; DOX/relatório, sem push e sem alterar test-core.sh.

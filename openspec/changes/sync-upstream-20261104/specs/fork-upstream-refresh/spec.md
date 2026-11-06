@@ -11,12 +11,26 @@ The integration SHALL hold complete steering messages until the prompt opening t
 
 ### Requirement: Windows server termination continues after individual process failures
 
-The integration SHALL attempt termination of every safely captured process handle, including the launcher root, before returning the first relevant error. A descendant that cannot be opened or whose creation cannot be read SHALL be logged and skipped together with descendants that cannot be validated through it. Termination SHALL never use a bare PID, and a captured child SHALL NOT predate its captured parent.
+The integration SHALL attempt termination of every safely captured process handle, including the validated launchers, before returning the first relevant error. It SHALL terminate only the validated listener and launcher chain plus safely captured descendants of that listener; siblings under any launcher SHALL remain untouched. Launcher handles SHALL be attempted first, and each explicit target SHALL have its creation/identity checked using a handle retained during validation. A descendant that cannot be opened or whose creation cannot be read SHALL be logged and skipped together with descendants that cannot be validated through it. Termination SHALL never use a bare PID, and a captured child SHALL NOT predate its captured parent.
 
 #### Scenario: One descendant is inaccessible or one termination fails
 - **Test:** unit
 - **WHEN** a descendant cannot be opened, its creation time cannot be read, or termination of one captured handle fails
 - **THEN** the other validated handles, including the root, are still attempted in parent-first order and the first relevant error is returned only after those attempts
+
+#### Scenario: Multiple servers share a validated launcher
+- **Test:** unit
+- **WHEN** the process table includes the selected listener, its launchers, listener descendants and siblings under those launchers
+- **THEN** only the validated launchers, listener and listener descendants are attempted, with launchers first, while siblings and their descendants are neither opened nor terminated
+
+### Requirement: Live OMP captures belong only to the current execution
+
+Each live test SHALL start with an empty capture directory in its own output namespace so process boundaries and request captures from previous executions cannot contaminate current evidence.
+
+#### Scenario: A live capture directory already contains old process evidence
+- **Test:** integration
+- **WHEN** the same test prepares a new capture with old boundaries and rr-session files present
+- **THEN** those old files are removed before launch, new boundaries contain only current requests, and a sibling test directory remains intact
 
 ### Requirement: Browser cleanup tolerates a process disappearing after identity checks
 

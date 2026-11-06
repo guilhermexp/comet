@@ -450,12 +450,8 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
             libc::kill(*target as libc::pid_t, libc::SIGTERM);
         }
     }
-    // The highest validated launcher owns the listener's tree. Stopping it
-    // once also avoids revisiting descendants that already exited.
     #[cfg(windows)]
-    if let Some(&target) = targets.last() {
-        terminate_windows_tree(target)?;
-    }
+    terminate_windows_tree(&targets)?;
     Ok(targets)
 }
 
@@ -463,7 +459,7 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
 /// descendants with ToolHelp, retaining process handles so PID reuse cannot
 /// redirect termination. A child's creation must follow its captured parent.
 #[cfg(windows)]
-fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
+fn terminate_windows_tree(targets: &[u32]) -> std::io::Result<()> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, INVALID_HANDLE_VALUE, STILL_ACTIVE,
@@ -527,7 +523,6 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
         Ok(())
     }
 
-    let root = open(pid)?;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
@@ -551,9 +546,8 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
     if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
         return Err(error);
     }
-    terminate_captured_tree(
-        pid,
-        root,
+    terminate_selected_tree(
+        targets,
         &children,
         |pid| match open(pid) {
             Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => Ok(None),
@@ -562,6 +556,24 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
         created,
         terminate,
     )
+}
+
+/// Select termination roots using the same policy as the native stop path.
+#[cfg(any(windows, test))]
+fn terminate_selected_tree<H>(
+    targets: &[u32],
+    children: &HashMap<u32, Vec<u32>>,
+    mut open: impl FnMut(u32) -> std::io::Result<Option<H>>,
+    created: impl FnMut(&H) -> std::io::Result<u64>,
+    terminate: impl FnMut(&H) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let Some(&pid) = targets.last() else {
+        return Ok(());
+    };
+    let Some(root) = open(pid)? else {
+        return Ok(());
+    };
+    terminate_captured_tree(pid, root, children, open, created, terminate)
 }
 
 /// Keep collection and termination policy shared with portable fake-handle tests.
@@ -667,14 +679,23 @@ mod tests {
         }
 
         fn stop(&mut self, children: &[(u32, Vec<u32>)]) -> std::io::Result<()> {
+            self.stop_targets(&[10], children)
+        }
+
+        fn stop_targets(
+            &mut self,
+            targets: &[u32],
+            children: &[(u32, Vec<u32>)],
+        ) -> std::io::Result<()> {
             let state = RefCell::new(self);
-            terminate_captured_tree(
-                10,
-                Self::process(10),
+            terminate_selected_tree(
+                targets,
                 &children.iter().cloned().collect(),
                 |pid| {
                     let mut state = state.borrow_mut();
-                    state.opened.push(pid);
+                    if !targets.contains(&pid) {
+                        state.opened.push(pid);
+                    }
                     if state.missing.contains(&pid) {
                         return Ok(None);
                     }
@@ -706,6 +727,38 @@ mod tests {
                     Ok(())
                 },
             )
+        }
+    }
+
+    #[test]
+    fn selected_tree_stop_preserves_siblings_of_the_listener_and_its_launchers() {
+        for (children, expected) in [
+            (
+                vec![
+                    (10, vec![20, 80]),
+                    (20, vec![30, 50]),
+                    (30, vec![40]),
+                    (50, vec![60]),
+                    (80, vec![90]),
+                ],
+                vec![10, 20, 30, 40],
+            ),
+            (
+                vec![(10, vec![20]), (20, vec![30, 50]), (50, vec![60])],
+                vec![10, 20, 30],
+            ),
+        ] {
+            let mut tree = FakeProcessTree::default();
+            tree.stop_targets(&[30, 20, 10], &children).unwrap();
+            assert_eq!(
+                tree.terminated, expected,
+                "siblings must survive; validated launchers go first"
+            );
+            assert!(
+                tree.opened.iter().all(|pid| *pid == 40),
+                "do not even open siblings or their descendants: {:?}",
+                tree.opened
+            );
         }
     }
 
