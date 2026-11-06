@@ -486,14 +486,7 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
             )
         };
         if handle.is_null() {
-            let error = std::io::Error::last_os_error();
-            return Err(
-                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, error)
-                } else {
-                    error
-                },
-            );
+            return Err(std::io::Error::last_os_error());
         }
         // SAFETY: OpenProcess returned a valid, uniquely owned handle.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
@@ -558,48 +551,88 @@ fn terminate_windows_tree(pid: u32) -> std::io::Result<()> {
     if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
         return Err(error);
     }
-    terminate_captured_tree(pid, root, &children, open, created, terminate)
+    terminate_captured_tree(
+        pid,
+        root,
+        &children,
+        |pid| match open(pid) {
+            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => Ok(None),
+            result => result.map(Some),
+        },
+        created,
+        terminate,
+    )
 }
 
 /// Keep collection and termination policy shared with portable fake-handle tests.
-/// Only `open` accepts a PID; creation and termination always use retained handles.
+/// Only `open` accepts a PID (`None` means it disappeared); creation and
+/// termination always use retained handles. Other errors remain relevant.
 #[cfg(any(windows, test))]
 fn terminate_captured_tree<H>(
     pid: u32,
     root: H,
     children: &HashMap<u32, Vec<u32>>,
-    mut open: impl FnMut(u32) -> std::io::Result<H>,
+    mut open: impl FnMut(u32) -> std::io::Result<Option<H>>,
     mut created: impl FnMut(&H) -> std::io::Result<u64>,
     mut terminate: impl FnMut(&H) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let mut tree = vec![(pid, created(&root)?, root)];
+    let mut first_error = None;
+    let mut record_error = |pid, operation, error: std::io::Error| {
+        tracing::warn!(pid, operation, %error, "failed to stop part of a server process tree");
+        first_error.get_or_insert(error);
+    };
+    let root_start = match created(&root) {
+        Ok(start) => Some(start),
+        Err(error) => {
+            record_error(pid, "read creation", error);
+            None
+        }
+    };
+    let mut tree = vec![(pid, root_start, root)];
     let mut seen = std::collections::HashSet::from([pid]);
     let mut index = 0;
     while index < tree.len() {
         let (parent, start, _) = &tree[index];
         let (parent, start) = (*parent, *start);
+        // Without a parent creation time no child can be safely attributed.
+        // Its own captured handle can still be terminated below.
+        let Some(start) = start else {
+            index += 1;
+            continue;
+        };
         for &child in children.get(&parent).into_iter().flatten() {
             if !seen.insert(child) {
                 continue;
             }
             let handle = match open(child) {
-                Ok(handle) => handle,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
+                Ok(Some(handle)) => handle,
+                Ok(None) => continue,
+                Err(error) => {
+                    record_error(child, "open", error);
+                    continue;
+                }
             };
-            let child_start = created(&handle)?;
+            let child_start = match created(&handle) {
+                Ok(start) => start,
+                Err(error) => {
+                    record_error(child, "read creation", error);
+                    continue;
+                }
+            };
             if child_start >= start {
-                tree.push((child, child_start, handle));
+                tree.push((child, Some(child_start), handle));
             }
         }
         index += 1;
     }
     // Parents first to stop restart loops; retained handles still identify
     // children even after their parents exit. Never terminate by bare PID.
-    for (_, _, process) in tree {
-        terminate(&process)?;
+    for (pid, _, process) in tree {
+        if let Err(error) = terminate(&process) {
+            record_error(pid, "terminate", error);
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -616,6 +649,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeProcessTree {
+        missing: std::collections::HashSet<u32>,
         open_errors: HashMap<u32, std::io::ErrorKind>,
         creation_errors: HashMap<u32, std::io::ErrorKind>,
         termination_errors: HashMap<u32, std::io::ErrorKind>,
@@ -641,10 +675,13 @@ mod tests {
                 |pid| {
                     let mut state = state.borrow_mut();
                     state.opened.push(pid);
+                    if state.missing.contains(&pid) {
+                        return Ok(None);
+                    }
                     if let Some(&kind) = state.open_errors.get(&pid) {
                         return Err(std::io::Error::new(kind, format!("open {pid}")));
                     }
-                    Ok(Self::process(pid))
+                    Ok(Some(Self::process(pid)))
                 },
                 |handle| {
                     if let Some(&kind) = state.borrow().creation_errors.get(&handle.pid) {
@@ -776,9 +813,22 @@ mod tests {
     }
 
     #[test]
-    fn tree_stop_rejects_older_children_and_deduplicates_handles() {
+    fn tree_stop_does_not_treat_other_not_found_errors_as_missing() {
         let mut tree = FakeProcessTree {
             open_errors: [(20, std::io::ErrorKind::NotFound)].into(),
+            ..Default::default()
+        };
+        let result = tree.stop(&[(10, vec![20, 30])]);
+        assert_eq!(tree.terminated, [10, 30]);
+        let error = result.expect_err("only an explicit missing-process result may be ignored");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "open 20");
+    }
+
+    #[test]
+    fn tree_stop_rejects_older_children_and_deduplicates_handles() {
+        let mut tree = FakeProcessTree {
+            missing: [20].into(),
             ..Default::default()
         };
         tree.stop(&[
