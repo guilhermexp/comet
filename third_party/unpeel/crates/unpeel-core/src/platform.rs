@@ -164,6 +164,16 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     windows::process_start_time(pid)
 }
 
+fn missing_process_error(error: io::Error, missing_code: i32) -> io::Error {
+    if error.raw_os_error() == Some(missing_code) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
+    }
+}
+
+/// A missing positive PID is NotFound, not global success. Callers retain
+/// their own policy for a target that disappeared after identity checks.
 pub(crate) fn terminate_process(pid: i32, force: bool) -> io::Result<()> {
     if pid <= 0 {
         return Err(io::Error::new(
@@ -175,7 +185,10 @@ pub(crate) fn terminate_process(pid: i32, force: bool) -> io::Result<()> {
     {
         let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
         if unsafe { libc::kill(pid, signal) } != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(missing_process_error(
+                io::Error::last_os_error(),
+                libc::ESRCH,
+            ));
         }
         Ok(())
     }
@@ -458,7 +471,10 @@ pub(crate) mod windows {
     pub(super) fn terminate_process(pid: u32) -> io::Result<()> {
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if handle.is_null() {
-            return Err(io::Error::last_os_error());
+            return Err(missing_process_error(
+                io::Error::last_os_error(),
+                ERROR_INVALID_PARAMETER as i32,
+            ));
         }
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
         if unsafe { TerminateProcess(handle.as_raw_handle().cast(), 1) } == 0 {
@@ -472,6 +488,31 @@ pub(crate) mod windows {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn missing_process_errors_are_typed_without_swallowing_denial() {
+        #[cfg(unix)]
+        let (missing, denied) = (libc::ESRCH, libc::EPERM);
+        #[cfg(windows)]
+        let (missing, denied) = (
+            windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32,
+            windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32,
+        );
+        let message = io::Error::from_raw_os_error(missing).to_string();
+        let error = missing_process_error(io::Error::from_raw_os_error(missing), missing);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        // local_urls keeps returning Err and formats this message unchanged.
+        assert_eq!(error.to_string(), message);
+        let error = missing_process_error(io::Error::from_raw_os_error(denied), missing);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.raw_os_error(), Some(denied));
+        for pid in [0, -1] {
+            assert_eq!(
+                terminate_process(pid, true).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
 
     #[test]
     fn exclusive_locks_exclude_other_handles_and_release_on_close() {

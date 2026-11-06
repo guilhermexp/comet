@@ -469,8 +469,13 @@ fn remove_singleton_files(dir: &Path) {
     }
 }
 
-fn browser_termination_result(result: std::io::Result<()>) -> std::io::Result<()> {
-    result
+// True means definitive absence: do not wait or escalate against that PID.
+fn browser_termination_result(result: std::io::Result<()>) -> std::io::Result<bool> {
+    match result {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 // Called only after the caller has checked the orphan's argv and ownership.
@@ -491,14 +496,18 @@ fn retire_browserless_daemon(
     socket_dir: &Path,
     mut terminate: impl FnMut(i32, bool) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    browser_termination_result(terminate(pid, false))?;
-    let deadline = Instant::now() + Duration::from_millis(1000);
-    while pid_is_alive(pid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if pid_is_alive(pid) {
-        browser_termination_result(terminate(pid, true))?;
-        std::thread::sleep(Duration::from_millis(100));
+    let already_gone = browser_termination_result(terminate(pid, false))?;
+    if !already_gone {
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        while pid_is_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if pid_is_alive(pid) {
+            let already_gone = browser_termination_result(terminate(pid, true))?;
+            if !already_gone {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
     for suffix in ["sock", "pid"] {
         let _ = std::fs::remove_file(socket_dir.join(format!("{key}.{suffix}")));
@@ -612,7 +621,7 @@ falling back to {}",
                     return fallback;
                 }
                 trace(&format!(
-                    "killed orphaned browser chrome pid={pid} session={session_id}"
+                    "retired orphaned browser chrome pid={pid} session={session_id}"
                 ));
             } else {
                 remove_singleton_files(&fallback);
@@ -1536,6 +1545,32 @@ mod tests {
             "an exited daemon must not leave socket/PID artifacts: {result:?}"
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn missing_daemon_is_not_waited_on_or_escalated() {
+        let root = tempfile::tempdir().unwrap();
+        let key = engine_session_key("already-gone");
+        for suffix in ["sock", "pid"] {
+            std::fs::write(root.path().join(format!("{key}.{suffix}")), b"stale").unwrap();
+        }
+        let mut calls = 0;
+        // A live sentinel makes an accidental liveness recheck observable.
+        // The injected operation never signals this process.
+        retire_browserless_daemon(std::process::id() as i32, &key, root.path(), |_, force| {
+            calls += 1;
+            assert_eq!(calls, 1, "NotFound must not escalate against a reused PID");
+            assert!(!force);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "gone fixture",
+            ))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        for suffix in ["sock", "pid"] {
+            assert!(!root.path().join(format!("{key}.{suffix}")).exists());
+        }
     }
 
     #[test]

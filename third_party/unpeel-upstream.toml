@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "3a74b5601e88a0936579589ba010aeb100daa5d4"
+vendored_tree = "b9a4a25440b79a165a59259b77601c030e8b6534"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -307,3 +307,11 @@ base_revision_resolves_upstream = false
 # the existing grace/escalation logic and error behavior until GREEN. Tests
 # use an unallocatable positive PID on Linux and preserve files on denial.
 # Base/MIT/historical modification count unchanged.
+
+# 2026-11-05 — review3 GREEN: normalize ESRCH and Windows OpenProcess
+# ERROR_INVALID_PARAMETER as NotFound, without changing other failures or
+# invalid nonpositive PIDs. Browser retirement alone accepts already-gone
+# processes, cleans artifacts and skips wait/escalation after disappearance.
+# Permission errors retain artifacts and return through trace; local_urls
+# keeps returning an error, including NotFound. Live-process budgets, argv/
+# ownership checks, base/MIT and historical modification count unchanged.
