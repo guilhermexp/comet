@@ -485,6 +485,113 @@ impl zeron_harness::Harness for ControlledInspection {
 }
 
 #[tokio::test]
+async fn context_rpc_preserves_protocol_reasons_and_keeps_other_errors_generic() {
+    use zeron_harness::HarnessError;
+    let (pending, mut native) = tokio::sync::mpsc::unbounded_channel();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(ControlledInspection {
+        pending,
+        starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Omp, None).unwrap();
+    core.workspace
+        .create_chat("chat", None, Some(&core.device_id), None, None)
+        .unwrap();
+    let request = RunRequest {
+        prompt: "synthetic".into(),
+        harness: Some(HarnessId::Omp),
+        model: Some("selected-model".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        access: Default::default(),
+        plan: false,
+        cwd: dir.path().to_string_lossy().into_owned(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: false,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
+        sessions: None,
+        resume: None,
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+        extra_mcp: Default::default(),
+        env: Default::default(),
+    };
+    core.sessions
+        .dispatch("chat", HarnessId::Omp, request, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while core
+            .sessions
+            .session_status("chat")
+            .is_none_or(|s| s.status != SessionStatus::Idle)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let client = Arc::new(zeron_rpc::memory_client(core.rpc_service()));
+    let mut outcomes = Vec::new();
+    // Both protocol reasons must survive the serialized host boundary. Other
+    // errors must still hide implementation-specific details; Unsupported stays distinct.
+    for (error, availability, reason) in [
+        (
+            HarnessError::Protocol("Runtime configuration is not settled".into()),
+            ContextAvailability::Error,
+            "Runtime configuration is not settled",
+        ),
+        (
+            HarnessError::Protocol("Context inspection is busy".into()),
+            ContextAvailability::Error,
+            "Context inspection is busy",
+        ),
+        (
+            HarnessError::Io(std::io::Error::other("private transport diagnostic")),
+            ContextAvailability::Error,
+            "Context inspection failed or timed out",
+        ),
+        (
+            HarnessError::Unsupported("Runtime update required".into()),
+            ContextAvailability::Unsupported,
+            "Runtime update required",
+        ),
+    ] {
+        let caller = client.clone();
+        let read = tokio::spawn(async move {
+            caller
+                .call("GetChatContextBreakdown", json!({"chatId":"chat"}))
+                .await
+        });
+        let waiter = tokio::time::timeout(Duration::from_secs(2), native.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.reply.send(Err(error)).unwrap();
+        let report: ContextBreakdown =
+            serde_json::from_value(read.await.unwrap().unwrap()).unwrap();
+        assert_eq!(report.chat_id, "chat");
+        assert_eq!(report.host_device_id, core.device_id);
+        assert_eq!(report.used_tokens, None);
+        outcomes.push((
+            (availability, reason.to_string()),
+            (report.availability, report.reason.unwrap()),
+        ));
+    }
+    core.sessions.terminate("chat").await.unwrap();
+    core.shutdown().await;
+    for (expected, actual) in outcomes {
+        assert_eq!(
+            actual, expected,
+            "native protocol reason must cross the context RPC unchanged"
+        );
+    }
+}
+
+#[tokio::test]
 async fn context_rpc_rejects_late_model_and_runtime_results_without_caching_them() {
     let (pending, mut native) = tokio::sync::mpsc::unbounded_channel();
     let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
